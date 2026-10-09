@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
+import { finished } from "node:stream/promises";
 import test from "node:test";
 import { sessionEventActivePath } from "../src/session/event-log.js";
 import { connectSocket, nextJsonLine } from "./queue-test-helpers.js";
@@ -26,14 +27,30 @@ import { connectSocket, nextJsonLine } from "./queue-test-helpers.js";
 // ---------------------------------------------------------------------------
 
 // L1.6 bound. PROCESS_EXIT_GRACE_MS is 1_500 ms — the whole window before
-// SIGKILL — so the handler has to finish in a small fraction of it. A regression
+// SIGKILL — so the handler has to do a small fraction of it in WORK. A regression
 // here means the owner no longer dies on SIGTERM and only the SIGKILL saves it,
 // i.e. process teardown made worse fleet-wide (risk R1).
-const SIGNAL_EXIT_LATENCY_BUDGET_MS = 300;
+//
+// ⚠️ DO NOT TURN THIS BACK INTO A WALL-CLOCK ASSERTION ON `kill → exit` (it was
+// `exitLatencyMs <= 300`, and it reddened intermittently under box load — brick
+// 15315a55). On a loaded workbench that interval is mostly NOT the handler: of 46
+// over-300 ms samples in 360 loaded runs (8 busy loops, load average 19–33 on 8
+// CPUs, identical on main and dev), 42 were dominated by the leg AFTER the handler
+// — process teardown plus the starved test runner's own wake-up — and the handler's
+// share was p50 9 ms. Every sample still wrote all 20 terminals and exited 143: the
+// guarantee held 360/360 while the clock-margin failed ~13 % of the time. What the
+// bound is FOR is "the handler does only bounded local synchronous work", and CPU
+// time is the load-independent measure of that. The wall-clock that remains is a
+// HANG detector (the owner must exit at all), sized far above any load stall.
+const SIGNAL_HANDLER_CPU_BUDGET_MS = 300;
+const SIGNAL_EXIT_HANG_BUDGET_MS = 15_000;
+// The control's burn must clear the budget by a margin no scheduler noise can close.
+const CPU_BURN_CONTROL_MS = SIGNAL_HANDLER_CPU_BUDGET_MS + 200;
 const PINNED_TASK_COUNT = 20;
 
 const OWNER_HARNESS = `
 import { spawn } from "node:child_process";
+import { writeSync } from "node:fs";
 import { installQueueOwnerFatalSignalHandlers } from "%RUNTIME%";
 import {
   appendDeliveryStreamEvent,
@@ -43,6 +60,8 @@ import {
 
 const sessionId = process.argv[2];
 const asyncWriterControl = process.argv[3] === "--async-writer";
+const burnArg = process.argv.find((arg) => arg.startsWith("--burn-cpu-ms="));
+const burnCpuMs = burnArg ? Number(burnArg.slice("--burn-cpu-ms=".length)) : 0;
 
 // A long-lived descendant in this process's group, standing in for the ACP
 // adapter and its SDK children — the processes that were being stranded.
@@ -68,6 +87,36 @@ const owner = await SessionQueueOwner.start(
   },
   { maxQueueDepth: 64 },
 );
+
+// HANDLER CPU TIME — the load-independent measure of "bounded local synchronous
+// work". The first SIGTERM listener, registered BEFORE the product's, opens the
+// window; the process 'exit' event (fired synchronously by the product's own
+// process.exit) closes it and reports on stderr. ORDER MATTERS: listeners run in
+// registration order, so anything registered before the product handler is
+// counted inside the window.
+let cpuAtSignal = null;
+process.once("SIGTERM", () => {
+  cpuAtSignal = process.cpuUsage();
+});
+if (burnCpuMs > 0) {
+  // CONTROL for the budget: stand-in for a slow handler. Spins on CPU time, not the
+  // wall clock, so a starved process cannot "burn" less than asked.
+  process.once("SIGTERM", () => {
+    const start = process.cpuUsage();
+    for (;;) {
+      const used = process.cpuUsage(start);
+      if ((used.user + used.system) / 1000 >= burnCpuMs) {
+        break;
+      }
+    }
+  });
+}
+process.on("exit", () => {
+  if (cpuAtSignal) {
+    const used = process.cpuUsage(cpuAtSignal);
+    writeSync(2, "HANDLER_CPU_MS " + Math.round((used.user + used.system) / 1000) + "\\n");
+  }
+});
 
 if (asyncWriterControl) {
   // CONTROL — the pre-fix behaviour, on the identical signal path: hand the
@@ -96,6 +145,7 @@ type OwnerHarness = {
   child: ReturnType<typeof spawn>;
   socketPath: string;
   adapterChildPid: number;
+  stderr: () => string;
 };
 
 async function startOwnerHarness(options: {
@@ -108,6 +158,9 @@ async function startOwnerHarness(options: {
   // harness shares the test runner's group and is deliberately NOT a leader —
   // that is the guard case.
   groupLeader?: boolean;
+  // CONTROL ONLY: a pre-handler listener that burns this much CPU inside the
+  // measured window, standing in for a slow sweep.
+  burnCpuMs?: number;
 }): Promise<OwnerHarness> {
   const child = spawn(
     process.execPath,
@@ -115,6 +168,7 @@ async function startOwnerHarness(options: {
       options.scriptPath,
       options.sessionId,
       ...(options.asyncWriterControl ? ["--async-writer"] : []),
+      ...(options.burnCpuMs ? [`--burn-cpu-ms=${options.burnCpuMs}`] : []),
     ],
     {
       stdio: ["ignore", "pipe", "pipe"],
@@ -137,7 +191,12 @@ async function startOwnerHarness(options: {
     }
     if (line.startsWith("READY ")) {
       lines.close();
-      return { child, socketPath: line.slice("READY ".length).trim(), adapterChildPid };
+      return {
+        child,
+        socketPath: line.slice("READY ".length).trim(),
+        adapterChildPid,
+        stderr: () => stderr,
+      };
     }
   }
   throw new Error(`owner harness never became ready: ${stderr}`);
@@ -167,6 +226,47 @@ function isAlive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+// Wait for the harness to exit. The only wall-clock here is a HANG detector: a
+// handler that never lets the owner die must fail this test, not stall the runner.
+// It is not a latency budget (see SIGNAL_HANDLER_CPU_BUDGET_MS).
+async function waitForExit(harness: OwnerHarness): Promise<[number | null, NodeJS.Signals | null]> {
+  const timer = new AbortController();
+  const hang = new Promise<never>((_, reject) => {
+    const handle = setTimeout(
+      () =>
+        reject(
+          new Error(
+            `owner did not exit within ${SIGNAL_EXIT_HANG_BUDGET_MS}ms of SIGTERM — the handler hangs`,
+          ),
+        ),
+      SIGNAL_EXIT_HANG_BUDGET_MS,
+    );
+    timer.signal.addEventListener("abort", () => clearTimeout(handle));
+  });
+  try {
+    const result = (await Promise.race([once(harness.child, "exit"), hang])) as [
+      number | null,
+      NodeJS.Signals | null,
+    ];
+    // 'exit' can fire before the last stderr chunk has been delivered; the CPU
+    // report is written in the child's final act, so wait for the pipe to end.
+    if (harness.child.stderr) {
+      await finished(harness.child.stderr);
+    }
+    return result;
+  } finally {
+    timer.abort();
+  }
+}
+
+// CPU milliseconds the handler used between the first SIGTERM listener and the
+// process 'exit' event, as reported by the harness on stderr.
+function readHandlerCpuMs(harness: OwnerHarness): number {
+  const match = /HANDLER_CPU_MS (\d+)/.exec(harness.stderr());
+  assert.ok(match, `harness did not report its handler CPU time; stderr: ${harness.stderr()}`);
+  return Number(match[1]);
 }
 
 // The reap is asynchronous from this process's point of view: the SIGKILL lands
@@ -276,24 +376,20 @@ test("L1.5/L1.6 a real SIGTERM writes pending custody terminals to disk, inside 
     try {
       await pinTasksInHarness(harness.socketPath, PINNED_TASK_COUNT);
 
-      const killedAt = Date.now();
       // Two signals back to back: the handler must be re-entrant, i.e. the
       // second must exit immediately rather than queue behind the first, and it
       // must never produce a second terminal for the same message.
       harness.child.kill("SIGTERM");
       harness.child.kill("SIGTERM");
-      const [code, signal] = (await once(harness.child, "exit")) as [
-        number | null,
-        NodeJS.Signals | null,
-      ];
-      const exitLatencyMs = Date.now() - killedAt;
+      const [code, signal] = await waitForExit(harness);
 
       assert.equal(signal, null, "the owner must handle SIGTERM, not die from it");
       assert.equal(code, 143, "conventional 128 + SIGTERM");
+      const handlerCpuMs = readHandlerCpuMs(harness);
       assert.ok(
-        exitLatencyMs <= SIGNAL_EXIT_LATENCY_BUDGET_MS,
-        `signal exit took ${exitLatencyMs}ms with ${PINNED_TASK_COUNT} pinned items; ` +
-          `budget is ${SIGNAL_EXIT_LATENCY_BUDGET_MS}ms inside PROCESS_EXIT_GRACE_MS=1500`,
+        handlerCpuMs <= SIGNAL_HANDLER_CPU_BUDGET_MS,
+        `signal handler used ${handlerCpuMs}ms of CPU with ${PINNED_TASK_COUNT} pinned items; ` +
+          `budget is ${SIGNAL_HANDLER_CPU_BUDGET_MS}ms inside PROCESS_EXIT_GRACE_MS=1500`,
       );
 
       const terminals = await readDeliveryTerminals(sessionId, homeDir);
@@ -432,6 +528,40 @@ test("L1.5 control: the asynchronous writer loses every terminal on the same sig
         await readDeliveryTerminals(sessionId, homeDir),
         [],
         "an async append does not survive process.exit() — this is the trap L1.5 exists to catch",
+      );
+    } finally {
+      harness.child.kill("SIGKILL");
+      killAdapterChild(harness);
+    }
+  });
+});
+
+// THE CONTROL for L1.6. The CPU-time bound above is only worth having if it can
+// go red: the identical process and signal, but a listener registered before the
+// product's handler burns more CPU than the budget allows inside the measured
+// window. The harness must report it as over budget — on the same reader the real
+// gate uses. No product code is altered to prove this.
+test("L1.6 control: a handler that burns CPU past the budget reads as over budget", async () => {
+  await withSignalHarnessHome(async ({ homeDir, scriptPath }) => {
+    const sessionId = "signal-cpu-burn-control";
+    await prepareSessionStreamDir(sessionId, homeDir);
+    const harness = await startOwnerHarness({
+      homeDir,
+      scriptPath,
+      sessionId,
+      burnCpuMs: CPU_BURN_CONTROL_MS,
+    });
+
+    try {
+      await pinTasksInHarness(harness.socketPath, 3);
+      harness.child.kill("SIGTERM");
+      await waitForExit(harness);
+
+      const handlerCpuMs = readHandlerCpuMs(harness);
+      assert.ok(
+        handlerCpuMs >= CPU_BURN_CONTROL_MS && handlerCpuMs > SIGNAL_HANDLER_CPU_BUDGET_MS,
+        `the injected ${CPU_BURN_CONTROL_MS}ms burn must be counted inside the handler window ` +
+          `and exceed the ${SIGNAL_HANDLER_CPU_BUDGET_MS}ms budget; measured ${handlerCpuMs}ms`,
       );
     } finally {
       harness.child.kill("SIGKILL");
