@@ -235,6 +235,58 @@ test("appendMessages persists _claude/sessionStatus markers but leaves last_writ
   });
 });
 
+// brick cec4c064 — the adapter's background-task set is chrome: a membership change is not
+// agent output, so a helper starting or finishing during a silent wait must not reset the
+// silence clock acpx-ui's stalled verdict reads.
+test("_claude/backgroundTasks is a stream line but does not advance last_write_at", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const sessionId = "session-background-tasks-neutral";
+    const record = makeSessionRecord(sessionId, cwd, 5);
+    await writeSessionRecord(record);
+    const writer = await SessionEventWriter.open(record);
+
+    await writer.appendMessage({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "x" } },
+      },
+    } as never);
+    const lastWriteAfterReal = writer.getRecord().eventLog.last_write_at;
+    const lastUsedAfterReal = writer.getRecord().lastUsedAt;
+    const seqAfterReal = writer.getRecord().lastSeq;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    await writer.appendMessage({
+      jsonrpc: "2.0",
+      method: "_claude/backgroundTasks",
+      params: {
+        sessionId,
+        at: new Date().toISOString(),
+        tasks: [
+          {
+            taskId: "a1",
+            taskType: "local_agent",
+            description: "background helper",
+            startedAt: new Date().toISOString(),
+          },
+        ],
+      },
+    } as never);
+
+    assert.equal(writer.getRecord().eventLog.last_write_at, lastWriteAfterReal);
+    assert.equal(writer.getRecord().lastUsedAt, lastUsedAfterReal);
+    assert.equal(writer.getRecord().lastSeq, seqAfterReal + 1);
+    await writer.close({ checkpoint: true });
+    const events = await listSessionEvents(sessionId);
+    assert.equal((events[1] as { method?: string }).method, "_claude/backgroundTasks");
+  });
+});
+
 test("acpx/delivery events are stream lines but do not advance last_write_at", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
