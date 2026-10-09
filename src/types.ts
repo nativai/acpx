@@ -1260,14 +1260,20 @@ export type SessionRecord = {
   parentSetAt?: string;
   /**
    * WRITE-ONCE provenance, persisted as `spawned_by_session_id`: who spawned this
-   * session, captured from `parentSessionId` immediately before the FIRST re-parent.
-   * Never overwritten (after A→B→C it still reads A), never cleared.
+   * session. Written at ONE of two moments, never both: at CREATION by
+   * `sessions new --no-parent` (plain, `--from`, `--from-template`) — the parent the
+   * session would have had without the flag, kept with no edge (brick 5eaf316c) — or,
+   * for a session created WITH a parent, captured from `parentSessionId` immediately
+   * before the FIRST re-parent (brick c99f9994). Never overwritten (after A→B→C it
+   * still reads A), never cleared.
    *
-   * ⚠️ ABSENT means "was a root when first adopted" — do NOT back-fill a sentinel.
+   * ⚠️ ABSENT means "nobody to record": created with no resolvable parent (a human in
+   * atrium, a bare shell, a `--no-parent` with no caller) and never re-parented from
+   * one, or still under its spawn parent. Do NOT back-fill a sentinel.
    * It exists because the relations upsert overwrites the edge in place, so the
    * original spawn parent is otherwise unrecoverable. Provenance, not a foreign key:
-   * it may name an archived or pruned session and nothing dereferences it.
-   * (brick c99f9994)
+   * it may name an archived, pruned or other-box session and nothing dereferences it —
+   * no hierarchy view (session tree, relations, board) draws an edge from it.
    */
   spawnedBySessionId?: string;
   forkedFromSessionId?: string;

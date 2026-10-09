@@ -532,6 +532,8 @@ test("new --no-parent: no parent session and no parent seat on record or index, 
     const control = await spawnChild(["--prompt", "echo env-check"]);
     assert.equal((await rig.onDisk(control.id)).parent_session_id, caller);
     assert.equal(typeof (await rig.onDisk(control.id)).parent_seat_id, "string");
+    // With a parent, provenance waits for the first re-parent (brick c99f9994).
+    assert.equal(Object.hasOwn(await rig.onDisk(control.id), "spawned_by_session_id"), false);
     assert.equal(control.env.ACPX_PARENT_SESSION_URL, `${UI_BASE}/?session=${caller}`);
     assert.match(control.env.ACPX_PARENT_SEAT_URL ?? "", /\?seat=/);
 
@@ -540,9 +542,27 @@ test("new --no-parent: no parent session and no parent seat on record or index, 
     assert.equal(Object.hasOwn(record, "parent_session_id"), false);
     assert.equal(Object.hasOwn(record, "parent_seat_id"), false);
     assert.equal(Object.hasOwn(record, "parent_session_url"), false);
+    // Brick 5eaf316c — the dropped parent survives as provenance, read back AFTER the first
+    // turn ran (the turn path rewrites the record).
+    assert.equal(record.spawned_by_session_id, caller);
     const entry = await rig.indexEntry(top.id);
     assert.equal(entry.parentSessionId, undefined);
     assert.equal(entry.parentSeatId, undefined);
+    assert.equal(entry.spawnedBySessionId, caller);
+    const shown = await rig.cli([
+      ...rig.base,
+      "--format",
+      "json",
+      "sessions",
+      "show",
+      "--session-id",
+      top.id,
+    ]);
+    assert.equal(shown.code, 0, shown.stderr);
+    assert.equal(
+      (JSON.parse(shown.stdout.trim()) as { spawnedBySessionId?: unknown }).spawnedBySessionId,
+      caller,
+    );
     assert.equal(Object.hasOwn(top.env, "ACPX_PARENT_SESSION_URL"), false);
     assert.equal(Object.hasOwn(top.env, "ACPX_PARENT_SEAT_URL"), false);
     // Its own identity is still composed — the dump is not merely empty.
@@ -587,10 +607,80 @@ test("new --from-template --no-parent: the template child records no parent edge
         String((JSON.parse(result.stdout.trim()) as { acpxRecordId: unknown }).acpxRecordId),
       );
     };
-    assert.equal((await spawnFromTemplate([])).parent_session_id, caller, "control");
+    const control = await spawnFromTemplate([]);
+    assert.equal(control.parent_session_id, caller, "control");
+    assert.equal(Object.hasOwn(control, "spawned_by_session_id"), false, "control");
     const top = await spawnFromTemplate(["--no-parent"]);
     assert.equal(Object.hasOwn(top, "parent_session_id"), false);
     assert.equal(Object.hasOwn(top, "parent_seat_id"), false);
+    assert.equal(top.spawned_by_session_id, caller);
+    assert.equal((await rig.indexEntry(String(top.acpx_record_id))).spawnedBySessionId, caller);
+  });
+});
+
+test("new --no-parent with no caller (a bare shell) records no provenance", async () => {
+  await withRig(async (rig) => {
+    const id = String((await rig.create(["--no-parent"])).acpxRecordId);
+    const record = await rig.onDisk(id);
+    assert.equal(Object.hasOwn(record, "parent_session_id"), false);
+    assert.equal(Object.hasOwn(record, "spawned_by_session_id"), false);
+    assert.equal((await rig.indexEntry(id)).spawnedBySessionId, undefined);
+  });
+});
+
+test("new --no-parent provenance is write-once: set-parent to another session, then --no-parent, keeps the creator", async () => {
+  await withRig(async (rig) => {
+    const caller = String((await rig.create()).acpxRecordId);
+    const other = String((await rig.create()).acpxRecordId);
+    const id = String((await rig.create(["--no-parent"], await rig.agentEnv(caller))).acpxRecordId);
+    assert.equal((await rig.onDisk(id)).spawned_by_session_id, caller, "precondition");
+
+    const setParent = async (flags: string[]) => {
+      const result = await rig.cli([
+        ...rig.base,
+        "--format",
+        "json",
+        "sessions",
+        "set-parent",
+        "--session-id",
+        id,
+        ...flags,
+      ]);
+      assert.equal(result.code, 0, result.stderr);
+    };
+    await setParent(["--parent-id", other]);
+    assert.equal((await rig.onDisk(id)).parent_session_id, other, "the re-parent landed");
+    assert.equal((await rig.onDisk(id)).spawned_by_session_id, caller);
+    await setParent(["--no-parent"]);
+    assert.equal(Object.hasOwn(await rig.onDisk(id), "parent_session_id"), false);
+    assert.equal((await rig.onDisk(id)).spawned_by_session_id, caller);
+    assert.equal((await rig.indexEntry(id)).spawnedBySessionId, caller);
+  });
+});
+
+test("new --from X --no-parent keeps X's parent (the parent it would have had) as provenance, not the env caller; a parentless X gives none", async () => {
+  await withRig(async (rig) => {
+    const grandparent = String((await rig.create()).acpxRecordId);
+    const caller = String((await rig.create()).acpxRecordId);
+    const old = String((await rig.create([], await rig.agentEnv(grandparent))).acpxRecordId);
+    const env = await rig.agentEnv(caller);
+
+    const control = await rig.onDisk(String((await rig.create(["--from", old], env)).acpxRecordId));
+    assert.equal(control.parent_session_id, grandparent, "control: --from takes X's parent");
+
+    const top = await rig.onDisk(
+      String((await rig.create(["--from", old, "--no-parent"], env)).acpxRecordId),
+    );
+    assert.equal(Object.hasOwn(top, "parent_session_id"), false);
+    assert.equal(Object.hasOwn(top, "parent_seat_id"), false);
+    assert.equal(top.spawned_by_session_id, grandparent);
+
+    const parentless = String((await rig.create()).acpxRecordId);
+    const none = await rig.onDisk(
+      String((await rig.create(["--from", parentless, "--no-parent"], env)).acpxRecordId),
+    );
+    assert.equal(Object.hasOwn(none, "parent_session_id"), false);
+    assert.equal(Object.hasOwn(none, "spawned_by_session_id"), false);
   });
 });
 

@@ -146,6 +146,12 @@ Repo: https://github.com/openclaw/acpx
   flag and the RESOLVED absolute path (`cannot be read (ENOENT)`, `is empty`)
   instead of `--file` or a raw filesystem error; text output says
   `[acpx] first turn queued (from <path>)`. (brick b40a9a5d)
+- CLI: `sessions new --no-parent` (plain, `--from`, `--from-template`) keeps
+  the parent it dropped as write-once provenance: `spawned_by_session_id` names
+  the caller (under `--from`, the old session's parent), visible in
+  `sessions show` and the index entry, never drawn as a hierarchy edge. A later
+  `set-parent` does not overwrite it; with no caller it stays absent.
+  (brick 5eaf316c)
 
 ### Breaking
 

@@ -891,6 +891,7 @@ async function resolveNewSessionLineage(flags: SessionsNewFlags): Promise<{
   from: SessionRecord | undefined;
   parent: ResolvedParentSession | undefined;
   inherit: ResolvedParentSession | undefined;
+  spawnedBySessionId: string | undefined;
 }> {
   const from = flags.from === undefined ? undefined : await resolveFromSessionRecord(flags.from);
   const caller = await resolveParentForNew(flags, from);
@@ -898,8 +899,15 @@ async function resolveNewSessionLineage(flags: SessionsNewFlags): Promise<{
   // session and the parent SEAT. What the session inherits (agent type, model, effort,
   // credentials, brick) still resolves from the caller exactly as without the flag: a bare
   // `sessions new --no-parent` from a claude session is a claude child at the caller's model.
+  // The dropped parent is kept as provenance (brick 5eaf316c) — `spawnedBySessionId`, which no
+  // hierarchy view draws an edge from.
   const parent = flags.parent === false ? undefined : caller;
-  return { from, parent, inherit: from ? await parentInheritableFields(from) : caller };
+  return {
+    from,
+    parent,
+    inherit: from ? await parentInheritableFields(from) : caller,
+    spawnedBySessionId: flags.parent === false ? caller?.acpxRecordId : undefined,
+  };
 }
 
 // Brick 28964dd8 — a successor (`--from` into the old session's own seat) is never the old
@@ -1113,6 +1121,8 @@ function buildSessionStartOptions(params: {
   permissionMode: ReturnType<typeof resolvePermissionMode>;
   permissionPolicy?: PermissionPolicy;
   parent?: ResolvedParentSession;
+  /** `--no-parent` only: the dropped parent, as write-once provenance (brick 5eaf316c). */
+  spawnedBySessionId?: string;
   /** Where inherited model/effort/profile/output-style/brick come from: the spawning `parent`,
    * or — under `sessions new --from` (brick 06b01b6b) — the old session's fields. Always passed,
    * so a caller cannot forget it; `parent` stays the lineage edge either way. */
@@ -1134,6 +1144,7 @@ function buildSessionStartOptions(params: {
     parentSessionId: params.parent?.acpxRecordId,
     parentSessionUrl: params.parent?.sessionUrl,
     parentSeatId: params.parent?.seatId,
+    spawnedBySessionId: params.spawnedBySessionId,
     // D11 — the join, and it comes ONLY from an explicit flag: `--seat`, or `--from <old>`,
     // which NAMES the predecessor whose seat this session is the prepared successor of
     // (brick 06b01b6b — the handover's create step). 🛑 Never from
@@ -3094,7 +3105,7 @@ async function createSessionFromNewFlags(
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   // Brick 06b01b6b — an unknown `--from` refuses here, before anything is created.
-  const { from, parent, inherit } = await resolveNewSessionLineage(flags);
+  const { from, parent, inherit, spawnedBySessionId } = await resolveNewSessionLineage(flags);
   const joining = seatToJoin(flags, from);
   if (flags.favorite === true && joining !== undefined) {
     throw new InvalidArgumentError(favoriteOnJoinMessage(joining));
@@ -3163,6 +3174,7 @@ async function createSessionFromNewFlags(
       permissionMode,
       permissionPolicy,
       parent,
+      spawnedBySessionId,
       inherit,
       from,
       resolvedBrick,
@@ -3363,7 +3375,7 @@ async function runSessionCopy(
   // carries BOTH its spawn-parent edge (parentSessionId/Url) AND its template
   // /fork origin (forkFromSessionId) — the "both edges" write. With no parent
   // context the `?.` guards omit both fields → byte-identical to today.
-  const { caller, parent } = await resolveCopyLineage(flags);
+  const { caller, parent, spawnedBySessionId } = await resolveCopyLineage(flags);
   const { value: resolvedBrick, validated: resolvedBrickValidated } = await resolveBrickFlagValue(
     flags.brick,
   );
@@ -3395,6 +3407,7 @@ async function runSessionCopy(
     parentSessionId: parent?.acpxRecordId,
     parentSessionUrl: parent?.sessionUrl,
     parentSeatId: parent?.seatId,
+    spawnedBySessionId,
     forkFromSessionId: source.acpxRecordId,
     forkAtMessageIndex: flags.atIndex,
     seatFavorite: flags.favorite,
@@ -3419,13 +3432,18 @@ async function runSessionCopy(
 }
 
 // `noParent` (`sessions new --from-template --no-parent`, HoD ruling R1) records no parent
-// edge; the caller is still resolved, because the copy's brick inherits from it as before.
+// edge; the caller is still resolved, because the copy's brick inherits from it as before and
+// it becomes the copy's `spawnedBySessionId` provenance (brick 5eaf316c).
 async function resolveCopyLineage(flags: SessionsCopyFlags): Promise<{
   caller: ResolvedParentSession | undefined;
   parent: ResolvedParentSession | undefined;
+  spawnedBySessionId: string | undefined;
 }> {
   const caller = await resolveAndValidateParentSessionId(flags);
-  return { caller, parent: flags.noParent ? undefined : caller };
+  if (flags.noParent) {
+    return { caller, parent: undefined, spawnedBySessionId: caller?.acpxRecordId };
+  }
+  return { caller, parent: caller, spawnedBySessionId: undefined };
 }
 
 function assertTemplateSource(source: SessionRecord): void {
@@ -3697,6 +3715,7 @@ function sessionSeatLines(record: SessionRecord): string[] {
     `holder: ${holderLine(record)}`,
     `parentSession: ${displayValue(record.parentSessionId)}`,
     `parentSeat: ${displayValue(record.parentSeatId)}`,
+    `spawnedBy: ${displayValue(record.spawnedBySessionId)}`,
   ];
 }
 
