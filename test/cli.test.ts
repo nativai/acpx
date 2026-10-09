@@ -3096,23 +3096,32 @@ test("raw metadata brick is record-driven for stamp/context; set-metadata valida
 // The owner knows it is closing for the session (the drain verb flagged it), so the terminal it writes for a delivery
 // the close killed is `failed / SESSION_CLOSED_TURN_CANCELLED` — outcome unknown, do not resend. A cancel with NO
 // close (the Stop button) is a different fact and must stay `cancelled`.
+type DeliveryTerminalParams = {
+  phase?: string;
+  stopReason?: string | null;
+  error?: { detailCode?: string };
+};
+
+async function deliveryTerminalsFor(
+  homeDir: string,
+  id: string,
+  messageId: string,
+): Promise<DeliveryTerminalParams[]> {
+  const stream = path.join(homeDir, ".acpx", "sessions", `${encodeURIComponent(id)}.stream.ndjson`);
+  const raw = await fs.readFile(stream, "utf8").catch(() => "");
+  return raw
+    .split("\n")
+    .filter((line) => line.includes('"acpx/delivery"') && line.includes(messageId))
+    .map((line) => (JSON.parse(line) as { params: DeliveryTerminalParams }).params)
+    .filter((params) => params.phase !== "accepted" && params.phase !== "queued");
+}
+
 async function deliveryTerminalFor(
   homeDir: string,
   id: string,
   messageId: string,
-): Promise<
-  { phase?: string; stopReason?: string | null; error?: { detailCode?: string } } | undefined
-> {
-  const stream = path.join(homeDir, ".acpx", "sessions", `${encodeURIComponent(id)}.stream.ndjson`);
-  const raw = await fs.readFile(stream, "utf8").catch(() => "");
-  const terminals = raw
-    .split("\n")
-    .filter((line) => line.includes('"acpx/delivery"') && line.includes(messageId))
-    .map((line) => (JSON.parse(line) as { params: { phase?: string } }).params)
-    .filter((params) => params.phase !== "accepted" && params.phase !== "queued");
-  return terminals.at(-1) as
-    | { phase?: string; stopReason?: string | null; error?: { detailCode?: string } }
-    | undefined;
+): Promise<DeliveryTerminalParams | undefined> {
+  return (await deliveryTerminalsFor(homeDir, id, messageId)).at(-1);
 }
 
 async function startSleepingDelivery(
@@ -3176,11 +3185,12 @@ async function startSleepingDelivery(
 async function freshSleepingTarget(
   homeDir: string,
   messageId: string,
+  mockArgs = "--close-cancels-prompt",
 ): Promise<{ cwd: string; id: string; operationLog: string }> {
   const cwd = path.join(homeDir, "workspace");
   const operationLog = path.join(homeDir, "codex-acp-ops.jsonl");
   await fs.mkdir(cwd, { recursive: true });
-  await writeCodexAgentConfig(homeDir, mockCodexCommand(operationLog, "--close-cancels-prompt"));
+  await writeCodexAgentConfig(homeDir, mockCodexCommand(operationLog, mockArgs));
   const created = await runCli(
     [
       "--cwd",
@@ -3254,6 +3264,29 @@ test("a CANCEL with no close still ends the delivery cancelled — only a close 
     );
     assert.equal(terminal.phase, "cancelled");
     assert.equal(terminal.error?.detailCode ?? "", "");
+  });
+});
+
+// brick 570d2570 — the WHOLE `sessions close` verb, final SIGTERM included, against a main turn the adapter does NOT
+// end on session/close (the mock's prompt keeps sleeping, as a real turn mid-tool can). The kill always beats the
+// runtime here, so before this brick the main delivery stayed `accepted` forever and acpx-ui read it done/delivered
+// (a147982f VERIFICATION, "HoD addition to AC7 (c)"). The owner's signal sweep now writes the close's code for it,
+// exactly once. The in-process rows for the orderings and the controls are in test/close-cut-main-turn.test.ts.
+test("sessions close during a mid-turn main delivery ends it failed/SESSION_CLOSED_TURN_CANCELLED, exactly once (570d2570)", async () => {
+  await withTempHome(async (homeDir) => {
+    const messageId = "57000000-1111-4222-8333-444455556666";
+    const { cwd, id } = await freshSleepingTarget(homeDir, messageId, "");
+    const closed = await runCli(
+      ["--cwd", cwd, "codex", "sessions", "close", "--session-id", id],
+      homeDir,
+      { env: { ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh" } },
+    );
+    assert.equal(closed.code, 0, closed.stderr);
+    // `sessions close` returns only after the owner has exited, so whatever the owner wrote is on disk.
+    const terminals = await deliveryTerminalsFor(homeDir, id, messageId);
+    assert.equal(terminals.length, 1, `terminals: ${JSON.stringify(terminals)}`);
+    assert.equal(terminals[0]?.phase, "failed");
+    assert.equal(terminals[0]?.error?.detailCode, "SESSION_CLOSED_TURN_CANCELLED");
   });
 });
 

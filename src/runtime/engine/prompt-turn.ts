@@ -34,7 +34,7 @@ type PromptTurnClient = {
  * substituted value. **The emptiness check is load-bearing, not defensive
  * tidiness — see the caller in `cli/session/runtime.ts`.**
  */
-function turnErrorFromMeta(meta: unknown): string | undefined {
+export function turnErrorFromMeta(meta: unknown): string | undefined {
   if (!meta || typeof meta !== "object") {
     return undefined;
   }
@@ -77,6 +77,40 @@ async function drainLateSessionUpdates(client: PromptTurnClient): Promise<void> 
     .catch(() => {});
 }
 
+type RpcTurnResult = {
+  stopReason: RunPromptResult["stopReason"];
+  source: "rpc";
+  turnError?: string;
+  steered?: boolean;
+};
+
+/**
+ * The success leg of {@link runPromptTurn}, after the `session/prompt` response arrived: report it to
+ * `onPromptResponse` FIRST (synchronously, brick 570d2570 C3), then drain late updates, then read the out-of-band
+ * flags. Its own function so `runPromptTurn` stays inside the complexity budget.
+ */
+async function settleRpcResponse(
+  params: {
+    client: PromptTurnClient;
+    onPromptResponse?: (response: {
+      stopReason: RunPromptResult["stopReason"];
+      _meta?: unknown;
+    }) => void;
+  },
+  response: { stopReason: RunPromptResult["stopReason"]; _meta?: unknown },
+): Promise<RpcTurnResult> {
+  params.onPromptResponse?.(response);
+  await drainLateSessionUpdates(params.client);
+  const turnError = turnErrorFromMeta(response._meta);
+  const steered = steeredFromMeta(response._meta);
+  return {
+    stopReason: response.stopReason,
+    source: "rpc",
+    ...(turnError !== undefined ? { turnError } : {}),
+    ...(steered ? { steered: true } : {}),
+  };
+}
+
 export async function runPromptTurn(params: {
   client: PromptTurnClient;
   sessionId: string;
@@ -88,6 +122,17 @@ export async function runPromptTurn(params: {
   /** brick a147982f — forwarded as `AcpPromptOptions.promptId` (`_claude/promptId`). */
   promptId?: string;
   onPromptStarted?: () => Promise<void> | void;
+  /**
+   * brick 570d2570 (C3) — called SYNCHRONOUSLY the moment the `session/prompt` response arrives, BEFORE the
+   * late-update drain below (which waits for >=1 s of quiet). The runtime records the turn's own end here, so a
+   * session close landing during the drain writes that turn's `done` instead of the close's code.
+   * ⚠️ Do not move this call below `drainLateSessionUpdates`: that is exactly the second in which the test-engineer
+   * measured a finished turn getting the close's code (570d2570 VERIFICATION C3).
+   */
+  onPromptResponse?: (response: {
+    stopReason: RunPromptResult["stopReason"];
+    _meta?: unknown;
+  }) => void;
 }): Promise<{
   stopReason: RunPromptResult["stopReason"];
   source: "rpc" | "session";
@@ -110,16 +155,7 @@ export async function runPromptTurn(params: {
       promptId: params.promptId,
     });
     await params.onPromptStarted?.();
-    const response = await withTimeout(promptPromise, params.timeoutMs);
-    await drainLateSessionUpdates(params.client);
-    const turnError = turnErrorFromMeta(response._meta);
-    const steered = steeredFromMeta(response._meta);
-    return {
-      stopReason: response.stopReason,
-      source: "rpc",
-      ...(turnError !== undefined ? { turnError } : {}),
-      ...(steered ? { steered: true } : {}),
-    };
+    return await settleRpcResponse(params, await withTimeout(promptPromise, params.timeoutMs));
   } catch (error) {
     if (!(error instanceof TimeoutError) || !params.promptMessageId) {
       throw error;

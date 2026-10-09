@@ -9,6 +9,8 @@ import {
   buildDeliveryEvent,
   type DeliveryEventError,
   type DeliveryPhase,
+  type DeliveryRecoveredBy,
+  type DeliveryStopReason,
 } from "../../session/delivery-events.js";
 import type { DepthProjection } from "../../session/depth-projection.js";
 import { sessionEventActivePath } from "../../session/event-log.js";
@@ -24,7 +26,10 @@ import {
   ownerExitDeliveryError,
   QUEUE_OWNER_CLOSING_DETAIL_CODE,
   QUEUE_OWNER_CLOSING_MESSAGE,
+  SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE,
+  SESSION_CLOSED_TURN_CANCELLED_MESSAGE,
 } from "./delivery-terminals.js";
+import { claimMainTurnOnSessionClose } from "./main-turn-delivery.js";
 import {
   parseQueueRequest,
   type QueueDrainedDelivery,
@@ -188,8 +193,10 @@ export function appendDeliveryStreamEventSync(
   task: Pick<QueueTask, "messageId" | "requestId">,
   phase: DeliveryPhase,
   error?: DeliveryEventError,
+  // brick 570d2570 — a turn's own `done` written from the owner's exit path carries its real stop reason.
+  terminal?: DeliveryLineTerminalFields,
 ): void {
-  const line = deliveryStreamLine(task, phase, error);
+  const line = deliveryStreamLine(task, phase, error, terminal);
   if (!line) {
     return;
   }
@@ -242,10 +249,17 @@ export function appendRefusedStreamEventSync(
 }
 
 // A task with no messageId has no delivery lifecycle to update, so it is skipped.
+type DeliveryLineTerminalFields = {
+  stopReason?: DeliveryStopReason;
+  steered?: boolean;
+  recoveredBy?: DeliveryRecoveredBy;
+};
+
 function deliveryStreamLine(
   task: Pick<QueueTask, "messageId" | "requestId">,
   phase: DeliveryPhase,
   error?: DeliveryEventError,
+  terminal: DeliveryLineTerminalFields = {},
 ): string | undefined {
   if (!task.messageId) {
     return undefined;
@@ -255,6 +269,7 @@ function deliveryStreamLine(
     requestId: task.requestId,
     phase,
     ...(error !== undefined ? { error } : {}),
+    ...terminal,
   });
   return `${JSON.stringify(event)}\n`;
 }
@@ -474,7 +489,50 @@ export class SessionQueueOwner {
    */
   terminalizeCustodyOnSignal(): number {
     const custody = [...this.pending.splice(0), ...(this.midTurnCustodySource?.() ?? [])];
-    return this.terminalizeCustody(custody, this.drainCause).length;
+    const undelivered = this.terminalizeCustody(custody, this.drainCause).length;
+    return undelivered + this.terminalizeMainTurnCutByClose();
+  }
+
+  /**
+   * brick 570d2570 — the running MAIN turn's delivery, cut by the session close. `sessions close` SIGTERMs this
+   * owner right after the ACP close cancels the turn, and the runtime writes that turn's terminal only at the end
+   * of its async path, so without this the delivery stays `accepted` forever and acpx-ui reads it `done`. The
+   * code is the one the runtime's own choke point writes for a close-cancelled turn: the message reached the
+   * agent, the close cut its turn, outcome unknown, do not resend. Nothing is re-delivered or resumed — the close
+   * stands (Daniel, 2026-10-09); only the record changes.
+   *
+   * ONLY when this owner was TOLD the session is closing (`drainCause`), for the reason `OwnerExitCause` gives:
+   * on `--no-drain`, or any other death, the owner witnessed no close and writes nothing here. One terminal per
+   * delivery: the claim in `main-turn-delivery.ts` is shared with the runtime's choke point, so a turn whose
+   * terminal the runtime already wrote (or is writing) — including a watchdog cut — gets nothing more. And a turn
+   * that ENDED ON ITS OWN before the kill (its response arrived with a stop the close did not cause) gets its
+   * OWN `done`, with its recorded stopReason (570d2570 C3) — never the close's code. SYNCHRONOUS and O(1), like every write on this exit path — it runs inside the
+   * 1.5 s grace before SIGKILL. Returns the terminals written (0 or 1).
+   */
+  private terminalizeMainTurnCutByClose(): number {
+    if (this.drainCause !== "session-close") {
+      return 0;
+    }
+    const claimed = claimMainTurnOnSessionClose(this.sessionId);
+    if (!claimed) {
+      return 0;
+    }
+    if (claimed.ownEnd) {
+      // The turn had already ANSWERED on its own (`ownEnd` is recorded the moment the response arrives); the
+      // close only cut the runtime's write. That turn's own `done`, with its stopReason — never the close's code.
+      appendDeliveryStreamEventSync(this.sessionId, claimed.context, "done", claimed.ownEnd.error, {
+        stopReason: claimed.ownEnd.stopReason,
+        ...(claimed.ownEnd.steered ? { steered: true } : {}),
+        ...(claimed.ownEnd.recoveredBy ? { recoveredBy: claimed.ownEnd.recoveredBy } : {}),
+      });
+      return 1;
+    }
+    appendDeliveryStreamEventSync(this.sessionId, claimed.context, "failed", {
+      code: 0,
+      message: SESSION_CLOSED_TURN_CANCELLED_MESSAGE,
+      detailCode: SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE,
+    });
+    return 1;
   }
 
   isDraining(): boolean {

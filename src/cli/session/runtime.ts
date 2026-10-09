@@ -58,7 +58,11 @@ import {
   applyConversation,
   applyLifecycleSnapshotToRecord,
 } from "../../runtime/engine/lifecycle.js";
-import { runPromptTurn, steeredFromMeta } from "../../runtime/engine/prompt-turn.js";
+import {
+  runPromptTurn,
+  steeredFromMeta,
+  turnErrorFromMeta,
+} from "../../runtime/engine/prompt-turn.js";
 import { connectAndLoadSession } from "../../runtime/engine/reconnect.js";
 import {
   mergeSessionOptions,
@@ -179,6 +183,12 @@ import {
   type QueueTask,
   waitMs,
 } from "../queue/ipc.js";
+import {
+  claimMainTurnDeliveryTerminal,
+  type OpenMainTurnDelivery,
+  registerOpenMainTurnDelivery,
+  unregisterOpenMainTurnDelivery,
+} from "../queue/main-turn-delivery.js";
 import { type QueueOwnerActiveSessionController } from "../queue/owner-turn-controller.js";
 import { isSessionCloseDrainActive } from "../queue/session-close-intent.js";
 import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
@@ -758,6 +768,22 @@ function recoveredDeliveryPhase(
     return undefined;
   }
   return reconciliation.stopReason === "cancelled" ? "cancelled" : "done";
+}
+
+// brick 570d2570 — a main turn ENDED ON ITS OWN when the terminal its own path will write is `done`: neither a
+// cancel nor a watchdog cut. The owner's close-cut sweep never gives such a turn the close's code, even when the
+// SIGTERM lands in the awaits between the prompt resolving and that terminal being written — the close did not
+// cause how it ended. The same reconciliation `appendMainTurnTerminals` applies, so the two cannot disagree.
+function mainTurnEndedOnItsOwn(
+  stopReason: RunPromptResult["stopReason"],
+  reconciliation: TurnWatchdogReconciliation,
+): boolean {
+  if (reconciliation.kind === "cut") {
+    return false;
+  }
+  return (
+    (recoveredDeliveryPhase(reconciliation) ?? deliveryPhaseForStopReason(stopReason)) === "done"
+  );
 }
 
 // Tier-2 turn-response timeout: retryable + a stable detailCode the UI (D-lane)
@@ -1932,6 +1958,18 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const conversation = cloneSessionConversation(record);
   let acpxState = cloneSessionAcpxState(record.acpx);
   const mainDeliveryContext = deliveryContextFor(options);
+  // brick 570d2570 — the main delivery as the owner's exit paths see it: registered once `accepted` is written,
+  // unregistered in the `finally`, and claimed by whichever of `appendDeliveryTerminal` and the owner's
+  // close-cut sweep writes its terminal first (`main-turn-delivery.ts`).
+  const openMainDelivery: OpenMainTurnDelivery | undefined = mainDeliveryContext
+    ? {
+        context: {
+          messageId: mainDeliveryContext.messageId,
+          requestId: mainDeliveryContext.requestId,
+        },
+        terminalClaimed: false,
+      }
+    : undefined;
 
   const recordPromptStart = async (
     prompt: PromptInput | string,
@@ -2223,22 +2261,50 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     }
   };
 
+  type DeliveryTerminalParams = {
+    stopReason?: DeliveryStopReason;
+    error?: DeliveryEventError;
+    /** brick ddd76838 — forward the adapter's steer-ack flag onto the terminal. */
+    steered?: boolean;
+    /** brick a147982f — the C1 watchdog recovered this terminal (forensic). */
+    recoveredBy?: DeliveryRecoveredBy;
+  };
+
   const appendDeliveryTerminal = async (
     context: DeliveryContext | undefined,
     phase: Exclude<DeliveryPhase, "accepted">,
-    params: {
-      stopReason?: DeliveryStopReason;
-      error?: DeliveryEventError;
-      /** brick ddd76838 — forward the adapter's steer-ack flag onto the terminal. */
-      steered?: boolean;
-      /** brick a147982f — the C1 watchdog recovered this terminal (forensic). */
-      recoveredBy?: DeliveryRecoveredBy;
-    } = {},
+    params: DeliveryTerminalParams = {},
+  ): Promise<void> => {
+    // brick 570d2570 — the main delivery's terminal has a second writer: the owner's exit sweep for a turn the
+    // close cut (`ipc-server.ts` `terminalizeMainTurnCutByClose`). Claim it SYNCHRONOUSLY, before any await; if
+    // the sweep claimed first, its terminal is the one and this writes nothing — so a late `done`, `cancelled` or
+    // watchdog cut can never become a second terminal. A write that throws releases the claim, so a fallback
+    // terminal (the catch paths below) can still land, as it could before.
+    const mainClaim =
+      context !== undefined && context === mainDeliveryContext ? openMainDelivery : undefined;
+    if (mainClaim && !claimMainTurnDeliveryTerminal(mainClaim)) {
+      return;
+    }
+    try {
+      await writeDeliveryTerminal(context, phase, params);
+    } catch (error) {
+      if (mainClaim) {
+        mainClaim.terminalClaimed = false;
+      }
+      throw error;
+    }
+  };
+
+  const writeDeliveryTerminal = async (
+    context: DeliveryContext | undefined,
+    phase: Exclude<DeliveryPhase, "accepted">,
+    params: DeliveryTerminalParams,
   ): Promise<void> => {
     // 71fdcaf2 (S5.4) — THE ONE CHOKE POINT for every terminal this runtime writes (main turn, injected turn,
-    // absorbed sweep). A turn CANCELLED while this owner is draining for a session close is the close's doing,
-    // not a Stop: the message reached the agent and never settled, so it is `failed` with the outcome-unknown
-    // code acpx-ui notifies the sender on — never a code-less `cancelled`. A cancel with NO close stays one.
+    // absorbed sweep), reached only through `appendDeliveryTerminal`. A turn CANCELLED while this owner is draining
+    // for a session close is the close's doing, not a Stop: the message reached the agent and never settled, so it
+    // is `failed` with the outcome-unknown code acpx-ui notifies the sender on — never a code-less `cancelled`. A
+    // cancel with NO close stays one.
     // brick a147982f — a turn the C1 watchdog's cancel cut is a cancel too: during a close drain the close wins.
     const watchdogCut =
       phase === "failed" && params.error?.detailCode === TURN_WATCHDOG_CANCELLED_DETAIL_CODE;
@@ -3380,6 +3446,41 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     injectedDeliveries.length = 0;
   };
 
+  // brick 570d2570 — what the owner's close sweep writes if it lands before this turn's own terminal: the turn's
+  // `done` (with the stopReason, steer flag, watchdog recovery and turn-error note the runtime's own terminal would
+  // carry) when it ended on its own, else nothing recorded (the close's code). Called at response time and again
+  // after the late-update drain; `mainTurnEndedOnItsOwn` uses the reconciliation `appendMainTurnTerminals` applies.
+  const recordMainTurnOwnEnd = (answer: {
+    stopReason: RunPromptResult["stopReason"];
+    turnError?: string;
+    steered?: boolean;
+  }): void => {
+    if (!openMainDelivery) {
+      return;
+    }
+    const reconciliation = reconcileStopReasonWithMarker(
+      answer.stopReason,
+      endMarkerReasonThisTurn,
+      {
+        watchdogCancelSent,
+        updatesAfterArm,
+      },
+    );
+    if (!mainTurnEndedOnItsOwn(answer.stopReason, reconciliation)) {
+      delete openMainDelivery.ownEnd;
+      return;
+    }
+    const recovered = reconciliation.kind === "recovered";
+    openMainDelivery.ownEnd = {
+      stopReason: recovered ? reconciliation.stopReason : toDeliveryStopReason(answer.stopReason),
+      ...(answer.steered ? { steered: true } : {}),
+      ...(recovered ? { recoveredBy: "turn-watchdog" as const } : {}),
+      ...(answer.turnError
+        ? { error: { code: 0, message: answer.turnError, detailCode: "" } }
+        : {}),
+    };
+  };
+
   const runPromptAttempt = async (sessionId: string, attempt: number) => {
     const promptStartedAt = Date.now();
     // Fresh watchdog state for this attempt (a retry re-arms cleanly, under a NEW
@@ -3394,6 +3495,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       turnWatchdogArmingMode === "claude-prompt-lifecycle" ? crypto.randomUUID() : undefined;
     const promptId = guardedPromptIdThisTurn;
     await appendDeliveryEvent(mainDeliveryContext, "accepted");
+    if (openMainDelivery) {
+      // brick 570d2570 — from here a session close that cuts this turn can terminalize it from the owner's exit.
+      registerOpenMainTurnDelivery(record.acpxRecordId, openMainDelivery);
+    }
     // The seat's level as of this turn, and the detector visible to the turn-context
     // channel while this turn's prompt is composed (brick 4f3fa88c).
     await contextAlarm.refreshLevel();
@@ -3409,6 +3514,15 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         messageId: options.messageId,
         ...(promptId !== undefined ? { promptId } : {}),
         onPromptStarted: buildPromptStartedHook(sessionId, attempt),
+        // brick 570d2570 (C3) — the turn's own end, recorded the moment the response arrives (before the drain).
+        onPromptResponse: (answer) => {
+          const turnError = turnErrorFromMeta(answer._meta);
+          recordMainTurnOwnEnd({
+            stopReason: answer.stopReason,
+            ...(turnError !== undefined ? { turnError } : {}),
+            ...(steeredFromMeta(answer._meta) ? { steered: true } : {}),
+          });
+        },
       });
       if (!turnWatchdogEnabled) {
         return await turnPromise;
@@ -3467,6 +3581,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         watchdog.dispose();
       }
     }).finally(unregisterContextAlarm);
+    // brick 570d2570 — re-recorded after the late-update drain with the reconciliation `appendMainTurnTerminals`
+    // will use, so a close in the remaining gap writes exactly the terminal this turn would have written.
+    recordMainTurnOwnEnd(response);
     // The primary ACP prompt resolved. That may be a real turn end OR the
     // adapter handing the turn over to an injected prompt, so keep injecting
     // while any injected prompt is still unsettled; stop only once they are
@@ -3772,6 +3889,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     throw annotatedError;
   } finally {
     unregisterAbsorbedDeliveries(record.acpxRecordId, absorbedInjectedDeliveries);
+    if (openMainDelivery) {
+      unregisterOpenMainTurnDelivery(record.acpxRecordId, openMainDelivery);
+    }
     if (options.verbose) {
       process.stderr.write(`[acpx] ${formatPerfMetric("prompt.total", stopTotalTimer())}\n`);
     } else {
