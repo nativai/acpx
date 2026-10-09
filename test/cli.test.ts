@@ -7259,12 +7259,11 @@ test("sessions copy --prompt queues a non-blocking prompt handoff into the copie
         "sleep 5000",
       ],
       homeDir,
-      // Keep this below the injected prompt sleep so the assertion still proves
-      // copy returns without waiting for the handoff prompt to finish, while
-      // leaving enough headroom for full-suite process startup contention.
-      // Mock sleep is 5 s; 4 s gives ample startup margin on a loaded box while
-      // staying under the ceiling so the non-blocking guarantee is measurable.
-      { timeoutMs: 4_000 },
+      // Budget for a slow owner start only: copy waits up to the 30 s queue-owner
+      // startup budget (QUEUE_OWNER_STARTUP_BUDGET_MS, A1) for the owner to accept
+      // the handoff, so this must sit above it. It is NOT the non-blocking proof —
+      // that is the state assertion below, which holds however slow the start was.
+      { timeoutMs: 45_000 },
     );
     assert.equal(result.code, 0, result.stderr);
     const payload = JSON.parse(result.stdout.trim()) as {
@@ -7284,7 +7283,7 @@ test("sessions copy --prompt queues a non-blocking prompt handoff into the copie
     assert.equal(stored.forked_from_session_id, "source-prompt-handoff");
     assert.equal(await seatNameOfRecord(homeDir, childId), "handoff-child");
 
-    await waitFor(async () => {
+    const readPreviews = async (): Promise<unknown[] | null> => {
       const history = await runCli(
         ["--cwd", cwd, "--format", "json", "codex", "sessions", "read", "--session-id", childId],
         homeDir,
@@ -7295,7 +7294,22 @@ test("sessions copy --prompt queues a non-blocking prompt handoff into the copie
       const read = JSON.parse(history.stdout.trim()) as {
         entries?: Array<{ textPreview?: unknown }>;
       };
-      const previews = read.entries?.map((entry) => entry.textPreview);
+      return read.entries?.map((entry) => entry.textPreview) ?? [];
+    };
+
+    // Non-blocking, proved by STATE rather than wall-clock: copy returns at the
+    // owner's enqueue ack and the 5 s mock prompt starts only once it is accepted,
+    // so the reply cannot exist yet. A read that fails (non-zero, e.g. caught
+    // mid-write of the record) is inconclusive, never a pass — retry until it reads.
+    const immediate = await waitFor(readPreviews, 10_000);
+    assert.equal(
+      immediate.includes("slept 5000ms"),
+      false,
+      "copy --prompt returned only after the handoff prompt finished (blocking)",
+    );
+
+    await waitFor(async () => {
+      const previews = await readPreviews();
       return previews?.includes("slept 5000ms") ? previews : null;
     }, 20_000);
 
