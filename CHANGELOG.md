@@ -183,6 +183,10 @@ Repo: https://github.com/openclaw/acpx
   `sessions new --from-template` also honours `--parent-seat`, which it
   silently dropped. (brick b40a9a5d)
 
+- Agent environment: remove inherited descriptive `CLAUDE_EFFORT` from non-Claude
+  spawns, preserving recognized SDK Claude and legacy PTY metadata, active effort
+  input, and existing Codex environment handling.
+
 ## 2026.5.23 (v0.10.0)
 
 ### Changes
