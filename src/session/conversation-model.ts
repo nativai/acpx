@@ -1346,20 +1346,33 @@ function rememberContextWindow(acpx: SessionAcpxState, update: UsageUpdate): voi
  * as 0, never replaced by a remembered or guessed one) and the compaction point the
  * adapter named in `_meta.contextCompaction.atTokens`. Whole-value overwrite: a point the
  * adapter stopped naming (a model switch) is not carried forward.
+ *
+ * Brick 4a6716b5: a report whose `used` exceeds a KNOWN window is not a fill — no harness
+ * holds more than its window — so it is ignored and the previous reading stands.
  */
 function rememberContextFill(acpx: SessionAcpxState, update: UsageUpdate): void {
   const used = (update as { used?: unknown }).used;
   if (typeof used !== "number" || !Number.isFinite(used) || used < 0) {
     return;
   }
-  const size = (update as { size?: unknown }).size;
-  const window = typeof size === "number" && Number.isFinite(size) && size > 0 ? size : 0;
+  const window = reportedWindow(update);
+  // ⚠️ DROPPED, NOT CLAMPED: clamped to the window it would still ring the alarm at 100 %
+  // on a number we know is wrong (codex-acp's 1,104,235 / 828,400 rang a false handover).
+  if (window > 0 && used > window) {
+    return;
+  }
   const compactAt = readCompactionAtTokens((update as { _meta?: unknown })._meta);
   acpx.context_fill = {
     used_tokens: used,
     window_tokens: window,
     ...(compactAt === undefined ? {} : { compaction_tokens: compactAt }),
   };
+}
+
+/** The window the report names; `0` = unknown (absent, non-finite or non-positive). */
+function reportedWindow(update: UsageUpdate): number {
+  const size = (update as { size?: unknown }).size;
+  return typeof size === "number" && Number.isFinite(size) && size > 0 ? size : 0;
 }
 
 /** `_meta.contextCompaction.atTokens` — the one key every adapter names it under. */

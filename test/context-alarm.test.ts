@@ -38,7 +38,7 @@ import {
 } from "../src/session/context-alarm.js";
 import { recordSessionUpdate } from "../src/session/conversation-model.js";
 import { createSessionConversation } from "../src/session/conversation-model.js";
-import { sessionBaseDir } from "../src/session/persistence/repository.js";
+import { resolveSessionRecord, sessionBaseDir } from "../src/session/persistence/repository.js";
 import {
   mintSeatRow,
   parseSeatStore,
@@ -214,6 +214,27 @@ test("the fill is remembered as REPORTED: size 0 stays 0, and a point the adapte
   assert.equal(acpx?.context_window_size, undefined);
 });
 
+test("brick 4a6716b5 — a report past a KNOWN window is not a fill: the previous reading stands; == window is one; unknown window unchanged", () => {
+  const conversation = createSessionConversation("2026-10-09T00:00:00.000Z");
+  // The very first report impossible ⇒ nothing stored.
+  let acpx = recordSessionUpdate(conversation, undefined, usageUpdate(828_401, 828_400, 784_800));
+  assert.equal(acpx?.context_fill, undefined);
+  acpx = recordSessionUpdate(conversation, acpx, usageUpdate(217_168, 828_400, 784_800));
+  // One token past the window, after a plausible reading ⇒ that reading stands.
+  acpx = recordSessionUpdate(conversation, acpx, usageUpdate(828_401, 828_400, 784_800));
+  assert.deepEqual(acpx?.context_fill, {
+    used_tokens: 217_168,
+    window_tokens: 828_400,
+    compaction_tokens: 784_800,
+  });
+  // The boundary: exactly the window is a reading.
+  acpx = recordSessionUpdate(conversation, acpx, usageUpdate(828_400, 828_400, 784_800));
+  assert.equal(acpx?.context_fill?.used_tokens, 828_400);
+  // Window unknown (0) ⇒ stored as reported, window 0.
+  acpx = recordSessionUpdate(conversation, acpx, usageUpdate(5_000_000, 0));
+  assert.deepEqual(acpx?.context_fill, { used_tokens: 5_000_000, window_tokens: 0 });
+});
+
 // ─── A · the level lives on the SEAT ─────────────────────────────────────────
 
 const SEAT = "44444444-4444-4444-8444-444444444444";
@@ -320,7 +341,10 @@ function promptText(input: PromptInput | string): string {
     : input.map((block) => (block.type === "text" ? block.text : "")).join("");
 }
 
-function alarmRig(params: { usages: number[]; seatLevel?: number }) {
+/** A usage report: `used` on the 1M window, or an explicit `[used, size]`. */
+type RigUsage = number | readonly [used: number, size: number];
+
+function alarmRig(params: { usages: RigUsage[]; seatLevel?: number }) {
   const injected: string[] = [];
   const turnTops: (string | undefined)[] = [];
   let onSessionUpdate: SessionUpdateHandler | undefined;
@@ -361,8 +385,9 @@ function alarmRig(params: { usages: number[]; seatLevel?: number }) {
         ),
       );
       if (mainTurns === 1) {
-        for (const used of params.usages) {
-          onSessionUpdate?.(usageUpdate(used, 1_000_000, 967_000));
+        for (const usage of params.usages) {
+          const [used, size] = typeof usage === "number" ? [usage, 1_000_000] : usage;
+          onSessionUpdate?.(usageUpdate(used, size, 967_000));
           await new Promise((resolve) => setTimeout(resolve, 20));
         }
         await new Promise((resolve) => setTimeout(resolve, 50));
@@ -387,7 +412,12 @@ function task(requestId: string, text: string): QueueTask {
   };
 }
 
-async function runTwoTurns(params: { usages: number[]; seatLevel?: number }) {
+async function runTwoTurns(params: {
+  usages: RigUsage[];
+  seatLevel?: number;
+  /** Also read back what the turns persisted: the record's fill and `acpx context`. */
+  readBack?: boolean;
+}) {
   return await withTempHome("acpx-context-alarm-runtime-", async (homeDir) => {
     const record: SessionRecord = {
       ...makeSessionRecord({
@@ -421,7 +451,12 @@ async function runTwoTurns(params: { usages: number[]; seatLevel?: number }) {
     await runQueuedTask(record.acpxRecordId, task("turn-1", "work"), options);
     await runQueuedTask(record.acpxRecordId, task("turn-2", "a parent's message"), options);
     void handler;
-    return rig;
+    if (!params.readBack) {
+      return { ...rig, storedFill: undefined, contextCli: undefined };
+    }
+    const stored = await resolveSessionRecord(record.acpxRecordId);
+    const contextCli = await runCli(["context", "--session-id", record.acpxRecordId], homeDir);
+    return { ...rig, storedFill: stored.acpx?.context_fill, contextCli };
   });
 }
 
@@ -449,6 +484,56 @@ test("the seat's explicit level is what rings: 75 % crosses at 750,000", async (
     rig.injected[0] ?? "",
     /760,000 \/ 1,000,000 tokens \(76\.0 %\) is past your 75 % alarm/,
   );
+});
+
+// ─── brick 4a6716b5 · a report past a known window is not a fill (real turn) ─
+
+test("4a6716b5 — window + 1 after a plausible reading: no notice, no turn-start line, the plausible fill stays on the record and in `acpx context`", async () => {
+  const rig = await runTwoTurns({ usages: [850_000, 1_000_001], readBack: true });
+  assert.deepEqual(rig.injected, []);
+  assert.deepEqual(rig.turnTops, [undefined, undefined]);
+  assert.deepEqual(rig.storedFill, {
+    used_tokens: 850_000,
+    window_tokens: 1_000_000,
+    compaction_tokens: 967_000,
+  });
+  assert.equal(rig.contextCli?.code, 0, rig.contextCli?.stderr);
+  assert.match(rig.contextCli?.stdout ?? "", /^context: 850,000 \/ 1,000,000 tokens \(85\.0 %\)/);
+});
+
+test("4a6716b5 — window + 1 as the very first report: nothing stored, no notice", async () => {
+  const rig = await runTwoTurns({ usages: [1_000_001], readBack: true });
+  assert.deepEqual(rig.injected, []);
+  assert.deepEqual(rig.turnTops, [undefined, undefined]);
+  assert.equal(rig.storedFill, undefined);
+});
+
+test("4a6716b5 — an impossible report after a real crossing: one notice, and the next turn opens with the REAL numbers", async () => {
+  const rig = await runTwoTurns({ usages: [905_000, 1_200_000] });
+  assert.equal(rig.injected.length, 1);
+  assert.match(rig.injected[0] ?? "", /Context 905,000 \/ 1,000,000/);
+  assert.match(rig.turnTops[1] ?? "", /⟦CONTEXT-ALARM⟧ Context 905,000 \/ 1,000,000/);
+});
+
+test("4a6716b5 — used == window is a reading: stored, and it rings past the level", async () => {
+  const rig = await runTwoTurns({ usages: [1_000_000], readBack: true });
+  assert.equal(rig.injected.length, 1);
+  assert.match(
+    rig.injected[0] ?? "",
+    /^⟦CONTEXT-ALARM⟧ Context 1,000,000 \/ 1,000,000 tokens \(100\.0 %\)/,
+  );
+  assert.equal(rig.storedFill?.used_tokens, 1_000_000);
+});
+
+test("4a6716b5 — window unknown (0), large used: stored as reported with window 0, no alarm (unchanged)", async () => {
+  const rig = await runTwoTurns({ usages: [[5_000_000, 0]], readBack: true });
+  assert.deepEqual(rig.injected, []);
+  assert.deepEqual(rig.turnTops, [undefined, undefined]);
+  assert.deepEqual(rig.storedFill, {
+    used_tokens: 5_000_000,
+    window_tokens: 0,
+    compaction_tokens: 967_000,
+  });
 });
 
 // ─── D · `acpx context`, through the compiled CLI ────────────────────────────
