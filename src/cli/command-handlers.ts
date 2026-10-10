@@ -56,7 +56,7 @@ import {
   repairAccountSeamRecords,
 } from "../session/account-seam-repair.js";
 import {
-  handoverBelowAlarmWarning,
+  handoverBelowAlarmNote,
   readSeatContextAlarmLevel,
 } from "../session/context-alarm-detector.js";
 import { exportSession } from "../session/export.js";
@@ -4836,7 +4836,6 @@ export async function handleSessionsHandover(
       process.stderr.write(`${warning}\n`);
     }
     const caller = await resolveHandoverCaller(flags.sessionId, handover.HandoverRefusalError);
-    await warnIfHandoverBelowAlarm(caller);
     const { created } = await createSessionFromNewFlags(
       explicitAgentName,
       { from: caller.acpxRecordId },
@@ -4859,6 +4858,7 @@ export async function handleSessionsHandover(
       process.exitCode = 1;
     }
     printHandoverResult(format, { turn, outcome, brief, predecessorId: caller.acpxRecordId });
+    await noteIfHandoverBelowAlarm(caller);
   } catch (error) {
     if (
       error instanceof handover.HandoverRefusalError ||
@@ -4874,14 +4874,14 @@ export async function handleSessionsHandover(
   }
 }
 
-/** Brick bbe2bc47 A6: a handover from far below the alarm warns, and proceeds. */
-async function warnIfHandoverBelowAlarm(caller: SessionRecord): Promise<void> {
-  const warning = handoverBelowAlarmWarning(
+/** Brick bbe2bc47 A6: the last thing a handover from far below the alarm prints. */
+async function noteIfHandoverBelowAlarm(caller: SessionRecord): Promise<void> {
+  const note = handoverBelowAlarmNote(
     caller.acpx?.context_fill,
     await readSeatContextAlarmLevel(sessionBaseDir(), caller.seatId),
   );
-  if (warning) {
-    process.stderr.write(`${warning}\n`);
+  if (note) {
+    process.stderr.write(`${note}\n`);
   }
 }
 

@@ -24,7 +24,7 @@ import { runQueuedTask } from "../src/cli/session/runtime.js";
 import { type PromptInput, textPrompt } from "../src/prompt-content.js";
 import {
   ContextAlarmDetector,
-  handoverBelowAlarmWarning,
+  handoverBelowAlarmNote,
   registerContextAlarmDetector,
 } from "../src/session/context-alarm-detector.js";
 import {
@@ -417,7 +417,7 @@ test("A6 — codex at its recomputed compaction point 559,594: the default alarm
   assert.equal(explicit.atTokens, 745_560);
 });
 
-test("A6 handover backstop — the stored fill below half the alarm point warns; at/above it, no fill, alarm off, or an impossible fill: silent", () => {
+test("A6 handover backstop — the stored fill below half the alarm point yields the note; at/above it, no fill, alarm off, or an impossible fill: silent", () => {
   const stored = (used: number, window = 828_400): SessionContextFill => ({
     used_tokens: used,
     window_tokens: window,
@@ -425,18 +425,18 @@ test("A6 handover backstop — the stored fill below half the alarm point warns;
   });
   // Default alarm 744,800 → half = 372,400.
   assert.match(
-    handoverBelowAlarmWarning(stored(97_088), undefined) ?? "",
-    /^handover: your context is 97,088 \/ 828,400 tokens, far below your alarm .* Proceeding anyway\.$/,
+    handoverBelowAlarmNote(stored(97_088), undefined) ?? "",
+    /^note: your context is 97,088 \/ 828,400 tokens, far below your alarm — it was probably compacted after the alarm, so this handover was not needed\. It has gone ahead: finish it with the close line above, and do not keep working in this session beside your successor\.$/,
   );
-  assert.equal(handoverBelowAlarmWarning(stored(372_400), undefined), undefined, "exactly half");
-  assert.equal(handoverBelowAlarmWarning(stored(700_000), undefined), undefined);
-  assert.equal(handoverBelowAlarmWarning(undefined, undefined), undefined);
-  assert.equal(handoverBelowAlarmWarning(stored(97_088), 0), undefined, "alarm off");
-  assert.equal(handoverBelowAlarmWarning(stored(0, 0), undefined), undefined, "window unknown");
-  assert.equal(handoverBelowAlarmWarning(stored(1_104_235), undefined), undefined, "impossible");
+  assert.equal(handoverBelowAlarmNote(stored(372_400), undefined), undefined, "exactly half");
+  assert.equal(handoverBelowAlarmNote(stored(700_000), undefined), undefined);
+  assert.equal(handoverBelowAlarmNote(undefined, undefined), undefined);
+  assert.equal(handoverBelowAlarmNote(stored(97_088), 0), undefined, "alarm off");
+  assert.equal(handoverBelowAlarmNote(stored(0, 0), undefined), undefined, "window unknown");
+  assert.equal(handoverBelowAlarmNote(stored(1_104_235), undefined), undefined, "impossible");
   // The seat's explicit level decides: 20 % of 828,400 = 165,680 → half 82,840.
-  assert.equal(handoverBelowAlarmWarning(stored(97_088), 20), undefined);
-  assert.notEqual(handoverBelowAlarmWarning(stored(80_000), 20), undefined);
+  assert.equal(handoverBelowAlarmNote(stored(97_088), 20), undefined);
+  assert.notEqual(handoverBelowAlarmNote(stored(80_000), 20), undefined);
 });
 
 // ─── the fill as reported, on the record ─────────────────────────────────────

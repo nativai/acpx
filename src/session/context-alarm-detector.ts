@@ -68,10 +68,12 @@ export async function readSeatContextAlarmLevel(
 
 /**
  * A6 backstop: `acpx sessions handover` from a context that is already far below the seat's
- * alarm — compacted after the alarm — prints this one line and proceeds (never a refusal: a
- * handover is a legitimate choice, and the stored fill can be stale).
+ * alarm — compacted after the alarm — adds this note and still hands over (never a refusal: a
+ * handover is a legitimate choice, and the stored fill can be stale). It is printed LAST, after
+ * the successor and the close line: the one risk it guards is an agent that reads "not needed"
+ * and keeps working beside the successor it has just created — two live agents on one seat.
  */
-export function handoverBelowAlarmWarning(
+export function handoverBelowAlarmNote(
   stored: SessionContextFill | undefined,
   seatLevel: number | undefined,
 ): string | undefined {
@@ -84,9 +86,10 @@ export function handoverBelowAlarmWarning(
     return undefined;
   }
   return (
-    `handover: your context is ${fill.used.toLocaleString("en-US")} / ` +
-    `${fill.window.toLocaleString("en-US")} tokens, far below your alarm — if it was compacted after the ` +
-    `alarm, a handover is not needed: continuing is the default. Proceeding anyway.`
+    `note: your context is ${fill.used.toLocaleString("en-US")} / ` +
+    `${fill.window.toLocaleString("en-US")} tokens, far below your alarm — it was probably ` +
+    `compacted after the alarm, so this handover was not needed. It has gone ahead: finish it ` +
+    `with the close line above, and do not keep working in this session beside your successor.`
   );
 }
 

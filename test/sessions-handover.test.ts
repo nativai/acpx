@@ -422,7 +422,8 @@ test("F8 (TE D3) a RETIRED holder cannot hand over: NOT_HOLDER names the live ho
 });
 
 // Brick bbe2bc47 A6 — the backstop: a handover from a context that Codex already compacted
-// after the alarm prints ONE line and proceeds. It never refuses.
+// after the alarm still goes ahead, and ends with ONE note that says so and says to finish it.
+// It never refuses, and it is the LAST thing printed — after the successor and the close line.
 async function storeContextFill(
   homeDir: string,
   id: string,
@@ -434,9 +435,49 @@ async function storeContextFill(
   await fs.writeFile(file, `${JSON.stringify(record, null, 2)}\n`, "utf8");
 }
 
-test("F9 (bbe2bc47 A6) a handover from far below the alarm warns once and still hands over; near the alarm, or with no fill on record, it is silent", async () => {
+/** The text handover with stdout and stderr on ONE file description: what the agent reads, in order. */
+async function handoverMergedStreams(
+  homeDir: string,
+  callerId: string,
+  origin: string,
+): Promise<{ code: number | null; output: string }> {
+  const logPath = path.join(homeDir, `handover-${callerId}.log`);
+  const log = await fs.open(logPath, "w");
+  try {
+    const code = await new Promise<number | null>((resolve) => {
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        HOME: homeDir,
+        ACPX_SESSION_URL: url(callerId),
+        ACPX_UI_INTERNAL_URL: origin,
+        ACPX_UI_BASE_URL: "https://atrium.example.test",
+      };
+      delete env.ACPX_STATE_HOME;
+      const child = spawn(
+        process.execPath,
+        [
+          CLI_PATH,
+          "--approve-all",
+          "claude",
+          "sessions",
+          "handover",
+          "--brief",
+          path.join(homeDir, "HANDOVER.md"),
+        ],
+        { env, stdio: ["ignore", log.fd, log.fd] },
+      );
+      child.on("close", resolve);
+    });
+    return { code, output: await fs.readFile(logPath, "utf8") };
+  } finally {
+    await log.close();
+  }
+}
+
+test("F9 (bbe2bc47 A6) a handover from far below the alarm still hands over and ENDS with the note: probably not needed, gone ahead, finish it with the close line; near the alarm, or with no fill, it is silent", async () => {
   await withTempHome("acpx-handover-compacted-", async (homeDir) => {
     const cwd = await rig(homeDir);
+    await writeBrief(homeDir);
     const compacted = await newHolder(homeDir, cwd);
     await storeContextFill(homeDir, compacted, {
       used_tokens: 97_088,
@@ -444,17 +485,24 @@ test("F9 (bbe2bc47 A6) a handover from far below the alarm warns once and still 
       compaction_tokens: 784_800,
     });
     await withAcpxUi(async (origin, posted) => {
-      const res = await handover(homeDir, compacted, origin, [
-        "--brief",
-        await writeBrief(homeDir),
-      ]);
-      assert.equal(res.code, 0, res.stderr);
-      assert.match(
-        res.stderr,
-        /handover: your context is 97,088 \/ 828,400 tokens, far below your alarm .* Proceeding anyway\./,
-      );
+      const { code, output } = await handoverMergedStreams(homeDir, compacted, origin);
+      assert.equal(code, 0, output);
       assert.equal(posted.length, 1, "the handover was delivered all the same");
       assert.equal((await readStored(homeDir, compacted)).holder_active, false);
+      const lines = output.trimEnd().split("\n");
+      const closeAt = lines.findIndex((l) =>
+        l.includes(`acpx sessions close --session-id ${compacted}`),
+      );
+      assert.ok(closeAt >= 0, `the close line is printed:\n${output}`);
+      const note = lines.at(-1) ?? "";
+      assert.equal(
+        note,
+        "note: your context is 97,088 / 828,400 tokens, far below your alarm — it was probably " +
+          "compacted after the alarm, so this handover was not needed. It has gone ahead: finish it " +
+          "with the close line above, and do not keep working in this session beside your successor.",
+      );
+      assert.ok(lines.length - 1 > closeAt, "the note comes AFTER the close line");
+      assert.equal(lines.filter((l) => l.startsWith("note: your context")).length, 1, "once");
     });
 
     // CONTROLS: past half the alarm point (744,800 / 2 = 372,400) and no fill at all: silent.
@@ -467,9 +515,9 @@ test("F9 (bbe2bc47 A6) a handover from far below the alarm warns once and still 
     const fresh = await newHolder(homeDir, cwd);
     await withAcpxUi(async (origin) => {
       for (const id of [busy, fresh]) {
-        const res = await handover(homeDir, id, origin, ["--brief", await writeBrief(homeDir)]);
-        assert.equal(res.code, 0, res.stderr);
-        assert.doesNotMatch(res.stderr, /far below your alarm/);
+        const { code, output } = await handoverMergedStreams(homeDir, id, origin);
+        assert.equal(code, 0, output);
+        assert.doesNotMatch(output, /far below your alarm/);
       }
     });
   });
