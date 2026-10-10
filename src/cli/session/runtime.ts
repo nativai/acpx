@@ -222,6 +222,9 @@ type RunSessionPromptOptions = Omit<
   // re-entry — the failover loop is already selecting reactively; a second proactive
   // switch could fight its just-picked sibling. Set only on the retry runTurn closure.
   skipProactiveSelection?: boolean;
+  // brick://3356183e: background tasks live on the queue owner's adapter. Proactive
+  // selection defers a switch while it is non-zero (the switch would kill them).
+  liveBackgroundTaskCount?: () => number;
   onClientAvailable?: (controller: ActiveSessionController) => void;
   onClientClosed?: () => void;
   onPromptActive?: () => Promise<void> | void;
@@ -1378,6 +1381,7 @@ function buildQueuedTaskRunOptions(
     // extracted helper so concurrent in-turn prompts still reach runSessionPrompt.
     onAcpMessage: options.onAcpMessage,
     setMidTurnHandler: options.setMidTurnHandler,
+    liveBackgroundTaskCount: options.liveBackgroundTaskCount,
     client: options.sharedClient,
   };
 }
@@ -1666,8 +1670,17 @@ export async function runQueuedTask(
     // Failover: signaled after a turn auto-switched the session to a new
     // profile/account. The owner uses it to recycle its stale shared client so
     // subsequent turns cold-spawn on the new transcript anchor.
-    onFailoverSwitched?: (newProfileId: string) => void;
+    onFailoverSwitched?: (newProfileId: string, trigger: AccountSwitchTrigger) => void;
     onLockBlocked?: () => void;
+    // brick://3356183e: a switch decided BEFORE the turn (lock or selection) asks the
+    // owner to replace its shared client with one built from the switched record, and
+    // the turn runs on it: no throwaway client closed at turn end, no owner recycle.
+    // `undefined` back (or no hook) falls back to a fresh client + recycle.
+    replaceSharedClient?: (
+      newProfileId: string,
+      trigger: AccountSwitchTrigger,
+    ) => Promise<AcpClient | undefined>;
+    liveBackgroundTaskCount?: () => number;
   },
 ): Promise<void> {
   const outputFormatter = task.waitForCompletion
@@ -1681,7 +1694,7 @@ export async function runQueuedTask(
       const lockPolicy = await applyQueuedTaskSubscriptionLockPolicy(sessionRecordId, options);
       result = await runSessionPrompt({
         ...buildQueuedTaskRunOptions(sessionRecordId, task, options, outputFormatter, turnStart),
-        ...(lockPolicy.useFreshClient ? { client: undefined } : {}),
+        ...clientForQueuedTurn(lockPolicy),
       });
     } catch (error) {
       result = await runQueuedTaskFailover(
@@ -1729,18 +1742,43 @@ async function persistPreSubmitTerminalError(record: SessionRecord, error: unkno
   await mirrorTerminalTurnErrorToMessages(record, error).catch(() => {});
 }
 
-function queuedSwitchResult(
+export type AccountSwitchTrigger = "lock" | "selection" | "failover";
+
+type QueuedTaskClientPolicy = { useFreshClient: boolean; replacementClient?: AcpClient };
+
+// A switch before the turn means the turn must run on a client built for the new
+// subscription's config dir. brick://3356183e: the owner REPLACES its shared client
+// with one, so the adapter (and the background tasks the turn starts) survives turn
+// end. Only without that replacement does the turn take a throwaway client, which
+// runSessionPrompt closes at turn end, and the owner recycles after it.
+async function queuedSwitchResult(
   profile: string,
+  trigger: AccountSwitchTrigger,
   options: QueuedTaskRuntimeOptions,
-): { useFreshClient: true } {
-  options.onFailoverSwitched?.(profile);
+): Promise<QueuedTaskClientPolicy> {
+  const replacementClient = await options.replaceSharedClient?.(profile, trigger);
+  if (replacementClient) {
+    return { useFreshClient: false, replacementClient };
+  }
+  options.onFailoverSwitched?.(profile, trigger);
   return { useFreshClient: true };
+}
+
+// The replacement is the owner's NEW shared client; the old one it replaced is
+// already closed, so there is no previous turn left to end on it.
+function clientForQueuedTurn(
+  policy: QueuedTaskClientPolicy,
+): Pick<RunSessionPromptOptions, "client" | "previousTurnClient"> | Record<string, never> {
+  if (policy.replacementClient) {
+    return { client: policy.replacementClient, previousTurnClient: undefined };
+  }
+  return policy.useFreshClient ? { client: undefined } : {};
 }
 
 async function applyQueuedTaskSubscriptionLockPolicy(
   sessionRecordId: string,
   options: QueuedTaskRuntimeOptions,
-): Promise<{ useFreshClient: boolean }> {
+): Promise<QueuedTaskClientPolicy> {
   const record = await resolveSessionRecord(sessionRecordId);
   if (bindRecordToDefaultAccount(record)) {
     await writeSessionRecord(record);
@@ -1748,14 +1786,16 @@ async function applyQueuedTaskSubscriptionLockPolicy(
   try {
     const outcome = await enforceSubscriptionLockBeforeTurn(record);
     if (outcome.switchedTo) {
-      return queuedSwitchResult(outcome.switchedTo, options);
+      return await queuedSwitchResult(outcome.switchedTo, "lock", options);
     }
     // brick://4d517be2: proactive selection runs after lock enforcement (skipped
     // above when the lock hook already switched). Best-effort / never-throws; a
-    // switch means the next turn needs a fresh client to resolve the new dir.
-    const selection = await selectSubscriptionBeforeTurn(record);
+    // switch means the turn needs a client built for the new dir.
+    const selection = await selectSubscriptionBeforeTurn(record, undefined, {
+      liveBackgroundTasks: options.liveBackgroundTaskCount?.(),
+    });
     if (selection.switchedTo) {
-      return queuedSwitchResult(selection.switchedTo, options);
+      return await queuedSwitchResult(selection.switchedTo, "selection", options);
     }
     await enforceAutomationWeeklyCeilingBeforeTurn(record);
   } catch (error) {
@@ -1904,7 +1944,7 @@ async function runQueuedTaskFailover(
     await surfaceFailoverTerminalError(record, failoverError);
     throw failoverError;
   }
-  options.onFailoverSwitched?.(outcome.switchedTo);
+  options.onFailoverSwitched?.(outcome.switchedTo, "failover");
   return outcome.result;
 }
 
@@ -1935,7 +1975,12 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // (skipProactiveSelection). Best-effort / never-throws.
     let selectionSwitched = false;
     if (!options.skipProactiveSelection && !lockOutcome.switchedTo) {
-      selectionSwitched = (await selectSubscriptionBeforeTurn(record)).switchedTo !== undefined;
+      selectionSwitched =
+        (
+          await selectSubscriptionBeforeTurn(record, undefined, {
+            liveBackgroundTasks: options.liveBackgroundTaskCount?.(),
+          })
+        ).switchedTo !== undefined;
     }
     if (!lockOutcome.switchedTo && !selectionSwitched && !options.skipProactiveSelection) {
       await enforceAutomationWeeklyCeilingBeforeTurn(record);

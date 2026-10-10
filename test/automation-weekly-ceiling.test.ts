@@ -982,3 +982,32 @@ test("automatic current reserve switches to an eligible 1.00 account", async () 
     },
   );
 });
+
+// brick://3356183e — a switch closes the adapter that holds the session's background
+// tasks, so proactive selection must defer while any are live, and must not touch the
+// record. The same rig, with the count at 0, is the positive control: it switches.
+test("proactive selection defers a switch while background tasks are live", async () => {
+  await withCeilingRig(
+    [
+      { id: "busy", account: "busy-account", outcome: { fiveHour: 0.95, sevenDay: 0.1 } },
+      { id: "free", account: "free-account", outcome: { fiveHour: 0.1, sevenDay: 0.1 } },
+    ],
+    undefined,
+    async ({ lookup, record }) => {
+      const session = record("busy");
+      const profileBefore = session.acpx?.session_options?.profile;
+      const deferred = await selectSubscriptionBeforeTurn(session, lookup, {
+        liveBackgroundTasks: 2,
+      });
+      assert.equal(deferred.switchedTo, undefined);
+      assert.match(deferred.deferredTo ?? "", /^free-/u);
+      assert.equal(session.acpx?.session_options?.profile, profileBefore);
+      assert.equal(session.acpx?.session_options?.account_switch, undefined);
+
+      const switched = await selectSubscriptionBeforeTurn(session, lookup, {
+        liveBackgroundTasks: 0,
+      });
+      assert.match(switched.switchedTo ?? "", /^free-/u);
+    },
+  );
+});
