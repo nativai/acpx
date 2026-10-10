@@ -1,12 +1,15 @@
 // Fake ACP adapter for brick 7c06a855: answers initialize and session/new, and
 // on session/prompt writes to stderr and then dies with exit code 1 mid-prompt,
 // the shape codex-acp took on 2026-10-10 (an uncaught exception's stack on
-// stderr, then exit 1). argv[2] is the number of filler bytes to write first;
+// stderr, then exit 1). argv[2] is the number of filler bytes to write first,
+// as 100-byte lines, or as bare newlines when argv[3] is "newlines" (the TE's
+// adversarial input for the owner-log bound, finding F1);
 // the final writes split one line across two chunks and a multi-byte character
 // across two more, so the owner log must reassemble them.
 import readline from "node:readline";
 
 const fillerBytes = Number(process.argv[2] ?? "0");
+const fillerShape = process.argv[3] === "newlines" ? "\n" : `${"x".repeat(99)}\n`;
 // Mirrored in test/agent-stderr-tee.test.ts; never import this file (it reads stdin).
 const CRASH_MARKER = "Error: stderr-crash-adapter boom";
 
@@ -23,7 +26,7 @@ function write(chunk: string | Buffer): Promise<void> {
 async function crash(): Promise<never> {
   process.stderr.write("startup noise before the crash\n");
   if (fillerBytes > 0) {
-    await write(`${"x".repeat(99)}\n`.repeat(Math.ceil(fillerBytes / 100)));
+    await write(fillerShape.repeat(Math.ceil(fillerBytes / fillerShape.length)));
   }
   await write("split line, first half / ");
   await write("second half\n");
