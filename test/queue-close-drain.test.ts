@@ -325,7 +325,7 @@ test("L1.4/L3.1 the emitted contract strings match the checked-in cross-repo fix
   // rather than silently diverging for six weeks.
   assert.equal(
     createHash("sha256").update(bytes).digest("hex"),
-    "5fda238e8b56aa5eeeb9ae5d02c0262d375e4a0135cfd1be46c2f4b1fa0c71c4",
+    "03bb70fdd01c39772079797d2b9ffb355f41375fbb6a86324b01e36dbaa6003f",
     "delivery-contract.fixture.json changed — re-broker the sha to the acpx-ui lanes before merging",
   );
 

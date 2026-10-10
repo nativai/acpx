@@ -36,15 +36,15 @@
       "requiredSubstringLowercased": "session closed"
     },
     {
-      "$comment": "Injected mid-turn, containing turn never settled (F3). The content MAY have reached the model, so this is outcome-unknown: never auto-resend, manual decision only.",
+      "$comment": "Injected mid-turn, containing turn never settled (F3). The content MAY have reached the model, so this is outcome-unknown: never auto-resend, manual decision only. The sender IS notified (e09628a1 addendum A), with outcome-unknown wording, never 'resend'.",
       "detailCode": "ABSORBED_TURN_NEVER_ENDED",
       "message": "delivery outcome unknown — the message may have been processed",
       "phase": "failed",
       "reachedModel": "maybe",
       "retryable": false,
-      "notifiesSender": false,
+      "notifiesSender": true,
       "resendSafe": false,
-      "acpxUiDefinitiveGiveUp": false,
+      "acpxUiDefinitiveGiveUp": true,
       "requiredSubstringLowercased": null
     },
     {
