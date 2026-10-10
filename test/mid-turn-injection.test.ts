@@ -2366,7 +2366,11 @@ test("493729fc F3: owner-exit sweep terminalizes still-open absorbed deliveries 
       // The owner exits while the turn never settled: the sweep must write the
       // outcome-unknown terminal for the absorbed delivery.
       const written = terminalizeAbsorbedDeliveriesOnOwnerExit(record.acpxRecordId);
-      assert.equal(written, 1, "sweep wrote exactly one absorbed terminal");
+      assert.deepEqual(
+        written,
+        { failed: 1, consumed: 0 },
+        "sweep wrote exactly one absorbed terminal",
+      );
       // The write is fire-and-forget; give it a beat to land.
       await new Promise((resolve) => setTimeout(resolve, 30));
 

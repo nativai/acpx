@@ -1,6 +1,9 @@
+import { CONSUMED_BEFORE_CUT } from "../../session/delivery-consumption.js";
 import {
   ABSORBED_TURN_NEVER_ENDED_DETAIL_CODE,
   ABSORBED_TURN_NEVER_ENDED_MESSAGE,
+  CONSUMED_CUT_BY_OWNER_EXIT,
+  consumedBeforeCutNote,
 } from "../queue/delivery-terminals.js";
 import { appendDeliveryStreamEventSync } from "../queue/ipc-server.js";
 
@@ -15,7 +18,12 @@ import { appendDeliveryStreamEventSync } from "../queue/ipc-server.js";
 export type RegisteredAbsorbedDelivery = {
   context: { messageId: string; requestId: string };
   terminalWritten: boolean;
+  /** brick e09628a1 — set by the runtime when the model consumed the steer (R-CONSUMED). */
+  consumed?: boolean;
 };
+
+/** What one owner-exit sweep wrote: `failed` outcome-unknown terminals, and `done` ones for consumed steers. */
+export type AbsorbedExitSweep = { failed: number; consumed: number };
 
 const liveAbsorbedDeliveriesBySession = new Map<string, RegisteredAbsorbedDelivery[]>();
 
@@ -43,15 +51,19 @@ export function unregisterAbsorbedDeliveries(
  * outcome-unknown copy: the steer content DID reach the model even though its
  * turn never closed (RCA 493729fc §3.3), so consumers must surface a manual
  * resend decision — never auto-resend (double-execution risk), mirroring
- * INJECTED_RESPONSE_TIMEOUT semantics. Returns the number of terminals written.
+ * INJECTED_RESPONSE_TIMEOUT semantics.
+ *
+ * brick e09628a1 (R-CONSUMED) — a steer the model had already CONSUMED gets `done / consumed_before_cut`
+ * instead, with ABSORBED_TURN_NEVER_ENDED kept as the note's detailCode: the turn that carried it has ended
+ * (the owner is exiting), and the model read and acted on it, so it is delivered.
  */
-export function terminalizeAbsorbedDeliveriesOnOwnerExit(sessionId: string): number {
+export function terminalizeAbsorbedDeliveriesOnOwnerExit(sessionId: string): AbsorbedExitSweep {
+  const sweep: AbsorbedExitSweep = { failed: 0, consumed: 0 };
   const deliveries = liveAbsorbedDeliveriesBySession.get(sessionId);
   if (!deliveries) {
-    return 0;
+    return sweep;
   }
   liveAbsorbedDeliveriesBySession.delete(sessionId);
-  let written = 0;
   for (const delivery of deliveries) {
     if (delivery.terminalWritten) {
       continue;
@@ -63,12 +75,23 @@ export function terminalizeAbsorbedDeliveriesOnOwnerExit(sessionId: string): num
     // reached from the SIGTERM handler — so the write must be synchronous or it
     // does not survive the process (the same async-appendFile trap that lost
     // every externally-killed owner's custody).
+    if (delivery.consumed) {
+      appendDeliveryStreamEventSync(
+        sessionId,
+        delivery.context,
+        "done",
+        consumedBeforeCutNote(CONSUMED_CUT_BY_OWNER_EXIT, ABSORBED_TURN_NEVER_ENDED_DETAIL_CODE),
+        { stopReason: CONSUMED_BEFORE_CUT },
+      );
+      sweep.consumed += 1;
+      continue;
+    }
     appendDeliveryStreamEventSync(sessionId, delivery.context, "failed", {
       code: 0,
       message: ABSORBED_TURN_NEVER_ENDED_MESSAGE,
       detailCode: ABSORBED_TURN_NEVER_ENDED_DETAIL_CODE,
     });
-    written += 1;
+    sweep.failed += 1;
   }
-  return written;
+  return sweep;
 }

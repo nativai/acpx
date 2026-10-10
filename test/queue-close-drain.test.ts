@@ -432,7 +432,10 @@ test("L1.7 the owner-exit vocabulary splits by cause: close vs self-exit vs abso
       },
     ];
     registerAbsorbedDeliveries(absorbedSession, absorbed);
-    assert.equal(terminalizeAbsorbedDeliveriesOnOwnerExit(absorbedSession), 1);
+    assert.deepEqual(terminalizeAbsorbedDeliveriesOnOwnerExit(absorbedSession), {
+      failed: 1,
+      consumed: 0,
+    });
     const absorbedEvents = await readDeliveryEvents(absorbedSession);
     assert.equal(absorbedEvents.length, 1);
     assert.equal(absorbedEvents[0].error?.detailCode, ABSORBED_TURN_NEVER_ENDED_DETAIL_CODE);

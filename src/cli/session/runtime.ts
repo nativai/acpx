@@ -87,6 +87,7 @@ import {
   trimConversationForRuntime,
 } from "../../session/conversation-model.js";
 import { withDefaultModelForNewSession } from "../../session/default-model.js";
+import { CONSUMED_BEFORE_CUT, ConsumptionTracker } from "../../session/delivery-consumption.js";
 import {
   buildDeliveryEvent,
   deliveryTerminalWarning,
@@ -175,6 +176,7 @@ import {
   SESSION_CLOSED_UNDELIVERED_MESSAGE,
   TURN_WATCHDOG_CANCELLED_DETAIL_CODE,
   TURN_WATCHDOG_CANCELLED_MESSAGE,
+  consumedCutNote,
 } from "../queue/delivery-terminals.js";
 import {
   appendDeliveryStreamEventSync,
@@ -341,6 +343,8 @@ type AbsorbedInjectedDelivery = {
   task: QueueTask;
   closed: boolean;
   terminalWritten: boolean;
+  /** brick e09628a1 — the model consumed it (R-CONSUMED); the owner-exit sweep writes `done` for it. */
+  consumed?: boolean;
 };
 
 // A tracked (awaited) mid-turn-injected prompt: its promise, its delivery
@@ -2123,6 +2127,24 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const completeAbsorbedInjected = injectionAbsorbsIntoActiveTurn(record.agentCommand);
   const absorbedInjectedDeliveries: AbsorbedInjectedDelivery[] = [];
   registerAbsorbedDeliveries(record.acpxRecordId, absorbedInjectedDeliveries);
+  // brick e09628a1 (R-CONSUMED) — for those same backends, whether the model CONSUMED each delivered message,
+  // fed every inbound ACP message in wire order. A flip writes nothing (KD-10): it only decides what a CUT
+  // writes — `done / consumed_before_cut` instead of the outcome-unknown failure (`writeDeliveryTerminal`).
+  // The flags let the owner's exit paths, which share no object with this closure, see the verdict.
+  const consumptionTracker = completeAbsorbedInjected
+    ? new ConsumptionTracker({
+        onConsumed: (messageId) => {
+          for (const delivery of absorbedInjectedDeliveries) {
+            if (delivery.context.messageId === messageId) {
+              delivery.consumed = true;
+            }
+          }
+          if (openMainDelivery?.context.messageId === messageId) {
+            openMainDelivery.consumed = true;
+          }
+        },
+      })
+    : undefined;
   let sawAcpMessage = false;
   // brick ddd76838 — total `session/update` frames observed on this client since
   // connect, counted in the onSessionUpdate tap below. Never reset: each
@@ -2340,6 +2362,24 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     }
   };
 
+  // brick e09628a1 — the R-CONSUMED verdict for a terminal about to be written (`consumedCutNote`).
+  const consumedCutNoteFor = (
+    context: DeliveryContext | undefined,
+    phase: Exclude<DeliveryPhase, "accepted">,
+    error: DeliveryEventError | undefined,
+  ): DeliveryEventError | undefined => {
+    if (!context || !consumptionTracker) {
+      return undefined;
+    }
+    return consumedCutNote({
+      kind: consumptionTracker.kindOf(context.messageId),
+      consumed: consumptionTracker.isConsumed(context.messageId),
+      phase,
+      error,
+      closeDrainActive: isSessionCloseDrainActive(record.acpxRecordId),
+    });
+  };
+
   const writeDeliveryTerminal = async (
     context: DeliveryContext | undefined,
     phase: Exclude<DeliveryPhase, "accepted">,
@@ -2351,6 +2391,25 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // is `failed` with the outcome-unknown code acpx-ui notifies the sender on — never a code-less `cancelled`. A
     // cancel with NO close stays one.
     // brick a147982f — a turn the C1 watchdog's cancel cut is a cancel too: during a close drain the close wins.
+    // brick e09628a1 (R-CONSUMED) — FIRST: a cut of a message the model already consumed is `done`, with the
+    // cut's own code kept in a non-failing note (`consumedCutNote`: a steer on every cut, a main only on a close).
+    const consumedNote = consumedCutNoteFor(context, phase, params.error);
+    // Released only once a terminal is written: a write that throws leaves the verdict for the fallback
+    // terminal the catch paths write next.
+    const releaseConsumption = (): void => {
+      if (context) {
+        consumptionTracker?.release(context.messageId);
+      }
+    };
+    if (consumedNote) {
+      await appendDeliveryEvent(context, "done", {
+        stopReason: CONSUMED_BEFORE_CUT,
+        error: consumedNote,
+        terminal: true,
+      });
+      releaseConsumption();
+      return;
+    }
     const watchdogCut =
       phase === "failed" && params.error?.detailCode === TURN_WATCHDOG_CANCELLED_DETAIL_CODE;
     if ((phase === "cancelled" || watchdogCut) && isSessionCloseDrainActive(record.acpxRecordId)) {
@@ -2362,12 +2421,14 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         },
         terminal: true,
       });
+      releaseConsumption();
       return;
     }
     await appendDeliveryEvent(context, phase, {
       ...params,
       terminal: true,
     });
+    releaseConsumption();
   };
 
   const closeAbsorbedInjectedDelivery = (delivery: AbsorbedInjectedDelivery): void => {
@@ -2441,6 +2502,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       task,
       closed: false,
       terminalWritten: false,
+      // brick e09628a1 — a flip that landed before this entry existed (onConsumed marks only listed ones).
+      consumed: consumptionTracker?.isConsumed(context.messageId) === true,
     };
     absorbedInjectedDeliveries.push(delivery);
     return delivery;
@@ -2600,6 +2663,12 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     return { ...(messageId !== undefined ? { messageId } : {}), promptId };
   };
 
+  const registerSteerConsumption = (context: DeliveryContext | undefined): void => {
+    if (context) {
+      consumptionTracker?.register(context.messageId, "steer");
+    }
+  };
+
   const runInjectedPromptTask = async (
     sessionId: string,
     injectedTask: QueueTask,
@@ -2618,6 +2687,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       }
       const injectedMessageId = injectedPromptStart.messageId;
       await appendDeliveryEvent(injectedDeliveryContext, "accepted");
+      // brick e09628a1 — count from BEFORE the prompt is sent, so no completion it causes is missed.
+      registerSteerConsumption(injectedDeliveryContext);
       const injectedResponsePromise = client.prompt(
         sessionId,
         injectedPrompt,
@@ -2861,6 +2932,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       if (direction === "inbound") {
         lastAgentProgressAt = Date.now();
         observeTurnWatchdogInbound(message);
+        // brick e09628a1 — wire order, never the async onSessionUpdate tap.
+        consumptionTracker?.observe(message);
       }
       pendingMessages.push(message);
       // Route messages with subagentId to the child stream as well
@@ -3546,6 +3619,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     if (openMainDelivery) {
       // brick 570d2570 — from here a session close that cuts this turn can terminalize it from the owner's exit.
       registerOpenMainTurnDelivery(record.acpxRecordId, openMainDelivery);
+    }
+    // brick e09628a1 — counted from before the prompt is sent; a retry keeps the first registration (E4).
+    if (mainDeliveryContext) {
+      consumptionTracker?.register(mainDeliveryContext.messageId, "main");
     }
     // The seat's level as of this turn, and the detector visible to the turn-context
     // channel while this turn's prompt is composed (brick 4f3fa88c).

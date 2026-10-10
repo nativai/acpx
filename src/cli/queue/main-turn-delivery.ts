@@ -42,6 +42,8 @@ export type OpenMainTurnDelivery = {
   context: { messageId: string; requestId: string };
   terminalClaimed: boolean;
   ownEnd?: MainTurnOwnEnd;
+  /** brick e09628a1 — the model consumed the prompt (R-CONSUMED): a close cut writes `done`, not the close's code. */
+  consumed?: boolean;
 };
 
 const openMainTurnDeliveries = new Map<string, OpenMainTurnDelivery>();
@@ -79,7 +81,9 @@ export function claimMainTurnDeliveryTerminal(delivery: OpenMainTurnDelivery): b
  */
 export function claimMainTurnOnSessionClose(
   sessionId: string,
-): { context: OpenMainTurnDelivery["context"]; ownEnd?: MainTurnOwnEnd } | undefined {
+):
+  | { context: OpenMainTurnDelivery["context"]; ownEnd?: MainTurnOwnEnd; consumed?: boolean }
+  | undefined {
   const delivery = openMainTurnDeliveries.get(sessionId);
   if (!delivery) {
     return undefined;
@@ -88,7 +92,9 @@ export function claimMainTurnOnSessionClose(
   if (!claimMainTurnDeliveryTerminal(delivery)) {
     return undefined;
   }
-  return delivery.ownEnd
-    ? { context: delivery.context, ownEnd: delivery.ownEnd }
-    : { context: delivery.context };
+  return {
+    context: delivery.context,
+    ...(delivery.ownEnd ? { ownEnd: delivery.ownEnd } : {}),
+    ...(delivery.consumed ? { consumed: true } : {}),
+  };
 }

@@ -5,6 +5,7 @@ import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { normalizeOutputError } from "../../acp/error-normalization.js";
 import { recordPerfDuration } from "../../perf-metrics.js";
 import { textPrompt } from "../../prompt-content.js";
+import { CONSUMED_BEFORE_CUT } from "../../session/delivery-consumption.js";
 import {
   buildDeliveryEvent,
   type DeliveryEventError,
@@ -22,6 +23,8 @@ import type {
   SessionResumePolicy,
 } from "../../types.js";
 import {
+  CONSUMED_CUT_BY_SESSION_CLOSE,
+  consumedBeforeCutNote,
   type OwnerExitCause,
   ownerExitDeliveryError,
   QUEUE_OWNER_CLOSING_DETAIL_CODE,
@@ -525,6 +528,21 @@ export class SessionQueueOwner {
         ...(claimed.ownEnd.steered ? { steered: true } : {}),
         ...(claimed.ownEnd.recoveredBy ? { recoveredBy: claimed.ownEnd.recoveredBy } : {}),
       });
+      return 1;
+    }
+    if (claimed.consumed) {
+      // brick e09628a1 (R-CONSUMED) — the model had consumed the prompt before the close cut its turn: delivered,
+      // with the close's code kept in the non-failing note. `ownEnd` above still wins (570d2570 C3).
+      appendDeliveryStreamEventSync(
+        this.sessionId,
+        claimed.context,
+        "done",
+        consumedBeforeCutNote(
+          CONSUMED_CUT_BY_SESSION_CLOSE,
+          SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE,
+        ),
+        { stopReason: CONSUMED_BEFORE_CUT },
+      );
       return 1;
     }
     appendDeliveryStreamEventSync(this.sessionId, claimed.context, "failed", {

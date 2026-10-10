@@ -341,9 +341,10 @@ async function closeQueueOwnerRuntime(params: {
   // reached the model, so the terminal must lead to a manual resend decision,
   // never an auto-resend.
   const absorbedTerminals = terminalizeAbsorbedDeliveriesOnOwnerExit(params.sessionId);
-  if (absorbedTerminals > 0) {
+  if (absorbedTerminals.failed + absorbedTerminals.consumed > 0) {
     process.stderr.write(
-      `[acpx] queue owner exit wrote ${absorbedTerminals} ABSORBED_TURN_NEVER_ENDED terminal(s) for session ${params.sessionId}\n`,
+      `[acpx] queue owner exit wrote ${absorbedTerminals.failed} ABSORBED_TURN_NEVER_ENDED + ` +
+        `${absorbedTerminals.consumed} consumed_before_cut terminal(s) for session ${params.sessionId}\n`,
     );
   }
   await params.owner?.close();
@@ -431,10 +432,11 @@ export function installQueueOwnerFatalSignalHandlers(params: {
       // `custody` includes the main turn a session close cut (brick 570d2570).
       const custody = params.owner.terminalizeCustodyOnSignal();
       const absorbed = terminalizeAbsorbedDeliveriesOnOwnerExit(params.sessionId);
-      if (custody > 0 || absorbed > 0) {
+      if (custody > 0 || absorbed.failed + absorbed.consumed > 0) {
         process.stderr.write(
           `[acpx] queue owner for session ${params.sessionId} took ${signal} while holding custody; ` +
-            `wrote ${custody} custody + ${absorbed} absorbed terminal(s)\n`,
+            `wrote ${custody} custody + ${absorbed.failed} absorbed + ` +
+            `${absorbed.consumed} consumed_before_cut terminal(s)\n`,
         );
       }
     } catch {
