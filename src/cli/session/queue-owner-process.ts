@@ -1,5 +1,13 @@
 import { spawn } from "node:child_process";
-import { closeSync, mkdirSync, openSync, readSync, realpathSync, statSync } from "node:fs";
+import {
+  closeSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  realpathSync,
+  renameSync,
+  statSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { SessionAgentOptions } from "../../runtime/engine/session-options.js";
@@ -189,8 +197,8 @@ export function queueOwnerRuntimeOptionsFromSend(
   };
 }
 
-// Cap the per-session owner log so it can't grow unbounded across respawns.
-const OWNER_LOG_MAX_BYTES = 1024 * 1024;
+// Rotate the per-session owner log at spawn once it passes this size.
+export const OWNER_LOG_MAX_BYTES = 1024 * 1024;
 
 // Open the per-session queue-owner log (`~/.acpx/sessions/<id>.owner.log`) to
 // capture the detached owner's stdout+stderr — which includes the ACP adapter's
@@ -203,19 +211,41 @@ function openQueueOwnerLogFd(sessionId: string): number | null {
   try {
     const dir = join(homedir(), ".acpx", "sessions");
     mkdirSync(dir, { recursive: true });
-    const logPath = join(dir, `${sessionId}.owner.log`);
-    let size = 0;
-    try {
-      size = statSync(logPath).size;
-    } catch {
-      // absent → size 0
-    }
-    // Truncate a bloated log ("w"), otherwise append ("a") to preserve recent
-    // crash output across respawns.
-    return openSync(logPath, size > OWNER_LOG_MAX_BYTES ? "w" : "a");
+    return openOwnerLogFile(join(dir, `${sessionId}.owner.log`));
   } catch {
     return null;
   }
+}
+
+/**
+ * Open an owner log for appending. One over `OWNER_LOG_MAX_BYTES` is first
+ * ROTATED to `<path>.1` (replacing any previous `.1`), so the crash output of the
+ * owners before this one survives the spawn (brick 7c06a855, TE finding F2).
+ *
+ * ⚠️ DO NOT GO BACK TO TRUNCATING (`"w"`). It looks like the simpler bound and it
+ * is the bug: once adapter stderr is teed here (up to ~264 KB per adapter
+ * process), a few chatty crashes pass 1 MB, and the next spawn erased every
+ * earlier crash stack. On disk this keeps at most two generations: `.1` (≈ 1 MB
+ * plus whatever its last owner appended) and the live log. Every path that
+ * deletes the owner log also deletes `.1` (`repository.ts` `ownerLogPaths`).
+ * Only if the rename fails does it fall back to truncating, so the log stays bounded.
+ */
+export function openOwnerLogFile(logPath: string): number {
+  let size = 0;
+  try {
+    size = statSync(logPath).size;
+  } catch {
+    // absent → size 0
+  }
+  if (size <= OWNER_LOG_MAX_BYTES) {
+    return openSync(logPath, "a");
+  }
+  try {
+    renameSync(logPath, `${logPath}.1`);
+  } catch {
+    return openSync(logPath, "w");
+  }
+  return openSync(logPath, "a");
 }
 
 export function buildQueueOwnerSpawnOptions(

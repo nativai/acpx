@@ -1654,7 +1654,9 @@ async function unlinkHardDeletedFiles(
   const logPath = path.join(sessionDir, messagesLogFileName(acpxRecordId));
   await unlinkIfPresent(logPath);
   await unlinkIfPresent(messagesLogStalePath(logPath));
-  await unlinkIfPresent(ownerLogPath(sessionDir, safeId));
+  for (const ownerLog of ownerLogPaths(sessionDir, safeId)) {
+    await unlinkIfPresent(ownerLog);
+  }
   await unlinkIfPresent(timestampsSidecarPath(sessionDir, safeId));
   try {
     const dirEntries = await fs.readdir(sessionDir);
@@ -2463,7 +2465,9 @@ async function unlinkPrunedSessionFiles(
   const logPath = path.join(sessionDir, messagesLogFileName(record.acpxRecordId));
   bytesFreed += await unlinkCountingBytes(logPath);
   bytesFreed += await unlinkCountingBytes(messagesLogStalePath(logPath));
-  bytesFreed += await unlinkCountingBytes(ownerLogPath(sessionDir, safeId));
+  for (const ownerLog of ownerLogPaths(sessionDir, safeId)) {
+    bytesFreed += await unlinkCountingBytes(ownerLog);
+  }
   if (includeHistory) {
     for (const name of streamFilesFor(streamFilesBySafeId, safeId)) {
       bytesFreed += await unlinkCountingBytes(path.join(sessionDir, name));
@@ -2474,8 +2478,9 @@ async function unlinkPrunedSessionFiles(
 }
 
 /**
- * The queue owner's log — RECORD tier, so it goes even under
- * `--no-include-history`. acpx's own file, capped at 1 MiB; its only reader
+ * The queue owner's log and its one rotated generation (`<id>.owner.log.1`,
+ * written by `openOwnerLogFile` in `queue-owner-process.ts`) — RECORD tier, so both go even under
+ * `--no-include-history`. acpx's own files, rotated at 1 MiB; their only reader
  * takes a session id and is unreachable once the record is gone.
  *
  * ⚠️ RESOLVED FROM `sessionDir`, NEVER FROM `homedir()`. The WRITER
@@ -2499,8 +2504,9 @@ async function unlinkPrunedSessionFiles(
  * `HOME` from `ACPX_STATE_HOME` (both to temp paths, neither ever the real `~`),
  * because the property does not exist while they are equal.
  */
-function ownerLogPath(sessionDir: string, safeId: string): string {
-  return path.join(sessionDir, `${safeId}.owner.log`);
+function ownerLogPaths(sessionDir: string, safeId: string): string[] {
+  const live = path.join(sessionDir, `${safeId}.owner.log`);
+  return [live, `${live}.1`];
 }
 
 /**
