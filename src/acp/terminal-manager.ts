@@ -69,15 +69,16 @@ function toCommandLine(command: string, args: string[] | undefined): string {
   return renderedArgs.length > 0 ? `${command} ${renderedArgs}` : command;
 }
 
-function toEnvObject(env: CreateTerminalRequest["env"]): NodeJS.ProcessEnv | undefined {
-  if (!env || env.length === 0) {
-    return undefined;
-  }
-
+// Always an explicit env: an inherited `process.env` would hand the command
+// `ACPX_OWNER_LOG=1`, which means "your stderr IS the queue owner's log". A
+// terminal command's stderr is a pipe, so a nested acpx (e.g. `--json-strict`)
+// would otherwise tee agent stderr onto its own JSON stream (brick 7c06a855, TE F4).
+function toEnvObject(env: CreateTerminalRequest["env"]): NodeJS.ProcessEnv {
   const merged: NodeJS.ProcessEnv = { ...process.env };
-  for (const entry of env) {
+  for (const entry of env ?? []) {
     merged[entry.name] = entry.value;
   }
+  delete merged.ACPX_OWNER_LOG;
   return merged;
 }
 
@@ -94,12 +95,7 @@ export function buildTerminalSpawnOptions(
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   };
-  return buildSpawnCommandOptions(
-    command,
-    options,
-    platform,
-    resolvedEnv ?? process.env,
-  ) as TerminalSpawnOptions;
+  return buildSpawnCommandOptions(command, options, platform, resolvedEnv) as TerminalSpawnOptions;
 }
 
 function trimToUtf8Boundary(buffer: Buffer, limit: number): Buffer {
