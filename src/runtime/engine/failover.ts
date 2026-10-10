@@ -1088,6 +1088,15 @@ export async function enforceAutomationWeeklyCeilingBeforeTurn(
 
 export type SubscriptionSelectionResult = {
   switchedTo?: string;
+  // brick://3356183e: the switch selection wanted, held back because the session's
+  // adapter holds live background tasks that the switch would kill.
+  deferredTo?: string;
+};
+
+export type SubscriptionSelectionTurn = {
+  // Background tasks live on the adapter that serves this session now. A switch
+  // closes that adapter, so selection waits until it is zero.
+  liveBackgroundTasks?: number;
 };
 
 // brick://4d517be2 — DEFAULT-ON autonomous subscription selection, a pre-turn
@@ -1100,9 +1109,10 @@ export type SubscriptionSelectionResult = {
 export async function selectSubscriptionBeforeTurn(
   record: SessionRecord,
   loadOpts?: SubscriptionLookupOptions,
+  turn?: SubscriptionSelectionTurn,
 ): Promise<SubscriptionSelectionResult> {
   try {
-    return await selectSubscriptionBeforeTurnUnsafe(record, loadOpts);
+    return await selectSubscriptionBeforeTurnUnsafe(record, loadOpts, turn);
   } catch (error) {
     // Best-effort: log and keep the current sub. Model on resolveAutoSubscription's
     // "never throws — any failure degrades to the default" contract.
@@ -1129,6 +1139,7 @@ function proactiveSelectionDisabled(record: SessionRecord): boolean {
 async function selectSubscriptionBeforeTurnUnsafe(
   record: SessionRecord,
   loadOpts?: SubscriptionLookupOptions,
+  turn?: SubscriptionSelectionTurn,
 ): Promise<SubscriptionSelectionResult> {
   if (proactiveSelectionDisabled(record)) {
     return {};
@@ -1166,7 +1177,27 @@ async function selectSubscriptionBeforeTurnUnsafe(
     return {}; // already optimal / nothing eligible
   }
 
-  const currentIndex = usages.findIndex((usage) => usage.id === current.id);
+  const held = holdSelectionSwitch({ record, usages, currentId: current.id, target, turn });
+  if (held) {
+    return held;
+  }
+
+  await switchSessionAccount(record, target.id, "selection", loadOpts);
+  await writeSessionRecord(record);
+  return { switchedTo: target.id };
+}
+
+// Why a switch to an eligible, different target does NOT happen this turn — the
+// thrash guard, or live background tasks — or undefined when it should happen.
+function holdSelectionSwitch(params: {
+  record: SessionRecord;
+  usages: SubscriptionUsage[];
+  currentId: string;
+  target: SubscriptionUsage;
+  turn: SubscriptionSelectionTurn | undefined;
+}): SubscriptionSelectionResult | undefined {
+  const { record, usages, target } = params;
+  const currentIndex = usages.findIndex((usage) => usage.id === params.currentId);
   const currentUsage = usages[currentIndex]; // undefined when currentIndex is -1 (not found)
   const targetIndex = usages.findIndex((usage) => usage.id === target.id);
   if (
@@ -1180,10 +1211,30 @@ async function selectSubscriptionBeforeTurnUnsafe(
   ) {
     return {};
   }
+  // brick://3356183e: the live-task gate sits HERE, after the decision, so the log
+  // names a switch that would really have happened. Deferring is within selection's
+  // best-effort contract; reactive failover is not gated and still switches.
+  if (deferSwitchForLiveBackgroundTasks(record, params.currentId, target.id, params.turn)) {
+    return { deferredTo: target.id };
+  }
+  return undefined;
+}
 
-  await switchSessionAccount(record, target.id, "selection", loadOpts);
-  await writeSessionRecord(record);
-  return { switchedTo: target.id };
+function deferSwitchForLiveBackgroundTasks(
+  record: SessionRecord,
+  currentId: string,
+  targetId: string,
+  turn: SubscriptionSelectionTurn | undefined,
+): boolean {
+  const liveBackgroundTasks = turn?.liveBackgroundTasks ?? 0;
+  if (liveBackgroundTasks <= 0) {
+    return false;
+  }
+  process.stderr.write(
+    `[acpx] proactive subscription switch ${currentId} → ${targetId} deferred for session ` +
+      `${record.acpxRecordId}: ${liveBackgroundTasks} live background task(s) would be killed\n`,
+  );
+  return true;
 }
 
 // The #2 fallback ladder: primary rule (≥30% 5h headroom → soonest reset), then the

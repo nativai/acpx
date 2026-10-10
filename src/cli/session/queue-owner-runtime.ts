@@ -51,6 +51,7 @@ import { readQueueOwnerRecord, refreshQueueOwnerLease } from "../queue/lease-sto
 import { QueueOwnerTurnController } from "../queue/owner-turn-controller.js";
 import { terminalizeAbsorbedDeliveriesOnOwnerExit } from "./absorbed-delivery-registry.js";
 import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
+import { createBackgroundTaskTracker } from "./background-task-tracker.js";
 import { resolveSessionBrickContext } from "./brick-link.js";
 import {
   DEFAULT_QUEUE_OWNER_TTL_MS,
@@ -74,7 +75,7 @@ import {
   readQueueOwnerStartupFailureDetail,
   spawnQueueOwnerProcess,
 } from "./queue-owner-process.js";
-import { runQueuedTask } from "./runtime.js";
+import { runQueuedTask, type AccountSwitchTrigger } from "./runtime.js";
 
 // Wall-clock budget for a cold-respawn owner startup, shared across all re-spawn
 // attempts. It is a TIME bound, not a poll count: once the owner's lease exists a
@@ -613,6 +614,49 @@ export async function decideIdleOwnerRelease(
   return { release: false };
 }
 
+function logTurnBoundaryRecycle(sessionId: string, reason: string, liveBackgroundTasks: number) {
+  process.stderr.write(
+    `[acpx] queue owner recycling session ${sessionId} after turn (reason=${reason}); ` +
+      `killing ${liveBackgroundTasks} live background task(s); next prompt cold-respawns with context\n`,
+  );
+}
+
+// brick://3356183e: a lock or selection switch decided before a turn. The owner's
+// shared client is bound to the OLD subscription's config dir, so it is replaced by
+// one built from the switched record — exactly what a cold-spawned owner on the new
+// subscription would build. Built first, closed second: a failed build keeps the old
+// client and returns undefined, and the turn falls back to a fresh client + recycle.
+// Closing the old client kills its adapter; proactive selection never gets here with
+// live background tasks (it defers), a lock switch can, and says so.
+async function replaceSharedClientAfterSwitch(params: {
+  options: QueueOwnerRuntimeOptions;
+  current: AcpClient;
+  newProfileId: string;
+  trigger: AccountSwitchTrigger;
+  liveBackgroundTasks: number;
+}): Promise<AcpClient | undefined> {
+  const { options } = params;
+  let replacement: AcpClient;
+  try {
+    replacement = await createQueueOwnerSharedClient(
+      options,
+      await resolveSessionRecord(options.sessionId),
+    );
+  } catch (error) {
+    process.stderr.write(
+      `[acpx] queue owner could not rebuild its client for session ${options.sessionId} after a ` +
+        `switch to ${params.newProfileId}; this turn runs on a fresh client: ${formatErrorMessage(error)}\n`,
+    );
+    return undefined;
+  }
+  process.stderr.write(
+    `[acpx] queue owner switched session ${options.sessionId} to ${params.newProfileId} before the turn ` +
+      `(by ${params.trigger}); replacing its adapter client, killing ${params.liveBackgroundTasks} live background task(s)\n`,
+  );
+  await params.current.close().catch(() => {});
+  return replacement;
+}
+
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
 export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): Promise<void> {
   const lease = await tryAcquireQueueOwnerLease(options.sessionId);
@@ -670,7 +714,11 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   // WHEN an already-idle owner is released; WHETHER an active owner is protected is
   // the hasActiveTurn()+quiescence gate (see decideIdleOwnerRelease).
   let lastTaskCompletedAt = Date.now();
-  const sharedClient = await createQueueOwnerSharedClient(options, sessionRecord);
+  // brick://3356183e: `let`, because a switch decided before a turn replaces it
+  // (replaceSharedClient below). Every closure here reads the binding, never a copy.
+  let sharedClient = await createQueueOwnerSharedClient(options, sessionRecord);
+  const backgroundTasks = createBackgroundTaskTracker();
+  let recycleReason: string | undefined;
   const ttlMs = normalizeQueueOwnerTtlMs(options.ttlMs);
   // W13-24-14 Phase 2 — memory-release idle timeout (ms), read from env at owner
   // start (reaches the owner via ...process.env, like ACPX_DEPLOY_VERSION_FILE).
@@ -957,6 +1005,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           // Stamp inter-turn activity so the idle loop's quiescence gate keeps a
           // quietly-relaying owner warm (never recycles it mid background work).
           lastIdleDrainActivityAt = Date.now();
+          backgroundTasks.observe(_dir, message);
           pendingIdle.push(message);
 
           const msg = message as Record<string, unknown>;
@@ -1180,8 +1229,25 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
                 turnController.markPromptActive();
                 await applyPendingCancel();
               },
-              onFailoverSwitched: (newProfileId: string) => {
+              onAcpMessage: backgroundTasks.observe,
+              liveBackgroundTaskCount: backgroundTasks.liveCount,
+              replaceSharedClient: async (newProfileId, trigger) => {
+                const replaced = await replaceSharedClientAfterSwitch({
+                  options,
+                  current: sharedClient,
+                  newProfileId,
+                  trigger,
+                  liveBackgroundTasks: backgroundTasks.liveCount(),
+                });
+                if (replaced) {
+                  sharedClient = replaced;
+                  backgroundTasks.reset();
+                }
+                return replaced;
+              },
+              onFailoverSwitched: (newProfileId, trigger) => {
                 recycleOwnerAfterTask = true;
+                recycleReason = `account-switch; switched to ${newProfileId} by ${trigger}`;
                 if (options.verbose) {
                   process.stderr.write(
                     `[acpx] account switch applied (→ ${newProfileId}); recycling queue owner for session ${options.sessionId} after this turn\n`,
@@ -1190,6 +1256,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
               },
               onLockBlocked: () => {
                 recycleOwnerAfterTask = true;
+                recycleReason = "lock-blocked";
                 if (options.verbose) {
                   process.stderr.write(
                     `[acpx] subscription lock blocked session ${options.sessionId}; recycling queue owner after this task\n`,
@@ -1259,6 +1326,14 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       // keeps serving the old one: the change silently forgotten, looking exactly
       // like success. Re-reading the record instead has no such path.
       if (recycleOwnerAfterTask || (await outputStyleChangeIsPending())) {
+        // brick://3356183e: this exit used to be silent unless --verbose, so an owner
+        // that took the session's background tasks with it left two adapter lines and
+        // no reason. Non-verbose, like the idle-release line.
+        logTurnBoundaryRecycle(
+          options.sessionId,
+          recycleOwnerAfterTask ? (recycleReason ?? "account-switch") : "output-style-change",
+          backgroundTasks.liveCount(),
+        );
         break;
       }
     }
