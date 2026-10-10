@@ -13,6 +13,12 @@ export type DeliveryStopReason =
   | "max_turns"
   | "cancelled"
   | "deduplicated"
+  // brick e09628a1 (R-CONSUMED) — a `done` written at a CUT for a message the model had already consumed
+  // (`src/session/delivery-consumption.ts`): owner-witnessed, acpx-ui-inferred, and the HoD-gated backfill.
+  // Never a genuine completion (`isGenuineCompletionStopReason` stays false), always delivered for dedup.
+  | "consumed_before_cut"
+  | "consumed_before_cut_inferred"
+  | "consumed_before_cut_backfill"
   | null;
 
 export type DeliveryRecoveredBy = "turn-watchdog";

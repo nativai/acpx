@@ -1,4 +1,5 @@
-import type { DeliveryEventError } from "../../session/delivery-events.js";
+import type { ConsumptionKind } from "../../session/delivery-consumption.js";
+import type { DeliveryEventError, DeliveryPhase } from "../../session/delivery-events.js";
 
 // The owner-exit delivery vocabulary — the WIRE CONTRACT between acpx and
 // acpx-ui (brick://53437107 DESIGN §4.1 / KD-3). Three codes, one cause each:
@@ -148,3 +149,79 @@ export function ownerExitDeliveryError(cause: OwnerExitCause): DeliveryEventErro
 export const QUEUE_OWNER_CLOSING_DETAIL_CODE = "QUEUE_OWNER_CLOSING";
 export const QUEUE_OWNER_CLOSING_MESSAGE =
   "Session is closed — the queue owner is draining for close and is not accepting new messages.";
+
+// brick e09628a1 (R-CONSUMED, CONCEPTION §5) — the NON-FAILING NOTE on a `done` written at a cut for a message
+// the model had already consumed (`src/session/delivery-consumption.ts`). Its `detailCode` keeps the code the
+// cut would otherwise have written, so the stream still says what cut the turn (crash census, C-3 forensics);
+// acpx-ui stores the message as `attempt.error` on a `done` and never reads it as a failure (4ec33f59).
+// Contracted in `test/fixtures/delivery-consumption.fixture.json` (`note.prefix`), which acpx-ui vendors.
+// Neither the prefix nor any cause below may contain `session closed` / `session is closed`: acpx-ui's
+// substring backstops would read the note as a close.
+export const CONSUMED_BEFORE_CUT_NOTE = "consumed by the model before its turn was cut";
+export const CONSUMED_CUT_BY_OWNER_EXIT = "the queue owner exited while the turn was still open";
+export const CONSUMED_CUT_BY_SESSION_CLOSE = "the session was closed mid-turn";
+export const CONSUMED_CUT_BY_CANCEL = "the turn was cancelled";
+export const CONSUMED_CUT_BY_TURN_ERROR = "the turn ended with an error";
+
+export function consumedBeforeCutNote(cause: string, detailCode: string): DeliveryEventError {
+  return { code: 0, message: `${CONSUMED_BEFORE_CUT_NOTE}: ${cause}`, detailCode };
+}
+
+/**
+ * The note for a cut delivery the model already CONSUMED — write `done` / `consumed_before_cut` with it — or
+ * `undefined`: write the cut's own terminal unchanged (CONCEPTION §5.2).
+ *
+ *  - Only a cut (`failed` / `cancelled`) of a CONSUMED message changes; a `done` is the turn's own end.
+ *  - A steer flips on every cut: its delivery never depended on the containing turn finishing.
+ *  - A MAIN prompt flips ONLY while the owner is draining for a session close. ⚠️ DO NOT widen this to every
+ *    cut "for symmetry": a watchdog cut, an owner death or an adapter crash leaves the session open with
+ *    nobody continuing the work, and the failed outcome-unknown record and its sender notice are what tell a
+ *    delegating sender its report is never coming (a147982f). `test/delivery-consumption.test.ts` pins it.
+ */
+type ConsumedCutInput = {
+  kind: ConsumptionKind | undefined;
+  consumed: boolean;
+  phase: Exclude<DeliveryPhase, "accepted">;
+  error?: DeliveryEventError;
+  closeDrainActive: boolean;
+};
+
+function consumedCutFlips(input: ConsumedCutInput): boolean {
+  const cut = input.phase === "failed" || input.phase === "cancelled";
+  if (!input.consumed || !cut || input.kind === undefined) {
+    return false;
+  }
+  return input.kind === "steer" || input.closeDrainActive;
+}
+
+// The cut the runtime's choke point turns into SESSION_CLOSED_TURN_CANCELLED: a cancel, or a watchdog cut,
+// while the owner drains for a session close.
+function isCloseCancel(input: ConsumedCutInput): boolean {
+  const watchdogCut = input.error?.detailCode === TURN_WATCHDOG_CANCELLED_DETAIL_CODE;
+  return input.closeDrainActive && (input.phase === "cancelled" || watchdogCut);
+}
+
+function consumedCutCause(input: ConsumedCutInput): { cause: string; detailCode: string } {
+  if (isCloseCancel(input)) {
+    return {
+      cause: CONSUMED_CUT_BY_SESSION_CLOSE,
+      detailCode: SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE,
+    };
+  }
+  if (input.phase === "cancelled") {
+    return { cause: CONSUMED_CUT_BY_CANCEL, detailCode: "" };
+  }
+  const code = input.error?.detailCode ?? "";
+  return {
+    cause: code ? `${CONSUMED_CUT_BY_TURN_ERROR} (${code})` : CONSUMED_CUT_BY_TURN_ERROR,
+    detailCode: code,
+  };
+}
+
+export function consumedCutNote(input: ConsumedCutInput): DeliveryEventError | undefined {
+  if (!consumedCutFlips(input)) {
+    return undefined;
+  }
+  const { cause, detailCode } = consumedCutCause(input);
+  return consumedBeforeCutNote(cause, detailCode);
+}
