@@ -1,0 +1,5664 @@
+{
+  "$comment": "R-CONSUMED — the ONE consumption rule, two implementations (brick e09628a1, CONCEPTION §3 / §6.1). Authored in acpx (test/fixtures/delivery-consumption.fixture.json) and vendored BYTE-IDENTICALLY into acpx-ui at the same path; both suites assert the same sha256 over these bytes and run every vector — acpx feeds the frames one by one through ConsumptionTracker (src/session/delivery-consumption.ts), acpx-ui runs classifyStreamConsumption (server/delivery-consumption.ts) over the batch. A one-sided edit reds a suite. DO NOT REFORMAT: the sha is over the file bytes. Frames are REAL stream frames trimmed to the fields the rule reads (text shortened, sessionId and tool payloads dropped; a run of consecutive text chunks of one kind collapsed to its first frame); each names its source session and line. Regenerate with conception/evidence tooling only from real streams — never hand-edit a frame.",
+  "version": 1,
+  "classification": {
+    "$comment": "A model-output frame is a session/update whose sessionUpdate is in outputSessionUpdates, except an agent_message_chunk whose text equals excludedAgentMessageText. tool_call_update is NOT output. A completion frame is a session/update with sessionUpdate completionSessionUpdate carrying _meta[completionMetaKey]. A completion counts only if a model-output frame lies between it and the previous counted completion (or the prompt frame). Counting for a message stops at its first terminal acpx/delivery frame (terminalDeliveryPhases), even one written before its prompt frame.",
+    "outputSessionUpdates": ["agent_message_chunk", "agent_thought_chunk", "tool_call"],
+    "excludedAgentMessageText": "Context compacted.",
+    "completionSessionUpdate": "usage_update",
+    "completionMetaKey": "acpxUsage",
+    "terminalDeliveryPhases": ["done", "failed", "cancelled"]
+  },
+  "need": {
+    "steer": 2,
+    "main": 1
+  },
+  "stopReasons": {
+    "owner": "consumed_before_cut",
+    "inferred": "consumed_before_cut_inferred",
+    "backfill": "consumed_before_cut_backfill"
+  },
+  "note": {
+    "$comment": "Every consumption-aware done carries error {code:0, message:\"<prefix>: <cause>\", detailCode:<the code the old path would have written>} as a non-failing note. Neither the prefix nor any cause may contain a forbidden substring (lower-cased): acpx-ui reads those as a close.",
+    "prefix": "consumed by the model before its turn was cut",
+    "forbiddenSubstringsLowercased": ["session closed", "session is closed"]
+  },
+  "adapterCommands": [
+    {
+      "agentCommand": "node /opt/codex-acp/dist/index.js",
+      "applies": true,
+      "source": "deployed adapter, 01a125af record"
+    },
+    {
+      "agentCommand": "node /workspace/projects/codex-acp/te-bbe2bc47/dist/index.js",
+      "applies": true,
+      "source": "a codex-acp worktree build (CONCEPTION §6.3)"
+    },
+    {
+      "agentCommand": "node /opt/claude-agent-acp/dist/index.js",
+      "applies": false,
+      "source": "deployed Claude adapter, 84955ea5 record"
+    }
+  ],
+  "vectors": [
+    {
+      "id": "V1",
+      "about": "early steer (01a125af a198ff3d, accepted 13:17:22, cut 14:31:03): output+completion pairs, then owner exit — consumed",
+      "source": {
+        "session": "01a125af-53ca-7e03-9f00-92306a6d668f",
+        "target": "a198ff3d-45c2-4683-afec-2896d6f2cbfc",
+        "lines": "L2275 (open main), L2278-L2340, L2954-L2976",
+        "provenance": "real, elided",
+        "note": "the elided middle holds 20+ more counted completions (full stream: gated=28); elision can only lower the count"
+      },
+      "agentCommand": "node /opt/codex-acp/dist/index.js",
+      "target": "a198ff3d-45c2-4683-afec-2896d6f2cbfc",
+      "expected": {
+        "applicable": true,
+        "kind": "steer",
+        "consumed": true
+      },
+      "frames": [
+        {
+          "src": "01a125af:L2275",
+          "frame": {
+            "id": 1000036,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "327cc768-6ab6-4bfc-8a9b-278b6fc8a581"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2278",
+          "frame": {
+            "method": "acpx/received",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a125af:L2279",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "a198ff3d-45c2-4683-afec-2896d6f2cbfc",
+              "requestId": "cb79e498-acee-4ad9-a88c-cda349a74eee",
+              "phase": "accepted",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "",
+                "detailCode": ""
+              },
+              "at": "2026-10-10T13:17:22.307Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2280",
+          "frame": {
+            "id": 1000037,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "a198ff3d-45c2-4683-afec-2896d6f2cbfc"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2281",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                  "type": "text",
+                  "text": "The"
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2325",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-fbfee81c-de6b-4e6b-9675-9225bf1dc374",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2326",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-fbfee81c-de6b-4e6b-9675-9225bf1dc374",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2327",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-614e782e-0cd8-4e93-b877-8f8426805e08",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2328",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-614e782e-0cd8-4e93-b877-8f8426805e08",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2329",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-ce65f330-0c5e-4ead-a910-669a67633442",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2330",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-ce65f330-0c5e-4ead-a910-669a67633442",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2331",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-a319d354-99f6-4a86-b087-807f21feb9d6",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2332",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-a319d354-99f6-4a86-b087-807f21feb9d6"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2333",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-a319d354-99f6-4a86-b087-807f21feb9d6"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2334",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-a319d354-99f6-4a86-b087-807f21feb9d6"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2335",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-a319d354-99f6-4a86-b087-807f21feb9d6",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2336",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-7f67783c-11a4-40b3-9bda-de68e86f3f4d",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2337",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-7f67783c-11a4-40b3-9bda-de68e86f3f4d",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2338",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-6dfeb9ca-3650-45ac-b699-5335f3f62c30",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2339",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-6dfeb9ca-3650-45ac-b699-5335f3f62c30",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2340",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-a0d37d4d-2c42-4208-8980-75928a2aa2ee",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2954",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 2175,
+                      "cacheRead": 481024,
+                      "cacheWrite": 0,
+                      "output": 2377,
+                      "reasoning": 829
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2955",
+          "frame": {
+            "method": "acpx/received",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a125af:L2956",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "ccd33157-371a-4e55-ba72-177654bef98f",
+              "requestId": "07c9fb39-abd3-4829-b621-eac87256e746",
+              "phase": "accepted",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "",
+                "detailCode": ""
+              },
+              "at": "2026-10-10T14:28:10.209Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2957",
+          "frame": {
+            "id": 1000058,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "ccd33157-371a-4e55-ba72-177654bef98f"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2958",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-5c5f8254-0210-45c6-ac8e-261e85871ce2",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2959",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-5c5f8254-0210-45c6-ac8e-261e85871ce2",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2960",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-628aadd5-a7f7-45e5-ab2c-421bf9fdd58d",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2961",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-628aadd5-a7f7-45e5-ab2c-421bf9fdd58d",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2962",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 2572,
+                      "cacheRead": 483072,
+                      "cacheWrite": 0,
+                      "output": 693,
+                      "reasoning": 516
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2963",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2964",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-f5ea0d14-2c59-4795-8291-b045b5a07255",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2965",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-f5ea0d14-2c59-4795-8291-b045b5a07255",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2966",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-2838a47e-6dc0-4c2a-a06c-a6c971f6c892",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2967",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-2838a47e-6dc0-4c2a-a06c-a6c971f6c892",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2968",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-45fd185c-b8ea-4307-b670-a5082a55891d",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2969",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 6760,
+                      "cacheRead": 485504,
+                      "cacheWrite": 0,
+                      "output": 2195,
+                      "reasoning": 1552
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2970",
+          "frame": {
+            "method": "acpxui/message_sent",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a125af:L2971",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-45fd185c-b8ea-4307-b670-a5082a55891d"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2972",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-45fd185c-b8ea-4307-b670-a5082a55891d"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2973",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-45fd185c-b8ea-4307-b670-a5082a55891d",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2974",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 2583,
+                      "cacheRead": 492032,
+                      "cacheWrite": 0,
+                      "output": 557,
+                      "reasoning": 516
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2975",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-0b3a268a-6928-4231-ac18-f084b1483ec0",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2976",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "a198ff3d-45c2-4683-afec-2896d6f2cbfc",
+              "requestId": "cb79e498-acee-4ad9-a88c-cda349a74eee",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.981Z"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "V2",
+      "about": "last steer before the handover close (01a125af ccd33157, accepted 2 min 53 s before the cut): completion, output, completion, cut — consumed at exactly 2",
+      "source": {
+        "session": "01a125af-53ca-7e03-9f00-92306a6d668f",
+        "target": "ccd33157-371a-4e55-ba72-177654bef98f",
+        "lines": "L2275 (open main), L2955-L2996",
+        "provenance": "real, contiguous"
+      },
+      "agentCommand": "node /opt/codex-acp/dist/index.js",
+      "target": "ccd33157-371a-4e55-ba72-177654bef98f",
+      "expected": {
+        "applicable": true,
+        "kind": "steer",
+        "consumed": true,
+        "counted": 2,
+        "completionCount": 3
+      },
+      "frames": [
+        {
+          "src": "01a125af:L2275",
+          "frame": {
+            "id": 1000036,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "327cc768-6ab6-4bfc-8a9b-278b6fc8a581"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2955",
+          "frame": {
+            "method": "acpx/received",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a125af:L2956",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "ccd33157-371a-4e55-ba72-177654bef98f",
+              "requestId": "07c9fb39-abd3-4829-b621-eac87256e746",
+              "phase": "accepted",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "",
+                "detailCode": ""
+              },
+              "at": "2026-10-10T14:28:10.209Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2957",
+          "frame": {
+            "id": 1000058,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "ccd33157-371a-4e55-ba72-177654bef98f"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2958",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-5c5f8254-0210-45c6-ac8e-261e85871ce2",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2959",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-5c5f8254-0210-45c6-ac8e-261e85871ce2",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2960",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-628aadd5-a7f7-45e5-ab2c-421bf9fdd58d",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2961",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-628aadd5-a7f7-45e5-ab2c-421bf9fdd58d",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2962",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 2572,
+                      "cacheRead": 483072,
+                      "cacheWrite": 0,
+                      "output": 693,
+                      "reasoning": 516
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2963",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2964",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-f5ea0d14-2c59-4795-8291-b045b5a07255",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2965",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-f5ea0d14-2c59-4795-8291-b045b5a07255",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2966",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-2838a47e-6dc0-4c2a-a06c-a6c971f6c892",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2967",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-2838a47e-6dc0-4c2a-a06c-a6c971f6c892",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2968",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-45fd185c-b8ea-4307-b670-a5082a55891d",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2969",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 6760,
+                      "cacheRead": 485504,
+                      "cacheWrite": 0,
+                      "output": 2195,
+                      "reasoning": 1552
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2970",
+          "frame": {
+            "method": "acpxui/message_sent",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a125af:L2971",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-45fd185c-b8ea-4307-b670-a5082a55891d"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2972",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-45fd185c-b8ea-4307-b670-a5082a55891d"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2973",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-45fd185c-b8ea-4307-b670-a5082a55891d",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2974",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 2583,
+                      "cacheRead": 492032,
+                      "cacheWrite": 0,
+                      "output": 557,
+                      "reasoning": 516
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2975",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-0b3a268a-6928-4231-ac18-f084b1483ec0",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2976",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "a198ff3d-45c2-4683-afec-2896d6f2cbfc",
+              "requestId": "cb79e498-acee-4ad9-a88c-cda349a74eee",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.981Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2977",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "3c8aec5e-6b56-4a6b-8a8f-aeb23478b03d",
+              "requestId": "5343fabd-1649-48b3-a16a-4e5087be53ef",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.981Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2978",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "c26aa352-0404-4fe5-8d92-a09493743645",
+              "requestId": "a1c58c20-9e98-4205-86be-ccd13630b665",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.981Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2979",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "95728f17-4fff-4927-acaf-f408ea246978",
+              "requestId": "a1b9e793-3110-408a-a8a3-a7e0d888fe8d",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.982Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2980",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "0b62d64b-2af3-4e41-99e6-90ff53148200",
+              "requestId": "8c4449f2-6225-4dbb-94b1-6168e34c450d",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.982Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2981",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "20217d31-6b9c-4e85-aed6-58c01ccb54c1",
+              "requestId": "aa0071c7-ee1c-4d3e-ac9e-199deccbae1c",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.982Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2982",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "af8e012a-858a-4aa0-abd0-82b947b9cbf2",
+              "requestId": "3cd2b97f-080e-4974-a1c2-2de289ac771b",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.982Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2983",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "74cf6742-83f9-46d7-916b-7a31641e95e4",
+              "requestId": "c30ec274-6b2d-4aed-9406-f61c06a1a1e2",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.982Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2984",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "fe67be16-45b0-4914-a0bd-9d2c6b204ae8",
+              "requestId": "4a6b72bc-ab40-4323-aec2-badfd7ea014f",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.982Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2985",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "fb36768a-56de-4ba6-80f9-2a4c09a888f0",
+              "requestId": "f3ea21ed-6c25-4b05-a7b5-8730af91d2ef",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.982Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2986",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "059d46a5-429c-4b68-b779-c12d293995e5",
+              "requestId": "6c8c5c23-8ee7-4f3f-b0e6-d7b73cd61a84",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.982Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2987",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "38d52e3b-a17f-4997-ad26-b8e545da188b",
+              "requestId": "216c6a92-da41-45a1-ad2a-ffea647cf9e4",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.982Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2988",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "62e3c1c6-aea8-4caa-a3bc-f7bdfc4e266d",
+              "requestId": "51812e61-0e95-4905-b31b-b86d158fb4f0",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.982Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2989",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "20e5173e-c795-45bd-863b-70830f187644",
+              "requestId": "e0691894-6751-4cca-a8ad-8a18a6b51848",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.982Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2990",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "4b0607c0-6dc3-4399-9950-c1872ca56ef3",
+              "requestId": "624be77e-6557-4388-8f87-96deed25ebac",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.983Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2991",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "f03f8a23-0aad-497c-857c-c696de2f2d28",
+              "requestId": "9a72808a-388a-4f58-9aeb-aef58a17d4f2",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.983Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2992",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "1de0b961-cad4-462d-af25-1b166dcf3934",
+              "requestId": "affa226b-b316-4cde-b544-1d2c7603a748",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.983Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2993",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "97de6195-e1c9-4858-9166-524abfabc201",
+              "requestId": "fa448b89-ecd7-4736-b8b1-9ba90ee6936a",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.983Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2994",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "cbcef78a-a14b-45df-85eb-4b9743fd2e0e",
+              "requestId": "106d83ec-502f-4d18-b68f-61075b3bc06e",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.983Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2995",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "f1a3b452-248d-4831-846c-4c1154e861e7",
+              "requestId": "7905105d-6144-4e5e-a3f9-0044a4c4a34b",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.983Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2996",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "ccd33157-371a-4e55-ba72-177654bef98f",
+              "requestId": "07c9fb39-abd3-4829-b621-eac87256e746",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T14:31:03.983Z"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "V3",
+      "about": "main prompt (01a125af 327cc768): prompt, output, completion — consumed at need 1",
+      "source": {
+        "session": "01a125af-53ca-7e03-9f00-92306a6d668f",
+        "target": "327cc768-6ab6-4bfc-8a9b-278b6fc8a581",
+        "lines": "L2275-L2356",
+        "provenance": "real, contiguous, truncated (the real turn ran on to the 14:31:03 close)"
+      },
+      "agentCommand": "node /opt/codex-acp/dist/index.js",
+      "target": "327cc768-6ab6-4bfc-8a9b-278b6fc8a581",
+      "expected": {
+        "applicable": true,
+        "kind": "main",
+        "consumed": true
+      },
+      "frames": [
+        {
+          "src": "01a125af:L2275",
+          "frame": {
+            "id": 1000036,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "327cc768-6ab6-4bfc-8a9b-278b6fc8a581"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2276",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "session_info_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2277",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2278",
+          "frame": {
+            "method": "acpx/received",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a125af:L2279",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "a198ff3d-45c2-4683-afec-2896d6f2cbfc",
+              "requestId": "cb79e498-acee-4ad9-a88c-cda349a74eee",
+              "phase": "accepted",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "",
+                "detailCode": ""
+              },
+              "at": "2026-10-10T13:17:22.307Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2280",
+          "frame": {
+            "id": 1000037,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "a198ff3d-45c2-4683-afec-2896d6f2cbfc"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2281",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                  "type": "text",
+                  "text": "The"
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2325",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-fbfee81c-de6b-4e6b-9675-9225bf1dc374",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2326",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-fbfee81c-de6b-4e6b-9675-9225bf1dc374",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2327",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-614e782e-0cd8-4e93-b877-8f8426805e08",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2328",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-614e782e-0cd8-4e93-b877-8f8426805e08",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2329",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-ce65f330-0c5e-4ead-a910-669a67633442",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2330",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-ce65f330-0c5e-4ead-a910-669a67633442",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2331",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-a319d354-99f6-4a86-b087-807f21feb9d6",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2332",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-a319d354-99f6-4a86-b087-807f21feb9d6"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2333",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-a319d354-99f6-4a86-b087-807f21feb9d6"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2334",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-a319d354-99f6-4a86-b087-807f21feb9d6"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2335",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-a319d354-99f6-4a86-b087-807f21feb9d6",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2336",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-7f67783c-11a4-40b3-9bda-de68e86f3f4d",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2337",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-7f67783c-11a4-40b3-9bda-de68e86f3f4d",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2338",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-6dfeb9ca-3650-45ac-b699-5335f3f62c30",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2339",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-6dfeb9ca-3650-45ac-b699-5335f3f62c30",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2340",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-a0d37d4d-2c42-4208-8980-75928a2aa2ee",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2341",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-a0d37d4d-2c42-4208-8980-75928a2aa2ee",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2342",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-2f00dae5-ee80-4f4c-948b-c17835038108",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2343",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-2f00dae5-ee80-4f4c-948b-c17835038108",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2344",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 1438,
+                      "cacheRead": 308608,
+                      "cacheWrite": 0,
+                      "output": 2854,
+                      "reasoning": 2588
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2345",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2346",
+          "frame": {
+            "method": "acpx/received",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a125af:L2347",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "3c8aec5e-6b56-4a6b-8a8f-aeb23478b03d",
+              "requestId": "5343fabd-1649-48b3-a16a-4e5087be53ef",
+              "phase": "accepted",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "",
+                "detailCode": ""
+              },
+              "at": "2026-10-10T13:18:56.156Z"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2348",
+          "frame": {
+            "id": 1000038,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "3c8aec5e-6b56-4a6b-8a8f-aeb23478b03d"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2349",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-c24ddb7e-7f62-4fd6-83bc-48467a5e2739",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2350",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-c24ddb7e-7f62-4fd6-83bc-48467a5e2739",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2351",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-f3a00431-a5d9-419a-b342-959222d66849",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2352",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-f3a00431-a5d9-419a-b342-959222d66849",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2353",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-03e12044-28cd-448f-b281-4a42cbad8b8b",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2354",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-03e12044-28cd-448f-b281-4a42cbad8b8b"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2355",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-03e12044-28cd-448f-b281-4a42cbad8b8b",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2356",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 30583,
+                      "cacheRead": 309888,
+                      "cacheWrite": 0,
+                      "output": 2307,
+                      "reasoning": 2070
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "V4",
+      "about": "handover-instant family (01a126ee c0855387): new turn after the adapter reconnect, steer consumed, then self-close — consumed",
+      "source": {
+        "session": "01a126ee-ce0f-7eb1-bd5b-83b251ee283e",
+        "target": "c0855387-dc07-4e22-8be1-a077df16c8ef",
+        "lines": "L3300-L3361",
+        "provenance": "real, contiguous"
+      },
+      "agentCommand": "node /opt/codex-acp/dist/index.js",
+      "target": "c0855387-dc07-4e22-8be1-a077df16c8ef",
+      "expected": {
+        "applicable": true,
+        "kind": "steer",
+        "consumed": true,
+        "counted": 3
+      },
+      "frames": [
+        {
+          "src": "01a126ee:L3300",
+          "frame": {
+            "method": "acpx/turn",
+            "params": {
+              "phase": "idle",
+              "at": "2026-10-10T19:23:07.117Z"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3301",
+          "frame": {
+            "method": "acpx/received",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a126ee:L3302",
+          "frame": {
+            "method": "acpx/turn",
+            "params": {
+              "phase": "active",
+              "at": "2026-10-10T19:23:10.581Z"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3303",
+          "frame": {
+            "id": 1000000,
+            "method": "initialize",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a126ee:L3304",
+          "frame": {
+            "id": 1000000,
+            "result": {}
+          }
+        },
+        {
+          "src": "01a126ee:L3305",
+          "frame": {
+            "id": 1000001,
+            "method": "session/resume",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a126ee:L3306",
+          "frame": {
+            "id": 1000001,
+            "result": {}
+          }
+        },
+        {
+          "src": "01a126ee:L3307",
+          "frame": {
+            "id": 1000002,
+            "method": "session/set_model",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a126ee:L3308",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "available_commands_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3309",
+          "frame": {
+            "id": 1000002,
+            "result": {}
+          }
+        },
+        {
+          "src": "01a126ee:L3310",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "3d884271-0b07-4b00-9fe3-025caf29c735",
+              "requestId": "2bf82ed2-52d2-485f-8713-3227b8a436ab",
+              "phase": "accepted",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "",
+                "detailCode": ""
+              },
+              "at": "2026-10-10T19:23:12.463Z"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3311",
+          "frame": {
+            "id": 1000003,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "3d884271-0b07-4b00-9fe3-025caf29c735"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3312",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "session_info_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3313",
+          "frame": {
+            "method": "acpx/received",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a126ee:L3314",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "c0855387-dc07-4e22-8be1-a077df16c8ef",
+              "requestId": "19e1f29d-4380-4036-80a1-4ec889820990",
+              "phase": "accepted",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "",
+                "detailCode": ""
+              },
+              "at": "2026-10-10T19:23:16.574Z"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3315",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                  "type": "text",
+                  "text": "The"
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3327",
+          "frame": {
+            "id": 1000004,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "c0855387-dc07-4e22-8be1-a077df16c8ef"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3328",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                  "type": "text",
+                  "text": " files"
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3346",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-4467e542-03db-404c-be13-2b8d8ad3169c",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3347",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-4467e542-03db-404c-be13-2b8d8ad3169c",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3348",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 18344,
+                      "cacheRead": 110464,
+                      "cacheWrite": 0,
+                      "output": 189,
+                      "reasoning": 15
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3349",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3350",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-25045d55-b33d-416f-87e5-44414d5812e8",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3351",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-25045d55-b33d-416f-87e5-44414d5812e8",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3352",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 652,
+                      "cacheRead": 128640,
+                      "cacheWrite": 0,
+                      "output": 109,
+                      "reasoning": 0
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3353",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-e20711cf-8db6-46e8-b9af-0c4d1e9f4fe7",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3354",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-e20711cf-8db6-46e8-b9af-0c4d1e9f4fe7",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3355",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-687577f0-4cbf-4e93-b0bb-f3d1176a8e0f",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3356",
+          "frame": {
+            "method": "acpxui/message_sent",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a126ee:L3357",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-687577f0-4cbf-4e93-b0bb-f3d1176a8e0f"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3358",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-687577f0-4cbf-4e93-b0bb-f3d1176a8e0f",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3359",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 3820,
+                      "cacheRead": 129152,
+                      "cacheWrite": 0,
+                      "output": 594,
+                      "reasoning": 59
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3360",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-e03a0589-281b-4c7d-b015-7774023462a2",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3361",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "c0855387-dc07-4e22-8be1-a077df16c8ef",
+              "requestId": "19e1f29d-4380-4036-80a1-4ec889820990",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:23:44.816Z"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "N1",
+      "about": "never drained (01a126f2 1c6e337a, accepted 723 s before the owner exit): one completion with no output after the inject — cut; age is never evidence",
+      "source": {
+        "session": "01a126f2-2160-7a10-89ca-856f981bdd06",
+        "target": "1c6e337a-b8c8-4d2f-9aac-c6d5862c538f",
+        "lines": "L1340 (open main), L2247-L2256",
+        "provenance": "real, contiguous"
+      },
+      "agentCommand": "node /opt/codex-acp/dist/index.js",
+      "target": "1c6e337a-b8c8-4d2f-9aac-c6d5862c538f",
+      "expected": {
+        "applicable": true,
+        "kind": "steer",
+        "consumed": false,
+        "counted": 0,
+        "completionCount": 1
+      },
+      "frames": [
+        {
+          "src": "01a126f2:L1340",
+          "frame": {
+            "id": 1000003,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "Continue SAME session after second adapt…"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "src": "01a126f2:L2247",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 625,
+                      "cacheRead": 531456,
+                      "cacheWrite": 0,
+                      "output": 5737,
+                      "reasoning": 5696
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126f2:L2248",
+          "frame": {
+            "method": "acpx/received",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a126f2:L2249",
+          "frame": {
+            "method": "acpx/received",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a126f2:L2250",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "1c6e337a-b8c8-4d2f-9aac-c6d5862c538f",
+              "requestId": "69bb21a1-24ea-4336-96b2-9a3a73064971",
+              "phase": "accepted",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "",
+                "detailCode": ""
+              },
+              "at": "2026-10-10T19:28:34.852Z"
+            }
+          }
+        },
+        {
+          "src": "01a126f2:L2251",
+          "frame": {
+            "id": 1000006,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "Holder #2 has accepted the handover in t…"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "src": "01a126f2:L2252",
+          "frame": {
+            "id": 1000007,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "1c6e337a-b8c8-4d2f-9aac-c6d5862c538f"
+            }
+          }
+        },
+        {
+          "src": "01a126f2:L2253",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 625,
+                      "cacheRead": 531456,
+                      "cacheWrite": 0,
+                      "output": 5737,
+                      "reasoning": 5696
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126f2:L2254",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "43b273f2-a770-4b4f-917c-692bae386aa3",
+              "requestId": "05d244eb-7b4f-4125-a705-9ef457e3308d",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:40:37.957Z"
+            }
+          }
+        },
+        {
+          "src": "01a126f2:L2255",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "256350b4-36c2-4bdd-a96d-6e7cb680b3c1",
+              "requestId": "80c9144e-e76e-408c-b28c-98d3a26e9b6b",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:40:37.959Z"
+            }
+          }
+        },
+        {
+          "src": "01a126f2:L2256",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "1c6e337a-b8c8-4d2f-9aac-c6d5862c538f",
+              "requestId": "69bb21a1-24ea-4336-96b2-9a3a73064971",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:40:37.960Z"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "N2",
+      "about": "in-flight completion only (01a126e7 5090fb4a, drained 5 s after the handover brief): output, ONE counted completion, cut — the first completion never suffices for a steer",
+      "source": {
+        "session": "01a126e7-96f9-75f1-bc0a-b31d161da63e",
+        "target": "5090fb4a-b642-4127-b990-b89b9c16d534",
+        "lines": "L1291 (open main), L2091-L2128",
+        "provenance": "real, contiguous"
+      },
+      "agentCommand": "node /opt/codex-acp/dist/index.js",
+      "target": "5090fb4a-b642-4127-b990-b89b9c16d534",
+      "expected": {
+        "applicable": true,
+        "kind": "steer",
+        "consumed": false,
+        "counted": 1
+      },
+      "frames": [
+        {
+          "src": "01a126e7:L1291",
+          "frame": {
+            "id": 1000021,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx session wakeups:self …"
+                }
+              ],
+              "messageId": "ab77be49-a85c-43f8-a3f3-3dfbea42e0ac"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2091",
+          "frame": {
+            "method": "acpx/received",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a126e7:L2092",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "5090fb4a-b642-4127-b990-b89b9c16d534",
+              "requestId": "444c17e3-5547-4b64-b3f4-9d28c2e69ef4",
+              "phase": "accepted",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "",
+                "detailCode": ""
+              },
+              "at": "2026-10-10T19:27:34.444Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2093",
+          "frame": {
+            "id": 1000045,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "5090fb4a-b642-4127-b990-b89b9c16d534"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2094",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-eb2d258b-0e68-48a9-8517-22979632786d",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2095",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-eb2d258b-0e68-48a9-8517-22979632786d",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2096",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-784c2b0e-2e1d-454f-9e95-681cbb0dc783",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2097",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-784c2b0e-2e1d-454f-9e95-681cbb0dc783",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2098",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-acbdc1cd-5ad6-4bf5-9e3c-08c68230d49b",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2099",
+          "frame": {
+            "method": "acpxui/message_sent",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a126e7:L2100",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-acbdc1cd-5ad6-4bf5-9e3c-08c68230d49b"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2101",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2102",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-acbdc1cd-5ad6-4bf5-9e3c-08c68230d49b",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2103",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 938,
+                      "cacheRead": 70528,
+                      "cacheWrite": 0,
+                      "output": 5015,
+                      "reasoning": 110
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2104",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2105",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-c41d5ce8-73f4-466f-8f9d-4693cc11a118",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2106",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "bf1237ee-3a14-4528-8b5e-3b12aabd8c73",
+              "requestId": "17e8ddfb-1eee-450b-9a75-1dfb3a513117",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.286Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2107",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "10d59102-7bad-4091-bd96-731febca2921",
+              "requestId": "6dd406a0-c95a-4864-ad2a-e3635dfb2807",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.287Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2108",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "cbab0f98-da9d-43a2-a345-7fff12a85120",
+              "requestId": "e484b68f-f0e6-4893-bb15-011477ad1258",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.287Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2109",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "f230c683-335b-4161-bd91-a6349591f47d",
+              "requestId": "17bac6f6-9330-478e-8fea-71f3ffa1183b",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.287Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2110",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "a13a8cb9-841e-4976-ad12-97a3999a4d02",
+              "requestId": "385b9648-f706-4cde-9811-de1f64f01653",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.287Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2111",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "efe6c02e-d46b-46df-85fa-cb1e0ac71958",
+              "requestId": "06894137-816a-4f3c-9941-fd877fafbb08",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.288Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2112",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "aa01f194-2a60-4bcc-bec8-69c2b5417abc",
+              "requestId": "7860616f-8452-44ca-a9a4-512e162b907f",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.288Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2113",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "06e2ab4c-210f-408e-9953-e170455c2eef",
+              "requestId": "95e48067-395f-47fa-bdb6-eb0ae701a716",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.288Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2114",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "271b5653-656d-4d16-b1f0-89192108ea32",
+              "requestId": "59ca6780-c3a8-4bbc-a7a4-180d46566c6c",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.288Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2115",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "7966dd22-6e48-4a64-8e39-c22043cedf39",
+              "requestId": "8c97b978-85d9-4722-8d65-def19aa8491d",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.288Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2116",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "cc921687-be8c-4017-b75e-4752b26ad076",
+              "requestId": "59afe03e-d085-45ab-b449-7186dbf88dae",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.288Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2117",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "069ca13d-7615-4aae-b596-98c03cfb246f",
+              "requestId": "c79cf652-027d-48cc-aaae-914e21df5894",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.288Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2118",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "4c405213-31cd-430a-a1f6-18ee9373d90d",
+              "requestId": "29961191-cfae-474a-b1d5-1f42461ac0ad",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.289Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2119",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "84183896-1f99-4960-8ccf-f56009c756d7",
+              "requestId": "acaddd56-8c10-4b68-bda9-e4515cdeb24f",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.289Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2120",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "d2fb9900-ffc9-49eb-b226-2dfce1945378",
+              "requestId": "49d899eb-12f9-4143-b198-f5b01e2eb6e6",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.289Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2121",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "7f45ce9f-5dd2-428c-96e3-eee0b47983a1",
+              "requestId": "72a8ca16-418b-4354-a0c9-4a47f9c030a7",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.289Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2122",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "2aeb5058-de71-4de0-952c-3f87657f9016",
+              "requestId": "fd2301cd-a2e9-45ab-aaa5-1b62c2f8c77f",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.289Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2123",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "c77753d4-9e88-40b6-b9de-e9b18e87cf1b",
+              "requestId": "cbc3b531-aed5-4bd6-bbec-cb7b8eb02a5c",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.289Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2124",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "1d22a393-d146-45a0-93d3-9283d85d27a7",
+              "requestId": "89558f3d-1cbd-46f7-91cd-db907b9cc5be",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.290Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2125",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "1c86e8bd-ba9d-4e67-95e5-20c4c18ec663",
+              "requestId": "af165c8a-b0d7-412b-b998-0819c097368a",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.290Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2126",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "fd8f83a8-c2ae-40e2-9192-507855abf7ef",
+              "requestId": "3f12ecee-44c5-4c61-915a-1f41d88c1371",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.290Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2127",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "023015c1-cf4f-44d6-ae39-348a20575241",
+              "requestId": "672d77f1-ec51-4bd5-a31e-81652fdf230a",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.290Z"
+            }
+          }
+        },
+        {
+          "src": "01a126e7:L2128",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "5090fb4a-b642-4127-b990-b89b9c16d534",
+              "requestId": "444c17e3-5547-4b64-b3f4-9d28c2e69ef4",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:29:12.290Z"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "N4",
+      "about": "error-path count, then turn error (01a12745 04b733d2): output, completion, completion with NO output since, AGENT_DISCONNECTED — cut. Also N7: the codex rollout shows this steer WAS consumed (9.5 min of output the ACP stream never showed); the rule errs only toward cut, and that conservative miss is the contracted behaviour",
+      "source": {
+        "session": "01a12745-5400-7c70-b74e-c66b611ed307",
+        "target": "04b733d2-7928-44c9-a1de-b5aa5497a596",
+        "lines": "L13 (open main), L1559-L1613",
+        "provenance": "real, contiguous"
+      },
+      "agentCommand": "node /opt/codex-acp/dist/index.js",
+      "target": "04b733d2-7928-44c9-a1de-b5aa5497a596",
+      "expected": {
+        "applicable": true,
+        "kind": "steer",
+        "consumed": false,
+        "counted": 1,
+        "completionCount": 2
+      },
+      "frames": [
+        {
+          "src": "01a12745:L13",
+          "frame": {
+            "id": 1000004,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "b3190738-021b-4c32-9fbd-3c36d1abd5b8"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1559",
+          "frame": {
+            "method": "acpx/received",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a12745:L1560",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "04b733d2-7928-44c9-a1de-b5aa5497a596",
+              "requestId": "e83ac150-8c6d-4e45-8b07-a1b4b0d27384",
+              "phase": "accepted",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "",
+                "detailCode": ""
+              },
+              "at": "2026-10-10T20:25:11.293Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1561",
+          "frame": {
+            "id": 1000030,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "04b733d2-7928-44c9-a1de-b5aa5497a596"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1562",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-fb365910-2785-4e6b-9c95-33372bfead59",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1563",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-fb365910-2785-4e6b-9c95-33372bfead59",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1564",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-5426171a-67ba-4e54-8925-405e1cce76e5",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1565",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-5426171a-67ba-4e54-8925-405e1cce76e5"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1566",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-5426171a-67ba-4e54-8925-405e1cce76e5"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1567",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-5426171a-67ba-4e54-8925-405e1cce76e5"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1568",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-5426171a-67ba-4e54-8925-405e1cce76e5",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1569",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 1347,
+                      "cacheRead": 468096,
+                      "cacheWrite": 0,
+                      "output": 4936,
+                      "reasoning": 3106
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1570",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1571",
+          "frame": {
+            "method": "acpx/received",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a12745:L1572",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "736ae895-d9a7-4a72-a78d-c3a9e0fdd6d3",
+              "requestId": "187fc82f-cd9b-43f0-a388-03508443132a",
+              "phase": "accepted",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "",
+                "detailCode": ""
+              },
+              "at": "2026-10-10T20:30:53.092Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1573",
+          "frame": {
+            "method": "acpx/received",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a12745:L1574",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "b6db49df-f462-49f8-b040-8abbb2bd0e84",
+              "requestId": "dea52a24-671d-4d65-94ac-bdebc0f32c71",
+              "phase": "accepted",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "",
+                "detailCode": ""
+              },
+              "at": "2026-10-10T20:30:58.748Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1575",
+          "frame": {
+            "method": "acpx/received",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a12745:L1576",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "7e800e8b-785a-4f2f-a2f4-48b8d5080823",
+              "requestId": "6e48d049-1b40-4393-b01b-836b93878aea",
+              "phase": "accepted",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "",
+                "detailCode": ""
+              },
+              "at": "2026-10-10T20:34:16.726Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1577",
+          "frame": {
+            "method": "acpx/received",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a12745:L1578",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "475b5ef9-9421-46d6-99a6-63e5cc919cf4",
+              "requestId": "82f375ee-aea6-40c3-b9ec-361bf1a85e5f",
+              "phase": "accepted",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "",
+                "detailCode": ""
+              },
+              "at": "2026-10-10T20:35:10.542Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1579",
+          "frame": {
+            "id": 1000031,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "736ae895-d9a7-4a72-a78d-c3a9e0fdd6d3"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1580",
+          "frame": {
+            "id": 1000032,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "b6db49df-f462-49f8-b040-8abbb2bd0e84"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1581",
+          "frame": {
+            "id": 1000033,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "7e800e8b-785a-4f2f-a2f4-48b8d5080823"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1582",
+          "frame": {
+            "id": 1000034,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "475b5ef9-9421-46d6-99a6-63e5cc919cf4"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1583",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 145,
+                      "cacheRead": 475008,
+                      "cacheWrite": 0,
+                      "output": 16131,
+                      "reasoning": 15976
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1584",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1585",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1586",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1587",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1588",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "257b715b-6c95-480c-8d80-0a36a23563d4",
+              "requestId": "c50daf20-4ce7-4b4f-8089-4abdbf6a7f07",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.225Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1589",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "ed76f581-4fd6-4472-8a6e-a484744c6207",
+              "requestId": "148d8d11-dbc7-404d-80d0-7a8e80a2a47a",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.226Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1590",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "4e19f291-e501-463a-a237-7a664e2d71f3",
+              "requestId": "22205847-13bd-4eb0-92fe-6c0b61cc53bc",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.226Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1591",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "208d7deb-af19-4303-92be-644551a83aee",
+              "requestId": "b35845d0-b439-4190-8682-1fb0bdc68d78",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.226Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1592",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "1b226a58-9902-4b20-a50c-42865e1d5f05",
+              "requestId": "6581cb7d-df56-471d-b99f-ab68af74d374",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.226Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1593",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "2f8d6329-fcec-4269-af80-396844b84324",
+              "requestId": "22189b10-4747-482a-a972-31f7e298fbde",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.226Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1594",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "e07322f1-0542-46cf-ad0e-e0b85eadac10",
+              "requestId": "c0aa9172-1e85-4436-a5ac-06e928e944b7",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.226Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1595",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "7aaa817c-c2cc-4bfe-9a6c-7a96cb871d15",
+              "requestId": "27c87738-8861-4a2e-a100-7112bbc736af",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.226Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1596",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "d640a962-f64a-4e86-8468-7ebe826a8816",
+              "requestId": "b9931914-8935-41e2-9b79-85ef62e16c70",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.227Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1597",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "b32ef08c-4118-4207-a9a1-3c908f479138",
+              "requestId": "24c450f3-2ee4-4094-b26d-7c8dcc536a9e",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.227Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1598",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "05cfdf12-fbf8-45af-814f-48a5d03aa226",
+              "requestId": "b8b9c040-4f13-475f-928a-b2bda9b7af7c",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.227Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1599",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "beaee945-ec4d-4d3d-a9f4-9c5a7a246d1c",
+              "requestId": "a4cc5e54-2386-472e-8fee-83b24e283c96",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.227Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1600",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "86064655-a39f-487b-81b0-8d95382c8976",
+              "requestId": "07c43d3d-c0cb-4946-8e2b-ad42f39fc0be",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.227Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1601",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "ce5ebccf-7210-434e-8c29-e60df36a0824",
+              "requestId": "a0bc3aa8-84e7-4974-ae86-1a08a0ae79af",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.227Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1602",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "df3249ec-2b08-4f54-a1ed-f82786d6e1a4",
+              "requestId": "09a0acf1-a21c-4b05-a347-a9ec9c145fa3",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.227Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1603",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "77265919-32da-492d-bbd1-af20bf125fe3",
+              "requestId": "a0a28c0c-282c-43ae-8d9c-b6c1d563789f",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.227Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1604",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "629a7f85-e173-4f0c-902b-7c9ca72d3705",
+              "requestId": "48a80ec1-1824-4a45-be02-722b05cfd868",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.227Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1605",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "112a7ea3-ff8f-49b7-844a-e68fb24ad4c5",
+              "requestId": "d1c01d2a-cdd7-4753-ba78-2e8fb4f4a7c0",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.228Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1606",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "659fdbb6-2b80-457f-bef7-01b96e30475d",
+              "requestId": "4673dabc-4313-4a3c-8a22-b604253fc366",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.228Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1607",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "1d8262f1-52d5-489f-ba91-a12d3834d806",
+              "requestId": "bc1fc64e-9307-4081-ba21-516a863fe12a",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.228Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1608",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "99801459-fdc3-4eee-887a-023b9c01e889",
+              "requestId": "d811db98-0c98-40b9-a4cf-178f31931c57",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.228Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1609",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "5395e821-9b7d-461e-a424-2ecec5068f2c",
+              "requestId": "b7c488ae-7f3d-4f3a-9c88-5f420ad0d4e8",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.228Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1610",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "2082130f-277a-4f23-b152-fc3a68b8ba5a",
+              "requestId": "cb66ad4b-4c0c-4a99-be01-72ed291c48b6",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.228Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1611",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "942cde1a-a5cb-430e-866d-15fd3ea6a7bb",
+              "requestId": "607679b8-243a-49cc-b6eb-2461dff83ea6",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.228Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1612",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "63cf45f7-8834-4cf3-aebb-1fbf2539bb46",
+              "requestId": "0445ed20-d513-4879-9f34-bf5b04f5f9d9",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.228Z"
+            }
+          }
+        },
+        {
+          "src": "01a12745:L1613",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "04b733d2-7928-44c9-a1de-b5aa5497a596",
+              "requestId": "e83ac150-8c6d-4e45-8b07-a1b4b0d27384",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T20:39:06.228Z"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "N9",
+      "about": "terminal written BEFORE its own prompt frame (01a126ee 3b8035f0, killed in the 19:23:07 adapter crash, never drained): the later turn's completions must not count — cut",
+      "source": {
+        "session": "01a126ee-ce0f-7eb1-bd5b-83b251ee283e",
+        "target": "3b8035f0-b1d7-4139-bae1-5b1be85dc1b8",
+        "lines": "L2135 (open main), L3292-L3361",
+        "provenance": "real, contiguous after the open main"
+      },
+      "agentCommand": "node /opt/codex-acp/dist/index.js",
+      "target": "3b8035f0-b1d7-4139-bae1-5b1be85dc1b8",
+      "expected": {
+        "applicable": true,
+        "kind": "steer",
+        "consumed": false,
+        "counted": 0
+      },
+      "frames": [
+        {
+          "src": "01a126ee:L2135",
+          "frame": {
+            "id": 1000027,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "98294a1e-6324-4d61-8cc3-325c9b8b6236"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3292",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "b21fb60b-664d-4604-9930-f82af067a391",
+              "requestId": "ca8ef26d-5371-4d82-acb9-a8a2a4452fd7",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T19:23:07.096Z"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3293",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "fc037298-4ac4-4c1d-ac73-c2c6d5a0345b",
+              "requestId": "3d152293-f9e8-42f3-bd26-cde2534cc811",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T19:23:07.096Z"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3294",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "3b8035f0-b1d7-4139-bae1-5b1be85dc1b8",
+              "requestId": "5e51d44c-f62b-421e-85a8-072204126055",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T19:23:07.096Z"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3295",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "b799f7f3-d62f-4dcf-9dc1-6fd016104216",
+              "requestId": "304078ca-4e98-4499-a7e3-1a2eb12f104f",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T19:23:07.096Z"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3296",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "e16ef1a0-d46f-475a-9d5f-04e44f5ac743",
+              "requestId": "41450f5f-93bb-4e95-b04f-543a94417f1b",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T19:23:07.097Z"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3297",
+          "frame": {
+            "id": 1000059,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "3b8035f0-b1d7-4139-bae1-5b1be85dc1b8"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3298",
+          "frame": {
+            "id": 1000060,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "b799f7f3-d62f-4dcf-9dc1-6fd016104216"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3299",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "98294a1e-6324-4d61-8cc3-325c9b8b6236",
+              "requestId": "5deb83ca-6d77-4a46-8baf-41f0c389e1cd",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "ACP agent disconnected during request (connectio…",
+                "detailCode": "AGENT_DISCONNECTED"
+              },
+              "at": "2026-10-10T19:23:07.108Z"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3300",
+          "frame": {
+            "method": "acpx/turn",
+            "params": {
+              "phase": "idle",
+              "at": "2026-10-10T19:23:07.117Z"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3301",
+          "frame": {
+            "method": "acpx/received",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a126ee:L3302",
+          "frame": {
+            "method": "acpx/turn",
+            "params": {
+              "phase": "active",
+              "at": "2026-10-10T19:23:10.581Z"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3303",
+          "frame": {
+            "id": 1000000,
+            "method": "initialize",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a126ee:L3304",
+          "frame": {
+            "id": 1000000,
+            "result": {}
+          }
+        },
+        {
+          "src": "01a126ee:L3305",
+          "frame": {
+            "id": 1000001,
+            "method": "session/resume",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a126ee:L3306",
+          "frame": {
+            "id": 1000001,
+            "result": {}
+          }
+        },
+        {
+          "src": "01a126ee:L3307",
+          "frame": {
+            "id": 1000002,
+            "method": "session/set_model",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a126ee:L3308",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "available_commands_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3309",
+          "frame": {
+            "id": 1000002,
+            "result": {}
+          }
+        },
+        {
+          "src": "01a126ee:L3310",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "3d884271-0b07-4b00-9fe3-025caf29c735",
+              "requestId": "2bf82ed2-52d2-485f-8713-3227b8a436ab",
+              "phase": "accepted",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "",
+                "detailCode": ""
+              },
+              "at": "2026-10-10T19:23:12.463Z"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3311",
+          "frame": {
+            "id": 1000003,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "3d884271-0b07-4b00-9fe3-025caf29c735"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3312",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "session_info_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3313",
+          "frame": {
+            "method": "acpx/received",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a126ee:L3314",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "c0855387-dc07-4e22-8be1-a077df16c8ef",
+              "requestId": "19e1f29d-4380-4036-80a1-4ec889820990",
+              "phase": "accepted",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "",
+                "detailCode": ""
+              },
+              "at": "2026-10-10T19:23:16.574Z"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3315",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                  "type": "text",
+                  "text": "The"
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3327",
+          "frame": {
+            "id": 1000004,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "c0855387-dc07-4e22-8be1-a077df16c8ef"
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3328",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                  "type": "text",
+                  "text": " files"
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3346",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-4467e542-03db-404c-be13-2b8d8ad3169c",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3347",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-4467e542-03db-404c-be13-2b8d8ad3169c",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3348",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 18344,
+                      "cacheRead": 110464,
+                      "cacheWrite": 0,
+                      "output": 189,
+                      "reasoning": 15
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3349",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3350",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-25045d55-b33d-416f-87e5-44414d5812e8",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3351",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-25045d55-b33d-416f-87e5-44414d5812e8",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3352",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 652,
+                      "cacheRead": 128640,
+                      "cacheWrite": 0,
+                      "output": 109,
+                      "reasoning": 0
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3353",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-e20711cf-8db6-46e8-b9af-0c4d1e9f4fe7",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3354",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-e20711cf-8db6-46e8-b9af-0c4d1e9f4fe7",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3355",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-687577f0-4cbf-4e93-b0bb-f3d1176a8e0f",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3356",
+          "frame": {
+            "method": "acpxui/message_sent",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a126ee:L3357",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-687577f0-4cbf-4e93-b0bb-f3d1176a8e0f"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3358",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-687577f0-4cbf-4e93-b0bb-f3d1176a8e0f",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3359",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 3820,
+                      "cacheRead": 129152,
+                      "cacheWrite": 0,
+                      "output": 594,
+                      "reasoning": 59
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3360",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-e03a0589-281b-4c7d-b015-7774023462a2",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126ee:L3361",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "c0855387-dc07-4e22-8be1-a077df16c8ef",
+              "requestId": "19e1f29d-4380-4036-80a1-4ec889820990",
+              "phase": "failed",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "delivery outcome unknown — the message may have …",
+                "detailCode": "ABSORBED_TURN_NEVER_ENDED"
+              },
+              "at": "2026-10-10T19:23:44.816Z"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "N3",
+      "about": "compaction cluster: output, ONE counted completion, then three acpxUsage completions with no output and \"Context compacted.\" — cut; compaction counts never count",
+      "source": {
+        "session": "spliced",
+        "target": "ccd33157-371a-4e55-ba72-177654bef98f",
+        "lines": "01a125af:L2275-L2275, 01a125af:L2957-L2957, 01a125af:L2958-L2963, 01a126f2:L2346-L2347, 01a1261d:L3455-L3455, 01a126f2:L2348-L2348",
+        "provenance": "spliced from real frames (no contiguous real instance of this shape exists in the 2026-10-10 specimens)",
+        "note": "target ccd33157 reused as the steer identity; the cluster frames come from 01a126f2 and 01a1261d"
+      },
+      "agentCommand": "node /opt/codex-acp/dist/index.js",
+      "target": "ccd33157-371a-4e55-ba72-177654bef98f",
+      "expected": {
+        "applicable": true,
+        "kind": "steer",
+        "consumed": false,
+        "counted": 1,
+        "completionCount": 4
+      },
+      "frames": [
+        {
+          "src": "01a125af:L2275",
+          "frame": {
+            "id": 1000036,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "327cc768-6ab6-4bfc-8a9b-278b6fc8a581"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2957",
+          "frame": {
+            "id": 1000058,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "ccd33157-371a-4e55-ba72-177654bef98f"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2958",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-5c5f8254-0210-45c6-ac8e-261e85871ce2",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2959",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-5c5f8254-0210-45c6-ac8e-261e85871ce2",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2960",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-628aadd5-a7f7-45e5-ab2c-421bf9fdd58d",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2961",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-628aadd5-a7f7-45e5-ab2c-421bf9fdd58d",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2962",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 2572,
+                      "cacheRead": 483072,
+                      "cacheWrite": 0,
+                      "output": 693,
+                      "reasoning": 516
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2963",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126f2:L2346",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 17378,
+                      "cacheRead": 553600,
+                      "cacheWrite": 0,
+                      "output": 825,
+                      "reasoning": 516
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126f2:L2347",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 0,
+                      "cacheRead": 0,
+                      "cacheWrite": 0,
+                      "output": 0,
+                      "reasoning": 0
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a1261d:L3455",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 25303,
+                      "cacheRead": 11648,
+                      "cacheWrite": 0,
+                      "output": 39,
+                      "reasoning": 0
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a126f2:L2348",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                  "type": "text",
+                  "text": "Context compacted."
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "N5",
+      "about": "tool progress is not output: output, completion, then ONLY tool_call_update frames, completion, cut — cut",
+      "source": {
+        "session": "spliced",
+        "target": "ccd33157-371a-4e55-ba72-177654bef98f",
+        "lines": "01a125af:L2275-L2275, 01a125af:L2957-L2957, 01a125af:L2968-L2974",
+        "provenance": "spliced from real frames (no contiguous real instance of this shape exists in the 2026-10-10 specimens)",
+        "note": "L2968-L2974 is a real contiguous output, completion, tool_call_update×3, completion run"
+      },
+      "agentCommand": "node /opt/codex-acp/dist/index.js",
+      "target": "ccd33157-371a-4e55-ba72-177654bef98f",
+      "expected": {
+        "applicable": true,
+        "kind": "steer",
+        "consumed": false,
+        "counted": 1,
+        "completionCount": 2
+      },
+      "frames": [
+        {
+          "src": "01a125af:L2275",
+          "frame": {
+            "id": 1000036,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "327cc768-6ab6-4bfc-8a9b-278b6fc8a581"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2957",
+          "frame": {
+            "id": 1000058,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "ccd33157-371a-4e55-ba72-177654bef98f"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2968",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-45fd185c-b8ea-4307-b670-a5082a55891d",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2969",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 6760,
+                      "cacheRead": 485504,
+                      "cacheWrite": 0,
+                      "output": 2195,
+                      "reasoning": 1552
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2970",
+          "frame": {
+            "method": "acpxui/message_sent",
+            "params": {}
+          }
+        },
+        {
+          "src": "01a125af:L2971",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-45fd185c-b8ea-4307-b670-a5082a55891d"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2972",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-45fd185c-b8ea-4307-b670-a5082a55891d"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2973",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-45fd185c-b8ea-4307-b670-a5082a55891d",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2974",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 2583,
+                      "cacheRead": 492032,
+                      "cacheWrite": 0,
+                      "output": 557,
+                      "reasoning": 516
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "N8",
+      "about": "\"Context compacted.\" alone is not output: output, ONE counted completion, \"Context compacted.\", completion, cut — cut",
+      "source": {
+        "session": "spliced",
+        "target": "ccd33157-371a-4e55-ba72-177654bef98f",
+        "lines": "01a125af:L2275-L2275, 01a125af:L2957-L2957, 01a1261d:L3450-L3455",
+        "provenance": "spliced from real frames (no contiguous real instance of this shape exists in the 2026-10-10 specimens)",
+        "note": "01a1261d L3450-L3455 is a real contiguous tool_call, completion, \"Context compacted.\", completion run"
+      },
+      "agentCommand": "node /opt/codex-acp/dist/index.js",
+      "target": "ccd33157-371a-4e55-ba72-177654bef98f",
+      "expected": {
+        "applicable": true,
+        "kind": "steer",
+        "consumed": false,
+        "counted": 1,
+        "completionCount": 2
+      },
+      "frames": [
+        {
+          "src": "01a125af:L2275",
+          "frame": {
+            "id": 1000036,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "327cc768-6ab6-4bfc-8a9b-278b6fc8a581"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2957",
+          "frame": {
+            "id": 1000058,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "ccd33157-371a-4e55-ba72-177654bef98f"
+            }
+          }
+        },
+        {
+          "src": "01a1261d:L3450",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-605d88f9-fc5f-49d6-ba4f-9123feb53893",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a1261d:L3451",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-faa2b583-b189-42c5-893e-2a4e4ee10b2d"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a1261d:L3452",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-faa2b583-b189-42c5-893e-2a4e4ee10b2d",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a1261d:L3453",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 0,
+                      "cacheRead": 0,
+                      "cacheWrite": 0,
+                      "output": 0,
+                      "reasoning": 0
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a1261d:L3454",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                  "type": "text",
+                  "text": "Context compacted."
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a1261d:L3455",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 25303,
+                      "cacheRead": 11648,
+                      "cacheWrite": 0,
+                      "output": 39,
+                      "reasoning": 0
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "N6",
+      "about": "a real Claude stream (84955ea5) with output and usage_update frames after a steer — the rule does not apply",
+      "source": {
+        "session": "84955ea5-96df-4121-892c-5698e9884fd1",
+        "target": "2bd8ac19-30db-4173-b9e1-96ecfa4cf269",
+        "lines": "L1290-L1345",
+        "provenance": "real, contiguous"
+      },
+      "agentCommand": "node /opt/claude-agent-acp/dist/index.js",
+      "target": "2bd8ac19-30db-4173-b9e1-96ecfa4cf269",
+      "expected": {
+        "applicable": false
+      },
+      "frames": [
+        {
+          "src": "84955ea5:L1290",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "toolu_01PU7iKae3uQYdzsFtW8a6qw"
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1291",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "toolu_01PU7iKae3uQYdzsFtW8a6qw",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1292",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1293",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {
+                  "type": "text",
+                  "text": ""
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1296",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                  "type": "text",
+                  "text": ""
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1297",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "toolu_01Tz2WDxtCR3s5uVWiLT7LV4",
+                "status": "pending"
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1298",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "toolu_01Tz2WDxtCR3s5uVWiLT7LV4"
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1299",
+          "frame": {
+            "id": 72,
+            "method": "session/request_permission",
+            "params": {}
+          }
+        },
+        {
+          "src": "84955ea5:L1300",
+          "frame": {
+            "id": 72,
+            "result": {}
+          }
+        },
+        {
+          "src": "84955ea5:L1301",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1302",
+          "frame": {
+            "method": "acpx/received",
+            "params": {}
+          }
+        },
+        {
+          "src": "84955ea5:L1303",
+          "frame": {
+            "method": "acpx/delivery",
+            "params": {
+              "messageId": "2bd8ac19-30db-4173-b9e1-96ecfa4cf269",
+              "requestId": "ff985865-9b49-4128-b0ea-c349258ad856",
+              "phase": "accepted",
+              "stopReason": null,
+              "error": {
+                "code": 0,
+                "message": "",
+                "detailCode": ""
+              },
+              "at": "2026-10-10T22:03:57.373Z"
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1304",
+          "frame": {
+            "id": 1000005,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "2bd8ac19-30db-4173-b9e1-96ecfa4cf269"
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1305",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "toolu_01Tz2WDxtCR3s5uVWiLT7LV4"
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1306",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "toolu_01Tz2WDxtCR3s5uVWiLT7LV4"
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1307",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "toolu_01Tz2WDxtCR3s5uVWiLT7LV4",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1308",
+          "frame": {
+            "id": 1000004,
+            "result": {
+              "stopReason": "end_turn"
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1309",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1310",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {
+                  "type": "text",
+                  "text": ""
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1317",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                  "type": "text",
+                  "text": ""
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1318",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {
+                  "type": "text",
+                  "text": ""
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1336",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                  "type": "text",
+                  "text": ""
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1337",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "toolu_01XBqEx6wJGbLgZVVnQR6GyE",
+                "status": "pending"
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1338",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "toolu_01XBqEx6wJGbLgZVVnQR6GyE"
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1339",
+          "frame": {
+            "id": 73,
+            "method": "session/request_permission",
+            "params": {}
+          }
+        },
+        {
+          "src": "84955ea5:L1340",
+          "frame": {
+            "id": 73,
+            "result": {}
+          }
+        },
+        {
+          "src": "84955ea5:L1341",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1342",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "toolu_01XBqEx6wJGbLgZVVnQR6GyE"
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1343",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "toolu_01XBqEx6wJGbLgZVVnQR6GyE"
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1344",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "toolu_01XBqEx6wJGbLgZVVnQR6GyE",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "84955ea5:L1345",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
