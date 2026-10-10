@@ -40,6 +40,13 @@ export const TURN_WATCHDOG_EVENT_METHOD = "acpx/turn-watchdog";
 // `session/prompt` (`_claude/promptId`). It is what arms the Claude watchdog; it is chrome, not
 // agent output.
 export const CLAUDE_PROMPT_LIFECYCLE_METHOD = "_claude/promptLifecycle";
+// brick cec4c064 — claude-agent-acp's live background-task set (async Agent helpers,
+// `run_in_background` commands, Monitors), sent whenever it changes. acpx-ui reads it to tell
+// a healthy wait on a helper from a stuck turn, so it must never count as the agent's output:
+// a membership change is not progress, and counting it would reset the silence clock the
+// stalled verdict rests on. (It is not a `session/update`, so the turn watchdog's post-arm
+// frame count, `updatesAfterArm`, never counts it either.)
+export const CLAUDE_BACKGROUND_TASKS_METHOD = "_claude/backgroundTasks";
 export const ACTIVITY_NEUTRAL_EVENT_METHODS = new Set([
   ACTIVITY_NEUTRAL_EVENT_METHOD,
   DELIVERY_EVENT_METHOD,
@@ -47,6 +54,7 @@ export const ACTIVITY_NEUTRAL_EVENT_METHODS = new Set([
   RECEIVED_EVENT_METHOD,
   TURN_WATCHDOG_EVENT_METHOD,
   CLAUDE_PROMPT_LIFECYCLE_METHOD,
+  CLAUDE_BACKGROUND_TASKS_METHOD,
 ]);
 
 export function isActivityNeutralEventMessage(message: AcpJsonRpcMessage): boolean {
