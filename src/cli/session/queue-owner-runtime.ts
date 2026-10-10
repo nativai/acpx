@@ -636,6 +636,7 @@ async function replaceSharedClientAfterSwitch(params: {
   liveBackgroundTasks: number;
 }): Promise<AcpClient | undefined> {
   const { options } = params;
+  const startedAt = Date.now();
   let replacement: AcpClient;
   try {
     replacement = await createQueueOwnerSharedClient(
@@ -649,11 +650,15 @@ async function replaceSharedClientAfterSwitch(params: {
     );
     return undefined;
   }
+  await params.current.close().catch(() => {});
+  // The time this adds to the turn: building the client spawns nothing (the adapter
+  // starts when the turn connects, as on any cold owner); closing the old one costs
+  // nothing on a cold owner and one graceful adapter exit on a warm one.
   process.stderr.write(
     `[acpx] queue owner switched session ${options.sessionId} to ${params.newProfileId} before the turn ` +
-      `(by ${params.trigger}); replacing its adapter client, killing ${params.liveBackgroundTasks} live background task(s)\n`,
+      `(by ${params.trigger}); replaced its adapter client in ${Date.now() - startedAt} ms, ` +
+      `killing ${params.liveBackgroundTasks} live background task(s)\n`,
   );
-  await params.current.close().catch(() => {});
   return replacement;
 }
 
@@ -718,6 +723,8 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   // (replaceSharedClient below). Every closure here reads the binding, never a copy.
   let sharedClient = await createQueueOwnerSharedClient(options, sessionRecord);
   const backgroundTasks = createBackgroundTaskTracker();
+  const observeBackgroundTasks = (message: unknown) => backgroundTasks.observe("inbound", message);
+  let stopObservingBackgroundTasks = sharedClient.observeInbound(observeBackgroundTasks);
   let recycleReason: string | undefined;
   const ttlMs = normalizeQueueOwnerTtlMs(options.ttlMs);
   // W13-24-14 Phase 2 — memory-release idle timeout (ms), read from env at owner
@@ -1005,7 +1012,6 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           // Stamp inter-turn activity so the idle loop's quiescence gate keeps a
           // quietly-relaying owner warm (never recycles it mid background work).
           lastIdleDrainActivityAt = Date.now();
-          backgroundTasks.observe(_dir, message);
           pendingIdle.push(message);
 
           const msg = message as Record<string, unknown>;
@@ -1229,7 +1235,6 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
                 turnController.markPromptActive();
                 await applyPendingCancel();
               },
-              onAcpMessage: backgroundTasks.observe,
               liveBackgroundTaskCount: backgroundTasks.liveCount,
               replaceSharedClient: async (newProfileId, trigger) => {
                 const replaced = await replaceSharedClientAfterSwitch({
@@ -1240,8 +1245,11 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
                   liveBackgroundTasks: backgroundTasks.liveCount(),
                 });
                 if (replaced) {
+                  stopObservingBackgroundTasks();
                   sharedClient = replaced;
                   backgroundTasks.reset();
+                  stopObservingBackgroundTasks =
+                    sharedClient.observeInbound(observeBackgroundTasks);
                 }
                 return replaced;
               },

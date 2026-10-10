@@ -837,6 +837,12 @@ export class AcpClient {
     | "onClientOperation"
     | "onPermissionEscalation"
   >;
+  // brick://3356183e: inbound wire observers that setEventHandlers/clearEventHandlers
+  // never touch. The handlers are swapped per turn and cleared between a turn and the
+  // owner's idle drain, so a frame in that window reaches no handler at all; a
+  // consumer that must see EVERY frame (the owner's live background-task count)
+  // observes here instead.
+  private readonly inboundObservers = new Set<(message: AnyMessage) => void>();
   private readonly permissionStats: PermissionStats = {
     requested: 0,
     approved: 0,
@@ -1109,6 +1115,14 @@ export class AcpClient {
 
   clearEventHandlers(): void {
     this.eventHandlers = {};
+  }
+
+  /** Observe every inbound wire frame the handlers would see, across handler swaps. */
+  observeInbound(observer: (message: AnyMessage) => void): () => void {
+    this.inboundObservers.add(observer);
+    return () => {
+      this.inboundObservers.delete(observer);
+    };
   }
 
   updateRuntimeOptions(options: {
@@ -1872,6 +1886,7 @@ export class AcpClient {
   } {
     const onAcpMessage = () => this.eventHandlers.onAcpMessage;
     const onAcpOutputMessage = () => this.eventHandlers.onAcpOutputMessage;
+    const inboundObservers = this.inboundObservers;
 
     const shouldSuppressInboundReplaySessionUpdate = (message: AnyMessage): boolean => {
       return this.suppressReplaySessionUpdateMessages && isSessionUpdateNotification(message);
@@ -1892,6 +1907,9 @@ export class AcpClient {
             if (!shouldSuppressInboundReplaySessionUpdate(value)) {
               onAcpOutputMessage()?.("inbound", value);
               onAcpMessage()?.("inbound", value);
+              for (const observer of inboundObservers) {
+                observer(value);
+              }
             }
             controller.enqueue(value);
           }

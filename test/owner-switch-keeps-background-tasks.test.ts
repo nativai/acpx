@@ -321,7 +321,10 @@ test("warm owner, no live task: the switching turn's own background task survive
       );
       assert.equal(await ownerPid(rig, id), warmOwner, "the warm owner was kept, not recycled");
       const log = await readText(sessionFile(rig, id, ".owner.log"));
-      assert.match(log, /to target before the turn \(by selection\).*killing 0 live background/u);
+      assert.match(
+        log,
+        /to target before the turn \(by selection\); replaced its adapter client in \d+ ms, killing 0 live background/u,
+      );
       assert.doesNotMatch(log, /queue owner recycling session/u);
     } finally {
       await closeSession(rig, id);
@@ -334,7 +337,9 @@ test("warm owner WITH a live task: selection defers, no switch, and the task com
     const id = await newSession(rig, { autoSubscription: true });
     try {
       rig.setProbesUp(false);
-      await prompt(rig, id, "bg-task 4000 live3");
+      // Long enough to complete AFTER turn 2, while the owner's idle drain writes the
+      // stream: frames between a turn and the idle drain reach no stream writer.
+      await prompt(rig, id, "bg-task 9000 live3");
       const warmOwner = await ownerPid(rig, id);
       assert.notEqual(warmOwner, null);
       assert.equal((await readRecord(rig, id)).acpx?.session_options?.profile, "dflt");

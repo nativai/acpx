@@ -4,8 +4,15 @@
 // selection for the owner's whole life. Every frame below is the wire shape
 // claude-agent-acp actually sends (main 116f845d / dev, and Surface B cec4c064).
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { AcpClient } from "../src/acp/client.js";
 import { createBackgroundTaskTracker } from "../src/cli/session/background-task-tracker.js";
+
+const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 
 function toolUpdate(toolCallId: string, claudeCode: Record<string, unknown>): unknown {
   return {
@@ -126,4 +133,41 @@ test("reset forgets every task: the adapter that held them was closed", () => {
   tracker.observe("inbound", bashStarted("toolu_a", "t1"));
   tracker.reset();
   assert.equal(tracker.liveCount(), 0);
+});
+
+// The owner feeds the tracker from AcpClient.observeInbound because its event
+// handlers are CLEARED between a turn and the idle drain: a completion landing in
+// that window reaches no handler, and a tracker fed from handlers would hold a
+// phantom live task that defers selection for the owner's whole life. Real adapter
+// process (the mock), real wire; the handler capture is the negative control.
+test("observeInbound sees a completion that lands while no event handler is set", async () => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-observe-inbound-"));
+  const client = new AcpClient({
+    agentCommand: `${JSON.stringify(process.execPath)} ${JSON.stringify(MOCK_AGENT_PATH)}`,
+    cwd,
+    permissionMode: "approve-all",
+  });
+  const observed: unknown[] = [];
+  const handled: unknown[] = [];
+  try {
+    client.observeInbound((message) => observed.push(message));
+    client.setEventHandlers({ onAcpMessage: (_direction, message) => handled.push(message) });
+    await client.start();
+    const { sessionId } = await client.createSession(cwd);
+    await client.prompt(sessionId, "bg-task 300 obs1");
+    client.clearEventHandlers();
+    await new Promise((resolve) => setTimeout(resolve, 900));
+
+    const isCompletion = (message: unknown) => JSON.stringify(message).includes('"task_completed"');
+    assert.equal(handled.some(isCompletion), false, "control: the cleared handler saw nothing");
+    assert.equal(observed.some(isCompletion), true, "the observer saw the completion");
+    const tracker = createBackgroundTaskTracker();
+    for (const message of observed) {
+      tracker.observe("inbound", message);
+    }
+    assert.equal(tracker.liveCount(), 0, "start and end both reached the tracker");
+  } finally {
+    await client.close();
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
 });
