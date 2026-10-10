@@ -1228,6 +1228,23 @@ class MockAgent implements Agent {
       }
     }
 
+    // brick://3356183e — `rate-limited-on <dir>`: the prompt fails with a subscription
+    // limit, but only on the adapter whose CLAUDE_CONFIG_DIR ends with `<dir>`; the
+    // handler then serves it normally. Drives REACTIVE failover between subscriptions.
+    if (
+      text.startsWith("rate-limited-on ") &&
+      (process.env.CLAUDE_CONFIG_DIR ?? "").endsWith(text.slice("rate-limited-on ".length).trim())
+    ) {
+      if (session.pendingPrompt === promptAbort) {
+        session.pendingPrompt = undefined;
+      }
+      // The adapter's own shape: JSON-RPC -32603 whose `data.errorKind` names the cause.
+      throw new RequestError(-32603, "Internal error", {
+        errorKind: "rate_limit",
+        details: "You've hit your usage limit",
+      });
+    }
+
     if (text === "retryable-error-once") {
       const attempts = session.transientPromptAttempts[text] ?? 0;
       session.transientPromptAttempts[text] = attempts + 1;
@@ -1426,6 +1443,61 @@ class MockAgent implements Agent {
     }, scheduledDelay);
   }
 
+  // brick://3356183e — `bg-task <ms> <taskId>`: a `run_in_background` Bash, on the
+  // wire exactly as claude-agent-acp (main) carries one. The start is the tool's own
+  // result (`toolResponse.backgroundTaskId`); the turn ends; `<ms>` later the
+  // completion arrives as the legacy `task_completed` shape (`toolName: "Agent"`,
+  // `subagentId` = task id) — but only if THIS adapter process is still alive, which
+  // is the whole question the owner rows ask.
+  private async startBackgroundTask(sessionId: SessionId, args: string): Promise<string> {
+    const [rawMs, taskId] = args.trim().split(/\s+/u);
+    const delayMs = Number(rawMs);
+    if (!Number.isFinite(delayMs) || delayMs < 0 || !taskId) {
+      throw new Error("Usage: bg-task <milliseconds> <taskId>");
+    }
+    const toolCallId = `toolu_${taskId}`;
+    await this.connection.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: "Bash",
+        kind: "execute",
+        status: "pending",
+        rawInput: {},
+        _meta: { claudeCode: { toolName: "Bash" } },
+      },
+    });
+    await this.connection.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId,
+        _meta: {
+          claudeCode: {
+            toolName: "Bash",
+            toolResponse: { stdout: "", stderr: "", interrupted: false, backgroundTaskId: taskId },
+          },
+        },
+      },
+    });
+    setTimeout(() => {
+      void this.connection
+        .sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId,
+            _meta: {
+              claudeCode: { toolName: "Agent", status: "task_completed", subagentId: taskId },
+            },
+          },
+        })
+        .catch(() => {});
+    }, Math.round(delayMs));
+    return `started ${taskId}`;
+  }
+
   private ensureSession(sessionId: SessionId): SessionState {
     let session = this.sessions.get(sessionId);
     if (!session) {
@@ -1458,6 +1530,13 @@ class MockAgent implements Agent {
     }
     if (text === "retryable-error-once") {
       return "recovered after retry";
+    }
+
+    if (text.startsWith("bg-task ")) {
+      return await this.startBackgroundTask(sessionId, text.slice("bg-task ".length));
+    }
+    if (text.startsWith("rate-limited-on ")) {
+      return "served after failover";
     }
 
     if (text.startsWith("late-tool ")) {
