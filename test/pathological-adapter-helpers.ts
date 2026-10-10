@@ -154,6 +154,8 @@ export type PathologicalControl = {
   ) => void;
   /** brick a147982f — the `_claude/promptId` of the latest MAIN prompt (undefined if none sent). */
   mainPromptId: () => string | undefined;
+  /** brick cec4c064 — a `_claude/backgroundTasks` notification through the inbound wire tap. */
+  emitBackgroundTasks: (tasks: Array<Record<string, unknown>>) => void;
   /** Push the CODEX end-of-turn marker (493729fc F2) through the same tap. */
   emitCodexTurnEndMarker: (reason?: string) => void;
   /** Settle the withheld MAIN prompt (models the adapter finally responding). */
@@ -225,6 +227,14 @@ export function makePathologicalClient(config: {
         lastTurnEndReason: options.lastTurnEndReason,
       }),
     );
+  };
+
+  const emitBackgroundTasks = (tasks: Array<Record<string, unknown>>): void => {
+    handlers.onAcpMessage?.("inbound", {
+      jsonrpc: "2.0",
+      method: "_claude/backgroundTasks",
+      params: { sessionId: config.acpSessionId, at: new Date().toISOString(), tasks },
+    });
   };
 
   const emitCodexTurnEndMarker = (reason = "end_turn"): void => {
@@ -301,6 +311,7 @@ export function makePathologicalClient(config: {
     emitSessionUpdate,
     emitPromptLifecycle,
     mainPromptId: () => latestMainPromptId,
+    emitBackgroundTasks,
     emitCodexTurnEndMarker,
     resolveMainPrompt: (response) => mainRelease.resolve(response),
     rejectMainPrompt: (error) => mainRelease.reject(error),

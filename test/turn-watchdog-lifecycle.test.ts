@@ -343,6 +343,35 @@ test("X3 bracket: frames that only answer the watchdog's cancel keep it a recove
   assert.equal((terminal.error as { detailCode?: string }).detailCode, "");
 });
 
+// brick cec4c064 — `_claude/backgroundTasks` after arming is not post-arm output. The adapter
+// sends it whenever the background set changes, including while the turn is ending (a helper
+// finishing empties the set). It is not a `session/update`, so it must leave `updatesAfterArm`
+// at zero and the cancel a recovery — exactly P10's verdict. N6 is the paired control: a real
+// `session/update` in the same position turns the same cancel into a cut.
+test("X3 bg: _claude/backgroundTasks after arming is not post-arm output — the cancel stays a recovery", async () => {
+  const observation = await runClaudeTurn({
+    messageId: "x3c00000-0000-4000-8000-000000000000",
+    setup: (control) => cancelResolvesPrompt(control, "cancelled"),
+    drive: async (control) => {
+      emitClaudeTurnEnd(control, "lost-response");
+      control.emitBackgroundTasks([
+        {
+          taskId: "a1",
+          taskType: "local_agent",
+          description: "background helper",
+          startedAt: new Date().toISOString(),
+        },
+      ]);
+      control.emitBackgroundTasks([]);
+    },
+  });
+  assert.ok(observation.control.cancelCount() >= 1, "tier 1 sent a cancel");
+  const terminal = onlyTerminal(observation);
+  assert.equal(terminal.phase, "done");
+  assert.equal(terminal.stopReason, "end_turn");
+  assert.equal(terminal.recoveredBy, "turn-watchdog");
+});
+
 // --- committed negative rows ------------------------------------------------
 
 // N1 — TODAY's adapter: the unattributed `_claude/lastTurnEndReason` usage_update marker
