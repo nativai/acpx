@@ -8,8 +8,9 @@
 // every vector, and a one-sided edit reds a suite.
 //
 // The rule:
-//   - a MODEL-OUTPUT frame is a `session/update` whose `sessionUpdate` is `agent_message_chunk` (except the
-//     literal "Context compacted."), `agent_thought_chunk`, or `tool_call`;
+//   - a MODEL-OUTPUT frame is a `session/update` whose `sessionUpdate` is `agent_message_chunk`,
+//     `agent_thought_chunk`, or `tool_call` — except one whose `content.text` starts with a prefix codex-acp
+//     uses for a notice it SYNTHESIZES itself (`SYNTHESIZED_TEXT_PREFIXES`);
 //   - a COMPLETION frame is a `session/update` `usage_update` carrying `_meta.acpxUsage` — codex-acp emits
 //     exactly one per completed model request, after that request's tools resolved;
 //   - a completion COUNTS only if a model-output frame lies between it and the previous counted completion
@@ -29,7 +30,20 @@ export const CONSUMED_BEFORE_CUT = "consumed_before_cut" as const;
 export const CONSUMED_BEFORE_CUT_INFERRED = "consumed_before_cut_inferred" as const;
 export const CONSUMED_BEFORE_CUT_BACKFILL = "consumed_before_cut_backfill" as const;
 
-export const COMPACTION_NOTICE_TEXT = "Context compacted.";
+// Text codex-acp writes into output-typed frames itself — compaction, warning, reroute, interrupt and
+// stream-retry notices (CONCEPTION §3; `evidence/analyze-steers.mjs`). None of it is model output, and each can
+// sit inside a compaction cluster: counted as output, it would gate a compaction count into a false "consumed"
+// (fixture vectors N3, N8, N9a-d). Matched at the START of `content.text`.
+export const SYNTHESIZED_TEXT_PREFIXES: readonly string[] = [
+  "Context compacted.",
+  "*Context compacted",
+  "Warning: ",
+  "Config warning: ",
+  "Guardian warning: ",
+  "Model rerouted from ",
+  "*Conversation interrupted*",
+  "Reconnecting",
+];
 
 export type ConsumptionKind = "main" | "steer";
 
@@ -58,7 +72,10 @@ function isModelOutput(update: SessionUpdate): boolean {
   if (typeof kind !== "string" || !OUTPUT_UPDATES.has(kind)) {
     return false;
   }
-  return !(kind === "agent_message_chunk" && update.content?.text === COMPACTION_NOTICE_TEXT);
+  const text = update.content?.text;
+  return !(
+    typeof text === "string" && SYNTHESIZED_TEXT_PREFIXES.some((prefix) => text.startsWith(prefix))
+  );
 }
 
 export function classifyConsumptionFrame(message: unknown): ConsumptionFrameClass {

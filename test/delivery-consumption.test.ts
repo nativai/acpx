@@ -50,7 +50,7 @@ import {
   CONSUMED_BEFORE_CUT_BACKFILL,
   CONSUMED_BEFORE_CUT_INFERRED,
   CONSUMPTION_NEED,
-  COMPACTION_NOTICE_TEXT,
+  SYNTHESIZED_TEXT_PREFIXES,
   type ConsumptionKind,
   ConsumptionTracker,
   classifyConsumptionFrame,
@@ -76,7 +76,7 @@ import { makeSessionRecord, withTempHome, writeSessionRecordFile } from "./runti
 
 // Over the FILE BYTES. acpx-ui asserts the same value over its vendored copy.
 const CONSUMPTION_FIXTURE_SHA256 =
-  "9669acd0b1720c124b50c7dfa77844e168c02406a320b07c298da8222afa54f1";
+  "a5e6db38ddfa1eef86d9350b3413c40ccbd0263284c2bcfc15cdd21c0bc5ad80";
 
 type Vector = {
   id: string;
@@ -98,7 +98,7 @@ type Vector = {
 type ConsumptionFixture = {
   classification: {
     outputSessionUpdates: string[];
-    excludedAgentMessageText: string;
+    excludedTextPrefixes: string[];
     completionSessionUpdate: string;
     completionMetaKey: string;
     terminalDeliveryPhases: string[];
@@ -128,7 +128,7 @@ test("e09628a1: stopReasons, note prefix, need and the compaction text are the f
   assert.equal(CONSUMED_BEFORE_CUT_BACKFILL, fixture.stopReasons.backfill);
   assert.equal(CONSUMED_BEFORE_CUT_NOTE, fixture.note.prefix);
   assert.deepEqual({ ...CONSUMPTION_NEED }, fixture.need);
-  assert.equal(COMPACTION_NOTICE_TEXT, fixture.classification.excludedAgentMessageText);
+  assert.deepEqual([...SYNTHESIZED_TEXT_PREFIXES], fixture.classification.excludedTextPrefixes);
   // None of them is a genuine completion: no zero-output warning on a consumed-at-cut done.
   for (const stopReason of [
     CONSUMED_BEFORE_CUT,
@@ -165,13 +165,25 @@ test("e09628a1: frame classification follows the fixture table — tool progress
       "output",
     );
   }
+  for (const kind of ["agent_message_chunk", "agent_thought_chunk"]) {
+    for (const prefix of fixture.classification.excludedTextPrefixes) {
+      assert.equal(
+        classifyConsumptionFrame(
+          update(kind, { content: { type: "text", text: `${prefix}tail` } }),
+        ),
+        "other",
+        `${kind} ${prefix}`,
+      );
+    }
+  }
+  // Matched at the START only: model text that merely CONTAINS a notice word is output.
   assert.equal(
     classifyConsumptionFrame(
       update("agent_message_chunk", {
-        content: { type: "text", text: fixture.classification.excludedAgentMessageText },
+        content: { type: "text", text: "I saw a Warning: in the log" },
       }),
     ),
-    "other",
+    "output",
   );
   assert.equal(
     classifyConsumptionFrame(update("tool_call_update", { status: "completed" })),

@@ -2,9 +2,18 @@
   "$comment": "R-CONSUMED — the ONE consumption rule, two implementations (brick e09628a1, CONCEPTION §3 / §6.1). Authored in acpx (test/fixtures/delivery-consumption.fixture.json) and vendored BYTE-IDENTICALLY into acpx-ui at the same path; both suites assert the same sha256 over these bytes and run every vector — acpx feeds the frames one by one through ConsumptionTracker (src/session/delivery-consumption.ts), acpx-ui runs classifyStreamConsumption (server/delivery-consumption.ts) over the batch. A one-sided edit reds a suite. DO NOT REFORMAT: the sha is over the file bytes. Frames are REAL stream frames trimmed to the fields the rule reads (text shortened, sessionId and tool payloads dropped; a run of consecutive text chunks of one kind collapsed to its first frame); each names its source session and line. Regenerate with conception/evidence tooling only from real streams — never hand-edit a frame.",
   "version": 1,
   "classification": {
-    "$comment": "A model-output frame is a session/update whose sessionUpdate is in outputSessionUpdates, except an agent_message_chunk whose text equals excludedAgentMessageText. tool_call_update is NOT output. A completion frame is a session/update with sessionUpdate completionSessionUpdate carrying _meta[completionMetaKey]. A completion counts only if a model-output frame lies between it and the previous counted completion (or the prompt frame). Counting for a message stops at its first terminal acpx/delivery frame (terminalDeliveryPhases), even one written before its prompt frame.",
+    "$comment": "A model-output frame is a session/update whose sessionUpdate is in outputSessionUpdates, except one whose content.text STARTS WITH any of excludedTextPrefixes (adapter-synthesized notices; CONCEPTION §3, evidence/analyze-steers.mjs). tool_call_update is NOT output. A completion frame is a session/update with sessionUpdate completionSessionUpdate carrying _meta[completionMetaKey]. A completion counts only if a model-output frame lies between it and the previous counted completion (or the prompt frame). Counting for a message stops at its first terminal acpx/delivery frame (terminalDeliveryPhases), even one written before its prompt frame.",
     "outputSessionUpdates": ["agent_message_chunk", "agent_thought_chunk", "tool_call"],
-    "excludedAgentMessageText": "Context compacted.",
+    "excludedTextPrefixes": [
+      "Context compacted.",
+      "*Context compacted",
+      "Warning: ",
+      "Config warning: ",
+      "Guardian warning: ",
+      "Model rerouted from ",
+      "*Conversation interrupted*",
+      "Reconnecting"
+    ],
     "completionSessionUpdate": "usage_update",
     "completionMetaKey": "acpxUsage",
     "terminalDeliveryPhases": ["done", "failed", "cancelled"]
@@ -4127,7 +4136,7 @@
       ]
     },
     {
-      "id": "N9",
+      "id": "N10",
       "about": "terminal written BEFORE its own prompt frame (01a126ee 3b8035f0, killed in the 19:23:07 adapter crash, never drained): the later turn's completions must not count — cut",
       "source": {
         "session": "01a126ee-ce0f-7eb1-bd5b-83b251ee283e",
@@ -5239,6 +5248,718 @@
                 "content": {
                   "type": "text",
                   "text": "Context compacted."
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a1261d:L3455",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 25303,
+                      "cacheRead": 11648,
+                      "cacheWrite": 0,
+                      "output": 39,
+                      "reasoning": 0
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "N9a",
+      "about": "adapter-synthesized chunk \"Warning: the model retur…\" is the only output before the second completion — cut; synthesized text is not model output",
+      "source": {
+        "session": "spliced",
+        "target": "ccd33157-371a-4e55-ba72-177654bef98f",
+        "lines": "01a125af:L2275, L2957, L2958-L2963; synthesized chunk; 01a1261d:L3455",
+        "provenance": "spliced from real frames + one synthesized notice frame",
+        "note": "CodexEventHandler.ts:376-404 warning notice"
+      },
+      "agentCommand": "node /opt/codex-acp/dist/index.js",
+      "target": "ccd33157-371a-4e55-ba72-177654bef98f",
+      "expected": {
+        "applicable": true,
+        "kind": "steer",
+        "consumed": false,
+        "counted": 1,
+        "completionCount": 2
+      },
+      "frames": [
+        {
+          "src": "01a125af:L2275",
+          "frame": {
+            "id": 1000036,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "327cc768-6ab6-4bfc-8a9b-278b6fc8a581"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2957",
+          "frame": {
+            "id": 1000058,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "ccd33157-371a-4e55-ba72-177654bef98f"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2958",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-5c5f8254-0210-45c6-ac8e-261e85871ce2",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2959",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-5c5f8254-0210-45c6-ac8e-261e85871ce2",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2960",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-628aadd5-a7f7-45e5-ab2c-421bf9fdd58d",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2961",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-628aadd5-a7f7-45e5-ab2c-421bf9fdd58d",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2962",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 2572,
+                      "cacheRead": 483072,
+                      "cacheWrite": 0,
+                      "output": 693,
+                      "reasoning": 516
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2963",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "synthesized (CodexEventHandler.ts:376-404 warning notice)",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                  "type": "text",
+                  "text": "Warning: the model returned a partial response"
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a1261d:L3455",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 25303,
+                      "cacheRead": 11648,
+                      "cacheWrite": 0,
+                      "output": 39,
+                      "reasoning": 0
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "N9b",
+      "about": "adapter-synthesized chunk \"Reconnecting... 1/5…\" is the only output before the second completion — cut; synthesized text is not model output",
+      "source": {
+        "session": "spliced",
+        "target": "ccd33157-371a-4e55-ba72-177654bef98f",
+        "lines": "01a125af:L2275, L2957, L2958-L2963; synthesized chunk; 01a1261d:L3455",
+        "provenance": "spliced from real frames + one synthesized notice frame",
+        "note": "CodexEventHandler.ts:600-613 createErrorEvent stream-retry notice"
+      },
+      "agentCommand": "node /opt/codex-acp/dist/index.js",
+      "target": "ccd33157-371a-4e55-ba72-177654bef98f",
+      "expected": {
+        "applicable": true,
+        "kind": "steer",
+        "consumed": false,
+        "counted": 1,
+        "completionCount": 2
+      },
+      "frames": [
+        {
+          "src": "01a125af:L2275",
+          "frame": {
+            "id": 1000036,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "327cc768-6ab6-4bfc-8a9b-278b6fc8a581"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2957",
+          "frame": {
+            "id": 1000058,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "ccd33157-371a-4e55-ba72-177654bef98f"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2958",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-5c5f8254-0210-45c6-ac8e-261e85871ce2",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2959",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-5c5f8254-0210-45c6-ac8e-261e85871ce2",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2960",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-628aadd5-a7f7-45e5-ab2c-421bf9fdd58d",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2961",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-628aadd5-a7f7-45e5-ab2c-421bf9fdd58d",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2962",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 2572,
+                      "cacheRead": 483072,
+                      "cacheWrite": 0,
+                      "output": 693,
+                      "reasoning": 516
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2963",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "synthesized (CodexEventHandler.ts:600-613 createErrorEvent stream-retry notice)",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                  "type": "text",
+                  "text": "Reconnecting... 1/5"
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a1261d:L3455",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 25303,
+                      "cacheRead": 11648,
+                      "cacheWrite": 0,
+                      "output": 39,
+                      "reasoning": 0
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "N9c",
+      "about": "adapter-synthesized chunk \"*Context compacted to fi…\" is the only output before the second completion — cut; synthesized text is not model output",
+      "source": {
+        "session": "spliced",
+        "target": "ccd33157-371a-4e55-ba72-177654bef98f",
+        "lines": "01a125af:L2275, L2957, L2958-L2963; synthesized chunk; 01a1261d:L3455",
+        "provenance": "spliced from real frames + one synthesized notice frame",
+        "note": "CodexEventHandler.ts:268-275 compaction notice"
+      },
+      "agentCommand": "node /opt/codex-acp/dist/index.js",
+      "target": "ccd33157-371a-4e55-ba72-177654bef98f",
+      "expected": {
+        "applicable": true,
+        "kind": "steer",
+        "consumed": false,
+        "counted": 1,
+        "completionCount": 2
+      },
+      "frames": [
+        {
+          "src": "01a125af:L2275",
+          "frame": {
+            "id": 1000036,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "327cc768-6ab6-4bfc-8a9b-278b6fc8a581"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2957",
+          "frame": {
+            "id": 1000058,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "ccd33157-371a-4e55-ba72-177654bef98f"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2958",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-5c5f8254-0210-45c6-ac8e-261e85871ce2",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2959",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-5c5f8254-0210-45c6-ac8e-261e85871ce2",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2960",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-628aadd5-a7f7-45e5-ab2c-421bf9fdd58d",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2961",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-628aadd5-a7f7-45e5-ab2c-421bf9fdd58d",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2962",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 2572,
+                      "cacheRead": 483072,
+                      "cacheWrite": 0,
+                      "output": 693,
+                      "reasoning": 516
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2963",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "synthesized (CodexEventHandler.ts:268-275 compaction notice)",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                  "type": "text",
+                  "text": "*Context compacted to fit the model context window*"
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a1261d:L3455",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 25303,
+                      "cacheRead": 11648,
+                      "cacheWrite": 0,
+                      "output": 39,
+                      "reasoning": 0
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "N9d",
+      "about": "adapter-synthesized chunk \"Model rerouted from gpt-…\" is the only output before the second completion — cut; synthesized text is not model output",
+      "source": {
+        "session": "spliced",
+        "target": "ccd33157-371a-4e55-ba72-177654bef98f",
+        "lines": "01a125af:L2275, L2957, L2958-L2963; synthesized chunk; 01a1261d:L3455",
+        "provenance": "spliced from real frames + one synthesized notice frame",
+        "note": "CodexEventHandler.ts:406-415 reroute notice (a thought chunk)"
+      },
+      "agentCommand": "node /opt/codex-acp/dist/index.js",
+      "target": "ccd33157-371a-4e55-ba72-177654bef98f",
+      "expected": {
+        "applicable": true,
+        "kind": "steer",
+        "consumed": false,
+        "counted": 1,
+        "completionCount": 2
+      },
+      "frames": [
+        {
+          "src": "01a125af:L2275",
+          "frame": {
+            "id": 1000036,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "327cc768-6ab6-4bfc-8a9b-278b6fc8a581"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2957",
+          "frame": {
+            "id": 1000058,
+            "method": "session/prompt",
+            "params": {
+              "prompt": [
+                {
+                  "type": "text",
+                  "text": "[message from acpx seat https://atrium.d…"
+                }
+              ],
+              "messageId": "ccd33157-371a-4e55-ba72-177654bef98f"
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2958",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-5c5f8254-0210-45c6-ac8e-261e85871ce2",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2959",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-5c5f8254-0210-45c6-ac8e-261e85871ce2",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2960",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "exec-628aadd5-a7f7-45e5-ab2c-421bf9fdd58d",
+                "status": "in_progress"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2961",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "exec-628aadd5-a7f7-45e5-ab2c-421bf9fdd58d",
+                "status": "completed"
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2962",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update",
+                "_meta": {
+                  "acpxUsage": {
+                    "unit": {
+                      "model": "gpt-6.1-sol",
+                      "input": 2572,
+                      "cacheRead": 483072,
+                      "cacheWrite": 0,
+                      "output": 693,
+                      "reasoning": 516
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "src": "01a125af:L2963",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "usage_update"
+              }
+            }
+          }
+        },
+        {
+          "src": "synthesized (CodexEventHandler.ts:406-415 reroute notice (a thought chunk))",
+          "frame": {
+            "method": "session/update",
+            "params": {
+              "update": {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {
+                  "type": "text",
+                  "text": "Model rerouted from gpt-6.1-sol to gpt-6.1-sol-mini"
                 }
               }
             }
