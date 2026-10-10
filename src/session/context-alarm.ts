@@ -15,6 +15,10 @@
  * - **Unknown window ⇒ window 0, usage 0 %, no alarm** — and no "unconfirmed" wording.
  * - **Once per crossing**: speaks once when the fill crosses; re-arms only when the fill
  *   drops below half the alarm point (a compaction), never on an estimate's correction.
+ * - **Cleared, once**: that same drop, after the alarm has spoken in this holder, is the
+ *   moment the alarm no longer applies — the agent is told so once (brick bbe2bc47), because
+ *   a harness that compacts between the alarm and the handover (Codex, 10 of 16 production
+ *   alarms) otherwise leaves the agent handing over from a nearly empty context.
  *
  * Pure: no I/O here. The detector lives in the turn runtime, the delivery in the
  * mid-turn injector and the turn-context channel.
@@ -112,36 +116,42 @@ export function isPastContextAlarm(fill: ContextFill, alarm: ContextAlarm): bool
   return alarm.atTokens !== undefined && fill.used >= alarm.atTokens;
 }
 
+/** What one observation means for the agent: the alarm speaks, or it no longer applies. */
+export type ContextAlarmEvent = "crossed" | "cleared";
+
 /**
- * ONCE PER CROSSING. `observe` returns `true` exactly on the update that crosses the
- * alarm, then stays quiet while the fill stays past it.
+ * ONCE PER CROSSING. `observe` returns `"crossed"` exactly on the update that crosses the
+ * alarm, then stays quiet while the fill stays past it; and `"cleared"` exactly once, on
+ * the update that re-arms a latch that had spoken.
  *
  * 🔑 RE-ARM RULE: only a fill below HALF the alarm point re-arms it (a compaction, a
  * `/compact`, a switch to a bigger window) — or the alarm going off / the window unknown.
  * A dip just below the alarm is an ESTIMATE CORRECTING ITSELF, not the fill dropping back:
  * codex-acp's err-high charge crosses, the next real report lands back below, and a latch
  * that re-armed on any dip spoke five times in one turn for two real crossings (TE D2,
- * brick 4f3fa88c).
+ * brick 4f3fa88c). The same rule decides "cleared": a dip just below the alarm must NOT
+ * tell the agent its context was compacted.
  */
 export class ContextAlarmLatch {
   private spoken = false;
 
-  observe(fill: ContextFill, alarm: ContextAlarm): boolean {
+  observe(fill: ContextFill, alarm: ContextAlarm): ContextAlarmEvent | undefined {
     if (alarm.atTokens === undefined) {
       this.spoken = false;
-      return false;
+      return undefined;
     }
     if (fill.used < alarm.atTokens) {
-      if (fill.used < alarm.atTokens / 2) {
+      if (fill.used < alarm.atTokens / 2 && this.spoken) {
         this.spoken = false;
+        return "cleared";
       }
-      return false;
+      return undefined;
     }
     if (this.spoken) {
-      return false;
+      return undefined;
     }
     this.spoken = true;
-    return true;
+    return "crossed";
   }
 
   /** The crossing was announced another way (the top of a turn). */
@@ -183,6 +193,21 @@ export function formatContextAlarmNotice(fill: ContextFill, alarm: ContextAlarm)
     `(${pct(contextUsedPct(fill))}) is past ${alarmClause(fill, alarm)}${compaction}.${warning} ` +
     `Finish this step, then hand over to a successor (skill: context-succession). ` +
     `Off: acpx context --alarm 0`
+  );
+}
+
+/**
+ * The one-line notice that the alarm no longer applies (brick bbe2bc47). It states what acpx
+ * observed — the fill fell far below the alarm — which stays true when the drop is a window
+ * that grew rather than a compaction. The `context-succession` skill keys on this wording.
+ */
+export function formatContextAlarmClearedNotice(fill: ContextFill): string {
+  return (
+    `${CONTEXT_ALARM_MARKER} cleared — your context is now ${tokens(fill.used)} / ` +
+    `${tokens(fill.window)} tokens (${pct(contextUsedPct(fill))}), far below your alarm: it was ` +
+    `auto-compacted (or your window grew). If you have not run "acpx sessions handover" yet, ` +
+    `do not hand over: continue your task in this session. If your successor already exists, ` +
+    `finish the handover.`
   );
 }
 

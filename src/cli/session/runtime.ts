@@ -3250,9 +3250,12 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       .observe(fill)
       .then((notice) => {
         // No injector = no turn accepting injections now (between turns, or a harness
-        // without mid-turn steering): the next turn opens with the line instead.
+        // without mid-turn steering): the next turn opens with the line instead — a
+        // crossing recomputes it from the fill, a cleared notice is held for it.
         if (notice && contextAlarmInjector) {
           contextAlarmInjector(contextAlarmTask(notice));
+        } else if (notice) {
+          contextAlarm.holdForTurnStart(notice);
         }
       })
       .catch(() => {});

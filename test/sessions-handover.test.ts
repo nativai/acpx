@@ -420,3 +420,57 @@ test("F8 (TE D3) a RETIRED holder cannot hand over: NOT_HOLDER names the live ho
     assert.equal((await readStored(homeDir, retiredId)).holder_active, false);
   });
 });
+
+// Brick bbe2bc47 A6 — the backstop: a handover from a context that Codex already compacted
+// after the alarm prints ONE line and proceeds. It never refuses.
+async function storeContextFill(
+  homeDir: string,
+  id: string,
+  fill: { used_tokens: number; window_tokens: number; compaction_tokens: number },
+): Promise<void> {
+  const file = sessionFilePath(homeDir, id);
+  const record = JSON.parse(await fs.readFile(file, "utf8")) as { acpx?: Record<string, unknown> };
+  record.acpx = { ...record.acpx, context_fill: fill };
+  await fs.writeFile(file, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+}
+
+test("F9 (bbe2bc47 A6) a handover from far below the alarm warns once and still hands over; near the alarm, or with no fill on record, it is silent", async () => {
+  await withTempHome("acpx-handover-compacted-", async (homeDir) => {
+    const cwd = await rig(homeDir);
+    const compacted = await newHolder(homeDir, cwd);
+    await storeContextFill(homeDir, compacted, {
+      used_tokens: 97_088,
+      window_tokens: 828_400,
+      compaction_tokens: 784_800,
+    });
+    await withAcpxUi(async (origin, posted) => {
+      const res = await handover(homeDir, compacted, origin, [
+        "--brief",
+        await writeBrief(homeDir),
+      ]);
+      assert.equal(res.code, 0, res.stderr);
+      assert.match(
+        res.stderr,
+        /handover: your context is 97,088 \/ 828,400 tokens, far below your alarm .* Proceeding anyway\./,
+      );
+      assert.equal(posted.length, 1, "the handover was delivered all the same");
+      assert.equal((await readStored(homeDir, compacted)).holder_active, false);
+    });
+
+    // CONTROLS: past half the alarm point (744,800 / 2 = 372,400) and no fill at all: silent.
+    const busy = await newHolder(homeDir, cwd);
+    await storeContextFill(homeDir, busy, {
+      used_tokens: 400_000,
+      window_tokens: 828_400,
+      compaction_tokens: 784_800,
+    });
+    const fresh = await newHolder(homeDir, cwd);
+    await withAcpxUi(async (origin) => {
+      for (const id of [busy, fresh]) {
+        const res = await handover(homeDir, id, origin, ["--brief", await writeBrief(homeDir)]);
+        assert.equal(res.code, 0, res.stderr);
+        assert.doesNotMatch(res.stderr, /far below your alarm/);
+      }
+    });
+  });
+});

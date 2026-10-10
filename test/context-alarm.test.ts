@@ -24,13 +24,16 @@ import { runQueuedTask } from "../src/cli/session/runtime.js";
 import { type PromptInput, textPrompt } from "../src/prompt-content.js";
 import {
   ContextAlarmDetector,
+  handoverBelowAlarmWarning,
   registerContextAlarmDetector,
 } from "../src/session/context-alarm-detector.js";
 import {
   CONTEXT_ALARM_MARKER,
   ContextAlarmLatch,
+  type ContextAlarmEvent,
   type ContextFill,
   contextUsedPct,
+  formatContextAlarmClearedNotice,
   formatContextAlarmNotice,
   formatContextLine,
   parseContextAlarmArgument,
@@ -99,7 +102,10 @@ test("no compaction point reported ⇒ the plain level, no clamp", () => {
 test("row 5 — level 0 is off: never rings", () => {
   const alarm = resolveContextAlarm(0, fill(0, 1_000_000, 967_000));
   assert.equal(alarm.atTokens, undefined);
-  assert.equal(new ContextAlarmLatch().observe(fill(999_999, 1_000_000, 967_000), alarm), false);
+  assert.equal(
+    new ContextAlarmLatch().observe(fill(999_999, 1_000_000, 967_000), alarm),
+    undefined,
+  );
 });
 
 test("row 8 — unknown window (0): usage 0 %, no alarm, and no 'unconfirmed' wording", () => {
@@ -107,7 +113,7 @@ test("row 8 — unknown window (0): usage 0 %, no alarm, and no 'unconfirmed' wo
   const alarm = resolveContextAlarm(undefined, unknown);
   assert.equal(alarm.atTokens, undefined);
   assert.equal(contextUsedPct(unknown), 0);
-  assert.equal(new ContextAlarmLatch().observe(unknown, alarm), false);
+  assert.equal(new ContextAlarmLatch().observe(unknown, alarm), undefined);
   const line = formatContextLine(unknown, alarm);
   assert.match(line, /180,089 \/ 0 tokens \(0\.0 %\)/);
   assert.doesNotMatch(line, /unconfirm|unknown|guess/i);
@@ -130,7 +136,15 @@ test("once per crossing: speaks on the crossing update only, re-arms after the f
   const spoke = [850_000, 905_000, 930_000, 950_000, 12_000, 400_000, 910_000].map((used) =>
     latch.observe(fill(used, 1_000_000, 967_000), alarm),
   );
-  assert.deepEqual(spoke, [false, true, false, false, false, false, true]);
+  assert.deepEqual(spoke, [
+    undefined,
+    "crossed",
+    undefined,
+    undefined,
+    "cleared",
+    undefined,
+    "crossed",
+  ]);
 });
 
 // D2 (TE 4c8a82db, verification-evidence/codex-errhigh-probe.txt) — the REAL report sequence
@@ -148,8 +162,8 @@ test("D2 — an estimate correcting itself is not the fill dropping back: one no
   const latch = new ContextAlarmLatch();
   const alarm = resolveContextAlarm(4, fill(0, 828_400, 40_000));
   assert.equal(alarm.atTokens, 33_136);
-  const spokeAt = TE_CODEX_INTERLEAVING.filter((used) =>
-    latch.observe(fill(used, 828_400, 40_000), alarm),
+  const spokeAt = TE_CODEX_INTERLEAVING.filter(
+    (used) => latch.observe(fill(used, 828_400, 40_000), alarm) === "crossed",
   );
   assert.deepEqual(spokeAt, [53_467, 47_647]);
 });
@@ -158,16 +172,16 @@ test("D2 — re-arm rule: only a drop below HALF the alarm point (a compaction, 
   const alarm = resolveContextAlarm(undefined, fill(0, 1_000_000, 967_000)); // 900,000
   const latch = new ContextAlarmLatch();
   const spoke = (used: number, a = alarm) => latch.observe(fill(used, 1_000_000, 967_000), a);
-  assert.equal(spoke(905_000), true);
-  assert.equal(spoke(880_000), false); // an estimate corrected down: NOT re-armed
-  assert.equal(spoke(920_000), false);
-  assert.equal(spoke(450_001), false); // still above half
-  assert.equal(spoke(910_000), false);
-  assert.equal(spoke(449_999), false); // below half: re-armed
-  assert.equal(spoke(901_000), true);
-  // The alarm switched off (or the window unknown) re-arms: switching it back on speaks again.
-  assert.equal(spoke(950_000, resolveContextAlarm(0, fill(0, 1_000_000, 967_000))), false);
-  assert.equal(spoke(950_000), true);
+  assert.equal(spoke(905_000), "crossed");
+  assert.equal(spoke(880_000), undefined); // an estimate corrected down: NOT re-armed
+  assert.equal(spoke(920_000), undefined);
+  assert.equal(spoke(450_001), undefined); // still above half
+  assert.equal(spoke(910_000), undefined);
+  assert.equal(spoke(449_999), "cleared"); // below half: re-armed, and the agent is told
+  assert.equal(spoke(901_000), "crossed");
+  // The alarm switched off (or the window unknown) re-arms silently: switching it back on speaks again.
+  assert.equal(spoke(950_000, resolveContextAlarm(0, fill(0, 1_000_000, 967_000))), undefined);
+  assert.equal(spoke(950_000), "crossed");
 });
 
 test("the notice is the fixed line, numbers filled in, and names the way out", () => {
@@ -184,6 +198,245 @@ test("the notice is the fixed line, numbers filled in, and names the way out", (
     formatContextAlarmNotice(small, resolveContextAlarm(undefined, small)),
     /past your alarm \(90 %, moved to 147,000 to keep a 20,000-token runway before auto-compaction\)/,
   );
+});
+
+// ─── bbe2bc47 · the CLEARED notice: the alarm no longer applies ──────────────
+
+const CLEARED_NOTICE_900K =
+  "⟦CONTEXT-ALARM⟧ cleared — your context is now 120,000 / 1,000,000 tokens (12.0 %), far " +
+  "below your alarm: it was auto-compacted (or your window grew). If you have not run " +
+  '"acpx sessions handover" yet, do not hand over: continue your task in this session. ' +
+  "If your successor already exists, finish the handover.";
+
+test("the cleared notice is the fixed line, numbers filled in (the context-succession skill keys on it)", () => {
+  assert.equal(
+    formatContextAlarmClearedNotice(fill(120_000, 1_000_000, 967_000)),
+    CLEARED_NOTICE_900K,
+  );
+  // Numbers come from the fill: Codex's window, a fill of 0 (Claude's compaction report).
+  assert.match(
+    formatContextAlarmClearedNotice(fill(37_839, 828_400, 784_800)),
+    /^⟦CONTEXT-ALARM⟧ cleared — your context is now 37,839 \/ 828,400 tokens \(4\.6 %\), far below your alarm/,
+  );
+  assert.match(
+    formatContextAlarmClearedNotice(fill(0, 1_000_000)),
+    /now 0 \/ 1,000,000 tokens \(0\.0 %\)/,
+  );
+});
+
+/** What a latch-like observer says over a fill sequence, as the events it raised. */
+function eventsOver(
+  latch: { observe(f: ContextFill, a: ReturnType<typeof resolveContextAlarm>): unknown },
+  usedSequence: number[],
+  window = 1_000_000,
+  compactAt = 967_000,
+): unknown[] {
+  const alarm = resolveContextAlarm(undefined, fill(0, window, compactAt));
+  return usedSequence.map((used) => latch.observe(fill(used, window, compactAt), alarm));
+}
+
+/** WRONG DOUBLE 1 — clears on ANY dip below the alarm after speaking (no half-point rule). */
+class ClearsOnAnyDipLatch {
+  private spoken = false;
+  observe(
+    f: ContextFill,
+    a: ReturnType<typeof resolveContextAlarm>,
+  ): ContextAlarmEvent | undefined {
+    if (a.atTokens === undefined) {
+      return undefined;
+    }
+    if (f.used < a.atTokens) {
+      const was = this.spoken;
+      this.spoken = false;
+      return was ? "cleared" : undefined;
+    }
+    if (this.spoken) {
+      return undefined;
+    }
+    this.spoken = true;
+    return "crossed";
+  }
+}
+
+/** WRONG DOUBLE 2 — never re-arms, and clears on every update below half. */
+class ClearsEveryTimeLatch {
+  private spoken = false;
+  observe(
+    f: ContextFill,
+    a: ReturnType<typeof resolveContextAlarm>,
+  ): ContextAlarmEvent | undefined {
+    if (a.atTokens === undefined) {
+      return undefined;
+    }
+    if (f.used < a.atTokens / 2) {
+      return this.spoken ? "cleared" : undefined;
+    }
+    if (f.used >= a.atTokens && !this.spoken) {
+      this.spoken = true;
+      return "crossed";
+    }
+    return undefined;
+  }
+}
+
+test("A1 — spoken, then the fill falls below half the alarm point: ONE cleared; a second compaction with no new crossing gives nothing", () => {
+  const sequence = [850_000, 905_000, 950_000, 120_000, 100_000, 80_000, 60_000];
+  const expected = [undefined, "crossed", undefined, "cleared", undefined, undefined, undefined];
+  assert.deepEqual(eventsOver(new ContextAlarmLatch(), sequence), expected);
+  // …and a NEW crossing arms it again: cleared once more after it.
+  assert.deepEqual(eventsOver(new ContextAlarmLatch(), [905_000, 120_000, 910_000, 90_000]), [
+    "crossed",
+    "cleared",
+    "crossed",
+    "cleared",
+  ]);
+  // The row can fail: a latch that never re-arms raises "cleared" on every later report.
+  assert.notDeepEqual(eventsOver(new ClearsEveryTimeLatch(), sequence), expected);
+});
+
+test("A2 (negative) — a dip just below the alarm is an estimate correcting itself: NO cleared notice", () => {
+  // codex-acp's err-high charge crosses at 905,000, the next real report lands at 880,000.
+  const sequence = [905_000, 880_000, 920_000, 450_001, 899_999];
+  const expected = ["crossed", undefined, undefined, undefined, undefined];
+  assert.deepEqual(eventsOver(new ContextAlarmLatch(), sequence), expected);
+  // The row can fail: a latch that clears on any dip speaks on the very first correction.
+  assert.deepEqual(eventsOver(new ClearsOnAnyDipLatch(), sequence), [
+    "crossed",
+    "cleared",
+    "crossed",
+    "cleared",
+    undefined,
+  ]);
+  // The real Codex sequence of TE D2: two real crossings and the compaction between them
+  // (37,152 → 16,106 at an alarm of 33,136) — cleared exactly once, on the compaction.
+  const latch = new ContextAlarmLatch();
+  const alarm = resolveContextAlarm(4, fill(0, 828_400, 40_000));
+  const events = TE_CODEX_INTERLEAVING.map((used) =>
+    latch.observe(fill(used, 828_400, 40_000), alarm),
+  );
+  assert.equal(
+    events.filter((e) => e === "cleared").length,
+    1,
+    "one real compaction (half of 33,136 = 16,568)",
+  );
+  assert.equal(events[TE_CODEX_INTERLEAVING.indexOf(16_106)], "cleared");
+  assert.equal(events[TE_CODEX_INTERLEAVING.indexOf(29_390)], undefined, "an err-high correction");
+});
+
+test("A3 — respawn: a detector built from a stored fill already past the alarm still clears on a later compaction", async () => {
+  const stored = fill(905_000, 1_000_000, 967_000);
+  const detector = new ContextAlarmDetector(async () => undefined, stored);
+  // The new owner's FIRST report is the compaction: no crossing was ever observed here.
+  assert.equal(await detector.observe(fill(120_000, 1_000_000, 967_000)), CLEARED_NOTICE_900K);
+  assert.equal(await detector.observe(fill(100_000, 1_000_000, 967_000)), undefined, "once");
+  // The row can fail: a detector with nothing stored (or a latch fed only the new reports)
+  // never learns the alarm had spoken.
+  const noStored = new ContextAlarmDetector(async () => undefined, undefined);
+  assert.equal(await noStored.observe(fill(120_000, 1_000_000, 967_000)), undefined);
+  assert.deepEqual(eventsOver(new ContextAlarmLatch(), [120_000]), [undefined]);
+  // The stored fill is judged against the SEAT's level: a fill below an explicit 95 % alarm
+  // was never past it, so there is nothing to clear.
+  const high = new ContextAlarmDetector(async () => 95, stored);
+  assert.equal(await high.observe(fill(120_000, 1_000_000, 967_000)), undefined);
+});
+
+test("A4 — no injector: the cleared notice is held and delivered EXACTLY ONCE at the top of the next turn", async () => {
+  const detector = new ContextAlarmDetector(
+    async () => undefined,
+    fill(905_000, 1_000_000, 967_000),
+  );
+  const unregister = registerContextAlarmDetector("acp-session-a4", detector);
+  try {
+    const request = buildTurnContextRequest({
+      sessionId: "acp-session-a4",
+      agentCommand: "claude",
+      sessionEnv: {},
+    });
+    const notice = await detector.observe(fill(120_000, 1_000_000, 967_000));
+    assert.equal(notice, CLEARED_NOTICE_900K);
+    // The runtime found no injector and hands the notice back to be held.
+    detector.holdForTurnStart(notice ?? "");
+    const first = await resolveTurnContext(request);
+    assert.match(
+      first ?? "",
+      /<acpx-turn-context>[\s\S]*⟦CONTEXT-ALARM⟧ cleared — your context is now 120,000/,
+    );
+    assert.equal(await resolveTurnContext(request), undefined, "never repeated");
+  } finally {
+    unregister();
+  }
+  // The row can fail: a notice that was NOT held (the injector delivered it) is not repeated
+  // at the next turn — and a detector never told to hold has nothing to deliver.
+  const delivered = new ContextAlarmDetector(
+    async () => undefined,
+    fill(905_000, 1_000_000, 967_000),
+  );
+  await delivered.observe(fill(120_000, 1_000_000, 967_000));
+  assert.equal(delivered.lineForTurnStart(), undefined);
+  // A held cleared notice yields to a NEW crossing: the top of the turn is the alarm.
+  const recrossed = new ContextAlarmDetector(
+    async () => undefined,
+    fill(905_000, 1_000_000, 967_000),
+  );
+  recrossed.holdForTurnStart((await recrossed.observe(fill(120_000, 1_000_000, 967_000))) ?? "");
+  await recrossed.observe(fill(910_000, 1_000_000, 967_000));
+  assert.match(
+    recrossed.lineForTurnStart() ?? "",
+    /^⟦CONTEXT-ALARM⟧ Context 910,000 .* is past your 90 % alarm/,
+  );
+});
+
+test("A5 — harness-agnostic: Claude's compaction report (used: 0) after an alarm clears it", async () => {
+  const detector = new ContextAlarmDetector(async () => undefined, undefined);
+  assert.match(
+    (await detector.observe(fill(905_000, 1_000_000, 967_000))) ?? "",
+    /is past your 90 % alarm/,
+  );
+  assert.match(
+    (await detector.observe(fill(0, 1_000_000, 967_000))) ?? "",
+    /^⟦CONTEXT-ALARM⟧ cleared — your context is now 0 \/ 1,000,000 tokens \(0\.0 %\)/,
+  );
+  // Alarm off, or window unknown: re-armed silently, never a cleared notice.
+  let level: number | undefined;
+  const off = new ContextAlarmDetector(async () => level, undefined);
+  await off.observe(fill(905_000, 1_000_000, 967_000));
+  level = 0;
+  assert.equal(await off.observe(fill(0, 1_000_000, 967_000)), undefined);
+  const unknown = new ContextAlarmDetector(async () => undefined, undefined);
+  await unknown.observe(fill(905_000, 1_000_000, 967_000));
+  assert.equal(await unknown.observe(fill(10, 0)), undefined);
+});
+
+test("A6 — codex at its recomputed compaction point 559,594: the default alarm moves to 519,594; an explicit 90 % warns", () => {
+  const f = fill(0, 828_400, 559_594);
+  const dflt = resolveContextAlarm(undefined, f);
+  assert.equal(dflt.atTokens, 519_594);
+  assert.equal(dflt.movedForRunway, true);
+  const explicit = resolveContextAlarm(90, f);
+  assert.equal(explicit.pastCompaction, true);
+  assert.equal(explicit.atTokens, 745_560);
+});
+
+test("A6 handover backstop — the stored fill below half the alarm point warns; at/above it, no fill, alarm off, or an impossible fill: silent", () => {
+  const stored = (used: number, window = 828_400): SessionContextFill => ({
+    used_tokens: used,
+    window_tokens: window,
+    compaction_tokens: 784_800,
+  });
+  // Default alarm 744,800 → half = 372,400.
+  assert.match(
+    handoverBelowAlarmWarning(stored(97_088), undefined) ?? "",
+    /^handover: your context is 97,088 \/ 828,400 tokens, far below your alarm .* Proceeding anyway\.$/,
+  );
+  assert.equal(handoverBelowAlarmWarning(stored(372_400), undefined), undefined, "exactly half");
+  assert.equal(handoverBelowAlarmWarning(stored(700_000), undefined), undefined);
+  assert.equal(handoverBelowAlarmWarning(undefined, undefined), undefined);
+  assert.equal(handoverBelowAlarmWarning(stored(97_088), 0), undefined, "alarm off");
+  assert.equal(handoverBelowAlarmWarning(stored(0, 0), undefined), undefined, "window unknown");
+  assert.equal(handoverBelowAlarmWarning(stored(1_104_235), undefined), undefined, "impossible");
+  // The seat's explicit level decides: 20 % of 828,400 = 165,680 → half 82,840.
+  assert.equal(handoverBelowAlarmWarning(stored(97_088), 20), undefined);
+  assert.notEqual(handoverBelowAlarmWarning(stored(80_000), 20), undefined);
 });
 
 // ─── the fill as reported, on the record ─────────────────────────────────────
@@ -472,6 +725,43 @@ test("mid-turn: the crossing report injects ⟦CONTEXT-ALARM⟧ into the running
   );
   assert.equal(rig.turnTops[0], undefined, "turn 1 started below the alarm");
   assert.match(rig.turnTops[1] ?? "", /⟦CONTEXT-ALARM⟧ Context 950,000 \/ 1,000,000/);
+});
+
+test("bbe2bc47 — through the real runtime: the alarm, then a compaction, inject the cleared notice ONCE; a second compaction without a new crossing injects nothing", async () => {
+  const rig = await runTwoTurns({
+    usages: [850_000, 905_000, 950_000, 120_000, 100_000, 90_000, 80_000],
+  });
+  assert.equal(rig.injected.length, 2, `alarm + cleared, got ${JSON.stringify(rig.injected)}`);
+  assert.match(rig.injected[0] ?? "", /^⟦CONTEXT-ALARM⟧ Context 905,000 \/ 1,000,000/);
+  assert.equal(
+    rig.injected[1],
+    '⟦CONTEXT-ALARM⟧ cleared — your context is now 120,000 / 1,000,000 tokens (12.0 %), far below your alarm: it was auto-compacted (or your window grew). If you have not run "acpx sessions handover" yet, do not hand over: continue your task in this session. If your successor already exists, finish the handover.',
+  );
+  assert.deepEqual(rig.turnTops, [undefined, undefined], "nothing repeated at the next turn");
+});
+
+test("bbe2bc47 — through the real runtime (negative): a dip just below the alarm injects no cleared notice", async () => {
+  const rig = await runTwoTurns({ usages: [905_000, 880_000, 920_000, 600_000] });
+  assert.equal(rig.injected.length, 1, `only the alarm, got ${JSON.stringify(rig.injected)}`);
+  assert.match(rig.injected[0] ?? "", /is past your 90 % alarm/);
+});
+
+test("bbe2bc47 — through the real runtime, respawn shape: a stored fill past the alarm, then a compaction in the next turn, clears", async () => {
+  const rig = await runTwoTurns({
+    usages: [50_000],
+    persistedFill: { used_tokens: 905_000, window_tokens: 1_000_000, compaction_tokens: 967_000 },
+  });
+  assert.equal(rig.injected.length, 1);
+  assert.match(
+    rig.injected[0] ?? "",
+    /^⟦CONTEXT-ALARM⟧ cleared — your context is now 50,000 \/ 1,000,000 tokens \(5\.0 %\)/,
+  );
+});
+
+test("bbe2bc47 — through the real runtime, Claude shape: used 0 after the alarm clears", async () => {
+  const rig = await runTwoTurns({ usages: [905_000, 0] });
+  assert.equal(rig.injected.length, 2);
+  assert.match(rig.injected[1] ?? "", /^⟦CONTEXT-ALARM⟧ cleared — your context is now 0 \//);
 });
 
 test("row 5 — the seat at 0: nothing mid-turn, nothing at the top of the next turn", async () => {
