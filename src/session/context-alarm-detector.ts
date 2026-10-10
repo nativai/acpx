@@ -107,6 +107,7 @@ export class ContextAlarmDetector {
   private seeded = false;
   private clearedNotice: string | undefined;
   private clearedForTurnStart: string | undefined;
+  private heldSink: ((notice: string | undefined) => void) | undefined;
 
   constructor(
     private readonly readLevel: () => Promise<number | undefined>,
@@ -144,6 +145,7 @@ export class ContextAlarmDetector {
       const event = this.latch.observe(fill, alarm);
       if (event === "crossed") {
         this.clearedForTurnStart = undefined;
+        this.heldSink?.(undefined);
         return formatContextAlarmNotice(fill, alarm);
       }
       if (event === "cleared") {
@@ -159,12 +161,20 @@ export class ContextAlarmDetector {
   /**
    * A notice `observe` resolved to found no turn accepting injections: keep it for the top
    * of the next turn. Only the cleared notice is kept — a crossing is recomputed there from
-   * the fill, so it needs no keeping.
+   * the fill, so it needs no keeping. The next turn is a NEW task with a new detector, so the
+   * notice is also written through the sink `registerContextAlarmDetector` binds.
    */
   holdForTurnStart(notice: string): void {
     if (notice === this.clearedNotice) {
       this.clearedForTurnStart = notice;
+      this.heldSink?.(notice);
     }
+  }
+
+  /** Wire the session-level store of held notices; adopts one a previous task's detector left. */
+  bindHeldNotices(sink: (notice: string | undefined) => void, held: string | undefined): void {
+    this.heldSink = sink;
+    this.clearedForTurnStart = held;
   }
 
   /**
@@ -173,17 +183,17 @@ export class ContextAlarmDetector {
    * alarm it is the held cleared notice, exactly once.
    */
   lineForTurnStart(): string | undefined {
+    const held = this.clearedForTurnStart;
+    this.clearedForTurnStart = undefined;
+    this.heldSink?.(undefined);
     const fill = this.fill;
     if (fill === undefined) {
-      return undefined;
+      return held;
     }
     const alarm = this.alarm(fill);
     if (!isPastContextAlarm(fill, alarm)) {
-      const held = this.clearedForTurnStart;
-      this.clearedForTurnStart = undefined;
       return held;
     }
-    this.clearedForTurnStart = undefined;
     this.latch.markSpoken();
     return formatContextAlarmNotice(fill, alarm);
   }
@@ -192,11 +202,26 @@ export class ContextAlarmDetector {
 /** Detectors of the turns now running in this process, by ACP session id. */
 const runningDetectors = new Map<string, ContextAlarmDetector>();
 
+/**
+ * Cleared notices that found no injector, by ACP session id: a detector lives one task, the
+ * notice is for the top of the NEXT one. Held in this process (the session's queue owner), so
+ * an owner respawn in between loses it — acceptable: a respawned owner's detector starts from
+ * the stored fill, which is already below the alarm.
+ */
+const heldClearedNotices = new Map<string, string>();
+
 /** Make a detector visible to the turn-context channel for one turn; returns the undo. */
 export function registerContextAlarmDetector(
   acpSessionId: string,
   detector: ContextAlarmDetector,
 ): () => void {
+  detector.bindHeldNotices((notice) => {
+    if (notice === undefined) {
+      heldClearedNotices.delete(acpSessionId);
+    } else {
+      heldClearedNotices.set(acpSessionId, notice);
+    }
+  }, heldClearedNotices.get(acpSessionId));
   runningDetectors.set(acpSessionId, detector);
   return () => {
     if (runningDetectors.get(acpSessionId) === detector) {

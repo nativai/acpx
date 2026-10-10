@@ -386,6 +386,61 @@ test("A4 — no injector: the cleared notice is held and delivered EXACTLY ONCE 
   );
 });
 
+test("A4 across tasks — a cleared notice no injector could take is carried to the top of the session's NEXT turn (a new task, a new detector), once", async () => {
+  const session = "acp-session-a4-next-task";
+  const clearedFill = fill(120_000, 1_000_000, 967_000);
+  // Task 1: the alarm spoke earlier; the compaction report arrives with no injector.
+  const task1 = new ContextAlarmDetector(async () => undefined, fill(905_000, 1_000_000, 967_000));
+  const end1 = registerContextAlarmDetector(session, task1);
+  const notice = await task1.observe(clearedFill);
+  assert.equal(notice, CLEARED_NOTICE_900K);
+  task1.holdForTurnStart(notice ?? "");
+  end1();
+  const request = buildTurnContextRequest({
+    sessionId: session,
+    agentCommand: "claude",
+    sessionEnv: {},
+  });
+  // Task 2 starts from the stored (compacted) fill and is told once.
+  const task2 = new ContextAlarmDetector(async () => undefined, clearedFill);
+  const end2 = registerContextAlarmDetector(session, task2);
+  try {
+    assert.match(
+      (await resolveTurnContext(request)) ?? "",
+      /⟦CONTEXT-ALARM⟧ cleared — your context is now 120,000/,
+    );
+    assert.equal(await resolveTurnContext(request), undefined, "not repeated within the turn");
+  } finally {
+    end2();
+  }
+  // Task 3 hears nothing: the notice was delivered once.
+  const task3 = new ContextAlarmDetector(async () => undefined, clearedFill);
+  const end3 = registerContextAlarmDetector(session, task3);
+  try {
+    assert.equal(await resolveTurnContext(request), undefined, "once per compaction, not per turn");
+  } finally {
+    end3();
+  }
+  // A notice that went out through an injector is never held: nothing carries over.
+  const other = "acp-session-a4-injected";
+  const t1 = new ContextAlarmDetector(async () => undefined, fill(905_000, 1_000_000, 967_000));
+  const e1 = registerContextAlarmDetector(other, t1);
+  await t1.observe(clearedFill); // the runtime injected it: no holdForTurnStart call
+  e1();
+  const t2 = new ContextAlarmDetector(async () => undefined, clearedFill);
+  const e2 = registerContextAlarmDetector(other, t2);
+  try {
+    assert.equal(
+      await resolveTurnContext(
+        buildTurnContextRequest({ sessionId: other, agentCommand: "claude", sessionEnv: {} }),
+      ),
+      undefined,
+    );
+  } finally {
+    e2();
+  }
+});
+
 test("A5 — harness-agnostic: Claude's compaction report (used: 0) after an alarm clears it", async () => {
   const detector = new ContextAlarmDetector(async () => undefined, undefined);
   assert.match(
@@ -597,7 +652,7 @@ function promptText(input: PromptInput | string): string {
 /** A usage report: `used` on the 1M window, or an explicit `[used, size]`. */
 type RigUsage = number | readonly [used: number, size: number];
 
-function alarmRig(params: { usages: RigUsage[]; seatLevel?: number }) {
+function alarmRig(params: { usages: RigUsage[]; seatLevel?: number; tailMs?: number }) {
   const injected: string[] = [];
   const turnTops: (string | undefined)[] = [];
   let onSessionUpdate: SessionUpdateHandler | undefined;
@@ -643,7 +698,8 @@ function alarmRig(params: { usages: RigUsage[]; seatLevel?: number }) {
           onSessionUpdate?.(usageUpdate(used, size, 967_000));
           await new Promise((resolve) => setTimeout(resolve, 20));
         }
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        // The injections of the last reports still need their seat-store read: let them land.
+        await new Promise((resolve) => setTimeout(resolve, params.tailMs ?? 50));
       }
       return { stopReason: "end_turn" };
     },
@@ -668,6 +724,8 @@ function task(requestId: string, text: string): QueueTask {
 async function runTwoTurns(params: {
   usages: RigUsage[];
   seatLevel?: number;
+  /** How long the first turn lingers after its last report (default 50 ms). */
+  tailMs?: number;
   /** Also read back what the turns persisted: the record's fill and `acpx context`. */
   readBack?: boolean;
   /** A fill already on the record before the first turn (as an older build persisted it). */
@@ -730,6 +788,7 @@ test("mid-turn: the crossing report injects ⟦CONTEXT-ALARM⟧ into the running
 test("bbe2bc47 — through the real runtime: the alarm, then a compaction, inject the cleared notice ONCE; a second compaction without a new crossing injects nothing", async () => {
   const rig = await runTwoTurns({
     usages: [850_000, 905_000, 950_000, 120_000, 100_000, 90_000, 80_000],
+    tailMs: 500,
   });
   assert.equal(rig.injected.length, 2, `alarm + cleared, got ${JSON.stringify(rig.injected)}`);
   assert.match(rig.injected[0] ?? "", /^⟦CONTEXT-ALARM⟧ Context 905,000 \/ 1,000,000/);
@@ -741,7 +800,7 @@ test("bbe2bc47 — through the real runtime: the alarm, then a compaction, injec
 });
 
 test("bbe2bc47 — through the real runtime (negative): a dip just below the alarm injects no cleared notice", async () => {
-  const rig = await runTwoTurns({ usages: [905_000, 880_000, 920_000, 600_000] });
+  const rig = await runTwoTurns({ usages: [905_000, 880_000, 920_000, 600_000], tailMs: 500 });
   assert.equal(rig.injected.length, 1, `only the alarm, got ${JSON.stringify(rig.injected)}`);
   assert.match(rig.injected[0] ?? "", /is past your 90 % alarm/);
 });
@@ -749,6 +808,7 @@ test("bbe2bc47 — through the real runtime (negative): a dip just below the ala
 test("bbe2bc47 — through the real runtime, respawn shape: a stored fill past the alarm, then a compaction in the next turn, clears", async () => {
   const rig = await runTwoTurns({
     usages: [50_000],
+    tailMs: 500,
     persistedFill: { used_tokens: 905_000, window_tokens: 1_000_000, compaction_tokens: 967_000 },
   });
   assert.equal(rig.injected.length, 1);
@@ -759,7 +819,7 @@ test("bbe2bc47 — through the real runtime, respawn shape: a stored fill past t
 });
 
 test("bbe2bc47 — through the real runtime, Claude shape: used 0 after the alarm clears", async () => {
-  const rig = await runTwoTurns({ usages: [905_000, 0] });
+  const rig = await runTwoTurns({ usages: [905_000, 0], tailMs: 500 });
   assert.equal(rig.injected.length, 2);
   assert.match(rig.injected[1] ?? "", /^⟦CONTEXT-ALARM⟧ cleared — your context is now 0 \//);
 });
