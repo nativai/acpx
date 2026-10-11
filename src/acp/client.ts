@@ -98,6 +98,7 @@ import {
   resolvePrimerChannel,
   shouldIgnoreNonJsonAgentOutputLine,
 } from "./agent-command.js";
+import { AgentStderrTee } from "./agent-stderr-tee.js";
 import {
   applyProfileAuth,
   buildAgentSpawnOptions,
@@ -919,6 +920,8 @@ export class AcpClient {
   private openRouterRouteModelId?: string;
   private agentStartedAt?: string;
   private lastAgentExit?: AgentExitInfo;
+  /** The current adapter process's owner-log stderr copy (queue owner only). */
+  private agentStderrTee?: AgentStderrTee;
   private lastKnownPid?: number;
   private latestProvisioningWarning?: ProvisioningWarningBreadcrumb;
   /**
@@ -1212,15 +1215,7 @@ export class AcpClient {
     this.lastAgentExit = undefined;
     this.lastKnownPid = child.pid ?? undefined;
     this.attachAgentLifecycleObservers(child);
-    const startupStderr: string[] = [];
-
-    child.stderr.on("data", (chunk: Buffer | string) => {
-      this.captureStartupStderr(startupStderr, chunk);
-      if (!this.options.verbose) {
-        return;
-      }
-      process.stderr.write(chunk);
-    });
+    const startupStderr = this.observeAgentStderr(child);
 
     const input = Writable.toWeb(child.stdin);
     const output = Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>;
@@ -1245,6 +1240,29 @@ export class AcpClient {
       startupStderr,
       launch,
     });
+  }
+
+  // Startup stderr is always captured (for startup-failure messages); --verbose
+  // forwards the stream raw. Otherwise a queue owner keeps a bounded, prefixed
+  // copy in its owner log (brick 7c06a855), and outside that gate — e.g. a
+  // --json-strict CLI whose stderr is JSON-RPC only — nothing is written.
+  private observeAgentStderr(child: ChildProcessByStdio<Writable, Readable, Readable>): string[] {
+    const startupStderr: string[] = [];
+    const stderrTee =
+      !this.options.verbose && process.env.ACPX_OWNER_LOG === "1"
+        ? new AgentStderrTee((text) => process.stderr.write(text))
+        : undefined;
+    this.agentStderrTee = stderrTee;
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      this.captureStartupStderr(startupStderr, chunk);
+      if (!this.options.verbose) {
+        stderrTee?.push(chunk);
+        return;
+      }
+      process.stderr.write(chunk);
+    });
+    child.stderr.once("close", () => stderrTee?.end());
+    return startupStderr;
   }
 
   private async resolveAgentLaunchPlan(): Promise<AgentLaunchPlan> {
@@ -3346,6 +3364,11 @@ export class AcpClient {
     this.logOwnerEvent(
       `agent disconnect: reason=${reason} code=${exitCode} signal=${signal} unexpectedDuringPrompt=${unexpectedDuringPrompt} pid=${this.lastKnownPid ?? "?"}`,
     );
+    if (unexpectedDuringPrompt) {
+      // If the stderr copy hit its cap, this releases the last 8 KB to the owner
+      // log once the stream has drained — the crash stack sits at the very end.
+      this.agentStderrTee?.noteUnexpectedExit();
+    }
     this.rejectPendingConnectionRequests(
       new AgentDisconnectedError(reason, exitCode, signal, {
         outputAlreadyEmitted: Boolean(this.activePrompt),

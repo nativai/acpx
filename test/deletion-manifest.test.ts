@@ -1045,6 +1045,57 @@ test("T-F4: the owner log goes with the record, even under --no-include-history"
   });
 });
 
+/** brick 7c06a855 (TE F2) — the owner log's rotated generation `<id>.owner.log.1`
+ *  is the same RECORD-tier file under another name, so it goes wherever the live
+ *  log goes: prune (even with history kept) and the hard delete. The kept stream
+ *  is the positive control that the instrument can watch a file survive. */
+test("owner.log.1: prune removes the rotated owner log too, even under --no-include-history", async () => {
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace");
+    await fs.mkdir(workCwd, { recursive: true });
+    await seedSession(homeDir, "tier-owner-rot", workCwd);
+    const rotated = `${ownerLogPath(homeDir, "tier-owner-rot")}.1`;
+    await fs.writeFile(rotated, "rotated owner log\n", "utf8");
+
+    const result = await runCli(
+      ["claude", "sessions", "prune", "tier-owner-rot", "--no-include-history"],
+      { home: homeDir, cwd: workCwd },
+    );
+    assert.equal(result.code, 0, result.stderr);
+
+    assert.equal(await fileExists(ownerLogPath(homeDir, "tier-owner-rot")), false);
+    assert.equal(await fileExists(rotated), false, "the rotated owner log survived a prune");
+    assert.equal(await fileExists(streamPath(homeDir, "tier-owner-rot")), true);
+  });
+});
+
+test("owner.log.1: templates rollback --delete removes the rotated owner log too", async () => {
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace");
+    await fs.mkdir(workCwd, { recursive: true });
+    await seedSession(homeDir, "rb-rot-victim", workCwd, {
+      template: {
+        slug: "rb-rot-slug",
+        version: 1,
+        enabled: true,
+        created_at: "2026-07-24T04:30:00.000Z",
+      },
+    });
+    const rotated = `${ownerLogPath(homeDir, "rb-rot-victim")}.1`;
+    await fs.writeFile(rotated, "rotated owner log\n", "utf8");
+
+    const result = await runCli(
+      ["claude", "sessions", "templates", "rollback", "rb-rot-slug", "--delete"],
+      { home: homeDir, cwd: workCwd },
+    );
+    assert.equal(result.code, 0, result.stderr);
+
+    assert.equal(await fileExists(sessionFilePath(homeDir, "rb-rot-victim")), false);
+    assert.equal(await fileExists(ownerLogPath(homeDir, "rb-rot-victim")), false);
+    assert.equal(await fileExists(rotated), false, "the rotated owner log survived a hard delete");
+  });
+});
+
 /** T-F5 — `.timestamps.ndjson` is HISTORY tier: it follows the STREAM, in both
  *  directions. It is acpx-ui's file, and the ownership argument that licenses
  *  deleting it is precisely that it is an index OF the stream — so if the stream
