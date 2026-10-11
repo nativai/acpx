@@ -2368,7 +2368,7 @@ test("493729fc F3: owner-exit sweep terminalizes still-open absorbed deliveries 
       const written = terminalizeAbsorbedDeliveriesOnOwnerExit(record.acpxRecordId);
       assert.deepEqual(
         written,
-        { failed: 1, consumed: 0 },
+        { failed: 1, consumed: 0, deliveredAtClose: 0 },
         "sweep wrote exactly one absorbed terminal",
       );
       // The write is fire-and-forget; give it a beat to land.

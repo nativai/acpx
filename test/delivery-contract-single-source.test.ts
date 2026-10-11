@@ -72,6 +72,7 @@ type ContractFixture = {
   quiesceRejection: { message: string };
   ownerExitTerminals: Array<{ detailCode: string; message: string }>;
   turnStartTerminals: Array<{ detailCode: string; message: string }>;
+  deliveredAtClose: { note: string };
 };
 
 // DERIVED FROM THE FIXTURE, NEVER TRANSCRIBED. A hand-maintained list here would
@@ -91,6 +92,8 @@ async function contractedMessages(): Promise<Array<{ label: string; message: str
       label: entry.detailCode,
       message: entry.message,
     })),
+    // brick e50e171d — the deliberate-close `done` note.
+    { label: "deliveredAtClose.note", message: fixture.deliveredAtClose.note },
   ];
 }
 

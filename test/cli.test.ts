@@ -3094,8 +3094,9 @@ test("raw metadata brick is record-driven for stamp/context; set-metadata valida
 // Practical-tests pass 1, brick 71fdcaf2 (S5.4) — a delivery whose turn is CANCELLED BY A SESSION CLOSE used to end
 // `cancelled` with NO code, and acpx-ui's sender notice fires only on `failed` + a code, so the sender was never told.
 // The owner knows it is closing for the session (the drain verb flagged it), so the terminal it writes for a delivery
-// the close killed is `failed / SESSION_CLOSED_TURN_CANCELLED` — outcome unknown, do not resend. A cancel with NO
-// close (the Stop button) is a different fact and must stay `cancelled`.
+// the close killed is no longer a code-less `cancelled`. Since brick e50e171d (Daniel, 2026-10-11) it is `done /
+// delivered_at_close`: the delivery was ACCEPTED and a deliberate close ended its turn, so it counts as delivered and
+// its sender is not told. A cancel with NO close (the Stop button) is a different fact and must stay `cancelled`.
 type DeliveryTerminalParams = {
   phase?: string;
   stopReason?: string | null;
@@ -3212,7 +3213,7 @@ async function freshSleepingTarget(
   return { cwd, id, operationLog };
 }
 
-test("a delivery whose turn a session CLOSE cancels ends failed/SESSION_CLOSED_TURN_CANCELLED, not cancelled (71fdcaf2)", async () => {
+test("a delivery whose turn a session CLOSE cancels ends done/delivered_at_close, not cancelled (71fdcaf2, e50e171d)", async () => {
   await withTempHome(async (homeDir) => {
     const messageId = "0a1b2c3d-1111-4222-8333-444455556666";
     const { id } = await freshSleepingTarget(homeDir, messageId);
@@ -3243,9 +3244,10 @@ test("a delivery whose turn a session CLOSE cancels ends failed/SESSION_CLOSED_T
     );
     assert.equal(
       terminal.phase,
-      "failed",
+      "done",
       `the close-cancelled delivery ended ${String(terminal.phase)}`,
     );
+    assert.equal(terminal.stopReason, "delivered_at_close");
     assert.equal(terminal.error?.detailCode, "SESSION_CLOSED_TURN_CANCELLED");
   });
 });
@@ -3270,9 +3272,10 @@ test("a CANCEL with no close still ends the delivery cancelled — only a close 
 // brick 570d2570 — the WHOLE `sessions close` verb, final SIGTERM included, against a main turn the adapter does NOT
 // end on session/close (the mock's prompt keeps sleeping, as a real turn mid-tool can). The kill always beats the
 // runtime here, so before this brick the main delivery stayed `accepted` forever and acpx-ui read it done/delivered
-// (a147982f VERIFICATION, "HoD addition to AC7 (c)"). The owner's signal sweep now writes the close's code for it,
-// exactly once. The in-process rows for the orderings and the controls are in test/close-cut-main-turn.test.ts.
-test("sessions close during a mid-turn main delivery ends it failed/SESSION_CLOSED_TURN_CANCELLED, exactly once (570d2570)", async () => {
+// (a147982f VERIFICATION, "HoD addition to AC7 (c)"). The owner's signal sweep now writes the close's terminal for it,
+// exactly once — `done / delivered_at_close` since brick e50e171d (accepted = delivered under a deliberate close).
+// The in-process rows for the orderings and the controls are in test/close-cut-main-turn.test.ts.
+test("sessions close during a mid-turn main delivery ends it done/delivered_at_close, exactly once (570d2570, e50e171d)", async () => {
   await withTempHome(async (homeDir) => {
     const messageId = "57000000-1111-4222-8333-444455556666";
     const { cwd, id } = await freshSleepingTarget(homeDir, messageId, "");
@@ -3285,7 +3288,8 @@ test("sessions close during a mid-turn main delivery ends it failed/SESSION_CLOS
     // `sessions close` returns only after the owner has exited, so whatever the owner wrote is on disk.
     const terminals = await deliveryTerminalsFor(homeDir, id, messageId);
     assert.equal(terminals.length, 1, `terminals: ${JSON.stringify(terminals)}`);
-    assert.equal(terminals[0]?.phase, "failed");
+    assert.equal(terminals[0]?.phase, "done");
+    assert.equal(terminals[0]?.stopReason, "delivered_at_close");
     assert.equal(terminals[0]?.error?.detailCode, "SESSION_CLOSED_TURN_CANCELLED");
   });
 });

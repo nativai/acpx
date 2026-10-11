@@ -218,6 +218,71 @@ function consumedCutCause(input: ConsumedCutInput): { cause: string; detailCode:
   };
 }
 
+// brick e50e171d (Daniel's ruling, 2026-10-11) — under a DELIBERATE close, an ACCEPTED delivery counts as
+// DELIVERED: `done`, never a failure code, so its sender gets no notice and no card. "Deliberate" needs no actor:
+// only the close verb tells an owner a close is on (`drainCause` / `isSessionCloseDrainActive`), so every terminal
+// this owner writes for an accepted delivery while it is on is `done / delivered_at_close`. acpx-ui writes the
+// `_inferred` twin where no owner terminal exists. A NEVER-accepted item is unchanged (SESSION_CLOSED_UNDELIVERED,
+// resend-safe, sender told) — that is the ruling's case (2). R-CONSUMED (`consumed_before_cut`) keeps precedence.
+// Contracted in `test/fixtures/delivery-contract.fixture.json` (`deliveredAtClose`), which acpx-ui vendors. The
+// note must not contain `session closed` / `session is closed`: acpx-ui's substring backstops would read a
+// delivered item as a close. ONE line on purpose (T11c finds contracted messages by verbatim substring).
+export const DELIVERED_AT_CLOSE = "delivered_at_close" as const;
+export const DELIVERED_AT_CLOSE_INFERRED = "delivered_at_close_inferred" as const;
+export const DELIVERED_AT_CLOSE_NOTE =
+  "accepted before a deliberate close ended its turn — counted as delivered";
+
+/** The non-failing note on a `done / delivered_at_close`; `detailCode` keeps the code the cut would have written. */
+export function deliveredAtCloseNote(detailCode: string): DeliveryEventError {
+  return { code: 0, message: DELIVERED_AT_CLOSE_NOTE, detailCode };
+}
+
+type CloseDrainTerminalInput = {
+  closeDrainActive: boolean;
+  accepted: boolean;
+  phase: Exclude<DeliveryPhase, "accepted">;
+  error?: DeliveryEventError;
+};
+
+// The cut a close's own cancel produces: a `cancelled`, or the watchdog's cancel racing the close.
+function isCloseCancelCut(input: CloseDrainTerminalInput): boolean {
+  return (
+    input.phase === "cancelled" || input.error?.detailCode === TURN_WATCHDOG_CANCELLED_DETAIL_CODE
+  );
+}
+
+function closeCutDetailCode(input: CloseDrainTerminalInput): string {
+  if (isCloseCancelCut(input)) {
+    return SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE;
+  }
+  return input.error?.detailCode || SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE;
+}
+
+/**
+ * What the runtime's choke point writes, while this owner drains for a session close, for a terminal that is not
+ * the turn's own `done` (and was not already turned into `consumed_before_cut`):
+ *
+ *  - ACCEPTED → `delivered` (`done / delivered_at_close`) for ANY cut — a cancel, a watchdog cut, and also an
+ *    adapter death (`AGENT_DISCONNECTED`): the non-self close arm can kill the adapter before the ACP cancel lands,
+ *    and that is the close's doing, not a crash. The note keeps the code the cut would have written.
+ *  - NOT accepted → today's rule: a cancel or watchdog cut → `turn-cancelled` (SESSION_CLOSED_TURN_CANCELLED);
+ *    anything else unchanged. ⚠️ Do not drop the `accepted` input: "accepted = delivered" is the ruling, and a
+ *    delivery that never reached the agent must never read delivered (test/delivered-at-close.test.ts).
+ *  - No close drain → `undefined`: write the terminal unchanged. Owner death, crash and watchdog keep notifying.
+ */
+export function closeDrainTerminal(
+  input: CloseDrainTerminalInput,
+): { kind: "delivered"; note: DeliveryEventError } | { kind: "turn-cancelled" } | undefined {
+  const cut = input.phase === "failed" || input.phase === "cancelled";
+  if (!input.closeDrainActive || !cut) {
+    return undefined;
+  }
+  if (input.accepted) {
+    return { kind: "delivered", note: deliveredAtCloseNote(closeCutDetailCode(input)) };
+  }
+  return isCloseCancelCut(input) ? { kind: "turn-cancelled" } : undefined;
+}
+
 export function consumedCutNote(input: ConsumedCutInput): DeliveryEventError | undefined {
   if (!consumedCutFlips(input)) {
     return undefined;

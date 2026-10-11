@@ -25,6 +25,7 @@ import {
   CONSUMED_CUT_BY_SESSION_CLOSE,
   CONSUMED_CUT_BY_TURN_ERROR,
   consumedCutNote,
+  DELIVERED_AT_CLOSE,
   SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE,
   TURN_WATCHDOG_CANCELLED_DETAIL_CODE,
 } from "../src/cli/queue/delivery-terminals.js";
@@ -611,7 +612,7 @@ test("e09628a1 U1/U2: the owner-exit sweep writes done/consumed_before_cut for a
     await injectSteer(rig, "req-b", STEER_B);
     rig.step();
     const sweep = terminalizeAbsorbedDeliveriesOnOwnerExit(rig.record.acpxRecordId);
-    assert.deepEqual(sweep, { failed: 1, consumed: 1 });
+    assert.deepEqual(sweep, { failed: 1, consumed: 1, deliveredAtClose: 0 });
     // No await between the sweep and the read: the writes are synchronous (they must survive SIGTERM).
     const a = await terminalsFor(rig.record, STEER_A);
     assert.equal(a.length, 1);
@@ -657,15 +658,17 @@ test("e09628a1 U7: a close drain + kill writes done/consumed_before_cut for a CO
   });
 });
 
-// U7 negative: an UNCONSUMED main cut by the same close keeps the close's code.
-test("e09628a1 U7 negative: a close drain + kill of an UNCONSUMED main keeps failed/SESSION_CLOSED_TURN_CANCELLED", async () => {
+// U7 negative: an UNCONSUMED main cut by the same close is not `consumed_before_cut` — since brick e50e171d it is
+// `done / delivered_at_close` (accepted = delivered under a deliberate close), the close's code kept in the note.
+test("e09628a1 U7 negative: a close drain + kill of an UNCONSUMED main is delivered_at_close, never consumed_before_cut", async () => {
   const mainMessageId = "e0960005-0000-4000-8000-000000000001";
   await withMainTurn({ sessionId: "consumption-u7n", mainMessageId }, async (rig) => {
     rig.completionOnly(); // a completion with no output since the prompt does not count
     await rig.owner.drainDeliveries("session-close", 0);
     rig.owner.terminalizeCustodyOnSignal();
     const [at] = await terminalsFor(rig.record, mainMessageId);
-    assert.equal(at?.phase, "failed");
+    assert.equal(at?.phase, "done");
+    assert.equal(at?.stopReason, DELIVERED_AT_CLOSE);
     assert.equal(at?.error?.detailCode, SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE);
     rig.control.resolveMainPrompt({ stopReason: "cancelled" });
   });
@@ -691,7 +694,10 @@ test("e09628a1 U3: a close-drain cancel reaching the choke point writes done/con
     assert.equal(a?.phase, "done");
     assert.equal(a?.stopReason, CONSUMED_BEFORE_CUT);
     const [b] = await terminalsFor(rig.record, STEER_B);
-    assert.equal(b?.phase, "failed", "the steer injected after the last completion is cut");
+    // The steer injected after the last completion is unconsumed: R-CONSUMED does not label it, and since brick
+    // e50e171d the deliberate close counts it delivered.
+    assert.equal(b?.phase, "done", "an unconsumed steer cut by a close is delivered_at_close");
+    assert.equal(b?.stopReason, DELIVERED_AT_CLOSE);
     assert.equal(b?.error?.detailCode, SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE);
   });
 });
@@ -740,8 +746,9 @@ test("e09628a1 U8: the close sweep writes a consumed main's OWN done when it ans
   });
 });
 
-// U9: a Claude session gets no tracker — the same frames change nothing.
-test("e09628a1 U9: a Claude main cut by a close keeps failed/SESSION_CLOSED_TURN_CANCELLED whatever it streamed", async () => {
+// U9: a Claude session gets no tracker — the same frames change nothing: never `consumed_before_cut`. Since brick
+// e50e171d the close's terminal for it is `done / delivered_at_close` (accepted = delivered).
+test("e09628a1 U9: a Claude main cut by a close is delivered_at_close, never consumed_before_cut, whatever it streamed", async () => {
   const mainMessageId = "e0960008-0000-4000-8000-000000000001";
   await withMainTurn(
     { sessionId: "consumption-u9", mainMessageId, agentCommand: CLAUDE_AGENT_COMMAND },
@@ -751,7 +758,8 @@ test("e09628a1 U9: a Claude main cut by a close keeps failed/SESSION_CLOSED_TURN
       await rig.owner.drainDeliveries("session-close", 0);
       rig.owner.terminalizeCustodyOnSignal();
       const [at] = await terminalsFor(rig.record, mainMessageId);
-      assert.equal(at?.phase, "failed");
+      assert.equal(at?.phase, "done");
+      assert.equal(at?.stopReason, DELIVERED_AT_CLOSE);
       assert.equal(at?.error?.detailCode, SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE);
       rig.control.resolveMainPrompt({ stopReason: "cancelled" });
     },

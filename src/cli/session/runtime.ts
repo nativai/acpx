@@ -176,6 +176,8 @@ import {
   SESSION_CLOSED_UNDELIVERED_MESSAGE,
   TURN_WATCHDOG_CANCELLED_DETAIL_CODE,
   TURN_WATCHDOG_CANCELLED_MESSAGE,
+  DELIVERED_AT_CLOSE,
+  closeDrainTerminal,
   consumedCutNote,
 } from "../queue/delivery-terminals.js";
 import {
@@ -2387,9 +2389,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   ): Promise<void> => {
     // 71fdcaf2 (S5.4) — THE ONE CHOKE POINT for every terminal this runtime writes (main turn, injected turn,
     // absorbed sweep), reached only through `appendDeliveryTerminal`. A turn CANCELLED while this owner is draining
-    // for a session close is the close's doing, not a Stop: the message reached the agent and never settled, so it
-    // is `failed` with the outcome-unknown code acpx-ui notifies the sender on — never a code-less `cancelled`. A
-    // cancel with NO close stays one.
+    // for a session close is the close's doing, not a Stop — never a code-less `cancelled`. Since brick e50e171d an
+    // ACCEPTED delivery so cut is `done / delivered_at_close` (`closeDrainTerminal`); only a never-accepted one still
+    // gets the outcome-unknown `failed`. A cancel with NO close stays one.
     // brick a147982f — a turn the C1 watchdog's cancel cut is a cancel too: during a close drain the close wins.
     // brick e09628a1 (R-CONSUMED) — FIRST: a cut of a message the model already consumed is `done`, with the
     // cut's own code kept in a non-failing note (`consumedCutNote`: a steer on every cut, a main only on a close).
@@ -2410,9 +2412,24 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       releaseConsumption();
       return;
     }
-    const watchdogCut =
-      phase === "failed" && params.error?.detailCode === TURN_WATCHDOG_CANCELLED_DETAIL_CODE;
-    if ((phase === "cancelled" || watchdogCut) && isSessionCloseDrainActive(record.acpxRecordId)) {
+    // brick e50e171d — then, while a DELIBERATE close drains this owner, an ACCEPTED delivery's cut is `done /
+    // delivered_at_close` (any cut, adapter death included); a never-accepted one keeps the rule above it.
+    const closeTerminal = closeDrainTerminal({
+      closeDrainActive: isSessionCloseDrainActive(record.acpxRecordId),
+      accepted: context !== undefined && acceptedDeliveryKeys.has(deliveryKey(context)),
+      phase,
+      error: params.error,
+    });
+    if (closeTerminal?.kind === "delivered") {
+      await appendDeliveryEvent(context, "done", {
+        stopReason: DELIVERED_AT_CLOSE,
+        error: closeTerminal.note,
+        terminal: true,
+      });
+      releaseConsumption();
+      return;
+    }
+    if (closeTerminal?.kind === "turn-cancelled") {
       await appendDeliveryEvent(context, "failed", {
         error: {
           code: 0,

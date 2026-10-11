@@ -16,8 +16,9 @@ import path from "node:path";
 import test from "node:test";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import {
+  DELIVERED_AT_CLOSE,
+  DELIVERED_AT_CLOSE_NOTE,
   SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE,
-  SESSION_CLOSED_TURN_CANCELLED_MESSAGE,
   TURN_WATCHDOG_CANCELLED_DETAIL_CODE,
 } from "../src/cli/queue/delivery-terminals.js";
 import {
@@ -35,6 +36,7 @@ import {
 import type { QueueOwnerMessage } from "../src/cli/queue/messages.js";
 import { resetSessionCloseIntentForTests } from "../src/cli/queue/session-close-intent.js";
 import { runQueuedTask } from "../src/cli/session/runtime.js";
+import { AgentDisconnectedError } from "../src/errors.js";
 import { textPrompt } from "../src/prompt-content.js";
 import type { DepthProjection } from "../src/session/depth-projection.js";
 import { sessionEventActivePath } from "../src/session/event-log.js";
@@ -51,7 +53,12 @@ import {
   type PathologicalControl,
   type PromptResponse,
 } from "./pathological-adapter-helpers.js";
-import { makeSessionRecord, withTempHome, writeSessionRecordFile } from "./runtime-test-helpers.js";
+import {
+  makeSessionRecord,
+  sessionFilePath,
+  withTempHome,
+  writeSessionRecordFile,
+} from "./runtime-test-helpers.js";
 
 // A healthy turn here finishes in milliseconds and a wrong one hangs forever, so the deadline sits far
 // above box noise (the sibling watchdog rows measured several seconds each at load ~80, 2026-10-09).
@@ -65,6 +72,7 @@ type DeliveryParams = {
 };
 
 type Rig = {
+  homeDir: string;
   record: SessionRecord;
   control: PathologicalControl;
   owner: SessionQueueOwner;
@@ -154,16 +162,20 @@ async function terminalsFor(record: SessionRecord, messageId: string): Promise<D
     .filter((params) => params.messageId === messageId && params.phase !== "accepted");
 }
 
-function assertCloseCut(terminals: DeliveryParams[], what: string): void {
+// brick e50e171d (Daniel, 2026-10-11) — an ACCEPTED delivery whose turn a deliberate close cut is DELIVERED:
+// `done / delivered_at_close`, the close's code kept in the non-failing note. Before that it was `failed /
+// SESSION_CLOSED_TURN_CANCELLED`, which notified the sender and raised a card for every handover self-close.
+function assertCloseCut(
+  terminals: DeliveryParams[],
+  what: string,
+  detailCode: string = SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE,
+): void {
   assert.equal(terminals.length, 1, `${what}: exactly one delivery terminal`);
   const [terminal] = terminals;
-  assert.equal(terminal?.phase, "failed", `${what}: phase`);
-  assert.equal(
-    terminal?.error?.detailCode,
-    SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE,
-    `${what}: code`,
-  );
-  assert.equal(terminal?.error?.message, SESSION_CLOSED_TURN_CANCELLED_MESSAGE, `${what}: message`);
+  assert.equal(terminal?.phase, "done", `${what}: phase`);
+  assert.equal(terminal?.stopReason, DELIVERED_AT_CLOSE, `${what}: stopReason`);
+  assert.equal(terminal?.error?.detailCode, detailCode, `${what}: code`);
+  assert.equal(terminal?.error?.message, DELIVERED_AT_CLOSE_NOTE, `${what}: message`);
 }
 
 /**
@@ -219,6 +231,7 @@ async function withMainTurn(
       await control.mainPromptInFlight;
       await sleep(0);
       await body({
+        homeDir,
         record,
         control,
         owner,
@@ -254,7 +267,7 @@ function agentMessageChunk(acpSessionId: string, text: string): SessionNotificat
 // mid-tool, the close drains and kills the owner, and the adapter has not answered the prompt. Before
 // the fix the sweep wrote nothing for the main delivery — it stayed `accepted` and acpx-ui read it
 // done/delivered. The adapter's late `cancelled` (what session/close produces) must not add a second.
-test("570d2570: the signal sweep after a close drain gives the cut main turn failed/SESSION_CLOSED_TURN_CANCELLED", async () => {
+test("570d2570/e50e171d: the signal sweep after a close drain gives the cut main turn done/delivered_at_close", async () => {
   const mainMessageId = "57000001-0000-4000-8000-000000000001";
   await withMainTurn({ sessionId: "close-cut-main-1", mainMessageId }, async (rig) => {
     await drainForClose(rig.owner);
@@ -265,6 +278,92 @@ test("570d2570: the signal sweep after a close drain gives the cut main turn fai
     rig.control.resolveMainPrompt({ stopReason: "cancelled" });
     await withRaceTimeout(rig.run, MUST_FINISH_MS, "the turn never finished");
     assertCloseCut(await terminalsFor(rig.record, mainMessageId), "after the late cancel");
+  });
+});
+
+// brick e50e171d — the choke point is widened from cancel/watchdog to ANY cut while a close drains: the non-self
+// close arm can kill the adapter before the ACP cancel lands, and that crash is the close's doing. The note keeps
+// the cut's own code (forensics). The paired row below is the same crash with NO close: it must stay a failure,
+// because an adapter death outside a close is Daniel's case (1) and its sender must be told.
+test("e50e171d: an adapter death during a close drain is done/delivered_at_close, the crash code kept in the note", async () => {
+  const mainMessageId = "e50e1710-0000-4000-8000-000000000001";
+  await withMainTurn({ sessionId: "close-cut-disconnect", mainMessageId }, async (rig) => {
+    await drainForClose(rig.owner);
+    rig.control.rejectMainPrompt(new AgentDisconnectedError("process exited", 1, null));
+    await rig.run.catch(() => {});
+    assertCloseCut(
+      await terminalsFor(rig.record, mainMessageId),
+      "adapter death in a close",
+      "AGENT_DISCONNECTED",
+    );
+    assert.equal(rig.owner.terminalizeCustodyOnSignal(), 0, "the runtime's terminal is the one");
+  });
+});
+
+test("e50e171d (negative): an adapter death with NO close drain stays failed/AGENT_DISCONNECTED", async () => {
+  const mainMessageId = "e50e1710-0000-4000-8000-000000000002";
+  await withMainTurn({ sessionId: "close-cut-disconnect-open", mainMessageId }, async (rig) => {
+    rig.control.rejectMainPrompt(new AgentDisconnectedError("process exited", 1, null));
+    await rig.run.catch(() => {});
+    const terminals = await terminalsFor(rig.record, mainMessageId);
+    assert.equal(terminals.length, 1);
+    assert.equal(terminals[0]?.phase, "failed");
+    assert.equal(terminals[0]?.error?.detailCode, "AGENT_DISCONNECTED");
+  });
+});
+
+// brick e50e171d — "accepted = delivered" binds ACCEPTED deliveries only. The injected path reaches the runtime's
+// choke point for a failure BEFORE its `accepted` (`recordPromptStart` throws first — driven here by an unreadable
+// record), and that message never reached the agent: it must stay `failed`, so its sender is told to resend
+// (Daniel's case 2). The same rig's accepted main is the positive control: the close settles it delivered.
+test("e50e171d: an injection that fails BEFORE accepted during a close drain stays failed — never delivered_at_close", async () => {
+  const mainMessageId = "e50e1710-0000-4000-8000-000000000003";
+  const injectedMessageId = "e50e1710-0000-4000-8000-0000000000cc";
+  await withMainTurn({ sessionId: "close-cut-unaccepted", mainMessageId }, async (rig) => {
+    await drainForClose(rig.owner);
+    const recordFile = sessionFilePath(rig.homeDir, rig.record.acpxRecordId);
+    const original = await fs.readFile(recordFile, "utf8");
+    await fs.writeFile(recordFile, "{ not json", "utf8");
+    let injectedTerminals: DeliveryParams[] = [];
+    try {
+      rig.inject(
+        makeTask({
+          requestId: "req-unaccepted",
+          messageId: injectedMessageId,
+          text: INJECTED_PROMPT_TEXT,
+          waitForCompletion: false,
+        }),
+      );
+      const deadline = Date.now() + MUST_FINISH_MS;
+      while (injectedTerminals.length === 0) {
+        assert.ok(Date.now() < deadline, "the failed injection never wrote its terminal");
+        await sleep(10);
+        injectedTerminals = await terminalsFor(rig.record, injectedMessageId);
+      }
+    } finally {
+      await fs.writeFile(recordFile, original, "utf8");
+    }
+    const events = (await listSessionEvents(rig.record.acpxRecordId)) as Array<{
+      method?: string;
+      params?: DeliveryParams;
+    }>;
+    assert.ok(
+      !events.some(
+        (event) =>
+          event.params?.messageId === injectedMessageId && event.params.phase === "accepted",
+      ),
+      "the rig failed the injection BEFORE its accepted event",
+    );
+    assert.equal(injectedTerminals.length, 1);
+    assert.equal(
+      injectedTerminals[0]?.phase,
+      "failed",
+      "a never-accepted message is not delivered",
+    );
+    assert.notEqual(injectedTerminals[0]?.stopReason, DELIVERED_AT_CLOSE);
+    rig.control.resolveMainPrompt({ stopReason: "cancelled" });
+    await withRaceTimeout(rig.run, MUST_FINISH_MS, "the turn never finished");
+    assertCloseCut(await terminalsFor(rig.record, mainMessageId), "the accepted main (control)");
   });
 });
 
@@ -332,9 +431,8 @@ test("570d2570: a main turn that resolved on its own before the kill gets its OW
   );
 });
 
-// The injected-message path is unchanged: the sweep never touches an injected delivery, and the
-// adapter's `cancelled` for it still becomes the runtime's own failed/SESSION_CLOSED_TURN_CANCELLED
-// (71fdcaf2) — the line the evidence showed working before this brick (ead85d8e L31).
+// The injected-message path: the sweep never touches an injected delivery, and the adapter's `cancelled`
+// for it becomes the runtime's own close terminal (71fdcaf2) — `done / delivered_at_close` since e50e171d.
 test("570d2570: the injected delivery still gets its own close terminal, untouched by the sweep", async () => {
   const mainMessageId = "57000003-0000-4000-8000-000000000003";
   const injectedMessageId = "57000003-0000-4000-8000-0000000000bb";

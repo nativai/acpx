@@ -74,5 +74,17 @@
       "acpxUiDefinitiveGiveUp": true,
       "requiredSubstringLowercased": null
     }
-  ]
+  ],
+  "deliveredAtClose": {
+    "$comment": "brick://e50e171d (Daniel, 2026-10-11). Under a DELIBERATE close (the close verb, by anyone), a delivery that was already ACCEPTED counts as DELIVERED: phase `done`, never a failure code, so its sender gets no notice and Daniel no card. acpx's queue owner, told by the close drain, writes `stopReasons.owner`; acpx-ui writes `stopReasons.inferred` where no owner terminal exists. Both carry `note` as the NON-FAILING `attempt.error.message` on that `done`; its `detailCode` keeps the code the cut would otherwise have written (forensic only — not contracted). R-CONSUMED's `consumed_before_cut*` keeps precedence. A NEVER-accepted item is unchanged (SESSION_CLOSED_UNDELIVERED above: resend-safe, sender notified). The note must contain none of `forbiddenSubstringsLowercased`: acpx-ui's substring backstops would read a delivered item as a close.",
+    "phase": "done",
+    "stopReasons": {
+      "owner": "delivered_at_close",
+      "inferred": "delivered_at_close_inferred"
+    },
+    "note": "accepted before a deliberate close ended its turn — counted as delivered",
+    "forbiddenSubstringsLowercased": ["session closed", "session is closed"],
+    "notifiesSender": false,
+    "resendSafe": false
+  }
 }

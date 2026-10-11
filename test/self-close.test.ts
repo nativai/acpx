@@ -16,6 +16,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
@@ -109,11 +110,19 @@ async function seedSessionRecord(homeDir: string, sessionId: string): Promise<vo
   );
 }
 
-type ObservedRequest = { type: string };
+type ObservedRequest = {
+  type: string;
+  reason?: string;
+  timeoutMs?: number;
+  /** brick e50e171d — what the record on disk read when the request arrived. */
+  closedOnDisk?: unknown;
+};
 
-// A recording owner socket. The self arm must NEVER connect to it; the
-// non-self path hits it with the exact drain → close_session sequence.
-function createRecordingOwnerServer(observed: ObservedRequest[]): net.Server {
+// A recording owner socket. The self arm sends it ONE zero-timeout drain and
+// nothing else (brick e50e171d); the non-self path hits it with the exact
+// drain → close_session sequence. `recordFile`, when given, is read as each
+// request arrives, so a row can pin what was already on disk at that moment.
+function createRecordingOwnerServer(observed: ObservedRequest[], recordFile?: string): net.Server {
   return net.createServer((socket) => {
     socket.setEncoding("utf8");
     let buffer = "";
@@ -132,8 +141,27 @@ function createRecordingOwnerServer(observed: ObservedRequest[]): net.Server {
         if (!line) {
           continue;
         }
-        const request = JSON.parse(line) as { requestId: string; type: string };
-        observed.push({ type: request.type });
+        const request = JSON.parse(line) as {
+          requestId: string;
+          type: string;
+          reason?: string;
+          timeoutMs?: number;
+        };
+        let closedOnDisk: unknown;
+        if (recordFile) {
+          try {
+            closedOnDisk = (JSON.parse(readFileSync(recordFile, "utf8")) as { closed?: unknown })
+              .closed;
+          } catch {
+            closedOnDisk = "unreadable";
+          }
+        }
+        observed.push({
+          type: request.type,
+          ...(request.reason !== undefined ? { reason: request.reason } : {}),
+          ...(request.timeoutMs !== undefined ? { timeoutMs: request.timeoutMs } : {}),
+          ...(recordFile ? { closedOnDisk } : {}),
+        });
         socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
         if (request.type === "drain_deliveries") {
           socket.write(
@@ -192,7 +220,13 @@ test("self-close: the terminal record lands closed:true even though the own owne
     await seedSessionRecord(homeDir, sessionId);
 
     const observed: ObservedRequest[] = [];
-    const server = createRecordingOwnerServer(observed);
+    const recordFile = path.join(
+      homeDir,
+      ".acpx",
+      "sessions",
+      `${encodeURIComponent(sessionId)}.json`,
+    );
+    const server = createRecordingOwnerServer(observed, recordFile);
     const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
     await listenServer(server, socketPath);
 
@@ -246,11 +280,14 @@ test("self-close: the terminal record lands closed:true even though the own owne
         `the owner was SIGTERMed by the self-close (its handler exits 0); stderr: ${intermediateStderr}`,
       );
 
-      // The skipped steps never reached the owner.
+      // brick e50e171d — the self arm TELLS its owner a close is on: exactly one
+      // drain, reason session-close, timeout 0 (any wait would be a wait on the
+      // turn running this close), sent only AFTER closed:true is on disk. The
+      // ACP shutdown still never reaches the doomed owner.
       assert.deepEqual(
         observed,
-        [],
-        "the self arm must skip the drain and the ACP shutdown — both target the doomed owner",
+        [{ type: "drain_deliveries", reason: "session-close", timeoutMs: 0, closedOnDisk: true }],
+        "the self arm sends one zero-timeout close drain after the privileged write, and no close_session",
       );
 
       // THE FIX, asserted on disk: the terminal record outlived the kill.

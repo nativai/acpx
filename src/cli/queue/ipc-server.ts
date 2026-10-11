@@ -25,12 +25,13 @@ import type {
 import {
   CONSUMED_CUT_BY_SESSION_CLOSE,
   consumedBeforeCutNote,
+  DELIVERED_AT_CLOSE,
+  deliveredAtCloseNote,
   type OwnerExitCause,
   ownerExitDeliveryError,
   QUEUE_OWNER_CLOSING_DETAIL_CODE,
   QUEUE_OWNER_CLOSING_MESSAGE,
   SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE,
-  SESSION_CLOSED_TURN_CANCELLED_MESSAGE,
 } from "./delivery-terminals.js";
 import { claimMainTurnOnSessionClose } from "./main-turn-delivery.js";
 import {
@@ -499,10 +500,11 @@ export class SessionQueueOwner {
   /**
    * brick 570d2570 — the running MAIN turn's delivery, cut by the session close. `sessions close` SIGTERMs this
    * owner right after the ACP close cancels the turn, and the runtime writes that turn's terminal only at the end
-   * of its async path, so without this the delivery stays `accepted` forever and acpx-ui reads it `done`. The
-   * code is the one the runtime's own choke point writes for a close-cancelled turn: the message reached the
-   * agent, the close cut its turn, outcome unknown, do not resend. Nothing is re-delivered or resumed — the close
-   * stands (Daniel, 2026-10-09); only the record changes.
+   * of its async path, so without this the delivery stays `accepted` forever and acpx-ui reads it `done`. Since
+   * brick e50e171d (Daniel, 2026-10-11) the terminal is `done / delivered_at_close`, the same one the runtime's
+   * choke point writes for an accepted delivery under a close: a deliberate close counts an accepted message as
+   * delivered, so its sender is not told. Nothing is re-delivered or resumed — the close stands (Daniel,
+   * 2026-10-09); only the record changes.
    *
    * ONLY when this owner was TOLD the session is closing (`drainCause`), for the reason `OwnerExitCause` gives:
    * on `--no-drain`, or any other death, the owner witnessed no close and writes nothing here. One terminal per
@@ -545,11 +547,15 @@ export class SessionQueueOwner {
       );
       return 1;
     }
-    appendDeliveryStreamEventSync(this.sessionId, claimed.context, "failed", {
-      code: 0,
-      message: SESSION_CLOSED_TURN_CANCELLED_MESSAGE,
-      detailCode: SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE,
-    });
+    // brick e50e171d (Daniel, 2026-10-11) — the main was ACCEPTED (it is registered only after its `accepted`
+    // event) and a deliberate close ended its turn: delivered by rule. The note keeps the close's code.
+    appendDeliveryStreamEventSync(
+      this.sessionId,
+      claimed.context,
+      "done",
+      deliveredAtCloseNote(SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE),
+      { stopReason: DELIVERED_AT_CLOSE },
+    );
     return 1;
   }
 

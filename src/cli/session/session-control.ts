@@ -803,10 +803,11 @@ export async function closeSession(
 //
 // The self arm therefore INVERTS the order: persist the terminal record FIRST
 // (privileged write, same as the non-self path — nothing can un-close it
-// afterwards), and terminate the own owner pid as the FINAL act. The drain and
-// the best-effort ACP shutdown are SKIPPED in this arm: both target the owner
-// being terminated, and the in-flight turn IS the close call itself — there is
-// nothing honest to drain. The adapter (`record.pid`) kill is skipped too: the
+// afterwards), and terminate the own owner pid as the FINAL act. The best-effort
+// ACP shutdown is SKIPPED in this arm: it targets the owner being terminated.
+// The drain runs with a ZERO timeout only (brick e50e171d): the in-flight turn IS
+// the close call itself, so it must not be waited for, but the owner must still
+// be TOLD a close is on so it settles that turn's delivery. The adapter (`record.pid`) kill is skipped too: the
 // adapter sits on the doomed owner→caller path and taking it down kills the
 // caller before it can return. The config-dir release is skipped as well — with
 // the owner still ALIVE at that point, `dropStaleHolders` would retain the
@@ -929,6 +930,18 @@ async function closeSelfOwnedSession(
   await writeSessionRecordAtBoundaryWithLifecycle(record);
   const recordClosedState = await readBackRecordClosedState(record.acpxRecordId);
 
+  // brick e50e171d — TELL the own owner a close is on, without waiting. Its SIGTERM sweep then writes `done /
+  // delivered_at_close` for the turn this close cuts (accepted = delivered under a deliberate close), and its
+  // custody ends `SESSION_CLOSED_UNDELIVERED` (resend-safe, sender told) instead of `QUEUE_OWNER_SHUTDOWN` → a
+  // re-drive into a closed record. ⚠️ The timeout MUST stay 0: the turn this drain would wait for IS the turn
+  // running this close, so any wait is a wait on ourselves (why the self arm skipped the drain before). With 0 the
+  // owner reports `turnSettled:false` at once. After the privileged write, before the kill; best-effort like the
+  // non-self barrier — an owner that cannot be asked leaves today's behaviour. `--no-drain` still opts out.
+  const drain = await drainCustodyBeforeClose(record.acpxRecordId, {
+    ...options,
+    drainTimeoutMs: 0,
+  });
+
   if (options.verbose) {
     process.stderr.write(
       `[acpx] self-close: terminal record persisted; terminating own owner pid ${ownerPid}\n`,
@@ -942,11 +955,7 @@ async function closeSelfOwnedSession(
   // member, and sweeping would be self-destruction beyond the close's mandate.
   await terminateProcess(ownerPid);
 
-  return {
-    record,
-    drain: { attempted: false, reachedOwner: false, undelivered: [] },
-    recordClosedState,
-  };
+  return { record, drain, recordClosedState };
 }
 
 /**

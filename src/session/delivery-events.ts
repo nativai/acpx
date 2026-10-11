@@ -19,6 +19,11 @@ export type DeliveryStopReason =
   | "consumed_before_cut"
   | "consumed_before_cut_inferred"
   | "consumed_before_cut_backfill"
+  // brick e50e171d (Daniel, 2026-10-11) — a `done` for an ACCEPTED delivery whose turn a DELIBERATE close ended:
+  // counted delivered by rule, consumption unknown. Owner-witnessed (`delivered_at_close`, written by this owner
+  // once the close drain told it) vs acpx-ui-inferred (`_inferred`). Never a genuine completion.
+  | "delivered_at_close"
+  | "delivered_at_close_inferred"
   | null;
 
 export type DeliveryRecoveredBy = "turn-watchdog";

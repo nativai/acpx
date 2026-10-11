@@ -4,8 +4,11 @@ import {
   ABSORBED_TURN_NEVER_ENDED_MESSAGE,
   CONSUMED_CUT_BY_OWNER_EXIT,
   consumedBeforeCutNote,
+  DELIVERED_AT_CLOSE,
+  deliveredAtCloseNote,
 } from "../queue/delivery-terminals.js";
 import { appendDeliveryStreamEventSync } from "../queue/ipc-server.js";
+import { isSessionCloseDrainActive } from "../queue/session-close-intent.js";
 
 // F3 (493729fc): absorbed injected deliveries (codex steers folded into the
 // active turn) are tracked in-memory inside runSessionPrompt and terminalized
@@ -22,8 +25,11 @@ export type RegisteredAbsorbedDelivery = {
   consumed?: boolean;
 };
 
-/** What one owner-exit sweep wrote: `failed` outcome-unknown terminals, and `done` ones for consumed steers. */
-export type AbsorbedExitSweep = { failed: number; consumed: number };
+/**
+ * What one owner-exit sweep wrote: `failed` outcome-unknown terminals, `done` ones for consumed steers, and
+ * `done / delivered_at_close` ones for steers a deliberate close cut (brick e50e171d).
+ */
+export type AbsorbedExitSweep = { failed: number; consumed: number; deliveredAtClose: number };
 
 const liveAbsorbedDeliveriesBySession = new Map<string, RegisteredAbsorbedDelivery[]>();
 
@@ -56,14 +62,18 @@ export function unregisterAbsorbedDeliveries(
  * brick e09628a1 (R-CONSUMED) — a steer the model had already CONSUMED gets `done / consumed_before_cut`
  * instead, with ABSORBED_TURN_NEVER_ENDED kept as the note's detailCode: the turn that carried it has ended
  * (the owner is exiting), and the model read and acted on it, so it is delivered.
+ *
+ * brick e50e171d — when the exit is a DELIBERATE close (the drain noted it), an unconsumed steer is `done /
+ * delivered_at_close` instead of `failed`: accepted = delivered under a deliberate close.
  */
 export function terminalizeAbsorbedDeliveriesOnOwnerExit(sessionId: string): AbsorbedExitSweep {
-  const sweep: AbsorbedExitSweep = { failed: 0, consumed: 0 };
+  const sweep: AbsorbedExitSweep = { failed: 0, consumed: 0, deliveredAtClose: 0 };
   const deliveries = liveAbsorbedDeliveriesBySession.get(sessionId);
   if (!deliveries) {
     return sweep;
   }
   liveAbsorbedDeliveriesBySession.delete(sessionId);
+  const closing = isSessionCloseDrainActive(sessionId);
   for (const delivery of deliveries) {
     if (delivery.terminalWritten) {
       continue;
@@ -84,6 +94,20 @@ export function terminalizeAbsorbedDeliveriesOnOwnerExit(sessionId: string): Abs
         { stopReason: CONSUMED_BEFORE_CUT },
       );
       sweep.consumed += 1;
+      continue;
+    }
+    // brick e50e171d — this owner was TOLD a deliberate close is on (the close drain), and an absorbed steer was
+    // accepted: delivered by rule, no sender notice. Any other exit (owner death, recover, eviction) keeps the
+    // outcome-unknown `failed` below, which does notify — Daniel's case (1).
+    if (closing) {
+      appendDeliveryStreamEventSync(
+        sessionId,
+        delivery.context,
+        "done",
+        deliveredAtCloseNote(ABSORBED_TURN_NEVER_ENDED_DETAIL_CODE),
+        { stopReason: DELIVERED_AT_CLOSE },
+      );
+      sweep.deliveredAtClose += 1;
       continue;
     }
     appendDeliveryStreamEventSync(sessionId, delivery.context, "failed", {

@@ -9,6 +9,9 @@ import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import {
   ABSORBED_TURN_NEVER_ENDED_DETAIL_CODE,
   ABSORBED_TURN_NEVER_ENDED_MESSAGE,
+  DELIVERED_AT_CLOSE,
+  DELIVERED_AT_CLOSE_INFERRED,
+  DELIVERED_AT_CLOSE_NOTE,
   QUEUE_OWNER_CLOSING_DETAIL_CODE,
   QUEUE_OWNER_CLOSING_MESSAGE,
   QUEUE_OWNER_SHUTDOWN_DETAIL_CODE,
@@ -318,6 +321,14 @@ test("L1.4/L3.1 the emitted contract strings match the checked-in cross-repo fix
       retryable: boolean;
       reachedModel: string;
     }>;
+    deliveredAtClose: {
+      phase: string;
+      stopReasons: { owner: string; inferred: string };
+      note: string;
+      forbiddenSubstringsLowercased: string[];
+      notifiesSender: boolean;
+      resendSafe: boolean;
+    };
   };
 
   // The sha binds acpx's copy to acpx-ui's. acpx-ui vendors the same bytes and
@@ -325,7 +336,7 @@ test("L1.4/L3.1 the emitted contract strings match the checked-in cross-repo fix
   // rather than silently diverging for six weeks.
   assert.equal(
     createHash("sha256").update(bytes).digest("hex"),
-    "03bb70fdd01c39772079797d2b9ffb355f41375fbb6a86324b01e36dbaa6003f",
+    "e0876a5be4fccc095cdf3852b051ef3e018972384761b86dd30470efa32c46b7",
     "delivery-contract.fixture.json changed — re-broker the sha to the acpx-ui lanes before merging",
   );
 
@@ -365,6 +376,25 @@ test("L1.4/L3.1 the emitted contract strings match the checked-in cross-repo fix
   assert.equal(turnStart.retryable, false);
   assert.equal(turnStart.reachedModel, "no");
   assert.doesNotMatch(turnStart.message, /session (is )?closed/i);
+
+  // brick e50e171d — the deliberate-close `done`: what the owner writes is what the fixture promises acpx-ui.
+  const deliveredAtClose = fixture.deliveredAtClose;
+  assert.equal(deliveredAtClose.phase, "done");
+  assert.equal(deliveredAtClose.stopReasons.owner, DELIVERED_AT_CLOSE);
+  assert.equal(deliveredAtClose.stopReasons.inferred, DELIVERED_AT_CLOSE_INFERRED);
+  assert.equal(deliveredAtClose.note, DELIVERED_AT_CLOSE_NOTE);
+  assert.equal(deliveredAtClose.notifiesSender, false);
+  assert.equal(deliveredAtClose.resendSafe, false);
+  assert.deepEqual(deliveredAtClose.forbiddenSubstringsLowercased, [
+    "session closed",
+    "session is closed",
+  ]);
+  for (const forbidden of deliveredAtClose.forbiddenSubstringsLowercased) {
+    assert.ok(
+      !DELIVERED_AT_CLOSE_NOTE.toLowerCase().includes(forbidden),
+      `the delivered-at-close note must not read as a close to acpx-ui ("${forbidden}")`,
+    );
+  }
 
   // And the classification rule holds against those literal texts. acpx-ui's
   // `isTerminalEnqueueFailure` / `isDefinitiveGiveUp` both LOWER-CASE the text
@@ -435,6 +465,7 @@ test("L1.7 the owner-exit vocabulary splits by cause: close vs self-exit vs abso
     assert.deepEqual(terminalizeAbsorbedDeliveriesOnOwnerExit(absorbedSession), {
       failed: 1,
       consumed: 0,
+      deliveredAtClose: 0,
     });
     const absorbedEvents = await readDeliveryEvents(absorbedSession);
     assert.equal(absorbedEvents.length, 1);
