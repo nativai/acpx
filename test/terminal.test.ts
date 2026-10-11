@@ -739,3 +739,62 @@ test("terminal manager fails when prompt is unavailable and policy is fail", asy
     await fs.rm(tmp, { recursive: true, force: true });
   }
 });
+
+// brick 7c06a855 (TE F4): a queue owner runs with ACPX_OWNER_LOG=1 ("your stderr
+// IS the owner log"). An ACP terminal/create command must never inherit it: its
+// stderr is a pipe, and a nested acpx would tee agent stderr onto its own stream.
+// ACPX_F4_CONTROL is the positive control that the env really was inherited.
+async function terminalEnvSeen(
+  env: { name: string; value: string }[] | undefined,
+): Promise<{ ownerLog: string; control: string }> {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-terminal-f4-"));
+  const saved = { ownerLog: process.env.ACPX_OWNER_LOG, control: process.env.ACPX_F4_CONTROL };
+  process.env.ACPX_OWNER_LOG = "1";
+  process.env.ACPX_F4_CONTROL = "inherited";
+  try {
+    const manager = new TerminalManager({ cwd: tmp, permissionMode: "approve-all" });
+    const created = await manager.createTerminal({
+      sessionId: "session-f4",
+      command: process.execPath,
+      args: [
+        "-e",
+        "process.stdout.write(JSON.stringify({ownerLog: String(process.env.ACPX_OWNER_LOG), control: String(process.env.ACPX_F4_CONTROL)}))",
+      ],
+      env,
+    });
+    await manager.waitForTerminalExit({ sessionId: "session-f4", terminalId: created.terminalId });
+    const { output } = await manager.terminalOutput({
+      sessionId: "session-f4",
+      terminalId: created.terminalId,
+    });
+    await manager.releaseTerminal({ sessionId: "session-f4", terminalId: created.terminalId });
+    return JSON.parse(output) as { ownerLog: string; control: string };
+  } finally {
+    for (const [name, value] of [
+      ["ACPX_OWNER_LOG", saved.ownerLog],
+      ["ACPX_F4_CONTROL", saved.control],
+    ] as const) {
+      if (value === undefined) {
+        delete process.env[name];
+      } else {
+        process.env[name] = value;
+      }
+    }
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+}
+
+test("terminal/create without env: the command inherits the env but NOT ACPX_OWNER_LOG", async () => {
+  const seen = await terminalEnvSeen(undefined);
+  assert.equal(seen.control, "inherited", "control: the owner env really was inherited");
+  assert.equal(seen.ownerLog, "undefined");
+});
+
+test("terminal/create with env entries: ACPX_OWNER_LOG is stripped, even when requested", async () => {
+  const seen = await terminalEnvSeen([
+    { name: "ACPX_F4_CONTROL", value: "requested" },
+    { name: "ACPX_OWNER_LOG", value: "1" },
+  ]);
+  assert.equal(seen.control, "requested", "control: requested entries are applied");
+  assert.equal(seen.ownerLog, "undefined");
+});
