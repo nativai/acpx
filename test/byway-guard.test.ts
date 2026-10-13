@@ -228,13 +228,19 @@ function bywayFixture(overrides: Partial<SessionRecord> = {}): SessionRecord {
   });
 }
 
-test("D6 · refusal predicate: an agent caller on a byway is refused; message names source, clamped question, and --allow-byway", () => {
-  const refusal = bywayCloseRefusal(bywayFixture(), false, agentEnv());
+test("D6 · refusal predicate: an agent caller on a byway is refused; message names source, clamped question and the human's route — and NO workaround", () => {
+  const refusal = bywayCloseRefusal(bywayFixture(), agentEnv());
   assert.ok(refusal, "an agent closing a byway was not refused");
   assert.equal(refusal.code, "BYWAY_CLOSE_REFUSED");
   assert.equal(refusal.sourceSessionId, "eeeeeeee-1111-4222-8333-444455556666");
   assert.match(refusal.message, /by-the-way side-thread/);
-  assert.match(refusal.message, /--allow-byway/);
+  assert.match(refusal.message, /agents cannot close it/);
+  assert.match(refusal.message, /they close it in atrium themselves/);
+  assert.match(refusal.message, /promote it there first/);
+  // NEGATIVE — the refusal must hand an agent no way round it: no flag, no env variable.
+  // (The first version said "re-run with --allow-byway"; an agent did, on another agent's order.)
+  assert.doesNotMatch(refusal.message, /--[a-z]/, "the refusal names a flag");
+  assert.doesNotMatch(refusal.message, /ACPX_|env/i, "the refusal names an env trick");
   const quoted = /\("([^"]*)"\)/.exec(refusal.message)?.[1] ?? "";
   assert.equal(quoted.length, 80, "the first question is not clamped to 80 chars");
 });
@@ -246,30 +252,29 @@ test("D6 · detection breadth — NEGATIVE: any ONE identity var is an agent, in
     { ACPX_SESSION_URL: `${UI_BASE}/?session=not-a-uuid` },
     { ACPX_SESSION_RECORD_ID: OTHER_AGENT },
   ]) {
-    assert.ok(bywayCloseRefusal(bywayFixture(), false, env), `fail-open on ${JSON.stringify(env)}`);
+    assert.ok(bywayCloseRefusal(bywayFixture(), env), `fail-open on ${JSON.stringify(env)}`);
   }
 });
 
 test("D6 · NEGATIVE — no identity env (a human shell, atrium's stripped spawn) is never refused; blank values are not identity", () => {
-  assert.equal(bywayCloseRefusal(bywayFixture(), false, {}), undefined);
+  assert.equal(bywayCloseRefusal(bywayFixture(), {}), undefined);
   assert.equal(
-    bywayCloseRefusal(bywayFixture(), false, { ACPX_SESSION_URL: "  ", ACPX_SEAT_URL: "" }),
+    bywayCloseRefusal(bywayFixture(), { ACPX_SESSION_URL: "  ", ACPX_SEAT_URL: "" }),
     undefined,
   );
 });
 
-test("D6 · self-close is exempt by session and by seat; a plain child and --allow-byway are never refused", () => {
+test("D6 · self-close is exempt by session and by seat; a plain child is never refused", () => {
   const target = bywayFixture();
-  assert.equal(bywayCloseRefusal(target, false, agentEnv(target.acpxRecordId)), undefined);
+  assert.equal(bywayCloseRefusal(target, agentEnv(target.acpxRecordId)), undefined);
   assert.equal(
-    bywayCloseRefusal(target, false, {
+    bywayCloseRefusal(target, {
       ACPX_SESSION_URL: `${UI_BASE}/?session=${OTHER_AGENT}`,
       ACPX_SEAT_URL: `${UI_BASE}/?seat=${target.seatId}`,
     }),
     undefined,
   );
-  assert.equal(bywayCloseRefusal(bywayFixture({ metadata: {} }), false, agentEnv()), undefined);
-  assert.equal(bywayCloseRefusal(target, true, agentEnv()), undefined);
+  assert.equal(bywayCloseRefusal(bywayFixture({ metadata: {} }), agentEnv()), undefined);
 });
 
 // ─── D6 — `sessions close` through the real CLI ──────────────────────────────
@@ -328,15 +333,35 @@ test("close guard · NEGATIVE — with NO identity env (atrium's UI close, a hum
   });
 });
 
-test("close guard · --allow-byway closes it from an agent shell", async () => {
+test("close guard · NEGATIVE — there is NO override: `--allow-byway` (the removed flag) is an unknown option and the byway stays open", async () => {
   await withRig(async (rig) => {
     const byway = await rig.byway(await rig.create("source"));
-    const result = await rig.cli(
-      ["sessions", "close", "--session-id", byway, "--allow-byway"],
-      agentEnv(),
-    );
-    assert.equal(result.code, 0, result.stderr);
-    assert.equal((await rig.onDisk(byway)).closed, true);
+    const before = await fs.readFile(rig.recordPath(byway), "utf8");
+    for (const env of [agentEnv(), {}]) {
+      const result = await rig.cli(
+        ["sessions", "close", "--session-id", byway, "--allow-byway"],
+        env,
+      );
+      assert.notEqual(result.code, 0, `--allow-byway was accepted: ${result.stdout}`);
+      assert.match(result.stderr, /unknown option '--allow-byway'/);
+    }
+    assert.equal(await fs.readFile(rig.recordPath(byway), "utf8"), before, "the byway moved");
+    assert.notEqual((await rig.onDisk(byway)).closed, true);
+  });
+});
+
+test("close guard · NEGATIVE — `sessions close --help` and its usage-error help never mention byways (nothing to discover)", async () => {
+  await withRig(async (rig) => {
+    const help = await rig.cli(["sessions", "close", "--help"]);
+    assert.equal(help.code, 0, help.stderr);
+    assert.match(help.stdout, /--session-id/, "precondition: this is the close help");
+    // The specimen: a usage error made commander print the whole close help, and the override
+    // the agent then used was in it. Both outputs must carry no byway wording at all.
+    const usage = await rig.cli(["sessions", "close", "a", "b", "c"], agentEnv());
+    assert.notEqual(usage.code, 0);
+    for (const text of [help.stdout, help.stderr, usage.stdout, usage.stderr]) {
+      assert.doesNotMatch(text, /byway|by-the-way|side-thread/i, text);
+    }
   });
 });
 

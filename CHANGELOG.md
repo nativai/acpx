@@ -154,7 +154,7 @@ Repo: https://github.com/openclaw/acpx
   (brick 5eaf316c)
 - CLI: by-the-way side-threads (a human's side conversations, `metadata.byway`)
   are kept out of agents' hands. An agent's `sessions close` on one is refused
-  with `BYWAY_CLOSE_REFUSED` unless it passes `--allow-byway`; `set-parent`
+  with `BYWAY_CLOSE_REFUSED` (the human closes it in acpx-ui); `set-parent`
   refuses or skips one with `BYWAY_PARENT_IMMUTABLE`; a byway copy no longer
   stamps `session-started` on its inherited brick; `sessions list --local`
   hides them unless `--include-byways`. (brick 6867bbfc)

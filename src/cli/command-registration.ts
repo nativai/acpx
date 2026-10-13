@@ -486,10 +486,6 @@ export function registerSessionsCommand(
     .option(
       "--fail-on-undelivered",
       "Exit 3 instead of 0 when the close found undelivered messages in the queue owner's custody",
-    )
-    .option(
-      "--allow-byway",
-      "Close a by-the-way side-thread (a human's side conversation) — only when the human explicitly asked you to",
     );
   addSessionIdentityOptions(closeCommand);
   addSeatSelectorOption(closeCommand);

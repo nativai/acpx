@@ -206,8 +206,6 @@ export type SessionsCloseFlags = StatusFlags & {
   drain?: boolean;
   drainTimeout?: number;
   failOnUndelivered?: boolean;
-  /** Close a by-the-way side-thread from an agent caller (brick 6867bbfc D6). */
-  allowByway?: boolean;
 };
 
 export type SessionsPruneFlags = {

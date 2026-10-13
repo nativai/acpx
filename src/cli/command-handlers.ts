@@ -2783,7 +2783,7 @@ export async function handleSessionsClose(
 
   // Brick 6867bbfc D6 — AFTER the record resolves (so `--seat` targets are covered) and BEFORE
   // anything is touched: a refusal drains nothing, stops no owner, writes no record.
-  const bywayRefusal = bywayCloseRefusal(record, flags.allowByway === true);
+  const bywayRefusal = bywayCloseRefusal(record);
   if (bywayRefusal) {
     emitBywayCloseRefusal(bywayRefusal, globalFlags.format);
     return;

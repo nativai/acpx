@@ -305,7 +305,7 @@ acpx [global_options] <agent> sessions new
 acpx [global_options] <agent> sessions new --name <name>
 acpx [global_options] <agent> sessions new [--prompt <text> | --prompt-file <path|->] [--no-parent] [--favorite]
 acpx [global_options] <agent> sessions set-parent --session-id <id> --no-parent
-acpx [global_options] <agent> sessions close --session-id <id> [--allow-byway]
+acpx [global_options] <agent> sessions close --session-id <id>
 acpx [global_options] <agent> sessions reopen <id>
 acpx [global_options] <agent> sessions reopen <id>
 acpx [global_options] <agent> sessions show
@@ -350,13 +350,12 @@ Behavior:
 - text and quiet output print the local `acpxRecordId`; JSON output also includes
   `acpxSessionId` and, when the adapter exposes one, `agentSessionId`
 - `sessions close --session-id <id>` soft-closes that session
-- `sessions close` refuses a by-the-way side-thread when the caller is an agent
-  (any of `ACPX_SESSION_URL`, `ACPX_SESSION_RECORD_ID`, `ACPX_SEAT_URL` is set)
-  and is not that side-thread itself: exit 1, code `BYWAY_CLOSE_REFUSED`
-  (`{ok:false, code, error, sessionId, sourceSessionId}` in JSON), and nothing is
-  drained, stopped or written. `--allow-byway` overrides — only when the human
-  explicitly asked. A caller with none of those variables (a human shell,
-  acpx-ui's own close) is not refused
+- `sessions close` run by an agent refuses a by-the-way side-thread (a human's
+  side conversation) other than the agent's own session: exit 1, code
+  `BYWAY_CLOSE_REFUSED` (`{ok:false, code, error, sessionId, sourceSessionId}`
+  in JSON), and nothing is drained, stopped or written. Agents cannot close
+  one; the human closes it in acpx-ui, or promotes it there first, after which
+  it is an ordinary session
 - `sessions set-parent` never re-parents a by-the-way side-thread
   (`BYWAY_PARENT_IMMUTABLE`, exit 2 for `--session-id`; a `skipped` entry under
   `--children-of`): it stays with the conversation it was opened from

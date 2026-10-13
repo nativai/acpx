@@ -66,19 +66,26 @@ function firstQuestionClause(target: SessionRecord): string {
 
 /**
  * `sessions close`'s byway guard (brick 6867bbfc D6). Refuses when ALL hold: the target is a
- * byway, the caller is an agent, the caller is not the target itself, and `--allow-byway` is
- * absent. Anything else — a human shell, atrium's own close, a plain child — returns
- * `undefined` and the close proceeds unchanged.
+ * byway, the caller is an agent, and the caller is not the target itself. Anything else —
+ * atrium's own close, a plain child — returns `undefined` and the close proceeds unchanged.
+ *
+ * ⚠️ THERE IS NO OVERRIDE, AND DO NOT ADD ONE. The first version had `--allow-byway`; an agent
+ * that read it in the usage-error help used it on the FIRST order from another agent to "close
+ * your idle children" and closed a human's byway (verification of brick 6867bbfc, AC2b — the
+ * conception's E6 risk, materialised). Any flag an agent can read is a flag agents use. The
+ * refusal text, the `--help` and the docs therefore name no way for an agent to close one; the
+ * human closes it (or promotes it, after which it is no longer a byway) in atrium. Pinned in
+ * `test/byway-guard.test.ts`: `--allow-byway` is an unknown option, and `sessions close --help`
+ * never mentions byways.
  *
  * It is evaluated by the HANDLER, never inside `closeSession()`, so acpx's own internal closes
  * (template enable, handover) are untouched.
  */
 export function bywayCloseRefusal(
   target: SessionRecord,
-  allowByway: boolean,
   env: NodeJS.ProcessEnv = process.env,
 ): BywayCloseRefusal | undefined {
-  if (allowByway || !isBywaySessionRecord(target) || !callerIsAgent(env)) {
+  if (!isBywaySessionRecord(target) || !callerIsAgent(env)) {
     return undefined;
   }
   if (callerIsTarget(target, env)) {
@@ -88,8 +95,8 @@ export function bywayCloseRefusal(
   const message =
     `Refused: ${target.acpxRecordId} is a by-the-way side-thread — a human's side conversation ` +
     `opened from session ${sourceSessionId ?? "(unknown)"}${firstQuestionClause(target)}. ` +
-    "It is not your child and not yours to close; leave it open — the human closes it from " +
-    "atrium. Only if the human explicitly asked you to close this side-thread, re-run with " +
-    "--allow-byway.";
+    "It is not your child, and agents cannot close it. Leave it open: if the human wants it " +
+    "closed, they close it in atrium themselves (or promote it there first, after which it is " +
+    "an ordinary session).";
   return { code: BYWAY_CLOSE_REFUSED, message, sessionId: target.acpxRecordId, sourceSessionId };
 }
