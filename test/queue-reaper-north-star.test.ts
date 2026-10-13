@@ -240,6 +240,9 @@ test("W13-24-10 #7: manual recover (Path 4) still kills a stale-but-alive owner"
       sessionId: "ns-recover-stale",
       socketPath: paths.socketPath,
       heartbeatAt: STALE_HEARTBEAT,
+      // REWRITTEN (brick ae547131): a verified identity — an explicit recover/recycle still kills a
+      // stale-but-alive owner it can PROVE is the owner; an identity-less one is never signalled.
+      processIdentity: await readQueueOwnerProcessIdentity(keeper.pid as number),
     });
 
     try {
@@ -266,6 +269,9 @@ test("W13-24-10 #7: recycle terminate (Path 3) still kills a stale-but-alive own
       sessionId: "ns-recycle-stale",
       socketPath: paths.socketPath,
       heartbeatAt: STALE_HEARTBEAT,
+      // REWRITTEN (brick ae547131): a verified identity — an explicit recover/recycle still kills a
+      // stale-but-alive owner it can PROVE is the owner; an identity-less one is never signalled.
+      processIdentity: await readQueueOwnerProcessIdentity(keeper.pid as number),
     });
 
     try {

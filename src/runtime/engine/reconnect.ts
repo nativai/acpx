@@ -29,6 +29,7 @@ import {
   SessionResumeRequiredError,
 } from "../../errors.js";
 import { incrementPerfCounter } from "../../perf-metrics.js";
+import { isRecordedPidPossiblyAlive } from "../../process-identity.js";
 import { normalizeEffortLevelForModel } from "../../session/config-option-application.js";
 import { applyConfigOptionsToRecord } from "../../session/config-options.js";
 import { resolveContextWindowHint } from "../../session/conversation-model.js";
@@ -61,19 +62,6 @@ export type ConnectedSessionController = {
     value: string,
   ) => ReturnType<AcpClient["setSessionConfigOption"]>;
 };
-
-function isProcessAlive(pid: number | undefined): boolean {
-  if (!pid || !Number.isInteger(pid) || pid <= 0 || pid === process.pid) {
-    return false;
-  }
-
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 export type ConnectAndLoadSessionOptions = {
   client: AcpClient;
@@ -476,7 +464,8 @@ export async function connectAndLoadSession(
   const desiredModeId = getDesiredModeId(record.acpx);
   const desiredModelId = getDesiredModelId(record.acpx);
   const desiredConfigOptions = getDesiredConfigOptions(record.acpx);
-  const storedProcessAlive = isProcessAlive(record.pid);
+  // brick ae547131 §5.3 — by identity when the record carries one (`unknown` counts as alive).
+  const storedProcessAlive = isRecordedPidPossiblyAlive(record.pid, record.pidIdentity);
   const shouldReconnect = Boolean(record.pid) && !storedProcessAlive;
 
   logReconnectAttempt(record, storedProcessAlive, shouldReconnect, options.verbose);

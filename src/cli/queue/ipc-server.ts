@@ -87,6 +87,19 @@ async function listenOnQueueSocket(server: net.Server, socketPath: string): Prom
   });
 }
 
+/** The `dev:ino` at `socketPath` now, or undefined (missing / win32). */
+async function socketPathInode(socketPath: string): Promise<string | undefined> {
+  if (process.platform === "win32") {
+    return undefined;
+  }
+  try {
+    const info = await stat(socketPath);
+    return `${info.dev}:${info.ino}`;
+  } catch {
+    return undefined;
+  }
+}
+
 async function closeQueueSocket(server: net.Server): Promise<void> {
   if (!server.listening) {
     return;
@@ -365,6 +378,13 @@ export class SessionQueueOwner {
   private midTurnCustodySource?: () => QueueTask[];
   private socketRepair?: Promise<boolean>;
   private closed = false;
+  // brick ae547131 §7.2 — the `dev:ino` this owner bound at `socketPath`. ⚠️ `net.Server.close()` on
+  // a unix socket UNLINKS THE BOUND PATH BY NAME (libuv `uv__pipe_close`, CONCEPT A.11): closing a
+  // superseded owner's listener deletes its SUCCESSOR's socket, and clients then get ENOENT. So the
+  // listener is closed only while the path still holds this inode.
+  private socketInode?: string;
+  // §7.4 — the lease now names another owner generation: never touch the socket path again.
+  private superseded = false;
   // D1 — the quiesce flag. Set the instant a drain starts and never cleared: a
   // draining owner is on its way out. This is where the RCA's TOCTOU actually
   // closes — at the only process that is authoritative about its own liveness,
@@ -401,8 +421,34 @@ export class SessionQueueOwner {
     ownerRef.current = new SessionQueueOwner(server, controlHandlers, lease, options);
 
     await listenOnQueueSocket(server, lease.socketPath);
+    ownerRef.current.socketInode = await socketPathInode(lease.socketPath);
 
     return ownerRef.current;
+  }
+
+  /** The inode this owner's listener is bound to — for the inode-checked lease release. */
+  getSocketInode(): string | undefined {
+    return this.socketInode;
+  }
+
+  /**
+   * The lease names another owner generation (CONCEPT §7.4): from now on this owner never closes its
+   * listener by name and answers any request with QUEUE_OWNER_SUPERSEDED until it exits.
+   */
+  markSuperseded(): void {
+    this.superseded = true;
+  }
+
+  /** Closes the listener ONLY while the socket path still holds this owner's inode (§7.2). */
+  private async closeListenerIfOwnPath(): Promise<void> {
+    const current = await socketPathInode(this.socketPath);
+    if (!this.superseded && (process.platform === "win32" || current === this.socketInode)) {
+      await closeQueueSocket(this.server);
+      return;
+    }
+    // Another inode (a successor) — or nothing we can prove is ours — at the path: leave the path
+    // alone. The listening fd is dropped at process exit, which does not unlink (CONCEPT A.4).
+    this.server.unref();
   }
 
   async close(): Promise<void> {
@@ -422,7 +468,7 @@ export class SessionQueueOwner {
       // A failed repair already left the listener unavailable; shutdown still
       // needs to release the owner lease and adapter process.
     });
-    await closeQueueSocket(this.server);
+    await this.closeListenerIfOwnPath();
   }
 
   /**
@@ -670,7 +716,7 @@ export class SessionQueueOwner {
   }
 
   private canRepairSocket(canRepair: () => boolean): boolean {
-    return !this.closed && process.platform !== "win32" && canRepair();
+    return !this.closed && !this.superseded && process.platform !== "win32" && canRepair();
   }
 
   private async probeAndRepairMissingSocket(canRepair: () => boolean): Promise<boolean> {
@@ -693,8 +739,9 @@ export class SessionQueueOwner {
     }
 
     await listenOnQueueSocket(this.server, this.socketPath);
+    this.socketInode = await socketPathInode(this.socketPath);
     if (this.closed) {
-      await closeQueueSocket(this.server);
+      await this.closeListenerIfOwnPath();
       return false;
     }
     return true;
@@ -1115,6 +1162,19 @@ export class SessionQueueOwner {
   private handleConnection(socket: net.Socket): void {
     socket.setEncoding("utf8");
 
+    if (this.superseded) {
+      writeQueueMessage(
+        socket,
+        makeQueueOwnerError(
+          "unknown",
+          "Queue owner was superseded by another owner generation",
+          "QUEUE_OWNER_SUPERSEDED",
+          { retryable: true },
+        ),
+      );
+      socket.end();
+      return;
+    }
     if (this.closed) {
       writeQueueMessage(
         socket,

@@ -55,6 +55,7 @@ export function makeSessionRecord(
     favorite: overrides.favorite,
     favoritedAt: overrides.favoritedAt,
     pid: overrides.pid,
+    pidIdentity: overrides.pidIdentity,
     agentStartedAt: overrides.agentStartedAt,
     lastPromptAt: overrides.lastPromptAt,
     lastAgentExitCode: overrides.lastAgentExitCode,

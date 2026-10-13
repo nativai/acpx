@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { isAcpJsonRpcMessage } from "../acp/jsonrpc.js";
 import { AcpxOperationalError } from "../errors.js";
-import { isProcessAlive } from "../process-liveness.js";
+import { isRecordedPidPossiblyAlive } from "../process-identity.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
 import {
   sessionEventActivePath,
@@ -91,7 +91,10 @@ async function isSessionActive(record: SessionRecord): Promise<boolean> {
   if (record.closed) {
     return false;
   }
-  return isProcessAlive(record.pid) || (await hasLiveEventLock(record.acpxRecordId));
+  return (
+    isRecordedPidPossiblyAlive(record.pid, record.pidIdentity) ||
+    (await hasLiveEventLock(record.acpxRecordId))
+  );
 }
 
 async function readHistoryFile(filePath: string): Promise<AcpJsonRpcMessage[]> {

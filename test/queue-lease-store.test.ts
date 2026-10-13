@@ -14,7 +14,6 @@ import {
   refreshQueueOwnerLease,
   releaseQueueOwnerLease,
   signalProcessGroup,
-  terminateProcess,
   terminateQueueOwnerForSession,
   tryAcquireQueueOwnerLease,
 } from "../src/cli/queue/lease-store.js";
@@ -414,7 +413,15 @@ test("recoverQueueOwnerForSession kills the owner's whole process group (reaps g
       assert.equal(isProcessAlive(ownerPid), true);
       assert.equal(isProcessAlive(childPid), true);
 
-      await writeQueueOwnerLock({ lockPath, pid: ownerPid, sessionId, socketPath });
+      // REWRITTEN (brick ae547131): the lease carries the owner's real birth identity — recover
+      // signals only a verified owner; an identity-less lease is never signalled (T08/T32).
+      await writeQueueOwnerLock({
+        lockPath,
+        pid: ownerPid,
+        sessionId,
+        socketPath,
+        processIdentity: await readQueueOwnerProcessIdentity(ownerPid),
+      });
 
       const result = await recoverQueueOwnerForSession(sessionId);
       assert.equal(result.killed, true);
@@ -513,7 +520,10 @@ test("recovery clears PID-reused lease without killing unrelated live process", 
       assert.equal(result.wasAlive, true);
       assert.equal(result.killed, false);
       assert.equal(result.alive, false);
-      assert.equal(result.killSkipped, true);
+      // REWRITTEN (brick ae547131 §8.2): `killSkipped` now means "a live OWNER was deliberately not
+      // signalled" and makes recover exit 1. A pid_reused lease has no live owner — it is reaped,
+      // exit 0 — so killSkipped is false. The unrelated live process is still never signalled.
+      assert.equal(result.killSkipped, false);
       assert.equal(result.processIdentityMatched, false);
       assert.equal(isProcessAlive(keeper.pid), true);
       assert.equal(await readQueueOwnerRecord(sessionId), undefined);
@@ -606,11 +616,14 @@ test("readQueueOwnerLiveness reports liveness read-only and never reaps the leas
   });
 });
 
-test("terminateProcess and terminateQueueOwnerForSession handle live and missing owners", async () => {
+// brick ae547131 §8 — REWRITTEN (listed in the PR). This row asserted that a lease with NO process
+// identity, naming a live keeper, gets its pid TERMINATED — a signal on a bare pid number, which is
+// exactly what the brick removes. Now: no identity ⇒ never signalled, lease untouched, the outcome
+// says so; a lease carrying the keeper's real identity in our scope ⇒ terminated and reaped.
+test("terminateQueueOwnerForSession: a bare pid is never signalled; a verified identity is", async () => {
   await withTempHome(async (homeDir) => {
     assert.equal(isProcessAlive(undefined), false);
     assert.equal(isProcessAlive(process.pid), false);
-    assert.equal(await terminateProcess(999_999), false);
 
     const sessionId = "terminate-owner";
     const keeper = await startKeeperProcess();
@@ -618,15 +631,30 @@ test("terminateProcess and terminateQueueOwnerForSession handle live and missing
 
     try {
       assert.equal(isProcessAlive(keeper.pid), true);
-      await writeQueueOwnerLock({
-        lockPath,
-        pid: keeper.pid,
-        sessionId,
-        socketPath,
+      await writeQueueOwnerLock({ lockPath, pid: keeper.pid, sessionId, socketPath });
+      assert.deepEqual(await terminateQueueOwnerForSession(sessionId), {
+        stopped: false,
+        reason: "identity-unverified",
       });
+      assert.notEqual(await readQueueOwnerRecord(sessionId), undefined, "lease must stay");
+      assert.equal(isProcessAlive(keeper.pid), true, "a bare pid was signalled");
 
-      await terminateQueueOwnerForSession(sessionId);
-      assert.equal(await readQueueOwnerRecord(sessionId), undefined);
+      const keeperPid = keeper.pid;
+      assert.ok(keeperPid);
+      if (process.platform === "linux") {
+        await writeQueueOwnerLock({
+          lockPath,
+          pid: keeper.pid,
+          sessionId,
+          socketPath,
+          processIdentity: await readQueueOwnerProcessIdentity(keeperPid),
+        });
+        assert.deepEqual(await terminateQueueOwnerForSession(sessionId), {
+          stopped: true,
+          reason: "stopped",
+        });
+        assert.equal(await readQueueOwnerRecord(sessionId), undefined);
+      }
     } finally {
       stopProcess(keeper);
     }

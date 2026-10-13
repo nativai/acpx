@@ -200,6 +200,8 @@ export type PersistedSessionLifecycle = {
   /** Extra fields the live-checkpoint closed-state merge needs — carried so
    * one read can serve both the preserve step and that merge (W2.4). */
   pid: number | undefined;
+  /** Travels with `pid` on every leg (brick ae547131 §4.2). */
+  pidIdentity: SessionRecord["pidIdentity"];
   acpx: SessionRecord["acpx"];
   /** THE SEAT GROUP — all four fields, read-preserved as TWO independently
    * authorised halves (D1, brick b64dfbb3). They are on this type for one
@@ -245,6 +247,7 @@ export async function readPersistedLifecycle(
       updatedAt: parsed.updated_at,
       metadata: parsed.metadata,
       pid: parsed.pid,
+      pidIdentity: parsed.pidIdentity,
       acpx: parsed.acpx,
       seatId: parsed.seatId,
       holderOrdinal: parsed.holderOrdinal,
@@ -507,10 +510,10 @@ export async function writeSessionRecordAuthorizingSeatHolderWithoutIndex(
  * F2; the window is ≥2 s and GROWS with how long the owner takes to die, i.e. it
  * is widest exactly when a handover is most likely.)
  *
- * ⚠️ NOT the same function as `repository.ts`'s own `closeSession`, which reads and
- * writes adjacently and never was stale. TWO SAME-NAMED FUNCTIONS — this file's is
- * safe, `session-control.ts`'s is not, and reasoning about the wrong one is what
- * let this ship.
+ * ⚠️ `repository.ts` used to have its OWN `closeSession` too, which read and wrote
+ * adjacently and never was stale — reasoning about the wrong one of the two is what
+ * let this ship. That one is DELETED (brick ae547131 §8.1; it also SIGKILLed
+ * `record.pid` with no identity guard at all), so `session-control.ts`'s is the only one.
  *
  * ⚠️ UNCONDITIONAL — disk wins, it does NOT merely fill an absence. The
  * `last_turn_provider` style ("disk only fills an absence") is wrong here: the
@@ -609,10 +612,9 @@ function preserveParentLinkageForPersist(
  * and classify every hit as writer / carrier / type / read before trusting this
  * preserve again. A correct enumeration with no expiry note is correct once.
  *
- * ⚠️ NOT the same function as `repository.ts`'s own `closeSession`, which reads
- * and writes adjacently and never was stale. TWO SAME-NAMED FUNCTIONS —
- * `session-control.ts`'s is the unsafe one, and reasoning about the wrong one
- * is what let the original defect ship.
+ * ⚠️ `repository.ts` once had a same-named `closeSession` of its own (deleted,
+ * brick ae547131 §8.1); reasoning about the wrong one of the two is what let the
+ * original defect ship. `session-control.ts`'s is the one meant here.
  */
 function preserveSeatHolderFieldsForPersist(
   record: SessionRecord,
@@ -1839,19 +1841,6 @@ export async function listSubagentsForSession(
     .toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
 }
 
-function killSignalCandidates(signal: NodeJS.Signals | undefined): NodeJS.Signals[] {
-  if (!signal) {
-    return ["SIGTERM", "SIGKILL"];
-  }
-
-  const normalized = signal.toUpperCase() as NodeJS.Signals;
-  if (normalized === "SIGKILL") {
-    return ["SIGKILL"];
-  }
-
-  return [normalized, "SIGKILL"];
-}
-
 export type PruneOptions = {
   agentCommand?: string;
   agentName?: string;
@@ -2534,53 +2523,4 @@ async function unlinkCountingBytes(filePath: string): Promise<number> {
   }
   await fs.unlink(filePath).catch(() => undefined);
   return bytes;
-}
-
-// eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
-export async function closeSession(id: string): Promise<SessionRecord> {
-  const record = await resolveSessionRecord(id);
-  const now = isoNow();
-
-  if (record.pid) {
-    for (const signal of killSignalCandidates(record.lastAgentExitSignal ?? undefined)) {
-      try {
-        process.kill(record.pid, signal);
-      } catch {
-        // ignore
-      }
-    }
-  }
-
-  record.closed = true;
-  record.closedAt = now;
-  record.pid = undefined;
-  record.lastUsedAt = now;
-  record.lastPromptAt = record.lastPromptAt ?? now;
-
-  // Privileged write: closeSession is the single daemon-authorized writer of
-  // lifecycle fields. See the writeSessionRecord doc comment for the rules.
-  await writeSessionRecordAtBoundaryWithLifecycle(record);
-
-  // Also mark any subagents of this session as closed. Cascade is operational,
-  // not user-intent, and runs under the same privileged write path.
-  if (record.subagents && record.subagents.length > 0) {
-    for (const subagentRef of record.subagents) {
-      try {
-        const subagentRecord = await resolveSessionRecord(subagentRef.acpxRecordId);
-        if (!subagentRecord.closed) {
-          subagentRecord.closed = true;
-          subagentRecord.closedAt = now;
-          subagentRecord.lastUsedAt = now;
-          await writeSessionRecordAtBoundaryWithLifecycle(subagentRecord);
-        }
-      } catch {
-        // best effort
-      }
-    }
-  }
-
-  // No index rebuild here: the lifecycle writes above already updated the
-  // affected entries, and the full-store re-parse is reserved for a missing
-  // or unparseable index.json (incremental reconcile heals any drift).
-  return record;
 }

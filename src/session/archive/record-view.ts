@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { parseRecordPidIdentity, type RecordPidIdentity } from "../../process-identity.js";
 
 /**
  * A read-only projection of an on-disk session record, for the archiver only.
@@ -57,6 +58,8 @@ export type ArchiveRecordView = {
    */
   favorite: boolean;
   pid: number | undefined;
+  /** brick ae547131 — judges `pid` by identity when present (§5.3). */
+  pidIdentity: RecordPidIdentity | undefined;
   parentSessionId: string | undefined;
   /**
    * `$.metadata.byway_parent` — checked FIRST when resolving a byway's anchor,
@@ -151,6 +154,7 @@ export function projectArchiveRecord(parsed: unknown): ArchiveRecordView | undef
     holderActive: record.holder_active === true,
     favorite: record.favorite === true,
     pid: optionalNumber(record.pid),
+    pidIdentity: parseRecordPidIdentity(record.pid_identity),
     parentSessionId: optionalString(record.parent_session_id),
     bywayParent: metadataString(metadata, "byway_parent"),
     forkedFromSessionId: optionalString(record.forked_from_session_id),

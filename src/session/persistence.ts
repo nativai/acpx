@@ -15,7 +15,6 @@ export type { SessionIndexEntryOverlay } from "./persistence/index-overlay.js";
 export {
   DEFAULT_HISTORY_LIMIT,
   absolutePath,
-  closeSession,
   countPruneCandidates,
   isArchivedRecord,
   isTemplateRecord,

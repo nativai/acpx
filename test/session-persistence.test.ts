@@ -540,59 +540,76 @@ test("writeSessionRecord maintains an index and listSessions rebuilds it when mi
   });
 });
 
-test("closeSession soft-closes and terminates matching process", async () => {
-  await withTempHome(async (homeDir) => {
-    const session = await loadSessionModule();
+// brick ae547131 §13.3 — REWRITTEN. This row used to write a record whose `pid` was a live `node`
+// child with NO identity and assert that close KILLED it: the hazard (close signalling whatever
+// holds a recorded pid number — after a container restart, atrium or another agent), asserted as a
+// feature. It is now two rows: T32e (a valid pid_identity ⇒ the adapter is terminated) and T32a (no
+// identity ⇒ the process survives, and the close still lands).
+for (const withIdentity of [true, false]) {
+  test(`closeSession soft-closes; the adapter at record.pid is terminated ONLY with a valid pid_identity (${withIdentity ? "T32e: identity ⇒ killed" : "T32a: none ⇒ survives"})`, async () => {
+    await withTempHome(async (homeDir) => {
+      const session = await loadSessionModule();
+      const { captureRecordPidIdentity } = await import("../src/process-identity.js");
 
-    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
-      stdio: "ignore",
-    });
-    await once(child, "spawn");
+      const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
+        stdio: "ignore",
+      });
+      await once(child, "spawn");
 
-    const sessionId = "live-session";
-    const cwd = path.join(homeDir, "repo");
-    await writeSessionRecord(
-      homeDir,
-      makeSessionRecord({
-        acpxRecordId: sessionId,
-        acpSessionId: sessionId,
-        agentCommand: process.execPath,
-        cwd,
-        pid: child.pid,
-      }),
-    );
+      const sessionId = withIdentity ? "live-session-identity" : "live-session-no-identity";
+      const cwd = path.join(homeDir, "repo");
+      await writeSessionRecord(
+        homeDir,
+        makeSessionRecord({
+          acpxRecordId: sessionId,
+          acpSessionId: sessionId,
+          // production-shaped: every real claude record is a node + adapter-path command
+          agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+          cwd,
+          pid: child.pid,
+          ...(withIdentity ? { pidIdentity: captureRecordPidIdentity(child.pid) } : {}),
+        }),
+      );
 
-    const filePath = sessionFilePath(homeDir, sessionId);
+      const filePath = sessionFilePath(homeDir, sessionId);
 
-    try {
-      // D1 (brick://53437107): closeSession now returns {record, drain} so the
-      // CLI can report custody the close destroyed. The record half is verbatim
-      // the old return value — every assertion below is unchanged.
-      const closed = await session.closeSession(sessionId);
-      assert.equal(closed.record.closed, true);
-      assert.equal(typeof closed.record.closedAt, "string");
-      assert.equal(closed.record.pid, undefined);
-      assert.equal(await fileExists(filePath), true);
+      try {
+        const closed = await session.closeSession(sessionId);
+        assert.equal(closed.record.closed, true);
+        assert.equal(typeof closed.record.closedAt, "string");
+        assert.equal(closed.record.pid, undefined);
+        assert.equal(await fileExists(filePath), true);
 
-      // This session has no queue owner, so the barrier reports that it asked
-      // and could not reach one — distinct from "asked, nothing was in flight".
-      assert.equal(closed.drain.attempted, true);
-      assert.equal(closed.drain.reachedOwner, false);
-      assert.deepEqual(closed.drain.undelivered, []);
+        // This session has no queue owner, so the barrier reports that it asked
+        // and could not reach one — distinct from "asked, nothing was in flight".
+        assert.equal(closed.drain.attempted, true);
+        assert.equal(closed.drain.reachedOwner, false);
+        assert.deepEqual(closed.drain.undelivered, []);
+        assert.equal(closed.ownerStopped, true);
 
-      const stored = JSON.parse(await fs.readFile(filePath, "utf8")) as Record<string, unknown>;
-      assert.equal(stored.closed, true);
-      assert.equal(typeof stored.closed_at, "string");
+        const stored = JSON.parse(await fs.readFile(filePath, "utf8")) as Record<string, unknown>;
+        assert.equal(stored.closed, true);
+        assert.equal(typeof stored.closed_at, "string");
+        assert.equal(stored.pid_identity, undefined, "pid_identity is cleared with pid");
 
-      const exited = await waitForExit(child.pid);
-      assert.equal(exited, true);
-    } finally {
-      if (child.exitCode == null && child.signalCode == null) {
-        child.kill("SIGKILL");
+        if (withIdentity) {
+          assert.deepEqual(closed.adapterKill, { signalled: true });
+          assert.equal(await waitForExit(child.pid), true);
+        } else {
+          assert.deepEqual(closed.adapterKill, { signalled: false, reason: "no-identity" });
+          assert.equal(child.exitCode, null, "an identity-less pid was signalled");
+          assert.equal(child.signalCode, null, "an identity-less pid was signalled");
+          assert.ok(child.pid);
+          process.kill(child.pid, 0); // still alive
+        }
+      } finally {
+        if (child.exitCode == null && child.signalCode == null) {
+          child.kill("SIGKILL");
+        }
       }
-    }
+    });
   });
-});
+}
 
 test("normalizeQueueOwnerTtlMs applies default and edge-case normalization", async () => {
   await withTempHome(async () => {

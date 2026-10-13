@@ -5,6 +5,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test, { afterEach } from "node:test";
 import { queueLockFilePath } from "../src/cli/queue/paths.js";
+import { getOwnProcessIdentity, serializeProcessBirthIdentity } from "../src/process-identity.js";
 import { createFileSessionStore } from "../src/runtime/public/file-session-store.js";
 import { parseSessionRecord } from "../src/session/persistence/parse.js";
 import { writeSessionRecordWithLifecycle } from "../src/session/persistence/repository.js";
@@ -522,10 +523,20 @@ function adoptedSpawnRecord(ledger: SpawnLedger, adopt: boolean): DiskRecord {
   }
   return owned;
 }
-function holdQueueLease(pid: number): void {
+function holdQueueLease(pid: number, processIdentity?: Record<string, string>): void {
   const file = queueLockFilePath(RECORD_ID);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify({ pid, sessionId: RECORD_ID }));
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ pid, sessionId: RECORD_ID, ...(processIdentity ? { processIdentity } : {}) }),
+  );
+}
+
+/** This process's lease identity — what a real owner writes into its lease (brick ae547131). */
+function ownLeaseIdentity(): Record<string, string> {
+  const own = getOwnProcessIdentity();
+  assert.ok(own, "own process identity");
+  return serializeProcessBirthIdentity(own);
 }
 
 test("d36c222f: the session's own queue owner may rebind acp_session_id once the attempt is adopted", async () => {
@@ -533,7 +544,10 @@ test("d36c222f: the session's own queue owner may rebind acp_session_id once the
   const ledger = new SpawnLedger();
   try {
     const owned = adoptedSpawnRecord(ledger, true);
-    holdQueueLease(process.pid);
+    // REWRITTEN (brick ae547131 S-40): a real owner's lease carries its birth identity, and the
+    // rebind now requires it — `lease.pid === process.pid` alone is a pid number that a lease from
+    // another pid namespace can carry (the T20 row below is that negative).
+    holdQueueLease(process.pid, ownLeaseIdentity());
     const rebound = { ...owned, acp_session_id: "fresh-after-resume-miss" };
     ledger.saveRecord(rebound);
     await ledger.saveRecordAsync({ ...rebound, name: "async owner write" });
@@ -600,5 +614,28 @@ test("d36c222f: an auto-spawned agent receives its initial prompt exactly once t
     assert.match(result.stdout, /PHASES=2/);
   } finally {
     fs.rmSync(childHome, { recursive: true, force: true });
+  }
+});
+
+test("T20 ownerMayRebind: my pid number but a FOREIGN pid namespace in the lease ⇒ refused", (t) => {
+  if (process.platform !== "linux") {
+    t.skip("linux identity");
+    return;
+  }
+  freshHome("rebind-foreign");
+  const ledger = new SpawnLedger();
+  try {
+    const owned = adoptedSpawnRecord(ledger, true);
+    holdQueueLease(process.pid, { ...ownLeaseIdentity(), pidNamespace: "pid:[1]" });
+    assert.throws(
+      () => ledger.saveRecord({ ...owned, acp_session_id: "rebound-by-a-foreign-pid-number" }),
+      /another ACP session/,
+    );
+    // positive control: the same lease with OUR identity is allowed
+    holdQueueLease(process.pid, ownLeaseIdentity());
+    ledger.saveRecord({ ...owned, acp_session_id: "rebound-by-the-real-owner" });
+    assert.equal(ledger.readRecord(RECORD_ID)?.acp_session_id, "rebound-by-the-real-owner");
+  } finally {
+    ledger.close();
   }
 });

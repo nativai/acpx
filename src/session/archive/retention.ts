@@ -936,6 +936,7 @@ async function applyLivenessGate(state: PlanState, input: PlanInput): Promise<vo
       planned.candidate.record?.pid,
       input.liveness,
       planned.candidate.record != null,
+      planned.candidate.record?.pidIdentity,
     );
     if (verdict.live) {
       state.selected.delete(id);

@@ -80,3 +80,28 @@ export async function connectToQueueOwner(
 
   return undefined;
 }
+
+export type QueueSocketPing = "listening" | "refused" | "absent" | "inconclusive";
+
+/**
+ * One connect, no retries (brick ae547131 §5.2). A process holding a listening unix socket keeps it
+ * until it closes it, and the kernel accepts into the backlog even while the owner's event loop is
+ * blocked — so `listening` means a live owner, wedged or not. `refused` (ECONNREFUSED: the file
+ * outlived its listener) and `absent` (ENOENT) are evidence of death ONLY for a path both pods see.
+ */
+export async function pingQueueSocket(
+  socketPath: string,
+  timeoutMs = 1_000,
+): Promise<QueueSocketPing> {
+  try {
+    const socket = await connectToSocket(socketPath, timeoutMs);
+    socket.destroy();
+    return "listening";
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ECONNREFUSED") {
+      return "refused";
+    }
+    return code === "ENOENT" || code === "ENOTDIR" ? "absent" : "inconclusive";
+  }
+}

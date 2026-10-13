@@ -572,3 +572,29 @@ export function classifyRecordedIdentity(raw: unknown): RecordedIdentity {
   }
   return { kind: "legacy", startTicks: parseLegacyStartTimeTicks(raw) };
 }
+
+/**
+ * Is the adapter at `record.pid` POSSIBLY alive? For KEEP decisions only — the archive gate, export's
+ * "active", reconnect, the account-seam sweep — never for a signal (process-signal.ts). With a valid
+ * `pid_identity` it is judged by identity, and `unknown` (another pid namespace, unreadable /proc)
+ * counts as alive: the conservative direction for a keep. Without one, today's bare probe, where
+ * EPERM is alive (CONCEPT §5.3).
+ */
+export function isRecordedPidPossiblyAlive(
+  pid: number | undefined,
+  pidIdentity: RecordPidIdentity | undefined,
+): boolean {
+  if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) {
+    return false;
+  }
+  const identity = validRecordPidIdentity(pid, pidIdentity);
+  if (identity) {
+    return observeProcessIncarnation(pid, identity) !== "gone";
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}

@@ -67,6 +67,7 @@ export function serializeSessionRecordForDisk(
     favorite: canonical.favorite,
     favorited_at: canonical.favoritedAt,
     pid: canonical.pid,
+    pid_identity: canonical.pidIdentity,
     agent_started_at: canonical.agentStartedAt,
     last_prompt_at: canonical.lastPromptAt,
     last_agent_exit_code: canonical.lastAgentExitCode,

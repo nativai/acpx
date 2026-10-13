@@ -2847,6 +2847,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     record.closed = true;
     record.closedAt = persisted.closedAt ?? record.closedAt ?? isoNow();
     record.pid = persisted.pid;
+    record.pidIdentity = persisted.pidIdentity;
     if (persisted.acpx) {
       record.acpx = {
         ...record.acpx,

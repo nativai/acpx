@@ -110,10 +110,9 @@ export async function writeQueueOwnerLock(options: {
   pid: number | undefined;
   sessionId: string;
   socketPath: string;
-  processIdentity?: {
-    kind: "linux-proc-stat-starttime";
-    startTimeTicks: string;
-  };
+  /** Any on-disk identity shape — legacy `{kind,startTimeTicks}`, legacy + scope, or upstream's. */
+  processIdentity?: Record<string, string>;
+  host?: string;
   ownerGeneration?: number;
   queueDepth?: number;
   createdAt?: string;
@@ -135,6 +134,7 @@ export async function writeQueueOwnerLock(options: {
         options.ownerGeneration ?? Date.now() * 1_000 + Math.floor(Math.random() * 1_000),
       queueDepth: options.queueDepth ?? 0,
       ...(options.processIdentity ? { processIdentity: options.processIdentity } : {}),
+      ...(options.host ? { host: options.host } : {}),
     })}\n`,
     "utf8",
   );

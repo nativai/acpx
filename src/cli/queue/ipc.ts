@@ -59,7 +59,6 @@ export {
   recoverQueueOwnerForSession,
   releaseQueueOwnerLease,
   signalProcessGroup,
-  terminateProcess,
   terminateQueueOwnerForSession,
   tryAcquireQueueOwnerLease,
   waitMs,
@@ -70,6 +69,7 @@ export type {
   QueueOwnerProcessIdentity,
   QueueOwnerRecoveryResult,
   QueueOwnerStateKind,
+  QueueOwnerStopOutcome,
 } from "./lease-store.js";
 
 const STALE_OWNER_PROTOCOL_DETAIL_CODES = new Set([
@@ -90,13 +90,17 @@ function isSameQueueOwner(left: QueueOwnerRecord, right: QueueOwnerRecord): bool
   return left.pid === right.pid && left.ownerGeneration === right.ownerGeneration;
 }
 
+// brick ae547131 §8.4b — retires ONLY the owner generation that answered "shutting down", only
+// through the verified signal, and cleans up only through the guarded, generation-checked reap. A
+// foreign or replaced lease is left untouched (T36): the old code recovered whatever lease was
+// current, including a successor's.
 async function recoverOwnerAfterShutdownError(params: {
   sessionId: string;
   owner: QueueOwnerRecord;
   detailCode?: string;
   verbose?: boolean;
 }): Promise<boolean> {
-  await recoverQueueOwnerForSession(params.sessionId).catch(() => {
+  await terminateQueueOwnerForSession(params.sessionId, params.owner).catch(() => {
     // Preserve the original shutdown error if cleanup fails.
   });
 
@@ -159,9 +163,14 @@ async function maybeRecoverStaleOwnerAfterProtocolMismatch(params: {
     return false;
   }
 
-  await terminateQueueOwnerForSession(params.sessionId).catch(() => {
-    // Preserve existing behavior if cleanup fails.
-  });
+  // Q9: the protocol-mismatch kill is kept, but it targets ONLY the generation that answered, and
+  // signals only through signalVerifiedProcess (a foreign or replaced lease is untouched, T36).
+  const outcome = await terminateQueueOwnerForSession(params.sessionId, params.owner).catch(
+    () => undefined,
+  );
+  if (!outcome?.stopped) {
+    return false;
+  }
   incrementPerfCounter("queue.owner.stale_recovered");
 
   if (params.verbose) {
@@ -172,6 +181,25 @@ async function maybeRecoverStaleOwnerAfterProtocolMismatch(params: {
 
   return true;
 }
+/**
+ * The owner has a live lease but did not accept the connection. For an owner in ANOTHER pid
+ * namespace that is `QUEUE_OWNER_UNREACHABLE` (retryable) — and never a cold spawn: a second owner
+ * on one session is the split brain brick ae547131 exists to stop (CONCEPT §5.2 F1–F3, F5).
+ */
+function notAcceptingRequestsError(health: QueueOwnerHealth, what: string): QueueConnectionError {
+  if (health.scope === "foreign") {
+    return new QueueConnectionError(
+      `Session queue owner runs in another pid namespace (${health.host ?? "unknown host"}) and ` +
+        `did not accept ${what} requests from here; retry`,
+      { detailCode: "QUEUE_OWNER_UNREACHABLE", origin: "queue", retryable: true },
+    );
+  }
+  return new QueueConnectionError(
+    `Session queue owner is running but not accepting ${what} requests`,
+    { detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS", origin: "queue", retryable: true },
+  );
+}
+
 export { probeQueueOwnerHealth };
 export type { QueueOwnerHealth };
 export type { QueueOwnerMessage, QueueSubmitRequest } from "./messages.js";
@@ -1005,14 +1033,7 @@ export async function trySubmitToRunningOwner(
     return undefined;
   }
 
-  throw new QueueConnectionError(
-    "Session queue owner is running but not accepting queue requests",
-    {
-      detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
-      origin: "queue",
-      retryable: true,
-    },
-  );
+  throw notAcceptingRequestsError(health, "queue");
 }
 
 export async function tryCloseSessionOnRunningOwner(options: {
@@ -1040,14 +1061,7 @@ export async function tryCloseSessionOnRunningOwner(options: {
     return undefined;
   }
 
-  throw new QueueConnectionError(
-    "Session queue owner is running but not accepting close_session requests",
-    {
-      detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
-      origin: "queue",
-      retryable: true,
-    },
-  );
+  throw notAcceptingRequestsError(health, "close_session");
 }
 
 export async function tryCancelOnRunningOwner(options: {
@@ -1074,14 +1088,7 @@ export async function tryCancelOnRunningOwner(options: {
     return undefined;
   }
 
-  throw new QueueConnectionError(
-    "Session queue owner is running but not accepting cancel requests",
-    {
-      detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
-      origin: "queue",
-      retryable: true,
-    },
-  );
+  throw notAcceptingRequestsError(health, "cancel");
 }
 
 // Query a live owner for whether a turn is in flight. Returns undefined when
@@ -1105,14 +1112,7 @@ export async function tryQueryActiveTurnOnRunningOwner(
     return undefined;
   }
 
-  throw new QueueConnectionError(
-    "Session queue owner is running but not accepting query_active_turn requests",
-    {
-      detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
-      origin: "queue",
-      retryable: true,
-    },
-  );
+  throw notAcceptingRequestsError(health, "query_active_turn");
 }
 
 export async function trySetModeOnRunningOwner(
@@ -1141,14 +1141,7 @@ export async function trySetModeOnRunningOwner(
     return undefined;
   }
 
-  throw new QueueConnectionError(
-    "Session queue owner is running but not accepting set_mode requests",
-    {
-      detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
-      origin: "queue",
-      retryable: true,
-    },
-  );
+  throw notAcceptingRequestsError(health, "set_mode");
 }
 
 export async function trySetModelOnRunningOwner(
@@ -1177,14 +1170,7 @@ export async function trySetModelOnRunningOwner(
     return undefined;
   }
 
-  throw new QueueConnectionError(
-    "Session queue owner is running but not accepting set_model requests",
-    {
-      detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
-      origin: "queue",
-      retryable: true,
-    },
-  );
+  throw notAcceptingRequestsError(health, "set_model");
 }
 
 export async function trySetConfigOptionOnRunningOwner(
@@ -1214,14 +1200,7 @@ export async function trySetConfigOptionOnRunningOwner(
     return undefined;
   }
 
-  throw new QueueConnectionError(
-    "Session queue owner is running but not accepting set_config_option requests",
-    {
-      detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
-      origin: "queue",
-      retryable: true,
-    },
-  );
+  throw notAcceptingRequestsError(health, "set_config_option");
 }
 
 async function submitSetDepthToQueueOwner(
@@ -1300,12 +1279,5 @@ export async function trySetDepthOnRunningOwner(
     return undefined;
   }
 
-  throw new QueueConnectionError(
-    "Session queue owner is running but not accepting set_depth requests",
-    {
-      detailCode: "QUEUE_NOT_ACCEPTING_REQUESTS",
-      origin: "queue",
-      retryable: true,
-    },
-  );
+  throw notAcceptingRequestsError(health, "set_depth");
 }

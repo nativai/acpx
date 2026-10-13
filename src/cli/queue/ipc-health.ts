@@ -11,6 +11,9 @@ export type QueueOwnerHealth = {
   socketPath?: string;
   ownerGeneration?: number;
   queueDepth?: number;
+  /** `foreign` ⇒ the owner lives in another pid namespace (brick ae547131). */
+  scope?: "local" | "foreign" | "legacy";
+  host?: string | null;
 };
 
 export async function probeQueueOwnerHealth(sessionId: string): Promise<QueueOwnerHealth> {
@@ -36,7 +39,7 @@ export async function probeQueueOwnerHealth(sessionId: string): Promise<QueueOwn
     };
   }
 
-  const pidAlive = owner.alive;
+  const pidAlive = owner.alive !== false;
   let socketReachable = false;
   try {
     const socket = await connectToQueueOwner(ownerRecord, 2);
@@ -60,5 +63,7 @@ export async function probeQueueOwnerHealth(sessionId: string): Promise<QueueOwn
     socketPath: owner.socketPath,
     ownerGeneration: owner.ownerGeneration,
     queueDepth: owner.queueDepth,
+    scope: owner.scope,
+    host: owner.host,
   };
 }

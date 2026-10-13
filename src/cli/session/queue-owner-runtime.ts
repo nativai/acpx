@@ -40,14 +40,20 @@ import {
   SessionQueueOwner,
   releaseQueueOwnerLease,
   hasLiveProcessGroup,
-  isProcessAlive,
   tryAcquireQueueOwnerLease,
   trySubmitToRunningOwner,
   type QueueOwnerLease,
   signalProcessGroup,
   waitMs,
 } from "../queue/ipc.js";
-import { readQueueOwnerRecord, refreshQueueOwnerLease } from "../queue/lease-store.js";
+import { withQueueLeaseMutation } from "../queue/lease-mutation.js";
+import {
+  leaseIsAliveForStartup,
+  matchesQueueOwner,
+  readQueueOwnerRecord,
+  refreshQueueOwnerLease,
+  releaseQueueOwnerLeaseSync,
+} from "../queue/lease-store.js";
 import { QueueOwnerTurnController } from "../queue/owner-turn-controller.js";
 import { terminalizeAbsorbedDeliveriesOnOwnerExit } from "./absorbed-delivery-registry.js";
 import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
@@ -316,19 +322,56 @@ function ownerIsGroupLeader(): boolean {
   return (readLinuxProcessGroupId() ?? readProcessGroupIdFromPs()) === process.pid;
 }
 
+/** The custody sweep of the signal path — synchronous writes only (see the handler). */
+function sweepCustodyOnSignal(
+  sessionId: string,
+  owner: SessionQueueOwner | undefined,
+  signal: string,
+): void {
+  try {
+    // `custody` includes the main turn a session close cut (brick 570d2570).
+    const custody = owner?.terminalizeCustodyOnSignal() ?? 0;
+    const absorbed = terminalizeAbsorbedDeliveriesOnOwnerExit(sessionId);
+    if (custody > 0 || absorbed.failed + absorbed.consumed + absorbed.deliveredAtClose > 0) {
+      process.stderr.write(
+        `[acpx] queue owner for session ${sessionId} took ${signal} while holding custody; ` +
+          `wrote ${custody} custody + ${absorbed.failed} absorbed + ` +
+          `${absorbed.consumed} consumed_before_cut + ` +
+          `${absorbed.deliveredAtClose} delivered_at_close terminal(s)\n`,
+      );
+    }
+  } catch {
+    // Never throw from a signal handler: a lost terminal is bad, a teardown
+    // that wedges until SIGKILL is worse.
+  }
+}
+
+/** §7.3: the heartbeat stops IMMEDIATELY before the release — never earlier. */
+async function stopHeartbeatAndRelease(
+  heartbeat: QueueOwnerHeartbeat,
+  lease: QueueOwnerLease,
+  owner: SessionQueueOwner | undefined,
+): Promise<void> {
+  heartbeat.stop();
+  if (!heartbeat.isSuperseded()) {
+    // Only OUR generation, and the socket path only while it holds the inode we bound (§7.2).
+    await releaseQueueOwnerLease(lease, owner?.getSocketInode());
+  }
+}
+
 async function closeQueueOwnerRuntime(params: {
   lease: QueueOwnerLease;
   owner: SessionQueueOwner | undefined;
-  heartbeatTimer: NodeJS.Timeout | undefined;
+  heartbeat: QueueOwnerHeartbeat;
   socketContinuityTimer: NodeJS.Timeout | undefined;
   turnController: QueueOwnerTurnController;
   sharedClient: AcpClient;
   sessionId: string;
   verbose?: boolean;
 }): Promise<void> {
-  if (params.heartbeatTimer) {
-    clearInterval(params.heartbeatTimer);
-  }
+  // brick ae547131 §7.3 — the heartbeat keeps beating THROUGH shutdown (adapter close, snapshot,
+  // index flush) and is cleared immediately before the release, so a closing owner never reads as
+  // stale-heartbeat to a reader in another pod (rows F3/F4). It used to be cleared first.
   if (params.socketContinuityTimer) {
     clearInterval(params.socketContinuityTimer);
   }
@@ -361,7 +404,7 @@ async function closeQueueOwnerRuntime(params: {
   await flushPendingSessionIndexUpdates().catch(() => {
     // best effort while queue owner is shutting down
   });
-  await releaseQueueOwnerLease(params.lease);
+  await stopHeartbeatAndRelease(params.heartbeat, params.lease, params.owner);
   if (params.verbose) {
     process.stderr.write(`[acpx] queue owner stopped for session ${params.sessionId}\n`);
   }
@@ -410,8 +453,28 @@ const FATAL_SIGNAL_EXIT_CODES: Record<string, number> = { SIGTERM: 143, SIGINT: 
  */
 export function installQueueOwnerFatalSignalHandlers(params: {
   sessionId: string;
-  owner: SessionQueueOwner;
+  /** The started owner, or a getter for one that may not exist yet (installed at lease acquire). */
+  owner?: SessionQueueOwner;
+  getOwner?: () => SessionQueueOwner | undefined;
+  /** This owner's lease: released (compare-and-unlink, synchronous) before the group reap. */
+  lease?: QueueOwnerLease;
 }): () => void {
+  return installQueueOwnerFatalShutdown(params).remove;
+}
+
+export type QueueOwnerFatalShutdown = {
+  remove: () => void;
+  /** Runs the signal path without a signal — the superseded owner's exit (CONCEPT §7.4, Q2). */
+  shutdown: (reason: string) => void;
+};
+
+export function installQueueOwnerFatalShutdown(params: {
+  sessionId: string;
+  owner?: SessionQueueOwner;
+  getOwner?: () => SessionQueueOwner | undefined;
+  lease?: QueueOwnerLease;
+}): QueueOwnerFatalShutdown {
+  const getOwner = params.getOwner ?? (() => params.owner);
   let handling = false;
   // Resolved ONCE, here, not inside the signal path: `ownerIsGroupLeader()`
   // reads /proc and, if that fails, shells out to `ps` — and the handler must do
@@ -419,12 +482,13 @@ export function installQueueOwnerFatalSignalHandlers(params: {
   // change after start, so the answer is stable for this owner's lifetime.
   const isGroupLeader = ownerIsGroupLeader();
 
-  const onFatalSignal = (signal: NodeJS.Signals): void => {
+  const onFatalSignal = (signal: string): void => {
     const exitCode = FATAL_SIGNAL_EXIT_CODES[signal] ?? 143;
     if (handling) {
       process.exit(exitCode);
     }
     handling = true;
+    const owner = getOwner();
 
     // THE ORDER BELOW IS LOAD-BEARING, NOT INCIDENTAL. The custody sweep must
     // COMPLETE before the process-group reap, because when this owner leads the
@@ -432,21 +496,13 @@ export function installQueueOwnerFatalSignalHandlers(params: {
     // SIGKILL is uncatchable, so no exit hook can rescue a pending write. That
     // is also why every write in the sweep is synchronous. Anything moved below
     // the reap becomes dead code silently.
-    try {
-      // `custody` includes the main turn a session close cut (brick 570d2570).
-      const custody = params.owner.terminalizeCustodyOnSignal();
-      const absorbed = terminalizeAbsorbedDeliveriesOnOwnerExit(params.sessionId);
-      if (custody > 0 || absorbed.failed + absorbed.consumed + absorbed.deliveredAtClose > 0) {
-        process.stderr.write(
-          `[acpx] queue owner for session ${params.sessionId} took ${signal} while holding custody; ` +
-            `wrote ${custody} custody + ${absorbed.failed} absorbed + ` +
-            `${absorbed.consumed} consumed_before_cut + ` +
-            `${absorbed.deliveredAtClose} delivered_at_close terminal(s)\n`,
-        );
-      }
-    } catch {
-      // Never throw from a signal handler: a lost terminal is bad, a teardown
-      // that wedges until SIGKILL is worse.
+    sweepCustodyOnSignal(params.sessionId, owner, signal);
+
+    // brick ae547131 §7.3 — release OUR OWN lease before the group reap (anything after the reap is
+    // dead code). Synchronous compare-and-unlink: our generation only, our socket inode only. A
+    // SIGTERMed owner used to leave its lease behind — a 30 s F4 wait for every reader in another pod.
+    if (params.lease) {
+      releaseQueueOwnerLeaseSync(params.lease, owner?.getSocketInode(), fs);
     }
 
     // Adapter descendants share this owner's process group. The leader guard is
@@ -460,14 +516,73 @@ export function installQueueOwnerFatalSignalHandlers(params: {
     // the owner always dies.
     process.exit(exitCode);
   };
-
   for (const signal of QUEUE_OWNER_FATAL_SIGNALS) {
     process.on(signal, onFatalSignal);
   }
-  return () => {
-    for (const signal of QUEUE_OWNER_FATAL_SIGNALS) {
-      process.off(signal, onFatalSignal);
+  return {
+    remove: () => {
+      for (const signal of QUEUE_OWNER_FATAL_SIGNALS) {
+        process.off(signal, onFatalSignal);
+      }
+    },
+    shutdown: (reason) => onFatalSignal(reason),
+  };
+}
+
+/**
+ * The owner's heartbeat (brick ae547131 §7.3): from lease acquire until immediately before release,
+ * and the fence (§7.2): a beat that finds ANOTHER generation in the lease reports `superseded`, and
+ * this owner then never touches the lease or the socket path again (§7.4).
+ */
+type QueueOwnerHeartbeat = {
+  start: (queueDepth: () => number) => void;
+  beat: (queueDepth: number) => Promise<void>;
+  stop: () => void;
+  isSuperseded: () => boolean;
+};
+
+function createQueueOwnerHeartbeat(params: {
+  lease: QueueOwnerLease;
+  onSuperseded: () => void;
+}): QueueOwnerHeartbeat {
+  let timer: NodeJS.Timeout | undefined;
+  let stopped = false;
+  let superseded = false;
+  const stop = (): void => {
+    stopped = true;
+    if (timer) {
+      clearInterval(timer);
+      timer = undefined;
     }
+  };
+  const beat = async (queueDepth: number): Promise<void> => {
+    if (stopped) {
+      return;
+    }
+    // `isCurrent` is re-checked INSIDE the lease guard: a beat in flight when the owner stops must
+    // not re-publish a lease the release just removed.
+    const outcome = await refreshQueueOwnerLease(params.lease, {
+      queueDepth,
+      isCurrent: () => !stopped,
+    }).catch(() => "skipped" as const);
+    if (outcome === "superseded" && !superseded) {
+      superseded = true;
+      stop();
+      params.onSuperseded();
+    }
+  };
+  return {
+    start: (queueDepth) => {
+      if (timer || stopped) {
+        return;
+      }
+      timer = setInterval(() => void beat(queueDepth()), QUEUE_OWNER_HEARTBEAT_INTERVAL_MS);
+      // Never the only thing keeping an owner alive (an early exit before the main loop).
+      timer.unref();
+    },
+    beat,
+    stop,
+    isSuperseded: () => superseded,
   };
 }
 
@@ -676,6 +791,23 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     return;
   }
 
+  // brick ae547131 §7.3 — from the moment the lease is ours: the heartbeat beats (a starting owner
+  // must not look stale to a reader in another pod for as long as startup takes), and the fatal-
+  // signal handlers are live, so a SIGTERM during startup still releases the lease (aligns with
+  // openclaw/acpx bad3e934). Both used to start only after `listen`.
+  let owner: SessionQueueOwner | undefined;
+  const fatalShutdown = installQueueOwnerFatalShutdown({
+    sessionId: options.sessionId,
+    getOwner: () => owner,
+    lease,
+  });
+  const heartbeat = createQueueOwnerHeartbeat({
+    lease,
+    onSuperseded: () => exitSupersededOwner(options.sessionId, owner, fatalShutdown),
+  });
+  await heartbeat.beat(0);
+  heartbeat.start(() => owner?.queueDepth() ?? 0);
+
   const sessionRecord = await resolveSessionRecord(options.sessionId);
   if (bindRecordToDefaultAccount(sessionRecord)) {
     await writeSessionRecordAtBoundary(sessionRecord);
@@ -693,6 +825,8 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         `with acpxRecordId=${sessionRecord.acpxRecordId}; refusing to serve (would misattribute turns). ` +
         `This indicates a corrupted or misnamed session record file.\n`,
     );
+    heartbeat.stop();
+    fatalShutdown.remove();
     return;
   }
 
@@ -702,12 +836,9 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   // adapters without known support keep the owner's mid-turn handler unset so
   // new prompts land in the normal pending queue.
   const midTurnInjectionSupported = supportsMidTurnPromptInjection(sessionRecord.agentCommand);
-  let owner: SessionQueueOwner | undefined;
-  let heartbeatTimer: NodeJS.Timeout | undefined;
   let socketContinuityTimer: NodeJS.Timeout | undefined;
   let socketContinuityCheck: Promise<void> | undefined;
   let idleDrain: { stop: () => Promise<void> } | undefined;
-  let removeFatalSignalHandlers: (() => void) | undefined;
   // Set when a turn auto-failed-over to a new subscription. The shared client is
   // pinned to the OLD CLAUDE_CONFIG_DIR for the owner's lifetime, so we recycle
   // the owner (exit the loop, release the lease) after the current turn; the
@@ -833,14 +964,21 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       return;
     }
 
-    const repaired = await currentOwner.repairSocketIfMissing(canRepair);
+    // brick ae547131 §7.3 — the repair closes its old listener (which UNLINKS THE PATH BY NAME) and
+    // re-listens; both run only while the lease is still OUR generation, checked under the lease
+    // guard before the close. A superseded owner never touches its successor's path.
+    const repaired = await withQueueLeaseMutation(options.sessionId, async () => {
+      const current = await readQueueOwnerRecord(options.sessionId);
+      if (!current || !matchesQueueOwner(lease, current) || heartbeat.isSuperseded()) {
+        return false;
+      }
+      return await currentOwner.repairSocketIfMissing(canRepair);
+    }).catch(() => false);
     if (!repaired) {
       return;
     }
 
-    await refreshQueueOwnerLease(lease, { queueDepth: currentOwner.queueDepth() }).catch(() => {
-      // Listener repair succeeded; a heartbeat write failure must not tear it down.
-    });
+    await heartbeat.beat(currentOwner.queueDepth());
     incrementPerfCounter("queue.owner.socket_repaired");
     process.stderr.write(
       `[acpx] queue owner restored missing socket for session ${options.sessionId}\n`,
@@ -912,9 +1050,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         maxQueueDepth,
         onQueueDepthChanged: (queueDepth) => {
           setPerfGauge("queue.owner.depth", queueDepth);
-          void refreshQueueOwnerLease(lease, { queueDepth }).catch(() => {
-            // best effort heartbeat refresh while owner is live
-          });
+          void heartbeat.beat(queueDepth);
         },
       },
     );
@@ -925,14 +1061,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       maxQueueDepth,
       verbose: options.verbose,
     });
-    await refreshQueueOwnerLease(lease, { queueDepth: owner.queueDepth() }).catch(() => {
-      // best effort initial heartbeat
-    });
-    heartbeatTimer = setInterval(() => {
-      void refreshQueueOwnerLease(lease, { queueDepth: owner?.queueDepth() ?? 0 }).catch(() => {
-        // best effort heartbeat
-      });
-    }, QUEUE_OWNER_HEARTBEAT_INTERVAL_MS);
+    await heartbeat.beat(owner.queueDepth());
     socketContinuityTimer = setInterval(
       scheduleSocketContinuityCheck,
       QUEUE_OWNER_SOCKET_CONTINUITY_INTERVAL_MS,
@@ -1091,10 +1220,6 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     // signal handler must walk both (corollary C-1). The owner holds `pending`;
     // the capture buffer lives here, so hand the owner an accessor that takes it.
     owner.setMidTurnCustodySource(() => midTurnBuffer.splice(0));
-    removeFatalSignalHandlers = installQueueOwnerFatalSignalHandlers({
-      sessionId: options.sessionId,
-      owner,
-    });
 
     if (midTurnInjectionSupported) {
       owner.setMidTurnHandler((task: QueueTask): boolean => {
@@ -1358,19 +1483,47 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       owner.clearMidTurnHandler();
     }
   } finally {
-    removeFatalSignalHandlers?.();
+    // The handlers stay live until the release settles (bad3e934): closeQueueOwnerRuntime releases
+    // the lease, and only then are they removed.
     await idleDrain?.stop().catch(() => {});
     await closeQueueOwnerRuntime({
       lease,
       owner,
-      heartbeatTimer,
+      heartbeat,
       socketContinuityTimer,
       turnController,
       sharedClient,
       sessionId: options.sessionId,
       verbose: options.verbose,
     });
+    fatalShutdown.remove();
   }
+}
+
+/**
+ * The lease names ANOTHER owner generation (CONCEPT §7.4, Q2): two owners would mean two adapters
+ * on one harness transcript and two writers on one stream and record, and the successor already
+ * exists. So this owner stops touching the lease and socket path, refuses new requests, and exits
+ * through its existing SIGTERM custody path (in-flight deliveries terminalized as on a SIGTERM; its
+ * own process group, adapter included, swept). A live 0a owner is never judged dead, so this
+ * happens only via a pre-0a reaper in a rollback window, or a human deleting the lease file.
+ */
+function exitSupersededOwner(
+  sessionId: string,
+  owner: SessionQueueOwner | undefined,
+  fatalShutdown: QueueOwnerFatalShutdown,
+): void {
+  owner?.markSuperseded();
+  incrementPerfCounter("queue.owner.superseded");
+  void readQueueOwnerRecord(sessionId)
+    .catch(() => undefined)
+    .then((successor) => {
+      process.stderr.write(
+        `[acpx] queue owner for session ${sessionId} superseded by generation ` +
+          `${successor?.ownerGeneration ?? "?"} (pid ${successor?.pid ?? "?"}, host ${successor?.host ?? "?"}); exiting\n`,
+      );
+      fatalShutdown.shutdown("SIGTERM");
+    });
 }
 
 // Injection seam for the cold-respawn startup loop. Production binds the real
@@ -1620,7 +1773,9 @@ async function startupBudgetLeftForLease(
   deps: SendSessionRuntimeDeps,
 ): Promise<number> {
   const lease = await readQueueOwnerRecord(sessionId);
-  if (!lease || !isProcessAlive(lease.pid)) {
+  // brick ae547131 S-33: a LOCAL lease must be the recorded live process; a FOREIGN one is alive
+  // while its heartbeat is fresh. A bare `isProcessAlive(lease.pid)` read every foreign owner as dead.
+  if (!lease || !(await leaseIsAliveForStartup(lease))) {
     return 0;
   }
   const leaseAgeMs = deps.nowMs() - Date.parse(lease.createdAt);

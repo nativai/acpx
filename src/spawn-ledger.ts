@@ -6,6 +6,16 @@ import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { queueLockFilePath } from "./cli/queue/paths.js";
 import { isSqliteExperimentalWarning } from "./models/ui-prefs-store.js";
+import {
+  classifyRecordedIdentity,
+  compareProcessBirthIdentity,
+  getOwnProcessIdentity,
+  observeProcessIncarnation,
+  parseProcessBirthIdentity,
+  processHostName,
+  readProcessBirthIdentity,
+  serializeProcessBirthIdentity,
+} from "./process-identity.js";
 
 /**
  * The spawn ledger: the durable record of brick-trigger auto-spawns (runs, fenced attempts, the
@@ -630,12 +640,21 @@ export class SpawnLedger {
     } catch {
       /* Incomplete identity stays unknown. */
     }
+    // brick ae547131 §4.4 — beside the pre-0a {boot,start} (whose meaning is unchanged), the child's
+    // scoped birth identity, so a child in ANOTHER pid namespace reads `unknown`, never `gone`.
+    const birth = readProcessBirthIdentity(pid);
+    const scoped = birth
+      ? { processIdentity: serializeProcessBirthIdentity(birth), host: processHostName() }
+      : {};
     return this.locked(() => {
       const attempt = this.getSpawnAttempt(runId, fence);
       if (!attempt || attempt.state !== "reserved") {
         throw new Error("child must start from reserved");
       }
-      this.setMeta(`spawn_child:${runId}:${fence}`, JSON.stringify({ pid, ...identity }));
+      this.setMeta(
+        `spawn_child:${runId}:${fence}`,
+        JSON.stringify({ pid, ...identity, ...scoped }),
+      );
       this.db
         .prepare("UPDATE spawn_attempt SET state='launched' WHERE run_id=? AND fence=?")
         .run(runId, fence);
@@ -658,7 +677,21 @@ export class SpawnLedger {
     if (!encoded) {
       return "unknown";
     }
-    const saved = JSON.parse(encoded) as { pid: number; boot: string | null; start: string | null };
+    const saved = JSON.parse(encoded) as {
+      pid: number;
+      boot: string | null;
+      start: string | null;
+      processIdentity?: unknown;
+    };
+    return scopedChildLiveness(saved.pid, saved.processIdentity) ?? this.legacyChildLiveness(saved);
+  }
+
+  /** The pre-0a rule for a meta row written without a scoped identity (unchanged). */
+  private legacyChildLiveness(saved: {
+    pid: number;
+    boot: string | null;
+    start: string | null;
+  }): "alive" | "gone" | "unknown" {
     if (!saved.boot || !saved.start) {
       return "unknown";
     }
@@ -820,8 +853,11 @@ export class SpawnLedger {
       return false;
     }
     try {
-      const lease = JSON.parse(fs.readFileSync(queueLockFilePath(id), "utf8")) as { pid?: unknown };
-      return lease.pid === process.pid;
+      const lease = JSON.parse(fs.readFileSync(queueLockFilePath(id), "utf8")) as {
+        pid?: unknown;
+        processIdentity?: unknown;
+      };
+      return lease.pid === process.pid && leaseIdentityIsOurs(lease.processIdentity);
     } catch {
       return false;
     }
@@ -1064,4 +1100,42 @@ export class SpawnLedger {
     process.stderr.write(`[acpx] receipt-conflict ${observation}\n`);
     return observation;
   }
+}
+
+/**
+ * brick ae547131 §5.3 (S-40) — `lease.pid === process.pid` alone is a pid NUMBER: a lease written in
+ * another pid namespace can carry ours. The lease must also carry OUR birth identity (legacy lease:
+ * our start ticks).
+ */
+function leaseIdentityIsOurs(raw: unknown): boolean {
+  const own = getOwnProcessIdentity();
+  if (!own) {
+    return false;
+  }
+  const recorded = classifyRecordedIdentity(raw);
+  if (recorded.kind === "birth") {
+    return compareProcessBirthIdentity(recorded.birth, own) === "matching";
+  }
+  return (
+    recorded.kind === "legacy" &&
+    own.kind === "linux-proc" &&
+    recorded.startTicks === own.startTicks
+  );
+}
+
+/**
+ * brick ae547131 §4.4 — a child recorded WITH its scoped identity: matching ⇒ alive; gone ⇒ gone;
+ * unknown (another pid namespace, unreadable /proc) ⇒ unknown — acpx-ui reports an unknown child,
+ * it never cancels its attempt. Undefined ⇒ a legacy meta row: today's rule.
+ */
+function scopedChildLiveness(
+  pid: number,
+  processIdentity: unknown,
+): "alive" | "gone" | "unknown" | undefined {
+  const birth = parseProcessBirthIdentity(processIdentity);
+  if (!birth) {
+    return undefined;
+  }
+  const incarnation = observeProcessIncarnation(pid, birth);
+  return incarnation === "matching" ? "alive" : incarnation;
 }

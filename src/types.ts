@@ -16,6 +16,7 @@ export type { McpServer, SessionNotification } from "@agentclientprotocol/sdk";
 import type { EffectiveAccountMetadata } from "./acp/auth-env.js";
 import type { LastTurnProviderBreadcrumb } from "./acp/openrouter-attribution.js";
 import type { RoutingPolicyWarningBreadcrumb } from "./acp/openrouter-provider-policy.js";
+import type { RecordPidIdentity } from "./process-identity.js";
 import type { PromptInput } from "./prompt-content.js";
 
 export type AcpPermissionRequest = {
@@ -202,6 +203,10 @@ export const QUEUE_ERROR_DETAIL_CODES = [
   "QUEUE_PROTOCOL_MALFORMED_MESSAGE",
   "QUEUE_PROTOCOL_UNEXPECTED_RESPONSE",
   "QUEUE_NOT_ACCEPTING_REQUESTS",
+  "QUEUE_OWNER_UNREACHABLE",
+  "QUEUE_OWNER_FOREIGN",
+  "QUEUE_OWNER_IDENTITY_UNVERIFIED",
+  "QUEUE_OWNER_SUPERSEDED",
   "QUEUE_CONTROL_REQUEST_FAILED",
   "QUEUE_RUNTIME_PROMPT_FAILED",
 ] as const;
@@ -1216,6 +1221,13 @@ export type SessionRecord = {
   favorite?: boolean;
   favoritedAt?: string;
   pid?: number;
+  /**
+   * The birth identity of the adapter process `pid` names (brick ae547131 §4.2), persisted as
+   * `pid_identity`. It counts ONLY when its own `pid` equals `pid` (`validRecordPidIdentity`): an
+   * old writer that moves `pid` drops or mismatches it, and no identity ⇒ the adapter is never
+   * signalled by `sessions close`. Every leg that writes, copies or clears `pid` does the same here.
+   */
+  pidIdentity?: RecordPidIdentity;
   agentStartedAt?: string;
   lastPromptAt?: string;
   lastAgentExitCode?: number | null;
@@ -1444,6 +1456,7 @@ export type SessionSetConfigOptionResult = {
   loadError?: string;
   /** True when a live queue owner existed and was recycled to bind the change. */
   ownerRestarted?: boolean;
+  ownerRestartSkipped?: string;
 };
 
 /**
@@ -1468,6 +1481,7 @@ export type SessionSetModelResult = {
   loadError?: string;
   /** True when a live queue owner existed and was recycled to bind the change. */
   ownerRestarted?: boolean;
+  ownerRestartSkipped?: string;
 };
 
 export type AgentSessionListResult = {

@@ -30,6 +30,7 @@ import {
   loadSubscriptionRegistry,
 } from "../config/subscriptions.js";
 import {
+  AcpxOperationalError,
   AgentSpawnError,
   ProfileClassMismatchError,
   ProfileUnknownError,
@@ -130,6 +131,7 @@ import { type MessageLedgerKind, withMessageLedger } from "./message-ledger.js";
 import { emitJsonResult } from "./output/json-output.js";
 // Type-only, so the render module stays lazily imported at runtime.
 import type { FirstTurnOutcome, PruneRefusal, PruneScope } from "./output/render.js";
+import type { QueueOwnerRecoveryResult } from "./queue/lease-store.js";
 import {
   addressedSeatIdFromSelector,
   NoSessionError,
@@ -1784,7 +1786,12 @@ function printSetModeResultByFormat(
 
 function printSetModelResultByFormat(
   modelId: string,
-  result: { record: SessionRecord; resumed: boolean; ownerRestarted?: boolean },
+  result: {
+    record: SessionRecord;
+    resumed: boolean;
+    ownerRestarted?: boolean;
+    ownerRestartSkipped?: string;
+  },
   format: OutputFormat,
 ): void {
   if (
@@ -1793,6 +1800,7 @@ function printSetModelResultByFormat(
       modelId,
       resumed: result.resumed,
       ownerRestarted: result.ownerRestarted ?? false,
+      ...(result.ownerRestartSkipped ? { ownerRestartSkipped: result.ownerRestartSkipped } : {}),
       acpxRecordId: result.record.acpxRecordId,
       acpxSessionId: result.record.acpSessionId,
       agentSessionId: result.record.agentSessionId,
@@ -1811,6 +1819,7 @@ function printSetConfigOptionResultByFormat(
     resumed: boolean;
     response: { configOptions: unknown[] };
     ownerRestarted?: boolean;
+    ownerRestartSkipped?: string;
   },
   format: OutputFormat,
 ): void {
@@ -1821,6 +1830,7 @@ function printSetConfigOptionResultByFormat(
       value,
       resumed: result.resumed,
       ownerRestarted: result.ownerRestarted ?? false,
+      ...(result.ownerRestartSkipped ? { ownerRestartSkipped: result.ownerRestartSkipped } : {}),
       configOptions: result.response.configOptions,
       acpxRecordId: result.record.acpxRecordId,
       acpxSessionId: result.record.acpSessionId,
@@ -1847,7 +1857,12 @@ function printSetConfigOptionResultByFormat(
  */
 function printSetOutputStyleResultByFormat(
   outputStyle: string,
-  result: { record: SessionRecord; ownerRestarted?: boolean; pending?: boolean },
+  result: {
+    record: SessionRecord;
+    ownerRestarted?: boolean;
+    ownerRestartSkipped?: string;
+    pending?: boolean;
+  },
   format: OutputFormat,
 ): void {
   const pending = result.pending === true;
@@ -1856,6 +1871,7 @@ function printSetOutputStyleResultByFormat(
       action: "output_style_set",
       outputStyle,
       ownerRestarted: result.ownerRestarted ?? false,
+      ...(result.ownerRestartSkipped ? { ownerRestartSkipped: result.ownerRestartSkipped } : {}),
       pending,
       // The style the CURRENT query was built with — what the session is really
       // running until the recycle lands. Never the harness readback.
@@ -2456,6 +2472,7 @@ function printSetSubscriptionResultByFormat(
     to: string;
     transcriptCopied: boolean;
     ownerRestarted: boolean;
+    ownerRestartSkipped?: string;
   },
   format: OutputFormat,
 ): void {
@@ -2466,6 +2483,7 @@ function printSetSubscriptionResultByFormat(
       from: result.from,
       transcriptCopied: result.transcriptCopied,
       ownerRestarted: result.ownerRestarted,
+      ...(result.ownerRestartSkipped ? { ownerRestartSkipped: result.ownerRestartSkipped } : {}),
       acpxRecordId: result.record.acpxRecordId,
       acpxSessionId: result.record.acpSessionId,
     })
@@ -2562,6 +2580,7 @@ function printSetProfileResultByFormat(
     to: string;
     transcriptCopied: boolean;
     ownerRestarted: boolean;
+    ownerRestartSkipped?: string;
   },
   format: OutputFormat,
 ): void {
@@ -2572,6 +2591,7 @@ function printSetProfileResultByFormat(
       from: result.from,
       transcriptCopied: result.transcriptCopied,
       ownerRestarted: result.ownerRestarted,
+      ...(result.ownerRestartSkipped ? { ownerRestartSkipped: result.ownerRestartSkipped } : {}),
       acpxRecordId: result.record.acpxRecordId,
       acpxSessionId: result.record.acpSessionId,
     })
@@ -2764,6 +2784,11 @@ export async function handleSessionsClose(
     closed.drain,
     closed.recordClosedState,
     globalFlags.format,
+    {
+      ownerStopped: closed.ownerStopped,
+      ownerStopSkipped: closed.ownerStopSkipped,
+      adapterKill: closed.adapterKill,
+    },
   );
 
   applyCloseExitCode(closed, record, flags, warnUndeliveredCustody);
@@ -4324,22 +4349,49 @@ export async function handleSessionsRecover(
   const result = await recoverSession(sessionId);
 
   if (!emitJsonResult(globalFlags.format, result)) {
-    const target = result.pid != null ? `owner pid ${result.pid}` : "owner";
-    const summary = !result.ownerFound
-      ? "no queue owner found (already gone)"
-      : result.killed
-        ? `killed ${target} and its process group`
-        : result.alive
-          ? `FAILED to kill ${target} (still alive)`
-          : `${target} already gone; cleared stale lease`;
-    process.stdout.write(`recover ${result.sessionId}: ${summary}\n`);
+    process.stdout.write(`recover ${result.sessionId}: ${recoverSummary(result)}\n`);
   }
 
-  if (result.alive) {
+  // brick ae547131 §8.2 — THE EXIT CODE IS THE CONTRACT WITH acpx-ui: it re-drives on exit 0. So
+  // every live owner this did NOT stop exits non-zero — including one it deliberately did not
+  // signal (another pid namespace, or an unprovable identity). The old "already gone; cleared stale
+  // lease", exit 0, for a foreign owner was the split-brain path.
+  if (result.killSkipped) {
+    throw new AcpxOperationalError(
+      `Did not recover session ${result.sessionId}: queue owner pid ${result.pid} was not signalled ` +
+        `(${result.skipReason ?? "identity-unverified"}${result.ownerHost ? `, host ${result.ownerHost}` : ""}); ` +
+        `its lease is untouched`,
+      {
+        detailCode:
+          result.skipReason === "foreign-owner"
+            ? "QUEUE_OWNER_FOREIGN"
+            : "QUEUE_OWNER_IDENTITY_UNVERIFIED",
+        origin: "queue",
+        retryable: true,
+      },
+    );
+  }
+  if (result.alive !== false) {
     throw new Error(
       `Failed to recover session ${result.sessionId}: queue owner pid ${result.pid} is still alive after kill`,
     );
   }
+}
+
+function recoverSummary(result: QueueOwnerRecoveryResult): string {
+  const target = result.pid != null ? `owner pid ${result.pid}` : "owner";
+  if (!result.ownerFound) {
+    return "no queue owner found (already gone)";
+  }
+  if (result.killSkipped) {
+    return `NOT signalled ${target} (${result.skipReason ?? "identity-unverified"}); lease left in place`;
+  }
+  if (result.killed) {
+    return `killed ${target} and its process group`;
+  }
+  return result.alive !== false
+    ? `FAILED to kill ${target} (still alive)`
+    : `${target} already gone; cleared stale lease`;
 }
 
 // Read-only owner-state probe so acpx-ui/heartbeat callers can consume the CLI

@@ -56,6 +56,9 @@ export function applyLifecycleSnapshotToRecord(
   }
 
   record.pid = snapshot.running ? snapshot.pid : undefined;
+  // brick ae547131 §4.2 — the adapter's birth identity travels WITH its pid, captured at spawn
+  // (client.ts), so `sessions close` can prove `record.pid` is still that adapter before signalling.
+  record.pidIdentity = snapshot.running ? snapshot.pidIdentity : undefined;
   record.agentStartedAt = snapshot.startedAt;
   // The config-dir CHANNEL, refreshed at every spawn/reconnect (brick fa2e54ec).
   // See AgentLifecycleSnapshot.harnessConfigDir for why it must not be written

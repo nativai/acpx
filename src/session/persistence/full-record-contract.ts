@@ -74,6 +74,7 @@ export const RECORD_FIELD_PLAN = {
   favorite: { persisted: true },
   favoritedAt: { persisted: true },
   pid: { persisted: true },
+  pidIdentity: { persisted: true },
   agentStartedAt: { persisted: true },
   lastPromptAt: { persisted: true },
   lastAgentExitCode: { persisted: true },

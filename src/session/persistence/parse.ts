@@ -1,3 +1,4 @@
+import { parseRecordPidIdentity } from "../../process-identity.js";
 import type {
   SessionAcpxState,
   SessionEventLog,
@@ -1379,6 +1380,9 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
   }
 
   const pid = normalizeOptionalPid(record.pid);
+  // Tolerant on purpose: a malformed pid_identity is treated as absent (⇒ never signalled), never
+  // as a reason to reject the whole record the way a bad `pid` is (brick ae547131 §4.2).
+  const pidIdentity = parseRecordPidIdentity(record.pid_identity);
   const closed = normalizeOptionalBoolean(record.closed, false);
   const closedAt = normalizeOptionalString(record.closed_at);
   const reopenedAt = normalizeOptionalString(record.reopened_at);
@@ -1527,6 +1531,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
       favorite,
       favoritedAt,
       pid,
+      ...(pidIdentity ? { pidIdentity } : {}),
       agentStartedAt,
       lastPromptAt,
       lastAgentExitCode,

@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
+import { isRecordedPidPossiblyAlive, type RecordPidIdentity } from "../../process-identity.js";
 import { hasActiveSidecar } from "./identity.js";
 
 /**
@@ -117,9 +118,9 @@ export async function loadWakeupLiveness(hotDir: string): Promise<WakeupLiveness
  * ⚠️ A bare pid match is NOT ownership, and this function makes no ownership
  * claim. It is safe here precisely because the consequence of a false "alive" is
  * that a session is KEPT — the conservative direction. Do not lift this helper
- * into any path that signals a pid: acpx qualifies a pid with
- * `isLikelyMatchingProcess(pid, record.agentCommand)` before it ever signals one,
- * and that check is not optional there.
+ * into any path that signals a pid: acpx signals a recorded pid ONLY through
+ * `signalVerifiedProcess` (process-signal.ts), which requires a full birth-identity
+ * match in the reader's own pid namespace (brick ae547131).
  */
 export function isPidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) {
@@ -252,12 +253,14 @@ export async function evaluateLiveness(
    * which is exactly how this would survive a partial fix.
    */
   hasRecord = true,
+  /** brick ae547131 §5.3 — with it, `pid` is judged by identity; `unknown` still KEEPS. */
+  pidIdentity?: RecordPidIdentity,
 ): Promise<LivenessVerdict> {
   const reported = await reportedLiveness(id, options);
   if (reported) {
     return reported;
   }
-  if (pid != null && isPidAlive(pid)) {
+  if (isRecordedPidPossiblyAlive(pid, pidIdentity)) {
     return { live: true, signal: "pid-alive" };
   }
   if (hasRecord && hasActiveSidecar(safeId, files)) {

@@ -147,8 +147,9 @@ async function defaultIsRecordBusy(record: SessionRecord): Promise<boolean> {
   // underneath it can simply be overwritten, or worse, interleave. The sweep is
   // for records nothing is currently driving; a skipped record is listed and can
   // be swept on a later run once its owner is gone.
+  // brick ae547131 §5.3 — busy unless NO owner is proven: a foreign owner (alive true/null) is busy.
   const liveness = await readQueueOwnerLiveness(record.acpxRecordId);
-  return liveness.alive;
+  return !["no_owner", "dead_owner", "pid_reused"].includes(liveness.state);
 }
 
 function defaultBackupDir(): string {

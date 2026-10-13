@@ -82,6 +82,16 @@ function fullRecordSentinel(): SessionRecord {
     favorite: true,
     favoritedAt: "2026-01-01T00:00:04.000Z",
     pid: 12345,
+    // brick ae547131 §4.2 — travels with pid on every leg; a valid identity so parse keeps it.
+    pidIdentity: {
+      pid: 12345,
+      kind: "linux-proc",
+      boot_id: "919304b9-e1a7-4f88-a74f-81b2ea37b43d",
+      pid_namespace: "pid:[4026534191]",
+      time_namespace: "time:[4026531834]",
+      start_ticks: "144330002",
+      host: "sentinel-host",
+    },
     agentStartedAt: "2026-01-01T00:00:05.000Z",
     lastPromptAt: "2026-01-01T00:00:06.000Z",
     lastAgentExitCode: 1,
@@ -225,8 +235,8 @@ test("full-record guard 4 · the plan is non-trivial and covers every SessionRec
   const total = PERSISTED_TRUE_KEYS.length + PERSISTED_FALSE_KEYS.length;
   assert.equal(
     total,
-    50,
-    `RECORD_FIELD_PLAN has ${total} classified keys, this test expected 50. If you added a field ` +
+    51,
+    `RECORD_FIELD_PLAN has ${total} classified keys, this test expected 51. If you added a field ` +
       `to SessionRecord: classify it in full-record-contract.ts, then run guards 1-3 above. If you ` +
       `removed one: update this count deliberately.`,
   );

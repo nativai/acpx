@@ -62,6 +62,7 @@ import {
   inferToolKind,
   resolvePermissionRequestWithDetails,
 } from "../permissions.js";
+import { captureRecordPidIdentity, type RecordPidIdentity } from "../process-identity.js";
 import { getUnsupportedPromptContentMessage, textPrompt } from "../prompt-content.js";
 import { ACTIVITY_NEUTRAL_EVENT_METHOD } from "../session/events.js";
 import { extractRuntimeSessionId } from "../session/runtime-session-id.js";
@@ -537,6 +538,12 @@ export type AgentExitInfo = {
 
 export type AgentLifecycleSnapshot = {
   /**
+   * The adapter's birth identity, captured at spawn (brick ae547131 §4.2) — persisted beside
+   * `pid` as `pid_identity`, so a later `sessions close` signals `record.pid` only while it is
+   * provably still this adapter. Present only with a running adapter whose pid it names.
+   */
+  pidIdentity?: RecordPidIdentity;
+  /**
    * The per-session harness config dir THIS spawn wrote (brick fa2e54ec).
    *
    * ⚠️ IT RIDES THE LIFECYCLE SNAPSHOT ON PURPOSE. The directory is per-SPAWN and
@@ -923,6 +930,7 @@ export class AcpClient {
   /** The current adapter process's owner-log stderr copy (queue owner only). */
   private agentStderrTee?: AgentStderrTee;
   private lastKnownPid?: number;
+  private lastKnownPidIdentity?: RecordPidIdentity;
   private latestProvisioningWarning?: ProvisioningWarningBreadcrumb;
   /**
    * The box settings file was rejected on THIS session's most recent spawn
@@ -1044,11 +1052,18 @@ export class AcpClient {
     return this.lastEffectiveAccountMetadata ? { ...this.lastEffectiveAccountMetadata } : undefined;
   }
 
+  private pidIdentityFor(pid: number | undefined, running: boolean): RecordPidIdentity | undefined {
+    return running && pid !== undefined && this.lastKnownPidIdentity?.pid === pid
+      ? this.lastKnownPidIdentity
+      : undefined;
+  }
+
   getAgentLifecycleSnapshot(): AgentLifecycleSnapshot {
     const pid = this.agent?.pid ?? this.lastKnownPid;
     const running = childProcessIsRunning(this.agent);
     return {
       pid,
+      pidIdentity: this.pidIdentityFor(pid, running),
       startedAt: this.agentStartedAt,
       running,
       lastExit: this.lastAgentExit ? { ...this.lastAgentExit } : undefined,
@@ -1214,6 +1229,7 @@ export class AcpClient {
     this.agentStartedAt = isoNow();
     this.lastAgentExit = undefined;
     this.lastKnownPid = child.pid ?? undefined;
+    this.lastKnownPidIdentity = captureRecordPidIdentity(child.pid ?? undefined);
     this.attachAgentLifecycleObservers(child);
     const startupStderr = this.observeAgentStderr(child);
 

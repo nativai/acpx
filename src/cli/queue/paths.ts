@@ -42,3 +42,31 @@ export function queueSocketPath(
   }
   return path.join(queueSocketBaseDir(homeDir) ?? "/tmp", `${key}.sock`);
 }
+
+/**
+ * The queue socket dir on the SHARED state volume (`<stateHome>/.acpx/q/`, brick ae547131 §9). A
+ * socket under it can be connected to from every pod that mounts `~/.acpx`, so ONLY there is a
+ * refused/absent ping evidence about an owner in another pod (CONCEPT §5.2, `shared(socketPath)`).
+ */
+export function queueSharedSocketDir(
+  homeDir: string = process.env.ACPX_STATE_HOME || os.homedir(),
+): string {
+  return path.join(homeDir, ".acpx", "q");
+}
+
+export function isSharedQueueSocketPath(
+  socketPath: string,
+  homeDir: string = process.env.ACPX_STATE_HOME || os.homedir(),
+): boolean {
+  return socketPath.startsWith(`${queueSharedSocketDir(homeDir)}${path.sep}`);
+}
+
+const LEGACY_TMP_SOCKET = /^\/tmp\/acpx-[0-9a-f]{10}\/[0-9a-f]{24}\.sock$/;
+
+/** A reaper unlinks a dead lease's socket only at a path acpx itself could have bound (§7.2). */
+export function isReapableQueueSocketPath(
+  socketPath: string,
+  homeDir: string = process.env.ACPX_STATE_HOME || os.homedir(),
+): boolean {
+  return isSharedQueueSocketPath(socketPath, homeDir) || LEGACY_TMP_SOCKET.test(socketPath);
+}

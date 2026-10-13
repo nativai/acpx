@@ -1,5 +1,4 @@
 import fs from "node:fs/promises";
-import path from "node:path";
 import { releaseHarnessConfigDir } from "../../acp/harness-config-dir.js";
 import {
   ConfigOptionQueuedWorkError,
@@ -8,6 +7,15 @@ import {
   ProfileTurnInFlightError,
   SubscriptionTurnInFlightError,
 } from "../../errors.js";
+import {
+  classifyRecordedIdentity,
+  getOwnProcessScope,
+  identityScope,
+  observeProcessIncarnation,
+  validRecordPidIdentity,
+  type ProcessBirthIdentity,
+} from "../../process-identity.js";
+import { terminateVerifiedProcess, type VerifiedTerminateOutcome } from "../../process-signal.js";
 import { switchSessionAccount } from "../../runtime/engine/account-seam.js";
 import { switchSessionSubscription } from "../../runtime/engine/subscription-switch.js";
 import { applyDepthOutcomeToRecord } from "../../session/depth-application.js";
@@ -42,14 +50,12 @@ import type {
 } from "../../types.js";
 import {
   drainQueueOwnerForSession,
-  isProcessAlive,
   type QueueDrainedDelivery,
   type QueueOwnerLiveness,
   type QueueOwnerRecoveryResult,
   readQueueOwnerLiveness,
   readQueueOwnerState,
   recoverQueueOwnerForSession,
-  terminateProcess,
   terminateQueueOwnerForSession,
   tryCancelOnRunningOwner,
   tryCloseSessionOnRunningOwner,
@@ -149,18 +155,43 @@ async function refuseTurnInFlightForRecycle(
   return await refuseTurnInFlightForLiveOwner(sessionId, makeTurnInFlightError);
 }
 
+/**
+ * brick ae547131 §8.4 — "alive" covers a local live owner AND a foreign one (rows L1, F1, F2), and an
+ * UNKNOWN liveness counts as alive: such an owner is asked over its socket whether a turn is active
+ * (the shared-volume socket works across pods), and refused only if it says so. The old rule read a
+ * foreign owner as dead, skipped both the refusal and the recycle, and left it serving the old value.
+ */
+function isOwnerPossiblyAlive(liveness: QueueOwnerLiveness): boolean {
+  return liveness.ownerFound && liveness.alive !== false;
+}
+
 async function refuseTurnInFlightForLiveOwner(
   sessionId: string,
   makeTurnInFlightError: () => Error,
 ): Promise<boolean> {
   const liveness = await readQueueOwnerLiveness(sessionId);
-  if (liveness.alive) {
+  const alive = isOwnerPossiblyAlive(liveness);
+  if (alive) {
     const active = await tryQueryActiveTurnOnRunningOwner(sessionId);
     if (active === true) {
       throw makeTurnInFlightError();
     }
   }
-  return liveness.alive;
+  return alive;
+}
+
+type OwnerRecycle = { ownerRestarted: boolean; ownerRestartSkipped?: string };
+
+/**
+ * Recycles a live owner after a setting changed — and reports what happened. `ownerRestarted:true`
+ * ONLY when the owner was actually stopped; a foreign or unverifiable owner is not signalled
+ * (`ownerRestartSkipped`), and the setting takes effect at that owner's next start.
+ */
+async function recycleLiveOwner(sessionId: string): Promise<OwnerRecycle> {
+  const outcome = await terminateQueueOwnerForSession(sessionId);
+  return outcome.stopped
+    ? { ownerRestarted: true }
+    : { ownerRestarted: false, ownerRestartSkipped: outcome.reason };
 }
 
 export async function setSessionModel(
@@ -217,8 +248,7 @@ export async function setSessionModel(
   }
 
   if (ownerToRecycle) {
-    await terminateQueueOwnerForSession(options.sessionId);
-    result.ownerRestarted = true;
+    Object.assign(result, await recycleLiveOwner(options.sessionId));
     if (options.verbose) {
       process.stderr.write(
         `[acpx] restarted queue owner for session ${options.sessionId} to bind model "${options.modelId}"\n`,
@@ -276,8 +306,7 @@ export async function setSessionConfigOption(
   }
 
   if (ownerToRecycle) {
-    await terminateQueueOwnerForSession(options.sessionId);
-    result.ownerRestarted = true;
+    Object.assign(result, await recycleLiveOwner(options.sessionId));
     if (options.verbose) {
       process.stderr.write(
         `[acpx] restarted queue owner for session ${options.sessionId} to bind config option "${options.configId}"\n`,
@@ -348,7 +377,7 @@ export async function setSessionSubscription(
   options: SessionSetSubscriptionOptions,
 ): Promise<SessionSetSubscriptionResult> {
   const liveness = await readQueueOwnerLiveness(options.sessionId);
-  const ownerAlive = liveness.alive;
+  const ownerAlive = isOwnerPossiblyAlive(liveness);
 
   if (ownerAlive) {
     const active = await tryQueryActiveTurnOnRunningOwner(options.sessionId);
@@ -369,18 +398,17 @@ export async function setSessionSubscription(
   // Bind on a live session by recycling the owner; the next prompt re-resolves
   // CLAUDE_CONFIG_DIR from the updated record. The ported transcript means the
   // fresh client resumes WITH context.
-  let ownerRestarted = false;
+  let recycled: OwnerRecycle = { ownerRestarted: false };
   if (ownerAlive) {
-    await terminateQueueOwnerForSession(options.sessionId);
-    ownerRestarted = true;
-    if (options.verbose) {
+    recycled = await recycleLiveOwner(options.sessionId);
+    if (options.verbose && recycled.ownerRestarted) {
       process.stderr.write(
         `[acpx] restarted queue owner for session ${options.sessionId} to bind subscription "${to}"\n`,
       );
     }
   }
 
-  return { record, from, to, transcriptCopied, ownerRestarted };
+  return { record, from, to, transcriptCopied, ...recycled };
 }
 
 // Move a session to a different credential PROFILE in place — the unified
@@ -398,7 +426,7 @@ export async function setSessionProfile(
   options: SessionSetProfileOptions,
 ): Promise<SessionSetProfileResult> {
   const liveness = await readQueueOwnerLiveness(options.sessionId);
-  const ownerAlive = liveness.alive;
+  const ownerAlive = isOwnerPossiblyAlive(liveness);
 
   if (ownerAlive) {
     const active = await tryQueryActiveTurnOnRunningOwner(options.sessionId);
@@ -416,18 +444,17 @@ export async function setSessionProfile(
   );
   await writeSessionRecord(record);
 
-  let ownerRestarted = false;
+  let recycled: OwnerRecycle = { ownerRestarted: false };
   if (ownerAlive) {
-    await terminateQueueOwnerForSession(options.sessionId);
-    ownerRestarted = true;
-    if (options.verbose) {
+    recycled = await recycleLiveOwner(options.sessionId);
+    if (options.verbose && recycled.ownerRestarted) {
       process.stderr.write(
         `[acpx] restarted queue owner for session ${options.sessionId} to bind profile "${toProfile}"\n`,
       );
     }
   }
 
-  return { record, from: fromProfile, to: toProfile, transcriptCopied, ownerRestarted };
+  return { record, from: fromProfile, to: toProfile, transcriptCopied, ...recycled };
 }
 
 // brick://f1f0b3ea — recycle a live idle owner after the write, mirroring the rest
@@ -457,8 +484,7 @@ export async function setSessionAutoFailover(
 
   const result: SessionSetAutoFailoverResult = { record, autoFailover: options.autoFailover };
   if (ownerAlive) {
-    await terminateQueueOwnerForSession(options.sessionId);
-    result.ownerRestarted = true;
+    Object.assign(result, await recycleLiveOwner(options.sessionId));
   }
   return result;
 }
@@ -507,7 +533,7 @@ export async function setSessionOutputStyle(
   options: SessionSetOutputStyleOptions,
 ): Promise<SessionSetOutputStyleResult> {
   const liveness = await readQueueOwnerLiveness(options.sessionId);
-  const ownerAlive = liveness.alive;
+  const ownerAlive = isOwnerPossiblyAlive(liveness);
 
   // Refuse ONLY for queued-behind work — never for the active turn itself.
   if (ownerAlive && liveness.queueDepth > 0) {
@@ -567,8 +593,7 @@ export async function setSessionOutputStyle(
     // model's actual behaviour would disagree — the one signal no automated test
     // reads by default. `test/output-style-no-live-apply.test.ts` pins the
     // structural half of this.
-    await terminateQueueOwnerForSession(options.sessionId);
-    result.ownerRestarted = true;
+    Object.assign(result, await recycleLiveOwner(options.sessionId));
   }
   return result;
 }
@@ -597,8 +622,7 @@ export async function setSessionAutoSubscription(
     autoSubscription: options.autoSubscription,
   };
   if (ownerAlive) {
-    await terminateQueueOwnerForSession(options.sessionId);
-    result.ownerRestarted = true;
+    Object.assign(result, await recycleLiveOwner(options.sessionId));
   }
   return result;
 }
@@ -625,46 +649,53 @@ export async function setSessionFableDegrade(
 
   const result: SessionSetFableDegradeResult = { record, fableDegradeOk: options.fableDegradeOk };
   if (ownerAlive) {
-    await terminateQueueOwnerForSession(options.sessionId);
-    result.ownerRestarted = true;
+    Object.assign(result, await recycleLiveOwner(options.sessionId));
   }
   return result;
 }
 
-function firstAgentCommandToken(command: string): string | undefined {
-  const trimmed = command.trim();
-  if (!trimmed) {
-    return undefined;
+/**
+ * What the close did to the ADAPTER at `record.pid` (brick ae547131 §8.1). `signalled:false` with a
+ * reason is the normal shape for every record without a provable identity — including every record
+ * written before 0a — and is reported, never guessed.
+ */
+export type SessionCloseAdapterKill = {
+  signalled: boolean;
+  reason?: "no-pid" | "no-identity" | "foreign" | "gone" | "unverified" | "self-close";
+};
+
+const ADAPTER_KILL_GRACE_MS = 1_500;
+
+/**
+ * Signals `record.pid` ONLY when its `pid_identity` is valid for it and still `matching` — SIGTERM,
+ * grace, re-verify, SIGKILL. 🛑 `isLikelyMatchingProcess` is DELETED, not bypassed (Q6): it matched
+ * ANY process with a `node` argv entry and returned TRUE when /proc could not be read, so after a
+ * container restart `sessions close` on an old record signalled whatever now held the pid number —
+ * atrium, or another agent mid-turn. A record with no identity is never signalled (T32a); its adapter
+ * died with its owner's process group, or exits on stdin EOF (CONCEPT R13).
+ */
+async function killRecordedAdapter(record: SessionRecord): Promise<SessionCloseAdapterKill> {
+  if (record.pid == null) {
+    return { signalled: false, reason: "no-pid" };
   }
-  const token = trimmed.split(/\s+/, 1)[0];
-  return token.length > 0 ? token : undefined;
+  const identity = validRecordPidIdentity(record.pid, record.pidIdentity);
+  const outcome = await terminateVerifiedProcess(record.pid, identity, ADAPTER_KILL_GRACE_MS);
+  if (outcome.signalled) {
+    return { signalled: true };
+  }
+  if (outcome.gone) {
+    return { signalled: false, reason: "gone" };
+  }
+  return { signalled: false, reason: refusedAdapterReason(outcome.refused) };
 }
 
-async function isLikelyMatchingProcess(pid: number, agentCommand: string): Promise<boolean> {
-  const expectedToken = firstAgentCommandToken(agentCommand);
-  if (!expectedToken) {
-    return false;
+function refusedAdapterReason(
+  refused: VerifiedTerminateOutcome["refused"],
+): NonNullable<SessionCloseAdapterKill["reason"]> {
+  if (refused === "refused:no-identity") {
+    return "no-identity";
   }
-
-  const procCmdline = `/proc/${pid}/cmdline`;
-  try {
-    const payload = await fs.readFile(procCmdline, "utf8");
-    const argv = payload
-      .split("\u0000")
-      .map((entry) => entry.trim())
-      .filter((entry) => entry.length > 0);
-    if (argv.length === 0) {
-      return false;
-    }
-
-    const executableBase = path.basename(argv[0]);
-    const expectedBase = path.basename(expectedToken);
-    return (
-      executableBase === expectedBase || argv.some((entry) => path.basename(entry) === expectedBase)
-    );
-  } catch {
-    return true;
-  }
+  return refused === "refused:foreign" ? "foreign" : "unverified";
 }
 
 export type CloseSessionOptions = {
@@ -700,6 +731,10 @@ export type SessionCloseResult = {
   record: SessionRecord;
   drain: SessionCloseDrainReport;
   recordClosedState: SessionCloseRecordState;
+  /** The queue owner was stopped (or there was none). false ⇒ `ownerStopSkipped` says why (§8.4). */
+  ownerStopped: boolean;
+  ownerStopSkipped?: string;
+  adapterKill: SessionCloseAdapterKill;
 };
 
 // Re-reads `<id>.json` immediately after the terminal write, converting a
@@ -752,10 +787,14 @@ export async function closeSession(
   const record = await resolveSessionRecord(sessionId);
 
   // Self-close detection FIRST — it decides which of the two arms runs.
-  const selfOwnerPid = await detectSelfOwnedOwnerPid(record.acpxRecordId);
-  if (selfOwnerPid !== undefined) {
-    return await closeSelfOwnedSession(record, selfOwnerPid, options);
+  const selfOwner = await detectSelfOwnedOwner(record.acpxRecordId);
+  if (selfOwner !== undefined) {
+    return await closeSelfOwnedSession(record, selfOwner, options);
   }
+
+  // The owner generation this close drains and sends `close_session` to — the ONLY one it may
+  // retire (port of openclaw/acpx 44a0a18e). A successor that started meanwhile is never signalled.
+  const drainedOwner = (await readQueueOwnerRecord(record.acpxRecordId)) ?? null;
 
   // Step 0.5 — ask the owner to give up its custody honestly BEFORE anything
   // kills it. Until this existed, step 2 below actively killed the very process
@@ -766,17 +805,16 @@ export async function closeSession(
   await tryCloseSessionOnRunningOwner({ sessionId: record.acpxRecordId }).catch(() => {
     // Preserve local close semantics even if best-effort ACP session shutdown fails.
   });
-  await terminateQueueOwnerForSession(record.acpxRecordId);
-
-  if (
-    record.pid != null &&
-    isProcessAlive(record.pid) &&
-    (await isLikelyMatchingProcess(record.pid, record.agentCommand))
-  ) {
-    await terminateProcess(record.pid);
+  const ownerStop = await terminateQueueOwnerForSession(record.acpxRecordId, drainedOwner);
+  const adapterKill = await killRecordedAdapter(record);
+  if (options.verbose && !adapterKill.signalled && adapterKill.reason !== "no-pid") {
+    process.stderr.write(
+      `[acpx] close: adapter pid ${record.pid} not signalled (${adapterKill.reason})\n`,
+    );
   }
 
   record.pid = undefined;
+  record.pidIdentity = undefined;
   record.closed = true;
   record.closedAt = isoNow();
   // Privileged write: this is a daemon-authorized close — bypass the
@@ -787,7 +825,16 @@ export async function closeSession(
 
   releaseConfigDirOnTerminalClose(record);
 
-  return { record, drain, recordClosedState };
+  // The close landed either way (an owner refuses turns on a closed record); whether the owner was
+  // actually stopped is reported, never assumed. Phase 1b stops a foreign owner via its launcher.
+  return {
+    record,
+    drain,
+    recordClosedState,
+    ownerStopped: ownerStop.stopped,
+    ...(ownerStop.stopped ? {} : { ownerStopSkipped: ownerStop.reason }),
+    adapterKill,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -886,24 +933,36 @@ export async function isPidSelfOrAncestor(pid: number): Promise<boolean> {
   return (await readSelfAncestorPids()).includes(pid);
 }
 
+type SelfOwner = { pid: number; identity: ProcessBirthIdentity };
+
+/** The identity a lease's owner may be signalled with — local scope only (§8.3), or undefined. */
+function localLeaseIdentity(
+  processIdentity: Record<string, string> | undefined,
+): ProcessBirthIdentity | undefined {
+  const recorded = classifyRecordedIdentity(processIdentity);
+  if (recorded.kind === "birth") {
+    return identityScope(recorded.birth) === "local" ? recorded.birth : undefined;
+  }
+  // A pre-0a lease (no scope) with start ticks: by §4.5 it was written in this container.
+  const own = getOwnProcessScope();
+  return recorded.kind === "legacy" && recorded.startTicks && own
+    ? { kind: "linux-proc", ...own, startTicks: recorded.startTicks }
+    : undefined;
+}
+
 /**
- * The session's owner pid when terminating it would terminate THIS process
- * tree — i.e. a self-close — and the pid is safe to signal (alive, lease
- * identity still matching). The identity guard mirrors `canSignalQueueOwner`
- * in lease-store.ts: a dead owner has nothing to terminate, and a pid-reused
- * lease must never cause this process to signal an unrelated process that
- * happens to sit in its ancestry.
+ * The session's owner when terminating it would terminate THIS process tree — a self-close — and it
+ * is safe to signal. brick ae547131 §8.3: the owner must first be in this reader's scope and provably
+ * the recorded process (`matching`); only then is the pid-number ancestry check meaningful. A pid
+ * recorded in another pid namespace can collide with a number in our own ancestry.
  */
-async function detectSelfOwnedOwnerPid(sessionId: string): Promise<number | undefined> {
+async function detectSelfOwnedOwner(sessionId: string): Promise<SelfOwner | undefined> {
   const owner = await readQueueOwnerRecord(sessionId);
-  if (owner?.pid === undefined || !(await isPidSelfOrAncestor(owner.pid))) {
+  const identity = owner ? localLeaseIdentity(owner.processIdentity) : undefined;
+  if (!owner || !identity || observeProcessIncarnation(owner.pid, identity) !== "matching") {
     return undefined;
   }
-  const ownerState = await readQueueOwnerState(sessionId);
-  if (!ownerState.pidAlive || ownerState.processIdentityMatched === false) {
-    return undefined;
-  }
-  return owner.pid;
+  return (await isPidSelfOrAncestor(owner.pid)) ? { pid: owner.pid, identity } : undefined;
 }
 
 /**
@@ -919,10 +978,12 @@ async function detectSelfOwnedOwnerPid(sessionId: string): Promise<number | unde
  */
 async function closeSelfOwnedSession(
   record: SessionRecord,
-  ownerPid: number,
+  selfOwner: SelfOwner,
   options: CloseSessionOptions,
 ): Promise<SessionCloseResult> {
+  const ownerPid = selfOwner.pid;
   record.pid = undefined;
+  record.pidIdentity = undefined;
   record.closed = true;
   record.closedAt = isoNow();
   // Privileged write: same daemon-authorized close as the non-self path —
@@ -953,9 +1014,16 @@ async function closeSelfOwnedSession(
   // the owner's shutdown cascade before the wait resolves, and the record is
   // already on disk. No process-group sweep: the caller itself is a group
   // member, and sweeping would be self-destruction beyond the close's mandate.
-  await terminateProcess(ownerPid);
+  // Through the verified signal (§8.3): re-checked immediately before each signal.
+  await terminateVerifiedProcess(ownerPid, selfOwner.identity, ADAPTER_KILL_GRACE_MS);
 
-  return { record, drain, recordClosedState };
+  return {
+    record,
+    drain,
+    recordClosedState,
+    ownerStopped: true,
+    adapterKill: { signalled: false, reason: "self-close" },
+  };
 }
 
 /**
@@ -1068,7 +1136,11 @@ export type SessionOwnerStatusClassification =
   | "idle_no_owner"
   | "recoverable_owner"
   | "socket_unreachable"
-  | "closed_ignored";
+  | "closed_ignored"
+  /** brick ae547131: the owner lives in another pid namespace (judged by heartbeat + ping). */
+  | "foreign_owner"
+  /** In our scope but its identity cannot be proven — never signalled. */
+  | "owner_unverified";
 
 export type SessionOwnerStatus = QueueOwnerLiveness & {
   parentSessionId?: string;
@@ -1358,6 +1430,9 @@ function classifySessionOwnerStatus(
   }
   if (state.state === "socket_unreachable") {
     return "socket_unreachable";
+  }
+  if (state.state === "foreign_owner" || state.state === "owner_unverified") {
+    return state.state;
   }
   return "healthy";
 }

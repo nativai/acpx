@@ -1834,7 +1834,12 @@ function editDuringBatch(
   let firedWith: string[] | undefined;
   const spy = t.mock.method(fs, "readFile", async (...args: Parameters<typeof fs.readFile>) => {
     const result = await (originalReadFile as (...a: typeof args) => unknown).apply(fs, args);
-    if (!firedWith) {
+    // brick ae547131 — never fire from inside a LOCK's own I/O: lock release is now a
+    // compare-and-delete that reads the lock file, and an edit fired there would wait on the very
+    // lock being released (a same-process nesting no second process can produce — it would simply
+    // wait the milliseconds the release takes). Fire on the next record read instead.
+    const target = typeof args[0] === "string" ? args[0] : "";
+    if (!firedWith && !/\.lock(?:\.|$)/.test(path.basename(target))) {
       const done = await writtenSoFar();
       if (done.length >= minWritten && done.length < childIds.length) {
         // Claim BEFORE awaiting: the edit reads and writes records itself and
@@ -2049,7 +2054,13 @@ test("a child that CLOSES or is FAVORITED during the batch keeps that change in 
     let victims: { closed: string; renamed: string } | undefined;
     const hook = editDuringBatch(t, homeDir, childIds, 2, async (written) => {
       victims = { closed: written[0], renamed: written[1] };
-      await other.closeSession(victims.closed);
+      // brick ae547131 §8.1 — persistence's own `closeSession` is DELETED (it SIGKILLed record.pid
+      // with no identity guard). Its record half — the privileged close write — is done directly.
+      const closing = await other.resolveSessionRecord(victims.closed);
+      closing.closed = true;
+      closing.closedAt = new Date().toISOString();
+      closing.pid = undefined;
+      await other.writeSessionRecordAtBoundaryWithLifecycle(closing);
       const record = await other.resolveSessionRecord(victims.renamed);
       record.favorite = true;
       record.favoritedAt = "2026-06-12T08:00:00.000Z";

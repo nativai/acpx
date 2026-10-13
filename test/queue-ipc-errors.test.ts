@@ -14,6 +14,7 @@ import {
   trySetModeOnRunningOwner,
   trySubmitToRunningOwner,
 } from "../src/cli/queue/ipc.js";
+import { readQueueOwnerProcessIdentity } from "../src/cli/queue/lease-store.js";
 import { QueueConnectionError, QueueProtocolError } from "../src/errors.js";
 import type { DepthProjection } from "../src/session/depth-projection.js";
 import type { OutputFormatter } from "../src/types.js";
@@ -30,6 +31,12 @@ import {
   withTempHome,
   writeQueueOwnerLock,
 } from "./queue-test-helpers.js";
+
+/** The pid of a spawned child — asserted present (lint and the compiler disagree on `!` here). */
+function pidOf(child: { pid?: number }): number {
+  assert.ok(child.pid, "child has a pid");
+  return child.pid;
+}
 
 const NOOP_OUTPUT_FORMATTER: OutputFormatter = {
   setContext() {
@@ -136,11 +143,14 @@ test("trySubmitToRunningOwner treats owner shutdown errors as no usable owner", 
       const sessionId = `submit-${detailCode.toLowerCase().replaceAll("_", "-")}`;
       const keeper = await startKeeperProcess();
       const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+      // REWRITTEN (brick ae547131 §8.4b): the lease carries the keeper's real identity — the
+      // shutdown-error recovery retires only an owner it can PROVE (T36 covers the foreign case).
       await writeQueueOwnerLock({
         lockPath,
         pid: keeper.pid,
         sessionId,
         socketPath,
+        processIdentity: await readQueueOwnerProcessIdentity(pidOf(keeper)),
       });
 
       const server = createSingleRequestServer((socket, request) => {
@@ -789,11 +799,14 @@ test("trySubmitToRunningOwner clears stale owner lock on protocol mismatch", asy
     const sessionId = "submit-stale-owner-protocol-mismatch";
     const keeper = await startKeeperProcess();
     const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    // REWRITTEN (brick ae547131, Q9): the protocol-mismatch kill is kept but goes through the
+    // verified signal, so the lease carries the keeper's real identity (T36 covers the foreign case).
     await writeQueueOwnerLock({
       lockPath,
       pid: keeper.pid,
       sessionId,
       socketPath,
+      processIdentity: await readQueueOwnerProcessIdentity(pidOf(keeper)),
     });
 
     const server = createSingleRequestServer((socket, request) => {

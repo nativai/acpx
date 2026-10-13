@@ -333,6 +333,7 @@ export type SessionSetSubscriptionResult = {
   transcriptCopied: boolean;
   /** True when a live queue owner existed and was restarted to bind the switch. */
   ownerRestarted: boolean;
+  ownerRestartSkipped?: string;
 };
 
 export type SessionSetProfileOptions = {
@@ -350,6 +351,7 @@ export type SessionSetProfileResult = {
   transcriptCopied: boolean;
   /** True when a live queue owner existed and was restarted to bind the move. */
   ownerRestarted: boolean;
+  ownerRestartSkipped?: string;
 };
 
 export type SessionSetAutoFailoverOptions = {
@@ -362,6 +364,7 @@ export type SessionSetAutoFailoverResult = {
   autoFailover: boolean;
   /** True when a live queue owner existed and was restarted to bind the change. */
   ownerRestarted?: boolean;
+  ownerRestartSkipped?: string;
 };
 
 // brick://874fee67 — enumerate an agent's output styles (the create-dialog feed).
@@ -404,6 +407,7 @@ export type SessionSetOutputStyleResult = {
   /** True when a live idle queue owner existed and was recycled immediately, so
    *  the change binds on the next prompt. */
   ownerRestarted?: boolean;
+  ownerRestartSkipped?: string;
   /**
    * True when the write was ACCEPTED but the recycle was deferred because a turn
    * was in flight. The change is durable and will bind at the turn boundary (or
@@ -424,6 +428,7 @@ export type SessionSetAutoSubscriptionResult = {
   autoSubscription: boolean;
   /** True when a live queue owner existed and was restarted to bind the change. */
   ownerRestarted?: boolean;
+  ownerRestartSkipped?: string;
 };
 
 // brick://4d517be2 — the fable→opus degrade opt-in.
@@ -437,6 +442,7 @@ export type SessionSetFableDegradeResult = {
   fableDegradeOk: boolean;
   /** True when a live queue owner existed and was restarted to bind the change. */
   ownerRestarted?: boolean;
+  ownerRestartSkipped?: string;
 };
 
 export type { SessionAgentOptions };

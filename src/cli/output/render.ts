@@ -164,11 +164,32 @@ function formatRawFieldForText(field: { present: boolean; value?: unknown }): st
   return field.present ? String(field.value) : "(absent)";
 }
 
+/** brick ae547131 §8.4 — whether the close actually stopped the owner, and what it did to the adapter. */
+export type SessionCloseProcessReport = {
+  ownerStopped: boolean;
+  ownerStopSkipped?: string;
+  adapterKill: { signalled: boolean; reason?: string };
+};
+
+function processReportForJson(
+  processReport: SessionCloseProcessReport | undefined,
+): Record<string, unknown> {
+  if (!processReport) {
+    return {};
+  }
+  return {
+    ownerStopped: processReport.ownerStopped,
+    ...(processReport.ownerStopSkipped ? { ownerStopSkipped: processReport.ownerStopSkipped } : {}),
+    adapterKill: processReport.adapterKill,
+  };
+}
+
 export function printClosedSessionByFormat(
   record: SessionRecord,
   drain: SessionCloseDrainReport,
   recordClosedState: SessionCloseRecordState,
   format: OutputFormat,
+  processReport?: SessionCloseProcessReport,
 ): void {
   if (
     emitJsonResult(format, {
@@ -188,6 +209,10 @@ export function printClosedSessionByFormat(
         undelivered: drain.undelivered,
       },
       ...recordClosedStateForJson(recordClosedState),
+      // brick ae547131 §8.4 — TOP-LEVEL on the `session_closed` line (cross-repo contract with
+      // acpx-ui, test/close-json-contract.test.ts). `ownerStopped:false` + `ownerStopSkipped`
+      // (e.g. "foreign-owner") means the close landed but the owner was deliberately not signalled.
+      ...processReportForJson(processReport),
     })
   ) {
     return;
@@ -207,6 +232,11 @@ export function printClosedSessionByFormat(
   process.stdout.write(
     `closed: ${formatRawFieldForText(recordClosedState.closed)} (read back from record)\n`,
   );
+  if (processReport && !processReport.ownerStopped) {
+    process.stderr.write(
+      `[acpx] queue owner of ${record.acpxRecordId} was NOT stopped (${processReport.ownerStopSkipped ?? "unknown"}); it refuses new turns on the closed record\n`,
+    );
+  }
 }
 
 /**
