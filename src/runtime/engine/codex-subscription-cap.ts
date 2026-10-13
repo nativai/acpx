@@ -39,6 +39,11 @@
  * over the cap. That turn immediately writes a fresh snapshot, so the next turn
  * is gated on truth — a one-turn overshoot per idle gap.
  */
+import {
+  type AcpxUiInternalOriginSources,
+  readAcpxUiInternalOriginSources,
+  resolveAcpxUiInternalOrigin,
+} from "../../acp/acpx-ui-internal-origin.js";
 import { CodexSubscriptionCapError } from "../../errors.js";
 import type { CodexSubscriptionCapDetail } from "../../types.js";
 
@@ -53,7 +58,30 @@ const MAX_OBSERVATION_AGE_MS = 120_000;
 // an unavailable control plane cannot block a turn forever, but leave enough
 // time for that bounded local scan to complete.
 const ADMISSION_TIMEOUT_MS = 45_000;
-const LOCAL_ACPX_UI_ORIGIN = "http://127.0.0.1:3456";
+const LOOPBACK_ACPX_UI_ORIGIN = "http://127.0.0.1:3456";
+
+/**
+ * brick cfcfa0de — where the quota read goes: the shared cluster-internal ladder
+ * ({@link resolveAcpxUiInternalOrigin} — `ACPX_UI_INTERNAL_URL`, else the namespace-derived
+ * `dev-server` Service), and only when that yields NOTHING, the same-pod loopback.
+ *
+ * The loopback alone was the bug: on the workbench, and on any agent pod, nothing
+ * listens on `127.0.0.1:3456`, the read fails, and an unreadable endpoint HOLDS — so
+ * every Codex turn started there was refused (`read-failed`), forever.
+ *
+ * ⚠️ DO NOT DROP THE LOOPBACK RUNG to make this "the same as notice delivery". There,
+ * "no origin" just skips a best-effort notice; here it would hold every Codex turn on a
+ * host with no namespace (a laptop, a non-k8s install), where loopback is the only
+ * acpx-ui there is. A set-but-EMPTY `ACPX_UI_INTERNAL_URL` therefore lands on loopback
+ * too: the ladder treats empty as "no origin", and this rung catches it.
+ * `test/codex-subscription-cap.test.ts` pins every rung by the URL the read receives.
+ */
+export function resolveCodexQuotaOrigin(
+  env: NodeJS.ProcessEnv,
+  sources: AcpxUiInternalOriginSources,
+): string {
+  return resolveAcpxUiInternalOrigin(env, sources) ?? LOOPBACK_ACPX_UI_ORIGIN;
+}
 
 type CodexQuotaWindow = {
   windowMinutes?: unknown;
@@ -219,8 +247,8 @@ function isStale(captured: { ms: number }, now: number): boolean {
 }
 
 /**
- * Admits a Codex turn unless the same-box acpx-ui quota endpoint gives positive
- * evidence that the weekly cap is reached.
+ * Admits a Codex turn unless the same-box acpx-ui quota endpoint (origin:
+ * {@link resolveCodexQuotaOrigin}) gives positive evidence that the weekly cap is reached.
  *
  * An unreadable endpoint is still a hold: that is a real dependency outage,
  * independent of Codex activity, and it clears on its own when acpx-ui returns.
@@ -231,9 +259,17 @@ export async function admitCodexSubscriptionTurn(params: {
   weeklyCapPercent: number;
   now?: () => number;
   fetchImpl?: typeof fetch;
+  /** The origin ladder's inputs; default `process.env` and this pod's own files. */
+  env?: NodeJS.ProcessEnv;
+  originSources?: AcpxUiInternalOriginSources;
 }): Promise<void> {
   try {
-    const observation = await readLocalQuota(params.fetchImpl);
+    const observation = await readLocalQuota(params.fetchImpl, () =>
+      resolveCodexQuotaOrigin(
+        params.env ?? process.env,
+        params.originSources ?? readAcpxUiInternalOriginSources(),
+      ),
+    );
     const hold = classifyObservation(
       observation,
       params.weeklyCapPercent,
@@ -315,7 +351,10 @@ function cannedQuotaFromEnv(): { observation: unknown } | undefined {
   return { observation: parsed };
 }
 
-async function readLocalQuota(fetchImpl: typeof fetch | undefined): Promise<unknown> {
+async function readLocalQuota(
+  fetchImpl: typeof fetch | undefined,
+  origin: () => string,
+): Promise<unknown> {
   // PRECEDENCE: an explicitly injected `fetchImpl` > the canned env value > the real
   // read. An explicit injection is a caller saying exactly what this read must see,
   // and it must never be shadowed. Measured under brick://c028c10e: with the env
@@ -331,7 +370,7 @@ async function readLocalQuota(fetchImpl: typeof fetch | undefined): Promise<unkn
       return canned.observation;
     }
   }
-  const response = await (fetchImpl ?? fetch)(`${LOCAL_ACPX_UI_ORIGIN}/api/usage/codex/quota`, {
+  const response = await (fetchImpl ?? fetch)(`${origin()}/api/usage/codex/quota`, {
     headers: { "User-Agent": "acpx/codex-subscription-cap" },
     signal: AbortSignal.timeout(ADMISSION_TIMEOUT_MS),
   });

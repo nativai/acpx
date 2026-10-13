@@ -772,6 +772,14 @@ function buildAgentEnvironment(
   deleteBricksCredentialEnv(env);
   delete env.ACPX_OWNER_LOG;
   delete env.ACPX_AGENT_TYPE;
+  // brick d7324406 — `PORT` is acpx-ui's OWN listener port (it is launched with PORT=3456)
+  // and reached every agent through the queue owner. A `$PORT`-honouring dev server an agent
+  // starts (Next.js, Vite, Express…) then binds acpx-ui's port instead of a dev slot.
+  // `delete`, not overwrite: an agent that wants a port names one itself.
+  // ⚠️ `HOST` IS KEPT ON PURPOSE — HOST=0.0.0.0 is the container default (image ENV + every
+  // box overlay), and dev servers that bind `$HOST` must listen on all interfaces to be
+  // reachable through the dev-slot Service.
+  delete env.PORT;
   // brick://6530d3b4 — the ACCOUNT stamp is spawn context too, and was missing
   // from the list above. Measured on devbox: a pi child of a claude parent
   // inherited ACPX_SUBSCRIPTION=sub7, ACPX_EFFECTIVE_ACCOUNT=sub7,

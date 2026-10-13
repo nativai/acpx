@@ -447,6 +447,31 @@ test("buildAgentSpawnOptions clears a stale inherited ACPX_TASK_FOLDER", () => {
   }
 });
 
+// brick d7324406 — acpx-ui is launched with PORT=3456 (its own listener) and every agent
+// inherited it, so a `$PORT`-honouring dev server an agent started bound acpx-ui's port.
+// HOST=0.0.0.0 is the container default and is KEPT: dev servers that bind `$HOST` must
+// listen on all interfaces to be reachable through the dev-slot Service.
+test("buildAgentSpawnOptions drops an inherited PORT and keeps HOST=0.0.0.0", () => {
+  const previous = { PORT: process.env.PORT, HOST: process.env.HOST };
+  process.env.PORT = "3456";
+  process.env.HOST = "0.0.0.0";
+  try {
+    const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      acpxRecordId: "child-id",
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(options.env, "PORT"), false);
+    assert.equal(options.env.HOST, "0.0.0.0");
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) {
+        delete process.env[name];
+      } else {
+        process.env[name] = value;
+      }
+    }
+  }
+});
+
 test("buildAgentSpawnOptions injects ACPX_BRICK and ACPX_BRICK_PATH when present", () => {
   const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
     acpxRecordId: "child-id",

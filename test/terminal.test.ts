@@ -798,3 +798,58 @@ test("terminal/create with env entries: ACPX_OWNER_LOG is stripped, even when re
   assert.equal(seen.control, "requested", "control: requested entries are applied");
   assert.equal(seen.ownerLog, "undefined");
 });
+
+// brick d7324406: the queue owner carries acpx-ui's own PORT=3456. A terminal/create
+// command must not inherit it (a `$PORT`-honouring dev server would bind acpx-ui's port),
+// must keep HOST=0.0.0.0 (dev-slot reachability), and must keep a PORT it ASKS for.
+async function terminalPortHostSeen(
+  env: { name: string; value: string }[] | undefined,
+): Promise<{ port: string; host: string }> {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-terminal-port-"));
+  const saved = { PORT: process.env.PORT, HOST: process.env.HOST };
+  process.env.PORT = "3456";
+  process.env.HOST = "0.0.0.0";
+  try {
+    const manager = new TerminalManager({ cwd: tmp, permissionMode: "approve-all" });
+    const created = await manager.createTerminal({
+      sessionId: "session-port",
+      command: process.execPath,
+      args: [
+        "-e",
+        "process.stdout.write(JSON.stringify({port: String(process.env.PORT), host: String(process.env.HOST)}))",
+      ],
+      env,
+    });
+    await manager.waitForTerminalExit({
+      sessionId: "session-port",
+      terminalId: created.terminalId,
+    });
+    const { output } = await manager.terminalOutput({
+      sessionId: "session-port",
+      terminalId: created.terminalId,
+    });
+    await manager.releaseTerminal({ sessionId: "session-port", terminalId: created.terminalId });
+    return JSON.parse(output) as { port: string; host: string };
+  } finally {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) {
+        delete process.env[name];
+      } else {
+        process.env[name] = value;
+      }
+    }
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+}
+
+test("terminal/create without env: the inherited PORT is dropped and HOST=0.0.0.0 is kept", async () => {
+  const seen = await terminalPortHostSeen(undefined);
+  assert.equal(seen.host, "0.0.0.0", "control: the owner env really was inherited");
+  assert.equal(seen.port, "undefined");
+});
+
+test("terminal/create with env naming PORT: the requested port arrives", async () => {
+  const seen = await terminalPortHostSeen([{ name: "PORT", value: "3004" }]);
+  assert.equal(seen.port, "3004");
+  assert.equal(seen.host, "0.0.0.0");
+});
