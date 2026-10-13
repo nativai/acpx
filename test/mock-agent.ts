@@ -271,6 +271,36 @@ function splitCommandLine(value: string): ParsedCommand {
   };
 }
 
+// brick 901ecf75 — the next prompt's arrival aborts `signal`. Bounded, so a row that never
+// injects cannot hang its adapter.
+async function waitForHandover(signal: AbortSignal): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, 20_000);
+    if (signal.aborted) {
+      clearTimeout(timer);
+      resolve();
+      return;
+    }
+    signal.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+  });
+}
+
+// The JSON-RPC error claude-agent-acp returned for session 087544e1's injected prompt, verbatim.
+function weeklyLimitError(withErrorKind: boolean): RequestError {
+  return new RequestError(
+    -32603,
+    "Internal error: You've hit your weekly limit · resets Oct 14, 7pm (UTC)",
+    withErrorKind ? { errorKind: "rate_limit" } : {},
+  );
+}
+
 function assertNotCancelled(signal: AbortSignal): void {
   if (signal.aborted) {
     throw new CancelledError();
@@ -1228,6 +1258,45 @@ class MockAgent implements Agent {
       }
     }
 
+    // brick 901ecf75 — `hold-for-injection`: claude-agent-acp's HANDOVER. The prompt stays in
+    // flight until the next prompt reaches this session (whose arrival aborts it, above), then
+    // resolves `end_turn` with no output: the turn's work goes on under the injected prompt.
+    // `hold-then-limit-on <dir>` hands over the same way but is then refused by the subscription
+    // limit itself — on the adapter whose CLAUDE_CONFIG_DIR ends with `<dir>`; elsewhere it is served.
+    const holdThenLimitDir = text.startsWith("hold-then-limit-on ")
+      ? text.slice("hold-then-limit-on ".length).trim()
+      : undefined;
+    if (
+      text === "hold-for-injection" ||
+      (holdThenLimitDir !== undefined &&
+        (process.env.CLAUDE_CONFIG_DIR ?? "").endsWith(holdThenLimitDir))
+    ) {
+      await waitForHandover(promptAbort.signal);
+      if (session.pendingPrompt === promptAbort) {
+        session.pendingPrompt = undefined;
+      }
+      if (holdThenLimitDir !== undefined) {
+        throw weeklyLimitError(true);
+      }
+      return { stopReason: "end_turn" };
+    }
+
+    // brick 901ecf75 — `weekly-limited-on <dir>`: refused with the EXACT production weekly-limit
+    // error (session 087544e1, 2026-10-13) on the adapter whose CLAUDE_CONFIG_DIR ends with `<dir>`,
+    // served elsewhere. `limit-text-only-on <dir>` carries no `data.errorKind`, so only its message
+    // text can classify it. A `+hold` after the dir refuses only once the NEXT prompt has arrived,
+    // so a row can land several injections inside one turn. Anything after that is a free label.
+    const limited = /^(weekly-limited-on|limit-text-only-on) (\S+)( \+hold)?/u.exec(text);
+    if (limited && (process.env.CLAUDE_CONFIG_DIR ?? "").endsWith(limited[2] ?? "")) {
+      if (limited[3] !== undefined) {
+        await waitForHandover(promptAbort.signal);
+      }
+      if (session.pendingPrompt === promptAbort) {
+        session.pendingPrompt = undefined;
+      }
+      throw weeklyLimitError(limited[1] === "weekly-limited-on");
+    }
+
     // brick://3356183e — `rate-limited-on <dir>`: the prompt fails with a subscription
     // limit, but only on the adapter whose CLAUDE_CONFIG_DIR ends with `<dir>`; the
     // handler then serves it normally. Drives REACTIVE failover between subscriptions.
@@ -1537,6 +1606,13 @@ class MockAgent implements Agent {
     }
     if (text.startsWith("rate-limited-on ")) {
       return "served after failover";
+    }
+    if (
+      text.startsWith("weekly-limited-on ") ||
+      text.startsWith("limit-text-only-on ") ||
+      text.startsWith("hold-then-limit-on ")
+    ) {
+      return `served on another subscription: ${text}`;
     }
 
     if (text.startsWith("late-tool ")) {
