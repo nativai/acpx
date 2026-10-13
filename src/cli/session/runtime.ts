@@ -245,9 +245,38 @@ type RunSessionPromptOptions = Omit<
   // be ended before THIS turn starts — whether this turn runs on that client or
   // on a fresh one (subscription switch, failover).
   previousTurnClient?: AcpClient;
+  // brick 901ecf75: set by the queue owner. An injected prompt the adapter rejects with a
+  // failover-classified error (a subscription limit) is handed back here when the turn ends — in
+  // arrival order, its delivery still OPEN — instead of being terminalized `failed`.
+  onInjectedFailoverPending?: (deferred: DeferredInjectedPrompt[]) => void;
+  // brick 901ecf75: set on the retry turn of such a deferred message (`HeldDeliveryTerminal`).
+  heldDeliveryTerminal?: HeldDeliveryTerminal;
 };
 
 type TurnStartProgress = { turnOwnsTerminal: boolean };
+
+// brick 901ecf75 — an injected prompt rejected by a subscription limit mid-turn. The Claude adapter
+// had already handed the turn over to it (the turn's own prompt resolved `end_turn`), so the turn
+// itself "succeeded" and the main-turn failover never ran: the session's work just stopped. The
+// queue owner re-runs the message on a sibling subscription once the turn has drained
+// (`settleDeferredInjectedPrompts`); only that retry settles the delivery's terminal.
+type DeferredInjectedPrompt = {
+  task: QueueTask;
+  error: unknown;
+  /** The session's subscription when the prompt failed. A different one at retry time means the session already moved. */
+  failedOnSelection: string | undefined;
+};
+
+// brick 901ecf75 — the retry turn of a deferred injected message. Its delivery terminal belongs to
+// the failover driver until the retry settles, so a failover-classified failure writes NONE: a
+// `failed` followed by the next sibling's `done` would let acpx-ui re-drive a limit-failed message
+// the retry already delivered. `written` reports whether a turn wrote the terminal after all.
+type HeldDeliveryTerminal = { written: boolean };
+
+function selectedSubscriptionOf(record: SessionRecord): string | undefined {
+  const sessionOptions = record.acpx?.session_options;
+  return sessionOptions?.profile?.trim() || sessionOptions?.subscription?.trim() || undefined;
+}
 
 type ActiveSessionController = QueueOwnerActiveSessionController;
 
@@ -1350,7 +1379,8 @@ async function waitBeforePromptRetry(
   await waitMs(delayMs);
 }
 
-type QueuedTaskRuntimeOptions = Parameters<typeof runQueuedTask>[2];
+type QueuedTaskRuntimeOptions = Parameters<typeof runQueuedTask>[2] &
+  Pick<RunSessionPromptOptions, "onInjectedFailoverPending" | "heldDeliveryTerminal">;
 
 function buildQueuedTaskRunOptions(
   sessionRecordId: string,
@@ -1388,6 +1418,8 @@ function buildQueuedTaskRunOptions(
     onAcpMessage: options.onAcpMessage,
     setMidTurnHandler: options.setMidTurnHandler,
     liveBackgroundTaskCount: options.liveBackgroundTaskCount,
+    onInjectedFailoverPending: options.onInjectedFailoverPending,
+    heldDeliveryTerminal: options.heldDeliveryTerminal,
     client: options.sharedClient,
   };
 }
@@ -1693,20 +1725,36 @@ export async function runQueuedTask(
     ? new QueueTaskOutputFormatter(task)
     : DISCARD_OUTPUT_FORMATTER;
   const turnStart: TurnStartProgress = { turnOwnsTerminal: false };
+  // brick 901ecf75 — injected prompts a subscription limit rejected during this task's turns. They
+  // are re-run once this task's own outcome is settled, before the owner takes its next task.
+  const deferredInjected: DeferredInjectedPrompt[] = [];
+  const runtimeOptions: QueuedTaskRuntimeOptions = {
+    ...options,
+    onInjectedFailoverPending: (deferred) => {
+      deferredInjected.push(...deferred);
+    },
+  };
+  const deferredState: DeferredInjectedFailoverState = { interrupted: false };
 
   try {
     let result: SessionSendResult;
     try {
       const lockPolicy = await applyQueuedTaskSubscriptionLockPolicy(sessionRecordId, options);
       result = await runSessionPrompt({
-        ...buildQueuedTaskRunOptions(sessionRecordId, task, options, outputFormatter, turnStart),
+        ...buildQueuedTaskRunOptions(
+          sessionRecordId,
+          task,
+          runtimeOptions,
+          outputFormatter,
+          turnStart,
+        ),
         ...clientForQueuedTurn(lockPolicy),
       });
     } catch (error) {
       result = await runQueuedTaskFailover(
         sessionRecordId,
         task,
-        options,
+        runtimeOptions,
         outputFormatter,
         error,
         turnStart,
@@ -1722,11 +1770,18 @@ export async function runQueuedTask(
     // After the two above, so a task they already terminalized is skipped here.
     terminalizeTurnThatNeverStarted(sessionRecordId, task, error, turnStart);
     sendQueuedTaskError(task, error);
+    rememberDeferredFailoverOutcome(deferredState, error);
     if (error instanceof InterruptedError) {
       throw error;
     }
   } finally {
     task.close();
+    await settleDeferredInjectedPrompts(
+      sessionRecordId,
+      deferredInjected,
+      runtimeOptions,
+      deferredState,
+    );
   }
 }
 
@@ -1954,6 +2009,121 @@ async function runQueuedTaskFailover(
   return outcome.result;
 }
 
+// brick 901ecf75 — what one queued task's deferred injected retries share: whether the task was
+// interrupted (a Stop never re-runs anything), and the failover terminal (all subscriptions
+// exhausted, Fable share exhausted) once one is known — every later message fails with it instead
+// of probing every subscription again.
+type DeferredInjectedFailoverState = { interrupted: boolean; terminalError?: unknown };
+
+function rememberDeferredFailoverOutcome(
+  state: DeferredInjectedFailoverState,
+  error: unknown,
+): void {
+  if (error instanceof InterruptedError) {
+    state.interrupted = true;
+  } else if (
+    error instanceof AllSubscriptionsExhaustedError ||
+    error instanceof FableShareExhaustedError
+  ) {
+    state.terminalError = error;
+  }
+}
+
+// brick 901ecf75 — re-run each deferred injected message ONCE, in arrival order, as a turn of its
+// own. A message deferred during one of these retries joins the end of the list.
+async function settleDeferredInjectedPrompts(
+  sessionRecordId: string,
+  deferred: DeferredInjectedPrompt[],
+  options: QueuedTaskRuntimeOptions,
+  state: DeferredInjectedFailoverState,
+): Promise<void> {
+  for (let entry = deferred.shift(); entry !== undefined; entry = deferred.shift()) {
+    await retryDeferredInjectedPrompt(sessionRecordId, entry, options, state);
+  }
+}
+
+async function retryDeferredInjectedPrompt(
+  sessionRecordId: string,
+  entry: DeferredInjectedPrompt,
+  options: QueuedTaskRuntimeOptions,
+  state: DeferredInjectedFailoverState,
+): Promise<void> {
+  const { task } = entry;
+  const held: HeldDeliveryTerminal = { written: false };
+  try {
+    if (state.interrupted) {
+      throw entry.error;
+    }
+    if (state.terminalError !== undefined) {
+      throw state.terminalError;
+    }
+    const result = await runDeferredInjectedTurn(sessionRecordId, entry, {
+      ...options,
+      heldDeliveryTerminal: held,
+    });
+    process.stderr.write(
+      `[acpx] deferred injected prompt for session ${sessionRecordId} ` +
+        `(messageId=${task.messageId ?? "-"}) re-run on ${selectedSubscriptionOf(result.record) ?? "-"} ` +
+        `after failover; stopReason=${result.stopReason}\n`,
+    );
+    sendQueuedTaskResult(task, result);
+  } catch (error) {
+    rememberDeferredFailoverOutcome(state, error);
+    // The one terminal this delivery gets when no turn wrote it: the retry never started, or every
+    // turn it ran failed over (`HeldDeliveryTerminal`) until failover itself gave up.
+    if (!held.written) {
+      appendDeliveryStreamEventSync(sessionRecordId, task, "failed", deliveryErrorFrom(error));
+    }
+    sendQueuedTaskError(task, error);
+  } finally {
+    task.close();
+  }
+}
+
+async function runDeferredInjectedTurn(
+  sessionRecordId: string,
+  entry: DeferredInjectedPrompt,
+  options: QueuedTaskRuntimeOptions,
+): Promise<SessionSendResult> {
+  const { task } = entry;
+  const outputFormatter = task.waitForCompletion
+    ? new QueueTaskOutputFormatter(task)
+    : DISCARD_OUTPUT_FORMATTER;
+  const turnStart: TurnStartProgress = { turnOwnsTerminal: false };
+  const record = await resolveSessionRecord(sessionRecordId);
+  if (selectedSubscriptionOf(record) === entry.failedOnSelection) {
+    // Still on the subscription that refused it: fail over now. Re-sending it there would only hit
+    // the limit again — and a pre-turn selection switch would hide that this was a failover.
+    return await runQueuedTaskFailover(
+      sessionRecordId,
+      task,
+      options,
+      outputFormatter,
+      entry.error,
+      turnStart,
+    );
+  }
+  // The session already moved off it — the main turn's own failover, or an earlier deferred
+  // message's. Run the message where the session is now, on a fresh client (the shared one is bound
+  // to the old subscription), and fail over again only if that fails over.
+  try {
+    return await runSessionPrompt({
+      ...buildQueuedTaskRunOptions(sessionRecordId, task, options, outputFormatter, turnStart),
+      client: undefined,
+      skipProactiveSelection: true,
+    });
+  } catch (error) {
+    return await runQueuedTaskFailover(
+      sessionRecordId,
+      task,
+      options,
+      outputFormatter,
+      error,
+      turnStart,
+    );
+  }
+}
+
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
 async function runSessionPrompt(options: RunSessionPromptOptions): Promise<SessionSendResult> {
   const stopTotalTimer = startPerfTimer("runtime.prompt.total");
@@ -2064,6 +2234,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   if (promptStart.deduplicated) {
     const deduplicatedRecord = promptStart.record ?? record;
     await appendDeduplicatedDeliveryTerminal(deduplicatedRecord, mainDeliveryContext);
+    if (options.heldDeliveryTerminal) {
+      options.heldDeliveryTerminal.written = true;
+    }
     return deduplicatedSessionSendResult(deduplicatedRecord);
   }
 
@@ -2106,6 +2279,13 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   // short. Each carries its delivery context + a settled flag so the drain
   // backstop (C3) can write a terminal for one still pending when it fires.
   const injectedDeliveries: TrackedInjectedDelivery[] = [];
+  // brick 901ecf75 — injected prompts a subscription limit rejected, tagged with their arrival
+  // order, handed to the queue owner once this turn has ended (`handOverDeferredInjectedPrompts`).
+  // Deferral closes at that hand-over: a rejection arriving later is terminalized as before,
+  // because nothing would ever retry it.
+  const deferredInjected: Array<{ arrival: number; deferred: DeferredInjectedPrompt }> = [];
+  let injectedArrivals = 0;
+  let injectedDeferralOpen = options.onInjectedFailoverPending !== undefined;
   // Brick 4f3fa88c — the context alarm. The detector judges every usage report against
   // the SEAT's level; a crossing mid-turn is injected through the same path a parent's
   // message takes (`contextAlarmInjector`, set only while a turn accepts injections), and
@@ -2352,6 +2532,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     const mainClaim =
       context !== undefined && context === mainDeliveryContext ? openMainDelivery : undefined;
     if (mainClaim && !claimMainTurnDeliveryTerminal(mainClaim)) {
+      noteHeldTerminalWritten(context);
       return;
     }
     try {
@@ -2362,6 +2543,30 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       }
       throw error;
     }
+    noteHeldTerminalWritten(context);
+  };
+
+  // brick 901ecf75 — tell a deferred injected message's failover driver that this retry turn settled
+  // the message's terminal itself, so it writes none of its own.
+  const noteHeldTerminalWritten = (context: DeliveryContext | undefined): void => {
+    if (context !== undefined && context === mainDeliveryContext && options.heldDeliveryTerminal) {
+      options.heldDeliveryTerminal.written = true;
+    }
+  };
+
+  // The main delivery's `failed` terminal for a turn that failed. brick 901ecf75 — except on a
+  // deferred message's retry turn, where a failover-classified failure is the failover driver's to
+  // terminalize (`HeldDeliveryTerminal`): the next sibling may still deliver it.
+  const appendMainFailedTerminal = async (
+    error: unknown,
+    deliveryError: DeliveryEventError,
+  ): Promise<void> => {
+    if (options.heldDeliveryTerminal !== undefined && classifyFailover(error) !== null) {
+      return;
+    }
+    await appendDeliveryTerminal(mainDeliveryContext, "failed", { error: deliveryError }).catch(
+      () => {},
+    );
   };
 
   // brick e09628a1 — the R-CONSUMED verdict for a terminal about to be written (`consumedCutNote`).
@@ -2643,17 +2848,77 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     sendInjectedResultIfWaiting(injectedTask, injectedResponse);
   };
 
+  // brick 901ecf75 — whether this rejection goes to the queue owner's failover instead of ending
+  // here: the SAME gate the main turn's failover applies (`resolveFailoverRecord`), for an injected
+  // prompt that is neither absorbed (codex) nor already terminalized (the drain backstop's C3 cut).
+  const shouldDeferInjectedError = (
+    injectedDeliveryContext: DeliveryContext | undefined,
+    injectedError: unknown,
+    absorbedDelivery: AbsorbedInjectedDelivery | undefined,
+  ): boolean => {
+    if (!injectedDeferralOpen || absorbedDelivery !== undefined) {
+      return false;
+    }
+    if (injectedDeliveryContext && terminalDeliveryKeys.has(deliveryKey(injectedDeliveryContext))) {
+      return false;
+    }
+    return (
+      classifyFailover(injectedError) !== null &&
+      failoverEnabled() &&
+      failoverEnabledForRecord(record)
+    );
+  };
+
+  const deferInjectedPrompt = (
+    injectedTask: QueueTask,
+    injectedError: unknown,
+    arrival: number,
+  ) => {
+    deferredInjected.push({
+      arrival,
+      deferred: {
+        task: injectedTask,
+        // The account that physically refused it, so failover marks THAT one dead.
+        error: attachEffectiveAccountMetadata(injectedError, client.getEffectiveAccountMetadata()),
+        failedOnSelection: selectedSubscriptionOf(record),
+      },
+    });
+    // NOT verbose-gated: the delivery stays open past this turn, and this line says why.
+    process.stderr.write(
+      `[acpx] injected prompt for session ${record.acpxRecordId} ` +
+        `(messageId=${injectedTask.messageId ?? "-"}) failed with a ${classifyFailover(injectedError)} ` +
+        `error; deferring it to an in-owner subscription failover once the turn ends\n`,
+    );
+  };
+
+  // Resolves true when the rejection was deferred: the task then stays open for the retry.
   const handleInjectedPromptError = async (
     injectedTask: QueueTask,
     injectedDeliveryContext: DeliveryContext | undefined,
     injectedError: unknown,
     absorbedDelivery: AbsorbedInjectedDelivery | undefined,
-  ): Promise<void> => {
+    arrival: number,
+  ): Promise<boolean> => {
+    if (shouldDeferInjectedError(injectedDeliveryContext, injectedError, absorbedDelivery)) {
+      deferInjectedPrompt(injectedTask, injectedError, arrival);
+      return true;
+    }
     await appendDeliveryTerminal(injectedDeliveryContext, "failed", {
       error: deliveryErrorFrom(injectedError),
     }).catch(() => {});
     markAbsorbedDeliveryTerminalWritten(absorbedDelivery);
     sendInjectedErrorIfWaiting(injectedTask, injectedError);
+    return false;
+  };
+
+  // brick 901ecf75 — called once, when the turn has ended: from here no rejection is deferred.
+  const handOverDeferredInjectedPrompts = (): void => {
+    injectedDeferralOpen = false;
+    if (deferredInjected.length === 0) {
+      return;
+    }
+    deferredInjected.sort((left, right) => left.arrival - right.arrival);
+    options.onInjectedFailoverPending?.(deferredInjected.map((entry) => entry.deferred));
   };
 
   const closeInjectedTask = (
@@ -2692,7 +2957,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   ): Promise<void> => {
     const injectedPrompt = injectedTask.prompt ?? textPrompt(injectedTask.message);
     const injectedDeliveryContext = deliveryContextFor(injectedTask);
+    // Taken synchronously, before any await: the order the messages reached the turn.
+    const arrival = injectedArrivals++;
     let absorbedDelivery: AbsorbedInjectedDelivery | undefined;
+    let deferred = false;
     try {
       const injectedPromptStart = await recordPromptStart(injectedPrompt, injectedTask.messageId);
       if (injectedPromptStart.deduplicated) {
@@ -2721,14 +2989,18 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         absorbedDelivery,
       );
     } catch (injectedError) {
-      await handleInjectedPromptError(
+      deferred = await handleInjectedPromptError(
         injectedTask,
         injectedDeliveryContext,
         injectedError,
         absorbedDelivery,
+        arrival,
       );
     } finally {
-      closeInjectedTask(injectedTask, absorbedDelivery);
+      // A deferred task stays open: its failover retry answers a waiting caller, then closes it.
+      if (!deferred) {
+        closeInjectedTask(injectedTask, absorbedDelivery);
+      }
     }
   };
 
@@ -3774,13 +4046,11 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     await flushPendingMessages(false).catch(() => {
       // best effort while bubbling prompt failure
     });
-    await appendDeliveryTerminal(mainDeliveryContext, "failed", {
-      error: {
-        code: normalizedError.acp?.code ?? 0,
-        message: normalizedError.message,
-        detailCode: normalizedError.detailCode ?? "",
-      },
-    }).catch(() => {});
+    await appendMainFailedTerminal(error, {
+      code: normalizedError.acp?.code ?? 0,
+      message: normalizedError.message,
+      detailCode: normalizedError.detailCode ?? "",
+    });
     output.flush();
     record.lastUsedAt = isoNow();
     applyConversation(record, conversation);
@@ -4024,12 +4294,13 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       await completeAbsorbedInjectedDeliveries("failed", {
         error: deliveryErrorFrom(annotatedError),
       }).catch(() => {});
-      await appendDeliveryTerminal(mainDeliveryContext, "failed", {
-        error: deliveryErrorFrom(annotatedError),
-      }).catch(() => {});
+      await appendMainFailedTerminal(annotatedError, deliveryErrorFrom(annotatedError));
     }
     throw annotatedError;
   } finally {
+    // brick 901ecf75 — first, so no throw below can strand a deferred message's open task. Every
+    // awaited injected prompt has settled by here (both drain paths run before this point).
+    handOverDeferredInjectedPrompts();
     unregisterAbsorbedDeliveries(record.acpxRecordId, absorbedInjectedDeliveries);
     if (openMainDelivery) {
       unregisterOpenMainTurnDelivery(record.acpxRecordId, openMainDelivery);
