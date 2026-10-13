@@ -73,8 +73,14 @@ function toCommandLine(command: string, args: string[] | undefined): string {
 // `ACPX_OWNER_LOG=1`, which means "your stderr IS the queue owner's log". A
 // terminal command's stderr is a pipe, so a nested acpx (e.g. `--json-strict`)
 // would otherwise tee agent stderr onto its own JSON stream (brick 7c06a855, TE F4).
+//
+// `PORT` is dropped from the INHERITED base only (brick d7324406): the queue owner carries
+// acpx-ui's own `PORT=3456`, which a `$PORT`-honouring dev server would bind. Unlike
+// ACPX_OWNER_LOG, a request that names `PORT` keeps it — that agent chose a port.
+// `HOST` (0.0.0.0, the container default) is kept, as in `buildAgentEnvironment`.
 function toEnvObject(env: CreateTerminalRequest["env"]): NodeJS.ProcessEnv {
   const merged: NodeJS.ProcessEnv = { ...process.env };
+  delete merged.PORT;
   for (const entry of env ?? []) {
     merged[entry.name] = entry.value;
   }
