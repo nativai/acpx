@@ -111,7 +111,7 @@ async function refusedSocket(socketPath: string): Promise<void> {
     ],
     { stdio: ["ignore", "pipe", "ignore"] },
   );
-  await new Promise<void>((resolve) => child.stdout!.once("data", () => resolve()));
+  await new Promise<void>((resolve) => child.stdout.once("data", () => resolve()));
   child.kill("SIGKILL");
   await new Promise((resolve) => child.once("exit", resolve));
   await fs.access(socketPath); // the file outlived its listener
