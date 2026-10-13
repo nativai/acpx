@@ -180,6 +180,8 @@ export type SessionsListFlags = {
   cursor?: string;
   filterCwd?: string;
   local?: boolean;
+  /** `--local` only: keep by-the-way side-threads in the listing (hidden by default). */
+  includeByways?: boolean;
 };
 
 export type SessionsOwnerStatusFlags = {
@@ -204,6 +206,8 @@ export type SessionsCloseFlags = StatusFlags & {
   drain?: boolean;
   drainTimeout?: number;
   failOnUndelivered?: boolean;
+  /** Close a by-the-way side-thread from an agent caller (brick 6867bbfc D6). */
+  allowByway?: boolean;
 };
 
 export type SessionsPruneFlags = {

@@ -119,6 +119,10 @@ function addSessionsListOptions(command: Command): Command {
     )
     .option("--filter-cwd <dir>", "Filter agent sessions by working directory", (value: string) =>
       parseNonEmptyValue("Filter cwd", value),
+    )
+    .option(
+      "--include-byways",
+      "With --local: also list by-the-way side-threads (a human's side conversations, hidden by default)",
     );
 }
 
@@ -482,6 +486,10 @@ export function registerSessionsCommand(
     .option(
       "--fail-on-undelivered",
       "Exit 3 instead of 0 when the close found undelivered messages in the queue owner's custody",
+    )
+    .option(
+      "--allow-byway",
+      "Close a by-the-way side-thread (a human's side conversation) — only when the human explicitly asked you to",
     );
   addSessionIdentityOptions(closeCommand);
   addSeatSelectorOption(closeCommand);
@@ -651,7 +659,7 @@ export function registerSessionsCommand(
     )
     .option(
       "--children-of <id>",
-      "Re-parent every OPEN DIRECT child of this session. Must resolve locally — a typo refuses rather than matching zero children. Closed children and Task-tool subagents are not moved.",
+      "Re-parent every OPEN DIRECT child of this session. Must resolve locally — a typo refuses rather than matching zero children. Never moves closed children, Task-tool subagents or by-the-way side-threads (reported as skipped).",
     )
     .option(
       "--parent-seat <seat>",

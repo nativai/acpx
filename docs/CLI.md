@@ -300,12 +300,12 @@ Behavior:
 ```bash
 acpx [global_options] <agent> sessions
 acpx [global_options] <agent> sessions list
-acpx [global_options] <agent> sessions list [--cursor <cursor>] [--filter-cwd <dir>] [--local]
+acpx [global_options] <agent> sessions list [--cursor <cursor>] [--filter-cwd <dir>] [--local [--include-byways]]
 acpx [global_options] <agent> sessions new
 acpx [global_options] <agent> sessions new --name <name>
 acpx [global_options] <agent> sessions new [--prompt <text> | --prompt-file <path|->] [--no-parent] [--favorite]
 acpx [global_options] <agent> sessions set-parent --session-id <id> --no-parent
-acpx [global_options] <agent> sessions close --session-id <id>
+acpx [global_options] <agent> sessions close --session-id <id> [--allow-byway]
 acpx [global_options] <agent> sessions reopen <id>
 acpx [global_options] <agent> sessions reopen <id>
 acpx [global_options] <agent> sessions show
@@ -332,6 +332,10 @@ Behavior:
   resolve against global `--cwd`
 - `sessions list --local` reads saved acpx records for selected `agentCommand`
   instead of contacting the agent
+- `sessions list --local` hides by-the-way side-threads (a human's side
+  conversations, opened from another session's transcript; their record carries
+  `metadata.byway`); `--include-byways` lists them too. The local fallback below
+  hides them the same way
 - when the agent does not support `session/list`, list falls back to local saved
   records unless agent-side list filters were requested
 - `sessions new` creates a fresh cwd-scoped default session
@@ -346,6 +350,16 @@ Behavior:
 - text and quiet output print the local `acpxRecordId`; JSON output also includes
   `acpxSessionId` and, when the adapter exposes one, `agentSessionId`
 - `sessions close --session-id <id>` soft-closes that session
+- `sessions close` refuses a by-the-way side-thread when the caller is an agent
+  (any of `ACPX_SESSION_URL`, `ACPX_SESSION_RECORD_ID`, `ACPX_SEAT_URL` is set)
+  and is not that side-thread itself: exit 1, code `BYWAY_CLOSE_REFUSED`
+  (`{ok:false, code, error, sessionId, sourceSessionId}` in JSON), and nothing is
+  drained, stopped or written. `--allow-byway` overrides — only when the human
+  explicitly asked. A caller with none of those variables (a human shell,
+  acpx-ui's own close) is not refused
+- `sessions set-parent` never re-parents a by-the-way side-thread
+  (`BYWAY_PARENT_IMMUTABLE`, exit 2 for `--session-id`; a `skipped` entry under
+  `--children-of`): it stays with the conversation it was opened from
 - `sessions reopen <id>` reopens a closed session so prompts are accepted again — the inverse of `sessions close`. Idempotent (an already-open session exits 0 with `reopened:false`), spawns nothing (the next prompt cold-respawns the owner), and does NOT cascade to subagents. **Not `sessions recover`**, which force-restarts a wedged queue owner and leaves the session closed.
 - `sessions reopen <id>` reopens a closed session so prompts are accepted again — the inverse of `sessions close`. Idempotent (an already-open session exits 0 with `reopened:false`), spawns nothing (the next prompt cold-respawns the owner), and does NOT cascade to subagents. Not `sessions recover`, which restarts a wedged queue owner and leaves the session closed.
 - `sessions show [name]` displays stored session metadata

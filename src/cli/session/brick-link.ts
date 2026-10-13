@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { InvalidArgumentError } from "commander";
 import { brickChildEnv } from "../../bricks-credential.js";
+import { isBywaySessionRecord } from "../../session/byway.js";
 import { sessionBaseDir } from "../../session/persistence/repository.js";
 import { decideSessionBrick } from "../../session/seat-brick.js";
 import type { SessionRecord } from "../../types.js";
@@ -134,7 +135,16 @@ export async function resolveSessionBrickContext(
   return { brick, brickPath: brick ? resolveExistingBrickPath(brick) : null };
 }
 
+/**
+ * ⚠️ A BYWAY NEVER STAMPS (brick 6867bbfc §5.7). It inherits its source's brick link on purpose
+ * (`withInheritedBrick`, so `$ACPX_BRICK` resolves inside it), but it is a human's side
+ * conversation, not a worker: a `session-started` stamp made an idle brick read as worked.
+ * Pinned by `test/byway-guard.test.ts` (a byway copy never calls `brick`; a plain copy does).
+ */
 export async function maybeStampBrickLink(record: SessionRecord): Promise<void> {
+  if (isBywaySessionRecord(record)) {
+    return;
+  }
   const brickId = (await decideSessionBrick(record, sessionBaseDir()))?.ref.toLowerCase();
   if (!brickId || !BRICK_UUID_RE.test(brickId)) {
     return;

@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { parseRecordPidIdentity, type RecordPidIdentity } from "../../process-identity.js";
+import { isBywaySessionRecord } from "../byway.js";
 
 /**
  * A read-only projection of an on-disk session record, for the archiver only.
@@ -120,7 +121,7 @@ function isBywayRecord(
   record: Record<string, unknown>,
   metadata: Record<string, unknown> | undefined,
 ): boolean {
-  return record.kind === "byway" || metadata?.byway != null;
+  return record.kind === "byway" || isBywaySessionRecord({ metadata });
 }
 
 export function projectArchiveRecord(parsed: unknown): ArchiveRecordView | undefined {

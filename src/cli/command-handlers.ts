@@ -56,6 +56,7 @@ import {
   formatAccountSeamRepairResult,
   repairAccountSeamRecords,
 } from "../session/account-seam-repair.js";
+import { isBywaySessionRecord } from "../session/byway.js";
 import {
   handoverBelowAlarmNote,
   readSeatContextAlarmLevel,
@@ -148,6 +149,7 @@ import {
   resolveBrickFlagRef,
   warnIfBrickDoesNotResolve,
 } from "./session/brick-link.js";
+import { type BywayCloseRefusal, bywayCloseRefusal } from "./session/byway-close-guard.js";
 import type { SessionListResult } from "./session/contracts.js";
 import { composeForkDivergenceNotice } from "./session/fork-handoff.js";
 import {
@@ -1479,12 +1481,17 @@ async function printLocalSessionsList(
   agentName: string,
   filterCwd: string | undefined,
   format: OutputFormat,
+  includeByways: boolean,
 ): Promise<void> {
   const [{ listSessionsForAgent }, { printSessionsByFormat }] = await Promise.all([
     loadSessionModule(),
     loadOutputRenderModule(),
   ]);
-  const sessions = await listSessionsForAgent(agentCommand, agentName);
+  // Brick 6867bbfc §5.9 — a byway is a human's side conversation, not one of the caller's
+  // sessions; listed only on request. The adapter-path fallback below inherits this.
+  const sessions = (await listSessionsForAgent(agentCommand, agentName)).filter(
+    (session) => includeByways || !isBywaySessionRecord(session),
+  );
   const filtered = filterCwd ? sessions.filter((session) => session.cwd === filterCwd) : sessions;
   printSessionsByFormat(filtered, format, await seatColumnLabeller());
 }
@@ -2714,6 +2721,7 @@ export async function handleSessionsList(
       agent.agentName,
       filterCwd,
       globalFlags.format,
+      flags.includeByways === true,
     );
     return;
   }
@@ -2734,6 +2742,7 @@ export async function handleSessionsList(
       agent.agentName,
       undefined,
       globalFlags.format,
+      flags.includeByways === true,
     );
     return;
   }
@@ -2772,6 +2781,14 @@ export async function handleSessionsClose(
   const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
   const record = await requireExplicitSessionRecord(selector, agent.agentName);
 
+  // Brick 6867bbfc D6 — AFTER the record resolves (so `--seat` targets are covered) and BEFORE
+  // anything is touched: a refusal drains nothing, stops no owner, writes no record.
+  const bywayRefusal = bywayCloseRefusal(record, flags.allowByway === true);
+  if (bywayRefusal) {
+    emitBywayCloseRefusal(bywayRefusal, globalFlags.format);
+    return;
+  }
+
   // Commander maps `--no-drain` onto `flags.drain === false`; absent means the
   // barrier runs.
   const closed = await closeSession(record.acpxRecordId, {
@@ -2792,6 +2809,17 @@ export async function handleSessionsClose(
   );
 
   applyCloseExitCode(closed, record, flags, warnUndeliveredCustody);
+}
+
+/** Rendered in the seat refusals' shape (`seats-command.ts` `runSeatMutation`): exit 1. */
+function emitBywayCloseRefusal(refusal: BywayCloseRefusal, format: OutputFormat): void {
+  const { code, message, sessionId, sourceSessionId } = refusal;
+  if (!emitJsonResult(format, { ok: false, code, error: message, sessionId, sourceSessionId })) {
+    if (format !== "quiet") {
+      process.stderr.write(`sessions close: ${code}: ${message}\n`);
+    }
+  }
+  process.exitCode = 1;
 }
 
 // The close call itself already succeeded (it would have thrown otherwise);
@@ -4454,6 +4482,7 @@ const SET_PARENT_EXIT_CODES: Record<SetParentRefusalCode | "USAGE", number> = {
   PARENT_SELF: EXIT_CODES.USAGE,
   PARENT_CYCLE: EXIT_CODES.USAGE,
   SUBAGENT_PARENT_IMMUTABLE: EXIT_CODES.USAGE,
+  BYWAY_PARENT_IMMUTABLE: EXIT_CODES.USAGE,
   PARENT_DETACH_UNSUPPORTED: EXIT_CODES.USAGE,
   // An archived record is not a usage mistake — it is a real record in a state
   // that must not be resurrected hot. ERROR, matching the write guard it comes from.

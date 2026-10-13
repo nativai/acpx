@@ -1,4 +1,5 @@
 import { SessionArchivedError, SessionNotFoundError } from "../../errors.js";
+import { isBywaySessionRecord } from "../../session/byway.js";
 import {
   isArchivedRecord,
   isoNow,
@@ -30,6 +31,7 @@ export type SetParentRefusalCode =
   | "PARENT_SELF"
   | "PARENT_CYCLE"
   | "SUBAGENT_PARENT_IMMUTABLE"
+  | "BYWAY_PARENT_IMMUTABLE"
   | "SESSION_ARCHIVED"
   | "PARENT_DETACH_UNSUPPORTED";
 
@@ -199,6 +201,19 @@ function refusalForChild(
     return {
       code: "SUBAGENT_PARENT_IMMUTABLE",
       reason: "Task-tool subagent; parent is its retention anchor",
+    };
+  }
+  // A byway is a human's side conversation anchored on `metadata.byway_parent` — so are its UI
+  // pill and its archive companion rule (`archive/retention.ts`). This verb rewrites `parent_*`
+  // and never `byway_parent`, so a move would split the graph parent from that anchor; and the
+  // `--children-of` adoption form is exactly how an agent swept a human's byways in as its own
+  // (brick 6867bbfc D8). Refused for EVERY caller and before the clear branch: `--no-parent`
+  // splits it just the same. Under `--children-of` this becomes a `skipped` entry.
+  if (isBywaySessionRecord(record)) {
+    return {
+      code: "BYWAY_PARENT_IMMUTABLE",
+      reason:
+        "by-the-way side-thread; it stays with the conversation it was opened from (metadata.byway_parent)",
     };
   }
   if (isArchivedRecord(record)) {

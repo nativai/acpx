@@ -1,0 +1,253 @@
+{
+  "acp_session_id": "3a241311-4a19-4f36-b9df-f1d290bc3cac",
+  "acpx": {
+    "applied_output_style": "default",
+    "available_models": ["default", "opus", "fable", "sonnet", "haiku"],
+    "config_options": [
+      {
+        "category": "mode",
+        "currentValue": "default",
+        "description": "Session permission mode",
+        "id": "mode",
+        "name": "Mode",
+        "options": [
+          {
+            "description": "Use a model classifier to approve/deny permission prompts",
+            "name": "Auto",
+            "value": "auto"
+          },
+          {
+            "description": "Standard behavior, prompts for dangerous operations",
+            "name": "Default",
+            "value": "default"
+          },
+          {
+            "description": "Auto-accept file edit operations",
+            "name": "Accept Edits",
+            "value": "acceptEdits"
+          },
+          {
+            "description": "Planning mode, no actual tool execution",
+            "name": "Plan Mode",
+            "value": "plan"
+          },
+          {
+            "description": "Don't prompt for permissions, deny if not pre-approved",
+            "name": "Don't Ask",
+            "value": "dontAsk"
+          },
+          {
+            "description": "Bypass all permission checks",
+            "name": "Bypass Permissions",
+            "value": "bypassPermissions"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "model",
+        "currentValue": "default",
+        "description": "AI model to use",
+        "id": "model",
+        "name": "Model",
+        "options": [
+          {
+            "description": "Opus 5.5 · Best for everyday, complex tasks",
+            "name": "Default (recommended)",
+            "value": "default"
+          },
+          {
+            "description": "Opus 5.5 · Best for everyday, complex tasks",
+            "name": "Opus",
+            "value": "opus"
+          },
+          {
+            "description": "Fable 5.1 · Most capable for your hardest and longest-running tasks",
+            "name": "Fable",
+            "value": "fable"
+          },
+          {
+            "description": "Sonnet 5.5 · Efficient for routine tasks",
+            "name": "Sonnet",
+            "value": "sonnet"
+          },
+          {
+            "description": "Haiku 4.5 · Fastest for quick answers",
+            "name": "Haiku",
+            "value": "haiku"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "thought_level",
+        "currentValue": "default",
+        "description": "Available effort levels for this model",
+        "id": "effort",
+        "name": "Effort",
+        "options": [
+          {
+            "name": "Default",
+            "value": "default"
+          },
+          {
+            "name": "Low",
+            "value": "low"
+          },
+          {
+            "name": "Medium",
+            "value": "medium"
+          },
+          {
+            "name": "High",
+            "value": "high"
+          },
+          {
+            "name": "Xhigh",
+            "value": "xhigh"
+          },
+          {
+            "name": "Max",
+            "value": "max"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "mode",
+        "currentValue": "default",
+        "description": "Response role, tone and format",
+        "id": "outputStyle",
+        "name": "Output style",
+        "options": [
+          {
+            "name": "default",
+            "value": "default"
+          },
+          {
+            "name": "Proactive",
+            "value": "Proactive"
+          },
+          {
+            "name": "Concise",
+            "value": "Concise"
+          },
+          {
+            "name": "Explanatory",
+            "value": "Explanatory"
+          },
+          {
+            "name": "Learning",
+            "value": "Learning"
+          },
+          {
+            "name": "Nativai Gamma Probe",
+            "value": "Nativai Gamma Probe"
+          }
+        ],
+        "type": "select"
+      }
+    ],
+    "context_window_model_id": "opus",
+    "context_window_size": 1000000,
+    "current_model_id": "opus",
+    "desired_config_options": {
+      "effort": "high"
+    },
+    "owner_options": {
+      "auth_policy": "skip",
+      "non_interactive_permissions": "deny",
+      "permission_mode": "approve-all"
+    },
+    "served": {
+      "at": "2026-10-07T08:45:42.386Z",
+      "effort": "high",
+      "model": "claude-opus-5-5",
+      "source": "claude-transcript"
+    },
+    "session_options": {
+      "disallowed_tools": [
+        "ScheduleWakeup",
+        "CronCreate",
+        "CronList",
+        "CronDelete",
+        "RemoteTrigger",
+        "Skill"
+      ],
+      "effort": "high",
+      "model": "opus",
+      "model_source": "inherited",
+      "profile": "sub8"
+    }
+  },
+  "acpx_record_id": "3a241311-4a19-4f36-b9df-f1d290bc3cac",
+  "agent_capabilities": {
+    "_meta": {
+      "claudeCode": {
+        "promptQueueing": true
+      }
+    },
+    "loadSession": true,
+    "mcpCapabilities": {
+      "http": true,
+      "sse": true
+    },
+    "promptCapabilities": {
+      "embeddedContext": true,
+      "image": true
+    },
+    "sessionCapabilities": {
+      "additionalDirectories": {},
+      "close": {},
+      "delete": {},
+      "fork": {},
+      "list": {},
+      "resume": {}
+    }
+  },
+  "agent_command": "node /opt/claude-agent-acp/dist/index.js",
+  "agent_name": "claude",
+  "agent_session_id": "3a241311-4a19-4f36-b9df-f1d290bc3cac",
+  "agent_started_at": "2026-10-07T08:41:38.014Z",
+  "closed": true,
+  "closed_at": "2026-10-07T08:46:31.382Z",
+  "created_at": "2026-10-07T08:41:28.633Z",
+  "cumulative_token_usage": {},
+  "cwd": "/workspace/projects",
+  "event_log": {
+    "active_path": "/home/node/.acpx/sessions/3a241311-4a19-4f36-b9df-f1d290bc3cac.stream.ndjson",
+    "last_write_at": "2026-10-07T08:45:42.378Z",
+    "last_write_error": null,
+    "max_segment_bytes": 67108864,
+    "max_segments": 5,
+    "segment_count": 5
+  },
+  "forked_at_message_index": 30,
+  "forked_from_session_id": "5965745d-3679-4925-a3cd-c50d903b9599",
+  "holder_active": true,
+  "holder_ordinal": 1,
+  "kind": "session",
+  "last_prompt_at": "2026-10-07T08:41:42.973Z",
+  "last_request_id": "1000005",
+  "last_seq": 357,
+  "last_used_at": "2026-10-07T08:45:42.391Z",
+  "messages": [],
+  "messages_log": {
+    "base_index": 0,
+    "bytes": 3144430,
+    "count": 33,
+    "v": 1
+  },
+  "metadata": {
+    "brick": "0d2b83f0-dda3-4f91-92ac-0c16572cd2e8",
+    "brick_validation": "unvalidated"
+  },
+  "parent_seat_id": "05601fda-8ce0-4b78-886e-71415efd3d38",
+  "parent_session_id": "5965745d-3679-4925-a3cd-c50d903b9599",
+  "protocol_version": 1,
+  "request_token_usage": {},
+  "schema": "acpx.session.v1",
+  "seat_id": "7a4ec22b-e2f3-45b5-a43f-1e0c2ce783b5",
+  "title": null,
+  "updated_at": "2026-10-07T08:45:42.362Z"
+}

@@ -1,0 +1,265 @@
+{
+  "acp_session_id": "02d69833-fce5-4a19-983a-0152aa53ec97",
+  "acpx": {
+    "applied_output_style": "default",
+    "available_models": ["default", "opus[1m]", "sonnet", "haiku", "fable", "opus"],
+    "config_options": [
+      {
+        "category": "mode",
+        "currentValue": "default",
+        "description": "Session permission mode",
+        "id": "mode",
+        "name": "Mode",
+        "options": [
+          {
+            "description": "Use a model classifier to approve/deny permission prompts",
+            "name": "Auto",
+            "value": "auto"
+          },
+          {
+            "description": "Standard behavior, prompts for dangerous operations",
+            "name": "Default",
+            "value": "default"
+          },
+          {
+            "description": "Auto-accept file edit operations",
+            "name": "Accept Edits",
+            "value": "acceptEdits"
+          },
+          {
+            "description": "Planning mode, no actual tool execution",
+            "name": "Plan Mode",
+            "value": "plan"
+          },
+          {
+            "description": "Don't prompt for permissions, deny if not pre-approved",
+            "name": "Don't Ask",
+            "value": "dontAsk"
+          },
+          {
+            "description": "Bypass all permission checks",
+            "name": "Bypass Permissions",
+            "value": "bypassPermissions"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "model",
+        "currentValue": "default",
+        "description": "AI model to use",
+        "id": "model",
+        "name": "Model",
+        "options": [
+          {
+            "description": "Opus 5 with 1M context · Best for everyday, complex tasks",
+            "name": "Default (recommended)",
+            "value": "default"
+          },
+          {
+            "description": "Opus 5 with 1M context · Best for everyday, complex tasks",
+            "name": "Opus (1M context)",
+            "value": "opus[1m]"
+          },
+          {
+            "description": "Sonnet 5 · Efficient for routine tasks",
+            "name": "Sonnet",
+            "value": "sonnet"
+          },
+          {
+            "description": "Haiku 4.5 · Fastest for quick answers",
+            "name": "Haiku",
+            "value": "haiku"
+          },
+          {
+            "description": "Fable (1M context)",
+            "name": "Fable",
+            "value": "fable"
+          },
+          {
+            "description": "Opus",
+            "name": "Opus",
+            "value": "opus"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "thought_level",
+        "currentValue": "default",
+        "description": "Available effort levels for this model",
+        "id": "effort",
+        "name": "Effort",
+        "options": [
+          {
+            "name": "Default",
+            "value": "default"
+          },
+          {
+            "name": "Low",
+            "value": "low"
+          },
+          {
+            "name": "Medium",
+            "value": "medium"
+          },
+          {
+            "name": "High",
+            "value": "high"
+          },
+          {
+            "name": "Xhigh",
+            "value": "xhigh"
+          },
+          {
+            "name": "Max",
+            "value": "max"
+          }
+        ],
+        "type": "select"
+      },
+      {
+        "category": "mode",
+        "currentValue": "default",
+        "description": "Response role, tone and format",
+        "id": "outputStyle",
+        "name": "Output style",
+        "options": [
+          {
+            "name": "default",
+            "value": "default"
+          },
+          {
+            "name": "Proactive",
+            "value": "Proactive"
+          },
+          {
+            "name": "Concise",
+            "value": "Concise"
+          },
+          {
+            "name": "Explanatory",
+            "value": "Explanatory"
+          },
+          {
+            "name": "Learning",
+            "value": "Learning"
+          },
+          {
+            "name": "Nativai Gamma Probe",
+            "value": "Nativai Gamma Probe"
+          }
+        ],
+        "type": "select"
+      }
+    ],
+    "context_window_model_id": "default",
+    "context_window_size": 1000000,
+    "current_model_id": "default",
+    "desired_config_options": {
+      "effort": "default"
+    },
+    "owner_options": {
+      "auth_policy": "skip",
+      "non_interactive_permissions": "deny",
+      "permission_mode": "approve-all"
+    },
+    "served": {
+      "at": "2026-09-11T07:00:02.036Z",
+      "effort": "default",
+      "model": "claude-opus-5",
+      "source": "claude-transcript"
+    },
+    "served_below_floor": {
+      "at": "2026-09-11T07:00:02.036Z",
+      "pinned_effort": "default",
+      "pinned_model": "default",
+      "served_model": "claude-opus-5"
+    },
+    "session_options": {
+      "effort": "default",
+      "model": "default",
+      "model_source": "inherited",
+      "profile": "sub7"
+    }
+  },
+  "acpx_record_id": "02d69833-fce5-4a19-983a-0152aa53ec97",
+  "agent_capabilities": {
+    "_meta": {
+      "claudeCode": {
+        "promptQueueing": true
+      }
+    },
+    "loadSession": true,
+    "mcpCapabilities": {
+      "http": true,
+      "sse": true
+    },
+    "promptCapabilities": {
+      "embeddedContext": true,
+      "image": true
+    },
+    "sessionCapabilities": {
+      "additionalDirectories": {},
+      "close": {},
+      "delete": {},
+      "fork": {},
+      "list": {},
+      "resume": {}
+    }
+  },
+  "agent_command": "node /opt/claude-agent-acp/dist/index.js",
+  "agent_name": "claude",
+  "agent_session_id": "02d69833-fce5-4a19-983a-0152aa53ec97",
+  "agent_started_at": "2026-09-11T06:59:02.237Z",
+  "closed": false,
+  "created_at": "2026-09-11T06:58:56.349Z",
+  "cumulative_token_usage": {},
+  "cwd": "/workspace/projects",
+  "event_log": {
+    "active_path": "/home/node/.acpx/sessions/02d69833-fce5-4a19-983a-0152aa53ec97.stream.ndjson",
+    "last_write_at": "2026-09-11T07:00:01.256Z",
+    "last_write_error": null,
+    "max_segment_bytes": 67108864,
+    "max_segments": 5,
+    "segment_count": 5
+  },
+  "forked_at_message_index": 140,
+  "forked_from_session_id": "8f769c5f-390f-425e-a289-3f7f55aee03a",
+  "holder_active": true,
+  "holder_ordinal": 1,
+  "kind": "session",
+  "last_agent_disconnect_reason": "connection_close",
+  "last_agent_exit_at": "2026-09-11T07:30:05.335Z",
+  "last_agent_exit_code": 0,
+  "last_agent_exit_signal": null,
+  "last_agent_unexpected_during_prompt": false,
+  "last_prompt_at": "2026-09-11T06:59:02.622Z",
+  "last_request_id": "1000003",
+  "last_seq": 289,
+  "last_used_at": "2026-09-11T07:00:02.019Z",
+  "messages": [],
+  "messages_log": {
+    "base_index": 0,
+    "bytes": 5774829,
+    "count": 145,
+    "v": 1
+  },
+  "metadata": {
+    "brick": "a1f0c116-c559-4db0-b903-4b208f1bf0f6",
+    "byway": "1",
+    "byway_at": "140",
+    "byway_first_question": "(redacted for the fixture: the human first question)",
+    "byway_parent": "8f769c5f-390f-425e-a289-3f7f55aee03a",
+    "byway_text_anchor": "(redacted)",
+    "byway_text_anchor_v": "1",
+    "byway_view_at": "202"
+  },
+  "parent_session_id": "8f769c5f-390f-425e-a289-3f7f55aee03a",
+  "protocol_version": 1,
+  "request_token_usage": {},
+  "schema": "acpx.session.v1",
+  "seat_id": "16578b4a-d3ba-4337-b02a-98471fd00c86",
+  "title": null,
+  "updated_at": "2026-09-11T07:00:00.998Z"
+}

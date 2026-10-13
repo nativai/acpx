@@ -152,6 +152,12 @@ Repo: https://github.com/openclaw/acpx
   `sessions show` and the index entry, never drawn as a hierarchy edge. A later
   `set-parent` does not overwrite it; with no caller it stays absent.
   (brick 5eaf316c)
+- CLI: by-the-way side-threads (a human's side conversations, `metadata.byway`)
+  are kept out of agents' hands. An agent's `sessions close` on one is refused
+  with `BYWAY_CLOSE_REFUSED` unless it passes `--allow-byway`; `set-parent`
+  refuses or skips one with `BYWAY_PARENT_IMMUTABLE`; a byway copy no longer
+  stamps `session-started` on its inherited brick; `sessions list --local`
+  hides them unless `--include-byways`. (brick 6867bbfc)
 
 ### Breaking
 
