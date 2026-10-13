@@ -2,11 +2,16 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import test from "node:test";
+import { resolveAcpxUiInternalOrigin } from "../src/acp/acpx-ui-internal-origin.js";
 import type { AcpClient } from "../src/acp/client.js";
 import type { QueueTask } from "../src/cli/queue/ipc.js";
 import type { QueueOwnerMessage } from "../src/cli/queue/messages.js";
+import { resolveNoticeDeliveryOrigin } from "../src/cli/session/notice-delivery.js";
 import { runQueuedTask } from "../src/cli/session/runtime.js";
-import { admitCodexSubscriptionTurn } from "../src/runtime/engine/codex-subscription-cap.js";
+import {
+  admitCodexSubscriptionTurn,
+  resolveCodexQuotaOrigin,
+} from "../src/runtime/engine/codex-subscription-cap.js";
 import { sessionEventActivePath } from "../src/session/event-log.js";
 import { makeSessionRecord, withTempHome, writeSessionRecordFile } from "./runtime-test-helpers.js";
 
@@ -402,3 +407,115 @@ for (const [label, value] of [
     });
   });
 }
+
+// ── Where the quota read goes (brick cfcfa0de) ───────────────────────────────
+// The read used to be hard-wired to `http://127.0.0.1:3456`. On the workbench and on
+// agent pods nothing listens there, the read fails, and an unreadable endpoint HOLDS —
+// every Codex turn refused. Each row asserts on the URL the injected `fetchImpl`
+// RECEIVES, so the origin is measured on the request itself, not on a helper's return.
+
+const LOOPBACK_QUOTA_URL = "http://127.0.0.1:3456/api/usage/codex/quota";
+const BOX_NAMESPACE_FILE = "dev-devbox\n";
+const BOX_SERVICE_QUOTA_URL =
+  "http://dev-server.dev-devbox.svc.cluster.local:3456/api/usage/codex/quota";
+
+async function quotaUrlRequested(params: {
+  env?: NodeJS.ProcessEnv;
+  originSources?: { namespaceFile?: string; resolvConf?: string };
+}): Promise<string> {
+  const urls: string[] = [];
+  const fetchImpl = (async (input: string | URL | Request) => {
+    urls.push(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+    return new Response(JSON.stringify(quotaResponse()), {
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  await admitCodexSubscriptionTurn({ weeklyCapPercent: 90, fetchImpl, ...params });
+  assert.equal(urls.length, 1, "exactly one quota read per admission");
+  return urls[0];
+}
+
+test("quota origin rung 1: a set ACPX_UI_INTERNAL_URL is where the read goes — NOT the loopback", async () => {
+  const url = await quotaUrlRequested({
+    env: { ACPX_UI_INTERNAL_URL: "http://dev-server.dev-other.svc.cluster.local:3456" },
+    originSources: { namespaceFile: BOX_NAMESPACE_FILE },
+  });
+  assert.equal(url, "http://dev-server.dev-other.svc.cluster.local:3456/api/usage/codex/quota");
+  assert.notEqual(url, LOOPBACK_QUOTA_URL);
+});
+
+test("quota origin rung 1: padding and trailing slashes are normalised away", async () => {
+  const url = await quotaUrlRequested({
+    env: { ACPX_UI_INTERNAL_URL: "  http://127.0.0.1:3004///  " },
+    originSources: {},
+  });
+  assert.equal(url, "http://127.0.0.1:3004/api/usage/codex/quota");
+});
+
+test("quota origin: a set-but-EMPTY ACPX_UI_INTERNAL_URL yields no ladder origin, so the read falls back to loopback", async () => {
+  for (const blank of ["", "   "]) {
+    const url = await quotaUrlRequested({
+      env: { ACPX_UI_INTERNAL_URL: blank },
+      // A namespace IS available: empty is authoritative in the shared ladder, so it must
+      // NOT fall through to the Service — only the quota's own loopback rung catches it.
+      originSources: { namespaceFile: BOX_NAMESPACE_FILE },
+    });
+    assert.equal(url, LOOPBACK_QUOTA_URL, `blank ${JSON.stringify(blank)}`);
+  }
+});
+
+test("quota origin rung 2: unset + service-account namespace → this box's cluster-internal Service", async () => {
+  const url = await quotaUrlRequested({
+    env: {},
+    originSources: { namespaceFile: BOX_NAMESPACE_FILE },
+  });
+  assert.equal(url, BOX_SERVICE_QUOTA_URL);
+  assert.notEqual(url, LOOPBACK_QUOTA_URL);
+});
+
+test("quota origin rung 2: unset + resolv.conf only → the Service of the search-domain namespace", async () => {
+  const url = await quotaUrlRequested({
+    env: {},
+    originSources: {
+      resolvConf: "nameserver 10.0.0.10\nsearch dev-konsiq.svc.cluster.local svc.cluster.local\n",
+    },
+  });
+  assert.equal(url, "http://dev-server.dev-konsiq.svc.cluster.local:3456/api/usage/codex/quota");
+});
+
+test("quota origin: nothing resolvable → the same-pod loopback (the quota read's own final rung)", async () => {
+  assert.equal(await quotaUrlRequested({ env: {}, originSources: {} }), LOOPBACK_QUOTA_URL);
+  assert.equal(
+    await quotaUrlRequested({ env: {}, originSources: { resolvConf: "search example.com\n" } }),
+    LOOPBACK_QUOTA_URL,
+  );
+});
+
+test("quota origin: with no env injected, the read honours process.env.ACPX_UI_INTERNAL_URL", async () => {
+  // The production call path passes no `env` (`runQueuedTask`), so this is the row that
+  // proves the variable a pod or a devN rig sets actually reaches the request.
+  const original = process.env.ACPX_UI_INTERNAL_URL;
+  process.env.ACPX_UI_INTERNAL_URL = "http://127.0.0.1:3007/";
+  try {
+    const url = await quotaUrlRequested({});
+    assert.equal(url, "http://127.0.0.1:3007/api/usage/codex/quota");
+    assert.notEqual(url, LOOPBACK_QUOTA_URL);
+  } finally {
+    if (original === undefined) {
+      delete process.env.ACPX_UI_INTERNAL_URL;
+    } else {
+      process.env.ACPX_UI_INTERNAL_URL = original;
+    }
+  }
+});
+
+test("one ladder: notice delivery and the quota read resolve through the same function", () => {
+  assert.equal(resolveNoticeDeliveryOrigin, resolveAcpxUiInternalOrigin);
+  // …and the quota read differs from it ONLY by the loopback rung.
+  assert.equal(
+    resolveCodexQuotaOrigin({}, { namespaceFile: BOX_NAMESPACE_FILE }),
+    resolveAcpxUiInternalOrigin({}, { namespaceFile: BOX_NAMESPACE_FILE }),
+  );
+  assert.equal(resolveAcpxUiInternalOrigin({}, {}), undefined);
+  assert.equal(resolveCodexQuotaOrigin({}, {}), "http://127.0.0.1:3456");
+});
