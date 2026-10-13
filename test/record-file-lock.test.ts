@@ -168,3 +168,46 @@ for (const [label, identity] of [
     assert.equal(ran, true);
   });
 }
+
+/**
+ * T19 (⊗ — d9ab5c0d breaks it at once). THE TRAP the hostname rule could not see: a holder with the
+ * SAME host and SAME boot but ANOTHER pid namespace — a sibling container of this pod, or this
+ * container before a restart. Its pid reads ESRCH here and proves nothing, so it is NOT broken
+ * before 15 s; after that it is broken by age, with a warning.
+ */
+test("T19 record lock: same host + boot, other pid namespace, pid ESRCH here — not broken before 15 s", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("linux identity");
+    return;
+  }
+  const { readProcessBirthIdentity, serializeProcessBirthIdentity } =
+    await import("../src/process-identity.js");
+  const own = readProcessBirthIdentity(process.pid);
+  assert.ok(own);
+  const pid = await deadPid();
+  const body = {
+    pid,
+    start: "1",
+    ...LOCAL,
+    processIdentity: { ...serializeProcessBirthIdentity(own), pidNamespace: "pid:[1]" },
+  };
+  const young = await tempRecordFile();
+  const lock = await writeLock(young, body, 1_000);
+  let ran = false;
+  const writing = withRecordFileLock(young, async () => {
+    ran = true;
+  });
+  await sleep(2_000);
+  assert.equal(ran, false, "a live-elsewhere holder was broken on a local ESRCH");
+  assert.equal(await fs.readFile(`${young}.lock`, "utf8"), lock);
+  await fs.rm(`${young}.lock`);
+  await writing;
+
+  const old = await tempRecordFile();
+  await writeLock(old, body, 16_000);
+  let landed = false;
+  await withRecordFileLock(old, async () => {
+    landed = true;
+  });
+  assert.ok(landed, "a 16 s old unjudgeable holder was not broken by age");
+});

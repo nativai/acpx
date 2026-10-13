@@ -1,7 +1,6 @@
 import fs from "node:fs/promises";
 import { isAcpJsonRpcMessage } from "../acp/jsonrpc.js";
 import { incrementPerfCounter, measurePerf } from "../perf-metrics.js";
-import { isProcessAlive } from "../process-liveness.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
 import { DELIVERY_EVENT_METHOD } from "./delivery-events.js";
 import {
@@ -17,6 +16,12 @@ import {
   writeSessionRecord,
   writeSessionRecordAtBoundary,
 } from "./persistence.js";
+import {
+  identityLockBody,
+  judgeLockHolder,
+  removeLockIfUnchanged,
+  tryCreateLockFile,
+} from "./persistence/identity-file-lock.js";
 
 const LOCK_RETRY_MS = 15;
 const EVENT_LOCK_STALE_MS = 15_000;
@@ -172,10 +177,11 @@ async function rotateSegments(sessionId: string, maxSegments: number): Promise<v
 
 type LockHandle = {
   filePath: string;
+  content: string;
 };
 
 type EventLockPayload = {
-  pid?: number;
+  body: Record<string, unknown> | undefined;
   created_at?: string;
 };
 
@@ -183,31 +189,43 @@ function parseEventLockPayload(raw: string): EventLockPayload {
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return {};
+      return { body: undefined };
     }
     const record = parsed as Record<string, unknown>;
     return {
-      pid: typeof record.pid === "number" ? record.pid : undefined,
+      body: record,
       created_at: typeof record.created_at === "string" ? record.created_at : undefined,
     };
   } catch {
-    return {};
+    return { body: undefined };
   }
+}
+
+/**
+ * May this stream lock be taken over now? (brick ae547131 §6.4)
+ * - a holder the shared identity rules prove GONE (dead in the reader's own pid namespace) — at
+ *   once, as before;
+ * - ANY holder older than EVENT_LOCK_STALE_MS by its `created_at` — including a LIVE local one.
+ *   That is a deliberate non-change: the lock is held for a writer's lifetime, and making it strict
+ *   would block the CLI direct path behind a long turn (CONCEPT R11, a separate follow-up).
+ * What changed: a holder in ANOTHER pid namespace is no longer stolen because its pid reads ESRCH
+ * here — it is judged by age only. `created_at` must stay in the body: without it a pre-0a reader
+ * computes an infinite age and steals at once.
+ */
+export function isStreamLockStealable(raw: string, nowMs: number = Date.now()): boolean {
+  const parsed = parseEventLockPayload(raw);
+  const createdAtMs = parsed.created_at ? Date.parse(parsed.created_at) : Number.NaN;
+  const lockAgeMs = Number.isFinite(createdAtMs) ? nowMs - createdAtMs : Number.POSITIVE_INFINITY;
+  return lockAgeMs > EVENT_LOCK_STALE_MS || judgeLockHolder(parsed.body) === "breakable";
 }
 
 async function removeStaleEventLock(lockPath: string): Promise<boolean> {
   try {
     const payload = await fs.readFile(lockPath, "utf8");
-    const parsed = parseEventLockPayload(payload);
-    const createdAtMs = parsed.created_at ? Date.parse(parsed.created_at) : Number.NaN;
-    const lockAgeMs = Number.isFinite(createdAtMs)
-      ? Date.now() - createdAtMs
-      : Number.POSITIVE_INFINITY;
-    const pidAlive = isProcessAlive(parsed.pid);
-    if (pidAlive && lockAgeMs <= EVENT_LOCK_STALE_MS) {
+    if (!isStreamLockStealable(payload)) {
       return false;
     }
-    await fs.unlink(lockPath);
+    await removeLockIfUnchanged(lockPath, payload);
     incrementPerfCounter("session.events.stale_lock_recovered");
     return true;
   } catch (error) {
@@ -222,43 +240,33 @@ async function acquireEventsLock(sessionId: string): Promise<LockHandle> {
   await ensureSessionDir();
   const lockPath = eventsLockPath(sessionId);
   const payload = JSON.stringify(
-    {
+    identityLockBody({
       pid: process.pid,
       created_at: new Date().toISOString(),
-    },
+    }),
     null,
     2,
   );
 
   for (;;) {
-    try {
-      await fs.writeFile(lockPath, `${payload}\n`, {
-        encoding: "utf8",
-        flag: "wx",
-      });
-      return { filePath: lockPath };
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") {
-        throw error;
-      }
-      const recovered = await removeStaleEventLock(lockPath);
-      if (recovered) {
-        continue;
-      }
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, LOCK_RETRY_MS);
-      });
+    // Created atomically WITH its body (temp + link): a pre-0a reader that caught a `writeFile(wx)`
+    // lock mid-write parsed an empty body as a dead holder and stole it.
+    if (await tryCreateLockFile(lockPath, `${payload}\n`)) {
+      return { filePath: lockPath, content: `${payload}\n` };
     }
+    const recovered = await removeStaleEventLock(lockPath);
+    if (recovered) {
+      continue;
+    }
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, LOCK_RETRY_MS);
+    });
   }
 }
 
 async function releaseEventsLock(lock: LockHandle): Promise<void> {
-  await fs.unlink(lock.filePath).catch((error) => {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw error;
-    }
-  });
+  // Compare-and-delete: a writer whose lock was taken over after 15 s must not delete its successor's.
+  await removeLockIfUnchanged(lock.filePath, lock.content);
 }
 
 type SessionEventWriterOptions = {

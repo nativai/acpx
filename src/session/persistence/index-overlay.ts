@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { SessionRecord } from "../../types.js";
-import { withSessionIndexLock } from "./index-lock.js";
+import { isIndexLockTimeoutError, withSessionIndexLock } from "./index-lock.js";
 import {
   reconcileSessionIndex,
   toSessionIndexEntry,
@@ -161,6 +161,22 @@ export async function overlaySessionIndexEntries(
   if (overlays.size === 0) {
     return;
   }
+  try {
+    await overlayUnderIndexLock(sessionDir, overlays);
+  } catch (error) {
+    // The overlay only PROJECTS record writes that are already durable, so an index lock timeout
+    // (brick ae547131 §6.2: no proceed-unlocked path) is logged, not fatal.
+    if (!isIndexLockTimeoutError(error)) {
+      throw error;
+    }
+    process.stderr.write(`[acpx] WARNING: session index overlay skipped: ${error.message}\n`);
+  }
+}
+
+async function overlayUnderIndexLock(
+  sessionDir: string,
+  overlays: ReadonlyMap<string, SessionIndexEntryOverlay>,
+): Promise<void> {
   await withSessionIndexLock(sessionDir, async () => {
     const { index } = await reconcileSessionIndex(sessionDir);
     const diskFiles = new Set(index.files);

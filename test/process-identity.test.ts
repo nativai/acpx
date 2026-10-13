@@ -4,6 +4,7 @@ import fs from "node:fs";
 import test from "node:test";
 import {
   captureRecordPidIdentity,
+  classifyRecordedIdentity,
   getOwnProcessIdentity,
   getOwnProcessScope,
   identityScope,
@@ -15,7 +16,6 @@ import {
   parseRecordPidIdentity,
   readProcessBirthIdentity,
   serializeProcessBirthIdentity,
-  serializeRecordPidIdentity,
   setProcReaderForTests,
   validRecordPidIdentity,
   type LinuxProcessIdentity,
@@ -87,7 +87,9 @@ test("T01 codec: posix-lstart and windows-creation parse only in canonical form"
   );
 });
 
-test("T01 codec: a malformed scope degrades to legacy (bad uuid, pid:[0], bad time ns)", () => {
+test("T01 codec: a malformed scope is no birth identity — and classifies FOREIGN, never legacy", () => {
+  // CONCEPT T01 said "malformed scope ⇒ legacy"; the HoD's 2026-10-13 alignment with acpx-ui made
+  // it conservative: scope fields present but not all equal to ours ⇒ foreign (never pid-judged).
   for (const bad of [
     { ...SCOPE, bootId: "not-a-uuid" },
     { ...SCOPE, pidNamespace: "pid:[0]" },
@@ -95,7 +97,9 @@ test("T01 codec: a malformed scope degrades to legacy (bad uuid, pid:[0], bad ti
   ]) {
     const onDisk = { kind: "linux-proc-stat-starttime", startTimeTicks: "7", ...bad };
     assert.equal(parseProcessBirthIdentity(onDisk), undefined, JSON.stringify(bad));
+    // a pre-0a reader still sees its start ticks
     assert.equal(parseLegacyStartTimeTicks(onDisk), "7");
+    assert.deepEqual(classifyRecordedIdentity(onDisk), { kind: "scope-only", local: false });
   }
   assert.deepEqual(
     parseProcessBirthIdentity({
@@ -122,14 +126,8 @@ test("T01 codec: serialize writes the LEGACY kind plus scope, and round-trips by
   assert.equal(JSON.stringify(serializeProcessBirthIdentity(reparsed)), text);
 });
 
-test("T01 codec: record pid_identity is snake_case and round-trips", () => {
-  const value = {
-    pid: 4242,
-    identity: { kind: "linux-proc" as const, ...SCOPE, startTicks: "144330002" },
-    host: "dev-server-b668d8954-kl4ff",
-  };
-  const onDisk = serializeRecordPidIdentity(value);
-  assert.deepEqual(onDisk, {
+test("T01 codec: record pid_identity is snake_case, validated, and decoded only for its own pid", () => {
+  const onDisk = {
     pid: 4242,
     kind: "linux-proc",
     boot_id: BOOT,
@@ -137,18 +135,23 @@ test("T01 codec: record pid_identity is snake_case and round-trips", () => {
     time_namespace: SCOPE.timeNamespace,
     start_ticks: "144330002",
     host: "dev-server-b668d8954-kl4ff",
+  };
+  const parsed = parseRecordPidIdentity(JSON.parse(JSON.stringify(onDisk)));
+  assert.deepEqual(parsed, onDisk);
+  assert.equal(JSON.stringify(parsed), JSON.stringify(onDisk), "byte-stable");
+  assert.deepEqual(validRecordPidIdentity(4242, parsed), {
+    kind: "linux-proc",
+    ...SCOPE,
+    startTicks: "144330002",
   });
-  assert.deepEqual(parseRecordPidIdentity(JSON.parse(JSON.stringify(onDisk))), value);
+  // the validity rule: pid_identity.pid must equal record.pid
+  assert.equal(validRecordPidIdentity(4243, parsed), undefined);
+  assert.equal(validRecordPidIdentity(undefined, parsed), undefined);
+  assert.equal(validRecordPidIdentity(4242, undefined), undefined);
+  // malformed ⇒ absent (never signalled), never a record rejection
   assert.equal(parseRecordPidIdentity({ ...onDisk, start_ticks: "x" }), undefined);
   assert.equal(parseRecordPidIdentity({ ...onDisk, pid: 0 }), undefined);
-});
-
-test("T01 codec: pid_identity counts only when its pid equals record.pid", () => {
-  const value = { pid: 10, identity: { kind: "linux-proc" as const, ...SCOPE, startTicks: "1" } };
-  assert.equal(validRecordPidIdentity(10, value), value.identity);
-  assert.equal(validRecordPidIdentity(11, value), undefined);
-  assert.equal(validRecordPidIdentity(undefined, value), undefined);
-  assert.equal(validRecordPidIdentity(10, undefined), undefined);
+  assert.equal(parseRecordPidIdentity({ ...onDisk, pid_namespace: "pid:[0]" }), undefined);
 });
 
 test("T01 stat parser: comm with spaces and parens, field 22", () => {
@@ -246,7 +249,10 @@ test("T03 captureRecordPidIdentity: matches the live process; undefined for a de
     const captured = captureRecordPidIdentity(child.pid);
     assert.ok(captured);
     assert.equal(captured.pid, child.pid);
-    assert.equal(observeProcessIncarnation(child.pid, captured.identity), "matching");
+    assert.equal(
+      observeProcessIncarnation(child.pid, validRecordPidIdentity(child.pid, captured)),
+      "matching",
+    );
   } finally {
     child.kill("SIGKILL");
     await waitForExit(child);
@@ -282,4 +288,45 @@ test("T35 /proc self-check: a /proc of another pid namespace makes every observa
     await waitForExit(child);
   }
   assert.equal(isOwnProcessScopeVerified(), true);
+});
+
+test("HoD alignment: scope fields WITHOUT start ticks — foreign unless the scope is exactly ours", (t) => {
+  if (!linux) {
+    t.skip("linux only");
+    return;
+  }
+  const own = getOwnProcessScope();
+  assert.ok(own);
+  // scope equal to ours, no start ticks ⇒ local-but-unverifiable (never signalled)
+  assert.deepEqual(classifyRecordedIdentity({ kind: "linux-proc-stat-starttime", ...own }), {
+    kind: "scope-only",
+    local: true,
+  });
+  assert.deepEqual(classifyRecordedIdentity({ kind: "linux-proc", ...own }), {
+    kind: "scope-only",
+    local: true,
+  });
+  // scope different from ours (another pid namespace), no start ticks ⇒ foreign
+  assert.deepEqual(
+    classifyRecordedIdentity({
+      kind: "linux-proc-stat-starttime",
+      ...own,
+      pidNamespace: "pid:[1]",
+    }),
+    { kind: "scope-only", local: false },
+  );
+  // a partial scope is "present but not equal" ⇒ foreign
+  assert.deepEqual(classifyRecordedIdentity({ kind: "linux-proc", bootId: own.bootId }), {
+    kind: "scope-only",
+    local: false,
+  });
+  // complete identity ⇒ birth; no scope at all ⇒ legacy with its ticks
+  assert.equal(
+    classifyRecordedIdentity({ kind: "linux-proc", ...own, startTicks: "5" }).kind,
+    "birth",
+  );
+  assert.deepEqual(
+    classifyRecordedIdentity({ kind: "linux-proc-stat-starttime", startTimeTicks: "5" }),
+    { kind: "legacy", startTicks: "5" },
+  );
 });

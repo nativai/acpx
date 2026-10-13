@@ -2418,9 +2418,12 @@ test("H1 · the delete mutator's hold is ONE seats.json read and ONE write — w
       const original = fsp.default[api] as (...args: unknown[]) => unknown;
       mock.method(fsp.default, api, (...args: unknown[]) => {
         const target = typeof args[0] === "string" ? args[0] : "<non-path>";
-        if (path.basename(target).startsWith("seats.json")) {
+        // `seats.json.lock` and its temp-link file are the seat LOCK's I/O (brick ae547131 §6.3),
+        // not the store's — excluded, so the bound below still counts store I/O only.
+        const base = path.basename(target);
+        if (base.startsWith("seats.json") && !base.startsWith("seats.json.lock")) {
           // `.tmp` siblings of seats.json are the atomic write's own temp file.
-          ops.push(`${api}:${path.basename(target).includes(".tmp") ? "temp" : "store"}`);
+          ops.push(`${api}:${base.includes(".tmp") ? "temp" : "store"}`);
         }
         return original(...args);
       });

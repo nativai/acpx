@@ -1,4 +1,4 @@
-import { withSessionIndexLock } from "./index-lock.js";
+import { isIndexLockTimeoutError, withSessionIndexLock } from "./index-lock.js";
 import { reconcileSessionIndex, writeSessionIndex, type SessionIndexEntry } from "./index.js";
 
 /**
@@ -80,18 +80,69 @@ async function flushDir(sessionDir: string, state: DirState): Promise<void> {
       await state.flushing;
       continue;
     }
-    state.flushing = writePendingEntries(sessionDir, state);
+    let written = true;
+    state.flushing = writePendingEntries(sessionDir, state).then((ok) => {
+      written = ok;
+    });
     try {
       await state.flushing;
     } finally {
       state.flushing = undefined;
     }
+    if (!written) {
+      armRetryTimer(sessionDir, state);
+      return;
+    }
   }
 }
 
-async function writePendingEntries(sessionDir: string, state: DirState): Promise<void> {
+function armRetryTimer(sessionDir: string, state: DirState): void {
+  if (state.timer) {
+    return;
+  }
+  const timer = setTimeout(() => {
+    state.timer = undefined;
+    void flushDir(sessionDir, state).catch(() => {
+      // best effort — the next write retries; the record stays the truth
+    });
+  }, SCALAR_FLUSH_INTERVAL_MS);
+  timer.unref?.();
+  state.timer = timer;
+}
+
+/**
+ * Writes the pending entries under the index lock. A lock TIMEOUT (brick ae547131 §6.2 — the lock
+ * no longer proceeds unlocked) is not a failure of the record write this projects: the entries go
+ * back into `pending` (a newer entry for the same file wins) for the next flush, and the caller
+ * is told nothing was written. Returns false then, true otherwise.
+ */
+async function writePendingEntries(sessionDir: string, state: DirState): Promise<boolean> {
   const pending = new Map(state.pending);
   state.pending.clear();
+  try {
+    await writeEntriesUnderLock(sessionDir, state, pending);
+    return true;
+  } catch (error) {
+    if (!isIndexLockTimeoutError(error)) {
+      throw error;
+    }
+    for (const [file, entry] of pending) {
+      if (!state.pending.has(file)) {
+        state.pending.set(file, entry);
+      }
+    }
+    process.stderr.write(
+      `[acpx] WARNING: session index update deferred (${pending.size} entr${pending.size === 1 ? "y" : "ies"}): ${error.message}\n`,
+    );
+    return false;
+  }
+}
+
+async function writeEntriesUnderLock(
+  sessionDir: string,
+  state: DirState,
+  pending: Map<string, SessionIndexEntry>,
+): Promise<void> {
   await withSessionIndexLock(sessionDir, async () => {
     // Reconcile picks up concurrent writers' membership changes; pending
     // entries are handed in so new files are not re-read from disk.

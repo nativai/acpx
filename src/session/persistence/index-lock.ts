@@ -1,129 +1,59 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import fs from "node:fs/promises";
 import path from "node:path";
+import { acquireIdentityFileLock, releaseIdentityFileLock } from "./identity-file-lock.js";
 
 /**
- * Advisory cross-process lock for the session-index read-modify-write window.
+ * Cross-process lock for the session-index read-modify-write window.
  *
  * Protocol (mirrored by acpx-ui's index-write helper — keep in sync):
- * - lock file: `<sessionDir>/index.json.lock`, created with O_CREAT|O_EXCL
- *   (`flag: "wx"`), body `{"pid":<number>,"ts":"<ISO-8601>"}`
- * - stale takeover: holder pid dead, or lock older than 5 s (body `ts`,
- *   falling back to file mtime when the body is unreadable)
- * - contention: retry with backoff for up to ~2 s, then PROCEED WITHOUT the
- *   lock — availability over strictness. A missed lock degrades to the
- *   pre-lock behaviour (racing read-modify-write), whose damage incremental
- *   reconcile has already made cheap. Locking must never wedge a daemon.
+ * - lock file: `<sessionDir>/index.json.lock`, created atomically WITH its body (temp + link),
+ *   body `{"pid":<number>,"ts":"<ISO-8601>","host":"…","processIdentity":{…}}` — `pid`/`ts` keep
+ *   their pre-0a meaning, so a pre-0a reader still judges a 0a holder by pid and 5 s age.
+ * - takeover: the shared identity rules (identity-file-lock.ts) — a holder in the reader's own
+ *   pid namespace that is provably gone is taken over at once; a provably LIVE one never; a
+ *   holder that cannot be judged from here (another pid namespace, a legacy body whose pid is
+ *   alive) only once the lock is older than INDEX_LOCK_STALE_MS, with a warning.
+ * - contention: wait up to INDEX_LOCK_BUDGET_MS, then THROW `IndexLockTimeoutError`.
  *
- * Within a process, acquisitions on the same lock path are serialized by a
- * promise queue, and nested acquisition (re-entrancy) is detected via
- * AsyncLocalStorage and runs the callback directly under the held lock.
+ * 🛑 THERE IS NO PROCEED-UNLOCKED FALLBACK ANY MORE (brick ae547131 §6.2). The old ~2 s "write
+ * anyway" was availability over strictness, and it is exactly the lost update the lock exists to
+ * prevent — including the seat store's compare-and-swap, which used to ride this lock. Each caller
+ * decides what a timeout means: a write that only PROJECTS an already-durable record write logs and
+ * continues (reconcile repairs it); a write that IS the operation fails.
+ *
+ * Within a process, acquisitions on the same lock path are serialized by a promise queue, and
+ * nested acquisition (re-entrancy) is detected via AsyncLocalStorage and runs the callback directly
+ * under the held lock.
  */
 
-const INDEX_LOCK_STALE_MS = 5_000;
-const INDEX_LOCK_MAX_WAIT_MS = 2_000;
-const INDEX_LOCK_RETRY_DELAY_MS = 100;
+const INDEX_LOCK_STALE_MS = 15_000;
+const INDEX_LOCK_BUDGET_MS = 20_000;
 
 const heldLockPaths = new AsyncLocalStorage<Set<string>>();
 const inProcessQueues = new Map<string, Promise<void>>();
+
+export class IndexLockTimeoutError extends Error {
+  readonly code = "index-lock-timeout";
+  constructor(lockPath: string, holder: string) {
+    super(
+      `index lock ${lockPath} is held by ${holder} for over ${INDEX_LOCK_BUDGET_MS} ms; ` +
+        `refusing to write unlocked`,
+    );
+  }
+}
+
+export function isIndexLockTimeoutError(error: unknown): error is IndexLockTimeoutError {
+  return error instanceof IndexLockTimeoutError;
+}
 
 export function sessionIndexLockPath(sessionDir: string): string {
   return path.join(sessionDir, "index.json.lock");
 }
 
-function delay(ms: number): Promise<void> {
-  // Deliberately NOT unref'd: this timer is awaited inline by a foreground
-  // write. With unref, a process whose only pending work is the lock backoff
-  // sees its event loop empty and node exits mid-write (observed as
-  // "unsettled top-level await" in the D1 self-test).
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
-
-function isPidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-function parseLockBody(payload: string): { pid: number; tsMs: number | undefined } | undefined {
-  try {
-    const parsed = JSON.parse(payload) as { pid?: unknown; ts?: unknown };
-    if (typeof parsed.pid !== "number") {
-      return undefined;
-    }
-    const tsMs = typeof parsed.ts === "string" ? Date.parse(parsed.ts) : Number.NaN;
-    return { pid: parsed.pid, tsMs: Number.isFinite(tsMs) ? tsMs : undefined };
-  } catch {
-    return undefined;
-  }
-}
-
-/** Returns true when the caller should immediately retry acquisition. */
-async function takeOverStaleLock(lockPath: string): Promise<boolean> {
-  try {
-    const payload = await fs.readFile(lockPath, "utf8");
-    const stat = await fs.stat(lockPath);
-    const holder = parseLockBody(payload);
-    const age = Date.now() - (holder?.tsMs ?? stat.mtimeMs);
-    const holderDead = holder !== undefined && !isPidAlive(holder.pid);
-    if (!holderDead && age < INDEX_LOCK_STALE_MS) {
-      return false;
-    }
-    await fs.unlink(lockPath);
-    return true;
-  } catch (error) {
-    // ENOENT only: the holder released between our EEXIST and this read —
-    // safe to retry the create immediately. Any OTHER error (EISDIR when a
-    // directory squats the lock path, EACCES on an unreadable lock, a failed
-    // unlink, ...) must NOT short-circuit back to the create: the
-    // retry-immediately `continue` skips the caller's deadline check and
-    // backoff sleep, so a persistent error becomes a busy spin and the write
-    // never completes. Report no-takeover instead — the caller backs off and
-    // proceeds unlocked after ~2 s.
-    return (error as NodeJS.ErrnoException).code === "ENOENT";
-  }
-}
-
-async function acquireLockFile(lockPath: string): Promise<boolean> {
-  const deadline = Date.now() + INDEX_LOCK_MAX_WAIT_MS;
-  for (;;) {
-    try {
-      await fs.writeFile(
-        lockPath,
-        `${JSON.stringify({ pid: process.pid, ts: new Date().toISOString() })}\n`,
-        { flag: "wx" },
-      );
-      return true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-        // Unexpected failure (permissions, missing dir) — proceed unlocked.
-        return false;
-      }
-    }
-    if (await takeOverStaleLock(lockPath)) {
-      continue;
-    }
-    if (Date.now() >= deadline) {
-      return false;
-    }
-    await delay(INDEX_LOCK_RETRY_DELAY_MS);
-  }
-}
-
-async function releaseLockFile(lockPath: string): Promise<void> {
-  try {
-    const holder = parseLockBody(await fs.readFile(lockPath, "utf8"));
-    if (!holder || holder.pid === process.pid) {
-      await fs.unlink(lockPath);
-    }
-  } catch {
-    // best effort — a stale-takeover by another process may have replaced it
-  }
+/** True when this async context holds ANY `index.json.lock` — the seat lock's order check. */
+export function isSessionIndexLockHeld(): boolean {
+  const held = heldLockPaths.getStore();
+  return held !== undefined && [...held].some((lockPath) => lockPath.endsWith("index.json.lock"));
 }
 
 export async function withSessionIndexLock<T>(
@@ -139,11 +69,8 @@ export async function withSessionIndexLock<T>(
  * Extracted so the cold-archive tier's `ARCHIVE-INDEX/.lock` can REUSE this
  * implementation rather than re-derive it (conception `archive-formats.md` §4.4.1
  * is explicit: "Reuse, do not re-derive"). Every property documented at the top of
- * this file — `O_CREAT|O_EXCL` create, the `{"pid","ts"}` body, 5 s stale
- * takeover, ~2 s max wait then PROCEED UNLOCKED, in-process queueing and
- * AsyncLocalStorage re-entrancy — is the same code for both callers, which is the
- * only way "the exact protocol of index.json.lock" stays true as this file
- * changes.
+ * this file is the same code for both callers, which is the only way "the exact
+ * protocol of index.json.lock" stays true as this file changes.
  */
 export async function withAdvisoryLock<T>(lockPath: string, fn: () => Promise<T>): Promise<T> {
   const held = heldLockPaths.getStore();
@@ -163,15 +90,19 @@ export async function withAdvisoryLock<T>(lockPath: string, fn: () => Promise<T>
   await previous;
 
   try {
-    const acquired = await acquireLockFile(lockPath);
+    const content = await acquireIdentityFileLock(lockPath, {
+      label: "index lock",
+      budgetMs: INDEX_LOCK_BUDGET_MS,
+      staleMs: INDEX_LOCK_STALE_MS,
+      legacyBody: () => ({ pid: process.pid, ts: new Date().toISOString() }),
+      makeTimeoutError: (lock, holder) => new IndexLockTimeoutError(lock, holder),
+    });
     try {
       const nextHeld = new Set(held ?? []);
       nextHeld.add(lockPath);
       return await heldLockPaths.run(nextHeld, fn);
     } finally {
-      if (acquired) {
-        await releaseLockFile(lockPath);
-      }
+      await releaseIdentityFileLock(lockPath, content);
     }
   } finally {
     releaseQueue();

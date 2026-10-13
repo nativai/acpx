@@ -8,7 +8,7 @@ import {
   type AbandonedRecordSweepResult,
   sweepAbandonedSessionRecords,
 } from "./abandoned-record-sweep.js";
-import { withSessionIndexLock } from "./persistence/index-lock.js";
+import { isIndexLockTimeoutError, withSessionIndexLock } from "./persistence/index-lock.js";
 import { overlaySessionIndexEntries } from "./persistence/index-overlay.js";
 import {
   listSessionRecordFiles,
@@ -1220,12 +1220,20 @@ async function reapHolderless(
  * entry's name from the seat store, so entries the per-record legs did not reach (an existing
  * seat that already had a name, an entry with a stale one) are brought level too. */
 async function reprojectIndexNames(sessionDir: string): Promise<void> {
-  await withSessionIndexLock(sessionDir, async () => {
-    const index = await readSessionIndex(sessionDir);
-    if (index) {
-      await writeSessionIndex(sessionDir, { files: index.files, entries: index.entries });
+  try {
+    await withSessionIndexLock(sessionDir, async () => {
+      const index = await readSessionIndex(sessionDir);
+      if (index) {
+        await writeSessionIndex(sessionDir, { files: index.files, entries: index.entries });
+      }
+    });
+  } catch (error) {
+    // A pure projection of the durable seat store (brick ae547131 §6.2): logged, not fatal.
+    if (!isIndexLockTimeoutError(error)) {
+      throw error;
     }
-  });
+    process.stderr.write(`[acpx] WARNING: index name re-projection skipped: ${error.message}\n`);
+  }
 }
 
 /** The strip step's PRE-RUN numbers, identical on a dry run and an apply. */

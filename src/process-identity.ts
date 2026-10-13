@@ -450,55 +450,66 @@ export function processHostName(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Session-record form (`pid_identity`, snake_case at every depth — persisted-key-policy.ts)
+// Session-record form (`pid_identity`). Held IN MEMORY in its persisted snake_case shape: the record's
+// wholesale subtrees must be snake_case at every depth (persisted-key-policy.ts), and keeping one
+// shape means no translation leg can drop a field.
 // ---------------------------------------------------------------------------
 
 export type RecordPidIdentity = {
   pid: number;
-  identity: ProcessBirthIdentity;
+  kind: "linux-proc" | "posix-lstart" | "windows-creation";
+  boot_id?: string;
+  pid_namespace?: string;
+  time_namespace?: string;
+  start_ticks?: string;
+  value?: string;
   host?: string;
 };
 
-/** The record's `pid_identity` body (CONCEPT §4.2). */
-export function serializeRecordPidIdentity(value: RecordPidIdentity): Record<string, unknown> {
-  const host = value.host === undefined ? {} : { host: value.host };
-  if (value.identity.kind !== "linux-proc") {
-    return { pid: value.pid, kind: value.identity.kind, value: value.identity.value, ...host };
+function encodeRecordPidIdentity(
+  pid: number,
+  identity: ProcessBirthIdentity,
+  host: string | undefined,
+): RecordPidIdentity {
+  const hostField = host === undefined ? {} : { host };
+  if (identity.kind !== "linux-proc") {
+    return { pid, kind: identity.kind, value: identity.value, ...hostField };
   }
   return {
-    pid: value.pid,
+    pid,
     kind: "linux-proc",
-    boot_id: value.identity.bootId,
-    pid_namespace: value.identity.pidNamespace,
-    time_namespace: value.identity.timeNamespace,
-    start_ticks: value.identity.startTicks,
-    ...host,
+    boot_id: identity.bootId,
+    pid_namespace: identity.pidNamespace,
+    time_namespace: identity.timeNamespace,
+    start_ticks: identity.startTicks,
+    ...hostField,
   };
 }
 
+function decodeRecordPidIdentity(raw: Record<string, unknown>): ProcessBirthIdentity | undefined {
+  if (raw.kind !== "linux-proc") {
+    return parseTimestampIdentity(raw);
+  }
+  return parseScopedLinux(
+    { bootId: raw.boot_id, pidNamespace: raw.pid_namespace, timeNamespace: raw.time_namespace },
+    raw.start_ticks,
+  );
+}
+
+/** Validates an on-disk `pid_identity` and returns its normalized form, or undefined. */
 export function parseRecordPidIdentity(raw: unknown): RecordPidIdentity | undefined {
   if (!isRecord(raw) || !Number.isSafeInteger(raw.pid) || (raw.pid as number) <= 0) {
     return undefined;
   }
-  const identity =
-    raw.kind === "linux-proc"
-      ? parseScopedLinux(
-          {
-            bootId: raw.boot_id,
-            pidNamespace: raw.pid_namespace,
-            timeNamespace: raw.time_namespace,
-          },
-          raw.start_ticks,
-        )
-      : parseTimestampIdentity(raw);
+  const identity = decodeRecordPidIdentity(raw);
   if (!identity) {
     return undefined;
   }
-  return {
-    pid: raw.pid as number,
+  return encodeRecordPidIdentity(
+    raw.pid as number,
     identity,
-    ...(typeof raw.host === "string" ? { host: raw.host } : {}),
-  };
+    typeof raw.host === "string" ? raw.host : undefined,
+  );
 }
 
 /**
@@ -510,7 +521,10 @@ export function validRecordPidIdentity(
   pid: number | undefined,
   pidIdentity: RecordPidIdentity | undefined,
 ): ProcessBirthIdentity | undefined {
-  return pid !== undefined && pidIdentity?.pid === pid ? pidIdentity.identity : undefined;
+  if (pid === undefined || pidIdentity?.pid !== pid) {
+    return undefined;
+  }
+  return decodeRecordPidIdentity(pidIdentity);
 }
 
 /** Captures `pid`'s current identity for a record — what a writer stores beside `record.pid`. */
@@ -519,5 +533,42 @@ export function captureRecordPidIdentity(pid: number | undefined): RecordPidIden
     return undefined;
   }
   const identity = readProcessBirthIdentity(pid);
-  return identity ? { pid, identity, host: processHostName() } : undefined;
+  return identity ? encodeRecordPidIdentity(pid, identity, processHostName()) : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// What a RECORDED identity (lease / lock body) tells this reader — the one classifier both acpx and
+// acpx-ui apply (HoD alignment 2026-10-13, conservative rule).
+// ---------------------------------------------------------------------------
+
+export type RecordedIdentity =
+  /** A complete birth identity — judged by `observeProcessIncarnation`. */
+  | { kind: "birth"; birth: ProcessBirthIdentity }
+  /**
+   * Scope fields present but no usable start ticks. If they do not ALL equal this reader's own
+   * scope (malformed counts as not equal), the holder is FOREIGN — never pid-judged, never
+   * signalled. If they equal ours, the pid may be judged for death (ESRCH) but never for identity:
+   * alive while the pid exists, never signalled ("identity-unverified").
+   */
+  | { kind: "scope-only"; local: boolean }
+  /** No scope at all: a pre-0a artefact, judged by today's rule (§4.5). */
+  | { kind: "legacy"; startTicks?: string };
+
+const SCOPE_KEYS = ["bootId", "pidNamespace", "timeNamespace"] as const;
+
+function scopeOnlyIsLocal(raw: Record<string, unknown>): boolean {
+  const own = getOwnProcessScope();
+  const scope = parseLinuxScope(raw);
+  return own !== undefined && scope !== undefined && compareLinuxScope(scope, own) === "matching";
+}
+
+export function classifyRecordedIdentity(raw: unknown): RecordedIdentity {
+  const birth = parseProcessBirthIdentity(raw);
+  if (birth) {
+    return { kind: "birth", birth };
+  }
+  if (isRecord(raw) && SCOPE_KEYS.some((key) => raw[key] !== undefined)) {
+    return { kind: "scope-only", local: scopeOnlyIsLocal(raw) };
+  }
+  return { kind: "legacy", startTicks: parseLegacyStartTimeTicks(raw) };
 }

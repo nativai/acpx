@@ -11,7 +11,7 @@ import {
 } from "../../models/claude-advertised-label.js";
 import type { SessionRecord } from "../../types.js";
 import { modelSetMethodKnownUnsupported } from "../mode-preference.js";
-import { withSessionIndexLock } from "./index-lock.js";
+import { isIndexLockTimeoutError, withSessionIndexLock } from "./index-lock.js";
 import { parseSessionRecord } from "./parse.js";
 import {
   brickFieldsToIndexEntry,
@@ -832,29 +832,36 @@ export async function rebuildSessionIndex(
   if (!rebuildLogSuppressed) {
     process.stderr.write(`[acpx] full session-index rebuild (reason: ${reason})\n`);
   }
-  // Advisory lock (re-entrant under a caller already holding it). A rebuild
-  // over a very large store can outlive the 5 s stale threshold and lose the
-  // lock to a takeover — acceptable: that degrades to the pre-lock racing
-  // behaviour for this rare reserve path.
-  return await withSessionIndexLock(sessionDir, async () => {
-    const files = await listSessionRecordFiles(sessionDir);
-
-    const indexEntries: SessionIndexEntry[] = [];
-    for (const file of files) {
-      const entry = await readIndexEntryFromDisk(sessionDir, file);
-      if (entry) {
-        indexEntries.push(entry);
-      }
+  // Lock (re-entrant under a caller already holding it). The rebuild only PROJECTS durable
+  // record files, so a lock timeout (brick ae547131 §6.2: the lock never proceeds unlocked) is not
+  // fatal: the caller still gets the rebuilt index, it is just not persisted this time.
+  try {
+    return await withSessionIndexLock(sessionDir, async () => {
+      const index = await buildSessionIndexFromDisk(sessionDir);
+      await writeSessionIndex(sessionDir, index);
+      return index;
+    });
+  } catch (error) {
+    if (!isIndexLockTimeoutError(error)) {
+      throw error;
     }
+    process.stderr.write(
+      `[acpx] WARNING: session index rebuilt but not persisted: ${error.message}\n`,
+    );
+    return await buildSessionIndexFromDisk(sessionDir);
+  }
+}
 
-    const index: SessionIndex = {
-      schema: SESSION_INDEX_SCHEMA,
-      files,
-      entries: indexEntries,
-    };
-    await writeSessionIndex(sessionDir, index);
-    return index;
-  });
+async function buildSessionIndexFromDisk(sessionDir: string): Promise<SessionIndex> {
+  const files = await listSessionRecordFiles(sessionDir);
+  const indexEntries: SessionIndexEntry[] = [];
+  for (const file of files) {
+    const entry = await readIndexEntryFromDisk(sessionDir, file);
+    if (entry) {
+      indexEntries.push(entry);
+    }
+  }
+  return { schema: SESSION_INDEX_SCHEMA, files, entries: indexEntries };
 }
 
 export type ReconciledSessionIndex = {

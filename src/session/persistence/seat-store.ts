@@ -3,7 +3,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { AcpxOperationalError } from "../../errors.js";
 import { isContextAlarmLevel } from "../context-alarm.js";
-import { withSessionIndexLock } from "./index-lock.js";
+import { withIdentityFileLock } from "./identity-file-lock.js";
+import { isSessionIndexLockHeld, withSessionIndexLock } from "./index-lock.js";
 import { SEAT_STORE_FILE, SESSION_INDEX_FILE } from "./session-dir-files.js";
 
 /**
@@ -36,14 +37,15 @@ import { SEAT_STORE_FILE, SESSION_INDEX_FILE } from "./session-dir-files.js";
  *
  * ## The lock is on a PATH, which makes this a convention
  *
- * `withSessionIndexLock` locks `index.json.lock` — not this file
- * (`SEAT-STORE.md` F2(i)). Writing `seats.json` "under the index lock" is therefore
- * **a convention every writer must honour**, enforced by there being exactly ONE
- * writer (`withSeatStoreWrite`) and nothing else opening this file for writing —
- * never by the lock itself. The lock is also **advisory**: after
- * `INDEX_LOCK_MAX_WAIT_MS = 2_000` of contention a writer PROCEEDS UNLOCKED
- * (`index-lock.ts:13`). Inherited, explicitly ratified (item 5), and the mitigation
- * is the narrow critical section below.
+ * Writing `seats.json` under `seats.json.lock` (brick ae547131 §6.3; it used to ride
+ * `index.json.lock`, `SEAT-STORE.md` F2(i)) is **a convention every writer must
+ * honour**, enforced by there being exactly ONE writer (`withSeatStoreWrite`) and
+ * nothing else opening this file for writing — never by the lock itself. The lock is
+ * strict: a writer that cannot get it within its budget throws `SeatLockTimeoutError`
+ * and writes nothing. Pre-0a writers know only the index lock, which is why the hold
+ * still takes `index.json.lock` inside (the transitional inner hold) — and a pre-0a
+ * writer can still take ITS OWN 2 s proceed-unlocked fallback on that inner lock, a
+ * residual that ends once every writer is ≥0a (CONCEPT R3).
  *
  * ## The critical section is bounded STRUCTURALLY, not by an adjective
  *
@@ -823,6 +825,45 @@ export class SeatStoreUnwritableError extends AcpxOperationalError {
   }
 }
 
+const SEAT_LOCK_BUDGET_MS = 20_000;
+const SEAT_LOCK_STALE_MS = 15_000;
+
+export function seatStoreLockPath(sessionDir: string): string {
+  return `${seatStorePath(sessionDir)}.lock`;
+}
+
+/**
+ * `seats.json.lock` could not be acquired within its budget (brick ae547131 §6.3). Fails CLOSED like
+ * `SeatStoreUnwritableError`: the seat store's compare-and-swap is never run unlocked.
+ */
+export class SeatLockTimeoutError extends AcpxOperationalError {
+  readonly code = "seat-lock-timeout";
+  constructor(lockPath: string, holder: string) {
+    super(
+      `seat store lock ${lockPath} is held by ${holder} for over ${SEAT_LOCK_BUDGET_MS} ms; ` +
+        `refusing to write the seat store unlocked`,
+      {
+        outputCode: "RUNTIME",
+        detailCode: "SEAT_LOCK_TIMEOUT",
+        origin: "runtime",
+        retryable: true,
+      },
+    );
+  }
+}
+
+/**
+ * The lock order is seats.json.lock → index.json.lock, always (brick ae547131 §6.3). Taking the seat
+ * lock while an index lock is held in this async context is a deadlock-in-waiting against a writer
+ * taking them in the documented order, so it throws instead of waiting.
+ */
+export class LockOrderError extends Error {
+  readonly code = "lock-order";
+  constructor() {
+    super("seats.json.lock must be taken before index.json.lock, never inside an index-lock hold");
+  }
+}
+
 /** A no-op mutation: the hold is taken, the store is read, and NOTHING is written.
  * Distinct from writing an unchanged store — an O(all seats) rewrite that changes
  * nothing is pure cost, and on a missing store it would also create the file. */
@@ -901,32 +942,59 @@ export async function withSeatStoreWrite<T>(
   // OUTSIDE the hold, deliberately: directory creation is I/O, and the hold's body
   // is operations on one file and nothing else.
   await fs.mkdir(sessionDir, { recursive: true });
-  return await withSessionIndexLock(sessionDir, async () => {
-    const store = await readSeatStore(sessionDir);
-    const { mutation, result } = mutate(store);
-    if (mutation.kind === "no-change") {
-      return result;
-    }
-    // 🛑 THE WRITER FAILS CLOSED ON AN UNHEALTHY FILE, and this is the asymmetry's other
-    // half: writing over a store whose contents could not be read would DESTROY every
-    // seat in it — and unlike `index.json` this file is rebuildable from nothing, since
-    // it holds each seat's active holder and next ordinal and nothing else holds either.
-    // `absent` is NOT unhealthy: creating the file is exactly what the first write on a
-    // fresh box is for.
-    //
-    // ⚠️ THIS USED TO BE A SECOND `readFile` INSIDE THE HOLD (to tell an absent file
-    // from an unparseable one), which quietly broke AP11's "exactly one read and one
-    // write" bound on the create path — where the store IS empty, so the extra read
-    // always fired. F1's typed `fileState` makes the distinction available from the read
-    // already taken, so the bound now holds UNCONDITIONALLY rather than only when the
-    // store happens to be non-empty.
-    if (store.fileState === "malformed" || store.fileState === "unreadable") {
-      throw new SeatStoreUnwritableError(seatStorePath(sessionDir), store.fileState);
-    }
-    await writeSeatStoreAtomically(sessionDir, mutation.seats, store.unparsedRows);
-    await reprojectChangedSeatNames(sessionDir, store.seats, mutation.seats);
+  if (isSessionIndexLockHeld()) {
+    throw new LockOrderError();
+  }
+  // brick ae547131 §6.3 — the seat store has its OWN lock now. It used to ride `index.json.lock`
+  // "by convention", whose ~2 s proceed-unlocked fallback let a concurrent activation's CAS run
+  // unlocked. TRANSITIONAL INNER HOLD: the index lock is still taken inside, because pre-0a seat
+  // writers (CLIs, and long-lived pre-0a owners via mintSeatRowBestEffort) know only the index
+  // lock, and `reprojectChangedSeatNames` rewrites index.json. Kept until every writer is ≥0a (Q3).
+  return await withIdentityFileLock(
+    seatStoreLockPath(sessionDir),
+    {
+      label: "seat store lock",
+      budgetMs: SEAT_LOCK_BUDGET_MS,
+      staleMs: SEAT_LOCK_STALE_MS,
+      legacyBody: () => ({ pid: process.pid, acquiredAt: new Date().toISOString() }),
+      makeTimeoutError: (lockPath, holder) => new SeatLockTimeoutError(lockPath, holder),
+    },
+    async () =>
+      await withSessionIndexLock(
+        sessionDir,
+        async () => await writeSeatStoreHold(sessionDir, mutate),
+      ),
+  );
+}
+
+async function writeSeatStoreHold<T>(
+  sessionDir: string,
+  mutate: (store: SeatStore) => { mutation: SeatStoreMutation; result: T },
+): Promise<T> {
+  const store = await readSeatStore(sessionDir);
+  const { mutation, result } = mutate(store);
+  if (mutation.kind === "no-change") {
     return result;
-  });
+  }
+  // 🛑 THE WRITER FAILS CLOSED ON AN UNHEALTHY FILE, and this is the asymmetry's other
+  // half: writing over a store whose contents could not be read would DESTROY every
+  // seat in it — and unlike `index.json` this file is rebuildable from nothing, since
+  // it holds each seat's active holder and next ordinal and nothing else holds either.
+  // `absent` is NOT unhealthy: creating the file is exactly what the first write on a
+  // fresh box is for.
+  //
+  // ⚠️ THIS USED TO BE A SECOND `readFile` INSIDE THE HOLD (to tell an absent file
+  // from an unparseable one), which quietly broke AP11's "exactly one read and one
+  // write" bound on the create path — where the store IS empty, so the extra read
+  // always fired. F1's typed `fileState` makes the distinction available from the read
+  // already taken, so the bound now holds UNCONDITIONALLY rather than only when the
+  // store happens to be non-empty.
+  if (store.fileState === "malformed" || store.fileState === "unreadable") {
+    throw new SeatStoreUnwritableError(seatStorePath(sessionDir), store.fileState);
+  }
+  await writeSeatStoreAtomically(sessionDir, mutation.seats, store.unparsedRows);
+  await reprojectChangedSeatNames(sessionDir, store.seats, mutation.seats);
+  return result;
 }
 
 /**

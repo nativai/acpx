@@ -104,14 +104,18 @@ function classify(sessionDir: string, value: string): string {
     return "session-dir";
   }
   const base = path.basename(value);
+  // brick ae547131 §6.3 — the seat store now has its own `seats.json.lock` (and every lock is
+  // created through a `<lock>.<pid>.<uuid>.tmp` + link). Lock-file I/O is the LOCK's, not the
+  // store's or a record's, so it is classified as such — before the `seats.json.` temp test below,
+  // which would otherwise count the lock's temp file as a second store write.
+  if (/\.json\.lock(?:\.\d+\.[0-9a-f-]+\.tmp)?$/.test(base)) {
+    return "lock";
+  }
   if (base === SEAT_STORE_BASENAME) {
     return "seat-store";
   }
   if (base.startsWith(`${SEAT_STORE_BASENAME}.`) && base.endsWith(".tmp")) {
     return "seat-store-temp";
-  }
-  if (base === "index.json.lock") {
-    return "lock";
   }
   if (base === "index.json") {
     return "index";

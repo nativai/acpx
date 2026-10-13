@@ -1,15 +1,28 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  readProcessBirthIdentity,
+  serializeProcessBirthIdentity,
+} from "../src/process-identity.js";
+import {
+  IndexLockTimeoutError,
   sessionIndexLockPath,
   withSessionIndexLock,
 } from "../src/session/persistence/index-lock.js";
 
-// perf-loadfix W2.2 — advisory index.json.lock: O_CREAT|O_EXCL with {pid, ts}
-// body, 5 s stale takeover, ~2 s bounded wait then proceed-unlocked.
+// perf-loadfix W2.2 — index.json.lock. brick ae547131 §6.2 (T15) made it STRICT: identity body,
+// takeover only of a provably dead local holder (at once) or an unjudgeable one older than 15 s,
+// and a typed IndexLockTimeoutError after 20 s instead of the old ~2 s proceed-unlocked fallback.
+//
+// REWRITTEN (listed in the PR, CONCEPT §13.3): "a live foreign lock older than 5 s is taken over"
+// (now: a LIVE local holder is never taken over; an unjudgeable one only after 15 s), "a live fresh
+// foreign lock makes the caller proceed unlocked after ~2 s" (now: IndexLockTimeoutError at ~20 s,
+// index untouched), and the directory-squat / unreadable-lock rows (no busy spin is still asserted;
+// the outcome is now a timeout or an age-bounded break, never an unlocked write).
 
 async function withSessionDir<T>(run: (sessionDir: string) => Promise<T>): Promise<T> {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-index-lock-"));
@@ -29,16 +42,25 @@ async function fileExists(filePath: string): Promise<boolean> {
   }
 }
 
-test("lock file is created with {pid, ts} during the callback and removed after", async () => {
+test("lock file is created with {pid, ts, host, processIdentity} during the callback and removed after", async () => {
   await withSessionDir(async (sessionDir) => {
     const lockPath = sessionIndexLockPath(sessionDir);
     await withSessionIndexLock(sessionDir, async () => {
       const body = JSON.parse(await fs.readFile(lockPath, "utf8")) as {
         pid: number;
         ts: string;
+        host: string;
+        processIdentity?: { kind: string; startTimeTicks: string; pidNamespace?: string };
       };
       assert.equal(body.pid, process.pid);
       assert.ok(Number.isFinite(Date.parse(body.ts)));
+      assert.equal(body.host, os.hostname());
+      if (process.platform === "linux") {
+        // pre-0a readers keep parsing kind + startTimeTicks; 0a readers read the scope beside them
+        assert.equal(body.processIdentity?.kind, "linux-proc-stat-starttime");
+        assert.match(body.processIdentity?.startTimeTicks ?? "", /^\d+$/);
+        assert.match(body.processIdentity?.pidNamespace ?? "", /^pid:\[\d+\]$/);
+      }
     });
     assert.equal(await fileExists(lockPath), false);
   });
@@ -98,96 +120,134 @@ test("a foreign lock with a dead pid is taken over immediately", async () => {
   });
 });
 
-test("a live foreign lock older than 5 s is taken over", async () => {
-  await withSessionDir(async (sessionDir) => {
-    const lockPath = sessionIndexLockPath(sessionDir);
-    const staleTs = new Date(Date.now() - 10_000).toISOString();
-    // pid 1 is alive (init) — staleness must come from the ts age.
-    await fs.writeFile(lockPath, `${JSON.stringify({ pid: 1, ts: staleTs })}\n`, "utf8");
+function sleeper() {
+  return spawn(process.execPath, ["-e", "setInterval(() => {}, 1e9)"], { stdio: "ignore" });
+}
 
-    let ran = false;
+/** A 0a lock body for a live process, in this reader's scope unless `scope` overrides it. */
+function identityBody(pid: number, scope: Record<string, string> = {}): string {
+  const identity = readProcessBirthIdentity(pid);
+  assert.ok(identity, `identity of ${pid}`);
+  return `${JSON.stringify({
+    pid,
+    ts: new Date().toISOString(),
+    host: os.hostname(),
+    processIdentity: { ...serializeProcessBirthIdentity(identity), ...scope },
+  })}\n`;
+}
+
+async function writeAged(lockPath: string, body: string, ageMs: number): Promise<void> {
+  await fs.writeFile(lockPath, body, "utf8");
+  const when = new Date(Date.now() - ageMs);
+  await fs.utimes(lockPath, when, when);
+}
+
+async function timeAcquire(
+  sessionDir: string,
+): Promise<{ ran: boolean; ms: number; error?: unknown }> {
+  const startedAt = Date.now();
+  let ran = false;
+  try {
     await withSessionIndexLock(sessionDir, async () => {
       ran = true;
     });
-    assert.equal(ran, true);
-    assert.equal(await fileExists(lockPath), false);
-  });
-});
+    return { ran, ms: Date.now() - startedAt };
+  } catch (error) {
+    return { ran, ms: Date.now() - startedAt, error };
+  }
+}
 
-test("a live fresh foreign lock makes the caller proceed unlocked after ~2 s", async () => {
-  await withSessionDir(async (sessionDir) => {
-    const lockPath = sessionIndexLockPath(sessionDir);
-    const foreignBody = `${JSON.stringify({ pid: 1, ts: new Date().toISOString() })}\n`;
-    await fs.writeFile(lockPath, foreignBody, "utf8");
-    // Keep the foreign lock fresh so the stale takeover never fires.
-    const refresher = setInterval(() => {
-      void fs.writeFile(lockPath, `${JSON.stringify({ pid: 1, ts: new Date().toISOString() })}\n`);
-    }, 500);
+/**
+ * T15 (⊗ — d9ab5c0d writes after ~2 s). Every slow holder shape at once, each in its own dir, so
+ * the 15–20 s bounds cost one wait rather than five.
+ */
+test("T15 index lock: never proceeds unlocked; takeover only on proof or after 15 s", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("linux identity");
+    return;
+  }
+  const holder = sleeper();
+  try {
+    assert.ok(holder.pid);
+    const dirs = await Promise.all(
+      Array.from({ length: 5 }, () => fs.mkdtemp(path.join(os.tmpdir(), "acpx-index-lock-t15-"))),
+    );
+    const [liveDir, foreignDir, legacyDir, squatDir, unreadableDir] = dirs;
+    const lock = (dir: string) => sessionIndexLockPath(dir);
 
-    try {
-      const startedAt = Date.now();
-      let ran = false;
-      await withSessionIndexLock(sessionDir, async () => {
-        ran = true;
-      });
-      const waited = Date.now() - startedAt;
-      assert.equal(ran, true, "must proceed without the lock instead of wedging");
-      assert.ok(waited >= 1900, `must back off ~2 s before proceeding (waited ${waited} ms)`);
-      assert.ok(waited < 4000, `must not wait much past the 2 s bound (waited ${waited} ms)`);
-      // The foreign lock was not ours to remove.
-      assert.equal(await fileExists(lockPath), true);
-    } finally {
-      clearInterval(refresher);
+    // (1) a LIVE holder in our own scope — must never be broken; the writer times out at ~20 s and
+    //     the index is never written.
+    const liveBody = identityBody(holder.pid);
+    await fs.writeFile(lock(liveDir), liveBody, "utf8");
+    await fs.writeFile(path.join(liveDir, "index.json"), "ORIGINAL", "utf8");
+    // (2) a holder in ANOTHER pid namespace whose pid is dead here — unjudgeable: not before 15 s.
+    const foreignDead = spawn("true");
+    await new Promise((resolve) => foreignDead.once("exit", resolve));
+    await writeAged(
+      lock(foreignDir),
+      `${JSON.stringify({ pid: foreignDead.pid, ts: new Date().toISOString(), host: "other-pod", processIdentity: { ...serializeProcessBirthIdentity(readProcessBirthIdentity(holder.pid)!), pidNamespace: "pid:[1]" } })}\n`,
+      0,
+    );
+    // (3) a LEGACY {pid,ts} body whose pid is alive — unjudgeable: broken once 15 s old (10 s now).
+    await writeAged(
+      lock(legacyDir),
+      `${JSON.stringify({ pid: holder.pid, ts: new Date().toISOString() })}\n`,
+      10_000,
+    );
+    // (4) a directory squatting the lock path — no busy spin, no unlocked write: a timeout.
+    await fs.mkdir(lock(squatDir));
+    // (5) an unreadable lock file — an unidentified holder: broken once 15 s old.
+    const unreadable = process.getuid?.() !== 0;
+    if (unreadable) {
+      await fs.writeFile(lock(unreadableDir), `${JSON.stringify({ pid: holder.pid })}\n`);
+      await fs.chmod(lock(unreadableDir), 0o000);
     }
-  });
+
+    const [live, foreign, legacy, squat, unreadableResult] = await Promise.all(
+      dirs.map((dir) => timeAcquire(dir)),
+    );
+
+    assert.ok(live.error instanceof IndexLockTimeoutError, `live: ${String(live.error)}`);
+    assert.equal(live.ran, false);
+    assert.ok(live.ms >= 19_500 && live.ms < 25_000, `live waited ${live.ms} ms`);
+    assert.equal(await fs.readFile(lock(liveDir), "utf8"), liveBody, "live holder's lock broken");
+    assert.equal(await fs.readFile(path.join(liveDir, "index.json"), "utf8"), "ORIGINAL");
+
+    assert.equal(foreign.ran, true, String(foreign.error));
+    assert.ok(foreign.ms >= 14_500, `foreign holder broken early: ${foreign.ms} ms`);
+
+    assert.equal(legacy.ran, true, String(legacy.error));
+    assert.ok(legacy.ms >= 4_500 && legacy.ms < 9_000, `legacy-alive broken at ${legacy.ms} ms`);
+
+    assert.ok(squat.error instanceof IndexLockTimeoutError, `squat: ${String(squat.error)}`);
+    assert.equal((await fs.stat(lock(squatDir))).isDirectory(), true);
+
+    if (unreadable) {
+      assert.equal(unreadableResult.ran, true, String(unreadableResult.error));
+      assert.ok(unreadableResult.ms >= 14_500, `unreadable broken early: ${unreadableResult.ms}`);
+    }
+    for (const dir of dirs) {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  } finally {
+    holder.kill("SIGKILL");
+  }
 });
 
-test("a directory squatting the lock path does not busy-spin: proceed unlocked after ~2 s", async () => {
-  await withSessionDir(async (sessionDir) => {
-    const lockPath = sessionIndexLockPath(sessionDir);
-    // EEXIST on create, EISDIR on read, EPERM/EISDIR on unlink — the shape
-    // that used to retry-immediately forever (te-w2b finding).
-    await fs.mkdir(lockPath);
-
-    const startedAt = Date.now();
-    let ran = false;
-    await withSessionIndexLock(sessionDir, async () => {
-      ran = true;
-    });
-    const waited = Date.now() - startedAt;
-    assert.equal(ran, true, "must proceed without the lock instead of spinning");
-    assert.ok(waited >= 1900, `must run the normal backoff (waited ${waited} ms)`);
-    assert.ok(waited < 4000, `must not spin past the 2 s bound (waited ${waited} ms)`);
-    // The squatting directory was not ours to remove.
-    const stat = await fs.stat(lockPath);
-    assert.equal(stat.isDirectory(), true);
-  });
-});
-
-test("an unreadable lock file does not busy-spin: proceed unlocked after ~2 s", async (t) => {
-  if (process.getuid?.() === 0) {
-    t.skip("running as root — chmod 000 does not produce EACCES");
+test("T15 index lock: a dead holder in our own scope (0a body) is taken over at once", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("linux identity");
     return;
   }
   await withSessionDir(async (sessionDir) => {
-    const lockPath = sessionIndexLockPath(sessionDir);
-    // Fresh live-pid body, but unreadable: EEXIST on create, EACCES on read.
-    await fs.writeFile(lockPath, `${JSON.stringify({ pid: 1, ts: new Date().toISOString() })}\n`);
-    await fs.chmod(lockPath, 0o000);
-
-    try {
-      const startedAt = Date.now();
-      let ran = false;
-      await withSessionIndexLock(sessionDir, async () => {
-        ran = true;
-      });
-      const waited = Date.now() - startedAt;
-      assert.equal(ran, true, "must proceed without the lock instead of spinning");
-      assert.ok(waited >= 1900, `must run the normal backoff (waited ${waited} ms)`);
-      assert.ok(waited < 4000, `must not spin past the 2 s bound (waited ${waited} ms)`);
-      assert.equal(await fileExists(lockPath), true, "foreign lock must be left in place");
-    } finally {
-      await fs.chmod(lockPath, 0o644).catch(() => {});
-    }
+    const child = sleeper();
+    assert.ok(child.pid);
+    const body = identityBody(child.pid);
+    child.kill("SIGKILL");
+    await new Promise((resolve) => child.once("exit", resolve));
+    await fs.writeFile(sessionIndexLockPath(sessionDir), body, "utf8");
+    const result = await timeAcquire(sessionDir);
+    assert.equal(result.ran, true);
+    assert.ok(result.ms < 1_000, `dead holder not taken over at once (${result.ms} ms)`);
   });
 });

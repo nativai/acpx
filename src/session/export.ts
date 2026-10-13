@@ -13,6 +13,7 @@ import {
 import { getLoggedMessageCount } from "./messages-log-bookkeeping.js";
 import { messagesLogPath } from "./messages-log.js";
 import { resolveSessionRecord, sessionBaseDir } from "./persistence.js";
+import { judgeLockHolder } from "./persistence/identity-file-lock.js";
 import { serializeSessionRecordForDisk } from "./persistence/serialize.js";
 import { seatDisplayName } from "./seat-display-name.js";
 
@@ -63,29 +64,21 @@ function sessionLookupError(message: string, code: string): SessionExportError {
   return new SessionExportError(message, code);
 }
 
-type EventLockPayload = {
-  pid?: number;
-};
-
-function parseEventLockPayload(raw: string): EventLockPayload {
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return {};
-    }
-    const record = parsed as Record<string, unknown>;
-    return {
-      pid: typeof record.pid === "number" ? record.pid : undefined,
-    };
-  } catch {
-    return {};
-  }
-}
-
+/** A live writer holds the stream lock unless the shared identity rules prove it gone (§6.4). */
 async function hasLiveEventLock(recordId: string): Promise<boolean> {
   try {
     const payload = await fs.readFile(sessionEventLockPath(recordId), "utf8");
-    return isProcessAlive(parseEventLockPayload(payload).pid);
+    let body: Record<string, unknown> | undefined;
+    try {
+      const parsed = JSON.parse(payload) as unknown;
+      body =
+        parsed && typeof parsed === "object" && !Array.isArray(parsed)
+          ? (parsed as Record<string, unknown>)
+          : undefined;
+    } catch {
+      body = undefined;
+    }
+    return body !== undefined && judgeLockHolder(body) !== "breakable";
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return false;
