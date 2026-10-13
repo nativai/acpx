@@ -32,6 +32,24 @@ export function queueLockFilePath(
   return path.join(queueBaseDir(homeDir), `${queueKeyForSession(sessionId)}.lock`);
 }
 
+/**
+ * The longest unix socket path we will bind, in bytes: `sun_path` is 108 bytes on Linux and 104 on
+ * macOS, and one byte is the NUL terminator.
+ *
+ * 🛑 NEVER RELY ON THE KERNEL OR LIBUV TO REFUSE A LONGER ONE. Node silently TRUNCATES a socket path
+ * past 108 bytes: bind and connect both "succeed" on the truncated name, so two sessions whose paths
+ * differ only past byte 108 share ONE socket — the second bind gets EADDRINUSE and a client of the
+ * second session is answered by the FIRST session's owner (CONCEPT A.5, measured).
+ */
+export const MAX_QUEUE_SOCKET_PATH_BYTES = process.platform === "darwin" ? 103 : 107;
+
+/**
+ * brick ae547131 §9 — the owner's socket lives on the SHARED state volume, `<stateHome>/.acpx/q/`,
+ * so every pod that mounts `~/.acpx` can reach it (and a refused/absent ping there is evidence about
+ * an owner in another pod, §5.2). A path that would exceed the byte limit (a long rig HOME) falls
+ * back to the pod-local `/tmp/acpx-<hash>/` dir — its owners are then judged as F5 from another pod
+ * (never reaped by automation). Clients never compute this: they connect to `lease.socketPath`.
+ */
 export function queueSocketPath(
   sessionId: string,
   homeDir: string = process.env.ACPX_STATE_HOME || os.homedir(),
@@ -39,6 +57,10 @@ export function queueSocketPath(
   const key = queueKeyForSession(sessionId);
   if (process.platform === "win32") {
     return `\\\\.\\pipe\\acpx-${key}`;
+  }
+  const shared = path.join(queueSharedSocketDir(homeDir), `${key}.sock`);
+  if (Buffer.byteLength(shared) <= MAX_QUEUE_SOCKET_PATH_BYTES) {
+    return shared;
   }
   return path.join(queueSocketBaseDir(homeDir) ?? "/tmp", `${key}.sock`);
 }

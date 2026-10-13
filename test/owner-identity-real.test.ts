@@ -194,6 +194,12 @@ test("real owner: pid_identity survives real turns and identifies the live adapt
     assert.equal(lease.processIdentity?.kind, "linux-proc-stat-starttime");
     assert.match(lease.processIdentity?.pidNamespace ?? "", /^pid:\[\d+\]$/);
     assert.equal(lease.host, os.hostname());
+    // T22a (§9): the owner's socket is on the shared state volume, recorded in the lease, and the
+    // prompt above round-tripped through it
+    assert.ok(
+      lease.socketPath.startsWith(path.join(homeDir, ".acpx", "q") + path.sep),
+      lease.socketPath,
+    );
     assert.ok(parseProcessBirthIdentity(lease.processIdentity), "lease identity parses");
 
     const first = await readRecord(homeDir, sessionId);
