@@ -639,3 +639,67 @@ test("T20 ownerMayRebind: my pid number but a FOREIGN pid namespace in the lease
     ledger.close();
   }
 });
+
+/**
+ * T20 (brick ae547131 §4.4, §5.3) — the spawn ledger's child identity. The meta row keeps the pre-0a
+ * {pid, boot, start} with their old meaning and adds the scoped `processIdentity` + `host`; liveness
+ * of a child in ANOTHER pid namespace is `unknown` (acpx-ui reports, never cancels), never `gone`.
+ */
+test("T20 spawn child: scoped identity recorded; same-scope dead ⇒ gone; foreign ns + dead pid ⇒ unknown; legacy ⇒ today", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("linux identity");
+    return;
+  }
+  freshHome("t20-child");
+  const ledger = new SpawnLedger();
+  const child = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"]);
+  const deadPid = Number(child.stdout.toString());
+  const db = new DatabaseSync(ledger.dbPath);
+  const metaOf = (runId: string) => {
+    const row = db.prepare("SELECT value FROM meta WHERE key=?").get(`spawn_child:${runId}:1`) as {
+      value: string;
+    };
+    return JSON.parse(row.value) as Record<string, unknown>;
+  };
+  const setMetaOf = (runId: string, value: Record<string, unknown>) =>
+    db
+      .prepare("UPDATE meta SET value=? WHERE key=?")
+      .run(JSON.stringify(value), `spawn_child:${runId}:1`);
+  try {
+    // live self: the scope is written beside the legacy fields
+    reserve(ledger, "run-live");
+    ledger.recordSpawnChild("run-live", 1, process.pid);
+    const live = metaOf("run-live");
+    assert.equal(typeof live.boot, "string");
+    assert.equal(typeof live.start, "string");
+    assert.equal(
+      (live.processIdentity as Record<string, string>).kind,
+      "linux-proc-stat-starttime",
+    );
+    assert.match((live.processIdentity as Record<string, string>).pidNamespace, /^pid:\[\d+\]$/);
+    assert.equal(typeof live.host, "string");
+    assert.equal(ledger.spawnChildLiveness("run-live", 1), "alive");
+
+    // same scope, the recorded pid now dead ⇒ gone
+    setMetaOf("run-live", { ...live, pid: deadPid });
+    assert.equal(ledger.spawnChildLiveness("run-live", 1), "gone");
+
+    // the same dead pid recorded in ANOTHER pid namespace ⇒ unknown (not gone)
+    setMetaOf("run-live", {
+      ...live,
+      pid: deadPid,
+      processIdentity: {
+        ...(live.processIdentity as Record<string, string>),
+        pidNamespace: "pid:[1]",
+      },
+    });
+    assert.equal(ledger.spawnChildLiveness("run-live", 1), "unknown");
+
+    // a legacy meta row (no processIdentity) keeps today's rule: dead pid ⇒ gone
+    setMetaOf("run-live", { pid: deadPid, boot: live.boot, start: live.start });
+    assert.equal(ledger.spawnChildLiveness("run-live", 1), "gone");
+  } finally {
+    db.close();
+    ledger.close();
+  }
+});
