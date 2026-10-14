@@ -180,6 +180,58 @@ test("ac0be75e: an entry whose record no longer parses is dropped, as listSessio
   });
 });
 
+// ── Two INTENDED behaviour changes from 037a1fb1, pinned (TE finding F2) ─────────────────────
+
+/** Point the record at a messages log, and make that log path a DIRECTORY, so every read fails. */
+async function breakMessagesLog(id: string): Promise<void> {
+  const recordPath = path.join(sessionBaseDir(), `${id}.json`);
+  const raw = JSON.parse(await fs.readFile(recordPath, "utf8")) as Record<string, unknown>;
+  raw.messages_log = { v: 1, count: 5, base_index: 0, bytes: 100 };
+  await fs.writeFile(recordPath, `${JSON.stringify(raw)}\n`);
+  await fs.mkdir(messagesLogPath(sessionBaseDir(), id), { recursive: true });
+}
+
+// (a) The scan never reads the messages log, so a session whose log cannot be read (EISDIR here;
+// EACCES behaves the same way) is REPORTED. On 037a1fb1, hydration threw, `listSessions()` dropped
+// the record, and its owner vanished from both scopes. Here that owner is a recoverable one.
+// That was a silent miss in a verb that exists to find owners. On 037a1fb1 this row FAILS: c1 is
+// missing from both scopes.
+test("ac0be75e: a session whose messages log is unreadable (EISDIR) IS reported, in both scopes", async () => {
+  await withTempHome("acpx-owner-scan-", async (homeDir) => {
+    await seedFamily(homeDir);
+    await breakMessagesLog("c1");
+    const all = await readAllSessionOwnerStatuses();
+    assert.deepEqual(idsOf(all.sessions), ["c1", "p", "s", "g"]);
+    assert.equal(
+      all.sessions.find((status) => status.sessionId === "c1")?.classification,
+      "recoverable_owner",
+    );
+    const descendants = await readDescendantSessionOwnerStatuses("p");
+    assert.deepEqual(idsOf(descendants.sessions), ["c1", "c2", "g"]);
+  });
+});
+
+// (b) `--descendants-of` takes MEMBERSHIP from the INDEX graph (parent and seat fields) and prints
+// every FIELD from the record. HoD decision on TE finding F1: that is the graph acpx-ui's board
+// draws from the same entries, so this verb and the board agree on who is whose child. The tear
+// heals at that session's next index flush, which re-projects the entry from its record
+// (brick 19ee17ab). The accepted cost: while an entry is torn, the child is listed under its INDEX
+// parent, and the printed `parentSessionId` (the record's) names a different session from the
+// scope it was listed under.
+// On 037a1fb1, which walked the record graph, this row FAILS: g stays under p, and s has no
+// descendants.
+test("ac0be75e: torn parent — --descendants-of follows the INDEX parent, prints the RECORD's", async () => {
+  await withTempHome("acpx-owner-scan-", async (homeDir) => {
+    await seedFamily(homeDir);
+    await tearIndexEntry("g", { parentSessionId: "s" });
+    const underP = await readDescendantSessionOwnerStatuses("p");
+    assert.deepEqual(idsOf(underP.sessions), ["c1", "c2"]);
+    const underS = await readDescendantSessionOwnerStatuses("s");
+    assert.deepEqual(idsOf(underS.sessions), ["g"]);
+    assert.equal(underS.sessions[0]?.parentSessionId, "c2", "the printed field is the record's");
+  });
+});
+
 // ── The memory bound ─────────────────────────────────────────────────────────────────────────
 //
 // 500 records, every other one CLOSED so `--all` reads closed bodies too. Each has a 200-message
