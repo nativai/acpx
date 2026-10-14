@@ -132,6 +132,32 @@ test("index.json and session records are written compact and parse identically",
   });
 });
 
+// brick 19ee17ab (T8) — the flush re-projects from the record under the lock; when that record
+// cannot be read, the index's EXISTING entry is kept. The queued snapshot predates whatever
+// happened since (a close, above all) and must never be written over it.
+test("a pending entry whose record is unreadable at flush keeps the existing index entry", async () => {
+  await withTempHome("acpx-write-policy-", async (homeDir) => {
+    const persistence = await loadPersistence();
+    const dir = sessionsDir(homeDir);
+    const rec = record("torn-session", { lastUsedAt: "2026-06-12T00:00:00.000Z" });
+    await persistence.writeSessionRecord(rec); // membership-immediate
+    rec.lastUsedAt = "2026-06-13T00:00:00.000Z";
+    await persistence.writeSessionRecord(rec); // pending scalar
+
+    await fs.writeFile(path.join(dir, "torn-session.json"), "{ not json", "utf8");
+    await persistence.flushPendingSessionIndexUpdates(dir);
+
+    const index = await readSessionIndex(dir);
+    const entries = index?.entries.filter((entry) => entry.file === "torn-session.json") ?? [];
+    assert.equal(entries.length, 1);
+    assert.equal(
+      entries[0]?.lastUsedAt,
+      "2026-06-12T00:00:00.000Z",
+      "the snapshot must not be written over the existing entry",
+    );
+  });
+});
+
 test("a pending entry whose file was pruned by another process is not resurrected", async () => {
   await withTempHome("acpx-write-policy-", async (homeDir) => {
     const persistence = await loadPersistence();

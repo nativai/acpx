@@ -834,7 +834,7 @@ export async function listSessionRecordFiles(sessionDir: string): Promise<string
     .toSorted();
 }
 
-async function readIndexEntryFromDisk(
+export async function readIndexEntryFromDisk(
   sessionDir: string,
   file: string,
 ): Promise<SessionIndexEntry | undefined> {
