@@ -124,19 +124,18 @@ export type SessionIndexEntryOverlay = {
  *   does.** One record read per file happens inside the lock (measured on the live
  *   store, 400 real records: median 0.68 ms, p90 3.1 ms, p99 8.7 ms, worst 14.5 ms
  *   at 630 KB; store sizes median 5 KB / p99 174 KB / max 1.4 MB). The threshold
- *   that matters is NOT the 5 s stale takeover — it is `INDEX_LOCK_MAX_WAIT_MS`
- *   (2 s), after which a waiting writer **proceeds unlocked**, which is precisely
- *   the racing read-modify-write this lock exists to prevent. Keep the locked
- *   section under ~1 s. See `INDEX_FLUSH_CHUNK` in `session-reparent.ts` for a
- *   worked bound.
+ *   that matters is the waiters' budget: since brick ae547131 a waiting writer no
+ *   longer proceeds unlocked after ~2 s — it waits up to 20 s and then DEFERS its
+ *   write (`IndexLockTimeoutError`), so every second held here is a second every
+ *   other index writer on the box blocks. Keep the locked section under ~1 s. See
+ *   `INDEX_FLUSH_CHUNK` in `session-reparent.ts` for a worked bound.
  *
- * > **Why holding it longer cannot DEADLOCK** (`index-lock.ts`, read before this
- * > was written): acquisition waits at most ~2 s and then proceeds without the
- * > lock — it never blocks indefinitely — and a nested acquisition in the same
- * > process is detected through `AsyncLocalStorage` and runs the callback directly
- * > under the held lock. The reads below are plain `fs.readFile` + parse: no
- * > outbox, no queue flush, no second lock of any kind. The cost of holding too
- * > long is a concurrent writer degrading to unlocked, never a wedge.
+ * > **Why holding it longer cannot DEADLOCK** (`index-lock.ts`): acquisition waits
+ * > at most 20 s and then throws — it never blocks indefinitely — and a nested
+ * > acquisition in the same process is detected through `AsyncLocalStorage` and
+ * > runs the callback directly under the held lock. The reads below are plain
+ * > `fs.readFile` + parse: no outbox, no queue flush, no second lock of any kind.
+ * > The cost of holding too long is concurrent writers deferring, never a wedge.
  *
  * ## Can this read a record MID-WRITE? No, and there are two cases
  *

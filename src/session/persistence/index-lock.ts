@@ -19,7 +19,10 @@ import { acquireIdentityFileLock, releaseIdentityFileLock } from "./identity-fil
  * anyway" was availability over strictness, and it is exactly the lost update the lock exists to
  * prevent — including the seat store's compare-and-swap, which used to ride this lock. Each caller
  * decides what a timeout means: a write that only PROJECTS an already-durable record write logs and
- * continues (reconcile repairs it); a write that IS the operation fails.
+ * defers it (the record stays authoritative; the deferred write re-projects from the record when it
+ * lands, and is dropped loudly at exit if it never does — index-update-queue.ts; acpx's reconcile
+ * repairs membership only, never an entry's fields, and a lost `closed:true` is repaired by
+ * acpx-ui's closed-drift reconcile); a write that IS the operation fails.
  *
  * Within a process, acquisitions on the same lock path are serialized by a promise queue, and
  * nested acquisition (re-entrancy) is detected via AsyncLocalStorage and runs the callback directly

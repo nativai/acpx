@@ -192,6 +192,16 @@ Repo: https://github.com/openclaw/acpx
 - Agent environment: remove inherited descriptive `CLAUDE_EFFORT` from non-Claude
   spawns, preserving recognized SDK Claude and legacy PTY metadata, active effort
   input, and existing Codex environment handling.
+- Sessions: the session index no longer reverts a closed session to open. An
+  index update a process had queued before a close (trailing 5 s flush, lock
+  wait, deferral) used to be written over that close; every flush now
+  re-projects the entry from the session record, read under the index lock.
+  When the index lock stays unavailable, a CLI now retries once at exit and then
+  exits with a `WARNING: session index update dropped` naming the sessions
+  (it used to wait for as long as the lock was held, or drop the update silently
+  on `process.exit()`), and a self-close makes its second index attempt before
+  terminating its own owner. `sessions close` still exits 0; the record stays
+  authoritative. (brick 19ee17ab)
 
 ## 2026.5.23 (v0.10.0)
 
