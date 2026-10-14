@@ -38,6 +38,40 @@ function localHolderBody(pid: number): string {
   })}\n`;
 }
 
+/**
+ * Runs `action` and reports what it armed and warned meanwhile: every `setTimeout` call (the lock's
+ * ONLY wait is its backoff `setTimeout`, identity-file-lock.ts) and every stderr line (a takeover by
+ * AGE, never by death, is announced there as `broke stale`).
+ */
+async function observeTimersAndWarnings(
+  action: () => Promise<void>,
+): Promise<{ timersArmed: number; stderr: string; error: unknown }> {
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalWrite = process.stderr.write;
+  let timersArmed = 0;
+  let stderr = "";
+  globalThis.setTimeout = new Proxy(originalSetTimeout, {
+    apply(target, thisArg, args: Parameters<typeof setTimeout>) {
+      timersArmed++;
+      return Reflect.apply(target, thisArg, args) as ReturnType<typeof setTimeout>;
+    },
+  });
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    stderr += String(chunk);
+    return true;
+  }) as typeof process.stderr.write;
+  let error: unknown;
+  try {
+    await action();
+  } catch (caught) {
+    error = caught;
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+    process.stderr.write = originalWrite;
+  }
+  return { timersArmed, stderr, error };
+}
+
 async function archiveFixture(): Promise<{ archiveDir: string; lockPath: string; shard: string }> {
   const archiveDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-archive-index-lock-"));
   const indexDir = archiveIndexDir(archiveDir);
@@ -63,16 +97,23 @@ test("F3 archive-index lock: a LIVE local holder past the budget ⇒ the writer 
     const shardBefore = await fs.stat(shard);
     const started = Date.now();
     let ran = false;
-    await assert.rejects(
-      withArchiveIndexLock(archiveDir, async () => {
+    const observed = await observeTimersAndWarnings(async () => {
+      await withArchiveIndexLock(archiveDir, async () => {
         ran = true;
         await fs.writeFile(shard, "WRITTEN-UNLOCKED", "utf8");
-      }),
-      (error: unknown) => (error as { code?: string }).code === "index-lock-timeout",
-    );
+      });
+    });
     const waited = Date.now() - started;
+    assert.equal(
+      (observed.error as { code?: string } | undefined)?.code,
+      "index-lock-timeout",
+      String(observed.error),
+    );
     assert.equal(ran, false, `the archive-index writer ran UNLOCKED after ${waited} ms`);
     assert.ok(waited >= 19_500 && waited < 25_000, `waited ${waited} ms`);
+    // The instrument the positive control below relies on, shown to SEE a wait: a waiter backing
+    // off from a live holder arms its backoff timer over and over.
+    assert.ok(observed.timersArmed > 10, `backoff timers seen: ${observed.timersArmed}`);
     assert.equal(await fs.readFile(shard, "utf8"), "ORIGINAL-SHARD", "shard bytes changed");
     assert.equal((await fs.stat(shard)).mtimeMs, shardBefore.mtimeMs, "shard mtime changed");
     assert.equal(await fs.readFile(lockPath, "utf8"), body, "the live holder's lock was broken");
@@ -96,11 +137,22 @@ test("F3 positive control: a DEAD local holder of ARCHIVE-INDEX/.lock is taken o
     // shape; the pid itself is ESRCH in our own scope, which is the proof of death)
     const body = localHolderBody(process.pid).replace(`"pid":${process.pid}`, `"pid":${deadPid}`);
     await fs.writeFile(lockPath, body, "utf8");
+    // "At once" is an ORDERING property, not a wall-clock one (brick 4fb1e3d3, gate red #112: 2,641 ms
+    // against a 1 s bound on a loaded box, with no wait on the path). The dead holder is broken on the
+    // FIRST EEXIST and the create retried with no backoff, so not one timer is armed; and it is broken
+    // for being dead, not for its age, so no `broke stale` warning and nowhere near the 15 s stale bound.
+    // ⚠️ Do not put a wall-clock bound back: it measures the box, and the live row above proves this
+    // instrument sees a wait when there is one.
     const started = Date.now();
-    await withArchiveIndexLock(archiveDir, async () => {
-      await fs.writeFile(shard, "WRITTEN-UNDER-LOCK", "utf8");
+    const observed = await observeTimersAndWarnings(async () => {
+      await withArchiveIndexLock(archiveDir, async () => {
+        await fs.writeFile(shard, "WRITTEN-UNDER-LOCK", "utf8");
+      });
     });
-    assert.ok(Date.now() - started < 1_000, "a dead local holder was not taken over at once");
+    assert.equal(observed.error, undefined, String(observed.error));
+    assert.equal(observed.timersArmed, 0, "the takeover waited (a backoff timer was armed)");
+    assert.doesNotMatch(observed.stderr, /broke stale/u, "taken over by AGE, not as dead");
+    assert.ok(Date.now() - started < 15_000, "taken over only at the stale bound");
     assert.equal(await fs.readFile(shard, "utf8"), "WRITTEN-UNDER-LOCK");
     await assert.rejects(fs.access(lockPath), "the lock was not released");
   } finally {
