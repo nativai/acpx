@@ -29,6 +29,7 @@ import {
   seedOpenSessions,
   sessionsDirOf,
 } from "./index-lock-holder-helpers.js";
+import "./install-owner-reaper.js";
 import { withTempHome } from "./queue-test-helpers.js";
 
 const CHILD_PATH = fileURLToPath(new URL("./index-monotonic-child.js", import.meta.url));
