@@ -380,6 +380,29 @@ async function settledDeliveryPhases(rig: Rig, id: string, messageId: string): P
   return deliveryFrames(await readFrames(rig, id), messageId).map((event) => event.phase);
 }
 
+// The owner.log as of the owner's turn-boundary recycle line, which a failover always ends in.
+//
+// ⚠️ DO NOT READ owner.log STRAIGHT AFTER `settledDeliveryPhases` (brick 4fb1e3d3, gate red #1373). The
+// delivery `done` is appended DURING the deferred re-run; the re-run's client then closes, then the
+// `re-run on target` line is written, then the owner leaves the turn and writes the recycle line
+// (`logTurnBoundaryRecycle`) — all AFTER the terminal the row waits on. Under load that tail measured
+// up to 1.3 s, past the 500 ms grace, and the row read a log without either line (0 recycle lines
+// where 1 was written moments later). The recycle line is the owner's last word: it `break`s out of
+// its loop right after, so once it is there no later line can come from this owner and a count is
+// final. A missing line still reds (bounded wait); a second one still reds the count.
+const OWNER_RECYCLE_LINE = /queue owner recycling session \S+ after turn \(reason=/u;
+
+async function ownerLogAfterRecycle(rig: Rig, id: string): Promise<string> {
+  return await waitFor(
+    async () => {
+      const log = await readText(sessionFile(rig, id, ".owner.log"));
+      return OWNER_RECYCLE_LINE.test(log) ? log : undefined;
+    },
+    "the owner's turn-boundary recycle line",
+    async () => await diagnose(rig, id),
+  );
+}
+
 async function closeSession(rig: Rig, id: string): Promise<void> {
   await rig.cli(["claude", "sessions", "close", id]);
 }
@@ -449,7 +472,7 @@ test("a weekly limit on an injected prompt fails the session over and re-runs th
       assert.equal(record.acpx?.session_options?.account_switch?.reason, "failover");
       assert.equal(await userRowsFor(rig, id, messageId), 1, "one User row for the message");
 
-      const log = await readText(sessionFile(rig, id, ".owner.log"));
+      const log = await ownerLogAfterRecycle(rig, id);
       assert.match(
         log,
         /failed with a rate_limit error; deferring it to an in-owner subscription failover/u,
@@ -527,7 +550,7 @@ test("two limit-refused injected messages are each re-run once, in arrival order
 
       const record = await readRecord(rig, id);
       assert.equal(record.acpx?.session_options?.profile, "target");
-      const log = await readText(sessionFile(rig, id, ".owner.log"));
+      const log = await ownerLogAfterRecycle(rig, id);
       assert.equal(
         log.match(/re-run on target after failover/gu)?.length,
         2,
@@ -561,7 +584,7 @@ test("when the turn's own prompt fails over too, the injected message rides on t
       const record = await readRecord(rig, id);
       assert.equal(record.acpx?.session_options?.profile, "target");
       assert.equal(await userRowsFor(rig, id, injection.messageId), 1, "one User row");
-      const log = await readText(sessionFile(rig, id, ".owner.log"));
+      const log = await ownerLogAfterRecycle(rig, id);
       // One switch: the main turn's. The injected message just ran where the session now was.
       assert.equal(
         log.match(/switched to target by failover/gu)?.length,
