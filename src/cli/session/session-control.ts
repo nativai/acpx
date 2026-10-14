@@ -1194,26 +1194,26 @@ export async function readSessionOwnerStatus(sessionId: string): Promise<Session
  * The batch scans (`--all`, `--descendants-of`) are built from INDEX ENTRIES (brick ac0be75e).
  * They used to start from `listSessions()`, which hydrates the messages log of EVERY record in
  * the store, closed ones included, before any filter runs. That cost ~1.6 MB of heap per record
- * and OOMed on a 3,540-record store. A status needs four record fields, so the scan now reads
- * only the bodies of the entries it reports on, never their messages.
+ * and OOMed on a 3,540-record store. A status needs four record fields, so the scan reads record
+ * BODIES only, never their messages, and keeps nothing of a body past its own check.
  *
- * Which store is the authority:
- * - SELECTION comes from the index. `--all` keeps the entries the index has open. The
- *   descendant walk runs over the index's seat and parent fields, the same graph acpx-ui's
- *   board draws from those entries.
- * - Every EMITTED FIELD (`closed`, `parentSessionId`, `kind`) and the order come from the
- *   RECORD, so the output matches the old `listSessions()` scan byte for byte. That old scan
- *   was also a hybrid: membership from the index, fields from the record.
- * - A torn session, whose index entry still says open after its record closed, is dropped by
- *   `--all` as before, because its record says closed.
- * - The torn case in the other direction is left out: an entry still marked closed after its
- *   record was reopened. Every index flush re-projects the entry from the record on disk
- *   (brick 19ee17ab), so the entry heals on that session's next write. Catching it here would
- *   mean reading every closed record on every scan, which is the cost this change removes.
+ * Which store is the authority — the same split as the old `listSessions()` scan, so the output
+ * matches it byte for byte: MEMBERSHIP comes from the index, every FIELD (`closed`,
+ * `parentSessionId`, `kind`, and the `lastUsedAt` order) from the record.
+ * - `--all` reads the body of EVERY index entry, open or closed, and keeps `record.closed !== true`.
+ *   ⚠️ DO NOT pre-filter on `entry.closed` to skip the closed bodies. It looks like the obvious
+ *   saving and it is a silent miss: an entry still marked closed after its record was reopened
+ *   (torn until that session's next index flush) is a live session, and this verb exists to find
+ *   live owners. The torn-closed row in `test/owner-status-index-scan.test.ts` goes red if you do.
+ *   An entry still marked open after its record closed is dropped, because the record says closed.
+ * - `--descendants-of` walks the index's seat and parent fields, the graph acpx-ui's board draws
+ *   from those entries, and reports every descendant, closed ones as `closed_ignored`.
  */
 export async function readAllSessionOwnerStatuses(): Promise<SessionOwnerStatusBatch> {
-  const entries = (await listSessionIndexEntries()).filter((entry) => !entry.closed);
-  const sessions = (await ownerStatusesForEntries(entries)).filter((status) => !status.closed);
+  const sessions = await ownerStatusesForEntries(
+    await listSessionIndexEntries(),
+    (record) => record.closed !== true,
+  );
   return ownerStatusBatch("all_open", undefined, sessions);
 }
 
@@ -1236,17 +1236,18 @@ export async function readDescendantSessionOwnerStatuses(
 const OWNER_STATUS_SCAN_CONCURRENCY = 8;
 
 /**
- * One status per entry whose record still loads, newest record first. An entry with an
- * unreadable record is dropped, as `listSessions()` dropped it. Only the status outlives
- * the iteration. The record body is released after each probe, so peak heap is bounded by
- * the pool width rather than by the store.
+ * One status per entry whose record still loads and passes `keep`, newest record first. An entry
+ * with an unreadable record is dropped, as `listSessions()` dropped it. A record `keep` rejects is
+ * never probed. Only the status row outlives the iteration: each body is released after its own
+ * check, so peak heap is bounded by the pool width, not by the store.
  */
 async function ownerStatusesForEntries(
   entries: SessionIndexEntry[],
+  keep: (record: SessionRecord) => boolean = () => true,
 ): Promise<SessionOwnerStatus[]> {
   const probed = await mapWithConcurrency(entries, OWNER_STATUS_SCAN_CONCURRENCY, async (entry) => {
     const record = await loadSessionRecordBodyFromIndexEntry(entry);
-    return record
+    return record && keep(record)
       ? { lastUsedAt: record.lastUsedAt, status: await readOwnerStatusForRecord(record) }
       : undefined;
   });

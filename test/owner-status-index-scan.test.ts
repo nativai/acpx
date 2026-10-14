@@ -154,19 +154,19 @@ test("ac0be75e: torn — index entry open, record closed: the RECORD wins, in bo
   });
 });
 
-// The trade-off the fix makes, pinned so it cannot change unnoticed. Only an index entry that
-// says OPEN costs a record read, so an entry left closed after its record was reopened is out of
-// `--all` until that session's next write re-projects it (session-control.ts explains why).
-test("ac0be75e: torn — index entry closed, record open: --all trusts the index for selection", async () => {
+// An index entry still marked closed after its record was reopened is a LIVE session until that
+// session's next index flush re-projects the entry. The old full scan listed it, and `--all` must
+// too: a scan that pre-filters on `entry.closed` goes red here (session-control.ts, the ⚠️ note).
+test("ac0be75e: torn — index entry closed, record open: --all still reports the session", async () => {
   await withTempHome("acpx-owner-scan-", async (homeDir) => {
     await seedFamily(homeDir);
     await tearIndexEntry("s", { closed: true });
     const all = await readAllSessionOwnerStatuses();
-    assert.deepEqual(idsOf(all.sessions), ["c1", "p", "g"]);
-    assert.ok(
-      idsOf(await oracleAll()).includes("s"),
-      "the old full scan read every record, so it still listed s",
-    );
+    assert.equal(asPrinted(all.sessions), asPrinted(await oracleAll()));
+    assert.deepEqual(idsOf(all.sessions), ["c1", "p", "s", "g"]);
+    const s = all.sessions.find((status) => status.sessionId === "s");
+    assert.equal(s?.closed, false);
+    assert.equal(s?.classification, "idle_no_owner");
   });
 });
 
@@ -182,8 +182,9 @@ test("ac0be75e: an entry whose record no longer parses is dropped, as listSessio
 
 // ── The memory bound ─────────────────────────────────────────────────────────────────────────
 //
-// 500 open records, each with a 200-message (~1.2 MB) messages log, hard-linked to ONE file so the
-// fixture costs ~1.2 MB of disk. The old scan retained every record's hydrated tail, ~600 MB,
+// 500 records, every other one CLOSED so `--all` reads closed bodies too. Each has a 200-message
+// (~1.2 MB) messages log, hard-linked to ONE file so the fixture costs ~1.2 MB of disk. The old scan
+// hydrated every record's tail, closed ones included, and retained ~600 MB of it,
 // and aborted with "JavaScript heap out of memory" under a 128 MB heap. On the old code this row
 // FAILS. Measured against 037a1fb1 for brick ac0be75e; see verification/MEASURE.md.
 const BOUND_RECORDS = 500;
@@ -210,6 +211,7 @@ async function seedHeavyStore(): Promise<void> {
       agentCommand: "agent",
       cwd: dir,
       lastUsedAt: `2026-10-14T00:00:${String(i % 60).padStart(2, "0")}.000Z`,
+      closed: i % 2 === 1,
     });
     await fs.writeFile(
       path.join(dir, `${id}.json`),
@@ -257,7 +259,7 @@ test(`ac0be75e: --all over ${BOUND_RECORDS} records with ~1.2 MB message logs co
     assert.doesNotMatch(result.stderr, /heap out of memory/);
     assert.equal(result.code, 0, result.stderr.slice(-2_000));
     const batch = JSON.parse(result.stdout.trim()) as { count: number; sessions: unknown[] };
-    assert.equal(batch.count, BOUND_RECORDS);
-    assert.equal(batch.sessions.length, BOUND_RECORDS);
+    assert.equal(batch.count, BOUND_RECORDS / 2);
+    assert.equal(batch.sessions.length, BOUND_RECORDS / 2);
   });
 });
