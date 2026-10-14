@@ -175,6 +175,18 @@ export type SessionIndexEntry = {
   lastTurnNativeFinishReason?: string;
   lastTurnProviderAt?: string;
   /**
+   * Who started this session: exactly the record's `metadata` entries whose key
+   * starts with {@link STARTED_BY_METADATA_PREFIX}, keys and string values copied
+   * VERBATIM — nothing renamed, nothing parsed. Absent when the record has none.
+   *
+   * ⚠️ Projected onto the INDEX ENTRY, not only the record: atrium's session list
+   * row and chat header read the entry on their hot path and never open `<id>.json`,
+   * so a record-only field fails at RUNTIME with typecheck and build green. BOTH
+   * index legs carry it (`toSessionIndexEntry` + `parseIndexEntry`); no compiler
+   * check covers index fields — `test/session-index-started-by.test.ts` does.
+   */
+  startedBy?: Record<string, string>;
+  /**
    * The DESCRIPTOR's `canSetModelLive`, REFINED by this session's own
    * advertisement (F-12). The UI's live-model control reads this, not the static
    * table — see {@link canSetModelLiveFromRecord}.
@@ -404,6 +416,28 @@ function parseIndexAccountSwitch(value: unknown): SessionIndexAccountSwitch | un
   };
 }
 
+/** Key prefix of the human-identity metadata atrium records on a session it starts. */
+export const STARTED_BY_METADATA_PREFIX = "started_by_";
+
+/**
+ * The `started_by_*` entries of `source`, verbatim, or undefined when there are none.
+ * Non-string values are dropped (the record's metadata is `Record<string,string>`; the
+ * index file is hand-/acpx-ui-writable, so the parse leg cannot assume it).
+ */
+function startedByFrom(source: unknown): Record<string, string> | undefined {
+  const entries = asRecord(source);
+  if (!entries) {
+    return undefined;
+  }
+  const picked: Record<string, string> = {};
+  for (const [key, value] of Object.entries(entries)) {
+    if (key.startsWith(STARTED_BY_METADATA_PREFIX) && typeof value === "string") {
+      picked[key] = value;
+    }
+  }
+  return Object.keys(picked).length > 0 ? picked : undefined;
+}
+
 // eslint-disable-next-line complexity -- flat field-by-field projection of the optional hot-path enrichment scalars; linear, not branchy logic
 function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
   const record = asRecord(raw);
@@ -467,6 +501,7 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     lastTurnProvider: optionalString(record.lastTurnProvider),
     lastTurnNativeFinishReason: optionalString(record.lastTurnNativeFinishReason),
     lastTurnProviderAt: optionalString(record.lastTurnProviderAt),
+    startedBy: startedByFrom(record.startedBy),
     canSetModelLive:
       typeof record.canSetModelLive === "boolean" ? record.canSetModelLive : undefined,
     // brick ebfe4c3c: BOTH index legs. Miss these and the next rewrite of ANY
@@ -641,6 +676,8 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     lastTurnProvider: acpx?.last_turn_provider?.provider_name ?? undefined,
     lastTurnNativeFinishReason: acpx?.last_turn_provider?.native_finish_reason ?? undefined,
     lastTurnProviderAt: acpx?.last_turn_provider?.at,
+    // BOTH index legs: the parse leg is `parseIndexEntry`'s `startedBy`.
+    startedBy: startedByFrom(metadata),
     outputStyleDesired: sessionOptions?.output_style,
     canSetModelLive: canSetModelLiveFromRecord(record),
     resolvedModelLabel: resolvedModelLabelForRecord(record),
