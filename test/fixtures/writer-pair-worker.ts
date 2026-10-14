@@ -68,14 +68,48 @@ async function runOwner(count: number): Promise<void> {
   }
 }
 
-function ownerWrites(i: number): number {
+function ownerWriteCounts(): number[] | undefined {
   try {
     return (
       JSON.parse(fs.readFileSync(path.join(dir, "owner.json"), "utf8")) as { writes: number[] }
-    ).writes[i];
+    ).writes;
   } catch {
-    return 0;
+    return undefined;
   }
+}
+
+function ownerWrites(i: number): number {
+  return ownerWriteCounts()?.[i] ?? 0;
+}
+
+function ownerTotalWrites(): number {
+  return (ownerWriteCounts() ?? []).reduce((sum, count) => sum + count, 0);
+}
+
+// `owner-stalled` means the owner STOPPED checkpointing — no write to ANY record for this long.
+//
+// ⚠️ NOT a deadline on the whole wait (brick 4fb1e3d3, gate red #1938). Two more rewrites of record i
+// take two full round-robins, 2 × records = 40 owner checkpoints, so a flat 20 s deadline was a floor of
+// 2 checkpoints/s on owner throughput — which a loaded box crosses with the owner healthy and the
+// property held (lost 0/20, `owner-stalled` 1). Measured owner throughput on the workbench swings
+// ~3× with box load (11–40/s), identical on main and dev. A progress window tracks the owner, not the box.
+const OWNER_NO_PROGRESS_MS = 20_000;
+
+/** Waits until record i has been rewritten twice after `after`; false only if the owner stalls. */
+async function waitForTwoRewrites(i: number, after: number): Promise<boolean> {
+  let lastTotal = ownerTotalWrites();
+  let lastProgressAt = Date.now();
+  while (ownerWrites(i) < after + 2) {
+    const total = ownerTotalWrites();
+    if (total !== lastTotal) {
+      lastTotal = total;
+      lastProgressAt = Date.now();
+    } else if (Date.now() - lastProgressAt >= OWNER_NO_PROGRESS_MS) {
+      return false;
+    }
+    await sleep(10);
+  }
+  return true;
 }
 
 /** Applies op i to record i and returns a check that is true while the op's effect survives. */
@@ -134,12 +168,7 @@ async function runPair(kind: string, count: number): Promise<void> {
     if (survives(readDisk(recordId(i)))) {
       observedWithOp++;
     }
-    const after = ownerWrites(i);
-    const deadline = Date.now() + 20_000;
-    while (ownerWrites(i) < after + 2 && Date.now() < deadline) {
-      await sleep(10);
-    }
-    if (ownerWrites(i) < after + 2) {
+    if (!(await waitForTwoRewrites(i, ownerWrites(i)))) {
       opErrors["owner-stalled"] = (opErrors["owner-stalled"] ?? 0) + 1;
       continue;
     }
