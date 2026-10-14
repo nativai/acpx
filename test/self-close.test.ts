@@ -30,6 +30,14 @@ import {
 } from "../src/cli/session/session-control.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence/serialize.js";
 import {
+  ChildLines,
+  holdLiveIndexLock,
+  readIndexEntry,
+  readRecordOnDisk,
+  seedOpenSessions,
+  sessionsDirOf,
+} from "./index-lock-holder-helpers.js";
+import {
   closeServer,
   listenServer,
   queuePaths,
@@ -369,6 +377,153 @@ test("self-close: a live owner that is not an ancestor takes the non-self path",
     } finally {
       if (keeper.exitCode == null && keeper.signalCode == null) {
         keeper.kill("SIGKILL");
+      }
+      await closeServer(server).catch(() => {
+        // already closed
+      });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (d) brick 19ee17ab — the INDEX outlives the self-close, not only the record.
+// ---------------------------------------------------------------------------
+
+const INDEX_OWNER_PATH = fileURLToPath(new URL("./self-close-index-owner.js", import.meta.url));
+
+async function waitForExit(
+  exited: Promise<number | null>,
+  timeoutMs: number,
+  what: string,
+): Promise<number | null> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} was never terminated`)), timeoutMs);
+  });
+  try {
+    return await Promise.race([exited, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// T2 — the owner's own pre-close pending update, flushed inside the window between the self
+// arm's index write and the terminate (a deterministic schedule of "the trailing timer fires
+// there"), must not leave the index open after the owner is gone.
+test("self-close T2: the owner's pending pre-close index update cannot reopen the index", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "self-close-index";
+    await seedOpenSessions(homeDir, [sessionId]);
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    const goFile = path.join(homeDir, "self-close-go");
+    const owner = new ChildLines(
+      spawn(process.execPath, [INDEX_OWNER_PATH, CHILD_PATH, sessionId, goFile, socketPath], {
+        env: { ...process.env, HOME: homeDir },
+        stdio: ["ignore", "pipe", "pipe"],
+      }),
+    );
+    try {
+      await owner.line("READY", 20_000);
+      const processIdentity = owner.child.pid
+        ? await readQueueOwnerProcessIdentity(owner.child.pid)
+        : undefined;
+      await writeQueueOwnerLock({
+        lockPath,
+        pid: owner.child.pid,
+        sessionId,
+        socketPath,
+        processIdentity,
+      });
+      await fs.writeFile(goFile, "go\n");
+
+      const drainLine = await owner.line("DRAIN ", 30_000);
+      const exit = await waitForExit(
+        owner.exited.then((result) => result.code),
+        30_000,
+        "the owner stand-in",
+      );
+      assert.equal(exit, 0, `the owner was SIGTERMed by the self-close; stderr=${owner.stderr}`);
+      const { sinceFirstWriteMs } = JSON.parse(drainLine.slice("DRAIN ".length)) as {
+        sinceFirstWriteMs: number;
+      };
+      assert.ok(
+        sinceFirstWriteMs < 4_500,
+        `the owner's own trailing timer may have flushed before the close (${sinceFirstWriteMs} ms) — vacuous run`,
+      );
+      assert.equal((await readRecordOnDisk(homeDir, sessionId)).closed, true);
+      assert.equal(
+        (await readIndexEntry(homeDir, sessionId))?.closed,
+        true,
+        "the owner's flush inside the self-close window must not revert the index",
+      );
+    } finally {
+      if (owner.child.exitCode == null && owner.child.signalCode == null) {
+        owner.child.kill("SIGKILL");
+      }
+    }
+  });
+});
+
+// T2b — the self arm's inline index write DEFERS behind a live lock holder (20 s budget). This
+// process dies with its owner's group at the terminate, so it never reaches beforeExit: the
+// second attempt must run BEFORE the terminate. Holder released at ~25 s → that attempt lands.
+test("self-close T2b: a deferred self-close index write lands before the terminate", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("linux identity");
+    return;
+  }
+  await withTempHome(async (homeDir) => {
+    const sessionId = "self-close-deferred";
+    await seedOpenSessions(homeDir, [sessionId]);
+    const observed: ObservedRequest[] = [];
+    const server = createRecordingOwnerServer(observed);
+    const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
+    await listenServer(server, socketPath);
+    const lock = await holdLiveIndexLock(sessionsDirOf(homeDir));
+
+    const goFile = path.join(homeDir, "self-close-go");
+    const intermediate = spawn(
+      process.execPath,
+      ["-e", INTERMEDIATE_SCRIPT, CHILD_PATH, sessionId, goFile],
+      { env: { ...process.env, HOME: homeDir }, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const lines = new ChildLines(intermediate);
+    let releaseTimer: NodeJS.Timeout | undefined;
+    try {
+      const processIdentity = intermediate.pid
+        ? await readQueueOwnerProcessIdentity(intermediate.pid)
+        : undefined;
+      await writeQueueOwnerLock({
+        lockPath,
+        pid: intermediate.pid,
+        sessionId,
+        socketPath,
+        processIdentity,
+      });
+      await fs.writeFile(goFile, "go\n");
+      releaseTimer = setTimeout(() => void lock.release(), 25_000);
+
+      const exit = await waitForExit(
+        lines.exited.then((result) => result.code),
+        60_000,
+        "intermediate owner",
+      );
+      assert.equal(exit, 0, `stderr: ${lines.stderr}`);
+      await lock.release();
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+
+      assert.equal((await readRecordOnDisk(homeDir, sessionId)).closed, true);
+      assert.ok(lines.stderr.includes("session index update deferred"), lines.stderr);
+      assert.equal(
+        (await readIndexEntry(homeDir, sessionId))?.closed,
+        true,
+        `the second attempt must land closed:true before the owner dies; stderr=${lines.stderr}`,
+      );
+    } finally {
+      clearTimeout(releaseTimer);
+      await lock.release();
+      if (intermediate.exitCode == null && intermediate.signalCode == null) {
+        intermediate.kill("SIGKILL");
       }
       await closeServer(server).catch(() => {
         // already closed

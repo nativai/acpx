@@ -14,6 +14,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -22,6 +23,7 @@ import { withSessionIndexLock } from "../src/session/persistence/index-lock.js";
 import {
   ChildLines,
   childEnv,
+  holdLiveIndexLock,
   readIndexEntry,
   readRecordOnDisk,
   seedOpenSessions,
@@ -30,6 +32,13 @@ import {
 import { withTempHome } from "./queue-test-helpers.js";
 
 const CHILD_PATH = fileURLToPath(new URL("./index-monotonic-child.js", import.meta.url));
+const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+
+// The counter's NAME is product surface — read across processes through ACPX_PERF_METRICS_FILE —
+// so it is pinned here as a literal (index-update-queue.ts SESSION_INDEX_UPDATE_DEFERRED_COUNTER).
+const DEFERRED_COUNTER = "session.index_update_deferred";
+const DEFERRAL_WARNING = "[acpx] WARNING: session index update deferred";
+const DROPPED_AT_EXIT = "[acpx] WARNING: session index update dropped at exit";
 
 function spawnChild(homeDir: string, args: string[]): ChildLines {
   return new ChildLines(
@@ -38,6 +47,16 @@ function spawnChild(homeDir: string, args: string[]): ChildLines {
       stdio: ["ignore", "pipe", "pipe"],
     }),
   );
+}
+
+function countersOf(child: ChildLines): Record<string, number> {
+  const line = child.stdout.split("\n").find((entry) => entry.startsWith("COUNTERS "));
+  assert.ok(line, `child printed no COUNTERS line; stdout=${child.stdout}`);
+  return JSON.parse(line.slice("COUNTERS ".length)) as Record<string, number>;
+}
+
+async function mkTempHome(prefix: string): Promise<string> {
+  return await fs.mkdtemp(path.join(os.tmpdir(), prefix));
 }
 
 /** The pending child's trailing flush must not have fired before the close — else the row is vacuous. */
@@ -155,4 +174,145 @@ test("T6b after close → reopen, a stale pending update cannot undo the second 
       "the trailing flush of an update queued after the reopen must not undo the second close",
     );
   });
+});
+
+// ---------------------------------------------------------------------------
+// T4 + T5a + T5b — the deferral contract, behind a LIVE lock holder (never taken over, so every
+// waiter runs the full 20 s budget). Run concurrently in separate stores so the suite pays one
+// ~45 s wait (the T15 pattern). Holder FIRST: each lock file exists before the process under
+// test is spawned (`holdLiveIndexLock` returns only after writing it).
+// ---------------------------------------------------------------------------
+
+/** T4 — a deferred pre-close entry, retried after the close, leaves the index closed. */
+async function deferredRetryAfterClose(): Promise<void> {
+  const homeDir = await mkTempHome("acpx-t4-");
+  try {
+    const sessionId = "t4-session";
+    await seedOpenSessions(homeDir, [sessionId]);
+    const lock = await holdLiveIndexLock(sessionsDirOf(homeDir));
+    try {
+      const owner = spawnChild(homeDir, ["defer", sessionId, "9000"]);
+      const deferred = await owner.line("DEFERRED ", 30_000);
+      const { blockedMs } = JSON.parse(deferred.slice("DEFERRED ".length)) as {
+        blockedMs: number;
+      };
+      assert.ok(blockedMs >= 19_000, `the write must wait the full budget (${blockedMs} ms)`);
+      // Release, then close at once: the owner's 5 s retry fires after the close lands.
+      await lock.release();
+      const closer = spawnChild(homeDir, ["close", sessionId]);
+      assert.equal((await closer.exited).code, 0, closer.stderr);
+      assert.equal((await readIndexEntry(homeDir, sessionId))?.closed, true, "the close's write");
+
+      const exit = await owner.exited;
+      assert.equal(exit.code, 0, owner.stderr);
+      assert.equal((await readRecordOnDisk(homeDir, sessionId)).closed, true);
+      assert.equal(
+        (await readIndexEntry(homeDir, sessionId))?.closed,
+        true,
+        "T4: the deferred retry must not resurrect the pre-close entry",
+      );
+      assert.ok(owner.stderr.includes(DEFERRAL_WARNING), `T4 stderr: ${owner.stderr}`);
+      assert.ok((countersOf(owner)[DEFERRED_COUNTER] ?? 0) >= 1, `T4 counter: ${owner.stdout}`);
+      assert.equal(owner.stderr.includes("dropped"), false, "the retry landed; nothing dropped");
+    } finally {
+      await lock.release();
+    }
+  } finally {
+    await fs.rm(homeDir, { recursive: true, force: true });
+  }
+}
+
+/** T5a — the real `acpx sessions close` behind a wedged lock: no hang, no silence, rc 0. */
+async function cliCloseBehindWedgedLock(): Promise<void> {
+  const homeDir = await mkTempHome("acpx-t5a-");
+  try {
+    const sessionId = "t5a-session";
+    await seedOpenSessions(homeDir, [sessionId]);
+    const lock = await holdLiveIndexLock(sessionsDirOf(homeDir));
+    try {
+      const env = childEnv(homeDir);
+      for (const key of Object.keys(env)) {
+        // a caller identity would route the close through agent-only paths
+        if (key.startsWith("ACPX_SESSION_") || key.startsWith("ACPX_PARENT_")) {
+          delete env[key];
+        }
+      }
+      const startedAt = Date.now();
+      const cli = new ChildLines(
+        spawn(
+          process.execPath,
+          [CLI_PATH, "--cwd", homeDir, "sessions", "close", "--session-id", sessionId],
+          { env, stdio: ["ignore", "pipe", "pipe"] },
+        ),
+      );
+      const killTimer = setTimeout(() => cli.child.kill("SIGKILL"), 50_000);
+      const exit = await cli.exited;
+      clearTimeout(killTimer);
+      const elapsedMs = Date.now() - startedAt;
+      assert.ok(
+        exit.signal === null && elapsedMs < 50_000,
+        `T5a: the CLI must exit by itself in < 50 s behind a wedged lock (ran ${elapsedMs} ms, ` +
+          `signal ${exit.signal}); stderr=${cli.stderr}`,
+      );
+      assert.equal(exit.code, 0, `T5a rc; stderr=${cli.stderr}`);
+      assert.match(cli.stdout, /closed: true \(read back from record\)/);
+      assert.ok(cli.stderr.includes(DEFERRAL_WARNING), `T5a stderr: ${cli.stderr}`);
+      assert.ok(
+        cli.stderr.includes(DROPPED_AT_EXIT) && cli.stderr.includes(sessionId),
+        `T5a must name the dropped session: ${cli.stderr}`,
+      );
+      assert.equal((await readRecordOnDisk(homeDir, sessionId)).closed, true);
+      // Correct, not a bug: the projection was dropped and the record is the authority.
+      // acpx-ui's closed-drift reconcile heals this entry (CONCEPTION §3.3).
+      assert.equal((await readIndexEntry(homeDir, sessionId))?.closed, false);
+      assert.equal(
+        await fs.readFile(path.join(sessionsDirOf(homeDir), "index.json.lock"), "utf8"),
+        lock.body,
+      );
+    } finally {
+      await lock.release();
+    }
+  } finally {
+    await fs.rm(homeDir, { recursive: true, force: true });
+  }
+}
+
+/** T5b — a deferred entry dropped by `process.exit()` is reported, synchronously. */
+async function deferredDroppedByProcessExit(): Promise<void> {
+  const homeDir = await mkTempHome("acpx-t5b-");
+  try {
+    const sessionId = "t5b-session";
+    await seedOpenSessions(homeDir, [sessionId]);
+    const lock = await holdLiveIndexLock(sessionsDirOf(homeDir));
+    try {
+      const child = spawnChild(homeDir, ["defer", sessionId, "exit"]);
+      const exit = await child.exited;
+      assert.equal(exit.code, 0, child.stderr);
+      assert.ok(child.stdout.includes("DEFERRED "), child.stdout);
+      assert.ok(
+        child.stderr.includes(DROPPED_AT_EXIT) && child.stderr.includes(sessionId),
+        `T5b must report the entry process.exit() dropped: ${child.stderr}`,
+      );
+    } finally {
+      await lock.release();
+    }
+  } finally {
+    await fs.rm(homeDir, { recursive: true, force: true });
+  }
+}
+
+test("T4/T5a/T5b deferral behind a live lock holder: retried without resurrection, bounded, loud", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("linux identity");
+    return;
+  }
+  const results = await Promise.allSettled([
+    deferredRetryAfterClose(),
+    cliCloseBehindWedgedLock(),
+    deferredDroppedByProcessExit(),
+  ]);
+  const failures = results.flatMap((result, i) =>
+    result.status === "rejected" ? [`${["T4", "T5a", "T5b"][i]}: ${String(result.reason)}`] : [],
+  );
+  assert.deepEqual(failures, []);
 });

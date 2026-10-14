@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   readProcessBirthIdentity,
   serializeProcessBirthIdentity,
@@ -13,6 +14,17 @@ import {
   sessionIndexLockPath,
   withSessionIndexLock,
 } from "../src/session/persistence/index-lock.js";
+import {
+  ChildLines,
+  childEnv,
+  holdLiveIndexLock,
+  readIndexEntry,
+  readRecordOnDisk,
+  seedOpenSessions,
+  sessionsDirOf,
+} from "./index-lock-holder-helpers.js";
+
+const MONOTONIC_CHILD_PATH = fileURLToPath(new URL("./index-monotonic-child.js", import.meta.url));
 
 // perf-loadfix W2.2 — index.json.lock. brick ae547131 §6.2 (T15) made it STRICT: identity body,
 // takeover only of a provably dead local holder (at once) or an unjudgeable one older than 15 s,
@@ -250,4 +262,65 @@ test("T15 index lock: a dead holder in our own scope (0a body) is taken over at 
     assert.equal(result.ran, true);
     assert.ok(result.ms < 1_000, `dead holder not taken over at once (${result.ms} ms)`);
   });
+});
+
+/**
+ * T3 (brick 19ee17ab; ⊗ on production `main` 1d0f93fd / RCA d9ab5c0, whose waiters write
+ * UNLOCKED after ~2 s — RCA R1: 2/20 closes reverted at W=12). Six cross-process writers and one
+ * close queue behind a LIVE holder: nothing is written while it holds, and once it releases every
+ * write lands and the close survives the six whole-index rewrites that follow it.
+ */
+test("T3 index lock: cross-process writers and a close wait out a live holder; the close survives", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("linux identity");
+    return;
+  }
+  const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-index-lock-t3-"));
+  try {
+    const writers = Array.from({ length: 6 }, (_, i) => `t3-writer-${i}`);
+    const victim = "t3-victim";
+    await seedOpenSessions(homeDir, [...writers, victim]);
+    const dir = sessionsDirOf(homeDir);
+    const indexFile = path.join(dir, "index.json");
+    const before = await fs.stat(indexFile);
+    const beforeBytes = await fs.readFile(indexFile, "utf8");
+
+    const lock = await holdLiveIndexLock(dir);
+    let children: ChildLines[] = [];
+    try {
+      children = [...writers.map((id) => ["write", id]), ["close", victim]].map(
+        (args) =>
+          new ChildLines(
+            spawn(process.execPath, [MONOTONIC_CHILD_PATH, ...args], {
+              env: childEnv(homeDir),
+              stdio: ["ignore", "pipe", "pipe"],
+            }),
+          ),
+      );
+      await Promise.all(children.map((child) => child.line("WRITING", 30_000)));
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+      const held = await fs.stat(indexFile);
+      assert.equal(
+        held.ino,
+        before.ino,
+        "index.json was replaced while a live holder held the lock",
+      );
+      assert.equal(held.mtimeMs, before.mtimeMs, "index.json was written while the lock was held");
+      assert.equal(await fs.readFile(indexFile, "utf8"), beforeBytes);
+      assert.equal(await fs.readFile(sessionIndexLockPath(dir), "utf8"), lock.body);
+    } finally {
+      await lock.release();
+    }
+    const exits = await Promise.all(children.map((child) => child.exited));
+    exits.forEach((exit, i) => assert.equal(exit.code, 0, children[i]?.stderr));
+
+    for (const id of writers) {
+      const record = await readRecordOnDisk(homeDir, id);
+      assert.equal((await readIndexEntry(homeDir, id))?.lastUsedAt, record.last_used_at, id);
+    }
+    assert.equal((await readRecordOnDisk(homeDir, victim)).closed, true);
+    assert.equal((await readIndexEntry(homeDir, victim))?.closed, true, "the close was reverted");
+  } finally {
+    await fs.rm(homeDir, { recursive: true, force: true });
+  }
 });

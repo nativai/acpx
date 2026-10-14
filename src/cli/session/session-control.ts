@@ -32,9 +32,12 @@ import {
 } from "../../session/model-application.js";
 import { OUTPUT_STYLE_CONFIG_ID, outputStyleChangePending } from "../../session/output-style.js";
 import {
+  abandonPendingSessionIndexUpdates,
+  flushPendingSessionIndexUpdates,
   resolveSessionRecord,
   listSessions,
   readRawRecordClosedState,
+  sessionBaseDir,
   writeSessionRecord,
   writeSessionRecordAtBoundaryWithLifecycle,
   writeSessionRecordWithLifecycle,
@@ -966,6 +969,23 @@ async function detectSelfOwnedOwner(sessionId: string): Promise<SelfOwner | unde
 }
 
 /**
+ * The self arm's SECOND index attempt (brick 19ee17ab, CONCEPTION §3.2b-4). The
+ * privileged write's index update may have DEFERRED (lock timeout) — and this
+ * process will not reach `beforeExit`: the terminate below ends it together with
+ * its owner's process group (the owner's SIGTERM handler kills the group it
+ * leads, `queue-owner-runtime`), so a deferred `closed:true` would die pending.
+ * So the bounded second attempt runs HERE, before the terminate; whatever is
+ * still pending after it is dropped with the WARNING now, while stderr still
+ * exists. With nothing pending this takes no lock and prints nothing.
+ */
+async function landOrDropIndexUpdatesBeforeSelfTerminate(): Promise<void> {
+  await flushPendingSessionIndexUpdates(sessionBaseDir()).catch(() => {
+    // not a lock timeout (those defer, they do not throw): reported just below
+  });
+  abandonPendingSessionIndexUpdates("before the self-close terminate");
+}
+
+/**
  * The SELF-CLOSE arm (brick://f4f1fa54): the session being closed owns the
  * process tree this CLI is running in, so the terminal record is written FIRST
  * and the own owner pid is terminated as the FINAL act. See the block above
@@ -990,6 +1010,7 @@ async function closeSelfOwnedSession(
   // bypass the read-preserve-lifecycle step so `closed: true` lands on disk.
   await writeSessionRecordAtBoundaryWithLifecycle(record);
   const recordClosedState = await readBackRecordClosedState(record.acpxRecordId);
+  await landOrDropIndexUpdatesBeforeSelfTerminate();
 
   // brick e50e171d — TELL the own owner a close is on, without waiting. Its SIGTERM sweep then writes `done /
   // delivered_at_close` for the turn this close cuts (accepted = delivered under a deliberate close), and its
