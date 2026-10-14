@@ -241,6 +241,27 @@ async function waitForCompletion(rig: Rig, id: string, taskId: string): Promise<
   return false;
 }
 
+// The owner.log as of the owner's turn-boundary recycle line.
+//
+// ⚠️ DO NOT READ owner.log RIGHT AFTER THE CLI RETURNS when the row needs that line (brick 4fb1e3d3, gate
+// red #2027). The caller is answered (`sendQueuedTaskResult`) INSIDE the turn; the owner writes the
+// recycle line (`logTurnBoundaryRecycle`) only after the turn ends — and after its post-turn socket check
+// and idle-drain restart. A loaded box puts the read between the two: the log held the failover's port
+// and adapter exit but not yet the line. The owner `break`s right after writing it, so once it is there
+// the log is final; a missing line still reds after the bound.
+async function ownerLogAfterRecycle(rig: Rig, id: string): Promise<string> {
+  const deadline = Date.now() + COMPLETION_WAIT_MS;
+  let log = "";
+  while (Date.now() < deadline) {
+    log = await readText(sessionFile(rig, id, ".owner.log"));
+    if (/queue owner recycling session \S+ after turn \(reason=/u.test(log)) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return log;
+}
+
 async function diagnose(rig: Rig, id: string): Promise<string> {
   const record = await readRecord(rig, id);
   return `acp_session_id=${record.acp_session_id} session_options=${JSON.stringify(record.acpx?.session_options)}\nowner.log:\n${await readText(sessionFile(rig, id, ".owner.log"))}`;
@@ -397,7 +418,7 @@ test("reactive failover still switches, and its recycle line counts the task it 
 
       const record = await readRecord(rig, id);
       assert.equal(record.acpx?.session_options?.profile, "target", "failover switched");
-      const log = await readText(sessionFile(rig, id, ".owner.log"));
+      const log = await ownerLogAfterRecycle(rig, id);
       assert.match(
         log,
         /queue owner recycling session \S+ after turn \(reason=account-switch; switched to target by failover\); killing 1 live background task\(s\)/u,
