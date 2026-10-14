@@ -585,6 +585,8 @@ test("LG3: a CLOSED session stays readable BY ID — status, show, history, expo
   });
 });
 
+const LG4_HANG_BOUND_MS = 60_000;
+
 test("LG4: `sessions new` exits even when the adapter ignores SIGTERM, and the record is stored", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await workdir(homeDir, "repo");
@@ -598,13 +600,22 @@ test("LG4: `sessions new` exits even when the adapter ignores SIGTERM, and the r
       "utf8",
     );
 
+    // The bound only has to turn a HANG into a red: the close escalates SIGTERM → SIGKILL within
+    // ~2.6 s of its start (client.ts AGENT_CLOSE_*). It used to be 8 s, which a loaded box reaches
+    // with no hang at all — two cold node starts plus that escalation measured med 5.4 s, max 8.2 s
+    // under load on main and dev alike, and killed a healthy run (brick 4fb1e3d3, gate red #1341).
+    // ⚠️ Do not tighten it back toward the measured duration; that measures the box, not the exit.
     const result = await runCli(
       ["--cwd", cwd, "--format", "json", "codex", "sessions", "new"],
       homeDir,
-      { cwd, timeoutMs: 8_000 },
+      { cwd, timeoutMs: LG4_HANG_BOUND_MS },
     );
 
-    assert.equal(result.code, 0, `hung or failed (null = killed at 8s): ${result.stderr}`);
+    assert.equal(
+      result.code,
+      0,
+      `hung or failed (null = killed at ${LG4_HANG_BOUND_MS} ms): ${result.stderr}`,
+    );
     const payload = JSON.parse(result.stdout.trim()) as {
       action?: string;
       created?: boolean;
