@@ -25,6 +25,7 @@ export {
   listSessionIndexEntries,
   listSessions,
   listSessionsForAgent,
+  loadSessionRecordBodyFromIndexEntry,
   listSubagentsForSession,
   matchesPruneSessionId,
   migrateTemplateSlugs,

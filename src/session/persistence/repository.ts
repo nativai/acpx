@@ -122,15 +122,35 @@ async function ensureSessionDir(): Promise<void> {
 async function loadRecordFromIndexEntry(
   entry: SessionIndexEntry,
 ): Promise<SessionRecord | undefined> {
+  const record = await loadSessionRecordBodyFromIndexEntry(entry);
   try {
-    const payload = await fs.readFile(path.join(sessionBaseDir(), entry.file), "utf8");
-    const record = parseSessionRecord(JSON.parse(payload));
     return record
       ? await hydrateSessionMessagesFromLog(
           record,
           messagesLogPath(sessionBaseDir(), record.acpxRecordId),
         )
       : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The record an index entry names, parsed from `<id>.json` alone. The messages log is NOT
+ * hydrated, so `messages` holds only what the record carries inline. `undefined` when the
+ * file is missing or unparseable, which matches `loadRecordFromIndexEntry`.
+ *
+ * Use this for a scan that needs record FIELDS and no conversation. Hydration reads up to
+ * `MAX_RUNTIME_MESSAGES` messages per record. Done for every entry in the store, that cost
+ * `sessions owner-status --all` ~1.6 MB of heap per record and OOMed at ~5.7 GB on a
+ * 3,540-record store (brick ac0be75e).
+ */
+export async function loadSessionRecordBodyFromIndexEntry(
+  entry: SessionIndexEntry,
+): Promise<SessionRecord | undefined> {
+  try {
+    const payload = await fs.readFile(path.join(sessionBaseDir(), entry.file), "utf8");
+    return parseSessionRecord(JSON.parse(payload)) ?? undefined;
   } catch {
     return undefined;
   }

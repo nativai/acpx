@@ -1,0 +1,263 @@
+// Brick ac0be75e — `sessions owner-status --all` / `--descendants-of` are built from INDEX ENTRIES.
+//
+// The scans used to start from `listSessions()`, which hydrates every record's messages log (up to
+// 200 messages each, closed records included) before any filter ran. That cost ~1.6 MB of heap per
+// record, and the scan OOMed on a 3,540-record store. The rows below show two things:
+// - the output still matches the old algorithm, which is kept here as an oracle over the same store;
+// - the scan stays within a 128 MB heap on a store that the old algorithm cannot fit in one.
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import fs from "node:fs/promises";
+import path from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+import {
+  familyDescendantRecords,
+  readAllSessionOwnerStatuses,
+  readDescendantSessionOwnerStatuses,
+  readOwnerStatusForRecord,
+  type SessionOwnerStatus,
+} from "../src/cli/session/session-control.js";
+import { messagesLogPath } from "../src/session/messages-log.js";
+import {
+  listSessions,
+  rebuildSessionIndex,
+  serializeSessionRecordForDisk,
+  sessionBaseDir,
+} from "../src/session/persistence.js";
+import type { SessionIndexEntry } from "../src/session/persistence/index.js";
+import type { SessionRecord } from "../src/types.js";
+import { queuePaths, writeQueueOwnerLock } from "./queue-test-helpers.js";
+import { makeSessionRecord, withTempHome } from "./runtime-test-helpers.js";
+
+const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+
+type Seed = Partial<SessionRecord> & { acpxRecordId: string; lastUsedAt: string };
+
+async function writeRecord(seed: Seed): Promise<void> {
+  const record = makeSessionRecord({
+    acpSessionId: `${seed.acpxRecordId}-acp`,
+    agentCommand: "agent",
+    cwd: sessionBaseDir(),
+    ...seed,
+  });
+  await fs.mkdir(sessionBaseDir(), { recursive: true });
+  await fs.writeFile(
+    path.join(sessionBaseDir(), `${seed.acpxRecordId}.json`),
+    `${JSON.stringify(serializeSessionRecordForDisk(record))}\n`,
+  );
+}
+
+// p ─┬─ c1 (open, subagent, dead-owner lease)
+//    └─ c2 (closed) ── g (open)
+// s (open, standalone) · x (closed, standalone)
+async function seedFamily(homeDir: string): Promise<void> {
+  await writeRecord({ acpxRecordId: "p", lastUsedAt: "2026-10-14T03:00:00.000Z" });
+  await writeRecord({
+    acpxRecordId: "c1",
+    lastUsedAt: "2026-10-14T05:00:00.000Z",
+    parentSessionId: "p",
+    kind: "subagent",
+  });
+  await writeRecord({
+    acpxRecordId: "c2",
+    lastUsedAt: "2026-10-14T04:00:00.000Z",
+    parentSessionId: "p",
+    closed: true,
+  });
+  await writeRecord({
+    acpxRecordId: "g",
+    lastUsedAt: "2026-10-14T01:00:00.000Z",
+    parentSessionId: "c2",
+  });
+  await writeRecord({ acpxRecordId: "s", lastUsedAt: "2026-10-14T02:00:00.000Z" });
+  await writeRecord({ acpxRecordId: "x", lastUsedAt: "2026-10-14T06:00:00.000Z", closed: true });
+  await rebuildSessionIndex(sessionBaseDir(), "test seed");
+  const { lockPath, socketPath } = queuePaths(homeDir, "c1");
+  await writeQueueOwnerLock({ lockPath, pid: 999_999, sessionId: "c1", socketPath });
+}
+
+/** Tear the index from the record: rewrite one field on the index ENTRY only. */
+async function tearIndexEntry(id: string, patch: Partial<SessionIndexEntry>): Promise<void> {
+  const indexPath = path.join(sessionBaseDir(), "index.json");
+  const index = JSON.parse(await fs.readFile(indexPath, "utf8")) as {
+    entries: SessionIndexEntry[];
+  };
+  const entry = index.entries.find((candidate) => candidate.acpxRecordId === id);
+  assert.ok(entry, `no index entry for ${id}`);
+  Object.assign(entry, patch);
+  await fs.writeFile(indexPath, `${JSON.stringify(index)}\n`);
+}
+
+// The pre-ac0be75e algorithm, verbatim, as the oracle.
+async function oracleAll(): Promise<SessionOwnerStatus[]> {
+  const records = (await listSessions()).filter((record) => record.closed !== true);
+  return await Promise.all(records.map(async (record) => await readOwnerStatusForRecord(record)));
+}
+
+async function oracleDescendants(rootId: string): Promise<SessionOwnerStatus[]> {
+  const descendants = familyDescendantRecords(rootId, await listSessions());
+  return await Promise.all(
+    descendants.map(async (record) => await readOwnerStatusForRecord(record)),
+  );
+}
+
+const idsOf = (sessions: SessionOwnerStatus[]) => sessions.map((status) => status.sessionId);
+
+// Byte-for-byte as the CLI prints it, key order included, minus the one field that is a clock
+// reading (`heartbeatAgeMs` is "now − heartbeatAt", so two reads a few ms apart differ).
+function asPrinted(sessions: SessionOwnerStatus[]): string {
+  return JSON.stringify(sessions.map(({ heartbeatAgeMs: _age, ...rest }) => rest));
+}
+
+test("ac0be75e: --all matches the old full-hydration scan, open sessions newest first", async () => {
+  await withTempHome("acpx-owner-scan-", async (homeDir) => {
+    await seedFamily(homeDir);
+    const batch = await readAllSessionOwnerStatuses();
+    assert.equal(asPrinted(batch.sessions), asPrinted(await oracleAll()));
+    assert.deepEqual(idsOf(batch.sessions), ["c1", "p", "s", "g"]);
+    assert.equal(batch.count, 4);
+    assert.equal(batch.recoverableCount, 1, "c1's dead-owner lease is still read");
+    const c1 = batch.sessions.find((status) => status.sessionId === "c1");
+    assert.equal(c1?.kind, "subagent");
+    assert.equal(c1?.parentSessionId, "p");
+    assert.equal(c1?.classification, "recoverable_owner");
+  });
+});
+
+test("ac0be75e: --descendants-of matches the old scan, closed descendants kept as closed_ignored", async () => {
+  await withTempHome("acpx-owner-scan-", async (homeDir) => {
+    await seedFamily(homeDir);
+    const batch = await readDescendantSessionOwnerStatuses("p");
+    assert.equal(asPrinted(batch.sessions), asPrinted(await oracleDescendants("p")));
+    assert.deepEqual(idsOf(batch.sessions), ["c1", "c2", "g"]);
+    assert.equal(batch.ignoredCount, 1);
+    assert.equal(
+      batch.sessions.find((status) => status.sessionId === "c2")?.classification,
+      "closed_ignored",
+    );
+  });
+});
+
+test("ac0be75e: torn — index entry open, record closed: the RECORD wins, in both scopes", async () => {
+  await withTempHome("acpx-owner-scan-", async (homeDir) => {
+    await seedFamily(homeDir);
+    await tearIndexEntry("c2", { closed: false });
+    await tearIndexEntry("x", { closed: false });
+    const all = await readAllSessionOwnerStatuses();
+    assert.equal(asPrinted(all.sessions), asPrinted(await oracleAll()));
+    assert.deepEqual(idsOf(all.sessions), ["c1", "p", "s", "g"], "neither c2 nor x is open");
+    const descendants = await readDescendantSessionOwnerStatuses("p");
+    const c2 = descendants.sessions.find((status) => status.sessionId === "c2");
+    assert.equal(c2?.closed, true);
+    assert.equal(c2?.classification, "closed_ignored");
+  });
+});
+
+// The trade-off the fix makes, pinned so it cannot change unnoticed. Only an index entry that
+// says OPEN costs a record read, so an entry left closed after its record was reopened is out of
+// `--all` until that session's next write re-projects it (session-control.ts explains why).
+test("ac0be75e: torn — index entry closed, record open: --all trusts the index for selection", async () => {
+  await withTempHome("acpx-owner-scan-", async (homeDir) => {
+    await seedFamily(homeDir);
+    await tearIndexEntry("s", { closed: true });
+    const all = await readAllSessionOwnerStatuses();
+    assert.deepEqual(idsOf(all.sessions), ["c1", "p", "g"]);
+    assert.ok(
+      idsOf(await oracleAll()).includes("s"),
+      "the old full scan read every record, so it still listed s",
+    );
+  });
+});
+
+test("ac0be75e: an entry whose record no longer parses is dropped, as listSessions dropped it", async () => {
+  await withTempHome("acpx-owner-scan-", async (homeDir) => {
+    await seedFamily(homeDir);
+    await fs.writeFile(path.join(sessionBaseDir(), "s.json"), "{ not json\n");
+    const all = await readAllSessionOwnerStatuses();
+    assert.equal(asPrinted(all.sessions), asPrinted(await oracleAll()));
+    assert.deepEqual(idsOf(all.sessions), ["c1", "p", "g"]);
+  });
+});
+
+// ── The memory bound ─────────────────────────────────────────────────────────────────────────
+//
+// 500 open records, each with a 200-message (~1.2 MB) messages log, hard-linked to ONE file so the
+// fixture costs ~1.2 MB of disk. The old scan retained every record's hydrated tail, ~600 MB,
+// and aborted with "JavaScript heap out of memory" under a 128 MB heap. On the old code this row
+// FAILS. Measured against 037a1fb1 for brick ac0be75e; see verification/MEASURE.md.
+const BOUND_RECORDS = 500;
+const BOUND_MESSAGES = 200;
+const BOUND_HEAP_MB = 128;
+
+async function seedHeavyStore(): Promise<void> {
+  const dir = sessionBaseDir();
+  await fs.mkdir(dir, { recursive: true });
+  const text = "x".repeat(6_000);
+  const lines = Array.from(
+    { length: BOUND_MESSAGES },
+    (_, i) =>
+      `${JSON.stringify({ Agent: { content: [{ Text: `${i}${text}` }], tool_results: {} } })}\n`,
+  ).join("");
+  const sharedLog = path.join(dir, "shared-log.ndjson.src");
+  await fs.writeFile(sharedLog, lines);
+  const bytes = Buffer.byteLength(lines);
+  for (let i = 0; i < BOUND_RECORDS; i += 1) {
+    const id = `heavy-${String(i).padStart(4, "0")}`;
+    const record = makeSessionRecord({
+      acpxRecordId: id,
+      acpSessionId: `${id}-acp`,
+      agentCommand: "agent",
+      cwd: dir,
+      lastUsedAt: `2026-10-14T00:00:${String(i % 60).padStart(2, "0")}.000Z`,
+    });
+    await fs.writeFile(
+      path.join(dir, `${id}.json`),
+      `${JSON.stringify({
+        ...serializeSessionRecordForDisk(record),
+        messages_log: { v: 1, count: BOUND_MESSAGES, base_index: 0, bytes },
+      })}\n`,
+    );
+    await fs.link(sharedLog, messagesLogPath(dir, id));
+  }
+  await rebuildSessionIndex(dir, "test seed");
+}
+
+async function runBoundedCli(
+  homeDir: string,
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: homeDir, ACPX_STATE_HOME: homeDir };
+  return await new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      [
+        `--max-old-space-size=${BOUND_HEAP_MB}`,
+        CLI_PATH,
+        "--format",
+        "json",
+        "sessions",
+        "owner-status",
+        "--all",
+      ],
+      { env, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => (stdout += chunk));
+    child.stderr.setEncoding("utf8").on("data", (chunk: string) => (stderr += chunk));
+    child.once("error", reject);
+    child.once("close", (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+test(`ac0be75e: --all over ${BOUND_RECORDS} records with ~1.2 MB message logs completes under a ${BOUND_HEAP_MB} MB heap`, async () => {
+  await withTempHome("acpx-owner-scan-bound-", async (homeDir) => {
+    await seedHeavyStore();
+    const result = await runBoundedCli(homeDir);
+    assert.doesNotMatch(result.stderr, /heap out of memory/);
+    assert.equal(result.code, 0, result.stderr.slice(-2_000));
+    const batch = JSON.parse(result.stdout.trim()) as { count: number; sessions: unknown[] };
+    assert.equal(batch.count, BOUND_RECORDS);
+    assert.equal(batch.sessions.length, BOUND_RECORDS);
+  });
+});
