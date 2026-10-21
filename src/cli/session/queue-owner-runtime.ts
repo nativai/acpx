@@ -6,6 +6,7 @@ import { formatErrorMessage } from "../../acp/error-normalization.js";
 import { harnessIdForAgentCommand } from "../../acp/harness-capabilities.js";
 import { supportsMidTurnPromptInjection } from "../../acp/mid-turn-injection-support.js";
 import { withTimeout } from "../../async-control.js";
+import { defaultBoxRuntimeInfoPath } from "../../box-runtime-info.js";
 import { QueueConnectionError, SessionClosedError } from "../../errors.js";
 import { checkpointPerfMetricsCapture } from "../../perf-metrics-capture.js";
 import { incrementPerfCounter, setPerfGauge } from "../../perf-metrics.js";
@@ -98,14 +99,11 @@ const QUEUE_OWNER_HEARTBEAT_INTERVAL_MS = 5_000;
 // so an idle owner can restore its listener without replaying the prompt.
 const QUEUE_OWNER_SOCKET_CONTINUITY_INTERVAL_MS = 500;
 
-// Path-1 deploy-staleness signal (W13-24-10). The default deployed-SHA record on
-// every dev-server; `refresh.sh` rewrites `.acpx.sha` here on every deploy.
-const DEFAULT_DEPLOY_VERSION_FILE = "/workspace/.runtime/info.json";
-
-// Primary signal: the dev-server deploy record's `.acpx.sha` (path from
-// `ACPX_DEPLOY_VERSION_FILE`, else the default above). refresh.sh rewrites it.
+// Path-1 deploy-staleness signal (W13-24-10). Primary signal: the dev-server deploy
+// record's `.acpx.sha` (path from `ACPX_DEPLOY_VERSION_FILE`, else the box's runtime
+// record, see box-runtime-info.ts). `refresh.sh` rewrites it on every deploy.
 function readDeployRecordSha(): string | undefined {
-  const infoPath = process.env.ACPX_DEPLOY_VERSION_FILE || DEFAULT_DEPLOY_VERSION_FILE;
+  const infoPath = process.env.ACPX_DEPLOY_VERSION_FILE || defaultBoxRuntimeInfoPath();
   try {
     const parsed = JSON.parse(fs.readFileSync(infoPath, "utf8")) as { acpx?: { sha?: unknown } };
     const sha = parsed?.acpx?.sha;

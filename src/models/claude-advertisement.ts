@@ -36,6 +36,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { CLAUDE_ACP_FORK_COMMAND, resolveClaudeAcpCommand } from "../agent-registry.js";
+import { defaultBoxRuntimeInfoPath } from "../box-runtime-info.js";
 import {
   advertisedModelOptions,
   parseAdvertisedOptions,
@@ -44,9 +45,6 @@ import {
 import type { ClaudeAdvertisementStatus } from "./types.js";
 
 export const CLAUDE_ADVERT_SCHEMA = "acpx.claude-advertisement.v1";
-
-/** `ACPX_RUNTIME_INFO_PATH` overrides it — the tests' seam; the suite scrub points it at nothing. */
-export const DEFAULT_RUNTIME_INFO_PATH = "/workspace/.runtime/info.json";
 
 /** Measured probe: ~1.4–2.7 s (CONTRACT §4.1 iv). The bound, not the expectation. */
 export const CLAUDE_PROBE_TIMEOUT_MS = 60_000;
@@ -146,8 +144,9 @@ export function defaultClaudeAdvertCachePath(env: NodeJS.ProcessEnv = process.en
   return path.join(stateRoot(env), ".acpx", "claude-advertisement.json");
 }
 
+/** `ACPX_RUNTIME_INFO_PATH` overrides the box's runtime record — the tests' seam; the suite scrub points it at nothing. */
 export function runtimeInfoPathFor(env: NodeJS.ProcessEnv = process.env): string {
-  return env.ACPX_RUNTIME_INFO_PATH?.trim() || DEFAULT_RUNTIME_INFO_PATH;
+  return env.ACPX_RUNTIME_INFO_PATH?.trim() || defaultBoxRuntimeInfoPath();
 }
 
 /**
