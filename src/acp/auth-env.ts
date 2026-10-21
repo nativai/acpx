@@ -658,6 +658,47 @@ function parseCodexConfigEnv(raw: string | undefined): Record<string, unknown> |
   return parsed as Record<string, unknown>;
 }
 
+const WORKBENCH_SEAT_PLACEHOLDER = "{seat}";
+const WORKBENCH_SEAT_KEY = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * `ACPX_WORKBENCH_HOST` — this seat's own workbench address (per-seat workbench plan I1/K2, brick
+ * 79f7a34f): `ACPX_WORKBENCH_HOST_TEMPLATE` from acpx's own env with its one `{seat}` replaced by the
+ * lowercase seat UUID. Its presence is what switches a process to per-seat workbenches (K14), so every
+ * case that is not a clean template plus a seat UUID exports NOTHING:
+ *
+ *  - template unset / blank, or no seat (the transient creation spawn) → absent, silently
+ *  - template without `{seat}`, or with it more than once              → absent, one stderr warning
+ *  - seat that is not a UUID (contract C0 refuses anything else)       → absent, one stderr warning
+ *
+ * No `baseUrl` gate, unlike ACPX_SEAT_URL: the seat id alone composes the address. The caller has
+ * already deleted any inherited value (the FW-07 block), so absent here really is absent.
+ */
+function applyWorkbenchHostEnvironment(
+  env: NodeJS.ProcessEnv,
+  seatId: string | null | undefined,
+): void {
+  const template = env.ACPX_WORKBENCH_HOST_TEMPLATE?.trim();
+  const seat = seatId?.trim().toLowerCase();
+  if (!template || !seat) {
+    return;
+  }
+  if (template.split(WORKBENCH_SEAT_PLACEHOLDER).length !== 2) {
+    process.stderr.write(
+      `[acpx] ACPX_WORKBENCH_HOST_TEMPLATE must contain ${WORKBENCH_SEAT_PLACEHOLDER} exactly once; ` +
+        `ACPX_WORKBENCH_HOST is not set for this session.\n`,
+    );
+    return;
+  }
+  if (!WORKBENCH_SEAT_KEY.test(seat)) {
+    process.stderr.write(
+      `[acpx] seat id ${JSON.stringify(seat)} is not a UUID; ACPX_WORKBENCH_HOST is not set for this session.\n`,
+    );
+    return;
+  }
+  env.ACPX_WORKBENCH_HOST = template.replace(WORKBENCH_SEAT_PLACEHOLDER, seat);
+}
+
 function preservesInheritedClaudeEffort(agentCommand: string | undefined): boolean {
   if (isClaudeFamilyAgent(agentCommand)) {
     return true;
@@ -695,6 +736,10 @@ function buildAgentEnvironment(
   // of the feature working.
   delete env.ACPX_SEAT_URL;
   delete env.ACPX_PARENT_SEAT_URL;
+  // Per-seat workbench (brick 79f7a34f) — the workbench address is seat identity like ACPX_SEAT_URL: a
+  // long-lived owner that served another seat must never hand that seat's workbench to this child. Re-set
+  // below from THIS spawn's seat by applyWorkbenchHostEnvironment, or stays absent.
+  delete env.ACPX_WORKBENCH_HOST;
   // eb8b1fa3 — the holder's own ordinal is session identity like the two above: an inherited value would
   // label a child's journal lines with its PARENT's holder number. Re-set below from THIS spawn's context.
   delete env.ACPX_SEAT_ORDINAL;
@@ -955,6 +1000,7 @@ function buildAgentEnvironment(
       env.ACPX_SEAT_URL = `${baseUrl}/?seat=${trimmedSeat}`;
     }
   }
+  applyWorkbenchHostEnvironment(env, sessionContext?.seatId);
   // eb8b1fa3 (S4.5/AC5) — the holder's OWN ordinal, beside ACPX_SESSION_NAME (the SEAT's name, the same for
   // every holder). Together with the session id they let the brick CLI attribute a journal line to
   // `<seat> #<ordinal> (session:<id8>)` with no schema change. No base URL needed: it composes nothing.
