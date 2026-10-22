@@ -1233,7 +1233,28 @@ async function persistRecordFile(
   return raw;
 }
 
+// One boundary append per log file at a time in this process (brick://5b608eaa). Two
+// overlapping boundary writes of one record — two injections drained in one tick — would
+// each slice from the same logged count before either advanced it, append the same entries
+// twice, and truncate to a watermark the other had already moved. The slice is taken INSIDE
+// the critical section. Per process only: the record write (lock + rename) stays outside it.
+const messagesLogBoundaryChains = new Map<string, Promise<void>>();
+
 async function writeMessagesLogBoundary(record: SessionRecord, logPath: string): Promise<void> {
+  const previous = messagesLogBoundaryChains.get(logPath) ?? Promise.resolve();
+  const current = previous.then(() => appendMessagesLogBoundary(record, logPath));
+  const settled = current.catch(() => {});
+  messagesLogBoundaryChains.set(logPath, settled);
+  try {
+    await current;
+  } finally {
+    if (messagesLogBoundaryChains.get(logPath) === settled) {
+      messagesLogBoundaryChains.delete(logPath);
+    }
+  }
+}
+
+async function appendMessagesLogBoundary(record: SessionRecord, logPath: string): Promise<void> {
   await prepareMessagesLogForBoundary(record, logPath);
 
   const loggedCount = getLoggedMessageCount(record);

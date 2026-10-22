@@ -2220,6 +2220,13 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     applyConversation(record, conversation);
     record.acpx = acpxState;
     await writeSessionRecordAtBoundary(record);
+    // A no-op while `record` and `conversation` share one messages array: the logged count is
+    // keyed by the array, so the write's advance is already visible here (brick://5b608eaa).
+    // It acts only if a log compaction inside that write re-based `record.messages` onto the
+    // compacted copy. ⚠️ Never turn this into a copy that wins over a shared count — a
+    // per-carrier copy-back is the bug: the turn's checkpoint copied a pre-append count over
+    // the fresh one and the next boundary write re-appended the tail
+    // (test/messages-log-injection-dup.test.ts).
     copyLoggedMessageCount(record, conversation);
     return { messageId: promptMessageId, deduplicated: false };
   };
@@ -2768,7 +2775,12 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     }
     stampSteerBoundaryUuid(conversation, injectedMessageId, steerBoundaryUuid);
     applyConversation(record, conversation);
-    await writeSessionRecordAtBoundary(record);
+    // ⚠️ A CHECKPOINT, NEVER A BOUNDARY (brick://5b608eaa): the ack arrives while the
+    // turn still streams, so the last entry is the in-progress Agent message. A boundary
+    // write would append that partial to the append-only log and count it logged, so the
+    // finished text would never reach the log (test/messages-log-injection-dup.test.ts,
+    // the steer-ack row). The stamp rides the inline tail or the next boundary write.
+    await writeSessionRecord(record);
   };
 
   const sendInjectedResultIfWaiting = (
