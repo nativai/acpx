@@ -629,6 +629,6 @@ test("L1.11 close prints the record-derived closed state read back from disk", a
       homeDir,
     );
     assert.equal(textResult.code, 0, `stderr was:\n${textResult.stderr}`);
-    assert.match(textResult.stdout, /closed: true \(read back from record\)/);
+    assert.match(textResult.stdout, /closed: true \(read back from record [^)]+\)/);
   });
 });

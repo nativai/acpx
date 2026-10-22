@@ -256,7 +256,7 @@ async function cliCloseBehindWedgedLock(): Promise<void> {
           `signal ${exit.signal}); stderr=${cli.stderr}`,
       );
       assert.equal(exit.code, 0, `T5a rc; stderr=${cli.stderr}`);
-      assert.match(cli.stdout, /closed: true \(read back from record\)/);
+      assert.match(cli.stdout, /closed: true \(read back from record [^)]+\)/);
       assert.ok(cli.stderr.includes(DEFERRAL_WARNING), `T5a stderr: ${cli.stderr}`);
       assert.ok(
         cli.stderr.includes(DROPPED_AT_EXIT) && cli.stderr.includes(sessionId),

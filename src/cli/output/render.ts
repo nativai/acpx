@@ -230,7 +230,7 @@ export function printClosedSessionByFormat(
     return;
   }
   process.stdout.write(
-    `closed: ${formatRawFieldForText(recordClosedState.closed)} (read back from record)\n`,
+    `closed: ${formatRawFieldForText(recordClosedState.closed)} (read back from record ${record.acpxRecordId})\n`,
   );
   if (processReport && !processReport.ownerStopped) {
     process.stderr.write(
