@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
+import { ForkCutUnresolvedError } from "../../acp/claude-fork-anchor.js";
 import {
   AcpClient,
   type SessionCreateResult,
@@ -1014,7 +1015,11 @@ function forkCutOptions(
   logWindow: LogIndexForkWindow | undefined,
 ) {
   return logWindow
-    ? { atIndex: logWindow.logIndex, atIndexIsAbsolute: true, sourceMessages: logWindow.messages }
+    ? {
+        atIndex: logWindow.logIndex,
+        logIndexHistory: logWindow.history,
+        sourceMessages: logWindow.messages,
+      }
     : { atIndex: options.forkAtMessageIndex, sourceMessages: sourceRecord.messages };
 }
 
@@ -1169,6 +1174,11 @@ async function forkSessionRecordWithClient(
       },
     };
   } catch (error) {
+    // A coded refusal keeps its own shape (detailCode + stderr JSON line), so a
+    // caller can route FORK_CUT_UNRESOLVED without parsing a wrapped message.
+    if (error instanceof ForkCutUnresolvedError) {
+      throw error;
+    }
     throw new Error(
       `Failed to copy ACP session ${sourceRecord.acpSessionId}: ${formatErrorMessage(error)}`,
       {

@@ -596,22 +596,211 @@ async function writeTranscript(homeDir: string, cwd: string, acpSessionId: strin
   await fs.writeFile(transcriptPath, `${rows.join("\n")}\n`, "utf8");
 }
 
-test("Claude, no uuid anywhere in the window: the positional fallback receives the ABSOLUTE n", async () => {
+// ── uuid-free windows: proven cut or refusal, never positional (verification T10) ──
+
+type Row = Record<string, unknown>;
+const tUser = (uuid: string, text: string): Row => ({
+  type: "user",
+  uuid,
+  message: { content: text },
+});
+const tText = (uuid: string, text: string): Row => ({
+  type: "assistant",
+  uuid,
+  message: { content: [{ type: "text", text }] },
+});
+const tToolUse = (uuid: string, id: string): Row => ({
+  type: "assistant",
+  uuid,
+  message: { content: [{ type: "tool_use", id, name: "Bash", input: {} }] },
+});
+const tToolResult = (uuid: string, id: string): Row => ({
+  type: "user",
+  uuid,
+  message: { content: [{ type: "tool_result", tool_use_id: id, content: "ok" }] },
+});
+const tQueued = (uuid: string, text: string): Row => ({
+  type: "attachment",
+  uuid,
+  attachment: { type: "queued_command", prompt: [{ type: "text", text }] },
+});
+const COMPACTION: Row = { type: "system", subtype: "compact_boundary" };
+
+async function writeRows(homeDir: string, cwd: string, acpSessionId: string, rows: Row[]) {
+  const transcriptPath = transcriptJsonlPath(path.join(homeDir, ".claude"), cwd, acpSessionId);
+  await fs.mkdir(path.dirname(transcriptPath), { recursive: true });
+  await fs.writeFile(transcriptPath, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+}
+
+const said = (id: string, text: string): SessionMessage => ({
+  User: { id, content: [{ Text: text }] },
+});
+const replied = (text: string, tools: string[] = []): SessionMessage => ({
+  Agent: {
+    content: [
+      { Text: text },
+      ...tools.map((id) => ({
+        ToolUse: { id, name: "Bash", raw_input: "{}", input: {}, is_input_complete: true },
+      })),
+    ],
+    tool_results: Object.fromEntries(
+      tools.map((id) => [
+        id,
+        { tool_use_id: id, tool_name: "Bash", is_error: false, content: { Text: "ok" } },
+      ]),
+    ),
+  },
+});
+
+/**
+ * The dbf3122b shape (T10): no claude_uuid anywhere, and the record carries a
+ * re-appended [Agent, User] pair, so record positions run AHEAD of transcript
+ * slots. Record: q0 a0 q1 (a0 q1 again) a1 q2 a2 q3 a3 q4 a4 = 12 entries;
+ * transcript: 10 slots.
+ */
+const DIVERGING: SessionMessage[] = [
+  said("u0", "first question"),
+  replied("first answer"),
+  said("u1", "second question"),
+  replied("first answer"),
+  said("u1", "second question"),
+  replied("second answer"),
+  said("u2", "third question"),
+  replied("third answer"),
+  said("u3", "fourth question"),
+  replied("fourth answer"),
+  said("u4", "fifth question"),
+  replied("fifth answer"),
+];
+const DIVERGING_ROWS: Row[] = [
+  tUser("t-u0", "first question"),
+  tText("t-a0", "first answer"),
+  tUser("t-u1", "second question"),
+  tText("t-a1", "second answer"),
+  tUser("t-u2", "third question"),
+  tText("t-a2", "third answer"),
+  tUser("t-u3", "fourth question"),
+  tText("t-a3", "fourth answer"),
+  tUser("t-u4", "fifth question"),
+  tText("t-a4", "fifth answer"),
+];
+
+async function resolveLogIndex(
+  homeDir: string,
+  record: SessionMessage[],
+  rows: Row[],
+  n: number,
+): Promise<string | undefined> {
+  const cwd = path.join(homeDir, "project");
+  await writeRows(homeDir, cwd, "session-log-index", rows);
+  return await resolveClaudeForkResumeAt({
+    cwd,
+    acpSessionId: "session-log-index",
+    atIndex: n,
+    sourceMessages: record.slice(Math.max(0, n - 200), n),
+    logIndexHistory: { before: record.slice(0, n), after: record.slice(n) },
+  });
+}
+
+test("uuid-free window on a diverging record: the Claude cut ends at the selected reply, never in the parent's future", async () => {
   await withTempHome("acpx-at-log-index-", async (homeDir) => {
-    const cwd = path.join(homeDir, "project");
-    await writeTranscript(homeDir, cwd, "session-absolute", 300);
-    // The window ending at n=101 (positions [0, 101)), no claude_uuid anywhere —
-    // a September-style record. Absolute: slot n-1 = 100 → t-100. Window
-    // semantics (recordMessageTotal = the window length) would count back from
-    // the transcript TAIL: 300 - 101 + 100 = 299 → t-299.
-    const resolved = await resolveClaudeForkResumeAt({
-      cwd,
-      acpSessionId: "session-absolute",
-      atIndex: 101,
-      sourceMessages: conversation(0, 101),
-      atIndexIsAbsolute: true,
-    });
-    assert.equal(resolved, "t-100");
+    // n=8 keeps entries [0,8): it ends with "third answer", and entry 8 opens the
+    // next turn. Positional arithmetic reads slot n-1 = 7 → t-a3 ("fourth answer",
+    // the parent's FUTURE) — what 88d81685 forked at. The proven cut is t-a2.
+    assert.equal(await resolveLogIndex(homeDir, DIVERGING, DIVERGING_ROWS, 8), "t-a2");
+    // Right after a user message the context ends BEFORE it (D5 asymmetry).
+    assert.equal(await resolveLogIndex(homeDir, DIVERGING, DIVERGING_ROWS, 9), "t-a2");
+  });
+});
+
+test("uuid-free window: content the record files AFTER the cut stops the context before it", async () => {
+  await withTempHome("acpx-at-log-index-", async (homeDir) => {
+    // A mid-turn delivery: acpx recorded q1 after T1, but Claude kept working
+    // (text + T2) before it attached q1 as a queued_command. acpx filed that work
+    // under the entry AFTER q1. A cut right after q1 must not show it.
+    const record: SessionMessage[] = [
+      said("u0", "first question"),
+      replied("first answer", ["T1"]),
+      said("u1", "mid-turn delivery"),
+      replied("more work", ["T2"]),
+    ];
+    const rows: Row[] = [
+      tUser("t-u0", "first question"),
+      tText("t-a0", "first answer"),
+      tToolUse("t-use1", "T1"),
+      tToolResult("t-res1", "T1"),
+      tText("t-more", "more work"),
+      tToolUse("t-use2", "T2"),
+      tToolResult("t-res2", "T2"),
+      tQueued("t-q1", "mid-turn delivery"),
+      tText("t-after", "after the delivery"),
+    ];
+    assert.equal(await resolveLogIndex(homeDir, record, rows, 3), "t-res1");
+  });
+});
+
+test("uuid-free window: what cannot be proven is REFUSED with FORK_CUT_UNRESOLVED", async () => {
+  await withTempHome("acpx-at-log-index-", async (homeDir) => {
+    const refused = async (record: SessionMessage[], rows: Row[], n: number, reason: RegExp) =>
+      await assert.rejects(
+        () => resolveLogIndex(homeDir, record, rows, n),
+        (error: unknown) =>
+          error instanceof Error &&
+          error.message.includes('"code":"FORK_CUT_UNRESOLVED"') &&
+          reason.test(error.message),
+      );
+    // The anchoring user message appears twice in the transcript (a re-delivery).
+    await refused(
+      DIVERGING,
+      [
+        ...DIVERGING_ROWS.slice(0, 6),
+        tUser("t-u2-again", "third question"),
+        ...DIVERGING_ROWS.slice(6),
+      ],
+      8,
+      /matches 2 transcript rows/,
+    );
+    // ... or not at all.
+    await refused(DIVERGING, DIVERGING_ROWS.slice(0, 4), 8, /matches 0 transcript rows/);
+    // A cut between two Agent entries of the record has no provable boundary.
+    await refused(
+      [...DIVERGING.slice(0, 8), replied("tail")],
+      DIVERGING_ROWS,
+      8,
+      /inside an agent turn/,
+    );
+    // No transcript at all.
+    const cwd = path.join(homeDir, "nowhere");
+    await assert.rejects(
+      () =>
+        resolveClaudeForkResumeAt({
+          cwd,
+          acpSessionId: "missing",
+          atIndex: 8,
+          sourceMessages: DIVERGING.slice(0, 8),
+          logIndexHistory: { before: DIVERGING.slice(0, 8), after: DIVERGING.slice(8) },
+        }),
+      /"code":"FORK_CUT_UNRESOLVED"/,
+    );
+  });
+});
+
+test("a cut older than the last compaction takes the compaction refusal, naming --at-log-index", async () => {
+  await withTempHome("acpx-at-log-index-", async (homeDir) => {
+    const compacted = [...DIVERGING_ROWS.slice(0, 7), COMPACTION, ...DIVERGING_ROWS.slice(7)];
+    const refusal =
+      /Cannot fork at --at-log-index 8: that point lies before the session's last context compaction/;
+    // Proven cut (t-a2) lies before the boundary.
+    await assert.rejects(() => resolveLogIndex(homeDir, DIVERGING, compacted, 8), refusal);
+    // The walk-back uuid path too.
+    const withUuids = DIVERGING.map((entry, index) =>
+      index === 7 && entry !== "Resume" && "Agent" in entry
+        ? { Agent: { ...entry.Agent, claude_uuid: "t-a2" } }
+        : entry,
+    );
+    await assert.rejects(() => resolveLogIndex(homeDir, withUuids, compacted, 8), refusal);
+    // After the boundary it resolves.
+    assert.equal(await resolveLogIndex(homeDir, withUuids, DIVERGING_ROWS, 8), "t-a2");
   });
 });
 
@@ -635,9 +824,54 @@ test("Claude, --at-index keeps its old resolution: no walk-back, window semantic
       acpSessionId: "session-window",
       atIndex: 10,
       sourceMessages: window,
-      atIndexIsAbsolute: true,
+      logIndexHistory: { before: window, after: [] },
     });
     assert.equal(absolute, "c-8");
+  });
+});
+
+test("CLI: an unprovable uuid-free cut exits FORK_CUT_UNRESOLVED and creates NO record", async () => {
+  await withTempHome("acpx-at-log-index-", async (homeDir) => {
+    const source: Source = {
+      id: "unprovable",
+      agentCommand: MOCK_CLAUDE,
+      cwd: path.join(homeDir, "workspace"),
+      logLines: lines(DIVERGING),
+    };
+    await writeSource(homeDir, source);
+    await writeRows(homeDir, source.cwd, `acp-${source.id}`, [
+      ...DIVERGING_ROWS.slice(0, 6),
+      tUser("t-u2-again", "third question"),
+      ...DIVERGING_ROWS.slice(6),
+    ]);
+    for (const format of ["text", "json"]) {
+      const result = await copyFails(homeDir, source, ["--at-log-index", "8"], format);
+      const line = result.stderr
+        .split("\n")
+        .find((l) => l.includes('"code":"FORK_CUT_UNRESOLVED"'));
+      assert.ok(line, `${format}: no FORK_CUT_UNRESOLVED line on stderr: ${result.stderr}`);
+      assert.equal((JSON.parse(line) as { at_log_index?: unknown }).at_log_index, 8);
+      if (format === "json") {
+        assert.match(result.stdout, /"detailCode":"FORK_CUT_UNRESOLVED"/);
+      }
+    }
+  });
+});
+
+test("CLI: a provable uuid-free cut forks the Claude context at the proven uuid", async () => {
+  await withTempHome("acpx-at-log-index-", async (homeDir) => {
+    const source: Source = {
+      id: "provable",
+      agentCommand: withForkMeta(MOCK_CLAUDE, {
+        claudeCode: { options: { resumeSessionAt: "t-a2" } },
+      }),
+      cwd: path.join(homeDir, "workspace"),
+      logLines: lines(DIVERGING),
+    };
+    await writeSource(homeDir, source);
+    await writeRows(homeDir, source.cwd, `acp-${source.id}`, DIVERGING_ROWS);
+    const copied = await copy(homeDir, source, ["--at-log-index", "8"]);
+    assert.deepEqual(copied.log, DIVERGING.slice(0, 8));
   });
 });
 

@@ -113,7 +113,13 @@ import {
 } from "./auth-env.js";
 import { brickContextIdentity, resolveBrickContext } from "./brick-context.js";
 import {
+  assertUuidAfterLastCompaction,
+  ForkCutUnresolvedError,
+  resolveClaudeForkCutByRecord,
+} from "./claude-fork-anchor.js";
+import {
   materializeClaudeForkSession,
+  readClaudeTranscript,
   resolveClaudeUuidForAcpxIndex,
 } from "./claude-fork-index.js";
 import {
@@ -225,8 +231,10 @@ type ForkSessionOptions = LoadSessionOptions & {
    * `sessions copy --at-log-index` (brick 0dc53ac9): `atIndex` is an ABSOLUTE
    * position over the source's full history, and `sourceMessages` is the window
    * ENDING at it — so the cut entry is the window's LAST, not `[atIndex-1]`.
+   * Carries the full history either side of the cut, which a uuid-free window
+   * needs to PROVE where the Claude context may end (`claude-fork-anchor.ts`).
    */
-  atIndexIsAbsolute?: boolean;
+  logIndexHistory?: LogIndexHistory;
   sourceCwd?: string;
   /**
    * The source session's messages_log entries, threaded in so the fork
@@ -234,6 +242,11 @@ type ForkSessionOptions = LoadSessionOptions & {
    * .claude_uuid`) on the non-Claude-ACP fork path (A5).
    */
   sourceMessages?: readonly SessionMessage[];
+};
+
+export type LogIndexHistory = {
+  before: readonly SessionMessage[];
+  after: readonly SessionMessage[];
 };
 
 type ForkRequestContext = {
@@ -284,9 +297,8 @@ export function resolveIndexForkMeta(
 
 /**
  * `--at-log-index` (conception 0d57058c D5): the cut entry's own `claude_uuid`,
- * else the nearest EARLIER entry's. Walking back errs earlier by part of a turn;
- * the positional fallback assumes a strictly alternating User/Agent record, which
- * duplicates, steers and attachment rows all break, so it can land anywhere.
+ * else the nearest EARLIER entry's. Walking back errs earlier by part of a turn,
+ * never later: an entry's uuid never lies past its own content.
  */
 function nearestClaudeUuidAtOrBefore(window: readonly SessionMessage[] | undefined) {
   for (let index = (window?.length ?? 0) - 1; index >= 0; index -= 1) {
@@ -309,31 +321,59 @@ function nearestClaudeUuidAtOrBefore(window: readonly SessionMessage[] | undefin
  * not yet stamp `_meta.claudeUuid`; this makes the branch a no-op until it
  * does).
  */
+/**
+ * `--at-log-index` — the uuid the Claude context ends at, never LATER than the
+ * record cut (verification T10, brick 0dc53ac9).
+ *
+ * ⚠️ DO NOT ADD THE POSITIONAL FALLBACK (`resolveClaudeUuidForAcpxIndex`) BACK
+ * HERE, not even "as a last resort". It reads n as a transcript slot; on records
+ * whose entries and transcript turns diverge (duplicates, re-deliveries, steers)
+ * that slot can lie far in the parent's FUTURE, and it did: dbf3122b n=481
+ * resolved 675 entries late with exit 0. A uuid-free window is resolved by proof
+ * or REFUSED. Test: `test/sessions-copy-at-log-index.test.ts` → "uuid-free window
+ * on a diverging record".
+ */
+async function resolveLogIndexClaudeCut(args: {
+  cwd: string;
+  acpSessionId: string;
+  atIndex: number;
+  sourceMessages: readonly SessionMessage[] | undefined;
+  subscriptionId?: string;
+  history: LogIndexHistory;
+}): Promise<string> {
+  const content = await readClaudeTranscript(args.cwd, args.acpSessionId, args.subscriptionId);
+  const walked = nearestClaudeUuidAtOrBefore(args.sourceMessages);
+  if (walked) {
+    if (content !== undefined) {
+      assertUuidAfterLastCompaction(content, walked, args.atIndex);
+    }
+    return walked;
+  }
+  if (content === undefined) {
+    throw new ForkCutUnresolvedError(
+      args.atIndex,
+      "no claude_uuid in the window and no Claude transcript to anchor the cut on",
+    );
+  }
+  return resolveClaudeForkCutByRecord(content, {
+    atLogIndex: args.atIndex,
+    window: args.sourceMessages ?? [],
+    before: args.history.before,
+    after: args.history.after,
+  });
+}
+
 export async function resolveClaudeForkResumeAt(args: {
   cwd: string;
   acpSessionId: string;
   atIndex: number;
   sourceMessages: readonly SessionMessage[] | undefined;
   subscriptionId?: string;
-  /** `sourceMessages` is the window ending at the ABSOLUTE `atIndex` (`--at-log-index`). */
-  atIndexIsAbsolute?: boolean;
+  /** Set ⇔ `--at-log-index`: `sourceMessages` is the window ending at the ABSOLUTE `atIndex`. */
+  logIndexHistory?: LogIndexHistory;
 }): Promise<string | undefined> {
-  if (args.atIndexIsAbsolute) {
-    // ⚠️ NO `recordMessageTotal` HERE, ON PURPOSE. That field switches the
-    // positional fallback to WINDOW semantics (count back from the transcript's
-    // tail), which is only true of a window that ends AT the tail. This window
-    // ends at `atIndex`, which is absolute, so the legacy absolute reading is the
-    // right one. Test: `test/sessions-copy-at-log-index.test.ts` → "positional
-    // fallback receives the absolute n".
-    return (
-      nearestClaudeUuidAtOrBefore(args.sourceMessages) ??
-      (await resolveClaudeUuidForAcpxIndex({
-        cwd: args.cwd,
-        acpSessionId: args.acpSessionId,
-        forkAtIndex: args.atIndex,
-        subscriptionId: args.subscriptionId,
-      }))
-    );
+  if (args.logIndexHistory) {
+    return await resolveLogIndexClaudeCut({ ...args, history: args.logIndexHistory });
   }
   const provenanceUuid = forkEntryClaudeUuid(args.sourceMessages?.[args.atIndex - 1]);
   if (provenanceUuid) {
@@ -2331,7 +2371,7 @@ export class AcpClient {
       sourceCwd,
       options.atIndex,
       options.sourceMessages,
-      options.atIndexIsAbsolute === true,
+      options.logIndexHistory,
     );
     const requestMeta = await this.buildForkRequestMeta(forkContext);
     const requestCwd = this.resolveForkRequestCwd(forkContext, sessionCwd);
@@ -2451,7 +2491,7 @@ export class AcpClient {
     cwd: string,
     atIndex: number | undefined,
     sourceMessages: readonly SessionMessage[] | undefined,
-    atIndexIsAbsolute: boolean,
+    logIndexHistory: LogIndexHistory | undefined,
   ): Promise<ForkRequestContext> {
     const { command, args } = splitCommandLine(this.options.agentCommand);
 
@@ -2466,10 +2506,10 @@ export class AcpClient {
         atIndex,
         sourceMessages,
         subscriptionId: this.claudeCopySubscriptionSelection(),
-        atIndexIsAbsolute,
+        logIndexHistory,
       });
       if (!uuid) {
-        const flag = atIndexIsAbsolute ? "--at-log-index" : "--at-index";
+        const flag = logIndexHistory ? "--at-log-index" : "--at-index";
         throw new Error(
           `Cannot copy Claude session at ${flag} ${atIndex}: no Claude transcript UUID could be resolved for that acpx message index`,
         );
@@ -2487,7 +2527,7 @@ export class AcpClient {
     return {
       claudeFork: false,
       sourceCwd: cwd,
-      meta: resolveIndexForkMeta(sourceMessages, atIndex, atIndexIsAbsolute),
+      meta: resolveIndexForkMeta(sourceMessages, atIndex, logIndexHistory !== undefined),
     };
   }
 

@@ -55,6 +55,8 @@ export type LogIndexForkWindow = {
   requestedLogIndex: number;
   /** Entries `[max(base_index, logIndex-200), logIndex)` — what the copy inherits. */
   messages: SessionMessage[];
+  /** The full history before `logIndex`, and from it on — the Claude cut's proof input. */
+  history: { before: SessionMessage[]; after: SessionMessage[] };
 };
 
 /**
@@ -140,5 +142,6 @@ export async function resolveLogIndexForkWindow(params: {
     logIndex,
     requestedLogIndex: requested,
     messages: history.messages.slice(Math.max(0, end - FORK_WINDOW_MESSAGES), end),
+    history: { before: history.messages.slice(0, end), after: history.messages.slice(end) },
   };
 }

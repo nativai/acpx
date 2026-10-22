@@ -9,7 +9,7 @@ import {
 import { chooseSubscriptionConfigDir, loadSubscriptionRegistry } from "../config/subscriptions.js";
 import { splitCommandLine } from "./client-process.js";
 
-type ClaudeJsonlRecord = {
+export type ClaudeJsonlRecord = {
   type?: string;
   subtype?: string;
   uuid?: string;
@@ -18,6 +18,11 @@ type ClaudeJsonlRecord = {
   isCompactSummary?: boolean;
   message?: {
     content?: unknown;
+  };
+  /** `type: "attachment"` rows; a `queued_command` one carries a mid-turn delivery in `prompt`. */
+  attachment?: {
+    type?: string;
+    prompt?: unknown;
   };
 };
 
@@ -76,7 +81,7 @@ export async function resolveClaudeUuidForAcpxIndex(args: {
   return resolved.uuid;
 }
 
-async function readClaudeTranscript(
+export async function readClaudeTranscript(
   cwd: string,
   acpSessionId: string,
   subscriptionId: string | undefined,
@@ -466,7 +471,7 @@ function resolveTranscriptCutPosition(
   return forkAtIndex - 1;
 }
 
-function isCompactionBoundary(record: ClaudeJsonlRecord): boolean {
+export function isCompactionBoundary(record: ClaudeJsonlRecord): boolean {
   return record.type === "system" && record.subtype === "compact_boundary";
 }
 
@@ -484,7 +489,7 @@ function indexClaudeRecord(
   return { nextAcpxIndex: currentAcpxIndex, recordAcpxIndex: currentAcpxIndex + 1 };
 }
 
-function parseClaudeJsonlRecord(line: string): ClaudeJsonlRecord | undefined {
+export function parseClaudeJsonlRecord(line: string): ClaudeJsonlRecord | undefined {
   try {
     const parsed: unknown = JSON.parse(line);
     return isRecord(parsed) ? (parsed as ClaudeJsonlRecord) : undefined;
@@ -493,7 +498,7 @@ function parseClaudeJsonlRecord(line: string): ClaudeJsonlRecord | undefined {
   }
 }
 
-function isIndexableClaudeRecord(record: ClaudeJsonlRecord): record is ClaudeJsonlRecord & {
+export function isIndexableClaudeRecord(record: ClaudeJsonlRecord): record is ClaudeJsonlRecord & {
   type: "user" | "assistant";
   uuid: string;
 } {
@@ -507,7 +512,7 @@ function isIndexableClaudeRecord(record: ClaudeJsonlRecord): record is ClaudeJso
   );
 }
 
-function isRealUserRecord(record: ClaudeJsonlRecord): boolean {
+export function isRealUserRecord(record: ClaudeJsonlRecord): boolean {
   return record.type === "user" && !hasToolResultContent(record) && !isSlashCommandRecord(record);
 }
 
