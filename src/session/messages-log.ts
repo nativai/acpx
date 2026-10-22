@@ -342,6 +342,46 @@ async function readMessagesLogTail(
   return messagesFromTail.toReversed();
 }
 
+/**
+ * Every entry of the log up to `endByte`, in order, each with the raw line it was
+ * read from — the FULL history `readMessagesLogTail` windows. Positions count
+ * parsed entries only: an empty or malformed line is skipped exactly as the tail
+ * reader skips it, so entry `i` here is the entry the tail reader would also
+ * place at `i`. A missing file is an empty log. (brick 0dc53ac9, `--at-log-index`)
+ */
+export async function readMessagesLogEntries(
+  logPath: string,
+  endByte: number,
+): Promise<{ messages: SessionMessage[]; rawLines: string[] }> {
+  let buffer: Buffer;
+  try {
+    // Clamped to the file: a watermark past EOF (hydration warns and reads the
+    // available tail) must not read zero-filled bytes as a line.
+    const stat = await fs.stat(logPath);
+    buffer = await readFileRange(logPath, 0, Math.min(endByte, stat.size));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { messages: [], rawLines: [] };
+    }
+    throw error;
+  }
+  const messages: SessionMessage[] = [];
+  const rawLines: string[] = [];
+  for (const line of splitBufferLines(buffer)) {
+    if (line.length === 0) {
+      continue;
+    }
+    const message = parseMessageLine(line);
+    if (!message) {
+      warn("ignoring malformed messages log line");
+      continue;
+    }
+    messages.push(message);
+    rawLines.push(line.toString("utf8"));
+  }
+  return { messages, rawLines };
+}
+
 export async function hydrateSessionMessagesFromLog(
   record: SessionRecord,
   logPath: string,

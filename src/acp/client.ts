@@ -221,6 +221,12 @@ function isPositiveFiniteNumber(value: number | undefined): value is number {
 
 type ForkSessionOptions = LoadSessionOptions & {
   atIndex?: number;
+  /**
+   * `sessions copy --at-log-index` (brick 0dc53ac9): `atIndex` is an ABSOLUTE
+   * position over the source's full history, and `sourceMessages` is the window
+   * ENDING at it — so the cut entry is the window's LAST, not `[atIndex-1]`.
+   */
+  atIndexIsAbsolute?: boolean;
   sourceCwd?: string;
   /**
    * The source session's messages_log entries, threaded in so the fork
@@ -262,12 +268,34 @@ function forkEntryClaudeUuid(entry: SessionMessage | undefined): string | undefi
 export function resolveIndexForkMeta(
   sourceMessages: readonly SessionMessage[] | undefined,
   atIndex: number,
+  atIndexIsAbsolute = false,
 ): Record<string, unknown> {
-  const claudeUuid = forkEntryClaudeUuid(sourceMessages?.[atIndex - 1]);
+  const claudeUuid = forkEntryClaudeUuid(
+    atIndexIsAbsolute ? sourceMessages?.at(-1) : sourceMessages?.[atIndex - 1],
+  );
   if (claudeUuid) {
     return { claudeCode: { options: { resumeSessionAt: claudeUuid } } };
   }
+  // Absolute or not, `atIndex` goes out as given: the adapters (codex-acp's
+  // `resolveForkBoundaryTurnId`) count from the THREAD START, which is exactly
+  // what an absolute `--at-log-index` position means.
   return { acpx: { forkAtMessageIndex: atIndex } };
+}
+
+/**
+ * `--at-log-index` (conception 0d57058c D5): the cut entry's own `claude_uuid`,
+ * else the nearest EARLIER entry's. Walking back errs earlier by part of a turn;
+ * the positional fallback assumes a strictly alternating User/Agent record, which
+ * duplicates, steers and attachment rows all break, so it can land anywhere.
+ */
+function nearestClaudeUuidAtOrBefore(window: readonly SessionMessage[] | undefined) {
+  for (let index = (window?.length ?? 0) - 1; index >= 0; index -= 1) {
+    const uuid = forkEntryClaudeUuid(window?.[index]);
+    if (uuid) {
+      return uuid;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -287,7 +315,26 @@ export async function resolveClaudeForkResumeAt(args: {
   atIndex: number;
   sourceMessages: readonly SessionMessage[] | undefined;
   subscriptionId?: string;
+  /** `sourceMessages` is the window ending at the ABSOLUTE `atIndex` (`--at-log-index`). */
+  atIndexIsAbsolute?: boolean;
 }): Promise<string | undefined> {
+  if (args.atIndexIsAbsolute) {
+    // ⚠️ NO `recordMessageTotal` HERE, ON PURPOSE. That field switches the
+    // positional fallback to WINDOW semantics (count back from the transcript's
+    // tail), which is only true of a window that ends AT the tail. This window
+    // ends at `atIndex`, which is absolute, so the legacy absolute reading is the
+    // right one. Test: `test/sessions-copy-at-log-index.test.ts` → "positional
+    // fallback receives the absolute n".
+    return (
+      nearestClaudeUuidAtOrBefore(args.sourceMessages) ??
+      (await resolveClaudeUuidForAcpxIndex({
+        cwd: args.cwd,
+        acpSessionId: args.acpSessionId,
+        forkAtIndex: args.atIndex,
+        subscriptionId: args.subscriptionId,
+      }))
+    );
+  }
   const provenanceUuid = forkEntryClaudeUuid(args.sourceMessages?.[args.atIndex - 1]);
   if (provenanceUuid) {
     return provenanceUuid;
@@ -2284,6 +2331,7 @@ export class AcpClient {
       sourceCwd,
       options.atIndex,
       options.sourceMessages,
+      options.atIndexIsAbsolute === true,
     );
     const requestMeta = await this.buildForkRequestMeta(forkContext);
     const requestCwd = this.resolveForkRequestCwd(forkContext, sessionCwd);
@@ -2403,6 +2451,7 @@ export class AcpClient {
     cwd: string,
     atIndex: number | undefined,
     sourceMessages: readonly SessionMessage[] | undefined,
+    atIndexIsAbsolute: boolean,
   ): Promise<ForkRequestContext> {
     const { command, args } = splitCommandLine(this.options.agentCommand);
 
@@ -2417,10 +2466,12 @@ export class AcpClient {
         atIndex,
         sourceMessages,
         subscriptionId: this.claudeCopySubscriptionSelection(),
+        atIndexIsAbsolute,
       });
       if (!uuid) {
+        const flag = atIndexIsAbsolute ? "--at-log-index" : "--at-index";
         throw new Error(
-          `Cannot copy Claude session at --at-index ${atIndex}: no Claude transcript UUID could be resolved for that acpx message index`,
+          `Cannot copy Claude session at ${flag} ${atIndex}: no Claude transcript UUID could be resolved for that acpx message index`,
         );
       }
       return {
@@ -2436,7 +2487,7 @@ export class AcpClient {
     return {
       claudeFork: false,
       sourceCwd: cwd,
-      meta: resolveIndexForkMeta(sourceMessages, atIndex),
+      meta: resolveIndexForkMeta(sourceMessages, atIndex, atIndexIsAbsolute),
     };
   }
 

@@ -144,6 +144,10 @@ export type SessionsCopyFlags = {
   recordId?: string;
   from: string;
   atIndex?: number;
+  /** brick 0dc53ac9 — absolute position over the source's full history. */
+  atLogIndex?: number;
+  /** brick 0dc53ac9 — `user:<id>` | `agent:<sha1>` that entry `atLogIndex - 1` must be. */
+  expectEntry?: string;
   name?: string;
   parentId?: string;
   parentSessionUrl?: string;
@@ -369,6 +373,26 @@ export function parseForkAtIndex(value: string): number {
     throw new InvalidArgumentError("--at-index must be a non-negative integer");
   }
   return parsed;
+}
+
+export function parseForkAtLogIndex(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new InvalidArgumentError("--at-log-index must be a non-negative integer");
+  }
+  return parsed;
+}
+
+const EXPECT_ENTRY_PATTERN = /^(?:user:.+|agent:[0-9a-f]{40})$/u;
+
+/** `--expect-entry` — the fingerprint shape `forkEntryFingerprint` produces. */
+export function parseExpectEntry(value: string): string {
+  if (!EXPECT_ENTRY_PATTERN.test(value)) {
+    throw new InvalidArgumentError(
+      "--expect-entry must be user:<User.id> or agent:<sha1 hex of the raw log line>",
+    );
+  }
+  return value;
 }
 
 export function parseDaysOlderThan(value: string): number {

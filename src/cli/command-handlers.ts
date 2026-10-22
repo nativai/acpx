@@ -1268,12 +1268,20 @@ function copyMetadata(
   flags: SessionsCopyFlags,
   source: SessionRecord,
   forkAtMessageIndex: number,
+  forkAtLogIndex: number | undefined,
 ): Record<string, string> | undefined {
   const metadata: Record<string, string> = { ...flags.metadata };
   if (flags.ephemeral === true) {
     metadata.byway = "1";
     metadata.byway_parent = source.acpxRecordId;
     metadata.byway_at = String(forkAtMessageIndex);
+  }
+  if (forkAtLogIndex !== undefined) {
+    // Metadata, not a record field: the absolute position where the copy ends
+    // in the SOURCE's history (`entry[fork_at_log_index - 1]` is its last
+    // inherited entry). A new persisted field would have to survive every
+    // allowlist that rebuilds the record.
+    metadata.fork_at_log_index = String(forkAtLogIndex);
   }
   return Object.keys(metadata).length > 0 ? metadata : undefined;
 }
@@ -1422,6 +1430,41 @@ function assertCopyableSource(source: SessionRecord): void {
  * `client.start()`. Both call the ONE pair of descriptor functions; neither
  * re-derives the rule.
  */
+function assertCopyCutFlags(flags: SessionsCopyFlags): void {
+  if (flags.atIndex !== undefined && flags.atLogIndex !== undefined) {
+    throw new InvalidArgumentError("--at-index and --at-log-index are mutually exclusive");
+  }
+  if (flags.expectEntry !== undefined && flags.atLogIndex === undefined) {
+    throw new InvalidArgumentError("--expect-entry requires --at-log-index");
+  }
+}
+
+/**
+ * The fork index (`byway_at`, the inherited count) and, for `--at-log-index`, the
+ * absolute position. The `--at-log-index` resolution runs here as well as in
+ * `resolveForkSourceContext` for the same reason the `--at-index` rules do: so a
+ * refusal — out of range, or FORK_CUT_MOVED — happens before an adapter spawns.
+ */
+async function resolveCopyCut(
+  source: SessionRecord,
+  flags: SessionsCopyFlags,
+): Promise<{ forkAtMessageIndex: number; forkAtLogIndex?: number }> {
+  assertCopyCutFlags(flags);
+  if (flags.atLogIndex === undefined) {
+    return {
+      forkAtMessageIndex: resolveForkAtMessageIndex(source, flags.atIndex, source.agentCommand),
+    };
+  }
+  const { resolveLogIndexForkWindow } = await import("./session/fork-at-log-index.js");
+  const window = await resolveLogIndexForkWindow({
+    source,
+    agentCommand: source.agentCommand,
+    atLogIndex: flags.atLogIndex,
+    expectEntry: flags.expectEntry,
+  });
+  return { forkAtMessageIndex: window.messages.length, forkAtLogIndex: window.logIndex };
+}
+
 function resolveForkAtMessageIndex(
   source: SessionRecord,
   atIndex: number | undefined,
@@ -3424,7 +3467,7 @@ async function runSessionCopy(
   if (requireTemplate) {
     assertTemplateSource(source);
   }
-  const forkAtMessageIndex = resolveForkAtMessageIndex(source, flags.atIndex, source.agentCommand);
+  const { forkAtMessageIndex, forkAtLogIndex } = await resolveCopyCut(source, flags);
   assertCopyAgentLock({ explicitAgentName, globalFlags, pathAgent, source, config });
 
   // GAP 1 — resolve the spawn parent the same way plain-`new` does (flag →
@@ -3451,7 +3494,10 @@ async function runSessionCopy(
     // > none. A plain fork/copy carries NO brick by default (the 07-15 source.metadata.brick
     // fallback was reversed, brick://1113da9d) so it does not impersonate the source's brick.
     metadata: withInheritedBrick(
-      applyBrickFlag(copyMetadata(flags, source, forkAtMessageIndex), resolvedBrick),
+      applyBrickFlag(
+        copyMetadata(flags, source, forkAtMessageIndex, forkAtLogIndex),
+        resolvedBrick,
+      ),
       caller?.brick, // spawn-parent brick (byway via --parent-id) — KEEP; the CALLER's under --no-parent
       resolvedBrick === false,
     ),
@@ -3467,6 +3513,8 @@ async function runSessionCopy(
     spawnedBySessionId,
     forkFromSessionId: source.acpxRecordId,
     forkAtMessageIndex: flags.atIndex,
+    forkAtLogIndex: flags.atLogIndex,
+    forkExpectEntry: flags.expectEntry,
     seatFavorite: flags.favorite,
     mcpServers: config.mcpServers,
     permissionMode,

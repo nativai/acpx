@@ -80,6 +80,7 @@ import type {
   SessionListOptions,
   SessionListResult,
 } from "./contracts.js";
+import { type LogIndexForkWindow, resolveLogIndexForkWindow } from "./fork-at-log-index.js";
 
 // brick://5bac5564 Layer B belt inputs — the pin + its provenance from the create
 // options, spread into applyRequestedModelIfAdvertised. Extracted so the resume /
@@ -922,6 +923,8 @@ type ForkSourceContext = {
   forkAtMessageIndex: number;
   /** The index that was ASKED for, present only when it differs from the above. */
   requestedForkAtMessageIndex?: number;
+  /** `--at-log-index` only: the window ending at the absolute cut. */
+  logWindow?: LogIndexForkWindow;
 };
 
 async function resumeSessionRecordWithClient(
@@ -977,7 +980,45 @@ async function resumeSessionRecordWithClient(
   }
 }
 
-async function resolveForkSourceContext(options: SessionCreateOptions): Promise<ForkSourceContext> {
+async function resolveLogIndexForkSourceContext(
+  sourceRecord: SessionRecord,
+  options: SessionCreateOptions,
+  atLogIndex: number,
+): Promise<ForkSourceContext> {
+  // The AUTHORITATIVE guard: the record re-read here is the one the copy is cut
+  // from, so an append or rewrite since the CLI's own early check is caught
+  // before any record exists.
+  const logWindow = await resolveLogIndexForkWindow({
+    source: sourceRecord,
+    agentCommand: options.agentCommand,
+    atLogIndex,
+    expectEntry: options.forkExpectEntry,
+  });
+  // `forked_at_message_index` keeps its meaning — the INHERITED count, which is
+  // what acpx-ui's byway display slices by — and the absolute position travels
+  // as `metadata.fork_at_log_index`.
+  const forkAtMessageIndex = logWindow.messages.length;
+  const snappedBy = logWindow.requestedLogIndex - logWindow.logIndex;
+  return {
+    sourceRecord,
+    forkAtMessageIndex,
+    ...(snappedBy === 0 ? {} : { requestedForkAtMessageIndex: forkAtMessageIndex + snappedBy }),
+    logWindow,
+  };
+}
+
+/** The cut half of `client.forkSession`'s options: window-relative, or absolute. */
+function forkCutOptions(
+  options: SessionCreateOptions,
+  sourceRecord: SessionRecord,
+  logWindow: LogIndexForkWindow | undefined,
+) {
+  return logWindow
+    ? { atIndex: logWindow.logIndex, atIndexIsAbsolute: true, sourceMessages: logWindow.messages }
+    : { atIndex: options.forkAtMessageIndex, sourceMessages: sourceRecord.messages };
+}
+
+async function loadForkSourceRecord(options: SessionCreateOptions): Promise<SessionRecord> {
   if (!options.forkFromSessionId) {
     throw new Error("forkFromSessionId is required");
   }
@@ -985,6 +1026,15 @@ async function resolveForkSourceContext(options: SessionCreateOptions): Promise<
   const sourceRecord = await resolveSessionRecord(options.forkFromSessionId);
   if (sourceRecord.kind === "subagent") {
     throw new Error("Cannot copy a subagent session");
+  }
+  return sourceRecord;
+}
+
+async function resolveForkSourceContext(options: SessionCreateOptions): Promise<ForkSourceContext> {
+  const sourceRecord = await loadForkSourceRecord(options);
+
+  if (options.forkAtLogIndex !== undefined) {
+    return await resolveLogIndexForkSourceContext(sourceRecord, options, options.forkAtLogIndex);
   }
 
   // THE CHOKE POINT both the CLI verb and acpx-ui's create route reach, which is
@@ -1069,7 +1119,7 @@ async function forkSessionRecordWithClient(
   options: SessionCreateOptions,
   cwd: string,
 ): Promise<ForkedSessionState> {
-  const { sourceRecord, forkAtMessageIndex, requestedForkAtMessageIndex } =
+  const { sourceRecord, forkAtMessageIndex, requestedForkAtMessageIndex, logWindow } =
     await resolveForkSourceContext(options);
 
   if (!client.supportsForkSession()) {
@@ -1084,9 +1134,8 @@ async function forkSessionRecordWithClient(
         ? await withTimeout(client.createSession(cwd), options.timeoutMs)
         : await withTimeout(
             client.forkSession(sourceRecord.acpSessionId, cwd, {
-              atIndex: options.forkAtMessageIndex,
+              ...forkCutOptions(options, sourceRecord, logWindow),
               sourceCwd: sourceRecord.cwd,
-              sourceMessages: sourceRecord.messages,
               suppressReplayUpdates: true,
             }),
             options.timeoutMs,
@@ -1113,7 +1162,10 @@ async function forkSessionRecordWithClient(
         ...(requestedForkAtMessageIndex === undefined ? {} : { requestedForkAtMessageIndex }),
         // Truncated at the EFFECTIVE boundary, so the record's own message count
         // agrees with the index it reports (row `G1-FRK-01`).
-        messages: sourceRecord.messages.slice(0, forkAtMessageIndex),
+        messages: forkCutOptions(options, sourceRecord, logWindow).sourceMessages.slice(
+          0,
+          forkAtMessageIndex,
+        ),
       },
     };
   } catch (error) {

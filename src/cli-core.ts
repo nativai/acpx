@@ -398,6 +398,16 @@ function isOutputAlreadyEmitted(error: unknown): boolean {
   return (error as { outputAlreadyEmitted?: unknown }).outputAlreadyEmitted === true;
 }
 
+// An error that defines a machine-readable stderr line (FORK_CUT_MOVED, brick
+// 0dc53ac9) keeps it on stderr in json mode too; in text mode the error's
+// message, written to stderr, IS that line.
+function writeErrorStderrLine(error: unknown, outputPolicy: OutputPolicy): void {
+  const stderrLine = (error as { stderrLine?: unknown } | null)?.stderrLine;
+  if (typeof stderrLine === "string" && !outputPolicy.suppressNonJsonStderr) {
+    process.stderr.write(`${stderrLine}\n`);
+  }
+}
+
 async function emitRequestedError(
   error: unknown,
   normalized: NormalizedOutputError,
@@ -409,6 +419,7 @@ async function emitRequestedError(
 
   if (outputPolicy.format === "json") {
     await emitJsonErrorEvent(normalized);
+    writeErrorStderrLine(error, outputPolicy);
     return;
   }
 

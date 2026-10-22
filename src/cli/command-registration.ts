@@ -52,7 +52,9 @@ import {
   addSessionOption,
   parseDaysOlderThan,
   parseDrainTimeoutMs,
+  parseExpectEntry,
   parseForkAtIndex,
+  parseForkAtLogIndex,
   parseMessageId,
   parseMetadataEntry,
   parseNonEmptyValue,
@@ -511,6 +513,16 @@ export function registerSessionsCommand(
       "--at-index <n>",
       "Truncate the copy at acpx message index N (omit = full copy)",
       parseForkAtIndex,
+    )
+    .option(
+      "--at-log-index <n>",
+      "Keep the first N entries of the source's FULL history, counted from messages_log.base_index (exclusive with --at-index)",
+      parseForkAtLogIndex,
+    )
+    .option(
+      "--expect-entry <fingerprint>",
+      "With --at-log-index: refuse (FORK_CUT_MOVED, no record created) unless entry N-1 is user:<id> / agent:<sha1 of its raw log line>",
+      parseExpectEntry,
     )
     .option("-s, --name <name>", "Name for the copy's new SEAT (display only)", parseSessionName)
     .option(

@@ -106,6 +106,13 @@ export type SessionCreateOptions = {
   resumeSessionId?: string;
   forkFromSessionId?: string;
   forkAtMessageIndex?: number;
+  /**
+   * `sessions copy --at-log-index` (brick 0dc53ac9): an ABSOLUTE position over the
+   * source's full history. Never set beside `forkAtMessageIndex`.
+   */
+  forkAtLogIndex?: number;
+  /** `--expect-entry`: the fingerprint entry `forkAtLogIndex - 1` must carry. */
+  forkExpectEntry?: string;
   parentSessionId?: string;
   /** Full parent acpx-ui URL (host+id) for cross-machine lineage. (FW-19) */
   parentSessionUrl?: string;
