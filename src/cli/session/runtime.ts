@@ -80,6 +80,7 @@ import {
   cloneSessionAcpxState,
   cloneSessionConversation,
   hasUserMessageId,
+  lastUserMessageWithId,
   recordClientOperation as recordConversationClientOperation,
   recordPromptSubmission,
   recordSessionUpdate as recordConversationSessionUpdate,
@@ -2219,14 +2220,21 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     record.lastUsedAt = promptStartedAt;
     applyConversation(record, conversation);
     record.acpx = acpxState;
-    await writeSessionRecordAtBoundary(record);
-    // A no-op while `record` and `conversation` share one messages array: the logged count is
+    // Log THROUGH this prompt's own User entry, never past it: mid-turn, output arriving
+    // while the write awaits opens a new Agent entry still being streamed into (brick://5b608eaa
+    // amendment 1, test/messages-log-injection-dup.test.ts, the pre-slice row).
+    await writeSessionRecordAtBoundary(record, {
+      logThrough:
+        promptMessageId === undefined
+          ? undefined // a prompt with no content pushed no entry
+          : lastUserMessageWithId(conversation.messages, promptMessageId),
+    });
+    // A no-op: `record` and `conversation` share one messages array, and the logged count is
     // keyed by the array, so the write's advance is already visible here (brick://5b608eaa).
-    // It acts only if a log compaction inside that write re-based `record.messages` onto the
-    // compacted copy. ⚠️ Never turn this into a copy that wins over a shared count — a
-    // per-carrier copy-back is the bug: the turn's checkpoint copied a pre-append count over
-    // the fresh one and the next boundary write re-appended the tail
-    // (test/messages-log-injection-dup.test.ts).
+    // (A bounded write never compacts, so nothing re-bases `record.messages` under it.)
+    // ⚠️ Never turn this into a copy that wins over a shared count — a per-carrier copy-back
+    // is the bug: the turn's checkpoint copied a pre-append count over the fresh one and the
+    // next boundary write re-appended the tail (test/messages-log-injection-dup.test.ts).
     copyLoggedMessageCount(record, conversation);
     return { messageId: promptMessageId, deduplicated: false };
   };

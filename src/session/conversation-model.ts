@@ -959,6 +959,13 @@ export function hasUserMessageId(conversation: SessionConversation, messageId: s
   );
 }
 
+export function lastUserMessageWithId(
+  messages: readonly SessionMessage[],
+  messageId: string,
+): SessionMessage | undefined {
+  return messages.findLast((message) => isUserMessage(message) && message.User.id === messageId);
+}
+
 function agentMessageHasObservedReply(message: SessionAgentMessage): boolean {
   return message.content.length > 0 || Object.keys(message.tool_results).length > 0;
 }

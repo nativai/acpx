@@ -141,3 +141,39 @@ test("the runtime trim of a fully logged array keeps every survivor logged (coun
   // drop to 199, so the next boundary write would re-append the last entry.
   assert.equal(getLoggedMessageCount(conversation), 200);
 });
+
+test("a bounded boundary write appends only through its entry; an entry no longer in the array appends nothing", async () => {
+  await withSplitRecord("bounded", [user("u0")], async (live, logPath) => {
+    const own = user("u1");
+    live.messages.push(agent("a0"), own, agent("in-progress"));
+    await writeSessionRecordAtBoundary(live, { logThrough: own });
+    assert.deepEqual(await logKeys(logPath), ["U:u0", "A:a0", "U:u1"]);
+    assert.equal(getLoggedMessageCount(live), 3, "the in-progress tail stays unlogged");
+
+    await writeSessionRecordAtBoundary(live, { logThrough: user("trimmed-away") });
+    assert.deepEqual(await logKeys(logPath), ["U:u0", "A:a0", "U:u1"]);
+
+    await writeSessionRecordAtBoundary(live);
+    assert.deepEqual(await logKeys(logPath), ["U:u0", "A:a0", "U:u1", "A:in-progress"]);
+  });
+});
+
+test("a bounded boundary write never compacts the log (compaction would log the held-back tail)", async () => {
+  const previous = process.env.ACPX_MESSAGES_LOG_COMPACT_BYTES;
+  process.env.ACPX_MESSAGES_LOG_COMPACT_BYTES = "1"; // every log is over threshold
+  try {
+    await withSplitRecord("bounded-compact", [user("u0")], async (live, logPath) => {
+      const own = user("u1");
+      live.messages.push(own, agent("in-progress"));
+      await writeSessionRecordAtBoundary(live, { logThrough: own });
+      assert.deepEqual(await logKeys(logPath), ["U:u0", "U:u1"]);
+      assert.equal(getLoggedMessageCount(live), 2);
+    });
+  } finally {
+    if (previous === undefined) {
+      delete process.env.ACPX_MESSAGES_LOG_COMPACT_BYTES;
+    } else {
+      process.env.ACPX_MESSAGES_LOG_COMPACT_BYTES = previous;
+    }
+  }
+});
