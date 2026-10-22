@@ -9,7 +9,7 @@ import {
 } from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { SpawnLedger, openSpawnLedgerForRecord, type DiskRecord } from "../../spawn-ledger.js";
-import type { SessionAcpxState, SessionRecord } from "../../types.js";
+import type { SessionAcpxState, SessionMessage, SessionRecord } from "../../types.js";
 import { sessionArchiveDirFor } from "../archive/paths.js";
 import { getLoggedMessageCount, setLoggedMessageCount } from "../messages-log-bookkeeping.js";
 import {
@@ -344,10 +344,19 @@ export async function writeSessionRecord(record: SessionRecord): Promise<void> {
   });
 }
 
-export async function writeSessionRecordAtBoundary(record: SessionRecord): Promise<void> {
+/**
+ * `logThrough` bounds the messages-log append to entries up to and including that entry
+ * (found by identity), for a boundary written while the turn still streams — see
+ * `appendMessagesLogBoundary`.
+ */
+export async function writeSessionRecordAtBoundary(
+  record: SessionRecord,
+  options: { logThrough?: SessionMessage } = {},
+): Promise<void> {
   await writeSessionRecordInternal(record, {
     messagePersistence: "boundary",
     preserveLifecycle: true,
+    logThrough: options.logThrough,
   });
 }
 
@@ -1070,6 +1079,8 @@ async function writeSessionRecordInternal(
     /** Write NO index update at all — the caller updates the index itself. See
      * `writeSessionRecordAuthorizingParentWithoutIndex`; a skip, never a defer. */
     skipIndexUpdate?: true;
+    /** Boundary writes only: see `writeSessionRecordAtBoundary`. */
+    logThrough?: SessionMessage;
   },
 ): Promise<void> {
   // ⚠️ THE ARCHIVED-RECORD WRITE GUARD, PLACED HERE **BY CONSTRUCTION**. All four
@@ -1090,7 +1101,12 @@ async function writeSessionRecordInternal(
 
     const sessionDir = sessionBaseDir();
     const logPath = messagesLogPath(sessionDir, record.acpxRecordId);
-    await writeMessagesSidecar(record, logPath, options.messagePersistence === "boundary");
+    await writeMessagesSidecar(
+      record,
+      logPath,
+      options.messagePersistence === "boundary",
+      options.logThrough,
+    );
 
     const file = sessionFilePath(record.acpxRecordId);
     // 🛑 READ -> MERGE -> RENAME RUNS UNDER THE RECORD'S OWN LOCK FILE (`record-file-lock.ts`), and
@@ -1211,9 +1227,10 @@ async function writeMessagesSidecar(
   record: SessionRecord,
   logPath: string,
   boundary: boolean,
+  logThrough: SessionMessage | undefined,
 ): Promise<void> {
   if (boundary) {
-    await writeMessagesLogBoundary(record, logPath);
+    await writeMessagesLogBoundary(record, logPath, logThrough);
   } else {
     await clearMissingMessagesLogPointerForWrite(record, logPath);
   }
@@ -1233,11 +1250,62 @@ async function persistRecordFile(
   return raw;
 }
 
-async function writeMessagesLogBoundary(record: SessionRecord, logPath: string): Promise<void> {
+// One boundary append per log file at a time in this process (brick://5b608eaa). Two
+// overlapping boundary writes of one record — two injections drained in one tick — would
+// each slice from the same logged count before either advanced it, append the same entries
+// twice, and truncate to a watermark the other had already moved. The slice is taken INSIDE
+// the critical section. Per process only: the record write (lock + rename) stays outside it.
+const messagesLogBoundaryChains = new Map<string, Promise<void>>();
+
+async function writeMessagesLogBoundary(
+  record: SessionRecord,
+  logPath: string,
+  logThrough: SessionMessage | undefined,
+): Promise<void> {
+  const previous = messagesLogBoundaryChains.get(logPath) ?? Promise.resolve();
+  const current = previous.then(() => appendMessagesLogBoundary(record, logPath, logThrough));
+  const settled = current.catch(() => {});
+  messagesLogBoundaryChains.set(logPath, settled);
+  try {
+    await current;
+  } finally {
+    if (messagesLogBoundaryChains.get(logPath) === settled) {
+      messagesLogBoundaryChains.delete(logPath);
+    }
+  }
+}
+
+// End of a boundary append. A bounded write (`logThrough`) stops at that entry, found by
+// IDENTITY here, inside the critical section, so the in-place runtime trim cannot shift it
+// (brick://5b608eaa amendment 1). Not found — trimmed off the head — appends nothing.
+function boundaryLogEnd(
+  messages: readonly SessionMessage[],
+  loggedCount: number,
+  logThrough: SessionMessage | undefined,
+): number {
+  if (!logThrough) {
+    return messages.length;
+  }
+  return Math.max(loggedCount, messages.lastIndexOf(logThrough) + 1);
+}
+
+async function appendMessagesLogBoundary(
+  record: SessionRecord,
+  logPath: string,
+  logThrough: SessionMessage | undefined,
+): Promise<void> {
   await prepareMessagesLogForBoundary(record, logPath);
 
+  // ⚠️ A boundary written while the turn streams must not log past its own entry: output
+  // that arrived during the awaits above (or the KD2 wait) opens a NEW trailing Agent entry,
+  // still in progress. Logged now it counts as logged, and every word streamed into it after
+  // this slice never reaches the log (test/messages-log-injection-dup.test.ts, the pre-slice
+  // row). It stays unlogged here and goes out with the next unbounded boundary.
   const loggedCount = getLoggedMessageCount(record);
-  const messagesToAppend = record.messages.slice(loggedCount);
+  const messagesToAppend = record.messages.slice(
+    loggedCount,
+    boundaryLogEnd(record.messages, loggedCount, logThrough),
+  );
   await appendFinalizedMessagesToLog(record, logPath, messagesToAppend);
   // ⚠️ COUNT WHAT WAS APPENDED — DO NOT "SIMPLIFY" THIS TO markAllMessagesLogged.
   // The record is live: the sub-agent tailer pushes onto it while this append
@@ -1255,7 +1323,10 @@ async function writeMessagesLogBoundary(record: SessionRecord, logPath: string):
     await initializeEmptyMessagesLog(record, logPath);
   }
 
-  if (record.messagesLog) {
+  // Never on a bounded write: compaction rewrites the log from ALL of `record.messages`,
+  // which would log the in-progress tail the bound just held back. The next unbounded
+  // boundary (the turn's close) compacts.
+  if (record.messagesLog && !logThrough) {
     await compactMessagesLog(record, logPath, resolveMessagesLogCompactBytes());
   }
 }

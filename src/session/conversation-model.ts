@@ -959,6 +959,13 @@ export function hasUserMessageId(conversation: SessionConversation, messageId: s
   );
 }
 
+export function lastUserMessageWithId(
+  messages: readonly SessionMessage[],
+  messageId: string,
+): SessionMessage | undefined {
+  return messages.findLast((message) => isUserMessage(message) && message.User.id === messageId);
+}
+
 function agentMessageHasObservedReply(message: SessionAgentMessage): boolean {
   return message.content.length > 0 || Object.keys(message.tool_results).length > 0;
 }
@@ -1437,8 +1444,13 @@ export function recordClientOperation(
 export function trimConversationForRuntime(conversation: SessionConversation): void {
   if (conversation.messages.length > MAX_RUNTIME_MESSAGES) {
     const dropped = conversation.messages.length - MAX_RUNTIME_MESSAGES;
-    conversation.messages = conversation.messages.slice(-MAX_RUNTIME_MESSAGES);
+    // In place, never `slice`: the logged count is keyed by this array, which `record`
+    // may share, and a re-based copy would carry its own count that goes stale the moment
+    // an in-flight boundary write advances this one (brick://5b608eaa). Count BEFORE the
+    // splice — the getter clamps to the current length, so afterwards one logged entry
+    // would read as unlogged and be appended again.
     dropLoggedMessagesFromHead(conversation, dropped);
+    conversation.messages.splice(0, dropped);
   }
 
   for (const message of conversation.messages) {
