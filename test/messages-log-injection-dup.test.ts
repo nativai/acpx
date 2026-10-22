@@ -248,6 +248,82 @@ test("CONTROL: the same injection with no update inside the window logs each ent
   ]);
 });
 
+test("output streamed while an injection's boundary write awaits before its slice is logged complete, once", async () => {
+  await withTempHome("acpx-5b608eaa-preslice-", async (homeDir) => {
+    const { record, logPath } = await startTurn(homeDir, "preslice");
+
+    const injectedInFlight = createDeferred<void>();
+    const injectedRelease = createDeferred<PromptResponse>();
+    const control = makePathologicalClient({
+      acpSessionId: record.acpSessionId,
+      onInjectedPrompt: async () => {
+        injectedInFlight.resolve();
+        return await injectedRelease.promise;
+      },
+    });
+
+    let midTurnHandler: ((task: QueueTask) => void) | undefined;
+    const handlerRegistered = createDeferred<void>();
+    const run = runQueuedTask(record.acpxRecordId, makeTask("req-main", MAIN_PROMPT_TEXT, MAIN), {
+      sharedClient: control.client,
+      setMidTurnHandler: (handler) => {
+        midTurnHandler = handler;
+        if (handler) {
+          handlerRegistered.resolve();
+        }
+      },
+      suppressSdkConsoleErrors: true,
+    });
+
+    await control.mainPromptInFlight;
+    await handlerRegistered.promise;
+    control.emitSessionUpdate(agentChunk(record.acpSessionId, "partial answer x"));
+    await sleep(CHECKPOINT_SETTLE_MS);
+
+    // Park the injection's boundary write on its pre-slice `stat` of the log
+    // (prepareMessagesLogForBoundary): the User entry is pushed, the slice not yet taken.
+    const originalStat = fs.stat;
+    const parked = createDeferred<void>();
+    const release = createDeferred<void>();
+    let armed = true;
+    fs.stat = (async (...args: Parameters<typeof originalStat>) => {
+      // Only the boundary's own stat: the dedupe hydrate before the push stats the log too.
+      const fromBoundaryPrepare = new Error().stack?.includes("prepareMessagesLogForBoundary");
+      if (armed && String(args[0]) === logPath && fromBoundaryPrepare) {
+        armed = false;
+        parked.resolve();
+        await release.promise;
+      }
+      return await originalStat(...args);
+    }) as typeof originalStat;
+    try {
+      midTurnHandler?.(makeTask("req-inj", INJECTED_PROMPT_TEXT, INJ_A));
+      await parked.promise;
+      // The turn streams on inside that await: a NEW Agent entry after U(d).
+      control.emitSessionUpdate(agentChunk(record.acpSessionId, "continued answer y"));
+      await sleep(100);
+      release.resolve();
+      await injectedInFlight.promise;
+    } finally {
+      fs.stat = originalStat;
+    }
+    assert.equal(armed, false, "the injection's boundary write never reached its pre-slice stat");
+
+    control.emitSessionUpdate(agentChunk(record.acpSessionId, " final"));
+    await sleep(CHECKPOINT_SETTLE_MS);
+    control.resolveMainPrompt({ stopReason: "end_turn" });
+    injectedRelease.resolve({ stopReason: "end_turn" });
+    await run;
+
+    assert.deepEqual(shape(await readLog(logPath)), [
+      `U(${MAIN})`,
+      "A(partial answer x)",
+      `U(${INJ_A})`,
+      "A(continued answer y final)",
+    ]);
+  });
+});
+
 test("a claude-pty steer ack settling mid-stream logs the final Agent entry once and complete", async () => {
   await withTempHome("acpx-5b608eaa-steer-", async (homeDir) => {
     const { record, logPath } = await startTurn(homeDir, "steer");
