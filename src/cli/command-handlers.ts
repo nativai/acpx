@@ -1430,6 +1430,16 @@ function assertCopyableSource(source: SessionRecord): void {
  * `client.start()`. Both call the ONE pair of descriptor functions; neither
  * re-derives the rule.
  */
+/** brick 0dc53ac9: one stderr line when the copy's agent context ends before its record cut. */
+function warnIfContextEndsEarly(created: SessionRecord, forkAtLogIndex: number | undefined): void {
+  const end = created.metadata?.fork_context_end_log_index;
+  if (forkAtLogIndex !== undefined && typeof end === "string") {
+    process.stderr.write(
+      `[acpx] warning: the copy's agent context ends at log index ${end}, before the record cut at ${forkAtLogIndex} (metadata fork_context_end_log_index=${end})\n`,
+    );
+  }
+}
+
 function assertCopyCutFlags(flags: SessionsCopyFlags): void {
   if (flags.atIndex !== undefined && flags.atLogIndex !== undefined) {
     throw new InvalidArgumentError("--at-index and --at-log-index are mutually exclusive");
@@ -3529,6 +3539,7 @@ async function runSessionCopy(
     desiredConfigOptions: copyDesiredConfigOptionsWithOverride(source, globalFlags),
   });
   await maybeStampBrickLink(created);
+  warnIfContextEndsEarly(created, forkAtLogIndex);
   const sourceType = agentTypeLabel(source.agentCommand, config);
   printCreatedSessionBanner(created, sourceType, globalFlags.format, globalFlags.jsonStrict);
   // The result line is the CALLER's: `sessions new --from-template` prints it only after the

@@ -559,6 +559,7 @@ async function createSessionRecordWithClient(
         forkAtMessageIndex: number;
         requestedForkAtMessageIndex?: number;
         messages: SessionRecord["messages"];
+        contextEndLogIndex?: number;
       }
     | undefined;
 
@@ -716,6 +717,14 @@ async function createSessionRecordWithClient(
 
   if (record.metadata?.spawn_key) {
     record.metadata.spawn_state = "pending";
+  }
+  if (forkContext?.contextEndLogIndex !== undefined) {
+    // brick 0dc53ac9: the copy's AGENT context ends before its last inherited
+    // entry — say so on the record, where acpx-ui's notice can read it.
+    record.metadata = {
+      ...record.metadata,
+      fork_context_end_log_index: String(forkContext.contextEndLogIndex),
+    };
   }
 
   // NOTE: the config-dir channel (brick fa2e54ec) is written by
@@ -915,6 +924,7 @@ type ForkedSessionState = CreatedSessionState & {
     forkAtMessageIndex: number;
     requestedForkAtMessageIndex?: number;
     messages: SessionRecord["messages"];
+    contextEndLogIndex?: number;
   };
 };
 
@@ -1006,6 +1016,11 @@ async function resolveLogIndexForkSourceContext(
     ...(snappedBy === 0 ? {} : { requestedForkAtMessageIndex: forkAtMessageIndex + snappedBy }),
     logWindow,
   };
+}
+
+/** `--at-log-index`: where the fork's agent context provably ends (fork results only). */
+function forkContextEnd(result: SessionCreateResult | SessionForkResult): number | undefined {
+  return "contextEndLogIndex" in result ? result.contextEndLogIndex : undefined;
 }
 
 /** The cut half of `client.forkSession`'s options: window-relative, or absolute. */
@@ -1165,6 +1180,9 @@ async function forkSessionRecordWithClient(
         sourceRecord,
         forkAtMessageIndex,
         ...(requestedForkAtMessageIndex === undefined ? {} : { requestedForkAtMessageIndex }),
+        ...(forkContextEnd(forkedSession) === undefined
+          ? {}
+          : { contextEndLogIndex: forkContextEnd(forkedSession) }),
         // Truncated at the EFFECTIVE boundary, so the record's own message count
         // agrees with the index it reports (row `G1-FRK-01`).
         messages: forkCutOptions(options, sourceRecord, logWindow).sourceMessages.slice(

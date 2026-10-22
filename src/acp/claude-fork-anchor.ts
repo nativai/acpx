@@ -21,14 +21,29 @@ import {
 // What this does instead is PROVE the cut:
 //   1. ANCHOR — the window's last User is found in the transcript by its text,
 //      among real user rows and `queued_command` attachments (how Claude Code
-//      records a mid-turn delivery). It must match EXACTLY ONE row.
+//      records a mid-turn delivery). Three consistency checks, all REFUSING:
+//      (a) the text matches exactly ONE transcript row that could carry it —
+//          every `type:"user"` row (meta and sidechain included) and every
+//          `queued_command` attachment — and that row is an input row;
+//      (b) the text belongs to exactly ONE delivery in the WHOLE record (User
+//          ids collapsed, so a re-appended duplicate is still one delivery);
+//      (c) the user message before it agrees: the record's previous distinct
+//          User and the transcript's previous distinct input row carry the same
+//          text (or both are absent).
+//      (b) and (c) are what verification A2 needed: a failed delivery, the same
+//      text re-delivered for real later, and the turns between missing from the
+//      record. The anchor was unique in the transcript, but it was the LATER
+//      delivery's row, and the stretch the record lacks was "neutral" to step 3.
 //   2. END — a cut right after that User ends before its row; a cut after its
 //      reply (only at a record turn boundary: entry n is a User, or n = total)
 //      ends before the next input row.
 //   3. SAFE PREFIX — the context stops before the first transcript row that
 //      carries content (text, thinking, tool_use id, tool_result id) or a user
 //      input found ONLY in record entries at or after n. Rows with content the
-//      record never stored are neutral.
+//      record never stored are neutral (which is why step 1 must not be fooled).
+//   4. CONTEXT END — step 3 can stop EARLY (a recurring synthetic text filed
+//      only after n). The last record entry the context provably holds is
+//      returned, so the caller can SAY where the agent's context ends.
 // So everything in the agent's context is either attributable to the copy or
 // to nothing — never to the parent's future. Anything unprovable is REFUSED
 // (FORK_CUT_UNRESOLVED), never shifted. A cut before the last compaction gets
@@ -272,20 +287,81 @@ export function assertUuidAfterLastCompaction(
   }
 }
 
+/** Any transcript row that could carry a user message's text — a superset of input rows. */
+function isUserCarrierRow(record: ClaudeJsonlRecord): boolean {
+  return record.type === "user" || isQueuedCommand(record);
+}
+
+function carrierText(record: ClaudeJsonlRecord): string {
+  return isQueuedCommand(record)
+    ? inputText(record)
+    : normalize(textBlocks(record.message?.content).join("\n"));
+}
+
+function sameUserText(text: string, want: string): boolean {
+  return text === want || text.endsWith(want);
+}
+
+function recordDeliveriesOf(entries: readonly SessionMessage[], want: string): number {
+  const ids = new Set<string>();
+  for (const entry of entries) {
+    if (entry !== "Resume" && "User" in entry && userText(entry) === want) {
+      ids.add(entry.User.id);
+    }
+  }
+  return ids.size;
+}
+
+/** (c): the previous distinct user message, as the record and as the transcript hold it. */
+function previousUsersAgree(
+  rows: readonly ClaudeJsonlRecord[],
+  anchor: number,
+  before: readonly SessionMessage[],
+  want: string,
+): boolean {
+  const recordPrevious = before.map(userText).findLast((text) => !!text && text !== want);
+  const transcriptAt = rows.findLastIndex(
+    (record, index) =>
+      index < anchor &&
+      isInputRow(record) &&
+      !!inputText(record) &&
+      !sameUserText(inputText(record), want),
+  );
+  if (recordPrevious === undefined || transcriptAt === -1) {
+    return recordPrevious === undefined && transcriptAt === -1;
+  }
+  return sameUserText(inputText(rows[transcriptAt]), recordPrevious);
+}
+
 /** The ONE transcript input row the window's last User was delivered as, or a refusal. */
 function findAnchor(
   rows: readonly ClaudeJsonlRecord[],
-  window: readonly SessionMessage[],
+  cut: RecordAnchoredCut,
   refuse: (reason: string) => never,
 ): number {
-  const userAt = window.findLastIndex((entry) => userText(entry) !== undefined);
-  const want = userAt === -1 ? undefined : userText(window[userAt]);
+  const userAt = cut.window.findLastIndex((entry) => userText(entry) !== undefined);
+  const want = userAt === -1 ? undefined : userText(cut.window[userAt]);
   if (!want) {
     return refuse("no user message with text in the window to anchor the cut on");
   }
+  const carriers = rows.filter(
+    (record) => isUserCarrierRow(record) && sameUserText(carrierText(record), want),
+  );
   const hits = findAnchorRow(rows, want);
-  if (hits.length !== 1) {
-    return refuse(`the anchoring user message matches ${hits.length} transcript rows, not 1`);
+  if (carriers.length !== 1 || hits.length !== 1) {
+    return refuse(`the anchoring user message matches ${carriers.length} transcript rows, not 1`);
+  }
+  const deliveries = recordDeliveriesOf([...cut.before, ...cut.after], want);
+  if (deliveries !== 1) {
+    return refuse(
+      `the anchoring user message is ${deliveries} separate deliveries in the record, not 1`,
+    );
+  }
+  const before = cut.before.slice(0, cut.before.length - cut.window.length + userAt);
+  if (!previousUsersAgree(rows, hits[0], before, want)) {
+    return refuse(
+      "the user message before the anchor differs between the record and the transcript",
+    );
   }
   return hits[0];
 }
@@ -304,16 +380,87 @@ function safePrefixEnd(rows: readonly ClaudeJsonlRecord[], end: number, cut: Rec
 }
 
 /**
+ * An entry that never reaches the agent's context, so it says nothing about
+ * where that context ends: `"Resume"`, an acpx-written terminal error, an Agent
+ * entry with no text, thinking or tool calls.
+ */
+export function isContextNeutral(entry: SessionMessage): boolean {
+  if (entry === "Resume") {
+    return true;
+  }
+  if ("User" in entry) {
+    return false;
+  }
+  if (entry.Agent.terminal_error !== undefined) {
+    return true;
+  }
+  return agentSide([entry]).blocks.size === 0 && agentSide([entry]).ids.size === 0;
+}
+
+/**
+ * The count of leading entries of `before` the agent's context provably holds,
+ * when that falls short of a non-neutral entry before the cut; else undefined.
+ */
+function contextEndCount(
+  rows: readonly ClaudeJsonlRecord[],
+  at: number,
+  before: readonly SessionMessage[],
+): number | undefined {
+  const held = agentSideOfRows(rows, at);
+  const inputs = rows
+    .slice(0, at + 1)
+    .filter(isInputRow)
+    .map(inputText);
+  const present = (entry: SessionMessage) => {
+    const text = userText(entry);
+    if (text !== undefined) {
+      return inputs.some((input) => sameUserText(input, text));
+    }
+    const side = agentSide([entry]);
+    return (
+      [...side.ids].some((id) => held.ids.has(id)) ||
+      [...side.blocks].some((block) => held.blob.includes(block))
+    );
+  };
+  const last = before.findLastIndex((entry) => !isContextNeutral(entry) && present(entry));
+  const count = last + 1;
+  return before.slice(count).some((entry) => !isContextNeutral(entry)) ? count : undefined;
+}
+
+function agentSideOfRows(rows: readonly ClaudeJsonlRecord[], at: number): Side {
+  const blocks = new Set<string>();
+  const ids = new Set<string>();
+  for (const record of rows.slice(0, at + 1)) {
+    if (!isIndexableClaudeRecord(record)) {
+      continue;
+    }
+    for (const piece of rowPieces(record)) {
+      (piece.kind === "id" ? ids : blocks).add(piece.value);
+    }
+  }
+  return { blocks, blob: [...blocks].join(" "), ids };
+}
+
+export type RecordAnchoredResult = {
+  uuid: string;
+  /** Absolute log index the agent's context provably ends at, when short of a non-neutral entry before n. */
+  contextEndLogIndex?: number;
+};
+
+/**
  * The transcript uuid a uuid-free `--at-log-index` cut forks at — proven as
  * described at the top of this file — or a refusal.
  */
-export function resolveClaudeForkCutByRecord(content: string, cut: RecordAnchoredCut): string {
+export function resolveClaudeForkCutByRecord(
+  content: string,
+  cut: RecordAnchoredCut,
+): RecordAnchoredResult {
   const refuse = (reason: string): never => {
     throw new ForkCutUnresolvedError(cut.atLogIndex, reason);
   };
   const rows = parseClaudeTranscriptRows(content);
   const endsOnUser = cut.window.findLastIndex((entry) => userText(entry) !== undefined);
-  const anchor = findAnchor(rows, cut.window, refuse);
+  const anchor = findAnchor(rows, cut, refuse);
   const userIsLast = endsOnUser === cut.window.length - 1;
   const end = anchoredEnd(rows, anchor, userIsLast, cut.after[0], refuse);
   const safeEnd = safePrefixEnd(rows, end, cut);
@@ -327,5 +474,11 @@ export function resolveClaudeForkCutByRecord(content: string, cut: RecordAnchore
   if (at < lastCompactionBoundary(rows)) {
     throw forkCutBeforeCompactionError(cut.atLogIndex);
   }
-  return rows[at].uuid as string;
+  const count = contextEndCount(rows, at, cut.before);
+  return {
+    uuid: rows[at].uuid as string,
+    ...(count === undefined
+      ? {}
+      : { contextEndLogIndex: cut.atLogIndex - cut.before.length + count }),
+  };
 }

@@ -6,7 +6,11 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { resolveClaudeForkResumeAt, resolveIndexForkMeta } from "../src/acp/client.js";
+import {
+  resolveClaudeForkResumeAt,
+  resolveIndexForkMeta,
+  resolveLogIndexClaudeCut,
+} from "../src/acp/client.js";
 import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import type { SessionMessage } from "../src/types.js";
@@ -855,6 +859,237 @@ test("CLI: an unprovable uuid-free cut exits FORK_CUT_UNRESOLVED and creates NO 
         assert.match(result.stdout, /"detailCode":"FORK_CUT_UNRESOLVED"/);
       }
     }
+  });
+});
+
+// ── verification A2: a fooled anchor plus a stretch the record never stored ──
+//
+// x's first delivery FAILED (the record keeps a copy + a terminal error), the
+// same text was re-delivered for real later, and the turns between never reached
+// the record. The transcript holds x ONCE — the later, real delivery — so the
+// anchor is unique there, and the stretch before it is "neutral" to the safe
+// prefix. b25e4a66 accepted the row before x: the out-of-band reply, i.e. LATER
+// than the cut.
+const FAILED_X: SessionMessage = said("x-failed", "please run the release");
+const TERMINAL_ERROR: SessionMessage = {
+  Agent: {
+    content: [{ Text: "turn failed: subscriptions exhausted" }],
+    tool_results: {},
+    terminal_error: { message: "exhausted" },
+  },
+};
+const A2_RECORD: SessionMessage[] = [
+  said("u0", "first question"),
+  replied("first answer"),
+  FAILED_X,
+  TERMINAL_ERROR,
+  said("x-real", "please run the release"),
+  replied("release done"),
+];
+const A2_ROWS: Row[] = [
+  tUser("t-u0", "first question"),
+  tText("t-a0", "first answer"),
+  tUser("t-oob", "an out-of-band question the record never stored"),
+  tText("t-oob-reply", "an out-of-band reply the record never stored"),
+  tUser("t-x", "please run the release"),
+  tText("t-done", "release done"),
+];
+
+test("A2: a failed delivery re-delivered after an unrecorded stretch is REFUSED, never forked late", async () => {
+  await withTempHome("acpx-at-log-index-", async (homeDir) => {
+    const refusedWith = async (record: SessionMessage[], n: number, reason: RegExp) =>
+      await assert.rejects(
+        () => resolveLogIndex(homeDir, record, A2_ROWS, n),
+        (error: unknown) =>
+          error instanceof Error &&
+          error.message.includes('"code":"FORK_CUT_UNRESOLVED"') &&
+          reason.test(error.message),
+        `n=${n} was not refused with ${String(reason)}`,
+      );
+    // Cut right after the failed copy, and after its error reply: the text is two
+    // deliveries in the record (distinct ids).
+    await refusedWith(A2_RECORD, 3, /2 separate deliveries in the record/);
+    await refusedWith(A2_RECORD, 4, /2 separate deliveries in the record/);
+    // The same retry under ONE id collapses to one delivery; the neighbour check
+    // catches it: the record's previous user ("first question") is not the
+    // transcript's ("an out-of-band question ...").
+    const sameId = A2_RECORD.map((entry) =>
+      entry === FAILED_X ? said("x-real", "please run the release") : entry,
+    );
+    await refusedWith(sameId, 3, /the user message before the anchor differs/);
+  });
+});
+
+test("A2 through the CLI: exit FORK_CUT_UNRESOLVED and NO record", async () => {
+  await withTempHome("acpx-at-log-index-", async (homeDir) => {
+    const source: Source = {
+      id: "a2-shape",
+      agentCommand: MOCK_CLAUDE,
+      cwd: path.join(homeDir, "workspace"),
+      logLines: lines(A2_RECORD),
+    };
+    await writeSource(homeDir, source);
+    await writeRows(homeDir, source.cwd, `acp-${source.id}`, A2_ROWS);
+    const result = await copyFails(homeDir, source, [
+      "--at-log-index",
+      "3",
+      "--expect-entry",
+      "user:x-failed",
+    ]);
+    assert.match(result.stderr, /"code":"FORK_CUT_UNRESOLVED"/);
+  });
+});
+
+// ── the agent's context ending EARLY is reported, never silent (verification P5) ──
+
+test("a proven cut that stops early reports where the agent's context ends", async () => {
+  await withTempHome("acpx-at-log-index-", async (homeDir) => {
+    const cwd = path.join(homeDir, "project");
+    const cut = async (record: SessionMessage[], rows: Row[], n: number) => {
+      await writeRows(homeDir, cwd, "session-end", rows);
+      return await resolveLogIndexClaudeCut({
+        cwd,
+        acpSessionId: "session-end",
+        atIndex: n,
+        sourceMessages: record.slice(Math.max(0, n - 200), n),
+        history: { before: record.slice(0, n), after: record.slice(n) },
+      });
+    };
+    // fd914cc5 shape: a synthetic text Claude wrote early ("session limit")
+    // that the record files only AFTER the cut stops the safe prefix there.
+    const limit = "You've hit your session limit";
+    const record: SessionMessage[] = [
+      said("u0", "first question"),
+      replied("first answer"),
+      said("u1", "second question"),
+      replied("second answer"),
+      said("u2", "third question"),
+      replied("third answer"),
+      said("u3", "fourth question"),
+      replied(limit),
+    ];
+    const rows: Row[] = [
+      tUser("t-u0", "first question"),
+      tText("t-a0", "first answer"),
+      tUser("t-u1", "second question"),
+      tText("t-a1", "second answer"),
+      tUser("t-u2", "third question"),
+      tText("t-limit-early", limit),
+      tText("t-a2", "third answer"),
+      tUser("t-u3", "fourth question"),
+      tText("t-limit", limit),
+    ];
+    // n=6 keeps the reply "third answer"; the early limit text stops the safe
+    // prefix inside that turn, so the context ends at "third question": entry 5
+    // (the reply) is in the record copy and not in the agent's context.
+    assert.deepEqual(await cut(record, rows, 6), { uuid: "t-u2", contextEndLogIndex: 5 });
+    // Exact cuts report nothing; a cut right after a user reports the user it
+    // leaves out (the D5 asymmetry, now stated rather than implied).
+    assert.deepEqual(await cut(DIVERGING, DIVERGING_ROWS, 8), { uuid: "t-a2" });
+    assert.deepEqual(await cut(DIVERGING, DIVERGING_ROWS, 9), {
+      uuid: "t-a2",
+      contextEndLogIndex: 8,
+    });
+  });
+});
+
+test("a walked-back uuid reports the entries it skips; neutral entries do not count", async () => {
+  await withTempHome("acpx-at-log-index-", async (homeDir) => {
+    const cwd = path.join(homeDir, "project");
+    await writeRows(homeDir, cwd, "session-walk", DIVERGING_ROWS);
+    const walk = async (window: SessionMessage[]) =>
+      await resolveLogIndexClaudeCut({
+        cwd,
+        acpSessionId: "session-walk",
+        atIndex: 100 + window.length,
+        sourceMessages: window,
+        history: { before: window, after: [] },
+      });
+    const withUuid = (entry: SessionMessage, uuid: string): SessionMessage =>
+      entry !== "Resume" && "Agent" in entry
+        ? { Agent: { ...entry.Agent, claude_uuid: uuid } }
+        : entry;
+    // Agent with a uuid at n-1: the context holds it — nothing to report.
+    assert.deepEqual(
+      await walk([said("u0", "first question"), withUuid(replied("first answer"), "t-a0")]),
+      {
+        uuid: "t-a0",
+      },
+    );
+    // Only a terminal error after it: neutral — nothing to report.
+    assert.deepEqual(
+      await walk([
+        said("u0", "first question"),
+        withUuid(replied("first answer"), "t-a0"),
+        TERMINAL_ERROR,
+      ]),
+      { uuid: "t-a0" },
+    );
+    // A user after it (the B1 shape: terminal error, then a uuid-less user):
+    // the context ends after the agent entry, absolute 100 + 2.
+    assert.deepEqual(
+      await walk([
+        said("u0", "first question"),
+        withUuid(replied("first answer"), "t-a0"),
+        TERMINAL_ERROR,
+        said("u1", "second question"),
+      ]),
+      { uuid: "t-a0", contextEndLogIndex: 102 },
+    );
+  });
+});
+
+test("CLI: an early agent-context end lands in metadata and one stderr warning", async () => {
+  await withTempHome("acpx-at-log-index-", async (homeDir) => {
+    const source: Source = {
+      id: "early-end",
+      agentCommand: withForkMeta(MOCK_CLAUDE, {
+        claudeCode: { options: { resumeSessionAt: "t-a2" } },
+      }),
+      cwd: path.join(homeDir, "workspace"),
+      logLines: lines(DIVERGING),
+    };
+    await writeSource(homeDir, source);
+    await writeRows(homeDir, source.cwd, `acp-${source.id}`, DIVERGING_ROWS);
+    const result = await runCli(
+      [
+        "--cwd",
+        source.cwd,
+        "--agent",
+        source.agentCommand,
+        "--approve-all",
+        "--format",
+        "json",
+        "sessions",
+        "copy",
+        "--from",
+        source.id,
+        "--ephemeral",
+        "--at-log-index",
+        "9",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const id = String(
+      (JSON.parse(result.stdout.trim().split("\n").at(-1) ?? "") as { acpxRecordId?: unknown })
+        .acpxRecordId,
+    );
+    const record = JSON.parse(
+      await fs.readFile(path.join(homeDir, ".acpx", "sessions", `${id}.json`), "utf8"),
+    ) as { metadata?: Record<string, unknown> };
+    assert.equal(record.metadata?.fork_context_end_log_index, "8");
+    assert.equal(record.metadata?.fork_at_log_index, "9");
+    const warnings = result.stderr
+      .split("\n")
+      .filter((line) => line.includes("fork_context_end_log_index=8"));
+    assert.equal(warnings.length, 1, result.stderr);
+    // An exact cut (n=8) says nothing.
+    const exact = await copy(homeDir, { ...source, agentCommand: source.agentCommand }, [
+      "--at-log-index",
+      "8",
+    ]);
+    assert.equal(exact.record.metadata?.fork_context_end_log_index, undefined);
   });
 });
 
