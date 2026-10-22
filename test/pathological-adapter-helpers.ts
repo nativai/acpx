@@ -26,6 +26,8 @@ export const INJECTED_PROMPT_TEXT = "injected mid-turn prompt";
 
 export type PromptResponse = {
   stopReason: "end_turn" | "cancelled" | "max_tokens" | "max_turns";
+  /** brick 5b608eaa — e.g. claude-pty's steer ack `{ steerBoundaryUuid }`. */
+  _meta?: Record<string, unknown>;
 };
 
 export type Deferred<T> = {
