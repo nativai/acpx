@@ -10,7 +10,13 @@ import os from "node:os";
 import path from "node:path";
 import { SpawnLedger } from "../../src/spawn-ledger.js";
 
-assert.ok(os.homedir().startsWith("/workspace/spawn-ledger-selftest/"));
+// The test mints a per-run `spawn-ledger-selftest-*` root (brick://db8f8b28): refuse any other HOME.
+assert.ok(
+  os
+    .homedir()
+    .split(path.sep)
+    .some((segment) => segment.startsWith("spawn-ledger-selftest-")),
+);
 const home = os.homedir();
 fs.mkdirSync(path.join(home, ".acpx"), { recursive: true });
 fs.writeFileSync(
@@ -23,7 +29,12 @@ const target = "44444444-4444-4444-8444-444444444444";
 const log = path.join(home, "adapter.log");
 const agent = `node ${path.resolve("test/fixtures/spawn-ledger-resume-miss-adapter.mjs")} ${log}`;
 const cli = path.resolve("dist/cli.js");
-const env = { PATH: process.env.PATH, HOME: home };
+// The owner-reaper tag rides along so the detached owner this fixture grows is reapable by the test.
+const env = {
+  PATH: process.env.PATH,
+  HOME: home,
+  ACPX_TEST_OWNER_TAG: process.env.ACPX_TEST_OWNER_TAG,
+};
 const base = ["--agent", agent, "--approve-all", "--format", "json", "--cwd", home];
 const initial = "INITIAL-PROMPT-d36c222f";
 const adapterLog = () =>

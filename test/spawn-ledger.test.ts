@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { fork, spawnSync } from "node:child_process";
+import { fork, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import test, { afterEach } from "node:test";
+import test, { after, afterEach } from "node:test";
 import { queueLockFilePath } from "../src/cli/queue/paths.js";
 import { getOwnProcessIdentity, serializeProcessBirthIdentity } from "../src/process-identity.js";
 import { createFileSessionStore } from "../src/runtime/public/file-session-store.js";
@@ -15,15 +16,23 @@ import {
   spawnIdempotencyKey,
   type DiskRecord,
 } from "../src/spawn-ledger.js";
+import "./install-owner-reaper.js";
+import { OWNER_TAG_ENV, exactTagMatcher, sweepOwners } from "./owner-reaper.js";
+import { processesUnder } from "./spawn-ledger-selftest-procs.js";
 
 // Every test runs under its own throwaway HOME: the ledger derives its database and the admitted
 // instance identity from os.homedir(), and must never touch the box's real ~/.acpx.
-const ROOT = "/workspace/spawn-ledger-selftest";
+//
+// ⚠️ The root is minted PER RUN. It used to be the fixed `/workspace/spawn-ledger-selftest`, shared by
+// every suite on the box: two runs at once (now normal — one per seat pod) rmdir'd each other's
+// homes (`ENOTEMPTY rmdir …/.acpx/q`) and the processes of one run were indistinguishable from the
+// other's. The fixtures accept any HOME that has a `spawn-ledger-selftest-*` path segment.
+const ROOT_PREFIX = "spawn-ledger-selftest-";
+const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), ROOT_PREFIX));
 const ORIGINAL_HOME = process.env.HOME;
 let home = "";
 
 function freshHome(label: string): string {
-  fs.mkdirSync(ROOT, { recursive: true });
   home = fs.mkdtempSync(path.join(ROOT, `${label}-`));
   process.env.HOME = home;
   fs.mkdirSync(path.join(home, ".acpx", "sessions"), { recursive: true });
@@ -36,6 +45,32 @@ afterEach(() => {
   }
   home = "";
 });
+after(() => {
+  if (path.dirname(ROOT) === os.tmpdir() && path.basename(ROOT).startsWith(ROOT_PREFIX)) {
+    fs.rmSync(ROOT, { recursive: true, force: true });
+  }
+});
+
+/**
+ * What the real-CLI rows hand their fixture: a clean env plus the owner-reaper tag. The tag is what
+ * lets {@link reapSpawned} (and the suite's L1/L2 reaper behind it) find the detached queue owner and
+ * adapter the fixture's CLI children grow — without it they are setsid'd to ppid 1 and live on for
+ * the production 30-minute idle default (brick://db8f8b28).
+ */
+function fixtureEnv(childHome: string): Record<string, string | undefined> {
+  return { PATH: process.env.PATH, HOME: childHome, [OWNER_TAG_ENV]: process.env[OWNER_TAG_ENV] };
+}
+
+/** Reaps every tagged owner/adapter the rows above started and refuses to continue past a survivor. */
+function reapSpawned(label: string): void {
+  if (process.platform !== "linux") {
+    return; // the reaper identifies by /proc
+  }
+  const tag = process.env[OWNER_TAG_ENV];
+  assert.ok(tag, "EXAMINED NOTHING: the owner-reaper tag is not installed");
+  const swept = sweepOwners(exactTagMatcher(tag), { label: `spawn-ledger ${label}` });
+  assert.equal(swept.survived, 0, `survivors after the sweep: ${swept.survivingPids.join(",")}`);
+}
 
 const dbFile = () => path.join(home, ".acpx", "brick-outbox.db");
 function admit(instanceId: string): void {
@@ -486,7 +521,6 @@ test("a live lock holder keeps a contender busy beyond 5 s; its death releases t
 
 for (const scenario of ["positive", "revoked"]) {
   test(`brick-trigger spawn through the real CLI: ${scenario}`, () => {
-    fs.mkdirSync(ROOT, { recursive: true });
     const childHome = fs.mkdtempSync(path.join(ROOT, `real-${scenario}-`));
     try {
       const result = spawnSync(
@@ -494,7 +528,7 @@ for (const scenario of ["positive", "revoked"]) {
         ["--import", "tsx", "test/fixtures/spawn-ledger-real-child.ts", scenario],
         {
           cwd: process.cwd(),
-          env: { PATH: process.env.PATH, HOME: childHome },
+          env: fixtureEnv(childHome),
           encoding: "utf8",
           // A cold CLI start is load-bound: at load ~76 on 8 cores (2026-10-05) one positive run
           // took 26 s and one starved past 30 s, against a sub-second warm run. Not the thing
@@ -506,6 +540,7 @@ for (const scenario of ["positive", "revoked"]) {
       assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
       assert.match(result.stdout, /PHASES=2/);
     } finally {
+      reapSpawned(`real-${scenario}`);
       fs.rmSync(childHome, { recursive: true, force: true });
     }
   });
@@ -595,7 +630,6 @@ test("d36c222f negative: even the lease holder cannot rebind before the attempt 
 });
 
 test("d36c222f: an auto-spawned agent receives its initial prompt exactly once through the real CLI after the resume miss", () => {
-  fs.mkdirSync(ROOT, { recursive: true });
   const childHome = fs.mkdtempSync(path.join(ROOT, "initial-prompt-"));
   try {
     const result = spawnSync(
@@ -603,7 +637,7 @@ test("d36c222f: an auto-spawned agent receives its initial prompt exactly once t
       ["--import", "tsx", "test/fixtures/spawn-ledger-initial-prompt.ts"],
       {
         cwd: process.cwd(),
-        env: { PATH: process.env.PATH, HOME: childHome },
+        env: fixtureEnv(childHome),
         encoding: "utf8",
         // Two cold CLI starts plus a queue owner — load-bound like the real-child rows above.
         timeout: 150_000,
@@ -613,6 +647,9 @@ test("d36c222f: an auto-spawned agent receives its initial prompt exactly once t
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
     assert.match(result.stdout, /PHASES=2/);
   } finally {
+    // The fixture's `acpx prompt` detaches a queue owner (+ adapter) that outlives it and keeps
+    // writing under childHome: reap it first, or the rmSync below races it (`ENOTEMPTY …/.acpx/q`).
+    reapSpawned("initial-prompt");
     fs.rmSync(childHome, { recursive: true, force: true });
   }
 });
@@ -702,4 +739,53 @@ test("T20 spawn child: scoped identity recorded; same-scope dead ⇒ gone; forei
     db.close();
     ledger.close();
   }
+});
+
+// brick://db8f8b28 — this MUST stay the last test of the file: it asks whether anything the rows
+// above started is still alive. The real-CLI rows detach a queue owner (setsid, ppid 1) that outlives
+// them for the production 30-minute idle default; on a per-seat workbench pod that keeps the pod busy
+// and holds a machine share for up to 12 h.
+test("no process started by the spawn-ledger tests outlives them", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("/proc witness");
+    return;
+  }
+  const idle = (home: string) =>
+    spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore",
+      env: { PATH: process.env.PATH, HOME: home },
+    });
+  // Positive control: a scan that cannot see a planted process proves nothing by finding none.
+  // Negative control: a process under a SIBLING root that merely shares this root's name as a prefix
+  // (another run's root, now that each run mints its own) must not be reported as ours.
+  const planted = idle(path.join(ROOT, "planted-control"));
+  const sibling = idle(`${ROOT}-sibling/planted-control`);
+  const exits = [planted, sibling].map(
+    (child) => new Promise((resolve) => child.once("exit", resolve)),
+  );
+  try {
+    const deadline = Date.now() + 5000;
+    const siblingSeen = () =>
+      processesUnder(`${ROOT}-sibling`).some((found) => found.pid === sibling.pid);
+    while (
+      !(processesUnder(ROOT).some((found) => found.pid === planted.pid) && siblingSeen()) &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const ours = new Set(processesUnder(ROOT).map((found) => found.pid));
+    assert.ok(
+      ours.has(planted.pid!),
+      "EXAMINED NOTHING: the /proc scan cannot see a planted process",
+    );
+    assert.ok(siblingSeen(), "EXAMINED NOTHING: the /proc scan cannot see the sibling's process");
+    assert.ok(!ours.has(sibling.pid!), "a sibling root's process was reported as ours");
+  } finally {
+    for (const child of [planted, sibling]) {
+      process.kill(-child.pid!, "SIGKILL");
+    }
+    await Promise.all(exits);
+  }
+  assert.deepEqual(processesUnder(ROOT), [], "processes the spawn-ledger tests left running");
 });

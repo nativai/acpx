@@ -6,7 +6,13 @@ import path from "node:path";
 import { parseSessionRecord } from "../../src/session/persistence/parse.js";
 import { SpawnLedger } from "../../src/spawn-ledger.js";
 
-assert.ok(os.homedir().startsWith("/workspace/spawn-ledger-selftest/"));
+// The test mints a per-run `spawn-ledger-selftest-*` root (brick://db8f8b28): refuse any other HOME.
+assert.ok(
+  os
+    .homedir()
+    .split(path.sep)
+    .some((segment) => segment.startsWith("spawn-ledger-selftest-")),
+);
 const outbox = new SpawnLedger();
 const revoked = process.argv[2] === "revoked";
 const target = "33333333-3333-4333-8333-333333333333";
@@ -43,7 +49,12 @@ const child = spawn(
     `spawn_key=${attempt.idempotency_key}`,
   ],
   {
-    env: { PATH: process.env.PATH, HOME: os.homedir() },
+    // The owner-reaper tag rides along so anything this child detaches is reapable by the test.
+    env: {
+      PATH: process.env.PATH,
+      HOME: os.homedir(),
+      ACPX_TEST_OWNER_TAG: process.env.ACPX_TEST_OWNER_TAG,
+    },
     stdio: ["ignore", "pipe", "pipe"],
   },
 );
