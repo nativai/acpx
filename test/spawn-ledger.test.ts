@@ -63,6 +63,9 @@ function fixtureEnv(childHome: string): Record<string, string | undefined> {
 
 /** Reaps every tagged owner/adapter the rows above started and refuses to continue past a survivor. */
 function reapSpawned(label: string): void {
+  if (process.platform !== "linux") {
+    return; // the reaper identifies by /proc
+  }
   const tag = process.env[OWNER_TAG_ENV];
   assert.ok(tag, "EXAMINED NOTHING: the owner-reaper tag is not installed");
   const swept = sweepOwners(exactTagMatcher(tag), { label: `spawn-ledger ${label}` });
@@ -742,7 +745,11 @@ test("T20 spawn child: scoped identity recorded; same-scope dead ⇒ gone; forei
 // above started is still alive. The real-CLI rows detach a queue owner (setsid, ppid 1) that outlives
 // them for the production 30-minute idle default; on a per-seat workbench pod that keeps the pod busy
 // and holds a machine share for up to 12 h.
-test("no process started by the spawn-ledger tests outlives them", async () => {
+test("no process started by the spawn-ledger tests outlives them", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("/proc witness");
+    return;
+  }
   const idle = (home: string) =>
     spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
       detached: true,
