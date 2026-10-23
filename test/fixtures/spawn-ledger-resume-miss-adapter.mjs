@@ -6,7 +6,8 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import readline from "node:readline";
 const log = process.argv[2];
-if (!log?.startsWith("/workspace/spawn-ledger-selftest/")) {
+// The test mints a per-run `spawn-ledger-selftest-*` root (brick://db8f8b28): refuse any other path.
+if (!log?.split("/").some((segment) => segment.startsWith("spawn-ledger-selftest-"))) {
   console.error("EXAMINED NOTHING");
   process.exit(2);
 }

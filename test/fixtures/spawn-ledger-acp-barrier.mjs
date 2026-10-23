@@ -4,10 +4,10 @@ import fs from "node:fs";
 import readline from "node:readline";
 const marker = process.argv[2];
 const release = process.argv[3];
-if (
-  !marker?.startsWith("/workspace/spawn-ledger-selftest/") ||
-  !release?.startsWith("/workspace/spawn-ledger-selftest/")
-) {
+// The test mints a per-run `spawn-ledger-selftest-*` root (brick://db8f8b28): refuse any other path.
+const inSelftestRoot = (candidate) =>
+  candidate?.split("/").some((segment) => segment.startsWith("spawn-ledger-selftest-"));
+if (!inSelftestRoot(marker) || !inSelftestRoot(release)) {
   console.error("EXAMINED NOTHING");
   process.exit(2);
 }
