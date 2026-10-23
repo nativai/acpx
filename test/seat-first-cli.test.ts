@@ -658,7 +658,8 @@ test("V1c · `seats set-brick` after a succession re-points EVERY holder's cache
       0,
     );
 
-    const reset = await rig.cli(["seats", "set-brick", seatId, BRICK_B2]);
+    // brick 641ea2f3 — the seat is already on BRICK_B, so this is a deliberate re-point.
+    const reset = await rig.cli(["seats", "set-brick", seatId, BRICK_B2, "--reassign"]);
     assert.equal(reset.code, 0, reset.stderr);
     for (const [role, id] of [
       ["retired founder", founder],
