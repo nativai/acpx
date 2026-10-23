@@ -390,9 +390,21 @@ test("F1b · `sessions set-metadata brick X` on a seat ALREADY on another brick 
       { brick: SEAT_BRICK, brick_validation: "validated" },
     );
     const refused = await runCli(homeDir, SET_METADATA(homeDir, "f1b-holder", NEW_BRICK));
-    assert.notEqual(refused.code, 0, "a re-point without --reassign must fail");
-    assert.match(`${refused.stdout}${refused.stderr}`, /SEAT_BRICK_REASSIGN_REQUIRED/);
-    assert.match(`${refused.stdout}${refused.stderr}`, /--reassign/);
+    // Same refusal shape and exit code as `seats set-brick` (contract, brick 641ea2f3): the JSON
+    // envelope carries code + detailCode + seatId/currentBrickId/requestedBrickId, exit 1.
+    assert.equal(
+      refused.code,
+      1,
+      "a re-point without --reassign must fail with set-brick's exit 1",
+    );
+    const body = JSON.parse(refused.stdout.trim()) as Record<string, unknown>;
+    assert.equal(body.ok, false);
+    assert.equal(body.code, "SEAT_BRICK_REASSIGN_REQUIRED");
+    assert.equal(body.detailCode, "SEAT_BRICK_REASSIGN_REQUIRED");
+    assert.equal(body.seatId, SEAT_ID);
+    assert.equal(body.currentBrickId, SEAT_BRICK);
+    assert.equal(body.requestedBrickId, NEW_BRICK);
+    assert.match(String(body.error), /Re-run with --reassign/);
     assert.deepEqual(await readSeatBrick(homeDir), { ref: SEAT_BRICK, validated: true });
     assert.deepEqual(await readCache(homeDir, "f1b-holder"), {
       brick: SEAT_BRICK,

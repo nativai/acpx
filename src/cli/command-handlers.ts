@@ -2727,11 +2727,21 @@ export async function handleSessionsSetMetadata(
       });
     } catch (error) {
       if (error instanceof SeatBrickReassignRequiredError) {
-        throw new AcpxOperationalError(error.message, {
-          outputCode: "USAGE",
-          detailCode: error.code,
-          origin: "runtime",
-        });
+        // The SAME refusal `seats set-brick` renders — envelope fields and exit code 1 — not a
+        // generic USAGE error, so a caller maps one shape for both verbs (brick 641ea2f3).
+        if (
+          !emitJsonResult(globalFlags.format, {
+            ok: false,
+            code: error.code,
+            error: error.message,
+            ...error.refusalFields(),
+          }) &&
+          globalFlags.format !== "quiet"
+        ) {
+          process.stderr.write(`sessions set-metadata: ${error.code}: ${error.message}\n`);
+        }
+        process.exitCode = 1;
+        return;
       }
       throw error;
     }

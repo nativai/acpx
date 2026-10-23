@@ -372,12 +372,7 @@ async function asSeatRefusal(error: unknown): Promise<SeatMutationRefusalError |
   if (error instanceof SeatBrickReassignRequiredError) {
     // `code` is this verb's refusal key (every sibling refusal carries it); `detailCode` repeats it
     // under the name the contract (brick 641ea2f3) gives acpx's refusal and acpx-ui maps to HTTP 409.
-    return new SeatMutationRefusalError(error.code, error.message, {
-      detailCode: error.code,
-      seatId: error.seatId,
-      currentBrickId: error.currentBrickId ?? null,
-      requestedBrickId: error.requestedBrickId ?? null,
-    });
+    return new SeatMutationRefusalError(error.code, error.message, error.refusalFields());
   }
   if (error instanceof SeatRowMissingError) {
     return new SeatMutationRefusalError("SEAT_ROW_MISSING", await explainSeatRowMissing(error));

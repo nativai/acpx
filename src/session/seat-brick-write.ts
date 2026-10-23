@@ -128,6 +128,20 @@ export class SeatBrickReassignRequiredError extends Error {
     );
     this.name = "SeatBrickReassignRequiredError";
   }
+
+  /**
+   * THE refusal's machine-readable fields, shared by every verb that renders it (`seats set-brick`,
+   * `sessions set-metadata brick`) so the `--format json` envelope cannot drift between them.
+   * `code` is the seats-verb envelope key, `detailCode` the contract's name; same value.
+   */
+  refusalFields(): Record<string, unknown> {
+    return {
+      detailCode: this.code,
+      seatId: this.seatId,
+      currentBrickId: this.currentBrickId ?? null,
+      requestedBrickId: this.requestedBrickId ?? null,
+    };
+  }
 }
 
 // The named records, the row's active holder, and every holder the index lists for the seat.
