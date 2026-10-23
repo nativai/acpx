@@ -642,11 +642,16 @@ export function registerSessionsCommand(
       parseNonEmptyValue("Metadata value", value),
     );
   addSessionNameOption(setMetadataCommand);
+  setMetadataCommand.option(
+    "--reassign",
+    "For the brick key: allow moving a session whose seat is ALREADY on a different brick. " +
+      "Without it that is refused (SEAT_BRICK_REASSIGN_REQUIRED) and nothing is written",
+  );
   setMetadataCommand.action(async function (
     this: Command,
     key: string,
     value: string,
-    flags: StatusFlags,
+    flags: StatusFlags & { reassign?: boolean },
   ) {
     await handleSessionsSetMetadata(explicitAgentName, key, value, flags, this, config);
   });

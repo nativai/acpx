@@ -171,6 +171,15 @@ Repo: https://github.com/openclaw/acpx
 - CLI: remove the agent-facing `acpx usage` and `acpx sessions tree` commands;
   agents should use the deployed acpx wisdom usage and session-tree scripts.
 
+- Seats/CLI: **a session stays on the brick it was assigned to.** `acpx seats set-brick`
+  and `acpx sessions set-metadata brick` now refuse to move a seat that is already on a
+  DIFFERENT brick (`SEAT_BRICK_REASSIGN_REQUIRED`, exit non-zero, nothing written; the
+  `--format json` refusal carries `seatId`, `currentBrickId`, `requestedBrickId`) unless
+  `--reassign` is passed, which writes it and reports `reassigned` (JSON `reassigned: true`).
+  Linking an unlinked seat, re-setting the same brick and `seats set-brick --unset` are
+  unchanged. The `sessions new --seat … --brick` mismatch hint now names `--reassign`.
+  (brick a91f8d23)
+
 ### Fixes
 
 - Runtime/reconnect: recover a never-prompted session whose `session/load` is

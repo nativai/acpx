@@ -477,7 +477,7 @@ function resolveJoinedSeatBrickMetadata(
         `--brick ${JSON.stringify(explicit)} disagrees with seat ${JSON.stringify(joinedSeatId)}'s ` +
           `brick ${JSON.stringify(seatBrickId.ref)}. The SEAT's brick_id is canonical (CONCEPTION C4) — ` +
           `a spawn cannot silently re-point it. Either run \`acpx seats set-brick ${joinedSeatId} ` +
-          `${explicit}\` first and re-spawn, or drop --brick to join under the seat's own brick.`,
+          `${explicit} --reassign\` first and re-spawn, or drop --brick to join under the seat's own brick.`,
         { outputCode: "USAGE", detailCode: "SEAT_BRICK_MISMATCH", origin: "runtime" },
       );
     }

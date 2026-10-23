@@ -2302,6 +2302,13 @@ test(
       assert.match(said, new RegExp(BRICK_A), "the refusal must name the EXPLICIT --brick");
       assert.match(said, new RegExp(BRICK_B), "the refusal must name the SEAT's own brick");
       assert.match(said, /seats set-brick/, "the refusal must name the remedy");
+      // brick 641ea2f3 — set-brick now REFUSES a re-point without --reassign, so the suggested
+      // command must carry it or the remedy this refusal prints would itself be refused.
+      assert.match(
+        said,
+        /seats set-brick \S+ \S+ --reassign/,
+        "the suggested set-brick command must carry --reassign",
+      );
 
       // NOTHING WAS CREATED — the refusal fires before any write, the same
       // guarantee D11/D8's "a malformed --seat is refused at the origin,

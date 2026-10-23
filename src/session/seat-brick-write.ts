@@ -31,6 +31,14 @@ import { withBrickCache } from "./seat-brick.js";
  *
  * `link === undefined` is a DETACH: the seat's link and the cache are cleared together.
  *
+ * 🛑 RE-POINTING A LINKED SEAT IS A DELIBERATE ACT (brick 641ea2f3, Daniel: "a session is assigned to
+ * a brick and then stays there"). When the seat row already carries a DIFFERENT brick than `link`,
+ * the write is REFUSED with `SeatBrickReassignRequiredError` unless the caller passes
+ * `reassign: true`. The comparison reads the SEAT ROW's `brickId` (never a holder's cache) INSIDE the
+ * seat-store hold, so a concurrent writer cannot slip between the check and the write. The check
+ * lives HERE, in the one writer, and not in each caller's `guard`: a caller added tomorrow takes it
+ * by construction. Unlinked → link, same brick → written as today, detach → never checked.
+ *
  * - `seatId` absent (a seat-less record): only the named records' caches are written.
  * - the seat row missing: the seat step is skipped (a row-less record is a legitimate state), the
  *   caches are still written.
@@ -43,12 +51,19 @@ export async function writeBrickLink(params: {
   seatId?: string;
   recordIds?: readonly string[];
   link: SeatBrickLink | undefined;
+  /** Permit moving a seat that is already on a DIFFERENT brick. Absent/false ⇒ that is refused. */
+  reassign?: boolean;
   guard?: (store: SeatStore) => SeatRecord;
   sessionDir?: string;
-}): Promise<{ previous: SeatBrickLink | undefined; activeHolderId: string | null | undefined }> {
+}): Promise<{
+  previous: SeatBrickLink | undefined;
+  activeHolderId: string | null | undefined;
+  reassigned: boolean;
+}> {
   const sessionDir = params.sessionDir ?? sessionBaseDir();
   let previous: SeatBrickLink | undefined;
   let activeHolderId: string | null | undefined;
+  let reassigned = false;
   if (params.seatId !== undefined) {
     const seatId = params.seatId;
     const seen = await withSeatStoreWrite(sessionDir, (store) => {
@@ -56,20 +71,63 @@ export async function writeBrickLink(params: {
       if (row === undefined) {
         return { mutation: SEAT_STORE_NO_CHANGE, result: undefined };
       }
+      const repoint = isRepoint(row.brickId, params.link);
+      if (repoint && params.reassign !== true) {
+        throw new SeatBrickReassignRequiredError(seatId, row.brickId?.ref, params.link?.ref);
+      }
       const seats = new Map(store.seats);
       seats.set(seatId, { ...row, brickId: params.link });
       return {
         mutation: { kind: "write" as const, seats },
-        result: { previous: row.brickId, activeHolderId: row.activeHolderId },
+        result: { previous: row.brickId, activeHolderId: row.activeHolderId, reassigned: repoint },
       };
     });
     previous = seen?.previous;
     activeHolderId = seen?.activeHolderId;
+    reassigned = seen?.reassigned ?? false;
   }
   for (const id of await cacheTargets(params.seatId, params.recordIds, activeHolderId)) {
     await writeCache(id, params.link);
   }
-  return { previous, activeHolderId };
+  return { previous, activeHolderId, reassigned };
+}
+
+/**
+ * The seat is ALREADY on a brick and `requested` is a different one. A detach (`requested`
+ * undefined) is its own explicit verb, never a re-point; an unlinked seat is a first link.
+ */
+function isRepoint(current: SeatBrickLink | undefined, requested: SeatBrickLink | undefined) {
+  return current !== undefined && requested !== undefined && current.ref !== requested.ref;
+}
+
+export const SEAT_BRICK_REASSIGN_REQUIRED = "SEAT_BRICK_REASSIGN_REQUIRED";
+
+/**
+ * Refusal of a re-point without `reassign`. The message names IDS only: this layer never resolves a
+ * brick title (resolving means running the `brick` CLI — see `parseBrickIdOrThrow`); a caller that
+ * can resolve titles (acpx-ui) enriches its own rendering from `currentBrickId`/`requestedBrickId`.
+ * Contract: /wisdom/Bricks/641ea2f3-849f-4289-828a-9c03b7737805/conception/CONTRACT.md.
+ */
+export class SeatBrickReassignRequiredError extends Error {
+  readonly code = SEAT_BRICK_REASSIGN_REQUIRED;
+
+  constructor(
+    readonly seatId: string,
+    readonly currentBrickId: string | undefined,
+    readonly requestedBrickId: string | undefined,
+  ) {
+    const current = (currentBrickId ?? "").slice(0, 8);
+    super(
+      `refused: seat ${seatId.slice(0, 8)} is already on brick ${current}.\n` +
+        `A session stays on the brick it was assigned to; this would re-point it to ` +
+        `${(requestedBrickId ?? "").slice(0, 8)}.\n` +
+        `New work that came up mid-session: file it as a part of your own brick\n` +
+        `  (brick new "<title>" --part-of ${current}) or give it to a new session linked at ` +
+        `spawn (acpx sessions new … --brick <uuid>).\n` +
+        `Moving this seat is really intended? Re-run with --reassign.`,
+    );
+    this.name = "SeatBrickReassignRequiredError";
+  }
 }
 
 // The named records, the row's active holder, and every holder the index lists for the seat.

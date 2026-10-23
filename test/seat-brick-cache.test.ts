@@ -340,7 +340,9 @@ async function readIndexBrick(homeDir: string, id: string) {
   };
 }
 
-const SET_METADATA = (homeDir: string, id: string, value: string) => [
+// brick 641ea2f3 — re-pointing a seat that is ALREADY on a different brick needs `--reassign`;
+// the rows below that re-point on purpose pass it, the ones that must be refused do not.
+const SET_METADATA = (homeDir: string, id: string, value: string, ...extra: string[]) => [
   "--cwd",
   path.join(homeDir, "workspace"),
   "--agent",
@@ -353,6 +355,7 @@ const SET_METADATA = (homeDir: string, id: string, value: string) => [
   id,
   "brick",
   value,
+  ...extra,
 ];
 
 test("F1 · `sessions set-metadata brick X` on a SEATED record re-points the SEAT: the next turn's ACPX_BRICK is X", async () => {
@@ -366,7 +369,7 @@ test("F1 · `sessions set-metadata brick X` on a SEATED record re-points the SEA
         brick_validation: "validated",
       },
     );
-    const out = await runCli(homeDir, SET_METADATA(homeDir, "f1-holder", NEW_BRICK));
+    const out = await runCli(homeDir, SET_METADATA(homeDir, "f1-holder", NEW_BRICK, "--reassign"));
     assert.equal(out.code, 0, out.stderr);
     assert.equal((await readSeatBrick(homeDir))?.ref, NEW_BRICK, "the seat row");
     assert.equal((await readCache(homeDir, "f1-holder"))?.brick, NEW_BRICK, "the cache");
@@ -375,6 +378,45 @@ test("F1 · `sessions set-metadata brick X` on a SEATED record re-points the SEA
     ) as { seat_id?: string; metadata?: Record<string, string> };
     const ctx = await connectedSessionContext(seatedRecord(homeDir, "f1-holder", reread.metadata));
     assert.equal(ctx?.brick, NEW_BRICK, "the next turn's env");
+  });
+});
+
+test("F1b · `sessions set-metadata brick X` on a seat ALREADY on another brick is REFUSED without --reassign: seat row and holder cache unchanged", async () => {
+  await withTempHome(async (homeDir) => {
+    await plantLinkedSeatAndHolder(
+      homeDir,
+      "f1b-holder",
+      { ref: SEAT_BRICK, validated: true },
+      { brick: SEAT_BRICK, brick_validation: "validated" },
+    );
+    const refused = await runCli(homeDir, SET_METADATA(homeDir, "f1b-holder", NEW_BRICK));
+    assert.notEqual(refused.code, 0, "a re-point without --reassign must fail");
+    assert.match(`${refused.stdout}${refused.stderr}`, /SEAT_BRICK_REASSIGN_REQUIRED/);
+    assert.match(`${refused.stdout}${refused.stderr}`, /--reassign/);
+    assert.deepEqual(await readSeatBrick(homeDir), { ref: SEAT_BRICK, validated: true });
+    assert.deepEqual(await readCache(homeDir, "f1b-holder"), {
+      brick: SEAT_BRICK,
+      brick_validation: "validated",
+    });
+  });
+});
+
+test("F1c · `sessions set-metadata brick X` still links an UNLINKED seat and re-sets the SAME brick with no flag; --reassign is refused for any other key", async () => {
+  await withTempHome(async (homeDir) => {
+    await plantLinkedSeatAndHolder(homeDir, "f1c-holder", undefined, undefined);
+    const linked = await runCli(homeDir, SET_METADATA(homeDir, "f1c-holder", NEW_BRICK));
+    assert.equal(linked.code, 0, linked.stderr);
+    assert.equal((await readSeatBrick(homeDir))?.ref, NEW_BRICK);
+    const same = await runCli(homeDir, SET_METADATA(homeDir, "f1c-holder", NEW_BRICK));
+    assert.equal(same.code, 0, same.stderr);
+    const wrongKey = await runCli(
+      homeDir,
+      SET_METADATA(homeDir, "f1c-holder", "x", "--reassign").map((arg) =>
+        arg === "brick" ? "note" : arg,
+      ),
+    );
+    assert.notEqual(wrongKey.code, 0, "--reassign applies to the brick key only");
+    assert.match(`${wrongKey.stdout}${wrongKey.stderr}`, /applies only to the brick key/);
   });
 });
 
@@ -389,7 +431,7 @@ test("O3 · `sessions set-metadata brick X` of a container brick (full card over
         brick_validation: "validated",
       },
     );
-    const out = await runCli(homeDir, SET_METADATA(homeDir, "o3-holder", NEW_BRICK), {
+    const out = await runCli(homeDir, SET_METADATA(homeDir, "o3-holder", NEW_BRICK, "--reassign"), {
       BRICK_SHIM_MODE: "ok",
       BRICK_SHIM_ID: NEW_BRICK,
       BRICK_SHIM_CARD_BYTES: String(2 * 1024 * 1024),
@@ -419,6 +461,7 @@ test("F2 · `seats set-brick` writes the holder's cache AND its validation; the 
       SEAT_ID,
       NEW_BRICK,
       "--validated",
+      "--reassign",
     ]);
     assert.equal(setValidated.code, 0, setValidated.stderr);
     assert.deepEqual(
@@ -440,6 +483,7 @@ test("F2 · `seats set-brick` writes the holder's cache AND its validation; the 
       "set-brick",
       SEAT_ID,
       SEAT_BRICK,
+      "--reassign",
     ]);
     assert.equal(setBare.code, 0, setBare.stderr);
     assert.deepEqual(await readIndexBrick(homeDir, "f2-holder"), {
@@ -478,9 +522,13 @@ test("F3 · the validation state is rewritten on EVERY ref change: a ref that di
         brick_validation: "validated",
       },
     );
-    const notFound = await runCli(homeDir, SET_METADATA(homeDir, "f3-holder", NEW_BRICK), {
-      BRICK_SHIM_MODE: "not-found",
-    });
+    const notFound = await runCli(
+      homeDir,
+      SET_METADATA(homeDir, "f3-holder", NEW_BRICK, "--reassign"),
+      {
+        BRICK_SHIM_MODE: "not-found",
+      },
+    );
     assert.equal(notFound.code, 0, notFound.stderr);
     assert.deepEqual(await readIndexBrick(homeDir, "f3-holder"), {
       brick: NEW_BRICK,
@@ -488,10 +536,14 @@ test("F3 · the validation state is rewritten on EVERY ref change: a ref that di
     });
     assert.equal((await readSeatBrick(homeDir))?.validated, false, "the seat's own state");
 
-    const resolved = await runCli(homeDir, SET_METADATA(homeDir, "f3-holder", SEAT_BRICK), {
-      BRICK_SHIM_MODE: "ok",
-      BRICK_SHIM_ID: SEAT_BRICK,
-    });
+    const resolved = await runCli(
+      homeDir,
+      SET_METADATA(homeDir, "f3-holder", SEAT_BRICK, "--reassign"),
+      {
+        BRICK_SHIM_MODE: "ok",
+        BRICK_SHIM_ID: SEAT_BRICK,
+      },
+    );
     assert.equal(resolved.code, 0, resolved.stderr);
     assert.deepEqual(await readIndexBrick(homeDir, "f3-holder"), {
       brick: SEAT_BRICK,

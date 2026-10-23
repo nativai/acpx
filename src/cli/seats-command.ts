@@ -32,7 +32,11 @@ import {
   runSeatBackfill,
   type SeatBackfillReport,
 } from "../session/seat-backfill.js";
-import { writeBrickLink } from "../session/seat-brick-write.js";
+import {
+  SEAT_BRICK_REASSIGN_REQUIRED,
+  SeatBrickReassignRequiredError,
+  writeBrickLink,
+} from "../session/seat-brick-write.js";
 import type { OutputFormat } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import { parseOutputFormat, resolveGlobalFlags } from "./flags.js";
@@ -167,6 +171,7 @@ type SeatMutationRefusalCode =
   | "SEAT_NAME_INVALID"
   | "SEAT_FAVORITE_FLAG_INVALID"
   | "SEAT_BRICK_ARGS_INVALID"
+  | typeof SEAT_BRICK_REASSIGN_REQUIRED
   | "SEAT_ROW_MISSING"
   | "SEAT_ROW_MALFORMED"
   | "SEAT_STORE_UNWRITABLE"
@@ -180,6 +185,8 @@ export class SeatMutationRefusalError extends Error {
   constructor(
     readonly code: SeatMutationRefusalCode,
     message: string,
+    /** Extra fields a caller may need beside `code`/`error` in the `--format json` refusal. */
+    readonly extra: Readonly<Record<string, unknown>> = {},
   ) {
     super(message);
     this.name = "SeatMutationRefusalError";
@@ -362,6 +369,16 @@ async function asSeatRefusal(error: unknown): Promise<SeatMutationRefusalError |
   if (error instanceof SeatMutationRefusalError) {
     return error;
   }
+  if (error instanceof SeatBrickReassignRequiredError) {
+    // `code` is this verb's refusal key (every sibling refusal carries it); `detailCode` repeats it
+    // under the name the contract (brick 641ea2f3) gives acpx's refusal and acpx-ui maps to HTTP 409.
+    return new SeatMutationRefusalError(error.code, error.message, {
+      detailCode: error.code,
+      seatId: error.seatId,
+      currentBrickId: error.currentBrickId ?? null,
+      requestedBrickId: error.requestedBrickId ?? null,
+    });
+  }
   if (error instanceof SeatRowMissingError) {
     return new SeatMutationRefusalError("SEAT_ROW_MISSING", await explainSeatRowMissing(error));
   }
@@ -395,7 +412,14 @@ async function runSeatMutation(
     if (!refusal) {
       throw error;
     }
-    if (!emitJsonResult(format, { ok: false, code: refusal.code, error: refusal.message })) {
+    if (
+      !emitJsonResult(format, {
+        ok: false,
+        code: refusal.code,
+        error: refusal.message,
+        ...refusal.extra,
+      })
+    ) {
       if (format !== "quiet") {
         process.stderr.write(`seats ${verb}: ${refusal.code}: ${refusal.message}\n`);
       }
@@ -416,8 +440,16 @@ function parseSeatBrickArgs(
   brickRef: string | undefined,
   unset: boolean | undefined,
   validated: boolean | undefined,
+  reassign: boolean | undefined,
 ): string | undefined {
   if (unset === true) {
+    if (reassign === true) {
+      throw new SeatMutationRefusalError(
+        "SEAT_BRICK_ARGS_INVALID",
+        "--reassign has nothing to move under --unset — detaching is its own explicit act and " +
+          "never needs it. Drop one of the two.",
+      );
+    }
     if (brickRef !== undefined) {
       throw new SeatMutationRefusalError(
         "SEAT_BRICK_ARGS_INVALID",
@@ -449,6 +481,7 @@ function setBrickJsonPayload(
   seatId: string,
   brickId: SeatBrickLink | undefined,
   previousBrickId: SeatBrickLink | undefined,
+  reassigned: boolean,
 ): Record<string, unknown> {
   return {
     ok: true,
@@ -458,13 +491,15 @@ function setBrickJsonPayload(
     brickIdValidated: brickId ? brickId.validated : null,
     previousBrickId: previousBrickId?.ref ?? null,
     previousBrickIdValidated: previousBrickId ? previousBrickId.validated : null,
+    // true ONLY when an already-linked seat was moved to a DIFFERENT brick (needs --reassign).
+    reassigned,
   };
 }
 
 async function handleSeatsSetBrick(
   seatRef: string,
   brickRef: string | undefined,
-  flags: { unset?: boolean; validated?: boolean },
+  flags: { unset?: boolean; validated?: boolean; reassign?: boolean },
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
@@ -475,7 +510,7 @@ async function handleSeatsSetBrick(
     // full uuid otherwise. Both legs write through the SAME spread below, so
     // `--unset` is not a second code path that could drift from the set path's
     // field discipline.
-    const resolvedRef = parseSeatBrickArgs(brickRef, flags.unset, flags.validated);
+    const resolvedRef = parseSeatBrickArgs(brickRef, flags.unset, flags.validated, flags.reassign);
     // Brick `9984c510`, ruling (B2′) — THIS VERB NEVER RESOLVES; THE CALLER
     // ASSERTS. `seats set-brick` performs no `brick show` call — shape only,
     // via `parseBrickIdOrThrow` — so on its own it cannot tell a real brick
@@ -490,23 +525,28 @@ async function handleSeatsSetBrick(
     // together — `writeBrickLink` spreads the fresh row (`closed_at` stays `null`, never absent; the
     // parse leg rejects a row missing the key as malformed, D8) and this verb keeps its refusals
     // through the guard, which runs inside the same hold.
-    const { previous: previousBrickId } = await writeBrickLink({
+    //
+    // 🛑 A RE-POINT NEEDS `--reassign`: `writeBrickLink` compares the SEAT ROW's brick_id to the
+    // requested one inside this same hold and throws `SeatBrickReassignRequiredError` (rendered by
+    // `asSeatRefusal`, nothing written) unless `reassign` is passed (brick 641ea2f3).
+    const { previous: previousBrickId, reassigned } = await writeBrickLink({
       seatId,
       link: brickId,
+      reassign: flags.reassign === true,
       sessionDir,
       guard: (store) => {
         refuseUnwritableStore(store, sessionDir);
         return requireSeatRow(store, seatId);
       },
     });
-    if (emitJsonResult(format, setBrickJsonPayload(seatId, brickId, previousBrickId))) {
+    if (emitJsonResult(format, setBrickJsonPayload(seatId, brickId, previousBrickId, reassigned))) {
       return;
     }
     if (format === "quiet") {
       return;
     }
     process.stdout.write(
-      `seat ${seatId}: brick_id = ${renderSeatBrickLinkText(brickId)}` +
+      `seat ${seatId}: ${reassigned ? "reassigned " : ""}brick_id = ${renderSeatBrickLinkText(brickId)}` +
         `${previousBrickId === undefined ? "" : ` (was ${renderSeatBrickLinkText(previousBrickId)})`}\n`,
     );
   });
@@ -1862,7 +1902,8 @@ IDEMPOTENT. A second run moves nothing. A seat whose holder is archived and whos
   seatsCommand
     .command("set-brick")
     .description(
-      "Point a seat at a brick — the write behind `brick attach` — or clear it with --unset",
+      "Point a seat at a brick — the write behind `brick attach` — or clear it with --unset. " +
+        "A seat already on a different brick is refused unless --reassign",
     )
     .argument("<seat>", "The seat, by id (a lowercase UUID)")
     .argument(
@@ -1870,6 +1911,11 @@ IDEMPOTENT. A second run moves nothing. A seat whose holder is archived and whos
       "The brick, by FULL uuid — short refs are rejected, never resolved. Omit with --unset",
     )
     .option("--unset", "Clear the seat's brick_id instead of setting one")
+    .option(
+      "--reassign",
+      "Allow moving a seat that is ALREADY on a different brick. Without it that is refused " +
+        "(SEAT_BRICK_REASSIGN_REQUIRED) and nothing is written. Not valid with --unset.",
+    )
     .option(
       "--validated",
       "Assert the ref was already confirmed to resolve (the CALLER's claim, e.g. `brick " +
@@ -1881,6 +1927,17 @@ IDEMPOTENT. A second run moves nothing. A seat whose holder is archived and whos
     .addHelpText(
       "after",
       `
+A SESSION STAYS ON THE BRICK IT WAS ASSIGNED TO.
+  Re-pointing a seat that is already on a DIFFERENT brick is refused
+  (SEAT_BRICK_REASSIGN_REQUIRED, exit 1, nothing written; the --format json
+  refusal carries seatId, currentBrickId and requestedBrickId) unless you pass
+  --reassign — then it is written and reported as "reassigned" (JSON:
+  reassigned: true, previousBrickId = the old brick). Linking an unlinked seat,
+  re-setting the SAME brick and --unset never need it. New work that came up
+  mid-session belongs in a part of the seat's own brick, or in a new session
+  linked at spawn (\`acpx sessions new … --brick <uuid>\`), not in a re-point.
+  The comparison is on the SEAT's brick_id, inside the seat-store hold.
+
 A SHORT BRICK REF IS REJECTED, NOT RESOLVED.
   Resolving one means running the \`brick\` CLI, measured at ~9 s on a loaded box
   against a 3 s timeout — so the resolution would fail this command rather than
@@ -1898,7 +1955,7 @@ PASS EXACTLY ONE OF <brick> OR --unset. Neither, or both, is refused
       this: Command,
       seat: string,
       brick: string | undefined,
-      flags: { unset?: boolean; validated?: boolean },
+      flags: { unset?: boolean; validated?: boolean; reassign?: boolean },
     ) {
       await handleSeatsSetBrick(seat, brick, flags, this, config);
     });

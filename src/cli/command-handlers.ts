@@ -91,7 +91,7 @@ import {
   writeSessionRecordWithLifecycle,
 } from "../session/persistence.js";
 import type { MigrateSlugsResult, TemplateRollbackResult } from "../session/persistence.js";
-import { writeBrickLink } from "../session/seat-brick-write.js";
+import { SeatBrickReassignRequiredError, writeBrickLink } from "../session/seat-brick-write.js";
 import { decideSessionBrick } from "../session/seat-brick.js";
 import { seatDisplayName, seatNameFromStore } from "../session/seat-display-name.js";
 import { EXIT_CODES } from "../types.js";
@@ -2697,24 +2697,44 @@ export async function handleSessionsSetMetadata(
   explicitAgentName: string | undefined,
   key: string,
   value: string,
-  flags: StatusFlags,
+  flags: StatusFlags & { reassign?: boolean },
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const trimmedValue = validateSessionMetadataValue(key, value);
+  if (flags.reassign === true && key !== "brick") {
+    throw new AcpxOperationalError(
+      `--reassign applies only to the brick key (got ${JSON.stringify(key)}).`,
+      { outputCode: "USAGE", origin: "cli" },
+    );
+  }
   const selector = resolveSessionTargetSelector({ flags, command });
   const record = await requireExplicitSessionRecord(selector, agent.agentName);
   if (key === "brick") {
     // The brick link has ONE writer (fb1a7a9c): a seated record's SEAT is re-pointed and the cache
     // follows with its validation word; a seat-less record's cache is written the same way.
     const validated = await warnIfBrickDoesNotResolve(trimmedValue);
-    await writeBrickLink({
-      seatId: record.seatId,
-      recordIds: [record.acpxRecordId],
-      link: seatBrickLinkFromRef(trimmedValue, validated),
-    });
+    // Re-pointing a seat that is already on a DIFFERENT brick needs `--reassign` — the same
+    // guard `seats set-brick` takes (brick 641ea2f3), because this verb is a second way to do it.
+    try {
+      await writeBrickLink({
+        seatId: record.seatId,
+        recordIds: [record.acpxRecordId],
+        link: seatBrickLinkFromRef(trimmedValue, validated),
+        reassign: flags.reassign === true,
+      });
+    } catch (error) {
+      if (error instanceof SeatBrickReassignRequiredError) {
+        throw new AcpxOperationalError(error.message, {
+          outputCode: "USAGE",
+          detailCode: error.code,
+          origin: "runtime",
+        });
+      }
+      throw error;
+    }
   } else {
     await writeSessionRecord(mergeSessionMetadata(record, key, trimmedValue));
   }
