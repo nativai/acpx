@@ -15,6 +15,7 @@ import {
   spawnIdempotencyKey,
   type DiskRecord,
 } from "../src/spawn-ledger.js";
+import { processesUnder } from "./spawn-ledger-selftest-procs.js";
 
 // Every test runs under its own throwaway HOME: the ledger derives its database and the admitted
 // instance identity from os.homedir(), and must never touch the box's real ~/.acpx.
@@ -702,4 +703,36 @@ test("T20 spawn child: scoped identity recorded; same-scope dead ⇒ gone; forei
     db.close();
     ledger.close();
   }
+});
+
+// brick://db8f8b28 — this MUST stay the last test of the file: it asks whether anything the rows
+// above started is still alive. The real-CLI rows detach a queue owner (setsid, ppid 1) that outlives
+// them for the production 30-minute idle default; on a per-seat workbench pod that keeps the pod busy
+// and holds a machine share for up to 12 h.
+test("no process started by the spawn-ledger tests outlives them", async () => {
+  // Positive control first: a scan that cannot see a planted process proves nothing by finding none.
+  const planted = fork("-e", ["setInterval(() => {}, 1000)"], {
+    execArgv: [],
+    detached: true,
+    stdio: "ignore",
+    env: { PATH: process.env.PATH, HOME: path.join(ROOT, "planted-control") },
+  });
+  const plantedExit = new Promise((resolve) => planted.once("exit", resolve));
+  try {
+    const deadline = Date.now() + 5000;
+    while (
+      !processesUnder(ROOT).some((found) => found.pid === planted.pid) &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(
+      processesUnder(ROOT).some((found) => found.pid === planted.pid),
+      "EXAMINED NOTHING: the /proc scan cannot see a planted process",
+    );
+  } finally {
+    process.kill(-planted.pid!, "SIGKILL");
+    await plantedExit;
+  }
+  assert.deepEqual(processesUnder(ROOT), [], "processes the spawn-ledger tests left running");
 });
