@@ -7,8 +7,20 @@ import path from "node:path";
 //
 // WHAT THIS FILE IS: the answer to "what can THIS BOX talk to", one entry per
 // provider credential the box holds. Written by an infra agent on the box it
-// belongs to (never copied between boxes); read here at agent spawn, where each
-// entry's declared `env` variable is set on the child's environment.
+// belongs to (never copied between boxes); read by acpx itself — the Claude
+// OpenRouter shim's key (`resolveOpenRouterBoxCredential`), generation lookups,
+// and pi's per-session `auth.json`, which points at this file by command instead
+// of holding the key (`writePiAuthFile`).
+//
+// ⚠️ NO ENTRY IS EVER PUT INTO AN AGENT'S ENVIRONMENT (brick 1dc24c1c, Daniel
+// 2026-10-24). This file used to be delivered as `OPENROUTER_API_KEY` into every
+// adapter spawn, so every agent's shell, every `workbench-exec` command and every
+// dev server it started carried the box key — and a project's own `.env` value
+// for the same name lost to it, because `dotenv` / `@next/env` never override a
+// set variable. The variable is now stripped from every agent env
+// (`AGENT_STRIPPED_CREDENTIAL_ENV`); do not reintroduce env delivery for any
+// harness. `env` on an entry is kept as the provider's conventional variable
+// name (a redaction input, `boxProviderEnvNames`), not as a delivery target.
 //
 // ⚠️ IT IS DELIBERATELY *NOT* `registry.json`. That file is a FIXED cross-repo
 // contract whose every entry is a PER-SESSION SELECTABLE PROFILE — acpx-ui
@@ -31,7 +43,7 @@ import path from "node:path";
 export type BoxProviderEntry = {
   /** The map key, carried onto the entry so callers can name what they got. */
   name: string;
-  /** The environment variable the harness reads (e.g. `OPENROUTER_API_KEY`). */
+  /** The provider's conventional variable name (e.g. `OPENROUTER_API_KEY`). Never set on an agent env. */
   env: string;
   /**
    * The literal credential. ⚠️ SECRET — never log it, never render it, never
@@ -137,8 +149,8 @@ function parseEntry(name: string, raw: unknown): BoxProviderEntry | undefined {
   const value = raw as Record<string, unknown>;
   const env = nonEmptyString(value.env);
   if (!env) {
-    // Without the variable name there is nothing to deliver; drop the entry
-    // rather than half-honor it.
+    // The schema requires the variable name; drop a malformed entry rather
+    // than half-honor it.
     return undefined;
   }
   const entry: BoxProviderEntry = { name, env };
@@ -215,8 +227,9 @@ function parseProviderMap(rawProviders: unknown): BoxProviderEntry[] {
  * The credential for one entry. `apiKeyEnv` beats a literal `apiKey`, mirroring
  * the profile schema's existing precedence.
  *
- * ⚠️ Returns a SECRET. Callers may put it in a child environment and nowhere
- * else — never a log line, an error message, a session record or an evidence file.
+ * ⚠️ Returns a SECRET. Callers may hand it to the one child that needs it (the
+ * OpenRouter shim) and nowhere else — never an AGENT environment, a log line, an
+ * error message, a session record or an evidence file.
  */
 export function resolveBoxProviderKey(
   entry: BoxProviderEntry,
@@ -232,36 +245,6 @@ export function resolveBoxProviderKey(
 }
 
 /**
- * An inherited value for a declared provider variable that DIFFERS from what
- * this box's file resolves. Carries no credential and no prefix of one: the
- * fingerprints are truncated SHA-256 digests, which is what makes two surfaces
- * (a child's `/proc/<pid>/environ`, this file, another box) comparable without
- * anybody handling the value. Lengths are here because "73 vs 73" and "73 vs 0"
- * are different diagnoses.
- */
-export type BoxProviderEnvConflict = {
-  /** The `providers.<name>` entry whose declared variable diverged. */
-  name: string;
-  /** The variable name (e.g. `OPENROUTER_API_KEY`). */
-  env: string;
-  /** SHA-256 prefix of the value ALREADY in the environment — the one that wins. */
-  inheritedFingerprint: string;
-  /** SHA-256 prefix of the value `providers.json` resolves — the one that is IGNORED. */
-  fileFingerprint: string;
-  inheritedLength: number;
-  fileLength: number;
-};
-
-export type BoxProviderApplyOptions = BoxProviderLookupOptions & {
-  /**
-   * Called once per diverging variable, BEFORE anything is spawned. Reporting is
-   * the caller's job (the spawn path writes one `[acpx] warning:` line); the
-   * detection lives here so it cannot be skipped by a caller that forgets it.
-   */
-  onConflict?: (conflict: BoxProviderEnvConflict) => void;
-};
-
-/**
  * The comparison handle for a credential. ⚠️ NEVER A PREFIX OF THE VALUE — a
  * truncated SHA-256 of a high-entropy key is not reversible, whereas the first
  * eight characters of the key itself would be exactly the leak
@@ -271,157 +254,6 @@ export type BoxProviderApplyOptions = BoxProviderLookupOptions & {
  */
 export function fingerprintCredential(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 16);
-}
-
-/**
- * The strict-fallback rule's one cost, made visible: the variable is already set,
- * so the file cannot deliver — and it holds a DIFFERENT credential.
- *
- * ⚠️ AN UNRESOLVABLE FILE CREDENTIAL IS NOT A CONFLICT. There is no second value
- * to diverge from, and reporting one would warn on a half-provisioned box about
- * a key it does not have.
- */
-function conflictFor(
-  entry: BoxProviderEntry,
-  existing: string,
-  fileKey: string | undefined,
-): BoxProviderEnvConflict | undefined {
-  if (!fileKey || fileKey === existing) {
-    return undefined;
-  }
-  return {
-    name: entry.name,
-    env: entry.env,
-    inheritedFingerprint: fingerprintCredential(existing),
-    fileFingerprint: fingerprintCredential(fileKey),
-    inheritedLength: existing.length,
-    fileLength: fileKey.length,
-  };
-}
-
-/**
- * One pass over the declared providers: deliver what is missing, and report what
- * diverges. Both callers below share it so detection and delivery can never
- * disagree about which entries were considered.
- */
-function scanEntry(
-  entry: BoxProviderEntry,
-  env: NodeJS.ProcessEnv,
-  sourceEnv: NodeJS.ProcessEnv,
-  apply: boolean,
-): { applied?: string; conflict?: BoxProviderEnvConflict } {
-  const existing = env[entry.env];
-  const key = resolveBoxProviderKey(entry, sourceEnv);
-  if (typeof existing === "string" && existing.length > 0) {
-    // The never-overwrite rule — the only outcome here is the report.
-    return { conflict: conflictFor(entry, existing, key) };
-  }
-  if (!key) {
-    return {};
-  }
-  if (apply) {
-    env[entry.env] = key;
-  }
-  return { applied: entry.env };
-}
-
-function scanBoxProviderEnv(
-  env: NodeJS.ProcessEnv,
-  options: BoxProviderApplyOptions | undefined,
-  apply: boolean,
-): { applied: string[]; conflicts: BoxProviderEnvConflict[] } {
-  const sourceEnv = options?.env ?? process.env;
-  const applied: string[] = [];
-  const conflicts: BoxProviderEnvConflict[] = [];
-  for (const entry of loadBoxProviders(options).providers) {
-    const outcome = scanEntry(entry, env, sourceEnv, apply);
-    if (outcome.applied !== undefined) {
-      applied.push(outcome.applied);
-    }
-    if (outcome.conflict !== undefined) {
-      conflicts.push(outcome.conflict);
-    }
-  }
-  return { applied, conflicts };
-}
-
-/**
- * Deliver the box's provider credentials into a child environment. THIS IS THE
- * ENTIRE DELIVERY MECHANISM — adapter-agnostic by construction, because the
- * variable is set on the spawn env every adapter inherits.
- *
- * A variable that is ALREADY SET IS NEVER OVERWRITTEN — the same rule
- * `promotePrefixedAuthEnvironment` uses. Anything more specific than the box
- * (the ambient wave-one `ACPX_AUTH_OPENROUTER_API_KEY` promotion, a caller's own
- * export) therefore wins, and this is a strict fallback.
- *
- * ⚠️ THAT PRECEDENCE HAS A COST, AND IT IS WHY `onConflict` EXISTS. An agent
- * captures `OPENROUTER_API_KEY` in its own environment at spawn and every child
- * it spawns inherits that snapshot, so REWRITING `providers.json` — the remedy
- * for a rotated or re-minted key — does not reach an already-running process or
- * any of its children. The precedence is deliberate and unchanged here (a
- * deliberate per-session export must still win); what is NOT acceptable is that
- * it used to be silent. OpenRouter answers a stale key with a `401 "User not
- * found."` that is BYTE-IDENTICAL to a bogus key's, so the symptom named
- * nothing and three lanes spent an investigation on it (brick c788eca0). The
- * divergence is now reported by hash, never by value.
- *
- * ⚠️ ON A CLAUDE SESSION THE INJECTED KEY IS INERT, AND SAYING OTHERWISE WOULD
- * DESCRIBE A BUG THAT DOES NOT EXIST. The Claude-on-OpenRouter shim receives its
- * key as an explicit PARAMETER (`spawnOpenRouterShim(apiKey, …)`) and sets
- * `OPENROUTER_API_KEY` on the SHIM CHILD's env, not the agent's
- * (`openrouter-shim.ts`); claude-agent-acp never reads that variable. Running
- * this before `applyProfileEnv` is a convention for predictability, NOT a
- * conflict resolution — the two do not collide.
- *
- * @returns the variable NAMES that were set (never values), for logging/tests.
- */
-export function applyBoxProviderEnv(
-  env: NodeJS.ProcessEnv,
-  options?: BoxProviderApplyOptions,
-): string[] {
-  const { applied, conflicts } = scanBoxProviderEnv(env, options, true);
-  if (options?.onConflict) {
-    for (const conflict of conflicts) {
-      options.onConflict(conflict);
-    }
-  }
-  return applied;
-}
-
-/**
- * The same comparison WITHOUT delivering anything — for a diagnostic surface
- * (`acpx providers list`) that asks "which credential would my children
- * actually get?" of the environment it is already running in.
- */
-export function detectBoxProviderEnvConflicts(
-  env: NodeJS.ProcessEnv,
-  options?: BoxProviderLookupOptions,
-): BoxProviderEnvConflict[] {
-  return scanBoxProviderEnv(env, options, false).conflicts;
-}
-
-/**
- * The one wording, so the spawn path and the CLI cannot drift. Says which value
- * is which, that the inherited one WINS, and what to do about it — a warning
- * that names a divergence without naming the remedy just relocates the puzzle.
- *
- * ⚠️ Contains no credential: `test/box-providers.test.ts` plants a synthetic key,
- * proves it is findable in the raw load, and then asserts it is absent from this
- * string.
- */
-export function formatBoxProviderEnvConflict(
-  conflict: BoxProviderEnvConflict,
-  providersPath: string = boxProvidersPath(),
-): string {
-  return (
-    `${conflict.env} in the environment differs from ${providersPath}; ` +
-    `the inherited value takes precedence and may be stale ` +
-    `(inherited sha256:${conflict.inheritedFingerprint} len=${conflict.inheritedLength}, ` +
-    `file sha256:${conflict.fileFingerprint} len=${conflict.fileLength}). ` +
-    `A rotated key never reaches an already-running process: unset ${conflict.env} ` +
-    `for this spawn, or restart the session, to pick up the file's value.`
-  );
 }
 
 /**
@@ -459,18 +291,6 @@ export type BoxProviderStatus = {
   /** `expiresInDays <= 14` (and not yet expired). */
   expiringSoon: boolean;
   expired: boolean;
-  /**
-   * THIS process's environment already holds a DIFFERENT value for `env` than
-   * this file resolves — so every child it spawns gets the inherited one and
-   * this file is inert for them. The whole point of surfacing it here: it
-   * answers "which credential did the PROCESS capture?", which is a different
-   * question from "which credential does the FILE hold?" and the one that was
-   * unanswerable when a stale key produced a `401 "User not found."`.
-   */
-  inheritedEnvDiffers: boolean;
-  /** Set only when `inheritedEnvDiffers` — truncated SHA-256, never a value. */
-  inheritedFingerprint?: string;
-  fileFingerprint?: string;
 };
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -531,31 +351,6 @@ function expiryOf(
   };
 }
 
-/**
- * The status projection's view of the same comparison the spawn path warns on —
- * built through `conflictFor` rather than re-derived, so the CLI and the warning
- * can never disagree about what counts as a divergence.
- */
-function describeDivergence(
-  entry: BoxProviderEntry,
-  resolved: string | undefined,
-  sourceEnv: NodeJS.ProcessEnv,
-): Pick<BoxProviderStatus, "inheritedEnvDiffers" | "inheritedFingerprint" | "fileFingerprint"> {
-  const inherited = sourceEnv[entry.env];
-  const conflict =
-    typeof inherited === "string" && inherited.length > 0
-      ? conflictFor(entry, inherited, resolved)
-      : undefined;
-  if (!conflict) {
-    return { inheritedEnvDiffers: false };
-  }
-  return {
-    inheritedEnvDiffers: true,
-    inheritedFingerprint: conflict.inheritedFingerprint,
-    fileFingerprint: conflict.fileFingerprint,
-  };
-}
-
 function describeEntry(
   entry: BoxProviderEntry,
   now: Date,
@@ -569,7 +364,6 @@ function describeEntry(
     hasCredential: resolved !== undefined,
     expiringSoon: expiry.expiringSoon,
     expired: expiry.expired,
-    ...describeDivergence(entry, resolved, sourceEnv),
   };
   for (const field of STATUS_FIELDS) {
     const value = entry[field];

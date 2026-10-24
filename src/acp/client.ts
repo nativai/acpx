@@ -40,7 +40,6 @@ import {
 import { resolveBuiltInAgentLaunch } from "../agent-registry.js";
 import { TimeoutError, withTimeout } from "../async-control.js";
 import type { ProvisioningWarningBreadcrumb } from "../config/os-harness-provisioning.js";
-import { applyBoxProviderEnv, formatBoxProviderEnvConflict } from "../config/providers.js";
 import {
   AgentDisconnectedError,
   AgentSpawnError,
@@ -1418,8 +1417,7 @@ export class AcpClient {
     // ── P0: model POLICY, before any credential or route work (brick 30eb2003) ──
     //
     // ★ THE ENFORCEMENT for "Claude-family models are not available on the
-    // OpenRouter route". Sited HERE, above `applyBoxProviderEnv` and
-    // `applyProfileEnv`, for one reason: this method is the single convergence
+    // OpenRouter route". Sited HERE, above `applyProfileEnv`, for one reason: this method is the single convergence
     // point of EVERY adapter spawn — create, acpx-ui create, an inherited child
     // with no `--model`, `sessions copy`/fork, `--from-template`, and resume — so
     // one harness-agnostic line covers all of them, including the four that brick
@@ -1458,20 +1456,16 @@ export class AcpClient {
         process.stderr.write(`[acpx] note: ${formatEntitlementUnknown(entitlement)}\n`);
       },
     });
-    // Box-scoped provider credentials (~/.acpx/providers.json) — adapter-agnostic,
-    // and a strict fallback: it never overwrites a variable that is already set.
-    // Deliberately BEFORE applyProfileEnv for predictable ordering; the two do not
-    // collide (see applyBoxProviderEnv's contract — on Claude the key is inert).
-    //
-    // ⚠️ THE WARNING IS NOT DEDUPED, ON PURPOSE. It fires per spawn, per diverging
-    // variable. A once-per-process warning is indistinguishable from a check that
-    // stopped running — and the reader who needs it is looking at THIS spawn's
-    // stderr, not at the first spawn of a long-lived queue owner (brick c788eca0).
-    applyBoxProviderEnv(spawnOptions.env, {
-      onConflict: (conflict) => {
-        process.stderr.write(`[acpx] warning: ${formatBoxProviderEnvConflict(conflict)}\n`);
-      },
-    });
+    // ⚠️ NO BOX PROVIDER CREDENTIAL IS SET ON THIS ENV — DO NOT ADD ONE BACK (brick
+    // 1dc24c1c). `applyBoxProviderEnv` used to sit here and put every
+    // `~/.acpx/providers.json` entry (`OPENROUTER_API_KEY`) into every adapter env of
+    // every harness, from where it reached the agent's shell, every `workbench-exec`
+    // command and every dev server — and beat the project's own `.env` value.
+    // `buildAgentSpawnOptions` now strips the name (`AGENT_STRIPPED_CREDENTIAL_ENV`);
+    // pi reads the key through a command reference in its per-session `auth.json`
+    // (`writePiAuthFile`, in `applyHarnessConfigDirEnv` below) and the Claude
+    // OpenRouter shim takes it as a parameter. `test/agent-credential-env.test.ts`
+    // spawns a real child and asserts the names are absent from what it received.
     await this.applyProfileEnv(spawnOptions.env);
     // B3: the per-session harness config dir — primer + model pin + catalogue
     // fragment, one directory (CONCEPTION §5.3). GATED PER HARNESS off the
@@ -1502,9 +1496,10 @@ export class AcpClient {
    * reads the session's own environment, and passing the wrong one silently
    * renders somebody else's context.
    *
-   * ⚠️ Ordering: this runs AFTER `applyBoxProviderEnv` and `applyProfileEnv`, so
-   * the primer script sees the fully-built child environment — including the
-   * provider credential — exactly as the adapter will.
+   * ⚠️ Ordering: this runs AFTER `applyProfileEnv`, so the primer script sees the
+   * fully-built child environment exactly as the adapter will. That environment
+   * carries no box provider credential (brick 1dc24c1c): pi's key arrives through
+   * the `auth.json` this call writes, never through the env.
    *
    * ⚠️ THE BRICK BLOCK BELONGS HERE TOO, AND ITS ABSENCE IS SILENT (brick
    * 968519c3). This leg is the ONLY primer path pi has, so a block folded in on

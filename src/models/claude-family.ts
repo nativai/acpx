@@ -361,9 +361,8 @@ function bareSlug(requested: string): string {
  * Steps 2 and 3 still fire in that state, which is exactly why they are kept
  * independent of the set.
  *
- * Called from `AcpClient.resolveAgentLaunchPlan` ABOVE both `applyBoxProviderEnv`
- * and `applyProfileEnv`, which is what makes it the single place that covers every
- * spawn there is — create, acpx-ui create, an inherited child with no `--model`,
+ * Called from `AcpClient.resolveAgentLaunchPlan` ABOVE `applyProfileEnv`, which
+ * is what makes it the single place that covers every spawn there is — create, acpx-ui create, an inherited child with no `--model`,
  * `sessions copy`/fork, `--from-template`, and RESUME — because every one of them
  * reaches the adapter through that one method (one caller, one call site).
  *
@@ -478,7 +477,7 @@ export type ModelPolicyOptions = {
    * Called when acpx could not establish what the key allows, immediately before it
    * fails open. Reporting is the caller's job (the spawn path writes one line);
    * detecting it lives here so a caller that forgets the callback still gets the
-   * right *behaviour* — the same split `applyBoxProviderEnv`'s `onConflict` uses.
+   * right *behaviour*.
    */
   onEntitlementUnknown?: (entitlement: OpenRouterEntitlement) => void;
 };

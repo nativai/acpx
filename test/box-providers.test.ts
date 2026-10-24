@@ -4,15 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
-  applyBoxProviderEnv,
   BOX_PROVIDER_EXPIRY_WARNING_DAYS,
-  type BoxProviderEnvConflict,
   boxProviderEnvNames,
   boxProvidersPath,
   describeBoxProviders,
-  detectBoxProviderEnvConflicts,
   fingerprintCredential,
-  formatBoxProviderEnvConflict,
   loadBoxProviders,
   resolveBoxProviderKey,
 } from "../src/config/providers.js";
@@ -72,9 +68,6 @@ test("an ABSENT file is the normal case and never throws", () => {
     // been provisioned — which is nearly all of them on day one.
     const loaded = loadBoxProviders({ homeDir: fixture.homeDir });
     assert.deepEqual(loaded, { version: 1, providers: [] });
-    const env: NodeJS.ProcessEnv = {};
-    assert.deepEqual(applyBoxProviderEnv(env, { homeDir: fixture.homeDir }), []);
-    assert.deepEqual(env, {});
     assert.deepEqual(describeBoxProviders({ homeDir: fixture.homeDir }), []);
   } finally {
     rmSync(fixture.homeDir, { recursive: true, force: true });
@@ -158,140 +151,6 @@ test("apiKeyEnv BEATS a literal apiKey — the profile schema's precedence, reus
   }
 });
 
-test("applyBoxProviderEnv sets the declared variable, and NEVER overwrites one already set", () => {
-  const fixture = makeHome();
-  try {
-    writeProviders(fixture, openRouterFixture());
-
-    const fresh: NodeJS.ProcessEnv = { PATH: "/usr/bin" };
-    assert.deepEqual(applyBoxProviderEnv(fresh, { homeDir: fixture.homeDir, env: {} }), [
-      "OPENROUTER_API_KEY",
-    ]);
-    assert.equal(fresh.OPENROUTER_API_KEY, SYNTHETIC_KEY);
-
-    // ⚠️ THE NON-OVERWRITING RULE — the same one `promotePrefixedAuthEnvironment`
-    // uses. Anything more specific than the box (the wave-one ambient
-    // ACPX_AUTH_OPENROUTER_API_KEY promotion, a caller's own export) wins, and
-    // the box credential is a strict fallback. This is also why the injection is
-    // a structural NO-OP wherever the variable is already in the parent's env.
-    const occupied: NodeJS.ProcessEnv = { OPENROUTER_API_KEY: "pre-existing-value" };
-    assert.deepEqual(applyBoxProviderEnv(occupied, { homeDir: fixture.homeDir, env: {} }), []);
-    assert.equal(occupied.OPENROUTER_API_KEY, "pre-existing-value");
-  } finally {
-    rmSync(fixture.homeDir, { recursive: true, force: true });
-  }
-});
-
-// ── The divergence warning (brick c788eca0) ─────────────────────────────────
-//
-// The precedence above is DELIBERATE and unchanged. What these tests pin is that
-// it is no longer SILENT: a rotated key rewritten into providers.json cannot
-// reach an already-running process, and OpenRouter answers the resulting stale
-// key with a `401 "User not found."` byte-identical to a bogus key's — so
-// without this warning the symptom names nothing. Both directions are asserted
-// on ONE collector, because "no warning" from an instrument that never ran looks
-// exactly like "no warning" from a check that found nothing.
-
-test("applyBoxProviderEnv WARNS when the inherited value differs — and is SILENT when it matches", () => {
-  const fixture = makeHome();
-  try {
-    writeProviders(fixture, openRouterFixture());
-    const seen: BoxProviderEnvConflict[] = [];
-    const onConflict = (conflict: BoxProviderEnvConflict) => seen.push(conflict);
-    const options = { homeDir: fixture.homeDir, env: {}, onConflict };
-
-    // 1. DIVERGENT — the measured production case: the process captured an old
-    //    key at its own spawn and the file has since been rewritten.
-    const stale: NodeJS.ProcessEnv = { OPENROUTER_API_KEY: `${SYNTHETIC_KEY}-STALE` };
-    assert.deepEqual(applyBoxProviderEnv(stale, options), []);
-    assert.equal(stale.OPENROUTER_API_KEY, `${SYNTHETIC_KEY}-STALE`, "precedence must not change");
-    assert.equal(seen.length, 1, "a divergent inherited value must warn");
-    assert.equal(seen[0].env, "OPENROUTER_API_KEY");
-    assert.equal(seen[0].name, "openrouter");
-    assert.equal(seen[0].inheritedFingerprint, fingerprintCredential(`${SYNTHETIC_KEY}-STALE`));
-    assert.equal(seen[0].fileFingerprint, fingerprintCredential(SYNTHETIC_KEY));
-    assert.equal(seen[0].inheritedLength, `${SYNTHETIC_KEY}-STALE`.length);
-    assert.equal(seen[0].fileLength, SYNTHETIC_KEY.length);
-    assert.notEqual(seen[0].inheritedFingerprint, seen[0].fileFingerprint);
-
-    // 2. IDENTICAL — the ordinary case on a healthy box. SAME collector, same
-    //    fixture, same call: it has just been proven able to fire, so this
-    //    silence is a measurement rather than a broken check.
-    seen.length = 0;
-    const matching: NodeJS.ProcessEnv = { OPENROUTER_API_KEY: SYNTHETIC_KEY };
-    assert.deepEqual(applyBoxProviderEnv(matching, options), []);
-    assert.deepEqual(seen, [], "an identical inherited value must be silent");
-
-    // 3. UNSET — nothing inherited, so the file delivers and there is nothing to
-    //    diverge from. The delivery path must not have grown a warning.
-    const fresh: NodeJS.ProcessEnv = {};
-    assert.deepEqual(applyBoxProviderEnv(fresh, options), ["OPENROUTER_API_KEY"]);
-    assert.deepEqual(seen, [], "delivering the file's own value must be silent");
-
-    // 4. THE FILE RESOLVES NOTHING — "differs" would be a lie: there is no second
-    //    value. Silence here is correctness, not a miss.
-    writeProviders(fixture, {
-      version: 1,
-      providers: { openrouter: { env: "OPENROUTER_API_KEY", apiKeyEnv: "HP_B1_ABSENT" } },
-    });
-    const orphan: NodeJS.ProcessEnv = { OPENROUTER_API_KEY: `${SYNTHETIC_KEY}-STALE` };
-    assert.deepEqual(applyBoxProviderEnv(orphan, options), []);
-    assert.deepEqual(seen, [], "no file credential means nothing to compare");
-  } finally {
-    rmSync(fixture.homeDir, { recursive: true, force: true });
-  }
-});
-
-test("no onConflict handler: divergence changes NOTHING about delivery", () => {
-  const fixture = makeHome();
-  try {
-    // The handler is optional and the caller that omits it must get exactly the
-    // pre-existing behaviour — the warning is additive, not a new failure mode.
-    writeProviders(fixture, openRouterFixture());
-    const stale: NodeJS.ProcessEnv = { OPENROUTER_API_KEY: "pre-existing-value" };
-    assert.deepEqual(applyBoxProviderEnv(stale, { homeDir: fixture.homeDir, env: {} }), []);
-    assert.equal(stale.OPENROUTER_API_KEY, "pre-existing-value");
-  } finally {
-    rmSync(fixture.homeDir, { recursive: true, force: true });
-  }
-});
-
-test("the warning MESSAGE names which value is which, and CANNOT carry the credential", () => {
-  const fixture = makeHome();
-  try {
-    writeProviders(fixture, openRouterFixture());
-    const inherited = `${SYNTHETIC_KEY}-STALE`;
-    const [conflict] = detectBoxProviderEnvConflicts(
-      { OPENROUTER_API_KEY: inherited },
-      { homeDir: fixture.homeDir, env: {} },
-    );
-    assert.ok(conflict, "detectBoxProviderEnvConflicts must see the divergence");
-
-    // ⚠️ POSITIVE CONTROL FIRST, same instrument: prove both plaintexts ARE
-    // findable somewhere before asserting they are absent from the message.
-    const rawFile = JSON.stringify(loadBoxProviders({ homeDir: fixture.homeDir }));
-    assert.match(rawFile, SECRET_SHAPE, "control: the planted key must be findable in the load");
-
-    const message = formatBoxProviderEnvConflict(conflict, "/tmp/probe/providers.json");
-    assert.ok(!message.includes(SYNTHETIC_KEY), "the warning leaked the file's credential");
-    assert.ok(!message.includes(inherited), "the warning leaked the inherited credential");
-    assert.doesNotMatch(message, SECRET_SHAPE, "the warning leaked a credential shape");
-
-    // …and it must still SAY the thing. A message that leaks nothing by saying
-    // nothing is the failure this pair of assertions exists to separate.
-    assert.match(message, /OPENROUTER_API_KEY in the environment differs/);
-    assert.ok(message.includes("/tmp/probe/providers.json"), "must name the file it compared to");
-    assert.match(message, /inherited value takes precedence and may be stale/);
-    assert.ok(message.includes(conflict.inheritedFingerprint), "must carry the inherited hash");
-    assert.ok(message.includes(conflict.fileFingerprint), "must carry the file hash");
-    // The remedy, named — a warning that describes a divergence without saying
-    // what to do about it just relocates the puzzle.
-    assert.match(message, /unset OPENROUTER_API_KEY|restart the session/);
-  } finally {
-    rmSync(fixture.homeDir, { recursive: true, force: true });
-  }
-});
-
 test("the fingerprint is a DIGEST, not a prefix of the key", () => {
   const digest = fingerprintCredential(SYNTHETIC_KEY);
   assert.match(digest, /^[0-9a-f]{16}$/);
@@ -302,85 +161,7 @@ test("the fingerprint is a DIGEST, not a prefix of the key", () => {
   assert.equal(digest, fingerprintCredential(SYNTHETIC_KEY), "must be stable across processes");
 });
 
-test("describeBoxProviders reports the divergence — both directions, one instrument", () => {
-  const fixture = makeHome();
-  try {
-    writeProviders(fixture, openRouterFixture());
-
-    const [diverged] = describeBoxProviders({
-      homeDir: fixture.homeDir,
-      env: { OPENROUTER_API_KEY: `${SYNTHETIC_KEY}-STALE` },
-    });
-    assert.ok(diverged);
-    assert.equal(diverged.inheritedEnvDiffers, true);
-    assert.equal(diverged.inheritedFingerprint, fingerprintCredential(`${SYNTHETIC_KEY}-STALE`));
-    assert.equal(diverged.fileFingerprint, fingerprintCredential(SYNTHETIC_KEY));
-    // `hasCredential` is about the FILE and stays true — which is exactly why the
-    // new field is needed: on its own, "credential: present" reads as "my
-    // sessions use this key" when they demonstrably do not.
-    assert.equal(diverged.hasCredential, true);
-    assert.ok(
-      !JSON.stringify(diverged).includes(SYNTHETIC_KEY),
-      "the status surface leaked a credential",
-    );
-
-    for (const env of [{ OPENROUTER_API_KEY: SYNTHETIC_KEY }, {}]) {
-      const [quiet] = describeBoxProviders({ homeDir: fixture.homeDir, env });
-      assert.ok(quiet);
-      assert.equal(
-        quiet.inheritedEnvDiffers,
-        false,
-        `env ${JSON.stringify(Object.keys(env))} must not report a divergence`,
-      );
-      assert.equal(quiet.inheritedFingerprint, undefined);
-      assert.equal(quiet.fileFingerprint, undefined);
-    }
-  } finally {
-    rmSync(fixture.homeDir, { recursive: true, force: true });
-  }
-});
-
-test("apiKeyEnv indirection pointing at the SAME variable is not a divergence", () => {
-  const fixture = makeHome();
-  try {
-    // The file says "read the credential from OPENROUTER_API_KEY". The inherited
-    // value IS then the file's answer, and calling that a conflict would warn on
-    // every spawn of a correctly-configured box — a warning that cries wolf is
-    // the fastest way to get this one ignored.
-    writeProviders(fixture, openRouterFixture({ apiKeyEnv: "OPENROUTER_API_KEY" }));
-    const env = { OPENROUTER_API_KEY: `${SYNTHETIC_KEY}-AMBIENT` };
-    assert.deepEqual(detectBoxProviderEnvConflicts(env, { homeDir: fixture.homeDir, env }), []);
-
-    // Control, same fixture: with the indirection pointing ELSEWHERE the literal
-    // is what the file resolves, and the same ambient value DOES diverge.
-    writeProviders(fixture, openRouterFixture({ apiKeyEnv: "HP_B1_ABSENT" }));
-    const conflicts = detectBoxProviderEnvConflicts(env, { homeDir: fixture.homeDir, env });
-    assert.equal(conflicts.length, 1, "control: the detector must be able to fire here");
-    assert.equal(conflicts[0].env, "OPENROUTER_API_KEY");
-  } finally {
-    rmSync(fixture.homeDir, { recursive: true, force: true });
-  }
-});
-
-test("an entry whose credential does not resolve sets NOTHING", () => {
-  const fixture = makeHome();
-  try {
-    // No literal and an indirection that resolves to nothing: setting the
-    // variable to "" would be worse than leaving it unset — the harness would
-    // then send an empty bearer token instead of falling through.
-    writeProviders(fixture, {
-      version: 1,
-      providers: { openrouter: { env: "OPENROUTER_API_KEY", apiKeyEnv: "HP_B1_ABSENT" } },
-    });
-    const env: NodeJS.ProcessEnv = {};
-    assert.deepEqual(applyBoxProviderEnv(env, { homeDir: fixture.homeDir, env: {} }), []);
-    assert.ok(!("OPENROUTER_API_KEY" in env));
-  } finally {
-    rmSync(fixture.homeDir, { recursive: true, force: true });
-  }
-});
-
-test("MULTIPLE providers are each delivered under their own declared name", () => {
+test("MULTIPLE providers each declare their own variable name — the redaction input", () => {
   const fixture = makeHome();
   try {
     writeProviders(fixture, {
@@ -394,11 +175,6 @@ test("MULTIPLE providers are each delivered under their own declared name", () =
         someprovider: { env: "SOMEPROVIDER_AUTH", apiKey: `${SYNTHETIC_KEY}-2` },
       },
     });
-    const env: NodeJS.ProcessEnv = {};
-    assert.deepEqual(applyBoxProviderEnv(env, { homeDir: fixture.homeDir, env: {} }).toSorted(), [
-      "OPENROUTER_API_KEY",
-      "SOMEPROVIDER_AUTH",
-    ]);
     assert.deepEqual(boxProviderEnvNames({ homeDir: fixture.homeDir }).toSorted(), [
       "OPENROUTER_API_KEY",
       "SOMEPROVIDER_AUTH",

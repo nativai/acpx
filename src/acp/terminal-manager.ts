@@ -24,6 +24,7 @@ import {
   type TerminalSpawnCommand,
 } from "../spawn-command-options.js";
 import type { ClientOperation, NonInteractivePermissionPolicy, PermissionMode } from "../types.js";
+import { deleteAgentStrippedCredentialEnv } from "./agent-credential-env.js";
 
 const DEFAULT_TERMINAL_OUTPUT_LIMIT_BYTES = 64 * 1024;
 const DEFAULT_KILL_GRACE_MS = 1_500;
@@ -78,9 +79,15 @@ function toCommandLine(command: string, args: string[] | undefined): string {
 // acpx-ui's own `PORT=3456`, which a `$PORT`-honouring dev server would bind. Unlike
 // ACPX_OWNER_LOG, a request that names `PORT` keeps it — that agent chose a port.
 // `HOST` (0.0.0.0, the container default) is kept, as in `buildAgentEnvironment`.
+//
+// The box API credentials are dropped from the inherited base for the same reason
+// `buildAgentEnvironment` drops them (brick 1dc24c1c): a terminal command is something the
+// AGENT runs, and the queue owner's own environment can still carry a pre-rule snapshot.
+// Like `PORT`, a request that names one explicitly keeps it.
 function toEnvObject(env: CreateTerminalRequest["env"]): NodeJS.ProcessEnv {
   const merged: NodeJS.ProcessEnv = { ...process.env };
   delete merged.PORT;
+  deleteAgentStrippedCredentialEnv(merged);
   for (const entry of env ?? []) {
     merged[entry.name] = entry.value;
   }

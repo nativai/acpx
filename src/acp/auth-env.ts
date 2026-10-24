@@ -42,6 +42,7 @@ import { SubscriptionLockedError } from "../errors.js";
 import type { AcpClientOptions } from "../types.js";
 import { commandCarriesAdapterToken } from "./adapter-token.js";
 import { isClaudeFamilyAgent } from "./agent-command.js";
+import { deleteAgentStrippedCredentialEnv } from "./agent-credential-env.js";
 import { splitCommandLine } from "./client-process.js";
 import { isCodexAcpCommand } from "./codex-compat.js";
 import { harnessIdForAgentCommand } from "./harness-capabilities.js";
@@ -1126,14 +1127,17 @@ function buildAgentEnvironment(
       ensureProvisioningForResolvedSubscription(env, lookupOptions, onProvisioningWarning);
     }
   }
-  if (!authCredentials) {
-    return env;
-  }
-
-  for (const [methodId, credential] of Object.entries(authCredentials)) {
+  for (const [methodId, credential] of Object.entries(authCredentials ?? {})) {
     assignAuthCredentialEnv(env, methodId, credential);
   }
-
+  // brick 1dc24c1c — box API credentials never reach an agent, whatever their source: inherited
+  // under the plain name (a parent spawned before this rule still carries the old snapshot),
+  // inherited as `ACPX_AUTH_<NAME>` (promoted above), or a config `authCredentials` entry naming
+  // one (assigned just above). ⚠️ IT MUST STAY THE LAST WRITE: moved above the loop, a config
+  // `authCredentials` entry would put the name straight back. No box config sets one today
+  // (checked 2026-10-24, key names only); the strip applies to them by decision anyway — agent
+  // API access goes through Cardea, never an ambient variable.
+  deleteAgentStrippedCredentialEnv(env);
   return env;
 }
 

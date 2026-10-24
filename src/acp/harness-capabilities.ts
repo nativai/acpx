@@ -1237,7 +1237,7 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
       ladder: "acp",
       configOptionAdvertisedAtSessionNew: false, // I2 R8/R11 — `configOptions` is null; depth rides `modes`
     },
-    credential: { tier: "box-provider", providers: ["openrouter"] }, // I2 R6 — plain OPENROUTER_API_KEY
+    credential: { tier: "box-provider", providers: ["openrouter"] }, // box key via pi's per-session auth.json command reference, never env (1dc24c1c)
     // B5: the fork implements `session/fork` on pi's JSONL session tree (the SDK
     // already dispatched it; upstream simply had no handler), and honours
     // `_meta.acpx.forkAtMessageIndex` by truncating the copied JSONL after the
@@ -1303,8 +1303,8 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
     // MEASURED, and — unlike the cell above — INDEPENDENT of which pi-acp is
     // running, because the gate dispatches on the ADAPTER KIND, which is `pi` for
     // the fork and for upstream alike (`acpAdapterKind`, the one classifier). Pi's
-    // credential is the box's OpenRouter key in the adapter environment
-    // (`credential.tier: "box-provider"`, I2 R6): no `AuthMode` maps to this adapter
+    // credential is the box's OpenRouter key, read through its per-session `auth.json`
+    // (`credential.tier: "box-provider"`, brick 1dc24c1c): no `AuthMode` maps to this adapter
     // (src/config/profiles.ts:145-156), so there is no profile to move to, and
     // `assertClaudeFamilySeam` (src/runtime/engine/account-seam.ts:111-120) refuses
     // the record before any work. I2 §5 measured the damage when that gate was

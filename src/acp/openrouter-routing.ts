@@ -380,10 +380,7 @@ export type OpenRouterBoxCredential = {
 /**
  * The box's OpenRouter credential for the picker route.
  *
- * ⚠️ FILE FIRST, AND THAT IS THE OPPOSITE OF `applyBoxProviderEnv` ON PURPOSE.
- * `applyBoxProviderEnv` is a strict fallback because it must not stomp a caller's
- * deliberate export into the AGENT env. The shim's key is a different question:
- * it is a credential the BOX owns, and **a rotated key never reaches an
+ * ⚠️ FILE FIRST. The shim's key is a credential the BOX owns, and **a rotated key never reaches an
  * already-running process** — an inherited `OPENROUTER_API_KEY` in a long-lived
  * queue owner is exactly the stale value that cost this programme a day on
  * 2026-09-06. Reading `providers.json` at spawn means the shim gets the key the
