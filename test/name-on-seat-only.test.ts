@@ -107,7 +107,7 @@ const ALLOWED_NAME_READS: ReadonlyMap<string, { count: number; why: string }> = 
   ],
   ["models/catalogue.ts", { count: 1, why: "a model catalogue row's `name`" }],
   ["models/matcher.ts", { count: 1, why: "a model row's `name`" }],
-  ["config/providers.ts", { count: 2, why: "a provider entry's `name`" }],
+  ["config/providers.ts", { count: 1, why: "a provider entry's `name`" }],
   ["mcp-servers.ts", { count: 1, why: "an MCP server entry's `name`" }],
   ["acp/terminal-manager.ts", { count: 1, why: "an env var entry's `name`" }],
   ["acp/harness-config-dir.ts", { count: 3, why: "fs Dirent names" }],
