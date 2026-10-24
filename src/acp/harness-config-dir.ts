@@ -38,6 +38,7 @@ import {
   reportRoutingPolicyWarning,
   resolveProviderObject,
 } from "./openrouter-provider-policy.js";
+import { writePiAuthFile } from "./pi-auth-file.js";
 import { readPiAdvertisedModelIds } from "./pi-model-knowledge.js";
 
 /**
@@ -787,7 +788,7 @@ export interface HarnessConfigDirPlan {
 }
 
 export interface HarnessConfigDirInput {
-  /** The adapter spawn env, mutated in place — same contract as `applyBoxProviderEnv`. */
+  /** The adapter spawn env, mutated in place. */
   env: NodeJS.ProcessEnv;
   agentCommand: string | undefined;
   /** Namespaces the directory. Any stable per-session string. */
@@ -808,6 +809,9 @@ export interface HarnessConfigDirInput {
   /** The session's working directory — pi namespaces its session store by it
    *  (brick ac86eb34). Absent ⇒ pi's session dir is left alone. */
   cwd?: string;
+  /** Overrides the box `providers.json` that pi's `auth.json` points at (default
+   *  `boxProvidersPath()`); tests use it to keep the file inside a fixture. */
+  providersPath?: string;
 }
 
 /**
@@ -959,6 +963,7 @@ function writePiConfigDir(dir: string, input: HarnessConfigDirInput): HarnessCon
     files,
   );
   writePiStallPolicyAndDefaultModel(dir, files);
+  writePiAuthFileFailOpen(dir, input, files);
   const piExtensions = seedPiExtensions(dir, boxAgentDir, input.env, files);
   writePiLiveRoutingExtension(dir, input.env, files, piExtensions);
   // KEEP pi's SESSION STORE IN THE BOX STORE (brick ac86eb34, corrected by
@@ -982,6 +987,28 @@ function writePiConfigDir(dir: string, input: HarnessConfigDirInput): HarnessCon
     delete input.env.PI_CODING_AGENT_SESSION_DIR;
   }
   return { harness: "pi", dir, sessionDir, envNames, files, piExtensions };
+}
+
+/**
+ * pi's OpenRouter key, as a command reference in the per-session `auth.json` —
+ * see {@link writePiAuthFile} for which file, why a command, and the merge rule.
+ *
+ * Fail-open like the rest of this dir: an unwritable `auth.json` costs this session
+ * its OpenRouter key (pi then says so on the first turn), never the primer and
+ * model pin that the surrounding `try` would otherwise discard with it.
+ */
+function writePiAuthFileFailOpen(dir: string, input: HarnessConfigDirInput, files: string[]): void {
+  try {
+    const authPath = writePiAuthFile(dir, input.env, input.providersPath);
+    if (authPath) {
+      files.push(authPath);
+    }
+  } catch (error) {
+    process.stderr.write(
+      `[acpx] could not write pi's auth.json in ${dir}; the session has no OpenRouter key: ` +
+        `${error instanceof Error ? error.message : String(error)}\n`,
+    );
+  }
 }
 
 /**
