@@ -194,7 +194,15 @@ test("SAFETY: a different tag, a different HOME, and a name-prefix sibling all s
       "children up",
     );
 
-    await removeTempHome(home);
+    // The different-TAG child holds this home and the reap cannot identify it, so the
+    // teardown refuses AT ONCE and names exactly that pid (and not the innocent ones).
+    await assert.rejects(removeTempHome(home), (error) => {
+      assert.ok(error instanceof Error);
+      assert.ok(error.message.includes(`pid=${String(foreignTag.pid)} `), error.message);
+      assert.ok(!error.message.includes(`pid=${String(otherHomeSameTag.pid)} `), error.message);
+      assert.ok(!error.message.includes(`pid=${String(sibling.pid)} `), error.message);
+      return true;
+    });
 
     // Positive control: the child the match DOES select is gone — otherwise "the
     // others survived" would also be true of a teardown that reaped nothing.
@@ -236,7 +244,7 @@ test("SAFETY: a different tag, a different HOME, and a name-prefix sibling all s
 const RUNNING_AS_ROOT = process.getuid?.() === 0;
 
 test(
-  "a home that cannot be removed throws naming the directory, what is left and who holds it — never silence",
+  "a home that cannot be removed (no holder) throws within the deadline, naming the directory and what is left — never silence",
   {
     skip: RUNNING_AS_ROOT
       ? "root ignores directory permissions, so this failure cannot be made honestly"
@@ -244,11 +252,6 @@ test(
   },
   async () => {
     const home = newHome("acpx-temphome-c-");
-    // An unreapable holder: same HOME, NO tag of this file. The teardown must not
-    // touch it, and must name it in the failure.
-    const stranger = spawnHomeChild(IDLE_SOURCE, home, {
-      [OWNER_TAG_ENV]: "acpxtest.not-ours.some-other-file.1.abcdef",
-    });
     const locked = path.join(home, "locked");
     mkdirSync(locked);
     writeFileSync(path.join(locked, "stuck.txt"), "x");
@@ -256,35 +259,127 @@ test(
     // cheap failure — not a mocked fs.
     chmodSync(locked, 0o500);
     try {
-      await waitFor(() => isAlive(stranger.pid), "stranger up");
-      await assert.rejects(removeTempHome(home, { maxRetries: 2, retryDelayMs: 5 }), (error) => {
+      const started = Date.now();
+      await assert.rejects(removeTempHome(home, { deadlineMs: 300, retryDelayMs: 20 }), (error) => {
         assert.ok(error instanceof Error);
         assert.ok(error.message.includes(home), `names the directory: ${error.message}`);
         assert.ok(
           error.message.includes("locked/stuck.txt"),
           `lists what is left: ${error.message}`,
         );
-        assert.ok(
-          error.message.includes(`pid=${String(stranger.pid)} comm=node`),
-          `names the holder's pid and comm: ${error.message}`,
-        );
         assert.ok(error.cause instanceof Error, "carries the underlying fs error as its cause");
         return true;
       });
-      assert.equal(isAlive(stranger.pid), true, "the unreapable holder was not killed");
+      assert.ok(Date.now() - started < 5_000, "the deadline bounded the retrying");
       assert.equal(
         existsSync(path.join(locked, "stuck.txt")),
         true,
         "nothing was hidden or half-removed",
       );
     } finally {
-      killOwn(stranger);
-      await stranger.exited;
       chmodSync(locked, 0o700);
       rmSync(home, { recursive: true, force: true });
     }
   },
 );
+
+// brick://1d1cd13a F-1 / F-2. The writer below is the TE's shape: a child whose env
+// drops ACPX_TEST_OWNER_TAG (so the reap cannot identify it) and which refills
+// `.acpx/sessions` every 2 ms. Against it, a retrying `fs.rm` ran for >600 s (Node
+// retries at every directory level) and, with a slower writer, an rm that succeeded
+// never named the holder. The teardown must instead refuse at once and name it.
+const UNTAGGED_WRITER_SOURCE = [
+  "const fs = require('node:fs');",
+  "const dir = process.env.HOME + '/.acpx/sessions';",
+  "let n = 0;",
+  "setInterval(() => {",
+  "  try { fs.mkdirSync(dir, { recursive: true }); for (let i = 0; i < 5; i++) fs.writeFileSync(dir + '/w-' + (n++) + '.json', 'x'); } catch {}",
+  "}, 2);",
+].join("\n");
+
+/** Spawn a writer the reap cannot identify: NO ACPX_TEST_OWNER_TAG in its env at all. */
+function spawnUntaggedWriter(home: string): Spawned {
+  const child = spawn(process.execPath, ["-e", UNTAGGED_WRITER_SOURCE], {
+    detached: true,
+    stdio: "ignore",
+    env: { PATH: process.env.PATH, HOME: home },
+  });
+  const pid = child.pid;
+  assert.ok(pid !== undefined, "writer failed to spawn");
+  const exited = new Promise<void>((resolve) => {
+    child.once("exit", () => {
+      resolve();
+    });
+  });
+  return { child, pid, exited };
+}
+
+const UNTAGGED_DEADLINE_MS = 10_000;
+
+for (const mode of ["async", "sync"] as const) {
+  test(`UNIDENTIFIED HOLDER (${mode}): an untagged writer refilling the home makes the teardown throw at once, naming its pid — it neither hangs nor kills it`, async () => {
+    const home = newHome(`acpx-temphome-f-${mode}-`);
+    const writer = spawnUntaggedWriter(home);
+    try {
+      await waitFor(
+        () => existsSync(path.join(home, ".acpx", "sessions", "w-0.json")),
+        "the untagged writer's 1st file",
+      );
+      const started = Date.now();
+      let thrown: unknown;
+      try {
+        if (mode === "async") {
+          await removeTempHome(home);
+        } else {
+          removeTempHomeSync(home);
+        }
+      } catch (error) {
+        thrown = error;
+      }
+      const elapsed = Date.now() - started;
+
+      assert.ok(thrown instanceof Error, "the teardown threw instead of returning silently");
+      assert.ok(
+        elapsed < UNTAGGED_DEADLINE_MS,
+        `threw in ${String(elapsed)} ms, inside the ${String(UNTAGGED_DEADLINE_MS)} ms deadline`,
+      );
+      assert.ok(
+        thrown.message.includes(`pid=${String(writer.pid)} comm=node`),
+        `names the holder's pid and comm: ${thrown.message}`,
+      );
+      assert.ok(thrown.message.includes(home), `names the directory: ${thrown.message}`);
+      assert.equal(isAlive(writer.pid), true, "an unidentified holder is never killed");
+    } finally {
+      killOwn(writer);
+      await writer.exited;
+      rmSync(home, { recursive: true, force: true, maxRetries: 5 });
+    }
+  });
+}
+
+test("UNIDENTIFIED HOLDER: an idle untagged holder is named even though the rm would have succeeded (F-2)", async () => {
+  const home = newHome("acpx-temphome-g-");
+  // Same HOME, NO tag of this file; writes nothing, so an unguarded rm succeeds silently.
+  const stranger = spawnHomeChild(IDLE_SOURCE, home, {
+    [OWNER_TAG_ENV]: "acpxtest.not-ours.some-other-file.1.abcdef",
+  });
+  try {
+    await waitFor(() => isAlive(stranger.pid), "stranger up");
+    await assert.rejects(removeTempHome(home), (error) => {
+      assert.ok(error instanceof Error);
+      assert.ok(
+        error.message.includes(`pid=${String(stranger.pid)} comm=node`),
+        `names the holder: ${error.message}`,
+      );
+      return true;
+    });
+    assert.equal(isAlive(stranger.pid), true, "the unreapable holder was not killed");
+  } finally {
+    killOwn(stranger);
+    await stranger.exited;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
 
 test(
   "withTempHome: a throwing body is not masked by a failing teardown — both are reported",
@@ -304,7 +399,7 @@ test(
             chmodSync(locked, 0o500);
             throw new Error("the test body's own failure");
           },
-          { removal: { maxRetries: 1, retryDelayMs: 5 } },
+          { removal: { deadlineMs: 200, retryDelayMs: 20 } },
         ),
         (error) => {
           assert.ok(error instanceof Error);

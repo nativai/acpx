@@ -17,8 +17,11 @@
 //      the process's environ that IS this home or lies under it (a fixture may hand
 //      the CLI `<root>/home` and `<root>/state`; message-ledger.test.ts does). It reuses owner-reaper's /proc readers and its
 //      identify -> group-kill -> verify-absence sweep; there is no second killer.
-//   2. REMOVE with bounded retries (Node's `fs.rm` `maxRetries`/`retryDelay`, which
-//      covers ENOTEMPTY/EBUSY/EPERM) for the in-process writers a reap cannot name.
+//   2. REFUSE, at once, if a process still holds the home after the reap (one the tag
+//      does not identify): throw naming its pid and comm; kill nothing more, remove
+//      nothing. Then REMOVE with a WALL-CLOCK-bounded retry loop (default 3 s) for the
+//      in-process writers a reap cannot name. Node's own `maxRetries` is NOT used: it
+//      compounds per directory level and ran for minutes against a fast writer.
 //   3. NOTHING IS SWALLOWED. A process still holding the home after the reap throws
 //      with its pid and comm; a home that still cannot be removed throws naming the
 //      directory, what is left in it and which processes hold it. Never argv, never
@@ -61,14 +64,14 @@ export type TempHomeOptions = {
 };
 
 export type RemovalOptions = {
-  /** `fs.rm` retries on ENOTEMPTY/EBUSY/EPERM. Default 10. */
-  maxRetries?: number;
-  /** `fs.rm` base delay in ms, multiplied by the attempt number. Default 100. */
+  /** Total wall-clock budget for removing the home, in ms. Default 3000. */
+  deadlineMs?: number;
+  /** Pause between removal attempts, in ms. Default 50. */
   retryDelayMs?: number;
 };
 
-const DEFAULT_MAX_RETRIES = 10;
-const DEFAULT_RETRY_DELAY_MS = 100;
+const DEFAULT_DEADLINE_MS = 3_000;
+const DEFAULT_RETRY_DELAY_MS = 50;
 const LEFTOVER_LIST_LIMIT = 40;
 
 /** Create a temp home under `os.tmpdir()`, run `run` against it, and tear it down
@@ -120,73 +123,83 @@ function pinEnv(vars: readonly PinnedHomeVar[], tempHome: string): () => void {
 }
 
 /** Reap what this file started against `tempHome`, then remove it. Throws — never
- *  returns quietly — if a process still holds the home or the directory survives. */
+ *  returns quietly — if a process still holds the home or the directory survives.
+ *
+ *  ORDER MATTERS. After the reap, any process still holding the home is an
+ *  unidentified one (no tag of this file, or a tag but unkillable): we throw AT ONCE,
+ *  naming it, WITHOUT trying to remove — a writer we cannot name is exactly the one
+ *  that makes a retrying `fs.rm` run for minutes (Node retries at every directory
+ *  level, so the cost compounds with depth: measured retries=3 -> 13.5 s,
+ *  retries=10 -> still running at 90 s against a 2 ms writer). And the removal itself
+ *  is bounded by WALL CLOCK (`deadlineMs`), not by Node's `maxRetries`. */
 export async function removeTempHome(
   tempHome: string,
   options: RemovalOptions = {},
 ): Promise<void> {
-  const survivors = reapHomeProcesses(tempHome);
-  let removalError: unknown;
-  try {
-    await fs.rm(tempHome, rmOptions(options));
-  } catch (error) {
-    removalError = error;
+  reapThenRefuseIfHeld(tempHome);
+  const deadline = Date.now() + (options.deadlineMs ?? DEFAULT_DEADLINE_MS);
+  const delay = options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
+  for (;;) {
+    try {
+      // maxRetries 0: ONE walk per attempt; the retrying is ours, and bounded.
+      await fs.rm(tempHome, RM_ONCE);
+      return;
+    } catch (error) {
+      if (Date.now() + delay >= deadline) {
+        throw removalFailure(tempHome, error, options);
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, delay));
   }
-  failIfNotClean(tempHome, survivors, removalError, options);
 }
 
 /** `removeTempHome` for the synchronous teardowns (`afterEach`, `finally` in a
- *  non-async fixture). Same reap, same retries (`rmSync` blocks between them), same
- *  throws. */
+ *  non-async fixture). Same reap, same refusal, same wall-clock bound. */
 export function removeTempHomeSync(tempHome: string, options: RemovalOptions = {}): void {
-  const survivors = reapHomeProcesses(tempHome);
-  let removalError: unknown;
-  try {
-    rmSync(tempHome, rmOptions(options));
-  } catch (error) {
-    removalError = error;
+  reapThenRefuseIfHeld(tempHome);
+  const deadline = Date.now() + (options.deadlineMs ?? DEFAULT_DEADLINE_MS);
+  const delay = options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
+  for (;;) {
+    try {
+      rmSync(tempHome, RM_ONCE);
+      return;
+    } catch (error) {
+      if (Date.now() + delay >= deadline) {
+        throw removalFailure(tempHome, error, options);
+      }
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
   }
-  failIfNotClean(tempHome, survivors, removalError, options);
 }
 
-function rmOptions(options: RemovalOptions): RmOptions {
-  return {
-    recursive: true,
-    force: true,
-    maxRetries: options.maxRetries ?? DEFAULT_MAX_RETRIES,
-    retryDelay: options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS,
-  };
+const RM_ONCE: RmOptions = { recursive: true, force: true, maxRetries: 0 };
+
+/** Reap, then refuse (throw, no removal attempt) if ANY process still holds the home.
+ *  Never kills what it cannot positively identify — the safety invariant stands. */
+function reapThenRefuseIfHeld(tempHome: string): void {
+  reapHomeProcesses(tempHome);
+  const holders = findHomeHolders(tempHome);
+  if (holders.length > 0) {
+    throw new Error(
+      `temp-home teardown: ${holders.map(describePid).join(", ")} still hold ${tempHome} ` +
+        `(HOME / ACPX_STATE_HOME at or under it) after the reap — a process this file's ` +
+        `${OWNER_TAG_ENV} does not identify (or one that survived SIGKILL), so it was NOT ` +
+        `killed and the home was NOT removed. Left in it: ${describeLeftovers(tempHome)}.`,
+    );
+  }
 }
 
-/** The "nothing is swallowed" step, shared by the async and sync teardown. */
-function failIfNotClean(
-  tempHome: string,
-  survivors: number[],
-  removalError: unknown,
-  options: RemovalOptions,
-): void {
-  if (survivors.length > 0) {
-    throw new Error(
-      `temp-home teardown: ${survivors.map(describePid).join(", ")} still hold ${tempHome} (via HOME / ACPX_STATE_HOME) ` +
-        `after SIGTERM and SIGKILL — a leaked process, not a flake. ` +
-        (removalError === undefined
-          ? "The directory itself was removed."
-          : `The directory could not be removed either: ${errorLine(removalError)}`),
-      { cause: removalError },
-    );
-  }
-  if (removalError !== undefined) {
-    const holders = findHomeHolders(tempHome);
-    throw new Error(
-      `temp-home teardown: could not remove ${tempHome} after the reap and ` +
-        `${String(options.maxRetries ?? DEFAULT_MAX_RETRIES)} retries: ${errorLine(removalError)}. ` +
-        `Left in it: ${describeLeftovers(tempHome)}. ` +
-        `Processes with HOME / ACPX_STATE_HOME at or under it: ${
-          holders.length === 0 ? "none" : holders.map(describePid).join(", ")
-        } (an unreapable holder has no ${OWNER_TAG_ENV} of this file).`,
-      { cause: removalError },
-    );
-  }
+function removalFailure(tempHome: string, error: unknown, options: RemovalOptions): Error {
+  const holders = findHomeHolders(tempHome);
+  return new Error(
+    `temp-home teardown: could not remove ${tempHome} within ` +
+      `${String(options.deadlineMs ?? DEFAULT_DEADLINE_MS)} ms: ${errorLine(error)}. ` +
+      `Left in it: ${describeLeftovers(tempHome)}. ` +
+      `Processes with HOME / ACPX_STATE_HOME at or under it: ${
+        holders.length === 0 ? "none" : holders.map(describePid).join(", ")
+      }.`,
+    { cause: error },
+  );
 }
 
 /** The reap step alone: group-kills this file's tagged processes whose HOME is
