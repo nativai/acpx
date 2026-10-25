@@ -31,6 +31,7 @@ import {
 } from "./index-lock-holder-helpers.js";
 import "./install-owner-reaper.js";
 import { withTempHome } from "./queue-test-helpers.js";
+import { removeTempHome } from "./temp-home.js";
 
 const CHILD_PATH = fileURLToPath(new URL("./index-monotonic-child.js", import.meta.url));
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
@@ -219,7 +220,7 @@ async function deferredRetryAfterClose(): Promise<void> {
       await lock.release();
     }
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await removeTempHome(homeDir);
   }
 }
 
@@ -274,7 +275,7 @@ async function cliCloseBehindWedgedLock(): Promise<void> {
       await lock.release();
     }
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await removeTempHome(homeDir);
   }
 }
 
@@ -298,7 +299,7 @@ async function deferredDroppedByProcessExit(): Promise<void> {
       await lock.release();
     }
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await removeTempHome(homeDir);
   }
 }
 

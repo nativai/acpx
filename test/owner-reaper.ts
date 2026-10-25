@@ -56,19 +56,21 @@ export type SweepResult = {
  *  run-level L2 backstop, whose prefix is the run-unique tag — still positive
  *  identification, still nothing else's. */
 export type OwnerMatcher =
-  | { kind: "exact"; entry: string; homeEntry?: string }
+  | { kind: "exact"; entry: string; homeRoot?: string }
   | { kind: "runPrefix"; prefix: string };
 
-/** `home` narrows the match to owners whose environ ALSO carries exactly
- *  `HOME=<home>` — the per-test teardown (`temp-home.ts`) uses it so that a test's
- *  `withTempHome` reaps only what was started against ITS home, never a sibling
- *  test's owner that shares the file's tag. It only ever narrows: the tag is still
- *  required, so no process becomes killable by HOME alone. */
+/** `home` narrows the match to owners whose environ ALSO carries a `HOME=` or
+ *  `ACPX_STATE_HOME=` that IS `home` or lies INSIDE it (`<home>/...`) — i.e. a path
+ *  under the directory the per-test teardown (`temp-home.ts`) is about to delete. A
+ *  fixture may hand the CLI a subdirectory (`<root>/home`, `<root>/state`) rather
+ *  than the root it removes, and such an owner holds the root all the same. It only
+ *  ever narrows: the tag is still required, so no process becomes killable by path
+ *  alone, and a sibling that merely shares a name prefix (`<home>-x`) is not inside. */
 export function exactTagMatcher(tag: string, options: { home?: string } = {}): OwnerMatcher {
   const entry = `${OWNER_TAG_ENV}=${tag}`;
   return options.home === undefined
     ? { kind: "exact", entry }
-    : { kind: "exact", entry, homeEntry: `HOME=${options.home}` };
+    : { kind: "exact", entry, homeRoot: options.home };
 }
 
 export function runTagMatcher(runTag: string): OwnerMatcher {
@@ -192,6 +194,20 @@ function listProcPids(): number[] {
   return pids;
 }
 
+const HOME_VARS = ["HOME=", "ACPX_STATE_HOME="] as const;
+
+/** Is this `KEY=VALUE` environ entry a HOME / ACPX_STATE_HOME whose value is `root`
+ *  or a path under it? The "/" boundary is load-bearing: `<root>-x` is not inside. */
+function entryIsInside(entry: string, root: string): boolean {
+  for (const prefix of HOME_VARS) {
+    if (entry.startsWith(prefix)) {
+      const value = entry.slice(prefix.length);
+      return value === root || value.startsWith(`${root}/`);
+    }
+  }
+  return false;
+}
+
 function environMatches(entries: string[], matcher: OwnerMatcher): boolean {
   const tagged = entries.some((entry) =>
     matcher.kind === "exact" ? entry === matcher.entry : entry.startsWith(matcher.prefix),
@@ -199,28 +215,28 @@ function environMatches(entries: string[], matcher: OwnerMatcher): boolean {
   if (!tagged) {
     return false;
   }
-  return (
-    matcher.kind !== "exact" ||
-    matcher.homeEntry === undefined ||
-    entries.includes(matcher.homeEntry)
-  );
+  if (matcher.kind !== "exact" || matcher.homeRoot === undefined) {
+    return true;
+  }
+  const root = matcher.homeRoot;
+  return entries.some((entry) => entryIsInside(entry, root));
 }
 
-/** Every process OTHER than this one and its ancestors whose environ carries
- *  exactly `HOME=<home>`, tagged or not — pid and comm only, never argv or environ.
+/** Every process OTHER than this one and its ancestors whose `HOME=` or
+ *  `ACPX_STATE_HOME=` is `<home>` or inside it, tagged or not — pid and comm only,
+ *  never argv or environ.
  *  READ-ONLY by construction: this is the report a failed temp-home removal attaches
  *  so a leaked holder is named, and it chooses no kill target (`identifyOwners` is
  *  still the only place one is chosen). */
 export function findHomeHolders(home: string): { pid: number; comm: string }[] {
   const excluded = selfAndAncestors();
-  const entry = `HOME=${home}`;
   const holders: { pid: number; comm: string }[] = [];
   for (const pid of listProcPids()) {
     if (excluded.has(pid)) {
       continue;
     }
     const entries = readEnvironEntries(pid);
-    if (entries !== null && entries.includes(entry)) {
+    if (entries !== null && entries.some((entry) => entryIsInside(entry, home))) {
       holders.push({ pid, comm: readComm(pid) ?? "?" });
     }
   }

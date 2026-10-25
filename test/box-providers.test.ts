@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -12,6 +12,7 @@ import {
   loadBoxProviders,
   resolveBoxProviderKey,
 } from "../src/config/providers.js";
+import { removeTempHomeSync } from "./temp-home.js";
 
 // Block B1 — box-scoped provider credentials (~/.acpx/providers.json).
 //
@@ -70,7 +71,7 @@ test("an ABSENT file is the normal case and never throws", () => {
     assert.deepEqual(loaded, { version: 1, providers: [] });
     assert.deepEqual(describeBoxProviders({ homeDir: fixture.homeDir }), []);
   } finally {
-    rmSync(fixture.homeDir, { recursive: true, force: true });
+    removeTempHomeSync(fixture.homeDir);
   }
 });
 
@@ -98,7 +99,7 @@ test("a MALFORMED file degrades to 'no provider credential' rather than throwing
       ["openrouter"],
     );
   } finally {
-    rmSync(fixture.homeDir, { recursive: true, force: true });
+    removeTempHomeSync(fixture.homeDir);
   }
 });
 
@@ -125,7 +126,7 @@ test("the schema round-trips CONCEPTION §4.2 verbatim", () => {
     ]);
     assert.equal(statSync(fixture.providersPath).mode & 0o777, 0o600);
   } finally {
-    rmSync(fixture.homeDir, { recursive: true, force: true });
+    removeTempHomeSync(fixture.homeDir);
   }
 });
 
@@ -147,7 +148,7 @@ test("apiKeyEnv BEATS a literal apiKey — the profile schema's precedence, reus
     assert.equal(resolveBoxProviderKey(entry, {}), SYNTHETIC_KEY);
     assert.equal(resolveBoxProviderKey(entry, { HP_B1_INDIRECT_KEY: "   " }), SYNTHETIC_KEY);
   } finally {
-    rmSync(fixture.homeDir, { recursive: true, force: true });
+    removeTempHomeSync(fixture.homeDir);
   }
 });
 
@@ -180,7 +181,7 @@ test("MULTIPLE providers each declare their own variable name — the redaction 
       "SOMEPROVIDER_AUTH",
     ]);
   } finally {
-    rmSync(fixture.homeDir, { recursive: true, force: true });
+    removeTempHomeSync(fixture.homeDir);
   }
 });
 
@@ -207,7 +208,7 @@ test("expiry: 'expires in N days' and the 14-day warning threshold", () => {
     }
     assert.equal(BOX_PROVIDER_EXPIRY_WARNING_DAYS, 14);
   } finally {
-    rmSync(fixture.homeDir, { recursive: true, force: true });
+    removeTempHomeSync(fixture.homeDir);
   }
 });
 
@@ -234,7 +235,7 @@ test("expiry: an unstamped or unparseable expiresAt is UNKNOWN, never a false al
       assert.equal(status.expired, false);
     }
   } finally {
-    rmSync(fixture.homeDir, { recursive: true, force: true });
+    removeTempHomeSync(fixture.homeDir);
   }
 });
 
@@ -265,7 +266,7 @@ test("describeBoxProviders CANNOT leak the credential — planted positive contr
     assert.equal(status.hasCredential, true);
     assert.equal(status.env, "OPENROUTER_API_KEY");
   } finally {
-    rmSync(fixture.homeDir, { recursive: true, force: true });
+    removeTempHomeSync(fixture.homeDir);
   }
 });
 
@@ -284,6 +285,6 @@ test("hasCredential is FALSE, not absent, when nothing resolves", () => {
     assert.equal(status.hasCredential, false);
     assert.equal(status.name, "openrouter");
   } finally {
-    rmSync(fixture.homeDir, { recursive: true, force: true });
+    removeTempHomeSync(fixture.homeDir);
   }
 });

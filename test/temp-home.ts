@@ -13,8 +13,9 @@
 //
 // WHAT THIS DOES, in this order, on every teardown:
 //   1. REAP what the test started against THIS home — by positive identification
-//      only: this file's exact ACPX_TEST_OWNER_TAG AND `HOME=<this home>` in the
-//      process's environ. It reuses owner-reaper's /proc readers and its
+//      only: this file's exact ACPX_TEST_OWNER_TAG AND a `HOME` / `ACPX_STATE_HOME` in
+//      the process's environ that IS this home or lies under it (a fixture may hand
+//      the CLI `<root>/home` and `<root>/state`; message-ledger.test.ts does). It reuses owner-reaper's /proc readers and its
 //      identify -> group-kill -> verify-absence sweep; there is no second killer.
 //   2. REMOVE with bounded retries (Node's `fs.rm` `maxRetries`/`retryDelay`, which
 //      covers ENOTEMPTY/EBUSY/EPERM) for the in-process writers a reap cannot name.
@@ -166,7 +167,7 @@ function failIfNotClean(
 ): void {
   if (survivors.length > 0) {
     throw new Error(
-      `temp-home teardown: ${survivors.map(describePid).join(", ")} still hold HOME=${tempHome} ` +
+      `temp-home teardown: ${survivors.map(describePid).join(", ")} still hold ${tempHome} (via HOME / ACPX_STATE_HOME) ` +
         `after SIGTERM and SIGKILL — a leaked process, not a flake. ` +
         (removalError === undefined
           ? "The directory itself was removed."
@@ -180,7 +181,7 @@ function failIfNotClean(
       `temp-home teardown: could not remove ${tempHome} after the reap and ` +
         `${String(options.maxRetries ?? DEFAULT_MAX_RETRIES)} retries: ${errorLine(removalError)}. ` +
         `Left in it: ${describeLeftovers(tempHome)}. ` +
-        `Processes with HOME=${tempHome}: ${
+        `Processes with HOME / ACPX_STATE_HOME at or under it: ${
           holders.length === 0 ? "none" : holders.map(describePid).join(", ")
         } (an unreapable holder has no ${OWNER_TAG_ENV} of this file).`,
       { cause: removalError },

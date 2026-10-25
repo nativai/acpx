@@ -57,6 +57,17 @@ function findHandRolledHomeTeardowns(source: string): HandRolledTeardown[] {
       });
     }
   }
+  // A removal can also name its target through a receiver (`fixture.homeDir`) or an
+  // assignment (`home = mkdtempSync(...)`), neither of which a `const x = mkdtemp`
+  // declaration scan sees. Any removal whose target's LAST segment is a home name is
+  // the same teardown.
+  for (const match of source.matchAll(/\brm(?:Sync)?\(\s*((?:\w+\.)*(\w+))\s*,\s*\{/g)) {
+    const target = match[1] ?? "";
+    const last = match[2] ?? "";
+    if (HOME_NAME.test(last) && !found.some((hit) => hit.variable === target)) {
+      found.push({ variable: target, reason: "named like a home" });
+    }
+  }
   return found;
 }
 
@@ -135,6 +146,13 @@ test("the scan flags a fresh offending source it has never been told about (nega
   assert.deepEqual(
     findHandRolledHomeTeardowns(stateVar).map((hit) => hit.variable),
     ["stateHome"],
+  );
+
+  assert.deepEqual(
+    findHandRolledHomeTeardowns("rmSync(fixture.homeDir, { recursive: true, force: true });").map(
+      (hit) => hit.variable,
+    ),
+    ["fixture.homeDir"],
   );
 
   assert.equal(

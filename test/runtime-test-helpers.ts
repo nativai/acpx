@@ -6,7 +6,7 @@ import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import type { SessionRecord } from "../src/types.js";
 import { beginIsolatedHarnessConfigDirRoot } from "./config-dir-root-isolation.js";
 import { installOwnerReaper } from "./owner-reaper.js";
-import { withTempHome as sharedWithTempHome } from "./temp-home.js";
+import { removeTempHome, withTempHome as sharedWithTempHome } from "./temp-home.js";
 
 // brick://113073b8 — stamp this test-file process's unique owner tag and register
 // the teardown reap. MUST run at module load: every test file reaches this module
@@ -105,7 +105,9 @@ export async function withTempDir<T>(prefix: string, fn: (dir: string) => Promis
   try {
     return await fn(dir);
   } finally {
-    await fs.rm(dir, { recursive: true, force: true });
+    // Several callers hand this dir to the CLI as HOME (`subscription-*`), so it is
+    // torn down by the same reap-then-remove as every other home (brick://1d1cd13a).
+    await removeTempHome(dir);
   }
 }
 

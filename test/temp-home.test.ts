@@ -167,23 +167,46 @@ test("withTempHome: a writer started inside the body is reaped by the teardown a
   }
 });
 
-test("SAFETY: a child with a DIFFERENT tag, and a child with the same tag but a DIFFERENT HOME, both survive the teardown", async () => {
+test("SAFETY: a different tag, a different HOME, and a name-prefix sibling all survive; a HOME / STATE_HOME under the home is reaped", async () => {
   const home = newHome("acpx-temphome-b-");
   const otherHome = newHome("acpx-temphome-b-other-");
+  // `<home>-sibling` shares the NAME PREFIX of `<home>` but is not inside it: the
+  // "/" boundary in the path match is what keeps it alive.
+  const siblingHome = `${home}-sibling`;
+  mkdirSync(siblingHome);
+  // A fixture may give the CLI `<root>/home` and `<root>/state` (message-ledger.test.ts):
+  // such a child holds the root being removed and MUST be reaped.
+  mkdirSync(path.join(home, "home"));
+  mkdirSync(path.join(home, "state"));
+  const underHome = spawnHomeChild(IDLE_SOURCE, path.join(home, "home"));
+  const underState = spawnHomeChild(IDLE_SOURCE, otherHome, {
+    ACPX_STATE_HOME: path.join(home, "state"),
+  });
+  const sibling = spawnHomeChild(IDLE_SOURCE, siblingHome);
   const foreignTag = spawnHomeChild(IDLE_SOURCE, home, {
     [OWNER_TAG_ENV]: "acpxtest.not-ours.some-other-file.1.abcdef",
   });
   const otherHomeSameTag = spawnHomeChild(IDLE_SOURCE, otherHome);
   const tagged = spawnHomeChild(IDLE_SOURCE, home);
   try {
-    await waitFor(() => isAlive(foreignTag.pid) && isAlive(otherHomeSameTag.pid), "children up");
+    await waitFor(
+      () => [foreignTag, otherHomeSameTag, sibling].every((child) => isAlive(child.pid)),
+      "children up",
+    );
 
     await removeTempHome(home);
 
     // Positive control: the child the match DOES select is gone — otherwise "the
     // others survived" would also be true of a teardown that reaped nothing.
-    await tagged.exited;
+    await Promise.all([tagged.exited, underHome.exited, underState.exited]);
     assert.equal(isAlive(tagged.pid), false, "control: the tagged child at this HOME was reaped");
+    assert.equal(isAlive(underHome.pid), false, "HOME=<home>/home is under the home: reaped");
+    assert.equal(
+      isAlive(underState.pid),
+      false,
+      "ACPX_STATE_HOME=<home>/state is under it: reaped",
+    );
+    assert.equal(isAlive(sibling.pid), true, "<home>-sibling is NOT inside <home>: must survive");
 
     assert.equal(isAlive(foreignTag.pid), true, "a different ACPX_TEST_OWNER_TAG must survive");
     assert.equal(isAlive(otherHomeSameTag.pid), true, "a different HOME must survive");
@@ -191,7 +214,18 @@ test("SAFETY: a child with a DIFFERENT tag, and a child with the same tag but a 
     killOwn(foreignTag);
     killOwn(otherHomeSameTag);
     killOwn(tagged);
-    await Promise.all([foreignTag.exited, otherHomeSameTag.exited, tagged.exited]);
+    killOwn(underHome);
+    killOwn(underState);
+    killOwn(sibling);
+    await Promise.all([
+      foreignTag.exited,
+      otherHomeSameTag.exited,
+      tagged.exited,
+      underHome.exited,
+      underState.exited,
+      sibling.exited,
+    ]);
+    rmSync(siblingHome, { recursive: true, force: true });
     rmSync(home, { recursive: true, force: true });
     rmSync(otherHome, { recursive: true, force: true });
     assert.equal(isAlive(foreignTag.pid), false, "cleanup killed our own foreign-tag child");

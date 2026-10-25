@@ -42,7 +42,7 @@ function freshHome(label: string): string {
 afterEach(() => {
   process.env.HOME = ORIGINAL_HOME;
   if (home.startsWith(`${ROOT}/`)) {
-    fs.rmSync(home, { recursive: true, force: true });
+    removeTempHomeSync(home);
   }
   home = "";
 });
