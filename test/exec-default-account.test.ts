@@ -6,6 +6,7 @@
 // likewise reached the profile lookup unresolved ("profile \"auto\" not found").
 // Asserted on what the spawned adapter actually received (the mock's env dump).
 
+import "./install-owner-reaper.js";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
