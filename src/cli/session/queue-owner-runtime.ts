@@ -68,6 +68,8 @@ import {
   type SessionSendOptions,
 } from "./contracts.js";
 import {
+  applySetConfigOptionToConnectedSession,
+  applySetModeToConnectedSession,
   applySetModelToConnectedSession,
   runSessionSetConfigOptionDirect,
   runSessionSetModelDirect,
@@ -214,75 +216,91 @@ async function createQueueOwnerSharedClient(
   });
 }
 
-function createQueueOwnerTurnController(
-  options: QueueOwnerRuntimeOptions,
+type OwnerHeldSession = { client: AcpClient; sessionId: string; record: SessionRecord };
+
+/**
+ * ⚠️ AN IDLE OWNER MUST APPLY A SESSION CHANGE THROUGH ITS OWN CLIENT, NOT OPEN A
+ * SECOND ONE. Between turns the owner's `sharedClient` still holds the adapter and
+ * the thread loaded on it. The `runSessionSet*Direct` fallbacks connect a NEW client
+ * and resume the thread, which an adapter that allows ONE writer per thread (Codex)
+ * refuses — `thread … already has an active writer`, surfaced as a 502 `Internal
+ * error` on every set-model / set-mode / set-config-option while the owner is alive.
+ * Claude tolerates a second connection, which is why only Codex showed it. The
+ * owner's `setDepth` handler already applies through `sharedClient` for the same
+ * reason. Returns `undefined` when the client no longer holds the session (adapter
+ * exited, session not loaded): the caller then takes the direct connect, and there
+ * is no writer to collide with. The three idle fallbacks of the turn controller
+ * (mode, model, config option) go through here; each has a "warm idle owner" row in
+ * `test/integration.test.ts` against a single-writer mock adapter that goes red if
+ * its fallback opens a second client again. A NEW setter added to the turn
+ * controller is not covered by those rows — give it one.
+ */
+async function applyOnOwnerClient<T>(
+  sessionRecordId: string,
   // A getter, not a client: `sharedClient` is replaced after an account switch.
   getSharedClient: () => AcpClient,
+  apply: (held: OwnerHeldSession) => Promise<T>,
+): Promise<{ value: T } | undefined> {
+  const client = getSharedClient();
+  const record = await resolveSessionRecord(sessionRecordId);
+  if (!client.hasReusableSession(record.acpSessionId)) {
+    return undefined;
+  }
+  const value = await apply({ client, sessionId: record.acpSessionId, record });
+  await writeSessionRecord(record);
+  return { value };
+}
+
+function createQueueOwnerTurnController(
+  options: QueueOwnerRuntimeOptions,
+  getSharedClient: () => AcpClient,
 ): QueueOwnerTurnController {
+  const directOptions = (timeoutMs?: number) => ({
+    sessionRecordId: options.sessionId,
+    mcpServers: options.mcpServers,
+    nonInteractivePermissions: options.nonInteractivePermissions,
+    authCredentials: options.authCredentials,
+    authPolicy: options.authPolicy,
+    terminal: options.terminal,
+    timeoutMs,
+    verbose: options.verbose,
+  });
   return new QueueOwnerTurnController({
     withTimeout: async (run, timeoutMs) => await withTimeout(run(), timeoutMs),
     setSessionModeFallback: async (modeId: string, timeoutMs?: number) => {
-      await runSessionSetModeDirect({
-        sessionRecordId: options.sessionId,
-        modeId,
-        mcpServers: options.mcpServers,
-        nonInteractivePermissions: options.nonInteractivePermissions,
-        authCredentials: options.authCredentials,
-        authPolicy: options.authPolicy,
-        terminal: options.terminal,
-        timeoutMs,
-        verbose: options.verbose,
-      });
+      const applied = await applyOnOwnerClient(
+        options.sessionId,
+        getSharedClient,
+        async (held) => await applySetModeToConnectedSession({ ...held, modeId, timeoutMs }),
+      );
+      if (!applied) {
+        await runSessionSetModeDirect({ ...directOptions(timeoutMs), modeId });
+      }
     },
     setSessionModelFallback: async (modelId: string, timeoutMs?: number) => {
-      // ⚠️ AN IDLE OWNER MUST APPLY THROUGH ITS OWN CLIENT, NOT OPEN A SECOND ONE.
-      // Between turns the owner's `sharedClient` still holds the adapter and the
-      // thread loaded on it. `runSessionSetModelDirect` connects a NEW client and
-      // resumes the thread, which an adapter that allows ONE writer per thread
-      // (Codex) refuses — `thread … already has an active writer`, surfaced as a
-      // 502 `Internal error` on every `set model` while the owner is alive. Claude
-      // tolerates a second connection, which is why only Codex showed it. The
-      // owner's `setDepth` handler already applies through `sharedClient` for the
-      // same reason. Only a client that no longer holds the session (adapter
-      // exited, session not loaded) falls back to the direct connect — then there
-      // is no writer to collide with.
-      const client = getSharedClient();
-      const record = await resolveSessionRecord(options.sessionId);
-      if (client.hasReusableSession(record.acpSessionId)) {
-        await applySetModelToConnectedSession({
-          client,
-          sessionId: record.acpSessionId,
-          record,
-          modelId,
-          timeoutMs,
-        });
-        await writeSessionRecord(record);
-        return;
+      const applied = await applyOnOwnerClient(
+        options.sessionId,
+        getSharedClient,
+        async (held) => await applySetModelToConnectedSession({ ...held, modelId, timeoutMs }),
+      );
+      if (!applied) {
+        await runSessionSetModelDirect({ ...directOptions(timeoutMs), modelId });
       }
-      await runSessionSetModelDirect({
-        sessionRecordId: options.sessionId,
-        modelId,
-        mcpServers: options.mcpServers,
-        nonInteractivePermissions: options.nonInteractivePermissions,
-        authCredentials: options.authCredentials,
-        authPolicy: options.authPolicy,
-        terminal: options.terminal,
-        timeoutMs,
-        verbose: options.verbose,
-      });
     },
     setSessionConfigOptionFallback: async (configId: string, value: string, timeoutMs?: number) => {
+      const applied = await applyOnOwnerClient(
+        options.sessionId,
+        getSharedClient,
+        async (held) =>
+          await applySetConfigOptionToConnectedSession({ ...held, configId, value, timeoutMs }),
+      );
+      if (applied) {
+        return applied.value;
+      }
       const result = await runSessionSetConfigOptionDirect({
-        sessionRecordId: options.sessionId,
+        ...directOptions(timeoutMs),
         configId,
         value,
-        mcpServers: options.mcpServers,
-        nonInteractivePermissions: options.nonInteractivePermissions,
-        authCredentials: options.authCredentials,
-        authPolicy: options.authPolicy,
-        terminal: options.terminal,
-        timeoutMs,
-        verbose: options.verbose,
       });
       return result.response;
     },

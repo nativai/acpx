@@ -2298,6 +2298,61 @@ test("integration: set model on a warm idle owner applies through the owner's cl
   });
 });
 
+// brick 76fed65c — the SAME idle-owner rule for `set-mode` and `set <config option>`:
+// the owner's idle fallbacks for them also opened a second client on the thread, so a
+// Codex session (one writer per thread; it advertises a `fast-mode` option and no
+// modes) refused both with `thread … already has an active writer`. Each row warms an
+// owner on a single-writer adapter, runs the verb, and asserts it succeeded WITHOUT the
+// writer refusal, that the record carries the change, and that the next turn runs.
+async function runIdleOwnerSetOnSingleWriterAdapter(
+  setArgs: string[],
+  assertRecord: (stored: SessionRecord) => void,
+): Promise<void> {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const lockDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-single-writer-"));
+    const agentCommand = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --single-writer-dir ${JSON.stringify(lockDir)}`;
+    const agentArgs = ["--agent", agentCommand, "--approve-all", "--cwd", cwd];
+
+    try {
+      const sessionId = await createSessionAndWarmOwner(agentArgs, homeDir, cwd);
+
+      // CONTROL: the lock is real — the warm owner's adapter holds the thread.
+      assert.equal((await fs.readdir(lockDir)).length, 1, "the warm owner holds the writer lock");
+
+      const set = await runCli([...agentArgs, "--format", "json", ...setArgs], homeDir);
+      assert.equal(set.code, 0, `${set.stdout}\n${set.stderr}`);
+      assert.doesNotMatch(`${set.stdout}${set.stderr}`, /active writer/);
+
+      assertRecord(await readSessionRecord(homeDir, sessionId));
+
+      const reprompt = await runCli(
+        [...agentArgs, "--format", "json", "--ttl", "5", "prompt", "echo after-set"],
+        homeDir,
+      );
+      assert.equal(reprompt.code, 0, `${reprompt.stdout}\n${reprompt.stderr}`);
+    } finally {
+      await runCli([...agentArgs, "--format", "json", "sessions", "close"], homeDir).catch(
+        () => {},
+      );
+      await fs.rm(cwd, { recursive: true, force: true });
+      await fs.rm(lockDir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("integration: set-mode on a warm idle owner applies through the owner's client (single-writer adapter)", async () => {
+  await runIdleOwnerSetOnSingleWriterAdapter(["set-mode", "plan"], (stored) => {
+    assert.equal(stored.acpx?.desired_mode_id, "plan");
+  });
+});
+
+test("integration: set <config option> on a warm idle owner applies through the owner's client (single-writer adapter)", async () => {
+  await runIdleOwnerSetOnSingleWriterAdapter(["set", "fast-mode", "on"], (stored) => {
+    assert.equal(stored.acpx?.desired_config_options?.["fast-mode"], "on");
+  });
+});
+
 test("integration: timeout emits structured TIMEOUT json error", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));

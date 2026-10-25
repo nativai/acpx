@@ -1,3 +1,4 @@
+import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import type { AcpClient } from "../../acp/client.js";
 import { withTimeout } from "../../async-control.js";
 import {
@@ -135,13 +136,38 @@ function toSessionMutationResult(
   };
 }
 
+/**
+ * Apply a mode to an ALREADY-CONNECTED session and fold the result into `record`
+ * (the caller persists it). Shared by the direct (no-owner) verb path and the
+ * queue owner's idle path, which applies through its own live client — see
+ * `createQueueOwnerTurnController` for why the owner must not open a second one.
+ */
+export async function applySetModeToConnectedSession(params: {
+  client: AcpClient;
+  sessionId: string;
+  record: SessionRecord;
+  modeId: string;
+  timeoutMs?: number;
+}): Promise<void> {
+  await withTimeout(
+    params.client.setSessionMode(params.sessionId, params.modeId),
+    params.timeoutMs,
+  );
+  setDesiredModeId(params.record, params.modeId);
+}
+
 export async function runSessionSetModeDirect(
   options: RunSessionSetModeDirectOptions,
 ): Promise<SessionSetModeResult> {
   const result = await withConnectedSession(
     buildDirectConnectedSessionOptions(options, async ({ client, sessionId, record }) => {
-      await withTimeout(client.setSessionMode(sessionId, options.modeId), options.timeoutMs);
-      setDesiredModeId(record, options.modeId);
+      await applySetModeToConnectedSession({
+        client,
+        sessionId,
+        record,
+        modeId: options.modeId,
+        timeoutMs: options.timeoutMs,
+      });
     }),
   );
 
@@ -249,22 +275,48 @@ export async function runSessionSetModelDirect(
   return toSessionMutationResult(result);
 }
 
+/**
+ * Apply a config option to an ALREADY-CONNECTED session and fold the result into
+ * `record` (the caller persists it). Shared by the direct (no-owner) verb path and
+ * the queue owner's idle path, like {@link applySetModelToConnectedSession}.
+ */
+export async function applySetConfigOptionToConnectedSession(params: {
+  client: AcpClient;
+  sessionId: string;
+  record: SessionRecord;
+  configId: string;
+  value: string;
+  timeoutMs?: number;
+}): Promise<SetSessionConfigOptionResponse> {
+  const { record, configId, value } = params;
+  const response = await withTimeout(
+    params.client.setSessionConfigOption(params.sessionId, configId, value),
+    params.timeoutMs,
+  );
+  if (configId === "mode") {
+    setDesiredModeId(record, value);
+  } else {
+    setDesiredConfigOption(record, configId, value);
+  }
+  return response;
+}
+
 export async function runSessionSetConfigOptionDirect(
   options: RunSessionSetConfigOptionDirectOptions,
 ): Promise<SessionSetConfigOptionResult> {
   const result = await withConnectedSession(
-    buildDirectConnectedSessionOptions(options, async ({ client, sessionId, record }) => {
-      const response = await withTimeout(
-        client.setSessionConfigOption(sessionId, options.configId, options.value),
-        options.timeoutMs,
-      );
-      if (options.configId === "mode") {
-        setDesiredModeId(record, options.value);
-      } else {
-        setDesiredConfigOption(record, options.configId, options.value);
-      }
-      return response;
-    }),
+    buildDirectConnectedSessionOptions(
+      options,
+      async ({ client, sessionId, record }) =>
+        await applySetConfigOptionToConnectedSession({
+          client,
+          sessionId,
+          record,
+          configId: options.configId,
+          value: options.value,
+          timeoutMs: options.timeoutMs,
+        }),
+    ),
   );
 
   return {
