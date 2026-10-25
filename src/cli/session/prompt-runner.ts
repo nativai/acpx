@@ -1,3 +1,4 @@
+import type { AcpClient } from "../../acp/client.js";
 import { withTimeout } from "../../async-control.js";
 import {
   withConnectedSession,
@@ -21,6 +22,7 @@ import type {
   AuthPolicy,
   McpServer,
   NonInteractivePermissionPolicy,
+  SessionRecord,
   SessionSetConfigOptionResult,
   SessionSetDepthResult,
   SessionSetModelResult,
@@ -186,38 +188,61 @@ export async function runSessionSetDepthDirect(
   };
 }
 
+/**
+ * Apply a model to an ALREADY-CONNECTED session and fold the result into `record`
+ * (the caller persists it). Shared by the direct (no-owner) verb path and the
+ * queue owner's idle path, which applies through its own live client — see
+ * `createQueueOwnerTurnController` for why the owner must not open a second one.
+ */
+export async function applySetModelToConnectedSession(params: {
+  client: AcpClient;
+  sessionId: string;
+  record: SessionRecord;
+  modelId: string;
+  timeoutMs?: number;
+}): Promise<void> {
+  const { client, sessionId, record } = params;
+  assertRecordModelSupported({
+    record,
+    requestedModel: params.modelId,
+    context: "apply",
+  });
+  try {
+    await withTimeout(client.setSessionModel(sessionId, params.modelId), params.timeoutMs);
+    // UP as well as DOWN: a set that succeeds clears a previously learned
+    // refusal, so a restored adapter is not permanently hidden.
+    setModelSetMethodUnsupported(record, false);
+  } catch (error) {
+    // ⚠️ PERSIST THE LEARNED FACT BEFORE RE-THROWING. This is the verb path
+    // the UI drives, and it is where the adapter's `-32601` is first seen with
+    // a record in hand. Without the write the fact dies with the process and
+    // the next session offers the same control that has already been proven
+    // impossible. The write is best-effort: failing to record a capability
+    // must never replace the user's real error with a bookkeeping one.
+    if (client.modelSetMethodIsUnsupported) {
+      setModelSetMethodUnsupported(record, true);
+      await writeSessionRecord(record).catch(() => {});
+    }
+    throw error;
+  }
+  setDesiredModelId(record, params.modelId);
+  setCurrentModelId(record, params.modelId);
+  // brick://5bac5564 R5: an explicit acpx-level `set model` → provenance "explicit".
+  setDesiredModelSource(record, "explicit");
+}
+
 export async function runSessionSetModelDirect(
   options: RunSessionSetModelDirectOptions,
 ): Promise<SessionSetModelResult> {
   const result = await withConnectedSession(
     buildDirectConnectedSessionOptions(options, async ({ client, sessionId, record }) => {
-      assertRecordModelSupported({
+      await applySetModelToConnectedSession({
+        client,
+        sessionId,
         record,
-        requestedModel: options.modelId,
-        context: "apply",
+        modelId: options.modelId,
+        timeoutMs: options.timeoutMs,
       });
-      try {
-        await withTimeout(client.setSessionModel(sessionId, options.modelId), options.timeoutMs);
-        // UP as well as DOWN: a set that succeeds clears a previously learned
-        // refusal, so a restored adapter is not permanently hidden.
-        setModelSetMethodUnsupported(record, false);
-      } catch (error) {
-        // ⚠️ PERSIST THE LEARNED FACT BEFORE RE-THROWING. This is the verb path
-        // the UI drives, and it is where the adapter's `-32601` is first seen with
-        // a record in hand. Without the write the fact dies with the process and
-        // the next session offers the same control that has already been proven
-        // impossible. The write is best-effort: failing to record a capability
-        // must never replace the user's real error with a bookkeeping one.
-        if (client.modelSetMethodIsUnsupported) {
-          setModelSetMethodUnsupported(record, true);
-          await writeSessionRecord(record).catch(() => {});
-        }
-        throw error;
-      }
-      setDesiredModelId(record, options.modelId);
-      setCurrentModelId(record, options.modelId);
-      // brick://5bac5564 R5: an explicit acpx-level `set model` → provenance "explicit".
-      setDesiredModelSource(record, "explicit");
     }),
   );
 

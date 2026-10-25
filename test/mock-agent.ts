@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
@@ -56,6 +56,11 @@ type MockAgentOptions = {
   newSessionMeta?: Record<string, string>;
   loadSessionMeta?: Record<string, string>;
   resumeSessionMeta?: Record<string, string>;
+  /** Codex-style ONE writer per thread, across PROCESSES: a lock file per session
+   *  in this directory. A second agent process that creates/loads/resumes a session
+   *  whose lock another LIVE process holds fails with codex's own
+   *  `thread … already has an active writer`. */
+  singleWriterDir?: string;
   supportsLoadSession: boolean;
   supportsResumeSession: boolean;
   supportsForkSession: boolean;
@@ -362,6 +367,15 @@ function parsePositiveIntegerOption(args: string[], index: number, flag: string)
   return parsed;
 }
 
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 type MetaFlagTarget = "newSessionMeta" | "loadSessionMeta" | "resumeSessionMeta";
 
 type MetaFlagSpec = {
@@ -445,6 +459,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let loadSessionNotFound = false;
   let resumeSessionNotFound = false;
   let loadSessionFailsOnEmpty = false;
+  let singleWriterDir: string | undefined;
   let setSessionModeFails = false;
   let setSessionModeInvalidParams = false;
   let setSessionConfigInvalidParams = false;
@@ -468,6 +483,12 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
 
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
+
+    if (token === "--single-writer-dir") {
+      singleWriterDir = parseOptionValue(argv, index + 1, token);
+      index += 1;
+      continue;
+    }
 
     if (token === "--supports-load-session") {
       supportsLoadSession = true;
@@ -700,6 +721,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     loadSessionMeta: Object.keys(loadSessionMeta).length > 0 ? { ...loadSessionMeta } : undefined,
     resumeSessionMeta:
       Object.keys(resumeSessionMeta).length > 0 ? { ...resumeSessionMeta } : undefined,
+    singleWriterDir,
     supportsLoadSession,
     supportsResumeSession,
     supportsForkSession,
@@ -1060,6 +1082,7 @@ class MockAgent implements Agent {
     const requestedModel = this.options.claudeAgentAcp
       ? (modelFromNewSessionMeta(params) ?? DEFAULT_MODEL_ID)
       : DEFAULT_MODEL_ID;
+    this.acquireSingleWriter(sessionId);
     this.sessions.set(sessionId, createSessionState(false, requestedModel));
     this.recordOperation({
       method: "session/new",
@@ -1087,6 +1110,39 @@ class MockAgent implements Agent {
     return response;
   }
 
+  /** `--single-writer-dir`: take the per-session lock, or fail like Codex does. */
+  private acquireSingleWriter(sessionId: string): void {
+    const dir = this.options.singleWriterDir;
+    if (!dir) {
+      return;
+    }
+    mkdirSync(dir, { recursive: true });
+    const lockPath = path.join(dir, `${encodeURIComponent(sessionId)}.lock`);
+    let holder: number | undefined;
+    try {
+      holder = Number(readFileSync(lockPath, "utf8"));
+    } catch {
+      holder = undefined;
+    }
+    if (holder && holder !== process.pid && isPidAlive(holder)) {
+      const error = new Error("Internal error") as Error & {
+        code: number;
+        data: { details: string };
+      };
+      error.code = -32603;
+      error.data = { details: `thread ${sessionId} already has an active writer` };
+      throw error;
+    }
+    writeFileSync(lockPath, String(process.pid));
+    process.once("exit", () => {
+      try {
+        unlinkSync(lockPath);
+      } catch {
+        // already gone
+      }
+    });
+  }
+
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     if (!this.options.supportsLoadSession) {
       throw new Error("loadSession is not supported");
@@ -1111,6 +1167,7 @@ class MockAgent implements Agent {
       throw error;
     }
 
+    this.acquireSingleWriter(params.sessionId);
     this.sessions.set(params.sessionId, existing ?? createSessionState(false));
 
     if (this.options.replayLoadSessionUpdates) {
@@ -1130,6 +1187,7 @@ class MockAgent implements Agent {
     }
 
     const existing = this.sessions.get(params.sessionId);
+    this.acquireSingleWriter(params.sessionId);
     this.sessions.set(params.sessionId, existing ?? createSessionState(false));
 
     return this.buildSessionReconnectResponse(params.sessionId, this.options.resumeSessionMeta);

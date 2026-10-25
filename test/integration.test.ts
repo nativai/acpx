@@ -2251,6 +2251,53 @@ test("integration: cold owner respawn replays mid-session model before the next 
   });
 });
 
+// brick 3a393bf5 — an IDLE owner must apply `set model` through its OWN client. Codex
+// allows ONE writer per thread, and the owner's adapter keeps the thread between
+// turns; the owner's idle fallback used to open a SECOND client and resume the
+// thread, which that adapter refuses (`thread … already has an active writer`),
+// so every `set model` on a warm Codex session failed. The mock's
+// `--single-writer-dir` enforces the same rule across processes.
+test("integration: set model on a warm idle owner applies through the owner's client (single-writer adapter)", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const lockDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-single-writer-"));
+    const modelAgentCommand = `${LOAD_CAPABLE_MOCK_AGENT_COMMAND} --advertise-models --single-writer-dir ${JSON.stringify(lockDir)}`;
+    const modelAgentArgs = ["--agent", modelAgentCommand, "--approve-all", "--cwd", cwd];
+
+    try {
+      const sessionId = await createSessionAndWarmOwner(modelAgentArgs, homeDir, cwd);
+
+      // CONTROL: the lock is real — a second process taking the thread is refused.
+      const lockFiles = await fs.readdir(lockDir);
+      assert.equal(lockFiles.length, 1, "the warm owner's adapter holds the thread's writer lock");
+
+      const setModel = await runCli(
+        [...modelAgentArgs, "--format", "json", "set", "model", "smart-model"],
+        homeDir,
+      );
+      assert.equal(setModel.code, 0, `${setModel.stdout}\n${setModel.stderr}`);
+      assert.doesNotMatch(`${setModel.stdout}${setModel.stderr}`, /active writer/);
+
+      const stored = await readSessionRecord(homeDir, sessionId);
+      assert.equal(stored.acpx?.session_options?.model, "smart-model");
+      assert.equal(stored.acpx?.current_model_id, "smart-model");
+
+      // The next turn runs (owner recycled, cold resume after the old adapter is gone).
+      const reprompt = await runCli(
+        [...modelAgentArgs, "--format", "json", "--ttl", "5", "prompt", "echo after-switch"],
+        homeDir,
+      );
+      assert.equal(reprompt.code, 0, `${reprompt.stdout}\n${reprompt.stderr}`);
+    } finally {
+      await runCli([...modelAgentArgs, "--format", "json", "sessions", "close"], homeDir).catch(
+        () => {},
+      );
+      await fs.rm(cwd, { recursive: true, force: true });
+      await fs.rm(lockDir, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: timeout emits structured TIMEOUT json error", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));

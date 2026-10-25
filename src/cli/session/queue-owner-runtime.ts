@@ -30,6 +30,7 @@ import {
   absolutePath,
   flushPendingSessionIndexUpdates,
   resolveSessionRecord,
+  writeSessionRecord,
   writeSessionRecordAtBoundary,
 } from "../../session/persistence.js";
 import { seatDisplayName } from "../../session/seat-display-name.js";
@@ -67,6 +68,7 @@ import {
   type SessionSendOptions,
 } from "./contracts.js";
 import {
+  applySetModelToConnectedSession,
   runSessionSetConfigOptionDirect,
   runSessionSetModelDirect,
   runSessionSetModeDirect,
@@ -214,6 +216,8 @@ async function createQueueOwnerSharedClient(
 
 function createQueueOwnerTurnController(
   options: QueueOwnerRuntimeOptions,
+  // A getter, not a client: `sharedClient` is replaced after an account switch.
+  getSharedClient: () => AcpClient,
 ): QueueOwnerTurnController {
   return new QueueOwnerTurnController({
     withTimeout: async (run, timeoutMs) => await withTimeout(run(), timeoutMs),
@@ -231,6 +235,30 @@ function createQueueOwnerTurnController(
       });
     },
     setSessionModelFallback: async (modelId: string, timeoutMs?: number) => {
+      // ⚠️ AN IDLE OWNER MUST APPLY THROUGH ITS OWN CLIENT, NOT OPEN A SECOND ONE.
+      // Between turns the owner's `sharedClient` still holds the adapter and the
+      // thread loaded on it. `runSessionSetModelDirect` connects a NEW client and
+      // resumes the thread, which an adapter that allows ONE writer per thread
+      // (Codex) refuses — `thread … already has an active writer`, surfaced as a
+      // 502 `Internal error` on every `set model` while the owner is alive. Claude
+      // tolerates a second connection, which is why only Codex showed it. The
+      // owner's `setDepth` handler already applies through `sharedClient` for the
+      // same reason. Only a client that no longer holds the session (adapter
+      // exited, session not loaded) falls back to the direct connect — then there
+      // is no writer to collide with.
+      const client = getSharedClient();
+      const record = await resolveSessionRecord(options.sessionId);
+      if (client.hasReusableSession(record.acpSessionId)) {
+        await applySetModelToConnectedSession({
+          client,
+          sessionId: record.acpSessionId,
+          record,
+          modelId,
+          timeoutMs,
+        });
+        await writeSessionRecord(record);
+        return;
+      }
       await runSessionSetModelDirect({
         sessionRecordId: options.sessionId,
         modelId,
@@ -880,7 +908,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   // How often an idle owner ASKS its gate. Deliberately NOT the quiescence window:
   // before this, the two were one variable, so the only way to check more often was
   // to shorten the window — which relaxes the gate. See the call site.
-  const turnController = createQueueOwnerTurnController(options);
+  const turnController = createQueueOwnerTurnController(options, () => sharedClient);
 
   // Deploy-staleness signal (Path 1, W13-24-10). Capture the owner's build token
   // at spawn; re-read it at each idle check. A difference means a deploy happened
