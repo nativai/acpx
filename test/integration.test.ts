@@ -2198,6 +2198,174 @@ test("integration: cold owner respawn replays mid-session effort before the next
   });
 });
 
+// brick 54643cac — a `set-mode` / `set <config option>` made while the owner is IDLE must
+// survive the NEXT turn and be replayed by a respawned owner. The owner's idle stream
+// drain holds a record snapshot taken when the owner went idle and writes it back when
+// the next task starts; that snapshot predates the `set`, so the write erased
+// `desired_mode_id` / `desired_config_options` and a later respawn silently dropped a
+// restrictive mode (read-only became writable).
+test("integration: a mode and config option set on an idle owner survive the next turn and an owner respawn", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const agentCommand = RESUME_CAPABLE_MOCK_AGENT_COMMAND;
+    const agentArgs = ["--agent", agentCommand, "--approve-all", "--cwd", cwd];
+
+    try {
+      const sessionId = await createSessionAndWarmOwner(agentArgs, homeDir, cwd);
+
+      const setMode = await runCli([...agentArgs, "--format", "json", "set-mode", "plan"], homeDir);
+      assert.equal(setMode.code, 0, setMode.stderr);
+      const setOption = await runCli(
+        [...agentArgs, "--format", "json", "set", "fast-mode", "on"],
+        homeDir,
+      );
+      assert.equal(setOption.code, 0, setOption.stderr);
+      const afterSet = await readSessionRecord(homeDir, sessionId);
+      assert.equal(afterSet.acpx?.desired_mode_id, "plan");
+      assert.equal(afterSet.acpx?.desired_config_options?.["fast-mode"], "on");
+
+      // The NEXT turn on the same owner (blocking, so it has fully ended when it returns).
+      const nextTurn = await runCli(
+        [...agentArgs, "--format", "json", "--ttl", "60", "prompt", "echo next-turn"],
+        homeDir,
+      );
+      assert.equal(nextTurn.code, 0, nextTurn.stderr);
+      const afterTurn = await readSessionRecord(homeDir, sessionId);
+      assert.equal(
+        afterTurn.acpx?.desired_mode_id,
+        "plan",
+        `desired_mode_id after the next turn:\n${JSON.stringify(afterTurn.acpx)}`,
+      );
+      assert.equal(afterTurn.acpx?.desired_config_options?.["fast-mode"], "on");
+
+      // Owner respawn: the cold owner must replay both before the prompt.
+      const recovered = await runCli(
+        [...agentArgs, "--format", "json", "sessions", "recover", sessionId],
+        homeDir,
+      );
+      assert.equal(recovered.code, 0, recovered.stderr);
+      const reprompt = await runCli(
+        [...agentArgs, "--format", "json", "--ttl", "5", "prompt", "echo after-respawn"],
+        homeDir,
+      );
+      assert.equal(reprompt.code, 0, reprompt.stderr);
+      const messages = parseJsonRpcOutputLines(reprompt.stdout);
+      const setModeIndex = assertRequestBefore(
+        messages,
+        "session/set_mode",
+        "session/prompt",
+        reprompt.stdout,
+      );
+      assert.equal(
+        (messages[setModeIndex] as { params?: { modeId?: string } }).params?.modeId,
+        "plan",
+      );
+      const setConfigIndex = assertRequestBefore(
+        messages,
+        "session/set_config_option",
+        "session/prompt",
+        reprompt.stdout,
+      );
+      const setConfig = messages[setConfigIndex] as {
+        params?: { configId?: string; value?: string };
+      };
+      assert.equal(setConfig.params?.configId, "fast-mode");
+      assert.equal(setConfig.params?.value, "on");
+    } finally {
+      await runCli([...agentArgs, "--format", "json", "sessions", "close"], homeDir).catch(
+        () => {},
+      );
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// brick 54643cac — the other half of the same promise: a LATER effort change (which
+// recycles the owner) must not clobber an earlier mode, and a mode set after an effort
+// change must not clobber the effort. Both replay on the respawned owner.
+test("integration: a mode set and an effort change do not clobber each other across an owner recycle", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const agentCommand = `${RESUME_CAPABLE_MOCK_AGENT_COMMAND} --advertise-config-options --claude-agent-acp`;
+    const agentArgs = ["--agent", agentCommand, "--approve-all", "--cwd", cwd];
+
+    try {
+      const sessionId = await createSessionAndWarmOwner(agentArgs, homeDir, cwd);
+
+      assert.equal(
+        (await runCli([...agentArgs, "--format", "json", "set-mode", "plan"], homeDir)).code,
+        0,
+      );
+      // `set effort` recycles the live owner after the apply.
+      const setEffort = await runCli(
+        [...agentArgs, "--format", "json", "set", "effort", "low"],
+        homeDir,
+      );
+      assert.equal(setEffort.code, 0, setEffort.stderr);
+      const afterEffort = await readSessionRecord(homeDir, sessionId);
+      assert.equal(afterEffort.acpx?.desired_mode_id, "plan");
+      assert.equal(afterEffort.acpx?.desired_config_options?.effort, "low");
+
+      // Re-warm a (cold-respawned) owner, then change the mode again on the idle owner.
+      const warm = await runCli(
+        [...agentArgs, "--format", "json", "--ttl", "60", "prompt", "echo rewarm"],
+        homeDir,
+      );
+      assert.equal(warm.code, 0, warm.stderr);
+      assert.equal(
+        (await runCli([...agentArgs, "--format", "json", "set-mode", "full-access"], homeDir)).code,
+        0,
+      );
+      const next = await runCli(
+        [...agentArgs, "--format", "json", "--ttl", "60", "prompt", "echo next-turn"],
+        homeDir,
+      );
+      assert.equal(next.code, 0, next.stderr);
+      const afterTurn = await readSessionRecord(homeDir, sessionId);
+      assert.equal(afterTurn.acpx?.desired_mode_id, "full-access");
+      assert.equal(afterTurn.acpx?.desired_config_options?.effort, "low");
+
+      const recovered = await runCli(
+        [...agentArgs, "--format", "json", "sessions", "recover", sessionId],
+        homeDir,
+      );
+      assert.equal(recovered.code, 0, recovered.stderr);
+      const reprompt = await runCli(
+        [...agentArgs, "--format", "json", "--ttl", "5", "prompt", "echo after-respawn"],
+        homeDir,
+      );
+      assert.equal(reprompt.code, 0, reprompt.stderr);
+      const messages = parseJsonRpcOutputLines(reprompt.stdout);
+      const modeIndex = assertRequestBefore(
+        messages,
+        "session/set_mode",
+        "session/prompt",
+        reprompt.stdout,
+      );
+      assert.equal(
+        (messages[modeIndex] as { params?: { modeId?: string } }).params?.modeId,
+        "full-access",
+      );
+      const effortIndex = assertRequestBefore(
+        messages,
+        "session/set_config_option",
+        "session/prompt",
+        reprompt.stdout,
+      );
+      const effortRequest = messages[effortIndex] as {
+        params?: { configId?: string; value?: string };
+      };
+      assert.equal(effortRequest.params?.configId, "effort");
+      assert.equal(effortRequest.params?.value, "low");
+    } finally {
+      await runCli([...agentArgs, "--format", "json", "sessions", "close"], homeDir).catch(
+        () => {},
+      );
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: cold owner respawn replays mid-session model before the next prompt", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));

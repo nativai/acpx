@@ -19,6 +19,7 @@ import {
 } from "../../runtime/engine/session-options.js";
 import { applyDepthAsMode } from "../../session/depth-application.js";
 import { SessionEventWriter } from "../../session/events.js";
+import { mergeLatestDurableAcpxPreferences } from "../../session/mode-preference.js";
 import { advertisedDepthLadderFromConfigOptions } from "../../session/model-application.js";
 import { outputStyleChangePending } from "../../session/output-style.js";
 import {
@@ -29,6 +30,7 @@ import {
 import {
   absolutePath,
   flushPendingSessionIndexUpdates,
+  readPersistedLifecycle,
   resolveSessionRecord,
   writeSessionRecord,
   writeSessionRecordAtBoundary,
@@ -1235,6 +1237,14 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           clearInterval(flushTimer);
           sharedClient.clearEventHandlers();
           await flushIdlePending();
+          // ⚠️ `idleRecord` WAS READ WHEN THE OWNER WENT IDLE, and `close` below writes it
+          // back. Everything an `acpx set-mode` / `set <config option>` stored on disk in
+          // between (`desired_mode_id`, `desired_config_options`, …) is newer than it, so
+          // writing it as-is erased the very fields a respawned owner replays — a read-only
+          // session silently became writable at the next owner restart (brick 54643cac).
+          // Overlay the disk's durable preferences first, as the turn's live checkpoint does.
+          const persisted = await readPersistedLifecycle(options.sessionId).catch(() => undefined);
+          idleRecord.acpx = mergeLatestDurableAcpxPreferences(idleRecord.acpx, persisted?.acpx);
           await idleWriter.close({ checkpoint: true }).catch(() => {});
           for (const writer of subagentWriters.values()) {
             await writer.close({ checkpoint: true }).catch(() => {});
