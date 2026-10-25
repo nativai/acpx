@@ -53,7 +53,10 @@ import { isFableModel } from "../../config/subscription-usage.js";
 import { formatPerfMetric, measurePerf, startPerfTimer } from "../../perf-metrics.js";
 import { textPrompt } from "../../prompt-content.js";
 import { admitCodexSubscriptionTurn } from "../../runtime/engine/codex-subscription-cap.js";
-import { bindRecordToDefaultAccount } from "../../runtime/engine/default-account-binding.js";
+import {
+  bindDefaultAccountToSessionOptionsAsync,
+  bindRecordToDefaultAccount,
+} from "../../runtime/engine/default-account-binding.js";
 import {
   applyConversation,
   applyLifecycleSnapshotToRecord,
@@ -4381,7 +4384,18 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   }
 }
 
-export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult> {
+export async function runOnce(runOptions: RunOnceOptions): Promise<RunPromptResult> {
+  // A one-shot exec binds the account exactly as `sessions new` does
+  // (createSessionWithClient): no selection → the registry default, `auto` → a
+  // concrete id. Without it an unbound exec spawned on the raw ~/.claude login
+  // and a literal `auto` reached the profile lookup (brick eeca6037).
+  const options: RunOnceOptions = {
+    ...runOptions,
+    sessionOptions: await bindDefaultAccountToSessionOptionsAsync(
+      runOptions.sessionOptions,
+      runOptions.agentCommand,
+    ),
+  };
   const output = options.outputFormatter;
   let promptTurnActive = false;
   let promptTurnHadSideEffects = false;
