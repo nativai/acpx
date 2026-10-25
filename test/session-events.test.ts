@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
@@ -9,22 +8,10 @@ import { defaultSessionEventLog } from "../src/session/event-log.js";
 import { SessionEventWriter, listSessionEvents } from "../src/session/events.js";
 import { resolveSessionRecord, writeSessionRecord } from "../src/session/persistence.js";
 import type { SessionRecord } from "../src/types.js";
+import { withTempHome as sharedWithTempHome } from "./temp-home.js";
 
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
-  const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-events-home-"));
-  const originalHome = process.env.HOME;
-  process.env.HOME = homeDir;
-
-  try {
-    await run(homeDir);
-  } finally {
-    if (originalHome === undefined) {
-      delete process.env.HOME;
-    } else {
-      process.env.HOME = originalHome;
-    }
-    await fs.rm(homeDir, { recursive: true, force: true });
-  }
+  await sharedWithTempHome("acpx-events-home-", run, { pin: ["HOME"] });
 }
 
 function makeSessionRecord(sessionId: string, cwd: string, maxSegments: number): SessionRecord {

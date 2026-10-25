@@ -28,7 +28,6 @@ import "./install-owner-reaper.js";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -36,6 +35,7 @@ import { reopenSession } from "../src/cli/session/session-control.js";
 import { SessionClosedError } from "../src/errors.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence/serialize.js";
 import type { SessionRecord } from "../src/types.js";
+import { withTempHome as sharedWithTempHome } from "./temp-home.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -89,26 +89,7 @@ async function runCli(
 }
 
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
-  const originalHome = process.env.HOME;
-  const originalStateHome = process.env.ACPX_STATE_HOME;
-  const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-closed-recovery-"));
-  process.env.HOME = tempHome;
-  process.env.ACPX_STATE_HOME = tempHome;
-  try {
-    await run(tempHome);
-  } finally {
-    if (originalHome == null) {
-      delete process.env.HOME;
-    } else {
-      process.env.HOME = originalHome;
-    }
-    if (originalStateHome == null) {
-      delete process.env.ACPX_STATE_HOME;
-    } else {
-      process.env.ACPX_STATE_HOME = originalStateHome;
-    }
-    await fs.rm(tempHome, { recursive: true, force: true });
-  }
+  await sharedWithTempHome("acpx-closed-recovery-", run, { pin: ["HOME", "ACPX_STATE_HOME"] });
 }
 
 function sessionsDir(homeDir: string): string {

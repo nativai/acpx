@@ -15,6 +15,7 @@ import {
 } from "../src/process-identity.js";
 import { startKeeperProcess, stopProcess, writeQueueOwnerLock } from "./queue-test-helpers.js";
 import { makeSessionRecord, writeSessionRecordFile } from "./runtime-test-helpers.js";
+import { removeTempHome } from "./temp-home.js";
 
 // brick ae547131 §12.1 C — T32a–f through the REAL CLI (`acpx sessions close|recover`), and the
 // cross-repo JSON contract acpx-ui consumes (CONCEPT §8.2, §8.4; HoD pin 2026-10-13):
@@ -87,7 +88,7 @@ async function withHome(run: (homeDir: string) => Promise<void>): Promise<void> 
   try {
     await run(homeDir);
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await removeTempHome(homeDir);
   }
 }
 

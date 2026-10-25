@@ -19,6 +19,7 @@ import {
 import "./install-owner-reaper.js";
 import { OWNER_TAG_ENV, exactTagMatcher, sweepOwners } from "./owner-reaper.js";
 import { processesUnder } from "./spawn-ledger-selftest-procs.js";
+import { removeTempHomeSync } from "./temp-home.js";
 
 // Every test runs under its own throwaway HOME: the ledger derives its database and the admitted
 // instance identity from os.homedir(), and must never touch the box's real ~/.acpx.
@@ -541,7 +542,7 @@ for (const scenario of ["positive", "revoked"]) {
       assert.match(result.stdout, /PHASES=2/);
     } finally {
       reapSpawned(`real-${scenario}`);
-      fs.rmSync(childHome, { recursive: true, force: true });
+      removeTempHomeSync(childHome);
     }
   });
 }
@@ -650,7 +651,7 @@ test("d36c222f: an auto-spawned agent receives its initial prompt exactly once t
     // The fixture's `acpx prompt` detaches a queue owner (+ adapter) that outlives it and keeps
     // writing under childHome: reap it first, or the rmSync below races it (`ENOTEMPTY …/.acpx/q`).
     reapSpawned("initial-prompt");
-    fs.rmSync(childHome, { recursive: true, force: true });
+    removeTempHomeSync(childHome);
   }
 });
 

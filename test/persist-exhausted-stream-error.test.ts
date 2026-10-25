@@ -19,6 +19,7 @@ import {
 } from "../src/session/persist-terminal-error.js";
 import { sessionBaseDir, writeSessionRecord } from "../src/session/persistence.js";
 import type { SessionMessage, SessionRecord } from "../src/types.js";
+import { removeTempHome } from "./temp-home.js";
 
 // Read the mirrored terminal-error entries acpx writes to a session's
 // `.messages.ndjson` sidecar (the conversation log spawner agents + the record's
@@ -242,7 +243,7 @@ test("a real exhausted turn persists the terminal error to .stream.ndjson with d
     } else {
       process.env.HOME = prevHome;
     }
-    await fs.rm(home, { recursive: true, force: true });
+    await removeTempHome(home);
   }
 });
 
@@ -313,7 +314,7 @@ test("a turn-ending rate_limit is mirrored into .messages.ndjson with its detail
     } else {
       process.env.HOME = prevHome;
     }
-    await fs.rm(home, { recursive: true, force: true });
+    await removeTempHome(home);
   }
 });
 

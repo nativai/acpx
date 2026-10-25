@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { removeTempHome } from "./temp-home.js";
 
 // brick 574b137e — `acpx <agent> model-catalogue` replaced acpx-ui creating,
 // statusing, closing and pruning a throwaway Codex session on every catalogue
@@ -76,7 +77,7 @@ async function withIsolatedHome(
     await fs.writeFile(path.join(sessionsDir, "sentinel.json"), '{"keep":true}\n');
     await run(homeDir, cwd, sessionsDir);
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await removeTempHome(homeDir);
   }
 }
 

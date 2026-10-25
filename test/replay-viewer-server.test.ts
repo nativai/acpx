@@ -14,6 +14,7 @@ import {
   isServerAlreadyRunning,
   requestViewerServerShutdown,
 } from "../examples/flows/replay-viewer/server/viewer-server.js";
+import { removeTempHome } from "./temp-home.js";
 
 test("parseReplayViewerCliArgs defaults to start and supports control flags", () => {
   assert.deepEqual(parseReplayViewerCliArgs([]), {
@@ -166,7 +167,7 @@ test("replay viewer blocks file reads that escape the runs directory via runId",
     assert.deepEqual(await response.json(), { error: "Invalid run bundle file request" });
   } finally {
     await viewerServer.close().catch(() => {});
-    await fs.rm(fakeHome, { recursive: true, force: true });
+    await removeTempHome(fakeHome);
   }
 });
 

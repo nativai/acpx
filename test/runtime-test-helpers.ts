@@ -6,6 +6,7 @@ import { serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import type { SessionRecord } from "../src/types.js";
 import { beginIsolatedHarnessConfigDirRoot } from "./config-dir-root-isolation.js";
 import { installOwnerReaper } from "./owner-reaper.js";
+import { withTempHome as sharedWithTempHome } from "./temp-home.js";
 
 // brick://113073b8 — stamp this test-file process's unique owner tag and register
 // the teardown reap. MUST run at module load: every test file reaches this module
@@ -123,55 +124,41 @@ export async function withTempHome<T>(
   prefix: string,
   run: (homeDir: string) => Promise<T>,
 ): Promise<T> {
-  const originalHome = process.env.HOME;
-  const originalStateHome = process.env.ACPX_STATE_HOME;
   const originalFetch = globalThis.fetch;
-  const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
-  process.env.HOME = tempHome;
-  process.env.ACPX_STATE_HOME = tempHome;
-  // ⚠️ THE STORE AND THE CONFIG-DIR ROOT ARE TWO SEPARATE ISOLATIONS, and pinning
-  // the store does not scope the sweep: `sessions prune` sweeps `tmpdir()`, which
-  // no HOME reaches. Without this line every prune the suite runs walks the box's
-  // real /tmp (brick 0bac6a00, `config-dir-root-isolation.ts`).
-  const restoreConfigDirRoot = beginIsolatedHarnessConfigDirRoot(tempHome);
-  globalThis.fetch = async (input, init) => {
-    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-    if (url === "http://127.0.0.1:3456/api/usage/codex/quota") {
-      return new Response(
-        JSON.stringify({
-          capturedAt: new Date().toISOString(),
-          secondary: { windowMinutes: 10_080, usedPercent: 0, elapsed: false },
-        }),
-        { headers: { "content-type": "application/json" } },
-      );
-    }
-    return await originalFetch(input, init);
-  };
-
-  try {
-    return await run(tempHome);
-  } finally {
-    restoreEnv("HOME", originalHome);
-    restoreEnv("ACPX_STATE_HOME", originalStateHome);
-    globalThis.fetch = originalFetch;
-    restoreConfigDirRoot();
-    // `force` suppresses ENOENT, not ENOTEMPTY. `sessions new`/`sessions copy`
-    // intentionally leave a detached `__queue-owner` daemon running past the
-    // CLI call's own exit (queue-owner-process.ts, `detached: true` by design —
-    // see owner-reaper.ts), and that daemon can still be writing under
-    // `<tempHome>/.acpx/sessions/` when a test's own cleanup runs here — races
-    // this recursive rm ~1 in 5 runs into ENOTEMPTY (brick://d9ba2870). Retry
-    // instead of widening isolation: the daemon drains on its own shortly.
-    await fs.rm(tempHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-  }
-}
-
-function restoreEnv(key: string, original: string | undefined): void {
-  if (original == null) {
-    delete process.env[key];
-  } else {
-    process.env[key] = original;
-  }
+  // Creation, the HOME/ACPX_STATE_HOME pin and the reap-then-remove teardown live in
+  // `temp-home.ts` (brick://1d1cd13a); this fixture adds only what is specific to the
+  // runtime tests.
+  return await sharedWithTempHome(
+    prefix,
+    async (tempHome) => {
+      // ⚠️ THE STORE AND THE CONFIG-DIR ROOT ARE TWO SEPARATE ISOLATIONS, and pinning
+      // the store does not scope the sweep: `sessions prune` sweeps `tmpdir()`, which
+      // no HOME reaches. Without this line every prune the suite runs walks the box's
+      // real /tmp (brick 0bac6a00, `config-dir-root-isolation.ts`).
+      const restoreConfigDirRoot = beginIsolatedHarnessConfigDirRoot(tempHome);
+      globalThis.fetch = async (input, init) => {
+        const url =
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        if (url === "http://127.0.0.1:3456/api/usage/codex/quota") {
+          return new Response(
+            JSON.stringify({
+              capturedAt: new Date().toISOString(),
+              secondary: { windowMinutes: 10_080, usedPercent: 0, elapsed: false },
+            }),
+            { headers: { "content-type": "application/json" } },
+          );
+        }
+        return await originalFetch(input, init);
+      };
+      try {
+        return await run(tempHome);
+      } finally {
+        globalThis.fetch = originalFetch;
+        restoreConfigDirRoot();
+      }
+    },
+    { pin: ["HOME", "ACPX_STATE_HOME"] },
+  );
 }
 
 export function assertTempHomeActive(): string {

@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { OPENROUTER_HARNESS_HOME_PREFIX, openRouterHarnessHomeDir } from "../src/acp/auth-env.js";
 import { subscriptionsDir } from "../src/config/subscriptions.js";
+import { removeTempHomeSync } from "./temp-home.js";
 
 /**
  * THE PERMANENT NEGATIVE TEST for brick e30b3f6a — an OpenRouter-routed Claude
@@ -143,7 +144,7 @@ function withScratchStateHome(body: (subscriptionsRoot: string) => void): void {
     } else {
       process.env.ACPX_STATE_HOME = previous;
     }
-    fs.rmSync(stateHome, { recursive: true, force: true });
+    removeTempHomeSync(stateHome);
   }
 }
 

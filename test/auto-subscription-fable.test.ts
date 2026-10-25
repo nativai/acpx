@@ -8,6 +8,7 @@ import {
   consumeAutoSubscriptionSelection,
   resolveAutoSubscription,
 } from "../src/runtime/engine/auto-subscription.js";
+import { removeTempHome } from "./temp-home.js";
 
 const CLAUDE_AGENT = "node /opt/claude-agent-acp/dist/index.js";
 const FABLE = "claude-fable-5";
@@ -144,7 +145,7 @@ async function withRig(
         process.env[key] = value;
       }
     }
-    await fs.rm(home, { recursive: true, force: true });
+    await removeTempHome(home);
   }
 }
 

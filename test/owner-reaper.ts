@@ -55,10 +55,20 @@ export type SweepResult = {
  *  `exact` is the only form L1 uses. `runPrefix` is allowed ONLY for the
  *  run-level L2 backstop, whose prefix is the run-unique tag — still positive
  *  identification, still nothing else's. */
-export type OwnerMatcher = { kind: "exact"; entry: string } | { kind: "runPrefix"; prefix: string };
+export type OwnerMatcher =
+  | { kind: "exact"; entry: string; homeEntry?: string }
+  | { kind: "runPrefix"; prefix: string };
 
-export function exactTagMatcher(tag: string): OwnerMatcher {
-  return { kind: "exact", entry: `${OWNER_TAG_ENV}=${tag}` };
+/** `home` narrows the match to owners whose environ ALSO carries exactly
+ *  `HOME=<home>` — the per-test teardown (`temp-home.ts`) uses it so that a test's
+ *  `withTempHome` reaps only what was started against ITS home, never a sibling
+ *  test's owner that shares the file's tag. It only ever narrows: the tag is still
+ *  required, so no process becomes killable by HOME alone. */
+export function exactTagMatcher(tag: string, options: { home?: string } = {}): OwnerMatcher {
+  const entry = `${OWNER_TAG_ENV}=${tag}`;
+  return options.home === undefined
+    ? { kind: "exact", entry }
+    : { kind: "exact", entry, homeEntry: `HOME=${options.home}` };
 }
 
 export function runTagMatcher(runTag: string): OwnerMatcher {
@@ -111,6 +121,15 @@ function readEnvironEntries(pid: number): string[] | null {
     return readFileSync(`/proc/${String(pid)}/environ`, "utf8").split("\0");
   } catch {
     // Not swallowed: the caller counts this as skipped_unreadable and reports it.
+    return null;
+  }
+}
+
+/** `/proc/<pid>/comm` — the executable's short name, never its argv. */
+export function readComm(pid: number): string | null {
+  try {
+    return readFileSync(`/proc/${String(pid)}/comm`, "utf8").trim();
+  } catch {
     return null;
   }
 }
@@ -174,12 +193,38 @@ function listProcPids(): number[] {
 }
 
 function environMatches(entries: string[], matcher: OwnerMatcher): boolean {
-  for (const entry of entries) {
-    if (matcher.kind === "exact" ? entry === matcher.entry : entry.startsWith(matcher.prefix)) {
-      return true;
+  const tagged = entries.some((entry) =>
+    matcher.kind === "exact" ? entry === matcher.entry : entry.startsWith(matcher.prefix),
+  );
+  if (!tagged) {
+    return false;
+  }
+  return (
+    matcher.kind !== "exact" ||
+    matcher.homeEntry === undefined ||
+    entries.includes(matcher.homeEntry)
+  );
+}
+
+/** Every process OTHER than this one and its ancestors whose environ carries
+ *  exactly `HOME=<home>`, tagged or not — pid and comm only, never argv or environ.
+ *  READ-ONLY by construction: this is the report a failed temp-home removal attaches
+ *  so a leaked holder is named, and it chooses no kill target (`identifyOwners` is
+ *  still the only place one is chosen). */
+export function findHomeHolders(home: string): { pid: number; comm: string }[] {
+  const excluded = selfAndAncestors();
+  const entry = `HOME=${home}`;
+  const holders: { pid: number; comm: string }[] = [];
+  for (const pid of listProcPids()) {
+    if (excluded.has(pid)) {
+      continue;
+    }
+    const entries = readEnvironEntries(pid);
+    if (entries !== null && entries.includes(entry)) {
+      holders.push({ pid, comm: readComm(pid) ?? "?" });
     }
   }
-  return false;
+  return holders;
 }
 
 export type Candidate = { pid: number; pgid: number };
@@ -281,6 +326,10 @@ export type SweepOptions = {
   settleMs?: number;
   label?: string;
   log?: (line: string) => void;
+  /** Log nothing when the sweep identified nothing and nothing survived. For
+   *  per-test callers (`temp-home.ts`), where a line per test would bury the
+   *  sweeps that did reap something; a sweep that found a process still logs. */
+  quietWhenEmpty?: boolean;
 };
 
 /** Identify → group-kill → VERIFY BY PROCESS ABSENCE. Never throws.
@@ -347,7 +396,11 @@ export function sweepOwners(matcher: OwnerMatcher, options: SweepOptions = {}): 
 
   // Log loudly, ALWAYS — including on a zero-identified sweep. A silent reaper is
   // the failure mode. Every count needed to reconcile the sweep is on this one
-  // line, so a reader never has to assume where a difference went.
+  // line, so a reader never has to assume where a difference went. The one opt-out
+  // is `quietWhenEmpty`, for a caller that sweeps once per test.
+  if (options.quietWhenEmpty === true && result.identified === 0 && result.survived === 0) {
+    return result;
+  }
   log(
     `${LOG_PREFIX} ${label} identified=${String(result.identified)} killed=${String(result.killed)} ` +
       `vanished=${String(result.vanished)} survived=${String(result.survived)} ` +

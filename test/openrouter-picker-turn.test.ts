@@ -13,6 +13,7 @@ import { applyPromptModelIfAdvertised } from "../src/cli/session/runtime.js";
 import { createSessionConversation } from "../src/session/conversation-model.js";
 import { defaultSessionEventLog } from "../src/session/event-log.js";
 import { SESSION_RECORD_SCHEMA, type SessionRecord } from "../src/types.js";
+import { removeTempHomeSync } from "./temp-home.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Brick 007eaac8 — THE TURN PATH.
@@ -105,7 +106,7 @@ function isolatedStore(t: { after: (fn: () => void) => void }): string {
     } else {
       process.env.ACPX_STATE_HOME = previous;
     }
-    fs.rmSync(home, { recursive: true, force: true });
+    removeTempHomeSync(home);
   });
   return home;
 }

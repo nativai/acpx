@@ -29,6 +29,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { scopeHarnessConfigDirRootForCli } from "./config-dir-root-isolation.js";
+import { removeTempHome } from "./temp-home.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -173,6 +174,6 @@ test("REAL TURN: resolvedModelLabel is on the entry at create, SURVIVES a prompt
       await runCli(["--cwd", cwd, "claude", "sessions", "close", id], homeDir, cwd);
     }
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    await removeTempHome(homeDir);
   }
 });

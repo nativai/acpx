@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { splitCommandLine } from "../src/acp/client-process.js";
 import { initGlobalConfigFile, loadResolvedConfig } from "../src/cli/config.js";
+import { removeTempHome } from "./temp-home.js";
 
 test("loadResolvedConfig merges global and project config with project priority", async () => {
   await withTempEnv(async ({ homeDir }) => {
@@ -314,6 +315,6 @@ async function withTempEnv(run: (ctx: { homeDir: string }) => Promise<void>): Pr
       process.env.HOME = originalHome;
     }
 
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await removeTempHome(homeDir);
   }
 }

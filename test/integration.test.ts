@@ -29,6 +29,7 @@ import {
   parseJsonRpcOutputLines,
 } from "./jsonrpc-test-helpers.js";
 import { queuePaths, writeQueueOwnerLock } from "./queue-test-helpers.js";
+import { withTempHome as sharedWithTempHome } from "./temp-home.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -5321,12 +5322,7 @@ async function writeFakeCodexAgent(binDir: string): Promise<void> {
 }
 
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
-  const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-home-"));
-  try {
-    await run(tempHome);
-  } finally {
-    await fs.rm(tempHome, { recursive: true, force: true });
-  }
+  return await sharedWithTempHome("acpx-integration-home-", run);
 }
 
 async function waitForFlowRunDir(outputRoot: string, flowName: string): Promise<string> {

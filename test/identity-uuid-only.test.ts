@@ -19,10 +19,10 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { withTempHome as sharedWithTempHome } from "./temp-home.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -80,32 +80,19 @@ async function runCli(
 }
 
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
-  const originalHome = process.env.HOME;
-  const originalStateHome = process.env.ACPX_STATE_HOME;
-  const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-identity-"));
-  process.env.HOME = tempHome;
-  process.env.ACPX_STATE_HOME = tempHome;
-  try {
-    await fs.mkdir(path.join(tempHome, ".acpx"), { recursive: true });
-    await fs.writeFile(
-      path.join(tempHome, ".acpx", "config.json"),
-      `${JSON.stringify({ agents: { codex: { command: MOCK_AGENT_COMMAND } } }, null, 2)}\n`,
-      "utf8",
-    );
-    await run(tempHome);
-  } finally {
-    if (originalHome == null) {
-      delete process.env.HOME;
-    } else {
-      process.env.HOME = originalHome;
-    }
-    if (originalStateHome == null) {
-      delete process.env.ACPX_STATE_HOME;
-    } else {
-      process.env.ACPX_STATE_HOME = originalStateHome;
-    }
-    await fs.rm(tempHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-  }
+  await sharedWithTempHome(
+    "acpx-identity-",
+    async (tempHome) => {
+      await fs.mkdir(path.join(tempHome, ".acpx"), { recursive: true });
+      await fs.writeFile(
+        path.join(tempHome, ".acpx", "config.json"),
+        `${JSON.stringify({ agents: { codex: { command: MOCK_AGENT_COMMAND } } }, null, 2)}\n`,
+        "utf8",
+      );
+      await run(tempHome);
+    },
+    { pin: ["HOME", "ACPX_STATE_HOME"] },
+  );
 }
 
 const sessionsDir = (homeDir: string): string => path.join(homeDir, ".acpx", "sessions");

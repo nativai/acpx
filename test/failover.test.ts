@@ -26,6 +26,7 @@ import {
 } from "../src/runtime/engine/failover.js";
 import type { SessionRecord } from "../src/types.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
+import { removeTempHome } from "./temp-home.js";
 
 // Risk 4: pin the failover error-kind contract so any change is a deliberate,
 // reviewed edit (acpx cannot import the SDK union directly — see failover.ts).
@@ -471,7 +472,7 @@ async function withLockedProfileRegistry(
     );
     await run({ homeDir, registryPath });
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await removeTempHome(homeDir);
   }
 }
 

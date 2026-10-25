@@ -13,7 +13,6 @@
 
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import type { QueueTask } from "../src/cli/queue/ipc.js";
@@ -28,22 +27,10 @@ import {
 } from "../src/session/persistence/repository.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence/serialize.js";
 import type { SessionRecord } from "../src/types.js";
+import { withTempHome as sharedWithTempHome } from "./temp-home.js";
 
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
-  const originalHome = process.env.HOME;
-  const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-lifecycle-home-"));
-  process.env.HOME = tempHome;
-
-  try {
-    await run(tempHome);
-  } finally {
-    if (originalHome == null) {
-      delete process.env.HOME;
-    } else {
-      process.env.HOME = originalHome;
-    }
-    await fs.rm(tempHome, { recursive: true, force: true });
-  }
+  await sharedWithTempHome("acpx-lifecycle-home-", run, { pin: ["HOME"] });
 }
 
 function sessionFilePath(homeDir: string, acpxRecordId: string): string {

@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { withTempHome as sharedWithTempHome } from "./temp-home.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const TINY_PNG_BASE64 =
@@ -53,12 +54,7 @@ test("integration: live Cursor ACP accepts a structured image prompt", async () 
 });
 
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
-  const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-home-"));
-  try {
-    await run(tempHome);
-  } finally {
-    await fs.rm(tempHome, { recursive: true, force: true });
-  }
+  return await sharedWithTempHome("acpx-integration-home-", run);
 }
 
 async function runCli(

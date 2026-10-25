@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
@@ -14,6 +13,7 @@ import { defaultSessionEventLog } from "../src/session/event-log.js";
 import { SessionEventWriter } from "../src/session/events.js";
 import { resolveSessionRecord, writeSessionRecord } from "../src/session/persistence.js";
 import type { SessionNotification, SessionRecord } from "../src/types.js";
+import { withTempHome as sharedWithTempHome } from "./temp-home.js";
 
 // Regression test suite for the "empty messages in JSON while NDJSON has data"
 // bug. Two failure patterns were observed on the devbox:
@@ -40,20 +40,7 @@ import type { SessionNotification, SessionRecord } from "../src/types.js";
 //      applyConversation, so crash-window data loss is bounded.
 
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
-  const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-reconcile-home-"));
-  const originalHome = process.env.HOME;
-  process.env.HOME = homeDir;
-
-  try {
-    await run(homeDir);
-  } finally {
-    if (originalHome === undefined) {
-      delete process.env.HOME;
-    } else {
-      process.env.HOME = originalHome;
-    }
-    await fs.rm(homeDir, { recursive: true, force: true });
-  }
+  await sharedWithTempHome("acpx-reconcile-home-", run, { pin: ["HOME"] });
 }
 
 function makeSessionRecord(sessionId: string, cwd: string): SessionRecord {

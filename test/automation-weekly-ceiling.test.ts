@@ -31,6 +31,7 @@ import { sessionEventActivePath } from "../src/session/event-log.js";
 import { resolveSessionRecord } from "../src/session/persistence.js";
 import type { PromptInput, SessionRecord } from "../src/types.js";
 import { makeSessionRecord, writeSessionRecordFile } from "./runtime-test-helpers.js";
+import { removeTempHome } from "./temp-home.js";
 
 const CLAUDE_AGENT = "node /opt/claude-agent-acp/dist/index.js";
 let uniqueId = 0;
@@ -214,7 +215,7 @@ async function withCeilingRig(
     } else {
       process.env.ACPX_SUBSCRIPTION_WEEKLY_THRESHOLD = previous.weekly;
     }
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await removeTempHome(homeDir);
   }
 }
 

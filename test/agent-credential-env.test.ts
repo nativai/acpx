@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { AGENT_STRIPPED_CREDENTIAL_ENV } from "../src/acp/agent-credential-env.js";
 import { AcpClient } from "../src/acp/client.js";
 import { buildTerminalSpawnOptions } from "../src/acp/terminal-manager.js";
+import { removeTempHome } from "./temp-home.js";
 
 // brick 1dc24c1c — box API credentials never reach an agent's environment.
 //
@@ -102,7 +103,7 @@ async function withScratch(providers: unknown, run: (scratch: Scratch) => Promis
     } else {
       process.env.ACPX_STATE_HOME = previous;
     }
-    await fs.rm(stateHome, { recursive: true, force: true });
+    await removeTempHome(stateHome);
     await fs.rm(scratchDir, { recursive: true, force: true });
   }
 }

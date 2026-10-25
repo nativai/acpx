@@ -9,6 +9,7 @@ import {
   defaultAccountBindingForAgent,
 } from "../src/runtime/engine/default-account-binding.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
+import { removeTempHome } from "./temp-home.js";
 
 const CLAUDE_AGENT = "node /opt/claude-agent-acp/dist/index.js";
 const CODEX_AGENT = "npx -y @agentclientprotocol/codex-acp";
@@ -53,7 +54,7 @@ async function withRegistry<T>(
       configDir: (id: string) => path.join(subsDir, id),
     });
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await removeTempHome(homeDir);
   }
 }
 

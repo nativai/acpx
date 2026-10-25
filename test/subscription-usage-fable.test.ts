@@ -13,6 +13,7 @@ import {
   stampFableRealTurnExhausted,
 } from "../src/config/subscription-usage.js";
 import type { SubscriptionEntry } from "../src/config/subscriptions.js";
+import { removeTempHome } from "./temp-home.js";
 
 // The haiku half still caches by subscription id for 5 minutes, so each seeded
 // sub needs a distinct id or one test's reading leaks into the next. The FABLE
@@ -254,7 +255,7 @@ async function withProbeRig(subs: SubSpec[], run: (ctx: RigContext) => Promise<v
         process.env[key] = value;
       }
     }
-    await fs.rm(home, { recursive: true, force: true });
+    await removeTempHome(home);
   }
 }
 

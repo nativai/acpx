@@ -34,6 +34,7 @@ import type {
 } from "../src/flows/runtime.js";
 import { flowRunsBaseDir } from "../src/flows/store.js";
 import type { PromptInput } from "../src/types.js";
+import { withTempHome as sharedWithTempHome } from "./temp-home.js";
 
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 const MOCK_AGENT_COMMAND = `node ${JSON.stringify(MOCK_AGENT_PATH)}`;
@@ -1775,26 +1776,16 @@ test("FlowRunner stores successful node results separately from outputs", async 
 });
 
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
-  const previousHome = process.env.HOME;
   const previousQueueOwnerArgs = process.env.ACPX_QUEUE_OWNER_ARGS;
-  const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-home-"));
-  process.env.HOME = homeDir;
   process.env.ACPX_QUEUE_OWNER_ARGS = TEST_QUEUE_OWNER_ARGS;
-
   try {
-    await run(homeDir);
+    await sharedWithTempHome("acpx-flow-home-", run, { pin: ["HOME"] });
   } finally {
-    if (previousHome === undefined) {
-      delete process.env.HOME;
-    } else {
-      process.env.HOME = previousHome;
-    }
     if (previousQueueOwnerArgs === undefined) {
       delete process.env.ACPX_QUEUE_OWNER_ARGS;
     } else {
       process.env.ACPX_QUEUE_OWNER_ARGS = previousQueueOwnerArgs;
     }
-    await fs.rm(homeDir, { recursive: true, force: true });
   }
 }
 

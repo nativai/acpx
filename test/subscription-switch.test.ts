@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
@@ -9,6 +8,7 @@ import {
   switchSessionSubscription,
 } from "../src/runtime/engine/subscription-switch.js";
 import type { SessionRecord } from "../src/types.js";
+import { withTempHome as sharedWithTempHome } from "./temp-home.js";
 
 async function withTempHome(
   run: (ctx: {
@@ -17,11 +17,10 @@ async function withTempHome(
     subDir: (id: string) => string;
   }) => Promise<void>,
 ): Promise<void> {
-  const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-switch-"));
-  const subsDir = path.join(homeDir, ".acpx", "subscriptions");
-  const registryPath = path.join(subsDir, "registry.json");
-  const subDir = (id: string) => path.join(subsDir, id);
-  try {
+  await sharedWithTempHome("acpx-switch-", async (homeDir) => {
+    const subsDir = path.join(homeDir, ".acpx", "subscriptions");
+    const registryPath = path.join(subsDir, "registry.json");
+    const subDir = (id: string) => path.join(subsDir, id);
     await fs.mkdir(subDir("subA"), { recursive: true });
     await fs.mkdir(subDir("subB"), { recursive: true });
     await fs.writeFile(
@@ -35,9 +34,7 @@ async function withTempHome(
       }),
     );
     await run({ homeDir, registryPath, subDir });
-  } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
-  }
+  });
 }
 
 function makeRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {

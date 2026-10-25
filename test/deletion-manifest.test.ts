@@ -14,6 +14,7 @@ import {
   withTempHome as withTempHomeFixture,
   writeSessionRecordFile,
 } from "./runtime-test-helpers.js";
+import { removeTempHome } from "./temp-home.js";
 
 /**
  * brick://401a6216 — the deletion manifest, the `--include-history` flip, and
@@ -1417,7 +1418,7 @@ test("T-ISO-4: the owner log is deleted from the state home, never from HOME", a
     );
     assert.equal(await fileExists(sessionFilePath(stateHome, "iso4-session")), false);
   } finally {
-    await fs.rm(homeOnly, { recursive: true, force: true });
-    await fs.rm(stateHome, { recursive: true, force: true });
+    await removeTempHome(homeOnly);
+    await removeTempHome(stateHome);
   }
 });

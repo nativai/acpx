@@ -16,6 +16,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import type { SessionRecord } from "../src/types.js";
+import { withTempHome as sharedWithTempHome } from "./temp-home.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -34,15 +35,7 @@ type CliRunOptions = {
 };
 
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
-  const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-l3-home-"));
-  try {
-    await run(tempHome);
-  } finally {
-    // Same ENOTEMPTY race integration.test.ts guards against: `sessions new`
-    // leaves a detached queue-owner daemon that can still be writing under
-    // <tempHome>/.acpx/sessions/ when this cleanup runs.
-    await fs.rm(tempHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-  }
+  return await sharedWithTempHome("acpx-l3-home-", run);
 }
 
 async function runCli(

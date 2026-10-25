@@ -11,7 +11,6 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import net from "node:net";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -41,6 +40,7 @@ import {
   stopProcess,
   writeQueueOwnerLock,
 } from "./queue-test-helpers.js";
+import { withTempHome as sharedWithTempHome } from "./temp-home.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -105,7 +105,6 @@ async function writeFakeClaudeAgentPackage(homeDir: string): Promise<string> {
     sdkPath,
     `
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 
 function cwdHash(cwd) {
@@ -6120,12 +6119,7 @@ test("exec subcommand works when disableExec is false", async () => {
 });
 
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
-  const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-cli-test-home-"));
-  try {
-    await run(tempHome);
-  } finally {
-    await fs.rm(tempHome, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
-  }
+  return await sharedWithTempHome("acpx-cli-test-home-", run);
 }
 
 async function writeNodeOnlyPathBin(homeDir: string): Promise<string> {

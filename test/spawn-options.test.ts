@@ -25,6 +25,7 @@ import {
   buildTerminalShellSpawnCommand,
   buildTerminalSpawnCommand,
 } from "../src/spawn-command-options.js";
+import { removeTempHome } from "./temp-home.js";
 import { withCapturedStderrWrites } from "./tty-test-helpers.js";
 
 test("buildAgentSpawnOptions hides Windows console windows and preserves auth env", () => {
@@ -1681,7 +1682,7 @@ async function withSubscriptionsHome(
       configDir: (id) => path.join(subsDir, id),
     });
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await removeTempHome(homeDir);
     if (previousClaudeConfigDir === undefined) {
       delete process.env.CLAUDE_CONFIG_DIR;
     } else {

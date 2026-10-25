@@ -13,6 +13,7 @@ import { applyProfileAuth, resolveAcpxUiBaseUrl } from "../src/acp/auth-env.js";
 import { buildAgentSpawnOptions } from "../src/acp/client.js";
 import { getValidEffortsForProfile, loadProfileRegistry } from "../src/config/profiles.js";
 import type { SubscriptionLookupOptions } from "../src/config/subscriptions.js";
+import { removeTempHome } from "./temp-home.js";
 
 const SDK_CLAUDE_COMMAND = "node /opt/claude-agent-acp/dist/index.js";
 
@@ -48,7 +49,7 @@ async function withProfilesHome(
     await fs.writeFile(registryPath, JSON.stringify(registry));
     await run({ lookupOptions: { homeDir, registryPath }, homeDir });
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await removeTempHome(homeDir);
   }
 }
 

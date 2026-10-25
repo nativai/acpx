@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -7,6 +7,7 @@ import type { LastTurnProviderBreadcrumb } from "../src/acp/openrouter-attributi
 import { parseSessionRecord, serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import type { SessionRecord } from "../src/types.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
+import { removeTempHomeSync } from "./temp-home.js";
 
 // Finding PM-1 — a Claude/OpenRouter session's FIRST turn recorded `null` on the
 // record AND the index although the shim's log held the provider (4/4 fresh
@@ -141,7 +142,7 @@ test("PM-1 · a STALE in-memory record does not erase what is already on disk", 
     } else {
       process.env.ACPX_STATE_HOME = previous;
     }
-    rmSync(home, { recursive: true, force: true });
+    removeTempHomeSync(home);
   }
 });
 
@@ -174,6 +175,6 @@ test("PM-1 · but a NEWER in-memory value still wins — the preserve is one-dir
     } else {
       process.env.ACPX_STATE_HOME = previous;
     }
-    rmSync(home, { recursive: true, force: true });
+    removeTempHomeSync(home);
   }
 });

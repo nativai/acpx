@@ -11,6 +11,7 @@ import {
   type RunIntent,
   type SessionsArchiveFlags,
 } from "../src/cli/archive-command.js";
+import { removeTempHome } from "./temp-home.js";
 
 /**
  * The acpx ↔ acpx-ui seam: `acpx sessions archive` requires an EXPLICIT intent.
@@ -200,6 +201,6 @@ test("🛑 the VERB enforces the intent gate — refuses a bare vector with exit
     } else {
       process.env.ACPX_STATE_HOME = previousHome;
     }
-    await fs.rm(dir, { recursive: true, force: true });
+    await removeTempHome(dir);
   }
 });

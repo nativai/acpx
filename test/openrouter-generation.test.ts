@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -20,6 +20,7 @@ import {
 import { flushPendingSessionIndexUpdates } from "../src/session/persistence/index-update-queue.js";
 import { readSessionIndex } from "../src/session/persistence/index.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
+import { removeTempHomeSync } from "./temp-home.js";
 
 // Brick 77054e85 — PER-TURN PROVIDER ATTRIBUTION ON THE pi PATH.
 //
@@ -96,7 +97,7 @@ function withHome<T>(prefix: string, body: (home: string) => T): T {
   try {
     return body(home);
   } finally {
-    rmSync(home, { recursive: true, force: true });
+    removeTempHomeSync(home);
   }
 }
 
@@ -495,7 +496,7 @@ test("the resolved provider reaches the RECORD and the index entry mirrors it", 
     } else {
       process.env.ACPX_STATE_HOME = previous;
     }
-    rmSync(home, { recursive: true, force: true });
+    removeTempHomeSync(home);
   }
 });
 
@@ -551,6 +552,6 @@ test("a LATER turn's breadcrumb is not overwritten by an earlier turn's answer",
     } else {
       process.env.ACPX_STATE_HOME = previous;
     }
-    rmSync(home, { recursive: true, force: true });
+    removeTempHomeSync(home);
   }
 });

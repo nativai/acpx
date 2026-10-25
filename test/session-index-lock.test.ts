@@ -23,6 +23,7 @@ import {
   seedOpenSessions,
   sessionsDirOf,
 } from "./index-lock-holder-helpers.js";
+import { removeTempHome } from "./temp-home.js";
 
 const MONOTONIC_CHILD_PATH = fileURLToPath(new URL("./index-monotonic-child.js", import.meta.url));
 
@@ -321,6 +322,6 @@ test("T3 index lock: cross-process writers and a close wait out a live holder; t
     assert.equal((await readRecordOnDisk(homeDir, victim)).closed, true);
     assert.equal((await readIndexEntry(homeDir, victim))?.closed, true, "the close was reverted");
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await removeTempHome(homeDir);
   }
 });

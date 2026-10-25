@@ -16,6 +16,7 @@ import {
   verifyEffectiveResolution,
 } from "../src/config/profiles.js";
 import { loadSubscriptionRegistry } from "../src/config/subscriptions.js";
+import { removeTempHome } from "./temp-home.js";
 import { withCapturedStderrWrites } from "./tty-test-helpers.js";
 
 const SDK_CLAUDE_COMMAND = "node /opt/claude-agent-acp/dist/index.js";
@@ -44,7 +45,7 @@ async function withRegistryFile(
       configDir: (id) => path.join(subsDir, id),
     });
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await removeTempHome(homeDir);
   }
 }
 

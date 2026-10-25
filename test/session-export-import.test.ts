@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
@@ -10,6 +9,7 @@ import { importSession } from "../src/session/import.js";
 import { messagesLogPath } from "../src/session/messages-log.js";
 import { resolveSessionRecord, serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import type { SessionMessage, SessionRecord } from "../src/types.js";
+import { withTempHome as sharedWithTempHome } from "./temp-home.js";
 
 function makeSessionRecord(
   overrides: Partial<SessionRecord> & {
@@ -62,20 +62,7 @@ function makeSessionRecord(
 }
 
 async function withTempHome<T>(prefix: string, run: (homeDir: string) => Promise<T>): Promise<T> {
-  const originalHome = process.env.HOME;
-  const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
-  process.env.HOME = tempHome;
-
-  try {
-    return await run(tempHome);
-  } finally {
-    if (originalHome == null) {
-      delete process.env.HOME;
-    } else {
-      process.env.HOME = originalHome;
-    }
-    await fs.rm(tempHome, { recursive: true, force: true });
-  }
+  return await sharedWithTempHome(prefix, run, { pin: ["HOME"] });
 }
 
 function sessionFilePath(homeDir: string, acpxRecordId: string): string {

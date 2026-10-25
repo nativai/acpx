@@ -13,6 +13,7 @@ import {
   validRecordPidIdentity,
   parseRecordPidIdentity,
 } from "../src/process-identity.js";
+import { removeTempHome } from "./temp-home.js";
 
 /** The pid of a spawned child — asserted present (lint and the compiler disagree on `!` here). */
 function pidOf(child: { pid?: number }): number {
@@ -152,7 +153,7 @@ async function withRealOwner(run: (rig: Rig) => Promise<void>): Promise<void> {
         process.kill(lease.pid, "SIGKILL");
       }
     }
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await removeTempHome(homeDir);
     await fs.rm(cwd, { recursive: true, force: true });
   }
 }

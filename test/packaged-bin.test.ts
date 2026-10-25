@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { withTempHome as sharedWithTempHome } from "./temp-home.js";
 
 const DIST_CLI_PATH = path.join(process.cwd(), "dist", "cli.js");
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -58,12 +58,7 @@ function packageBinSpawnArgs(args: string[]): {
 }
 
 async function withTempHome(run: (homeDir: string) => Promise<void>): Promise<void> {
-  const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-packaged-bin-test-home-"));
-  try {
-    await run(tempHome);
-  } finally {
-    await fs.rm(tempHome, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
-  }
+  return await sharedWithTempHome("acpx-packaged-bin-test-home-", run);
 }
 
 async function runPackageBin(args: string[], homeDir: string): Promise<CliRunResult> {

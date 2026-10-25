@@ -8,6 +8,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { InvalidArgumentError } from "commander";
 import { parseAutoWeeklyCeiling } from "../src/cli/subscriptions-command.js";
+import { removeTempHome } from "./temp-home.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 
@@ -102,7 +103,7 @@ async function withRegistry(
     );
     await run({ homeDir, registryPath });
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await removeTempHome(homeDir);
   }
 }
 

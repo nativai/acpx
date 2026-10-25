@@ -31,6 +31,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
 import { scopeHarnessConfigDirRootForCli } from "./config-dir-root-isolation.js";
+import { removeTempHome } from "./temp-home.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -175,7 +176,7 @@ async function withRig(run: (rig: Rig) => Promise<void>): Promise<void> {
     await run({ ...base, cli: async (args) => await runCli(base, args), setProbesUp: setUp });
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    await fs.rm(homeDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    await removeTempHome(homeDir);
   }
 }
 

@@ -9,6 +9,7 @@ import { finished } from "node:stream/promises";
 import test from "node:test";
 import { sessionEventActivePath } from "../src/session/event-log.js";
 import { connectSocket, nextJsonLine } from "./queue-test-helpers.js";
+import { removeTempHome } from "./temp-home.js";
 
 // ---------------------------------------------------------------------------
 // D1 / A6 — the SIGNAL PATH (brick://53437107), acpx gates L1.5 and L1.6.
@@ -349,7 +350,7 @@ async function withSignalHarnessHome(
     );
     await run({ homeDir, scriptPath });
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await removeTempHome(homeDir);
   }
 }
 

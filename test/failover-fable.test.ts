@@ -8,6 +8,7 @@ import { resetKnownDeadSubs } from "../src/config/known-dead-subscriptions.js";
 import { AllSubscriptionsExhaustedError, FableShareExhaustedError } from "../src/errors.js";
 import { attemptFailoverAndRetry } from "../src/runtime/engine/failover.js";
 import type { SessionRecord } from "../src/types.js";
+import { removeTempHome } from "./temp-home.js";
 
 const FABLE = "claude-fable-5";
 
@@ -152,7 +153,7 @@ async function withRig(
       }
     }
   } finally {
-    await fs.rm(home, { recursive: true, force: true });
+    await removeTempHome(home);
     resetKnownDeadSubs();
   }
 }

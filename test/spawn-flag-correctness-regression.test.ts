@@ -32,6 +32,7 @@ import {
   makeSessionRecord,
   withTempHome as withReconnectTempHome,
 } from "./runtime-test-helpers.js";
+import { removeTempHome } from "./temp-home.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -85,7 +86,7 @@ async function withSubscriptionsHome(
       configDir: (id) => path.join(subsDir, id),
     });
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    await removeTempHome(homeDir);
     if (previousClaudeConfigDir === undefined) {
       delete process.env.CLAUDE_CONFIG_DIR;
     } else {
@@ -268,7 +269,7 @@ async function withSubscriptionHome(
     );
     await run(homeDir, cwd);
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    await removeTempHome(homeDir);
   }
 }
 

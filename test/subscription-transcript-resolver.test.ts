@@ -9,6 +9,7 @@ import {
   transcriptJsonlPath,
 } from "../src/config/subscription-transcript.js";
 import type { SubscriptionRegistry } from "../src/config/subscriptions.js";
+import { removeTempHome } from "./temp-home.js";
 
 // Resolver hotfix (brick://f5aabb1d, completes brick://08ac840f).
 //
@@ -77,7 +78,7 @@ async function withRegistry(
       configDir: (id) => dirs.get(id) as string,
     });
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await removeTempHome(homeDir);
   }
 }
 

@@ -9,6 +9,7 @@ import {
 } from "../src/runtime/engine/failover.js";
 import type { SessionRecord } from "../src/types.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
+import { removeTempHome } from "./temp-home.js";
 
 // Regression: codex sessions authenticate from native ~/.codex (a chatgpt profile
 // or none). The subauto pre-turn selector forced the registry's Claude-subscription
@@ -46,7 +47,7 @@ async function withRegistry<T>(
     );
     return await run({ homeDir, registryPath });
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await removeTempHome(homeDir);
   }
 }
 

@@ -15,6 +15,7 @@ import type { ProfileRegistry } from "../src/config/profiles.js";
 import { buildCatalogue } from "../src/models/catalogue.js";
 import type { OpenRouterSnapshot } from "../src/models/openrouter-catalogue.js";
 import { applyRequestedModelIfAdvertised } from "../src/session/model-application.js";
+import { removeTempHomeSync } from "./temp-home.js";
 
 // Brick 007eaac8 — Daniel's founding item 6: claude's OpenRouter shim now takes a
 // PICKER-chosen slug on the BOX key, not only the profile's model.
@@ -228,7 +229,7 @@ test("the box credential is FILE-FIRST, and names its origin without its value",
   // A3. The literal below is a SYNTHETIC fixture value written into a temp dir —
   // no real credential is read, written or asserted anywhere in this file.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-l7-providers-"));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => removeTempHomeSync(home));
   fs.mkdirSync(path.join(home, ".acpx"), { recursive: true });
   const providersPath = path.join(home, ".acpx", "providers.json");
   fs.writeFileSync(
@@ -255,7 +256,7 @@ test("the box credential is FILE-FIRST, and names its origin without its value",
 
 test("with no provider entry the ambient variable is the last resort, then it refuses", (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-l7-providers-"));
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  t.after(() => removeTempHomeSync(home));
   const absent = path.join(home, ".acpx", "providers.json");
 
   const ambient = resolveOpenRouterBoxCredential({

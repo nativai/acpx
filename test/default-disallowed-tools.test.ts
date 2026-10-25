@@ -18,6 +18,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { scopeHarnessConfigDirRootForCli } from "./config-dir-root-isolation.js";
+import { removeTempHome } from "./temp-home.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -88,7 +89,7 @@ async function withAgentHome(
     );
     await run(homeDir, cwd);
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    await removeTempHome(homeDir);
   }
 }
 
@@ -222,7 +223,7 @@ test("default-disallowed-tools: claude exec with NO --disallowed-tools flag defa
     const disallowedTools = await execAndReadDisallowedTools(homeDir, cwd, [], operationLog);
     assert.deepEqual(disallowedTools, EXPECTED_DEFAULT);
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    await removeTempHome(homeDir);
   }
 });
 
@@ -247,6 +248,6 @@ test('default-disallowed-tools: claude exec with --disallowed-tools "" clears th
     );
     assert.deepEqual(disallowedTools, []);
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    await removeTempHome(homeDir);
   }
 });

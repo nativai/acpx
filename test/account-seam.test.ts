@@ -14,6 +14,7 @@ import { toSessionIndexEntry } from "../src/session/persistence/index.js";
 import { parseSessionRecord } from "../src/session/persistence/parse.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence/serialize.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
+import { removeTempHome } from "./temp-home.js";
 
 type SeamRegistryContext = {
   homeDir: string;
@@ -60,7 +61,7 @@ async function withSeamRegistry(run: (ctx: SeamRegistryContext) => Promise<void>
     );
     await run({ homeDir, registryPath, profileDir });
   } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
+    await removeTempHome(homeDir);
     resetKnownDeadSubs();
   }
 }

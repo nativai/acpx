@@ -8,6 +8,7 @@ import { getAccountHealth, resetKnownDeadSubs } from "../src/config/known-dead-s
 import { AllSubscriptionsExhaustedError } from "../src/errors.js";
 import { attemptFailoverAndRetry } from "../src/runtime/engine/failover.js";
 import type { SessionRecord } from "../src/types.js";
+import { removeTempHome } from "./temp-home.js";
 
 // A mock /v1/messages endpoint: maps a sub's bearer token to a utilization
 // (or 401). Lets us drive pickFailoverTarget deterministically without a real API.
@@ -77,7 +78,7 @@ async function withRig(
     );
     await run({ homeDir: home, registryPath, profileDir });
   } finally {
-    await fs.rm(home, { recursive: true, force: true });
+    await removeTempHome(home);
   }
 }
 
@@ -648,7 +649,7 @@ test("attemptFailoverAndRetry: account-level-locked sibling is skipped; valid si
       process.env.CLAUDE_MESSAGES_ENDPOINT = prevEndpoint;
     }
     process.env.HOME = prevHome;
-    await fs.rm(home, { recursive: true, force: true });
+    await removeTempHome(home);
     resetKnownDeadSubs();
   }
 });

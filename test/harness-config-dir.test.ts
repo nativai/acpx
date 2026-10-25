@@ -5,7 +5,6 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -37,6 +36,7 @@ import { parseSessionRecord, serializeSessionRecordForDisk } from "../src/sessio
 import { toSessionIndexEntry } from "../src/session/persistence/index.js";
 import type { SessionRecord } from "../src/types.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
+import { removeTempHomeSync } from "./temp-home.js";
 
 // B3 deliverable 5 — ONE per-session config dir serving primer + model pin +
 // catalogue fragment, GATED PER HARNESS off the descriptor.
@@ -54,7 +54,7 @@ function withTempRoot<T>(run: (root: string) => T): T {
   try {
     return run(root);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    removeTempHomeSync(root);
   }
 }
 

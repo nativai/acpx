@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { applyHarnessConfigDir } from "../src/acp/harness-config-dir.js";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
+import { removeTempHomeSync } from "./temp-home.js";
 
 // ac86eb34 — pi's session JSONL must keep landing where IR-3 reads it.
 //
@@ -86,7 +87,7 @@ test("ac86eb34: pi's session dir is pinned to the BOX store, at the cwd-mangled 
     assert.notEqual(env.PI_CODING_AGENT_DIR, box, "the agent dir was never moved");
     assert.deepEqual(plan.envNames, ["PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR"]);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    removeTempHomeSync(root);
   }
 });
 
@@ -109,7 +110,7 @@ test("ac86eb34: the target directory EXISTS before pi is started", () => {
     assert.ok(target, "no session dir was set at all");
     assert.equal(existsSync(target), true, `pi would HANG: ${target} does not exist`);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    removeTempHomeSync(root);
   }
 });
 
@@ -134,7 +135,7 @@ test("ac86eb34: with no box PI_CODING_AGENT_DIR, pi's documented default is used
       join(root, ".pi", "agent", "sessions", expectedName(cwd)),
     );
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    removeTempHomeSync(root);
   }
 });
 
@@ -159,7 +160,7 @@ test("ac86eb34: with NO cwd the session dir is left alone rather than invented",
       "the plan claims a var it did not set",
     );
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    removeTempHomeSync(root);
   }
 });
 
@@ -188,7 +189,7 @@ test("ac86eb34: the mangling matches pi's, including the drive-colon case", () =
     }
     assert.equal(expectedName("/a/b:c/d"), "--a-b-c-d--", "the colon clause was dropped");
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    removeTempHomeSync(root);
   }
 });
 
@@ -236,7 +237,7 @@ test("cb214e48: an inherited acpx-pi-* PI_CODING_AGENT_DIR is REFUSED as the box
       "the session store is inside another session's throwaway directory",
     );
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    removeTempHomeSync(root);
   }
 });
 
@@ -263,7 +264,7 @@ test("cb214e48: the holders marker ALONE is enough to refuse a dir — the prefi
       "a dir carrying .acpx-holders was accepted as the box dir",
     );
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    removeTempHomeSync(root);
   }
 });
 
@@ -283,7 +284,7 @@ test("cb214e48: a REAL box dir is still honoured — the refusal is not a blanke
     });
     assert.equal(env.PI_CODING_AGENT_SESSION_DIR, join(box, "sessions", expectedName(cwd)));
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    removeTempHomeSync(root);
   }
 });
 
@@ -310,7 +311,7 @@ test("cb214e48: ACPX_PI_BOX_AGENT_DIR overrides even an acpx-pi-* inherited valu
     });
     assert.equal(env.PI_CODING_AGENT_SESSION_DIR, join(box, "sessions", expectedName(cwd)));
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    removeTempHomeSync(root);
   }
 });
 
@@ -342,7 +343,7 @@ test("cb214e48: with NO cwd an inherited PI_CODING_AGENT_SESSION_DIR is DELETED,
     assert.deepEqual(plan?.envNames, ["PI_CODING_AGENT_DIR"]);
     assert.equal(plan?.sessionDir, undefined);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    removeTempHomeSync(root);
   }
 });
 
@@ -380,7 +381,7 @@ test("cb214e48: the box CATALOGUE is read from the box dir, not the parent's", (
     assert.match(written, /box-only\/model/, "the box catalogue was not carried forward");
     assert.doesNotMatch(written, /parent-only\/model/, "the PARENT's catalogue was read");
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    removeTempHomeSync(root);
   }
 });
 
@@ -401,7 +402,7 @@ test("cb214e48: the plan reports the session dir it handed pi", () => {
     assert.equal(plan?.sessionDir, join(box, "sessions", expectedName(cwd)));
     assert.equal(plan?.sessionDir, env.PI_CODING_AGENT_SESSION_DIR);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    removeTempHomeSync(root);
   }
 });
 
@@ -425,6 +426,6 @@ test("ac86eb34 GUARDRAIL: the Claude family and codex never gain the variable", 
       );
     }
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    removeTempHomeSync(root);
   }
 });
