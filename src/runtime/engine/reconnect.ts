@@ -413,8 +413,8 @@ function handleConfigOptionReplayError(params: {
 // would get a reply in the wrong style with nothing anywhere saying so.
 //
 // `effort` is the ONE carve-out, and only on VERBOSITY, never on tolerance: some
-// models (e.g. haiku) advertise an `effort` option at session/new yet have the
-// adapter reject mutating it, so this fires routinely for a case the creation
+// models (e.g. Haiku 4.x; 5.x accepts it) advertise an `effort` option at
+// session/new yet have the adapter reject mutating it, so this fires routinely for a case the creation
 // path already absorbs deliberately (`setConfigOptionWithEffortFallback` —
 // "layer on top, never break"). Warning unconditionally there would print noise
 // on every reconnect of every such session. Any other option reaching this branch

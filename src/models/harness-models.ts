@@ -50,10 +50,17 @@ export function nativeAgentTypesForSource(source: ModelSource): string[] | null 
 
 const CLAUDE_LADDER = toCanonicalLadder(["low", "medium", "high", "xhigh", "max"]);
 
-/** acpx-ui `claudeEffortCeiling` (:341): opus / fable / default reach `max`, the rest stop at `high`. */
+/**
+ * acpx-ui `claudeEffortCeiling` (:341): opus / fable / haiku / default reach `max`, the rest
+ * (sonnet) stop at `high`. `haiku` is the alias, which names the CURRENT Haiku — 5.5 since the
+ * adapter's SDK 0.3.310 bump, which accepts every level (brick 226d715c); the retired 4.x ids
+ * that reject effort are clamped by id in `config-option-application.ts`, not by this alias row.
+ */
 function claudeEffortCeiling(alias: string): CanonicalDepthLevel {
   const a = alias.trim().toLowerCase();
-  return !a || a === "default" || a.includes("opus") || a.includes("fable") ? "max" : "high";
+  return !a || a === "default" || a.includes("opus") || a.includes("fable") || a.includes("haiku")
+    ? "max"
+    : "high";
 }
 
 function capLadder(ladder: CanonicalDepthLevel[], ceiling: CanonicalDepthLevel) {

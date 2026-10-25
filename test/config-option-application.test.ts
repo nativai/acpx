@@ -92,9 +92,42 @@ test("normalizeEffortLevelForAdvertisedOption: clamps xhigh/max to high for low/
 test("normalizeEffortLevelForAdvertisedOption: child model id overrides stale broad advertisements", () => {
   const staleOption = effortOption("high", OPUS_EFFORT_LEVELS);
   assert.equal(normalizeEffortLevelForAdvertisedOption("xhigh", staleOption, "sonnet"), "high");
-  assert.equal(normalizeEffortLevelForAdvertisedOption("low", staleOption, "haiku"), "high");
-  assert.equal(normalizeEffortLevelForAdvertisedOption("medium", staleOption, "haiku"), "high");
-  assert.equal(normalizeEffortLevelForAdvertisedOption("max", staleOption, "haiku"), "high");
+  for (const legacy of [
+    "claude-haiku-4-5",
+    "claude-haiku-4-5-20251001",
+    "anthropic/claude-haiku-4.5",
+  ]) {
+    assert.equal(normalizeEffortLevelForAdvertisedOption("low", staleOption, legacy), "high");
+    assert.equal(normalizeEffortLevelForAdvertisedOption("medium", staleOption, legacy), "high");
+    assert.equal(normalizeEffortLevelForAdvertisedOption("max", staleOption, legacy), "high");
+  }
+});
+
+// ⚠️ Carrier for LEGACY_HAIKU_MODEL_ID in config-option-application.ts: widening the
+// haiku ladder must not lift the retired 4.x generation, which rejects effort mutation.
+test("haiku effort: legacy 3.x/4.x ids stay high-only", () => {
+  const option = effortOption("high", OPUS_EFFORT_LEVELS);
+  for (const legacy of [
+    "claude-haiku-4-5",
+    "claude-haiku-4-5-20251001",
+    "claude-3-5-haiku-20241022",
+    "claude-3-haiku-20240307",
+  ]) {
+    for (const level of ["low", "medium", "xhigh", "max"]) {
+      assert.equal(normalizeEffortLevelForModel(level, legacy), "high", `${legacy} ${level}`);
+      assert.equal(normalizeEffortLevelForAdvertisedOption(level, option, legacy), "high");
+    }
+  }
+});
+
+test("haiku effort: the bare alias and 5.x ids defer to the advertised ladder", () => {
+  const option = effortOption("default", OPUS_EFFORT_LEVELS);
+  for (const model of ["haiku", "claude-haiku-5-5", "claude-haiku-5-5-20261001"]) {
+    assert.equal(normalizeEffortLevelForModel("low", model), undefined, model);
+    for (const level of ["default", "low", "medium", "high", "xhigh", "max"]) {
+      assert.equal(normalizeEffortLevelForAdvertisedOption(level, option, model), level, model);
+    }
+  }
 });
 
 test("normalizeEffortLevelForAdvertisedOption: passes through supported effort levels", () => {
@@ -108,7 +141,7 @@ test("normalizeEffortLevelForAdvertisedOption: passes through supported effort l
 
 test("normalizeEffortLevelForModel: maps compact Claude model efforts without advertised options", () => {
   assert.equal(normalizeEffortLevelForModel("xhigh", "sonnet"), "high");
-  assert.equal(normalizeEffortLevelForModel("future-ultra", "haiku"), "high");
+  assert.equal(normalizeEffortLevelForModel("future-ultra", "claude-haiku-4-5"), "high");
   assert.equal(normalizeEffortLevelForModel("low", "claude-haiku-4-5"), "high");
   assert.equal(normalizeEffortLevelForModel("xhigh", "opus[1m]"), undefined);
 });
@@ -191,7 +224,7 @@ test("applyRequestedConfigOptionsIfAdvertised: maps stale broad effort advertise
   assert.equal(client.calls.length, 0);
 });
 
-test("applyRequestedConfigOptionsIfAdvertised: keeps haiku at default when advertisement is stale", async () => {
+test("applyRequestedConfigOptionsIfAdvertised: keeps Haiku 4.5 at default when advertisement is stale", async () => {
   const client = mockClient();
   const record = recordWithDesired({ effort: "low" });
   await applyRequestedConfigOptionsIfAdvertised({
@@ -203,6 +236,19 @@ test("applyRequestedConfigOptionsIfAdvertised: keeps haiku at default when adver
   });
   assert.equal(getDesiredConfigOptions(record.acpx).effort, "high");
   assert.equal(client.calls.length, 0);
+});
+
+test("applyRequestedConfigOptionsIfAdvertised: Haiku 5.5 gets the effort it asked for", async () => {
+  const client = mockClient();
+  const record = recordWithDesired({ effort: "xhigh" });
+  await applyRequestedConfigOptionsIfAdvertised({
+    client,
+    sessionId: "s1",
+    record,
+    advertised: [effortOption("default", OPUS_EFFORT_LEVELS)],
+    modelId: "claude-haiku-5-5",
+  });
+  assert.deepEqual(client.calls, [{ sessionId: "s1", configId: "effort", value: "xhigh" }]);
 });
 
 test("applyRequestedConfigOptionsIfAdvertised: rejected effort set falls back to default", async () => {
@@ -302,7 +348,28 @@ test("persistAndApplyRequestedEffort: persists mapped effort when the requested 
   assert.deepEqual(client.calls, [{ sessionId: "s1", configId: "effort", value: "high" }]);
 });
 
-test("persistAndApplyRequestedEffort: maps haiku effort to default without sending rejected set", async () => {
+test("persistAndApplyRequestedEffort: sends the requested effort on Haiku 5.5 (alias and id)", async () => {
+  for (const modelId of ["haiku", "claude-haiku-5-5"]) {
+    const client = mockClient();
+    const record = recordWithDesired();
+    await persistAndApplyRequestedEffort({
+      client,
+      sessionId: "s1",
+      record,
+      reasoningEffort: "low",
+      advertised: [effortOption("default", OPUS_EFFORT_LEVELS)],
+      modelId,
+    });
+    assert.equal(getDesiredConfigOptions(record.acpx).effort, "low", modelId);
+    assert.deepEqual(
+      client.calls,
+      [{ sessionId: "s1", configId: "effort", value: "low" }],
+      modelId,
+    );
+  }
+});
+
+test("persistAndApplyRequestedEffort: maps Haiku 4.5 effort to default without sending rejected set", async () => {
   const client = mockClient();
   const record = recordWithDesired();
   await persistAndApplyRequestedEffort({
@@ -311,7 +378,7 @@ test("persistAndApplyRequestedEffort: maps haiku effort to default without sendi
     record,
     reasoningEffort: "low",
     advertised: [effortOption("high", OPUS_EFFORT_LEVELS)],
-    modelId: "haiku",
+    modelId: "claude-haiku-4-5",
   });
   assert.equal(getDesiredConfigOptions(record.acpx).effort, "high");
   assert.equal(client.calls.length, 0);

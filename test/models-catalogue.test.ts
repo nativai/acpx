@@ -248,6 +248,15 @@ test("merge: harness-native rows are in the SAME array, with the same descriptor
     "medium",
     "high",
   ]);
+  // Haiku is the alias for the CURRENT Haiku (5.5), which accepts every level (brick 226d715c).
+  const haiku = catalogue.models.find((m) => m.key === "claude-subscription:haiku");
+  assert.deepEqual(haiku?.depth.kind === "ladder" ? haiku.depth.levels : [], [
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+  ]);
 });
 
 test("merge: codex has no static native rows; its ACP advertisement is authoritative", () => {

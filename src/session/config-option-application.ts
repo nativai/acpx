@@ -60,7 +60,20 @@ export function effortRank(level: string | undefined): number | undefined {
   return EFFORT_LEVEL_RANKS.get(level.trim());
 }
 const SONNET_CLAUDE_EFFORT_LEVELS = new Set(["low", "medium", "high"]);
-const HAIKU_CLAUDE_EFFORT_LEVELS = new Set(["high"]);
+const LEGACY_HAIKU_CLAUDE_EFFORT_LEVELS = new Set(["high"]);
+
+// Haiku generations that reject effort mutation: 3.x (`claude-3-haiku`,
+// `claude-3-5-haiku`) and 4.x (`claude-haiku-4-5`, `anthropic/claude-haiku-4.5`).
+// ⚠️ The BARE ALIAS `haiku` IS DELIBERATELY NOT HERE. It names whatever Haiku the
+// adapter currently serves — Haiku 5.5 since claude-agent-acp's SDK 0.3.310 bump
+// (brick 44662379), which accepts every level it advertises, spawn-time and live
+// (probed on raw ACP, brick 226d715c). Treating the alias as 4.5 pinned the
+// current model to `high` for the sake of one retired. An adapter that still
+// serves 4.5 behind the alias and rejects an effort set is absorbed by
+// `rejectedEffortFallback`, so a spawn never aborts either way. Guarded by the
+// "haiku alias and 5.x defer" and "legacy haiku stays high-only" cases in
+// test/config-option-application.test.ts.
+const LEGACY_HAIKU_MODEL_ID = /haiku[-.]4|3(?:[-.]5)?-haiku/;
 
 export function normalizeEffortLevelForAdvertisedOption(
   requestedLevel: string,
@@ -695,11 +708,12 @@ function effortLevelsForModel(modelId: string | undefined): ReadonlySet<string> 
   }
   // The Claude adapter may report stale/broad effort lists in session/new. The
   // follow-up session/set_config_option call is stricter: sonnet accepts the
-  // compact low/medium/high set, while haiku currently advertises broad levels
-  // but rejects effort mutation outright. Keep haiku at its advertised default
-  // `high` so spawn-time effort never aborts the child session.
-  if (model.includes("haiku")) {
-    return HAIKU_CLAUDE_EFFORT_LEVELS;
+  // compact low/medium/high set, while Haiku 4.x advertises broad levels but
+  // rejects effort mutation outright. Keep those at their advertised default
+  // `high` so spawn-time effort never aborts the child session. Haiku 5.x and the
+  // bare `haiku` alias fall through to the adapter's own advertisement.
+  if (LEGACY_HAIKU_MODEL_ID.test(model)) {
+    return LEGACY_HAIKU_CLAUDE_EFFORT_LEVELS;
   }
   if (model.includes("sonnet")) {
     return SONNET_CLAUDE_EFFORT_LEVELS;
