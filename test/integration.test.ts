@@ -2564,7 +2564,7 @@ test("integration: gemini ACP startup timeout is surfaced as actionable error fo
     try {
       await fs.writeFile(
         fakeGeminiPath,
-        '#!/bin/sh\nif [ "$1" = "--version" ]; then\n  echo "0.33.0"\n  exit 0\nfi\nsleep 60\n',
+        '#!/bin/sh\nif [ "$1" = "--version" ]; then\n  echo "0.33.0"\n  exit 0\nfi\nexec sleep 60\n',
         {
           encoding: "utf8",
           mode: 0o755,
@@ -2636,11 +2636,14 @@ test("integration: generic agent startup timeout bounds a command that never ans
     const previousTimeout = process.env.ACPX_AGENT_STARTUP_TIMEOUT_MS;
 
     try {
+      // `exec`: the shell BECOMES the sleep, so killing the agent pid kills the sleep.
+      // A bare `sleep 60` is a grandchild that outlives the killed shell and keeps
+      // HOME=<tempHome> held past the test (brick://1d1cd13a: temp-home refuses on it).
       // Spawns fine, never writes a single ACP frame, never exits on its own
       // -- indistinguishable, from acpx's side, from a real binary that
       // simply does not speak ACP (exactly what a mistaken raw `--agent`
       // command resolves to).
-      await fs.writeFile(fakeAgentPath, "#!/bin/sh\nsleep 60\n", {
+      await fs.writeFile(fakeAgentPath, "#!/bin/sh\nexec sleep 60\n", {
         encoding: "utf8",
         mode: 0o755,
       });
