@@ -1,3 +1,4 @@
+import "./install-owner-reaper.js";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -16,7 +17,12 @@ import {
 import { committedFromMemoryStat, parseFlatKeyed } from "../src/capacity/cgroup.js";
 import { CAPACITY_CONSTANTS, MIB } from "../src/capacity/constants.js";
 import { computeFormula, verdictFor } from "../src/capacity/formula.js";
-import { censusOwners, type OwnerTree, parseProcStat } from "../src/capacity/owners.js";
+import {
+  censusOwners,
+  type OwnerTree,
+  parseProcStat,
+  readReaderFootprint,
+} from "../src/capacity/owners.js";
 import { needMet, readCapacity } from "../src/capacity/reading.js";
 import { TOP_LEVEL_VERBS } from "../src/cli-core.js";
 import { registerDefaultCommands } from "../src/cli/command-registration.js";
@@ -630,6 +636,40 @@ const OVER_BUDGET: FixtureBox = {
   podinfo: { request: String(2 * GiB), limit: String(L) },
   memoryStat: { anon: 2800 * MIB, kernel: 272 * MIB, slab: 250 * MIB },
 };
+
+test("reader: the measuring process is taken out of committed memory AND out of its caller's tree", () => {
+  // devbox-staging 2026-10-27: the CLI read 416 MB committed where memory.stat by hand said 361 MB —
+  // the ~55 MB difference was `acpx capacity` itself, alive inside the cgroup and inside the calling
+  // agent's owner tree while it measured.
+  const { root } = attributionBox();
+  const proc = path.join(root, "proc");
+  fs.mkdirSync(path.join(proc, "4242", "ns"), { recursive: true });
+  fs.writeFileSync(
+    path.join(proc, "4242", "stat"),
+    statLine({ pid: 4242, ppid: 103, ticks: "9000" }),
+  );
+  fs.writeFileSync(
+    path.join(proc, "4242", "status"),
+    statusText({ pid: 4242, ppid: 103, ticks: "9000", rssAnonKb: 50_000, pteKb: 400 }),
+  );
+  fs.symlinkSync(NS, path.join(proc, "4242", "ns", "pid"));
+  fs.rmSync(path.join(proc, "self"), { recursive: true });
+  fs.symlinkSync("4242", path.join(proc, "self"));
+
+  assert.deepEqual(readReaderFootprint(proc), { pid: 4242, bytes: 50_400 * 1024 });
+  const s = readCapacity({ agent: "claude", sources: sourcesOf(root), box: "fixture" });
+  assert.equal(s.readerBytes, 50_400 * 1024);
+  assert.equal(s.committedBytes, (2000 + 300) * MIB - 50_400 * 1024, "anon + kernel − reader");
+  const a = s.owners.trees.find((tree) => tree.sessionId === "sess-a");
+  assert.equal(a?.processes, 4, "the reader (a grandchild of sess-a's harness) is not in the tree");
+  assert.equal(a?.measuredBytes, (100_000 + 1000 + 50_000 + 500 + 150_000 + 2000 + 4000) * 1024);
+  // Control: a fixture tree with no `self` link excludes nothing.
+  assert.equal(
+    readCapacity({ agent: "claude", sources: sourcesOf(attributionBox().root), box: "f" })
+      .readerBytes,
+    0,
+  );
+});
 
 test("NEGATIVE: an over-budget configured box reads `full` and does not meet --need 1", () => {
   const { root } = makeBox(OVER_BUDGET);

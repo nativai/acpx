@@ -49,6 +49,8 @@ export type CensusInputs = {
   readonly procRoot: string;
   readonly nowMs: number;
   readonly freshMs: number;
+  /** Never attributed to any owner: the reading process itself ({@link readReaderFootprint}). */
+  readonly readerPid?: number;
 };
 
 type ProcEntry = { pid: number; ppid: number; startTicks: string };
@@ -112,6 +114,28 @@ function readProcessTable(procRoot: string): Map<number, ProcEntry> {
     }
   }
   return table;
+}
+
+/**
+ * The reading process ITSELF — `acpx capacity`, a ~50 MiB node process that sits inside the cgroup
+ * and inside its caller's owner tree while it measures. Left in, it inflates committed memory by
+ * ~15 % on a 2 GiB box (devbox-staging, 2026-10-27: 416 MB read vs 361 MB by hand) and charges the
+ * calling agent's owner for the instrument. It is gone the moment the reading is printed, so it is
+ * measured here and taken out of both. Fixture trees have no `self` link: nothing is excluded.
+ */
+export type ReaderFootprint = { readonly pid: number | undefined; readonly bytes: number };
+
+export function readReaderFootprint(procRoot: string): ReaderFootprint {
+  let pid: number | undefined;
+  try {
+    const link = fs.readlinkSync(path.join(procRoot, "self"));
+    pid = /^\d+$/u.test(link) ? Number(link) : undefined;
+  } catch {
+    return { pid: undefined, bytes: 0 };
+  }
+  const status =
+    pid === undefined ? undefined : readText(path.join(procRoot, String(pid), "status"));
+  return { pid, bytes: status === undefined ? 0 : parseStatusMemory(status) };
 }
 
 function ownPidNamespace(procRoot: string): string | undefined {
@@ -262,6 +286,10 @@ function measureTree(walk: TreeWalk, root: number): { processes: number; measure
   return { processes, measuredBytes };
 }
 
+function readerPids(inputs: CensusInputs): number[] {
+  return inputs.readerPid === undefined ? [] : [inputs.readerPid];
+}
+
 export function censusOwners(inputs: CensusInputs): OwnerCensus {
   const excluded: Record<LeaseExclusion, number> = {
     unparsable: 0,
@@ -283,7 +311,7 @@ export function censusOwners(inputs: CensusInputs): OwnerCensus {
   const walk: TreeWalk = {
     procRoot: inputs.procRoot,
     children: childrenByParent(table),
-    claimed: new Set<number>(),
+    claimed: new Set<number>(readerPids(inputs)),
   };
   for (const name of fresh) {
     const lease = parseLeaseBody(readText(path.join(inputs.queueDir, name)));

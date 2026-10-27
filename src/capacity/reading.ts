@@ -17,7 +17,14 @@ import {
   type Verdict,
   verdictFor,
 } from "./formula.js";
-import { censusOwners, type LeaseExclusion, type OwnerCensus, type OwnerTree } from "./owners.js";
+import {
+  censusOwners,
+  type LeaseExclusion,
+  type OwnerCensus,
+  type OwnerTree,
+  type ReaderFootprint,
+  readReaderFootprint,
+} from "./owners.js";
 
 /**
  * One read-only capacity reading of THIS box's control container — the numbers behind
@@ -83,7 +90,10 @@ export type CapacitySnapshot = {
   readonly marginBytes: number | null;
   readonly oomMarginBytes: number | null;
   readonly interactiveReserveBytes: number;
+  /** `anon + kernel` from memory.stat, minus {@link readerBytes}. */
   readonly committedBytes: number | null;
+  /** The reading process's own RssAnon + VmPTE, excluded from committed and from every owner tree. */
+  readonly readerBytes: number;
   readonly workingSetBytes: number | null;
   readonly baseBytes: number | null;
   readonly chargedBytes: number | null;
@@ -149,6 +159,7 @@ type Gathered = {
   readonly node: NodeReading;
   readonly budget: BudgetResolution;
   readonly census: OwnerCensus;
+  readonly reader: ReaderFootprint;
 };
 
 function gather(options: ReadCapacityOptions): Gathered {
@@ -156,7 +167,9 @@ function gather(options: ReadCapacityOptions): Gathered {
   const now = options.now ?? new Date();
   const { sources } = options;
   const cgroup = readCgroup(sources.cgroupRoot);
+  const reader = readReaderFootprint(sources.procRoot);
   return {
+    reader,
     constants,
     now,
     sources,
@@ -173,6 +186,7 @@ function gather(options: ReadCapacityOptions): Gathered {
       procRoot: sources.procRoot,
       nowMs: now.getTime(),
       freshMs: constants.leaseFreshMs,
+      readerPid: reader.pid,
     }),
   };
 }
@@ -180,8 +194,14 @@ function gather(options: ReadCapacityOptions): Gathered {
 /** C, L and B — all three are needed for any slot figure; any one missing ⇒ unmeasured. */
 type Measured = { readonly committed: number; readonly limit: number; readonly budget: number };
 
+/** `anon + kernel` without the reading process itself (`readReaderFootprint`). */
+function committedOf(g: Gathered): number | undefined {
+  const raw = g.cgroup.committed?.committedBytes;
+  return raw === undefined ? undefined : Math.max(0, raw - g.reader.bytes);
+}
+
 function measuredOf(g: Gathered): Measured | undefined {
-  const committed = g.cgroup.committed?.committedBytes;
+  const committed = committedOf(g);
   const limit = g.budget.limitBytes;
   const budget = g.budget.budgetBytes;
   return committed === undefined || limit === undefined || budget === undefined
@@ -367,7 +387,8 @@ export function readCapacity(options: ReadCapacityOptions): CapacitySnapshot {
     requestBytes: nul(g.budget.requestBytes),
     limitBytes: nul(g.budget.limitBytes),
     interactiveReserveBytes: g.constants.interactiveReserveBytes,
-    committedBytes: nul(g.cgroup.committed?.committedBytes),
+    committedBytes: nul(committedOf(g)),
+    readerBytes: g.reader.bytes,
     workingSetBytes: nul(g.cgroup.workingSetBytes),
     pendingBytes: 0,
     reserveNewBytes: { ...g.constants.reserveNewBytes },
