@@ -13,6 +13,7 @@ description: Stable acpx exit codes for scripting — success, runtime errors, u
 | `3`   | Timeout (`--timeout` exceeded)                                      |
 | `4`   | No session found (prompt requires an explicit `sessions new`)       |
 | `5`   | Permission denied (every request denied/cancelled, none approved)   |
+| `75`  | No capacity: `acpx capacity --need N` found fewer than N slots      |
 | `130` | Interrupted (`SIGINT` / `SIGTERM`)                                  |
 
 ## Notes
@@ -23,6 +24,7 @@ description: Stable acpx exit codes for scripting — success, runtime errors, u
 - **`3`** is reserved for `--timeout` expiry. Adapter-side timeouts that are not surfaced as `acpx` timeouts come through as `1`.
 - **`4`** is the "no session id given" signal. Pass `--session-id <id>`, or run `sessions new` to create one and retry.
 - **`5`** only fires when at least one permission request happened, and every one ended in a denial or cancellation. If at least one was approved, the result reflects whatever the agent returned.
+- **`75`** means "temporary, nothing ran, try again later" — the same meaning as `workbench-exec`'s 75. `acpx capacity --need N` returns it when fewer than N new sessions of `--agent` fit in the box's memory; an unconfigured box (no `/etc/podinfo`) never returns it.
 - **`130`** matches the conventional shell signal exit code for `Ctrl+C` (`128 + SIGINT`). `acpx` cancels cooperatively before exiting with this code.
 
 ## Branching example

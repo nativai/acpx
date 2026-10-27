@@ -104,6 +104,10 @@ export const TOP_LEVEL_VERBS = new Set([
   // the two registrations that verb needs.
   "providers",
   "status",
+  // `capacity` — how many more agent sessions fit in this box's memory (brick afdb5784), registered
+  // by `registerCapacityCommand`. Agents call `acpx capacity --need N` before a fan-out; without this
+  // entry that line is a prompt delivery to the cwd's session.
+  "capacity",
   // `output-styles` is registered top-level by `registerSharedAgentSubcommands`
   // (command-registration.ts, called with `program` from `registerDefaultCommands`)
   // and was MISSING here — brick https://acpx.devbox.nativai.de/?brick=eb9c1d1e.

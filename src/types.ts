@@ -39,6 +39,8 @@ export const EXIT_CODES = {
   TIMEOUT: 3,
   NO_SESSION: 4,
   PERMISSION_DENIED: 5,
+  /** Temporary, nothing ran — the box has no memory for it (`acpx capacity --need`), as `workbench-exec`'s 75. */
+  CAPACITY: 75,
   INTERRUPTED: 130,
 } as const;
 

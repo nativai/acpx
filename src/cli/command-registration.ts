@@ -8,6 +8,7 @@ import {
   handleSessionsRestore,
   type SessionsArchiveFlags,
 } from "./archive-command.js";
+import { registerCapacityCommand } from "./capacity-command.js";
 import {
   handleCancel,
   handleExec,
@@ -1150,6 +1151,8 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
   registerAgentsCommand(program, config);
   registerModelsCommand(program, config);
   registerProvidersCommand(program, config);
+  // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS` (`"capacity"`, brick afdb5784).
+  registerCapacityCommand(program, config);
   registerConfigCommand(program, config);
   registerFlowCommand(program, config);
 }
