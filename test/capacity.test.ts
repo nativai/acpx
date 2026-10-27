@@ -744,6 +744,32 @@ test("owners D3: the nested owner keeps its own floor charge in K", () => {
   }
 });
 
+test("owners D4: a branch expanded AFTER the reader is still counted in the caller's tree", () => {
+  // The reader is a direct child of the owner, so the walk meets it on its FIRST expansion; the
+  // sibling branch 101 → 102 is expanded after that and must still be walked.
+  const { root } = makeBox({
+    processes: [
+      { pid: 100, ppid: 1, ticks: "5000", rssAnonKb: 100_000 },
+      { pid: 101, ppid: 100, ticks: "5001", comm: "bash", rssAnonKb: 10_000 },
+      { pid: 102, ppid: 101, ticks: "5002", comm: "node", rssAnonKb: 89_000 }, // e.g. a blocking `acpx prompt`
+      { pid: 4242, ppid: 100, ticks: "9000", rssAnonKb: 55_000 }, // the reader
+    ],
+    leases: [{ sessionId: "sess-caller", pid: 100, ticks: "5000" }],
+    records: { "sess-caller": CLAUDE_COMMAND },
+  });
+  const census = censusOwners({
+    ...sourcesOf(root),
+    nowMs: Date.now(),
+    freshMs: K.leaseFreshMs,
+    readerPid: 4242,
+  });
+  assert.equal(census.owners.length, 1);
+  const [caller] = census.owners;
+  assert.equal(caller.self, true);
+  assert.equal(caller.processes, 3, "100, 101 and 102 — only the reader is left out");
+  assert.equal(caller.measuredBytes, (100_000 + 10_000 + 89_000) * 1024);
+});
+
 /** D1 (TE `g3-pair.sh`): the same box, node MemAvailable 4 GiB, limit 8 GiB — only the request differs. */
 function g3Box(request: string | undefined) {
   return makeBox({

@@ -309,7 +309,12 @@ function measureTree(walk: TreeWalk, root: number): TreeMeasure {
     }
     result.processes += 1;
     result.measuredBytes += parseStatusMemory(status);
-    result.self ||= descend(walk, pid, stack);
+    // ⚠️ DO NOT FOLD THIS INTO `result.self ||= descend(…)`. `||=` short-circuits: once the walk
+    // has met the reader, `descend` would never run again and every not-yet-expanded branch of the
+    // CALLER's own tree is silently dropped (TE D4: a blocking `acpx prompt`, 87 MiB, vanished).
+    // Row "owners D4: a branch expanded AFTER the reader is still counted".
+    const sawReader = descend(walk, pid, stack);
+    result.self ||= sawReader;
   }
   return result;
 }
