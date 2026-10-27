@@ -660,6 +660,11 @@ test("reader: the measuring process is taken out of committed memory AND out of 
   const s = readCapacity({ agent: "claude", sources: sourcesOf(root), box: "fixture" });
   assert.equal(s.readerBytes, 50_400 * 1024);
   assert.equal(s.committedBytes, (2000 + 300) * MIB - 50_400 * 1024, "anon + kernel − reader");
+  assert.equal(
+    s.workingSetBytes,
+    5 * GiB - 50_400 * 1024,
+    "memory.current − inactive_file − reader",
+  );
   const a = s.owners.trees.find((tree) => tree.sessionId === "sess-a");
   assert.equal(a?.processes, 4, "the reader (a grandchild of sess-a's harness) is not in the tree");
   assert.equal(a?.measuredBytes, (100_000 + 1000 + 50_000 + 500 + 150_000 + 2000 + 4000) * 1024);

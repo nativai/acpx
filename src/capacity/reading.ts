@@ -200,6 +200,12 @@ function committedOf(g: Gathered): number | undefined {
   return raw === undefined ? undefined : Math.max(0, raw - g.reader.bytes);
 }
 
+/** The kubelet's working set, likewise without the reading process. */
+function workingSetOf(g: Gathered): number | undefined {
+  const raw = g.cgroup.workingSetBytes;
+  return raw === undefined ? undefined : Math.max(0, raw - g.reader.bytes);
+}
+
 function measuredOf(g: Gathered): Measured | undefined {
   const committed = committedOf(g);
   const limit = g.budget.limitBytes;
@@ -389,7 +395,7 @@ export function readCapacity(options: ReadCapacityOptions): CapacitySnapshot {
     interactiveReserveBytes: g.constants.interactiveReserveBytes,
     committedBytes: nul(committedOf(g)),
     readerBytes: g.reader.bytes,
-    workingSetBytes: nul(g.cgroup.workingSetBytes),
+    workingSetBytes: nul(workingSetOf(g)),
     pendingBytes: 0,
     reserveNewBytes: { ...g.constants.reserveNewBytes },
     liveFloorBytes: { ...g.constants.liveFloorBytes },
