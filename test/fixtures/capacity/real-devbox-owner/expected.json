@@ -1,0 +1,9 @@
+{
+  "capturedAt": "2026-10-27T09:30:09Z",
+  "box": "dev-devbox",
+  "sessionId": "e8bb2785-926a-453f-9ce4-0affb297d349",
+  "pid": 838638,
+  "processes": 5,
+  "measuredBytes": 391831552,
+  "method": "bash awk over the CAPTURED status files (RssAnon+VmPTE); tree membership by stat ppid at capture time"
+}

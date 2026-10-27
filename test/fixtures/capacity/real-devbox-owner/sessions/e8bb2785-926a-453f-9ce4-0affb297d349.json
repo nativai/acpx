@@ -1,0 +1,4 @@
+{
+  "agent_command": "node /opt/claude-agent-acp/dist/index.js",
+  "agent_name": "claude"
+}

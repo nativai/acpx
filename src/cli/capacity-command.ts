@@ -171,6 +171,14 @@ export function registerCapacityCommand(parent: Command, config: ResolvedAcpxCon
     )
     .option("--need <n>", "Exit 75 unless at least n new sessions of --agent fit", parseNeed)
     .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    // Subcommands are registered BEFORE `program.exitOverride()` (cli-core `main`), so without
+    // this commander exits a usage error with its own 1. Thrown, it reaches
+    // `handleProgramParseError`, which maps it to USAGE ⇒ exit 2, as §8.1 and
+    // docs/exit-codes.md promise. A script branching on 75 must be able to tell "no room"
+    // from "I typed it wrong".
+    .exitOverride((error) => {
+      throw error;
+    })
     .action(function (this: Command, flags: CapacityFlags) {
       handleCapacity(flags, this, config);
     });

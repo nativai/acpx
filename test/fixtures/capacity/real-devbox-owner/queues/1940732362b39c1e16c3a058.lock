@@ -1,0 +1,17 @@
+{
+  "pid": 838638,
+  "sessionId": "e8bb2785-926a-453f-9ce4-0affb297d349",
+  "socketPath": "/home/node/.acpx/q/1940732362b39c1e16c3a058.sock",
+  "createdAt": "2026-10-27T09:17:33.885Z",
+  "heartbeatAt": "2026-10-27T09:30:04.278Z",
+  "ownerGeneration": 2608798460575,
+  "queueDepth": 0,
+  "processIdentity": {
+    "kind": "linux-proc-stat-starttime",
+    "startTimeTicks": "7722497",
+    "bootId": "6f60c842-c0f4-423e-8559-0577865d44f2",
+    "pidNamespace": "pid:[4026532839]",
+    "timeNamespace": "time:[4026531834]"
+  },
+  "host": "dev-server-5fd478dc4-lld6w"
+}
