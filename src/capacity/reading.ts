@@ -74,6 +74,8 @@ export type OwnerSummary = {
   readonly processes: number;
   readonly measuredBytes: number;
   readonly chargedBytes: number;
+  /** This tree holds the reading process: it is the caller's own session. */
+  readonly self: boolean;
 };
 
 export type CapacitySnapshot = {
@@ -194,7 +196,16 @@ function gather(options: ReadCapacityOptions): Gathered {
 /** C, L and B — all three are needed for any slot figure; any one missing ⇒ unmeasured. */
 type Measured = { readonly committed: number; readonly limit: number; readonly budget: number };
 
-/** `anon + kernel` without the reading process itself (`readReaderFootprint`). */
+/**
+ * `anon + kernel` without the reading process itself (`readReaderFootprint`).
+ *
+ * ⚠️ THE READER MUST BE A SEPARATE, SHORT-LIVED CLI PROCESS. `/proc/self` is subtracted
+ * unconditionally, which is right for `acpx capacity` (its ~55 MB vanish when it exits) and WRONG
+ * for an in-process reader: loaded inside atrium (CONCEPTION §16's `__capacity-module`), "self" is
+ * atrium — a long-lived process that IS part of the base — and committed would under-read by its
+ * whole size, silently, in the unsafe direction. Phase 2 must make the exclusion opt-in for the CLI
+ * entry point (or pass the reader pid explicitly) before any in-process consumer exists.
+ */
 function committedOf(g: Gathered): number | undefined {
   const raw = g.cgroup.committed?.committedBytes;
   return raw === undefined ? undefined : Math.max(0, raw - g.reader.bytes);
@@ -362,6 +373,7 @@ function ownersField(g: Gathered): CapacitySnapshot["owners"] {
       processes: owner.processes,
       measuredBytes: owner.measuredBytes,
       chargedBytes: ownerCharge(owner, g.constants),
+      self: owner.self,
     })),
   };
 }
@@ -411,6 +423,21 @@ export function readCapacity(options: ReadCapacityOptions): CapacitySnapshot {
  * Does this reading satisfy `--need n` for its agent? An unconfigured or unmeasured box always
  * does — fail open (§3.3, D6): a missing instrument must never stop the agents that could fix it.
  */
+/**
+ * Why `needMet` says what it says — one sentence an agent can act on. On an unconfigured box it is
+ * true however small `freeSlots` is, and without this a real agent read it as "unreliable" (TE D2).
+ */
+export function needMetReason(snapshot: CapacitySnapshot, need: number): string {
+  if (snapshot.verdict === "unconfigured") {
+    return "unconfigured box (no /etc/podinfo): admission is not enforced; freeSlots is advisory";
+  }
+  if (snapshot.verdict === "unmeasured") {
+    return "unmeasured box (memory unreadable): admission is not enforced; nothing is refused";
+  }
+  const slots = snapshot.slotsAfterMakeRoom?.[snapshot.agent] ?? 0;
+  return `${slots} new ${snapshot.agent} session(s) fit; ${need} needed`;
+}
+
 export function needMet(snapshot: CapacitySnapshot, need: number): boolean {
   if (snapshot.verdict === "unconfigured" || snapshot.verdict === "unmeasured") {
     return true;

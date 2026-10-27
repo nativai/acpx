@@ -209,9 +209,27 @@ function selectBudget(inputs: SelectionInputs): Selection {
   return { fallback: `${BASIS_ANNOTATION}="${basisRaw}" is neither request nor limit` };
 }
 
-function positiveByteCount(raw: string | undefined): number | undefined {
+/**
+ * `R`, only if it passes the same bounds check as a budget ([256 MiB, L]). A request that fails it
+ * — a wrong `divisor` above all (`1m` turns 2 GiB into 2,147,483,648,000) — is treated EXACTLY as an
+ * absent request, everywhere: not reported, not the alternative basis, and above all not the `R` of
+ * G3's "borrowing while B > R" test. Kept as R, an out-of-bounds "request" made the box look as if it
+ * were not borrowing and switched the node guard off: 12 slots / rc 0 where the same box with no
+ * request file read 2 slots / rc 75 (TE finding D1). Row: "budget D1: …".
+ */
+function validRequest(raw: string | undefined, inputs: SelectionInputs): number | undefined {
   const value = parseByteCount(raw);
-  return value === undefined || value === 0 ? undefined : value;
+  return inBounds(value, inputs) ? value : undefined;
+}
+
+/** Under the limit or override basis an invalid request is not fatal — but it is not silent either. */
+function ignoredRequestWarning(raw: string | undefined, valid: number | undefined): string[] {
+  const text = raw?.trim() ?? "";
+  return text !== "" && valid === undefined
+    ? [
+        `/etc/podinfo/memory_request ("${text}") fails validation [256 MiB, limit]; treated as absent`,
+      ]
+    : [];
 }
 
 export function resolveBudget(inputs: BudgetInputs): BudgetResolution {
@@ -231,7 +249,7 @@ export function resolveBudget(inputs: BudgetInputs): BudgetResolution {
   const limitBytes = resolveLimit(podinfo.memoryLimit, inputs.cgroupLimitBytes, warnings);
   const base = {
     configured: true,
-    requestBytes: positiveByteCount(podinfo.memoryRequest),
+    requestBytes: validRequest(podinfo.memoryRequest, { podinfo, limitBytes, constants }),
     limitBytes,
     warnings,
   } as const;
@@ -244,6 +262,7 @@ export function resolveBudget(inputs: BudgetInputs): BudgetResolution {
   if ("fallback" in selection) {
     return fallback(selection.fallback);
   }
+  warnings.push(...ignoredRequestWarning(podinfo.memoryRequest, base.requestBytes));
   if (selection.budget === undefined) {
     // Only the limit basis lands here, and only with no readable limit: the caller reports
     // `unmeasured` (§3.3: cgroup unreadable on a configured box fails open).

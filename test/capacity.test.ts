@@ -220,6 +220,7 @@ const owner = (measuredMib: number, harness: OwnerTree["harness"] = "claude"): O
   harness,
   processes: 3,
   measuredBytes: measuredMib * MIB,
+  self: false,
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -451,6 +452,7 @@ test("owners: lease → verified pid → whole tree by ppid; RssAnon + VmPTE; ex
     "identity-mismatch": 1,
     "identity-unverified": 1,
     foreign: 1,
+    "duplicate-pid": 0,
   });
 });
 
@@ -667,6 +669,16 @@ test("reader: the measuring process is taken out of committed memory AND out of 
   );
   const a = s.owners.trees.find((tree) => tree.sessionId === "sess-a");
   assert.equal(a?.processes, 4, "the reader (a grandchild of sess-a's harness) is not in the tree");
+  // O2: the tree that held the reader is marked as the caller's own; no other is.
+  assert.deepEqual(
+    s.owners.trees
+      .map((tree) => [tree.sessionId, tree.self])
+      .toSorted((x, y) => String(x[0]).localeCompare(String(y[0]))),
+    [
+      ["sess-a", true],
+      ["sess-b", false],
+    ],
+  );
   assert.equal(a?.measuredBytes, (100_000 + 1000 + 50_000 + 500 + 150_000 + 2000 + 4000) * 1024);
   // Control: a fixture tree with no `self` link excludes nothing.
   assert.equal(
@@ -674,6 +686,119 @@ test("reader: the measuring process is taken out of committed memory AND out of 
       .readerBytes,
     0,
   );
+});
+
+/**
+ * D3 (TE, devbox 2026-10-27): an agent's BLOCKING `acpx prompt` spawns the child's queue owner under
+ * the waiting CLI — inside the agent's own owner tree. Both are live owners; the outer tree must stop
+ * at the inner owner's pid. Built twice with the lease files in opposite orders: the census must not
+ * depend on which lease is read first.
+ */
+function nestedBox(innerFirst: boolean) {
+  const outer = { sessionId: "sess-outer", pid: 100, ticks: "5000" };
+  const inner = { sessionId: "sess-inner", pid: 700, ticks: "7700" };
+  return makeBox({
+    processes: [
+      { pid: 100, ppid: 1, ticks: "5000", rssAnonKb: 100_000 },
+      { pid: 101, ppid: 100, ticks: "5001", rssAnonKb: 50_000 },
+      { pid: 102, ppid: 101, ticks: "5002", comm: "claude", rssAnonKb: 150_000 },
+      { pid: 103, ppid: 102, ticks: "5003", comm: "node", rssAnonKb: 40_000 }, // the waiting `acpx prompt`
+      { pid: 700, ppid: 103, ticks: "7700", rssAnonKb: 30_000 }, // the child's fresh queue owner
+      { pid: 701, ppid: 700, ticks: "7701", rssAnonKb: 20_000 }, // its adapter
+    ],
+    leases: innerFirst ? [inner, outer] : [outer, inner],
+    records: { "sess-outer": CLAUDE_COMMAND, "sess-inner": CLAUDE_COMMAND },
+  });
+}
+
+for (const innerFirst of [false, true]) {
+  test(`owners D3: an owner nested in another owner's tree is its own owner (inner lease ${innerFirst ? "first" : "second"})`, () => {
+    const { root } = nestedBox(innerFirst);
+    const census = censusOwners({ ...sourcesOf(root), nowMs: Date.now(), freshMs: K.leaseFreshMs });
+    const byId = Object.fromEntries(census.owners.map((o) => [o.sessionId, o]));
+    assert.equal(census.owners.length, 2, "both live leases are owners");
+    assert.equal(
+      census.freshLeases,
+      census.owners.length + Object.values(census.excluded).reduce((a, b) => a + b, 0),
+    );
+    assert.equal(byId["sess-outer"]?.processes, 4, "the outer tree stops at the inner owner's pid");
+    assert.equal(byId["sess-outer"]?.measuredBytes, 340_000 * 1024);
+    assert.equal(byId["sess-inner"]?.processes, 2);
+    assert.equal(byId["sess-inner"]?.measuredBytes, 50_000 * 1024);
+  });
+}
+
+test("owners D3: the nested owner keeps its own floor charge in K", () => {
+  for (const innerFirst of [false, true]) {
+    const s = readCapacity({
+      agent: "claude",
+      sources: sourcesOf(nestedBox(innerFirst).root),
+      box: "f",
+    });
+    assert.equal(s.owners.live, 2);
+    // outer max(300, 332 MiB) + inner max(300, 48.8 MiB) = 332.03 + 300 MiB
+    assert.equal(
+      s.owners.trees.reduce((sum, tree) => sum + tree.chargedBytes, 0),
+      340_000 * 1024 + 300 * MIB,
+    );
+  }
+});
+
+/** D1 (TE `g3-pair.sh`): the same box, node MemAvailable 4 GiB, limit 8 GiB — only the request differs. */
+function g3Box(request: string | undefined) {
+  return makeBox({
+    podinfo: { request, limit: String(8 * GiB), annotations: { [BASIS_ANNOTATION]: "request" } },
+    memoryStat: { anon: GiB, kernel: 300_000_000, slab: 250_000_000 },
+    memoryMax: String(8 * GiB),
+    nodeAvailableKb: 4 * 1024 * 1024,
+  });
+}
+
+test("budget D1: a request that fails validation is ABSENT everywhere — G3 stays on", () => {
+  const read = (request: string | undefined) =>
+    readCapacity({ agent: "claude", sources: sourcesOf(g3Box(request).root), box: "f" });
+  const missing = read(undefined);
+  // limit-fallback, B = L = 8 GiB ⇒ G1 12, but borrowing with no known request ⇒ G3:
+  // ⌊(4096 − (K − C) − 3072)/450⌋ = 2.
+  assert.equal(missing.basis, "limit-fallback");
+  assert.equal(missing.freeSlots?.claude, 2);
+  assert.equal(missing.bindingGuard?.claude, "G3");
+  for (const bad of [String(9 * GiB), "2147483648000", String(100 * MIB), "2Gi", "0"]) {
+    const s = read(bad);
+    assert.equal(s.basis, "limit-fallback", bad);
+    assert.equal(s.requestBytes, null, `${bad}: a failed request is not reported as R`);
+    assert.deepEqual(s.freeSlots, missing.freeSlots, `${bad}: same slots as no request at all`);
+    assert.equal(s.bindingGuard?.claude, "G3", bad);
+    assert.equal(needMet(s, 6), false, bad);
+    assert.deepEqual(
+      s.alternatives,
+      [],
+      `${bad}: no "request" alternative from an invalid request`,
+    );
+  }
+  // Under the LIMIT basis an invalid request is ignored too, and says so.
+  const { root } = makeBox({
+    podinfo: {
+      request: "2147483648000",
+      limit: String(8 * GiB),
+      annotations: { [BASIS_ANNOTATION]: "limit" },
+    },
+    memoryMax: String(8 * GiB),
+    nodeAvailableKb: 4 * 1024 * 1024,
+  });
+  const limit = readCapacity({ agent: "claude", sources: sourcesOf(root), box: "f" });
+  assert.equal(limit.basis, "limit");
+  assert.equal(limit.requestBytes, null);
+  assert.equal(limit.bindingGuard?.claude, "G3");
+  assert.ok(
+    limit.warnings.some((w) => w.includes("treated as absent")),
+    limit.warnings.join("; "),
+  );
+  // Positive control: a valid request equal to the limit is R, and B = R means not borrowing.
+  const exact = read(String(8 * GiB));
+  assert.equal(exact.basis, "request");
+  assert.equal(exact.requestBytes, 8 * GiB);
+  assert.equal(exact.bindingGuard?.claude, "G1");
 });
 
 test("NEGATIVE: an over-budget configured box reads `full` and does not meet --need 1", () => {
@@ -793,6 +918,32 @@ test("CLI NEGATIVE: over budget ⇒ `--need 1` exits 75; the same box without po
   assert.equal(admitted.code, 0, admitted.stderr);
   assert.match(admitted.stdout, /UNCONFIGURED/u);
   assert.doesNotMatch(admitted.stdout, /^full/mu);
+  // D2: the fail-open verdict carries its reason, in text and in JSON, so needMet:true beside
+  // freeSlots 0 is not mistaken for a bug.
+  const reason =
+    "unconfigured box (no /etc/podinfo): admission is not enforced; freeSlots is advisory";
+  assert.match(admitted.stdout, /need 1 claude slot: met \(exit 0\) — unconfigured box/u);
+  assert.ok(admitted.stdout.includes(reason), admitted.stdout);
+  const json = await runCli(["--format", "json", "capacity", "--need", "3"], open.env, open.root);
+  assert.equal(json.code, 0, json.stderr);
+  const parsed = JSON.parse(json.stdout) as {
+    needMet: boolean;
+    needMetReason: string;
+    freeSlots: { claude: number };
+  };
+  assert.equal(parsed.needMet, true);
+  assert.equal(parsed.freeSlots.claude, 0);
+  assert.equal(parsed.needMetReason, reason);
+  // …and a configured box names the numbers instead.
+  const refusedJson = await runCli(
+    ["--format", "json", "capacity", "--need", "1"],
+    full.env,
+    full.root,
+  );
+  assert.equal(
+    (JSON.parse(refusedJson.stdout) as { needMetReason: string }).needMetReason,
+    "0 new claude session(s) fit; 1 needed",
+  );
 });
 
 test("CLI: plain reading exits 0 and prints the human summary", async () => {

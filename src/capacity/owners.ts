@@ -24,6 +24,8 @@ export type OwnerTree = {
   readonly processes: number;
   /** `m_i` = Σ over the tree of RssAnon + VmPTE (page tables go with the session, §4.1). */
   readonly measuredBytes: number;
+  /** True for the owner whose tree holds the reading process — the CALLER's own session. */
+  readonly self: boolean;
 };
 
 export type LeaseExclusion =
@@ -31,7 +33,9 @@ export type LeaseExclusion =
   | "dead"
   | "identity-mismatch"
   | "identity-unverified"
-  | "foreign";
+  | "foreign"
+  /** A second fresh lease naming a pid already counted (fresh = live + Σ excluded always holds). */
+  | "duplicate-pid";
 
 export type OwnerCensus = {
   readonly owners: readonly OwnerTree[];
@@ -262,13 +266,37 @@ function judgeLease(
 type TreeWalk = {
   readonly procRoot: string;
   readonly children: ReadonlyMap<number, number[]>;
+  /** Every verified owner pid: a walk never descends into ANOTHER owner's subtree. */
+  readonly ownerPids: ReadonlySet<number>;
+  /** The reading process — never attributed; finding it marks the walked tree as the caller's. */
+  readonly readerPid: number | undefined;
   /** Pids already attributed — no process is counted for two owners. */
   readonly claimed: Set<number>;
 };
 
-function measureTree(walk: TreeWalk, root: number): { processes: number; measuredBytes: number } {
-  let measuredBytes = 0;
-  let processes = 0;
+type TreeMeasure = { processes: number; measuredBytes: number; self: boolean };
+
+/**
+ * One owner's tree, stopping at every OTHER owner's pid. An agent's blocking `acpx prompt` spawns
+ * the child's queue owner under the waiting CLI, i.e. INSIDE the agent's own owner tree, for the
+ * length of that turn (TE finding D3, devbox 2026-10-27). That nested owner is its own owner with its
+ * own floor charge: the outer tree must exclude its subtree, whichever lease is read first.
+ */
+/** Push `pid`'s children that belong to THIS tree; true when one of them is the reader. */
+function descend(walk: TreeWalk, pid: number, stack: number[]): boolean {
+  let sawReader = false;
+  for (const child of walk.children.get(pid) ?? []) {
+    if (child === walk.readerPid) {
+      sawReader = true;
+    } else if (!walk.ownerPids.has(child)) {
+      stack.push(child);
+    }
+  }
+  return sawReader;
+}
+
+function measureTree(walk: TreeWalk, root: number): TreeMeasure {
+  const result: TreeMeasure = { processes: 0, measuredBytes: 0, self: false };
   const stack = [root];
   for (let pid = stack.pop(); pid !== undefined; pid = stack.pop()) {
     if (walk.claimed.has(pid)) {
@@ -279,15 +307,34 @@ function measureTree(walk: TreeWalk, root: number): { processes: number; measure
     if (status === undefined) {
       continue; // exited mid-walk
     }
-    processes += 1;
-    measuredBytes += parseStatusMemory(status);
-    stack.push(...(walk.children.get(pid) ?? []));
+    result.processes += 1;
+    result.measuredBytes += parseStatusMemory(status);
+    result.self ||= descend(walk, pid, stack);
   }
-  return { processes, measuredBytes };
+  return result;
 }
 
-function readerPids(inputs: CensusInputs): number[] {
-  return inputs.readerPid === undefined ? [] : [inputs.readerPid];
+/** Pass 1: every fresh lease judged; the verified ones, one per pid, in a stable order. */
+function verifiedLeases(
+  inputs: CensusInputs,
+  fresh: readonly string[],
+  table: ReadonlyMap<number, ProcEntry>,
+  excluded: Record<LeaseExclusion, number>,
+): LeaseBody[] {
+  const ownNamespace = ownPidNamespace(inputs.procRoot);
+  const byPid = new Map<number, LeaseBody>();
+  for (const name of fresh) {
+    const lease = parseLeaseBody(readText(path.join(inputs.queueDir, name)));
+    const exclusion = lease ? judgeLease(lease, table, ownNamespace) : "unparsable";
+    if (exclusion) {
+      excluded[exclusion] += 1;
+    } else if (lease && byPid.has(lease.pid)) {
+      excluded["duplicate-pid"] += 1;
+    } else if (lease) {
+      byPid.set(lease.pid, lease);
+    }
+  }
+  return [...byPid.values()].toSorted((a, b) => a.pid - b.pid);
 }
 
 export function censusOwners(inputs: CensusInputs): OwnerCensus {
@@ -297,39 +344,39 @@ export function censusOwners(inputs: CensusInputs): OwnerCensus {
     "identity-mismatch": 0,
     "identity-unverified": 0,
     foreign: 0,
+    "duplicate-pid": 0,
   };
   const names = listLeaseFiles(inputs.queueDir);
   const fresh = freshLeaseFiles(inputs, names);
-  const owners: OwnerTree[] = [];
-  const census = { owners, leaseFiles: names.length, freshLeases: fresh.length, excluded };
+  const census = { leaseFiles: names.length, freshLeases: fresh.length, excluded };
   if (fresh.length === 0) {
-    return { ...census, warnings: [] };
+    return { ...census, owners: [], warnings: [] };
   }
 
   const table = readProcessTable(inputs.procRoot);
-  const ownNamespace = ownPidNamespace(inputs.procRoot);
+  const leases = verifiedLeases(inputs, fresh, table, excluded);
   const walk: TreeWalk = {
     procRoot: inputs.procRoot,
     children: childrenByParent(table),
-    claimed: new Set<number>(readerPids(inputs)),
+    ownerPids: new Set(leases.map((lease) => lease.pid)),
+    readerPid: inputs.readerPid,
+    claimed: new Set<number>(),
   };
-  for (const name of fresh) {
-    const lease = parseLeaseBody(readText(path.join(inputs.queueDir, name)));
-    const exclusion = lease ? judgeLease(lease, table, ownNamespace) : "unparsable";
-    if (exclusion) {
-      excluded[exclusion] += 1;
-    } else if (lease && !walk.claimed.has(lease.pid)) {
-      owners.push({
-        sessionId: lease.sessionId,
-        pid: lease.pid,
-        harness: harnessForSession(inputs.sessionsDir, lease.sessionId),
-        ...measureTree(walk, lease.pid),
-      });
-    }
-  }
+  // Pass 2: each owner measured separately — no order dependence between leases.
+  const owners: OwnerTree[] = leases.map((lease) => {
+    const tree = measureTree(walk, lease.pid);
+    return {
+      sessionId: lease.sessionId,
+      pid: lease.pid,
+      harness: harnessForSession(inputs.sessionsDir, lease.sessionId),
+      processes: tree.processes,
+      measuredBytes: tree.measuredBytes,
+      self: tree.self,
+    };
+  });
   const warnings =
     excluded.unparsable > 0
       ? [`${excluded.unparsable} fresh lease file(s) could not be parsed`]
       : [];
-  return { ...census, warnings };
+  return { ...census, owners, warnings };
 }

@@ -4,6 +4,7 @@ import {
   type CapacitySnapshot,
   capacitySourcesFromEnv,
   needMet,
+  needMetReason,
   readCapacity,
 } from "../capacity/reading.js";
 import { EXIT_CODES, type OutputFormat } from "../types.js";
@@ -69,11 +70,14 @@ function slotLine(s: CapacitySnapshot, free: number, interactive: number): strin
   );
 }
 
+const yours = (s: CapacitySnapshot): string =>
+  s.owners.trees.some((tree) => tree.self) ? " (one is yours)" : "";
+
 function chargeLine(s: CapacitySnapshot, charged: number, base: number): string {
   const ownerCharge = s.owners.trees.reduce((sum, tree) => sum + tree.chargedBytes, 0);
   const workingSet = s.workingSetBytes === null ? "" : ` · working set ${gib(s.workingSetBytes)}`;
   return (
-    `charged ${gib(charged)} = base ${gib(base)} + ${plural(s.owners.live, "owner")} ` +
+    `charged ${gib(charged)} = base ${gib(base)} + ${plural(s.owners.live, "owner")}${yours(s)} ` +
     `${gib(ownerCharge)} · committed ${gib(s.committedBytes ?? 0)} (anon + kernel) · margin ` +
     `${gib(s.marginBytes ?? 0)}${workingSet}`
   );
@@ -126,7 +130,14 @@ function writeCapacity(
   need: number | undefined,
   met: boolean,
 ): void {
-  if (emitJsonResult(format, need === undefined ? snapshot : { ...snapshot, need, needMet: met })) {
+  if (
+    emitJsonResult(
+      format,
+      need === undefined
+        ? snapshot
+        : { ...snapshot, need, needMet: met, needMetReason: needMetReason(snapshot, need) },
+    )
+  ) {
     return;
   }
   if (format === "quiet") {
@@ -134,8 +145,11 @@ function writeCapacity(
     return;
   }
   process.stdout.write(renderCapacityText(snapshot));
-  if (need !== undefined && !met) {
-    process.stdout.write(`need ${plural(need, `${snapshot.agent} slot`)}: NOT MET (exit 75)\n`);
+  if (need !== undefined) {
+    const verdict = met ? "met (exit 0)" : "NOT MET (exit 75)";
+    process.stdout.write(
+      `need ${plural(need, `${snapshot.agent} slot`)}: ${verdict} — ${needMetReason(snapshot, need)}\n`,
+    );
   }
 }
 
