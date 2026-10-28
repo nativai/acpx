@@ -126,6 +126,13 @@ export type SessionIndexEntry = {
   metadataInfra?: boolean;
   metadataInfraPurpose?: string;
   metadataInfraWakeupId?: string;
+  /**
+   * `metadata.byway_view_at` — the TRANSCRIPT row a fork was cut at, written by acpx-ui
+   * on every fork (brick bd806cad). The chat header's fork-origin chip jumps there, and a
+   * plain fork's header is built from this entry alone, so a record-only key would leave
+   * the chip on `forkedAtMessageIndex` — a RECORD count, not a row. BOTH index legs.
+   */
+  metadataBywayViewAt?: string;
   // A byway is stored as a normal kind:"session" fork flagged metadata.byway==="1"
   // (acpx-ui convention). Projected so acpx-ui's kind resolution can run from the
   // entry without reading the record. Byway *lineage* (byway_parent/byway_at)
@@ -488,6 +495,7 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     metadataInfra: optionalBoolean(record.metadataInfra),
     metadataInfraPurpose: optionalString(record.metadataInfraPurpose),
     metadataInfraWakeupId: optionalString(record.metadataInfraWakeupId),
+    metadataBywayViewAt: optionalString(record.metadataBywayViewAt),
     byway: optionalBoolean(record.byway),
     currentModelId: optionalString(record.currentModelId),
     sessionModel: optionalString(record.sessionModel),
@@ -664,6 +672,7 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     metadataInfra: metadata?.infra === "1" ? true : undefined,
     metadataInfraPurpose: metadata?.infra_purpose,
     metadataInfraWakeupId: metadata?.infra_wakeup_id,
+    metadataBywayViewAt: metadata?.byway_view_at,
     byway: metadata?.byway === "1" ? true : undefined,
     currentModelId: acpx?.current_model_id,
     sessionModel: sessionOptions?.model,

@@ -76,6 +76,7 @@ function enrichedRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {
       byway: "1",
       byway_parent: "src-1",
       byway_at: "7",
+      byway_view_at: "9",
       infra: "1",
       infra_purpose: "Intaker template nightly re-bake",
       infra_wakeup_id: "01KXV9FD8RMQACSEPWTJ4DH93X",
@@ -108,6 +109,8 @@ test("toSessionIndexEntry projects every hot scalar from the record", () => {
   assert.equal(entry.metadataInfra, true);
   assert.equal(entry.metadataInfraPurpose, "Intaker template nightly re-bake");
   assert.equal(entry.metadataInfraWakeupId, "01KXV9FD8RMQACSEPWTJ4DH93X");
+  // brick bd806cad: the fork-origin chip's transcript row, header-displayed.
+  assert.equal(entry.metadataBywayViewAt, "9");
   assert.equal(entry.byway, true);
   assert.equal(entry.currentModelId, "gpt-5.5[high]");
   assert.equal(entry.sessionModel, "gpt-5.5[high]");
@@ -237,6 +240,7 @@ test("parseIndexEntry preserves enrichment across a write→read round-trip (unt
     assert.equal(back.metadataInfra, true);
     assert.equal(back.metadataInfraPurpose, "Intaker template nightly re-bake");
     assert.equal(back.metadataInfraWakeupId, "01KXV9FD8RMQACSEPWTJ4DH93X");
+    assert.equal(back.metadataBywayViewAt, "9");
     assert.equal(back.templateEnabled, true);
     assert.equal(back.templateCreatedAt, "2026-06-01T05:00:00.000Z");
     assert.equal(back.forkedFromSessionId, "src-1");
@@ -277,4 +281,11 @@ test("parseIndexEntry is lenient: a wrong-typed optional is dropped, entry still
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
+});
+
+test("brick bd806cad: a record without metadata.byway_view_at projects no metadataBywayViewAt", () => {
+  const record = enrichedRecord();
+  delete (record.metadata as Record<string, string>).byway_view_at;
+  const entry = toSessionIndexEntry(record, "enrich-no-view.json");
+  assert.equal(entry.metadataBywayViewAt, undefined);
 });
