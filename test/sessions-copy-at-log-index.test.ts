@@ -215,6 +215,15 @@ async function copy(homeDir: string, source: Source, extra: string[]): Promise<C
     .split("\n")
     .filter((l) => l.length > 0)
     .map((l) => JSON.parse(l) as SessionMessage);
+  // Every copy here is --ephemeral: its byway anchor and its record must name ONE cut,
+  // whatever the cut form (copy-all, --at-log-index, --at-index, Codex snap, compaction).
+  // TE F-2 (brick bd806cad): byway_at was the 200-entry window's length while the record
+  // said 274, and acpx-ui slices a byway's tangent by byway_at.
+  assert.equal(
+    record.metadata?.byway_at,
+    String(record.forked_at_message_index),
+    `byway_at vs forked_at_message_index for ${extra.join(" ") || "copy-all"}`,
+  );
   return { id, record, log };
 }
 
@@ -292,6 +301,7 @@ test("a cut deep in a long record inherits the WHOLE prefix [0, n), not the 200-
     // uncompacted source it equals the absolute position, which also rides as metadata.
     assert.equal(copied.record.forked_at_message_index, 231);
     assert.equal(copied.record.metadata?.fork_at_log_index, "231");
+    assert.equal(copied.record.metadata?.byway_at, "231");
   });
 });
 
@@ -353,6 +363,9 @@ test("the konsiq-shaped 313-entry record: copy-all inherits all 313 entries and 
     );
     assert.equal(copied.record.forked_at_message_index, 313);
     assert.equal(copied.record.metadata?.fork_at_log_index, undefined);
+    // `copy` is --ephemeral: the byway anchor acpx-ui slices the tangent by must name the
+    // same point as the record (TE F-2 — it was the 200-entry window's length).
+    assert.equal(copied.record.metadata?.byway_at, "313");
   });
 });
 
@@ -382,6 +395,11 @@ test("the konsiq-shaped record: a mid cut inherits [0, n) while the adapter cut 
     assert.deepEqual(copied.log, all.slice(0, n));
     assert.equal(copied.record.forked_at_message_index, n);
     assert.equal(copied.record.metadata?.fork_at_log_index, String(n));
+    assert.equal(
+      copied.record.metadata?.byway_at,
+      String(n),
+      "byway_at names the record's own cut",
+    );
   });
 });
 
@@ -403,6 +421,7 @@ test("copy-all counts the inline tail once, after the log, past the 200-entry wi
     const copied = await copy(homeDir, source, []);
     assert.deepEqual(copied.log, all);
     assert.equal(copied.record.forked_at_message_index, 212);
+    assert.equal(copied.record.metadata?.byway_at, "212");
   });
 });
 

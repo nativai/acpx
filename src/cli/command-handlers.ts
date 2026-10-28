@@ -1454,12 +1454,23 @@ function assertCopyCutFlags(flags: SessionsCopyFlags): void {
  * absolute position. The `--at-log-index` resolution runs here as well as in
  * `resolveForkSourceContext` for the same reason the `--at-index` rules do: so a
  * refusal — out of range, or FORK_CUT_MOVED — happens before an adapter spawns.
+ *
+ * ⚠️ `byway_at` MUST equal the record's `forked_at_message_index`, which counts the
+ * source's FULL history before the cut (brick bd806cad) — never `source.messages` or
+ * the adapter's ≤200-entry window. acpx-ui slices a byway's tangent by `byway_at`;
+ * TE F-2 found it at 200 on a record saying 274. Test: every `copy` in
+ * `sessions-copy-at-log-index.test.ts` asserts the two are equal.
  */
 async function resolveCopyCut(
   source: SessionRecord,
   flags: SessionsCopyFlags,
 ): Promise<{ forkAtMessageIndex: number; forkAtLogIndex?: number }> {
   assertCopyCutFlags(flags);
+  if (flags.atLogIndex === undefined && flags.atIndex === undefined) {
+    // Copy-all: the record inherits the whole history, not the hydrated window.
+    const { readFullSourceHistory } = await import("./session/fork-at-log-index.js");
+    return { forkAtMessageIndex: (await readFullSourceHistory(source)).messages.length };
+  }
   if (flags.atLogIndex === undefined) {
     return {
       forkAtMessageIndex: resolveForkAtMessageIndex(source, flags.atIndex, source.agentCommand),
@@ -1472,7 +1483,7 @@ async function resolveCopyCut(
     atLogIndex: flags.atLogIndex,
     expectEntry: flags.expectEntry,
   });
-  return { forkAtMessageIndex: window.messages.length, forkAtLogIndex: window.logIndex };
+  return { forkAtMessageIndex: window.history.before.length, forkAtLogIndex: window.logIndex };
 }
 
 function resolveForkAtMessageIndex(
