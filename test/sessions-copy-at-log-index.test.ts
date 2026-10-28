@@ -271,7 +271,7 @@ test("a cut OLDER than the 200-entry window copies the window ending at n and se
   });
 });
 
-test("a cut deep in a long record inherits exactly [n-200, n), not the tail window", async () => {
+test("a cut deep in a long record inherits the WHOLE prefix [0, n), not the 200-entry window ending at n", async () => {
   await withTempHome("acpx-at-log-index-", async (homeDir) => {
     const all = conversation(0, 260);
     const source: Source = {
@@ -283,12 +283,14 @@ test("a cut deep in a long record inherits exactly [n-200, n), not the tail wind
     await writeSource(homeDir, source);
 
     const copied = await copy(homeDir, source, ["--at-log-index", "231"]);
-    assert.equal(copied.log.length, 200);
-    assert.deepEqual(copied.log, all.slice(31, 231));
+    // brick bd806cad: this asserted `[31, 231)` and a count of 200 — the shipped
+    // window that lost every fork's head on a session longer than 200 entries.
+    assert.equal(copied.log.length, 231);
+    assert.deepEqual(copied.log, all.slice(0, 231));
     assert.equal(entryId(copied.log.at(-1)), entryId(all[230]));
-    // The inherited COUNT (today's meaning, what acpx-ui's byway display slices
-    // by) — not the absolute position, which rides as metadata.
-    assert.equal(copied.record.forked_at_message_index, 200);
+    // The inherited COUNT (what acpx-ui's byway display slices by); on an
+    // uncompacted source it equals the absolute position, which also rides as metadata.
+    assert.equal(copied.record.forked_at_message_index, 231);
     assert.equal(copied.record.metadata?.fork_at_log_index, "231");
   });
 });
@@ -309,6 +311,116 @@ test("--at-index on the same long record stays window-relative (unchanged)", asy
     const copied = await copy(homeDir, source, ["--at-index", "50"]);
     assert.deepEqual(copied.log, all.slice(60, 110));
     assert.equal(copied.record.metadata?.fork_at_log_index, undefined);
+  });
+});
+
+// ── brick bd806cad: the record inherits the whole history ───────────────────
+//
+// konsiq 2026-10-28: a copy-all of a 313-entry session was born with source
+// entries [113, 313) and `forked_at_message_index: 200`, and acpx-ui cut the
+// fork's visible prefix at source entry 200. The fixture is the shape-only
+// extract of that source record (49671f69, the 313 entries present at the fork:
+// 158 User / 155 Agent, steer pairs, agent claude_uuids; ids pseudonymized,
+// content hashed).
+const KONSIQ_LOG = path.join(
+  process.cwd(),
+  "test",
+  "fixtures",
+  "fork-at-log-index",
+  "49671f69-konsiq-shape.messages.ndjson",
+);
+
+async function konsiqSource(homeDir: string, id: string, agentCommand: string): Promise<Source> {
+  const logLines = (await fs.readFile(KONSIQ_LOG, "utf8")).split("\n").filter((l) => l.length > 0);
+  assert.equal(logLines.length, 313, "the fixture is the 313-entry record at fork time");
+  const source: Source = { id, agentCommand, cwd: path.join(homeDir, "workspace"), logLines };
+  await writeSource(homeDir, source);
+  return source;
+}
+
+test("the konsiq-shaped 313-entry record: copy-all inherits all 313 entries and records 313", async () => {
+  await withTempHome("acpx-copy-all-", async (homeDir) => {
+    const source = await konsiqSource(homeDir, "konsiq-copy-all", MOCK_FORK);
+    const all = source.logLines.map((l) => JSON.parse(l) as SessionMessage);
+
+    const copied = await copy(homeDir, source, []);
+    assert.equal(copied.log.length, 313);
+    assert.deepEqual(copied.log, all);
+    assert.equal(
+      entryId(copied.log[0]),
+      entryId(all[0]),
+      "the copy starts at the source's FIRST entry",
+    );
+    assert.equal(copied.record.forked_at_message_index, 313);
+    assert.equal(copied.record.metadata?.fork_at_log_index, undefined);
+  });
+});
+
+test("the konsiq-shaped record: a mid cut inherits [0, n) while the adapter cut is unchanged", async () => {
+  await withTempHome("acpx-at-log-index-", async (homeDir) => {
+    const n = 250;
+    const logLines = (await fs.readFile(KONSIQ_LOG, "utf8"))
+      .split("\n")
+      .filter((l) => l.length > 0);
+    const all = logLines.map((l) => JSON.parse(l) as SessionMessage);
+    // The adapter still resolves the cut from the window's LAST entry — the same
+    // meta it got when the record inherited only that window.
+    const last = all[n - 1];
+    const uuid =
+      last === "Resume"
+        ? undefined
+        : "User" in last
+          ? last.User.claude_uuid
+          : last.Agent.claude_uuid;
+    const meta = uuid
+      ? { claudeCode: { options: { resumeSessionAt: uuid } } }
+      : { acpx: { forkAtMessageIndex: n } };
+    const source = await konsiqSource(homeDir, "konsiq-mid", withForkMeta(MOCK_FORK, meta));
+
+    const copied = await copy(homeDir, source, ["--at-log-index", String(n)]);
+    assert.equal(copied.log.length, n);
+    assert.deepEqual(copied.log, all.slice(0, n));
+    assert.equal(copied.record.forked_at_message_index, n);
+    assert.equal(copied.record.metadata?.fork_at_log_index, String(n));
+  });
+});
+
+test("copy-all counts the inline tail once, after the log, past the 200-entry window", async () => {
+  await withTempHome("acpx-copy-all-", async (homeDir) => {
+    const all = conversation(0, 212);
+    const source: Source = {
+      id: "copy-all-inline",
+      agentCommand: MOCK_FORK,
+      cwd: path.join(homeDir, "workspace"),
+      logLines: lines(all.slice(0, 205)),
+      inline: all.slice(205),
+    };
+    await writeSource(homeDir, source);
+    // Entry 205 also reached the log past the record's watermark: it counts ONCE.
+    const logPath = path.join(homeDir, ".acpx", "sessions", `${source.id}.messages.ndjson`);
+    await fs.appendFile(logPath, `${JSON.stringify(all[205])}\n`, "utf8");
+
+    const copied = await copy(homeDir, source, []);
+    assert.deepEqual(copied.log, all);
+    assert.equal(copied.record.forked_at_message_index, 212);
+  });
+});
+
+test("copy-all on a compacted log inherits what the log still holds; the count is the inherited count", async () => {
+  await withTempHome("acpx-copy-all-", async (homeDir) => {
+    const kept = conversation(40, 30);
+    const source: Source = {
+      id: "copy-all-compacted",
+      agentCommand: MOCK_FORK,
+      cwd: path.join(homeDir, "workspace"),
+      logLines: lines(kept),
+      baseIndex: 40,
+    };
+    await writeSource(homeDir, source);
+
+    const copied = await copy(homeDir, source, []);
+    assert.deepEqual(copied.log, kept);
+    assert.equal(copied.record.forked_at_message_index, 30);
   });
 });
 
@@ -1137,9 +1249,9 @@ test("Codex on a record longer than 200 entries gets the ABSOLUTE n (even-snappe
     await writeSource(homeDir, source);
 
     const copied = await copy(homeDir, source, ["--at-log-index", "231"]);
-    assert.deepEqual(copied.log, all.slice(30, 230));
-    assert.equal(copied.record.forked_at_message_index, 200);
-    assert.equal(copied.record.forked_at_message_index_requested, 201);
+    assert.deepEqual(copied.log, all.slice(0, 230));
+    assert.equal(copied.record.forked_at_message_index, 230);
+    assert.equal(copied.record.forked_at_message_index_requested, 231);
     assert.equal(copied.record.metadata?.fork_at_log_index, "230");
   });
 });

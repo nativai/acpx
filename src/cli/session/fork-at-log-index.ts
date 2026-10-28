@@ -15,10 +15,21 @@ import type { SessionMessage, SessionRecord } from "../../types.js";
 // entries), which slides on every append and cannot reach an entry older than
 // it. `--at-log-index n` addresses the source's FULL history instead: absolute
 // positions counted from `messages_log.base_index`, over the log lines followed
-// by the inline tail hydration has already de-duplicated. The copy inherits the
-// window ENDING at n — the same ≤200-entry runtime window a full copy gets.
+// by the inline tail hydration has already de-duplicated.
+//
+// Two different lists come out of the cut (brick bd806cad):
+//   - `inherited` — EVERY entry before n. This is what the copied RECORD carries.
+//   - `messages` — the ≤200-entry window ENDING at n. This is what the ADAPTER's
+//     cut is resolved against (Claude uuid walk-back, `contextEndLogIndex`).
+// ⚠️ DO NOT write the window into the record "because the runtime only hydrates
+// 200 anyway". That was the shipped design, and it made every fork of a session
+// longer than 200 entries lose its head and record a window-relative
+// `forked_at_message_index` — which acpx-ui then reads as the point to cut the
+// fork's visible prefix at (konsiq 2026-10-28: a fork at entry 313 showed the
+// conversation up to entry 200). Test: `sessions-copy-at-log-index.test.ts` →
+// "the konsiq-shaped 313-entry record".
 
-/** Same cap as `MAX_RUNTIME_MESSAGES` in `session/messages-log.ts`. */
+/** Same cap as `MAX_RUNTIME_MESSAGES` in `session/messages-log.ts` — the ADAPTER window only. */
 const FORK_WINDOW_MESSAGES = 200;
 
 export const FORK_CUT_MOVED = "FORK_CUT_MOVED";
@@ -53,9 +64,12 @@ export type LogIndexForkWindow = {
   logIndex: number;
   /** The absolute position that was asked for; equal to `logIndex` unless snapped. */
   requestedLogIndex: number;
-  /** Entries `[max(base_index, logIndex-200), logIndex)` — what the copy inherits. */
+  /** Entries `[max(base_index, logIndex-200), logIndex)` — the ADAPTER's cut window only. */
   messages: SessionMessage[];
-  /** The full history before `logIndex`, and from it on — the Claude cut's proof input. */
+  /**
+   * The full history before `logIndex`, and from it on — the Claude cut's proof input.
+   * `before` is also exactly what the copied record inherits.
+   */
   history: { before: SessionMessage[]; after: SessionMessage[] };
 };
 
@@ -82,7 +96,7 @@ export function forkEntryFingerprint(entry: SessionMessage, rawLine: string): st
  * `resolveSessionRecord` returned it — the logged-count bookkeeping that splits
  * its `messages` into "from the log" and "inline" lives on that object.
  */
-async function readFullSourceHistory(source: SessionRecord): Promise<{
+export async function readFullSourceHistory(source: SessionRecord): Promise<{
   baseIndex: number;
   messages: SessionMessage[];
   rawLines: string[];

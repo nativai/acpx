@@ -81,7 +81,11 @@ import type {
   SessionListOptions,
   SessionListResult,
 } from "./contracts.js";
-import { type LogIndexForkWindow, resolveLogIndexForkWindow } from "./fork-at-log-index.js";
+import {
+  type LogIndexForkWindow,
+  readFullSourceHistory,
+  resolveLogIndexForkWindow,
+} from "./fork-at-log-index.js";
 
 // brick://5bac5564 Layer B belt inputs — the pin + its provenance from the create
 // options, spread into applyRequestedModelIfAdvertised. Extracted so the resume /
@@ -936,6 +940,12 @@ type ForkSourceContext = {
   requestedForkAtMessageIndex?: number;
   /** `--at-log-index` only: the window ending at the absolute cut. */
   logWindow?: LogIndexForkWindow;
+  /**
+   * What the copied RECORD inherits — `forkAtMessageIndex` entries. For copy-all and
+   * `--at-log-index` this is the source's full history up to the cut, never the
+   * ≤200-entry window the adapter cut is resolved against (brick bd806cad).
+   */
+  inheritedMessages: SessionRecord["messages"];
 };
 
 async function resumeSessionRecordWithClient(
@@ -1007,14 +1017,18 @@ async function resolveLogIndexForkSourceContext(
   });
   // `forked_at_message_index` keeps its meaning — the INHERITED count, which is
   // what acpx-ui's byway display slices by — and the absolute position travels
-  // as `metadata.fork_at_log_index`.
-  const forkAtMessageIndex = logWindow.messages.length;
+  // as `metadata.fork_at_log_index`. The record inherits the WHOLE history before
+  // the cut, so on an uncompacted source (base_index 0) the count IS the source
+  // position (brick bd806cad; it used to be the ≤200 window's length).
+  const inheritedMessages = logWindow.history.before;
+  const forkAtMessageIndex = inheritedMessages.length;
   const snappedBy = logWindow.requestedLogIndex - logWindow.logIndex;
   return {
     sourceRecord,
     forkAtMessageIndex,
     ...(snappedBy === 0 ? {} : { requestedForkAtMessageIndex: forkAtMessageIndex + snappedBy }),
     logWindow,
+    inheritedMessages,
   };
 }
 
@@ -1057,12 +1071,29 @@ async function resolveForkSourceContext(options: SessionCreateOptions): Promise<
     return await resolveLogIndexForkSourceContext(sourceRecord, options, options.forkAtLogIndex);
   }
 
+  if (options.forkAtMessageIndex === undefined) {
+    // COPY-ALL (no cut): the record inherits the source's WHOLE history, not the
+    // hydrated ≤200-entry window `sourceRecord.messages` holds (brick bd806cad —
+    // a 313-entry source was copied as its last 200 with forked_at_message_index
+    // 200). The adapter is not cut at all here, so it never sees this list.
+    const inheritedMessages = (await readFullSourceHistory(sourceRecord)).messages;
+    return {
+      sourceRecord,
+      forkAtMessageIndex: inheritedMessages.length,
+      inheritedMessages,
+    };
+  }
+
+  // `--at-index k` (legacy) — WINDOW-relative by contract: `k` and the copy both
+  // address the hydrated window, and `k = 0` is the fresh-session path. Left as is;
+  // acpx-ui forks through copy-all and `--at-log-index`.
+  //
   // THE CHOKE POINT both the CLI verb and acpx-ui's create route reach, which is
   // why the refusal lives here rather than only in the handler: a truncating fork
   // a harness will not perform is refused before any record exists.
   assertForkAtIndexHonoured(options.agentCommand, options.forkAtMessageIndex);
 
-  const requested = options.forkAtMessageIndex ?? sourceRecord.messages.length;
+  const requested = options.forkAtMessageIndex;
   if (requested < 0 || requested > sourceRecord.messages.length) {
     throw new Error(`--at-index out of range (0-${sourceRecord.messages.length})`);
   }
@@ -1078,13 +1109,10 @@ async function resolveForkSourceContext(options: SessionCreateOptions): Promise<
   // new field rather than `effective`.
   //
   // It also truncates the cloned message list at the same boundary
-  // (`messages.slice(0, forkAtMessageIndex)` in the caller), so the record's own
+  // (`inheritedMessages` below), so the record's own
   // message COUNT agrees with the index it reports — the ground truth
   // `G1-FRK-01` checks the record against.
-  const forkAtMessageIndex =
-    options.forkAtMessageIndex === undefined
-      ? requested
-      : resolveEffectiveForkIndex(options.agentCommand, requested);
+  const forkAtMessageIndex = resolveEffectiveForkIndex(options.agentCommand, requested);
 
   return {
     sourceRecord,
@@ -1092,6 +1120,7 @@ async function resolveForkSourceContext(options: SessionCreateOptions): Promise<
     // Populated ONLY on a mismatch, so the common case stays byte-identical to
     // baseline and the field's mere presence means "these two differ".
     ...(forkAtMessageIndex === requested ? {} : { requestedForkAtMessageIndex: requested }),
+    inheritedMessages: sourceRecord.messages.slice(0, forkAtMessageIndex),
   };
 }
 
@@ -1139,8 +1168,13 @@ async function forkSessionRecordWithClient(
   options: SessionCreateOptions,
   cwd: string,
 ): Promise<ForkedSessionState> {
-  const { sourceRecord, forkAtMessageIndex, requestedForkAtMessageIndex, logWindow } =
-    await resolveForkSourceContext(options);
+  const {
+    sourceRecord,
+    forkAtMessageIndex,
+    requestedForkAtMessageIndex,
+    logWindow,
+    inheritedMessages,
+  } = await resolveForkSourceContext(options);
 
   if (!client.supportsForkSession()) {
     throw new Error(
@@ -1184,11 +1218,9 @@ async function forkSessionRecordWithClient(
           ? {}
           : { contextEndLogIndex: forkContextEnd(forkedSession) }),
         // Truncated at the EFFECTIVE boundary, so the record's own message count
-        // agrees with the index it reports (row `G1-FRK-01`).
-        messages: forkCutOptions(options, sourceRecord, logWindow).sourceMessages.slice(
-          0,
-          forkAtMessageIndex,
-        ),
+        // agrees with the index it reports (row `G1-FRK-01`) — and NOT the adapter's
+        // ≤200 window `forkCutOptions` hands the agent (brick bd806cad).
+        messages: inheritedMessages,
       },
     };
   } catch (error) {
