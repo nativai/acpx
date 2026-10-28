@@ -2199,6 +2199,29 @@ export class AcpClient {
   }
 
   /**
+   * brick a81e16a1 — the base `_meta` of a resume/load: the SAME `claudeCode`
+   * options fragment `session/new` sent (model, disallowedTools, skills, …, from
+   * the session record via `sessionOptions`), plus the resume primer.
+   *
+   * ⚠️ Without the options a respawned Claude runs with the adapter's defaults:
+   * the tools acpx disallows at creation (ScheduleWakeup, Cron*, RemoteTrigger,
+   * Skill) come BACK, and the changed tool list breaks the prompt-cache prefix,
+   * so the first respawn after `session/new` re-writes the whole conversation
+   * (CONCEPTION F1a: 52/64 misses). The adapter reads options on resume exactly
+   * as on new (one `createSession`), so they must be re-sent on every rebuild.
+   *
+   * Claude adapter only, like the fork path: other adapters keep their resume
+   * `_meta` unchanged (codex restores its developer item from thread history).
+   */
+  private async buildReconnectSessionMeta(): Promise<Record<string, unknown> | undefined> {
+    const { command, args } = splitCommandLine(this.options.agentCommand);
+    const optionsMeta = isClaudeAcpCommand(command, args)
+      ? buildClaudeCodeOptionsMeta(this.options.sessionOptions)
+      : undefined;
+    return mergeOptionalRecords(optionsMeta, await this.buildResumePrimerMeta());
+  }
+
+  /**
    * Render the OS primer in THIS session's agent environment. Unreachable with
    * `agentSpawnEnv` unset in production — every session op goes through
    * `getConnection()`, which throws unless `start()` (the only writer of that
@@ -2312,14 +2335,14 @@ export class AcpClient {
     let response: LoadSessionResponse | undefined;
 
     try {
-      // Re-supply the primer on cold load for the system-prompt channels
-      // (CONCEPTION §4.5.2) so a restarted adapter regenerates it; codex returns
-      // undefined here (its developer item is already in restored history).
-      const primerMeta = await this.buildResumePrimerMeta();
+      // Re-supply the creation options and the primer on cold load (CONCEPTION
+      // §4.5.2, brick a81e16a1) so a restarted adapter rebuilds the session it
+      // was created as; codex gets neither (its developer item is in history).
+      const reconnectMeta = await this.buildReconnectSessionMeta();
       const loadMeta =
         this.mergeOutputStyleMeta(
           this.mergeContextWindowHint(
-            { ...primerMeta },
+            { ...reconnectMeta },
             options.contextWindowSizeHint,
             options.contextWindowSizeHintModel,
           ),
@@ -2353,13 +2376,13 @@ export class AcpClient {
   ): Promise<SessionResumeResult> {
     const connection = this.getConnection();
     const sessionCwd = await resolveAgentSessionCwd(cwd, this.options.agentCommand);
-    // Re-supply the primer on cold resume for the system-prompt channels
-    // (CONCEPTION §4.5.2): a regenerated system prompt is dropped on rebuild
-    // unless re-sent. Idempotent; codex returns undefined (restored from thread).
-    const primerMeta = await this.buildResumePrimerMeta();
+    // Re-supply the creation options and the primer on cold resume (CONCEPTION
+    // §4.5.2, brick a81e16a1): both are dropped on rebuild unless re-sent.
+    // Idempotent; codex gets neither (restored from thread).
+    const reconnectMeta = await this.buildReconnectSessionMeta();
     const resumeMeta = this.mergeOutputStyleMeta(
       this.mergeContextWindowHint(
-        primerMeta,
+        reconnectMeta,
         options.contextWindowSizeHint,
         options.contextWindowSizeHintModel,
       ),

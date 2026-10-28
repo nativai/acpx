@@ -316,6 +316,7 @@ test("resolveSessionPrimer: a failure is NOT memoized — a later success still 
 type CapturedConnection = {
   newSessionMeta?: Record<string, unknown>;
   resumeMeta?: Record<string, unknown> | "absent";
+  loadMeta?: Record<string, unknown> | "absent";
 };
 
 function makeClient(agentCommand: string, sessionOptions?: Record<string, unknown>): AcpClient {
@@ -340,6 +341,10 @@ function stubConnection(client: AcpClient, captured: CapturedConnection): void {
     resumeSession: async (params: { _meta?: Record<string, unknown> }) => {
       captured.resumeMeta = "_meta" in params ? (params._meta ?? "absent") : "absent";
       return { sessionId: "session-stub" };
+    },
+    loadSession: async (params: { _meta?: Record<string, unknown> }) => {
+      captured.loadMeta = "_meta" in params ? (params._meta ?? "absent") : "absent";
+      return {};
     },
   };
 }
@@ -449,6 +454,98 @@ test("resumeSession (codex): attaches NO _meta (developer item restored from thr
     const client = makeClient(CODEX_COMMAND);
     stubConnection(client, captured);
     await client.resumeSession("session-stub", "/tmp/acpx-primer-resume-codex");
+    assert.equal(captured.resumeMeta, "absent");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// brick a81e16a1 — a respawn must rebuild the session it was CREATED as.
+// `session/new` carries `_meta.claudeCode.options` (model, disallowedTools, …);
+// resume/load used to carry only the primer, so a respawned Claude got the
+// adapter's default tool list back (ScheduleWakeup, Cron*, RemoteTrigger, Skill)
+// and the changed tool list broke the prompt-cache prefix (CONCEPTION F1a).
+// The property: with no context-window hint and no style change, the reconnect
+// `_meta` is IDENTICAL to the creation `_meta` — not merely "contains options".
+// ---------------------------------------------------------------------------
+const CREATION_OPTIONS = {
+  model: "haiku",
+  disallowedTools: [
+    "ScheduleWakeup",
+    "CronCreate",
+    "CronList",
+    "CronDelete",
+    "RemoteTrigger",
+    "Skill",
+  ],
+  allowedTools: ["Read"],
+  skills: ["one-skill"],
+  maxTurns: 7,
+};
+
+test("a81e16a1: resumeSession (claude) re-sends the session/new _meta byte for byte", async () => {
+  await withPrimerScript("printf 'PRIMER-SAME\\n'", async () => {
+    const captured: CapturedConnection = {};
+    const client = makeClient(SDK_CLAUDE_COMMAND, CREATION_OPTIONS);
+    stubConnection(client, captured);
+    await client.createSession("/tmp/acpx-a81e16a1-new");
+    await client.resumeSession("session-stub", "/tmp/acpx-a81e16a1-new");
+    const options = (captured.newSessionMeta?.claudeCode as { options?: unknown } | undefined)
+      ?.options;
+    assert.deepEqual(options, CREATION_OPTIONS, "control: creation carries the options");
+    assert.deepEqual(captured.resumeMeta, captured.newSessionMeta);
+  });
+});
+
+test("a81e16a1: loadSessionWithOptions (claude) re-sends the session/new _meta byte for byte", async () => {
+  await withPrimerScript("printf 'PRIMER-SAME\\n'", async () => {
+    const captured: CapturedConnection = {};
+    const client = makeClient(SDK_CLAUDE_COMMAND, CREATION_OPTIONS);
+    stubConnection(client, captured);
+    await client.createSession("/tmp/acpx-a81e16a1-load");
+    await client.loadSessionWithOptions("session-stub", "/tmp/acpx-a81e16a1-load", {
+      replayIdleMs: 0,
+      replayDrainTimeoutMs: 0,
+    });
+    assert.deepEqual(captured.loadMeta, captured.newSessionMeta);
+  });
+});
+
+test("a81e16a1: the resume hint deep-merges BESIDE the options, never replacing them", async () => {
+  await withPrimerScript("printf 'PRIMER-SAME\\n'", async () => {
+    const captured: CapturedConnection = {};
+    const client = makeClient(SDK_CLAUDE_COMMAND, CREATION_OPTIONS);
+    stubConnection(client, captured);
+    await client.resumeSession("session-stub", "/tmp/acpx-a81e16a1-hint", {
+      contextWindowSizeHint: 1_000_000,
+      contextWindowSizeHintModel: "haiku",
+    });
+    const claudeCode = (captured.resumeMeta as Record<string, unknown>).claudeCode;
+    assert.deepEqual(claudeCode, {
+      options: CREATION_OPTIONS,
+      contextWindowSizeHint: 1_000_000,
+      contextWindowSizeHintModel: "haiku",
+    });
+  });
+});
+
+test("a81e16a1: a human --system-prompt string survives a resume (it replaced the primer at creation)", async () => {
+  await withPrimerScript("printf 'PRIMER-SHOULD-NOT-APPEAR\\n'", async () => {
+    const captured: CapturedConnection = {};
+    const client = makeClient(SDK_CLAUDE_COMMAND, { systemPrompt: "HUMAN-WHOLE-PROMPT" });
+    stubConnection(client, captured);
+    await client.createSession("/tmp/acpx-a81e16a1-sp");
+    await client.resumeSession("session-stub", "/tmp/acpx-a81e16a1-sp");
+    assert.equal(captured.newSessionMeta?.systemPrompt, "HUMAN-WHOLE-PROMPT");
+    assert.deepEqual(captured.resumeMeta, captured.newSessionMeta);
+  });
+});
+
+test("a81e16a1: codex resume stays _meta-free even WITH creation options (Claude adapter only)", async () => {
+  await withPrimerScript("printf 'PRIMER-RESUME-CODEX\\n'", async () => {
+    const captured: CapturedConnection = {};
+    const client = makeClient(CODEX_COMMAND, CREATION_OPTIONS);
+    stubConnection(client, captured);
+    await client.resumeSession("session-stub", "/tmp/acpx-a81e16a1-codex");
     assert.equal(captured.resumeMeta, "absent");
   });
 });
