@@ -702,9 +702,10 @@ export function addGlobalFlags(command: Command): Command {
       // this is the idle-CHECK cadence — how often an idle owner re-checks for a
       // deploy-staleness recycle and the idle-memory release. 0 = never recycle or
       // release (the master opt-out). The idle-memory release timeout itself is a
-      // separate knob: env ACPX_OWNER_IDLE_RELEASE_MS in ms (default 1800000 = 30
-      // min; 0 disables only memory-release, keeping deploy-staleness recycle).
-      "Queue owner idle-check cadence in seconds (0 = never recycle/release). Idle-memory release timeout: env ACPX_OWNER_IDLE_RELEASE_MS (ms, default 1800000) (default: 900)",
+      // separate knob: env ACPX_OWNER_IDLE_RELEASE_MS in ms (default 300000 = 5
+      // min, floored at 30 min while background tasks are live; 0 disables only
+      // memory-release, keeping deploy-staleness recycle).
+      "Queue owner idle-check cadence in seconds (0 = never recycle/release). Idle-memory release timeout: env ACPX_OWNER_IDLE_RELEASE_MS (ms, default 300000) (default: 900)",
       parseTtlSeconds,
     )
     .option("--verbose", "Enable verbose debug logs");

@@ -64,6 +64,7 @@ import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
 import { createBackgroundTaskTracker } from "./background-task-tracker.js";
 import { resolveSessionBrickContext } from "./brick-link.js";
 import {
+  BACKGROUND_TASK_IDLE_RELEASE_HOLD_MS,
   DEFAULT_QUEUE_OWNER_TTL_MS,
   normalizeOwnerIdleReleaseMs,
   normalizeQueueOwnerTtlMs,
@@ -678,6 +679,9 @@ export type DecideIdleOwnerReleaseInput = {
   lastTaskCompletedAt: number;
   quiescenceWindowMs: number;
   idleReleaseMs: number;
+  // brick://a81e16a1 — background tasks the adapter still holds. Above zero, the
+  // idle-memory timeout is floored at BACKGROUND_TASK_IDLE_RELEASE_HOLD_MS.
+  liveBackgroundTaskCount: number;
   // Lazy so the deploy-file read happens ONLY after the safety gate already holds
   // (preserves the W13-24-10 short-circuit cost-ordering). Pure helper otherwise.
   deployDiffers: () => boolean | Promise<boolean>;
@@ -774,12 +778,23 @@ export async function decideIdleOwnerRelease(
   if (
     input.idleReleaseMs > 0 &&
     input.now - Math.max(input.lastTaskCompletedAt, input.lastIdleDrainActivityAt) >=
-      input.idleReleaseMs
+      idleMemoryReleaseAfterMs(input)
   ) {
     return { release: true, reason: "idle-memory" };
   }
 
   return { release: false };
+}
+
+// brick://a81e16a1 — the background-task hold. Applies to the idle-memory path
+// ONLY: output-style-change and deploy-staleness above stay unaffected, and the
+// shared gate is untouched. ⚠️ Callers must keep the `idleReleaseMs > 0` check on
+// the RAW value: flooring 0 to 30 min here would silently re-enable a release the
+// operator disabled (test "a81e16a1 #5").
+function idleMemoryReleaseAfterMs(input: DecideIdleOwnerReleaseInput): number {
+  return input.liveBackgroundTaskCount > 0
+    ? Math.max(input.idleReleaseMs, BACKGROUND_TASK_IDLE_RELEASE_HOLD_MS)
+    : input.idleReleaseMs;
 }
 
 function logTurnBoundaryRecycle(sessionId: string, reason: string, liveBackgroundTasks: number) {
@@ -914,7 +929,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   // W13-24-14 Phase 2 — memory-release idle timeout (ms), read from env at owner
   // start (reaches the owner via ...process.env, like ACPX_DEPLOY_VERSION_FILE).
   // 0 disables ONLY the memory-release path (deploy-staleness recycle survives);
-  // invalid/negative/unset → the 30-min default.
+  // invalid/negative/unset → the 5-min default.
   const idleReleaseMs = normalizeOwnerIdleReleaseMs(
     parseEnvMs(process.env.ACPX_OWNER_IDLE_RELEASE_MS),
   );
@@ -1345,6 +1360,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           lastTaskCompletedAt,
           quiescenceWindowMs,
           idleReleaseMs,
+          liveBackgroundTaskCount: backgroundTasks.liveCount(),
           // Lazy: the deploy-file read happens only after the gate already holds,
           // preserving the W13-24-10 short-circuit cost-ordering.
           deployDiffers: deployedBuildDiffersFromOwner,
