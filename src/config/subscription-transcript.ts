@@ -1,4 +1,5 @@
-import { access, copyFile, mkdir, open, rename, stat } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { access, copyFile, mkdir, open, rename, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { SessionRecord } from "../types.js";
@@ -9,6 +10,7 @@ import {
   type SubscriptionLookupOptions,
   type SubscriptionRegistry,
 } from "./subscriptions.js";
+import { removeRedundantCopy, type DedupHooks } from "./transcript-dedup.js";
 
 // Port a session's Claude transcript JSONL from one subscription's config dir to
 // another, so a close+reopen on the target account resumes WITH context.
@@ -181,10 +183,19 @@ export type TranscriptRecoveryResult =
       searchedPaths: string[];
       /**
        * When the destination already held a (staler / divergent) transcript that
-       * was renamed aside before porting, the path of that preserved sidecar.
-       * Absent when the destination was missing (nothing to supersede).
+       * was renamed aside before porting and the sidecar STILL EXISTS (it was kept),
+       * its path. Absent when there was nothing to supersede, or when the sidecar
+       * was proven redundant and removed (`supersededDisposition`).
        */
       supersededPath?: string;
+      /**
+       * What became of the renamed-aside destination (brick 81433524, D1):
+       * `deleted` — a byte-prefix of the new active copy; `reduced` — the new copy's
+       * prefix plus an exit block, kept byte-exactly in `exitTailPath`; `kept` — a
+       * real divergence, preserved as `supersededPath`. Absent when no sidecar was made.
+       */
+      supersededDisposition?: "deleted" | "reduced" | "kept";
+      exitTailPath?: string;
     }
   | {
       status: "missing";
@@ -315,6 +326,8 @@ export async function ensureTranscriptAtConfigDir(
   options?: SubscriptionLookupOptions & {
     registry?: SubscriptionRegistry;
     sourceConfigDirs?: string[];
+    /** Test seam into the dedup primitives (writer scan root, order trace). */
+    dedupHooks?: DedupHooks;
   },
 ): Promise<TranscriptRecoveryResult> {
   const { cwd, acpSessionId } = record;
@@ -336,12 +349,28 @@ export async function ensureTranscriptAtConfigDir(
     return { status: "already-present", activeConfigDir: dstConfigDir, activePath, searchedPaths };
   }
 
-  // A source is fresher. Preserve any existing (staler / divergent) destination
-  // aside before overwriting it, then port the freshest source in.
-  const supersededPath = destProbe
-    ? await renameDestinationAside(activePath, acpSessionId)
-    : undefined;
+  return await portFreshestIntoDestination({
+    record,
+    dstConfigDir,
+    activePath,
+    best,
+    destProbe,
+    searchedPaths,
+    hooks: options?.dedupHooks,
+  });
+}
 
+async function portFreshestIntoDestination(args: {
+  record: TranscriptBearingRecord;
+  dstConfigDir: string;
+  activePath: string;
+  best: TranscriptCandidate;
+  destProbe: TranscriptCandidate | undefined;
+  searchedPaths: string[];
+  hooks: DedupHooks | undefined;
+}): Promise<TranscriptRecoveryResult> {
+  const { record, dstConfigDir, activePath, best, destProbe, searchedPaths } = args;
+  const { cwd, acpSessionId } = record;
   // Port from the path we ACTUALLY found, not from a re-derivation of it: the
   // chosen source may sit under the legacy slug, and the destination is always
   // the primary form — which is what makes this a migration rather than a
@@ -354,12 +383,20 @@ export async function ensureTranscriptAtConfigDir(
       primaryPath: transcriptJsonlPath(best.configDir, cwd, acpSessionId),
     });
   }
-  const ported = await copyTranscriptFile(best.jsonlPath, activePath);
-  if (!ported.copied && !(await fileExists(activePath))) {
-    // Source vanished between probe and copy — the aside sidecar (if any) still
-    // preserves the destination's branch; report missing so callers can react.
-    return { status: "missing", activeConfigDir: dstConfigDir, activePath, searchedPaths };
+  const placed = await placeFreshestCopy(best.jsonlPath, activePath, Boolean(destProbe));
+  if (placed.status === "source-vanished") {
+    // The source vanished between probe and copy. Copy-first means the destination
+    // was never touched, so whatever sits there is still what a resume reads.
+    return {
+      status: (await fileExists(activePath)) ? "already-present" : "missing",
+      activeConfigDir: dstConfigDir,
+      activePath,
+      searchedPaths,
+    };
   }
+  const superseded = placed.sidecar
+    ? await disposeSupersededSidecar(placed.sidecar, activePath, args.hooks)
+    : undefined;
 
   logTranscriptPortDecision({
     acpSessionId,
@@ -368,7 +405,8 @@ export async function ensureTranscriptAtConfigDir(
     dstLastEntry: destProbe?.freshness.iso,
     srcLastEntry: best.freshness.iso,
     srcSlugForm: best.slugForm,
-    supersededPath,
+    sidecar: placed.sidecar,
+    superseded,
   });
 
   return {
@@ -378,8 +416,96 @@ export async function ensureTranscriptAtConfigDir(
     sourceConfigDir: best.configDir,
     sourcePath: best.jsonlPath,
     searchedPaths,
-    supersededPath,
+    ...supersededResultFields(placed.sidecar, superseded),
   };
+}
+
+function supersededResultFields(
+  sidecar: string | undefined,
+  superseded: SupersededOutcome | undefined,
+): Pick<
+  Extract<TranscriptRecoveryResult, { status: "ported" }>,
+  "supersededPath" | "supersededDisposition" | "exitTailPath"
+> {
+  if (!sidecar || !superseded) {
+    return {};
+  }
+  return {
+    ...(superseded.disposition === "kept" ? { supersededPath: sidecar } : {}),
+    supersededDisposition: superseded.disposition,
+    ...(superseded.exitTailPath ? { exitTailPath: superseded.exitTailPath } : {}),
+  };
+}
+
+/**
+ * D1 (brick 81433524) — COPY FIRST, then swap. The freshest source is copied to a
+ * private temp beside the destination (`<id>.jsonl.acpx-port-<pid>-<rand>.tmp`: not
+ * `*.jsonl`, so no probe or scanner ever sees it); only then is an existing
+ * destination renamed aside and the temp renamed in. The destination path is empty
+ * for the µs between two renames instead of for the whole copy, and a failed copy
+ * (ENOSPC) leaves the destination where it was instead of renamed away.
+ *
+ * No fsync here on purpose: durability matters only before a REMOVAL, and the
+ * primitives do it there (the witness is fdatasync'ed before any unlink). A crash
+ * that loses the rename still leaves every byte in the source, which this port never
+ * touches; the next connect re-ports.
+ */
+async function placeFreshestCopy(
+  sourcePath: string,
+  activePath: string,
+  destinationExists: boolean,
+): Promise<{ status: "placed"; sidecar?: string } | { status: "source-vanished" }> {
+  await mkdir(path.dirname(activePath), { recursive: true });
+  const temp = `${activePath}.acpx-port-${process.pid}-${randomBytes(4).toString("hex")}.tmp`;
+  try {
+    await copyFile(sourcePath, temp);
+    const sidecar = destinationExists
+      ? await renameDestinationAside(activePath, path.basename(activePath, ".jsonl"))
+      : undefined;
+    await rename(temp, activePath);
+    return { status: "placed", sidecar };
+  } catch (error) {
+    if (isNotFound(error) && !(await fileExists(temp))) {
+      return { status: "source-vanished" };
+    }
+    throw error;
+  } finally {
+    await rm(temp, { force: true });
+  }
+}
+
+type SupersededOutcome = {
+  disposition: "deleted" | "reduced" | "kept";
+  reason?: string;
+  bytes: number;
+  exitTailPath?: string;
+};
+
+/**
+ * The sidecar is PRIVATE (nobody writes by that name) and the canonical path already
+ * holds the new copy, so it can be proven against the active copy right away: a
+ * byte-prefix is deleted, a prefix + exit block is reduced (Option T), anything else
+ * stays exactly as before — same name, same place.
+ */
+async function disposeSupersededSidecar(
+  sidecar: string,
+  activePath: string,
+  hooks: DedupHooks | undefined,
+): Promise<SupersededOutcome> {
+  const { outcome, reasons } = await removeRedundantCopy(sidecar, activePath, {
+    reducedBy: "port",
+    hooks,
+  });
+  if (outcome.action === "removed") {
+    return { disposition: "deleted", bytes: outcome.bytes };
+  }
+  if (outcome.action === "reduced") {
+    return { disposition: "reduced", bytes: outcome.bytes, exitTailPath: outcome.tailFile };
+  }
+  const bytes = await stat(sidecar)
+    .then((info) => info.size)
+    .catch(() => 0);
+  return { disposition: "kept", reason: reasons.join("+"), bytes };
 }
 
 /**
@@ -391,7 +517,7 @@ export async function ensureTranscriptAtConfigDir(
  * when *strictly* newer, so equal timestamps keep whichever came first
  * (destination, then explicit source order, then registry order).
  */
-async function selectFreshestTranscript(
+export async function selectFreshestTranscript(
   record: TranscriptBearingRecord,
   dstConfigDir: string,
   options?: SubscriptionLookupOptions & {
@@ -402,11 +528,14 @@ async function selectFreshestTranscript(
   best: TranscriptCandidate | undefined;
   destProbe: TranscriptCandidate | undefined;
   searchedPaths: string[];
+  /** Every existing canonical copy probed, both slug forms, in probe order. */
+  candidates: TranscriptCandidate[];
 }> {
   const { cwd, acpSessionId } = record;
   const resolvedDst = path.resolve(dstConfigDir);
   const orderedConfigDirs = candidateConfigDirs(dstConfigDir, options);
 
+  const candidates: TranscriptCandidate[] = [];
   const searchedPaths: string[] = [];
   let best: TranscriptCandidate | undefined;
   let destProbe: TranscriptCandidate | undefined;
@@ -419,15 +548,39 @@ async function selectFreshestTranscript(
     });
     searchedPaths.push(...probed.searchedPaths);
     for (const candidate of probed.candidates) {
+      candidates.push(candidate);
       if (candidate.isDest) {
         destProbe = candidate;
       }
-      if (!best || candidate.freshness.ms > best.freshness.ms) {
+      if (!best || isFresherCandidate(candidate, best)) {
         best = candidate;
       }
     }
   }
-  return { best, destProbe, searchedPaths };
+  return { best, destProbe, searchedPaths, candidates };
+}
+
+/**
+ * D4 (brick 81433524): a candidate with NO timestamped entry at all ranks below
+ * every candidate that has one. Such a file is not a conversation — it is a
+ * metadata-only fragment, which only a writer that outlived the removal of its file
+ * can create (Claude Code's exit re-stamp appends by PATH and creates a missing
+ * file). Its mtime is "now", so under the old mtime fallback it beat the real active
+ * copy at the next connect, the port renamed the active copy aside, and the session
+ * resumed with no conversation. Among `none` candidates the old order still applies.
+ *
+ * ⚠️ DO NOT FOLD `none` BACK INTO THE MTIME FALLBACK. It looks like a simplification
+ * and it re-opens exactly that fragment race for every remover (D1, D2, the verb).
+ * `test/subscription-transcript.test.ts` pins it ("metadata-only fragment never
+ * wins").
+ */
+function isFresherCandidate(candidate: TranscriptCandidate, best: TranscriptCandidate): boolean {
+  const candidateHasEntry = candidate.freshness.basis !== "none";
+  const bestHasEntry = best.freshness.basis !== "none";
+  if (candidateHasEntry !== bestHasEntry) {
+    return candidateHasEntry;
+  }
+  return candidate.freshness.ms > best.freshness.ms;
 }
 
 /**
@@ -511,11 +664,15 @@ type FreshnessProbe = {
   ms: number;
   /** Human-readable form of the chosen instant, for the observability breadcrumb. */
   iso: string;
-  /** Which signal supplied `ms`. */
-  basis: "content" | "mtime";
+  /**
+   * Which signal supplied `ms`. `none`: the WHOLE file was scanned and holds no
+   * timestamped entry (`ms` is then the mtime, used only among `none` candidates).
+   * `mtime`: the scan hit its cap before finding one — today's fallback, kept.
+   */
+  basis: "content" | "mtime" | "none";
 };
 
-type TranscriptCandidate = {
+export type TranscriptCandidate = {
   configDir: string;
   jsonlPath: string;
   isDest: boolean;
@@ -525,6 +682,8 @@ type TranscriptCandidate = {
 };
 
 const TRANSCRIPT_TAIL_BYTES = 64 * 1024;
+const TRANSCRIPT_BACKSCAN_WINDOW_BYTES = 1024 * 1024;
+const TRANSCRIPT_BACKSCAN_MAX_BYTES = 16 * 1024 * 1024;
 
 /**
  * Freshness of a transcript JSONL, measured by CONTENT — the `.timestamp` of the
@@ -534,52 +693,95 @@ const TRANSCRIPT_TAIL_BYTES = 64 * 1024;
  * looks mtime-fresh (that is precisely how the rollback bug hid). Reading the
  * last real entry's timestamp compares the segments by actual conversation
  * progress instead.
+ *
+ * D4: the last 64 KiB first, then back in 1 MiB windows up to 16 MiB, so a single
+ * huge last line no longer drops a real conversation to mtime. A file scanned to
+ * byte 0 without a timestamped entry is `none` (see `isFresherCandidate`); a scan
+ * that hits the 16 MiB cap first keeps today's mtime basis — never worse than
+ * before for a conversation whose last line is longer than the cap.
  */
 async function lastEntryTimestamp(filePath: string): Promise<FreshnessProbe> {
   const content = await contentTimestampFromTail(filePath);
-  if (content) {
-    return { ms: content.ms, iso: content.iso, basis: "content" };
+  if (content.found) {
+    return { ms: content.found.ms, iso: content.found.iso, basis: "content" };
   }
   const info = await stat(filePath);
-  return { ms: info.mtimeMs, iso: new Date(info.mtimeMs).toISOString(), basis: "mtime" };
+  return {
+    ms: info.mtimeMs,
+    iso: new Date(info.mtimeMs).toISOString(),
+    basis: content.exhausted ? "none" : "mtime",
+  };
 }
 
-async function contentTimestampFromTail(
-  filePath: string,
-): Promise<{ ms: number; iso: string } | undefined> {
+async function contentTimestampFromTail(filePath: string): Promise<{
+  found?: { ms: number; iso: string };
+  exhausted: boolean;
+}> {
   const handle = await open(filePath, "r");
   try {
     const { size } = await handle.stat();
-    if (size === 0) {
-      return undefined;
-    }
-    const readLen = Math.min(size, TRANSCRIPT_TAIL_BYTES);
-    const start = size - readLen;
-    const buffer = Buffer.alloc(readLen);
-    await handle.read(buffer, 0, readLen, start);
-    let text = buffer.toString("utf8");
-    // If the window did not start at byte 0 its first line is a truncated
-    // partial (the entry began before the window) — drop it.
-    if (start > 0) {
-      const firstNewline = text.indexOf("\n");
-      text = firstNewline >= 0 ? text.slice(firstNewline + 1) : "";
-    }
-    const lines = text.split("\n");
-    // Walk backwards over trailing blank / unparseable lines to the last real entry.
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (!line) {
-        continue;
+    let end = size;
+    let carry: Buffer = Buffer.alloc(0);
+    let scanned = 0;
+    let windowBytes = TRANSCRIPT_TAIL_BYTES;
+    while (end > 0 && scanned < TRANSCRIPT_BACKSCAN_MAX_BYTES) {
+      const length = Math.min(windowBytes, end, TRANSCRIPT_BACKSCAN_MAX_BYTES - scanned);
+      const start = end - length;
+      const buffer = Buffer.alloc(length);
+      await handle.read(buffer, 0, length, start);
+      const window = splitCompleteLines(Buffer.concat([buffer, carry]), start > 0);
+      carry = window.carry;
+      const found = lastTimestampInLines(window.lines);
+      if (found) {
+        return { found, exhausted: false };
       }
-      const parsed = timestampFromJsonlLine(line);
-      if (parsed) {
-        return parsed;
-      }
+      end = start;
+      scanned += length;
+      windowBytes = TRANSCRIPT_BACKSCAN_WINDOW_BYTES;
     }
-    return undefined;
+    return { exhausted: end === 0 };
   } finally {
     await handle.close();
   }
+}
+
+/**
+ * When the window did not start at byte 0, its first line is a partial (the entry
+ * began before the window): keep those bytes as the carry for the next window back.
+ */
+function splitCompleteLines(
+  chunk: Buffer,
+  startsMidFile: boolean,
+): { lines: string[]; carry: Buffer } {
+  if (!startsMidFile) {
+    return { lines: chunk.toString("utf8").split("\n"), carry: Buffer.alloc(0) };
+  }
+  const firstNewline = chunk.indexOf(0x0a);
+  if (firstNewline < 0) {
+    return { lines: [], carry: chunk };
+  }
+  return {
+    lines: chunk
+      .subarray(firstNewline + 1)
+      .toString("utf8")
+      .split("\n"),
+    carry: chunk.subarray(0, firstNewline),
+  };
+}
+
+/** Walk backwards over trailing blank / unparseable lines to the last timestamped entry. */
+function lastTimestampInLines(lines: string[]): { ms: number; iso: string } | undefined {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) {
+      continue;
+    }
+    const parsed = timestampFromJsonlLine(line);
+    if (parsed) {
+      return parsed;
+    }
+  }
+  return undefined;
 }
 
 function timestampFromJsonlLine(line: string): { ms: number; iso: string } | undefined {
@@ -638,16 +840,31 @@ function logTranscriptPortDecision(info: {
   dstLastEntry?: string;
   srcLastEntry?: string;
   srcSlugForm: TranscriptSlugForm;
-  supersededPath?: string;
+  sidecar?: string;
+  superseded?: SupersededOutcome;
 }): void {
-  const decision = info.supersededPath ? "ported-superseded" : "ported";
-  const superseded = info.supersededPath ? ` superseded=${info.supersededPath}` : "";
+  // `decision=ported-superseded` still means "a sidecar was created" and
+  // `superseded=` still names it; the disposition keys say what became of it.
+  const decision = info.sidecar ? "ported-superseded" : "ported";
+  const superseded = info.sidecar ? ` superseded=${info.sidecar}` : "";
   process.stderr.write(
     `[acpx] transcript-port session=${info.acpSessionId} decision=${decision} ` +
       `dst=${info.activePath} chosenSource=${info.chosenSource} ` +
       `srcSlugForm=${info.srcSlugForm} ` +
       `dstLastEntry=${info.dstLastEntry ?? "none"} srcLastEntry=${info.srcLastEntry ?? "none"}` +
-      `${superseded}\n`,
+      `${superseded}${formatSupersededDisposition(info.superseded)}\n`,
+  );
+}
+
+function formatSupersededDisposition(outcome: SupersededOutcome | undefined): string {
+  if (!outcome) {
+    return "";
+  }
+  const reason = outcome.reason ? ` supersededReason=${outcome.reason}` : "";
+  const exitTail = outcome.exitTailPath ? ` exitTail=${outcome.exitTailPath}` : "";
+  return (
+    ` supersededDisposition=${outcome.disposition}${reason}` +
+    ` supersededBytes=${outcome.bytes}${exitTail}`
   );
 }
 
@@ -730,7 +947,7 @@ function registryFromLookupOptions(
 // profileId when present). Validation is inherent: chooseSubscriptionConfigDir
 // looks the id up in the subscription registry, so a non-subscription profile id
 // finds no dir and falls back exactly as an unknown sub did before.
-function subscriptionIdFromRecord(
+export function subscriptionIdFromRecord(
   record: Pick<TranscriptBearingRecord, "acpx">,
 ): string | undefined {
   const options = record.acpx?.session_options;
