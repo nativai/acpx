@@ -15,6 +15,27 @@ import {
 } from "../../process-identity.js";
 import { isProcessAlive, isProcessDefinitelyDead } from "../../process-liveness.js";
 import { terminateVerifiedProcess } from "../../process-signal.js";
+import {
+  reapSnapshot,
+  snapshotSessionTree,
+  unmeasuredReap,
+  type BackgroundTaskSet,
+  type ReapReport,
+  type ReapSnapshot,
+} from "../../process-tree-reap.js";
+
+/**
+ * brick ad6ba1c2 v3 — what a CLOSER knows about the session's background tasks: the live set `BG`
+ * (the gate's answer, or a `query_background_tasks` made just before the stop) and S, the record's
+ * `acp_session_id`. Without `bg` the closer can prove nothing, so it signals nothing and reports
+ * `skipped:"no-task-set"` (RV-5); the owner's own handler still reaps whenever it runs.
+ */
+export type CloserTaskContext = {
+  bg: BackgroundTaskSet | undefined;
+  acpSessionId: string | undefined;
+};
+
+const NO_TASK_CONTEXT: CloserTaskContext = { bg: undefined, acpSessionId: undefined };
 import { tryCreateLockFile } from "../../session/persistence/identity-file-lock.js";
 import { pingQueueSocket, type QueueSocketPing } from "./ipc-transport.js";
 import { isQueueLeaseGuardTimeout, withQueueLeaseMutation } from "./lease-mutation.js";
@@ -170,11 +191,15 @@ export type QueueOwnerRecoveryResult = {
   skipReason?: QueueOwnerSkipReason;
   ownerHost?: string | null;
   ownerScope?: QueueOwnerScope | null;
+  /** brick ad6ba1c2 — the session's task processes after the recover. `measured:false` is no census. */
+  reap: ReapReport;
 };
 
 /** What `terminateQueueOwnerForSession` did (CONCEPT §8.4) — callers report it honestly. */
 export type QueueOwnerStopOutcome = {
   stopped: boolean;
+  /** brick ad6ba1c2 — the session's task processes after the stop. `measured:false` is no census. */
+  reap: ReapReport;
   reason:
     | "no-owner"
     | "released"
@@ -1138,40 +1163,71 @@ function isSuccessor(
 export async function terminateQueueOwnerForSession(
   sessionId: string,
   expectedOwner?: QueueOwnerRecord | null,
+  tasks?: CloserTaskContext,
 ): Promise<QueueOwnerStopOutcome> {
   const owner = await readQueueOwnerRecord(sessionId);
   if (!owner) {
     if (expectedOwner) {
+      // The owner released its own lease: its own exit path reaps (§5.2 E).
       await waitForReleasedOwner(expectedOwner);
-      return { stopped: true, reason: "released" };
+      return { stopped: true, reason: "released", reap: unmeasuredReap("no-owner") };
     }
-    return { stopped: true, reason: "no-owner" };
+    return { stopped: true, reason: "no-owner", reap: unmeasuredReap("no-owner") };
   }
   if (isSuccessor(expectedOwner, owner)) {
-    return { stopped: false, reason: "successor" };
+    return { stopped: false, reason: "successor", reap: unmeasuredReap("no-owner") };
   }
-  return await stopJudgedOwner(sessionId, owner);
+  return await stopJudgedOwner(sessionId, owner, tasks);
+}
+
+/**
+ * brick ad6ba1c2 v3 §5.2 A/C/D — the closer's ADMISSION for a VERIFIED local owner, taken BEFORE it
+ * is signalled: only processes proven to be a live background task's (§5.1). The owner's whole
+ * session (owner, adapter, claude) is spared; so are this process and its ancestors (§5.3).
+ */
+function snapshotOwnerTasks(
+  pid: number,
+  identity: ProcessBirthIdentity,
+  context: CloserTaskContext | undefined,
+): ReapSnapshot {
+  const tasks = context ?? NO_TASK_CONTEXT;
+  return snapshotSessionTree({
+    bg: tasks.bg,
+    acpSessionId: tasks.acpSessionId,
+    ownerPid: pid,
+    ownerStartTicks: identity.kind === "linux-proc" ? identity.startTicks : undefined,
+    excludeSelfAncestry: true,
+  });
+}
+
+/** Reap only once the owner is proven gone; a surviving owner still holds its tree. */
+async function reapAfterOwnerStop(snapshot: ReapSnapshot, ownerGone: boolean): Promise<ReapReport> {
+  return ownerGone ? await reapSnapshot(snapshot) : unmeasuredReap("owner-survived");
 }
 
 async function stopJudgedOwner(
   sessionId: string,
   owner: QueueOwnerRecord,
+  tasks: CloserTaskContext | undefined,
 ): Promise<QueueOwnerStopOutcome> {
   const judgement = await judgeLease(sessionId, owner);
   if (judgement.liveness.recoverable) {
     await reapJudgedLease(sessionId, owner);
-    return { stopped: true, reason: "already-gone" };
+    return { stopped: true, reason: "already-gone", reap: unmeasuredReap("no-owner") };
   }
   if (!judgement.signalIdentity) {
-    return { stopped: false, reason: judgement.skipReason ?? "identity-unverified" };
+    const reason = judgement.skipReason ?? "identity-unverified";
+    return { stopped: false, reason, reap: unmeasuredReap(reason) };
   }
+  const snapshot = snapshotOwnerTasks(owner.pid, judgement.signalIdentity, tasks);
   const { gone } = await stopVerifiedOwner(sessionId, owner, judgement.signalIdentity);
   if (!gone) {
-    return { stopped: false, reason: "survived" };
+    return { stopped: false, reason: "survived", reap: unmeasuredReap("owner-survived") };
   }
+  const reap = await reapAfterOwnerStop(snapshot, true);
   // Cleanup only on proven death, and only of the generation we stopped.
   await reapJudgedLease(sessionId, owner);
-  return { stopped: true, reason: "stopped" };
+  return { stopped: true, reason: "stopped", reap };
 }
 
 // True when the process GROUP led by `pid` still has at least one live member. The queue owner is
@@ -1232,6 +1288,7 @@ function skippedRecovery(
     skipReason: judgement.skipReason ?? "identity-unverified",
     ownerHost: liveness.host,
     ownerScope: liveness.scope,
+    reap: unmeasuredReap(judgement.skipReason ?? "identity-unverified"),
   };
 }
 
@@ -1242,6 +1299,7 @@ function skippedRecovery(
 // owner as "already gone; cleared stale lease" with exit 0, and acpx-ui then re-drove into it.
 export async function recoverQueueOwnerForSession(
   sessionId: string,
+  tasks?: CloserTaskContext,
 ): Promise<QueueOwnerRecoveryResult> {
   const owner = await readQueueOwnerRecord(sessionId);
   if (!owner) {
@@ -1258,11 +1316,13 @@ export async function recoverQueueOwnerForSession(
     return skippedRecovery(sessionId, owner, judgement);
   }
   const identity = judgement.signalIdentity;
+  const snapshot = snapshotOwnerTasks(owner.pid, identity, tasks);
   const { gone, signalled } = await stopVerifiedOwner(sessionId, owner, identity);
   if (signalled) {
     await sweepVerifiedOwnerGroup(owner.pid, identity);
   }
   const alive = observeProcessIncarnation(owner.pid, identity) === "matching";
+  const reap = await reapAfterOwnerStop(snapshot, !alive);
   if (gone || !alive) {
     await reapJudgedLease(sessionId, owner);
   }
@@ -1279,6 +1339,7 @@ export async function recoverQueueOwnerForSession(
     killSkipped: false,
     ownerHost: liveness.host,
     ownerScope: liveness.scope,
+    reap,
   };
 }
 
@@ -1301,6 +1362,7 @@ function deadOwnerRecovery(
     killSkipped: false,
     ownerHost: liveness.host,
     ownerScope: liveness.scope,
+    reap: unmeasuredReap("no-owner"),
   };
 }
 
@@ -1316,6 +1378,7 @@ function noQueueOwnerRecoveryResult(sessionId: string): QueueOwnerRecoveryResult
     pidAlive: false,
     processIdentityMatched: null,
     killSkipped: false,
+    reap: unmeasuredReap("no-owner"),
   };
 }
 

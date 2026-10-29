@@ -2,7 +2,10 @@ import { randomUUID } from "node:crypto";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { QueueConnectionError, QueueProtocolError } from "../../errors.js";
 import { incrementPerfCounter } from "../../perf-metrics.js";
+import { classifyRecordedIdentity, identityScope } from "../../process-identity.js";
+import { isProcessDefinitelyDead } from "../../process-liveness.js";
 import type { DepthProjection } from "../../session/depth-projection.js";
+import { resolveSessionRecord } from "../../session/persistence.js";
 import type {
   AcpClientOptions,
   NonInteractivePermissionPolicy,
@@ -15,10 +18,13 @@ import type {
   SessionEnqueueResult,
   SessionSendOutcome,
 } from "../../types.js";
+import type { BackgroundTaskAnswer } from "../session/background-task-tracker.js";
+import { clearBackgroundTaskChipAfterReap } from "../session/owner-task-reap.js";
 import { probeQueueOwnerHealth, type QueueOwnerHealth } from "./ipc-health.js";
 import type { QueueOwnerDrainReport } from "./ipc-server.js";
 import { connectToQueueOwner } from "./ipc-transport.js";
 import {
+  type CloserTaskContext,
   type QueueOwnerRecord,
   readQueueOwnerRecord,
   readQueueOwnerState,
@@ -32,6 +38,7 @@ import {
   type QueueDrainDeliveriesRequest,
   type QueueDrainReason,
   type QueueOwnerActiveTurnResultMessage,
+  type QueueOwnerBackgroundTasksResultMessage,
   type QueueOwnerCancelResultMessage,
   type QueueOwnerCloseSessionResultMessage,
   type QueueOwnerDrainResultMessage,
@@ -41,6 +48,7 @@ import {
   type QueueOwnerSetModelResultMessage,
   type QueueOwnerSetModeResultMessage,
   type QueueQueryActiveTurnRequest,
+  type QueueQueryBackgroundTasksRequest,
   type QueueRequest,
   type QueueSetConfigOptionRequest,
   type QueueSetDepthRequest,
@@ -76,9 +84,11 @@ const STALE_OWNER_PROTOCOL_DETAIL_CODES = new Set([
   "QUEUE_PROTOCOL_MALFORMED_MESSAGE",
   "QUEUE_PROTOCOL_UNEXPECTED_RESPONSE",
 ]);
+// ⚠️ brick ad6ba1c2 v3.1: QUEUE_OWNER_CLOSE_PENDING must NEVER join this set — it would make a sender's
+// CLI terminate an owner whose close may yet be refused (`test/close-pending-drain.test.ts` pins it).
 const OWNER_SHUTDOWN_DETAIL_CODES = new Set(["QUEUE_OWNER_CLOSED", "QUEUE_OWNER_SHUTTING_DOWN"]);
 
-function isOwnerShutdownDetailCode(detailCode: string | undefined): boolean {
+export function isOwnerShutdownDetailCode(detailCode: string | undefined): boolean {
   return detailCode !== undefined && OWNER_SHUTDOWN_DETAIL_CODES.has(detailCode);
 }
 
@@ -100,9 +110,16 @@ async function recoverOwnerAfterShutdownError(params: {
   detailCode?: string;
   verbose?: boolean;
 }): Promise<boolean> {
-  await terminateQueueOwnerForSession(params.sessionId, params.owner).catch(() => {
-    // Preserve the original shutdown error if cleanup fails.
-  });
+  const stopped = await terminateQueueOwnerForSession(
+    params.sessionId,
+    params.owner,
+    await queryCloserTaskContext(params.sessionId),
+  ).catch(
+    () => undefined, // Preserve the original shutdown error if cleanup fails.
+  );
+  if (stopped) {
+    await clearBackgroundTaskChipAfterReap(params.sessionId, stopped.reap);
+  }
 
   const currentOwner = await readQueueOwnerRecord(params.sessionId);
   if (currentOwner && isSameQueueOwner(currentOwner, params.owner)) {
@@ -165,12 +182,15 @@ async function maybeRecoverStaleOwnerAfterProtocolMismatch(params: {
 
   // Q9: the protocol-mismatch kill is kept, but it targets ONLY the generation that answered, and
   // signals only through signalVerifiedProcess (a foreign or replaced lease is untouched, T36).
-  const outcome = await terminateQueueOwnerForSession(params.sessionId, params.owner).catch(
-    () => undefined,
-  );
+  const outcome = await terminateQueueOwnerForSession(
+    params.sessionId,
+    params.owner,
+    await queryCloserTaskContext(params.sessionId),
+  ).catch(() => undefined);
   if (!outcome?.stopped) {
     return false;
   }
+  await clearBackgroundTaskChipAfterReap(params.sessionId, outcome.reap);
   incrementPerfCounter("queue.owner.stale_recovered");
 
   if (params.verbose) {
@@ -889,6 +909,7 @@ async function submitDrainDeliveriesToQueueOwner(
   owner: QueueOwnerRecord,
   reason: QueueDrainReason,
   timeoutMs: number | undefined,
+  checkBackgroundTasks: boolean,
 ): Promise<QueueOwnerDrainResultMessage | undefined> {
   const request: QueueDrainDeliveriesRequest = {
     type: "drain_deliveries",
@@ -896,6 +917,7 @@ async function submitDrainDeliveriesToQueueOwner(
     ownerGeneration: owner.ownerGeneration,
     reason,
     timeoutMs,
+    ...(checkBackgroundTasks ? { checkBackgroundTasks: true } : {}),
   };
   const response = await submitControlToQueueOwner(
     owner,
@@ -938,6 +960,8 @@ export async function drainQueueOwnerForSession(options: {
   reason: QueueDrainReason;
   timeoutMs?: number;
   verbose?: boolean;
+  /** brick ad6ba1c2 v3.1 — an UNFORCED close: the owner re-checks for live tasks, abortably (§6.4). */
+  checkBackgroundTasks?: boolean;
 }): Promise<QueueOwnerDrainReport | undefined> {
   const owner = await readQueueOwnerRecord(options.sessionId);
   if (!owner) {
@@ -946,7 +970,12 @@ export async function drainQueueOwnerForSession(options: {
 
   let report: QueueOwnerDrainResultMessage | undefined;
   try {
-    report = await submitDrainDeliveriesToQueueOwner(owner, options.reason, options.timeoutMs);
+    report = await submitDrainDeliveriesToQueueOwner(
+      owner,
+      options.reason,
+      options.timeoutMs,
+      options.checkBackgroundTasks === true,
+    );
   } catch (error) {
     if (options.verbose) {
       process.stderr.write(
@@ -966,11 +995,16 @@ export async function drainQueueOwnerForSession(options: {
         `(${report.drained} undelivered, turnSettled=${report.turnSettled})\n`,
     );
   }
+  return drainReportFrom(report);
+}
+
+function drainReportFrom(report: QueueOwnerDrainResultMessage): QueueOwnerDrainReport {
   return {
     drained: report.drained,
     undelivered: report.undelivered,
     turnSettled: report.turnSettled,
     activeTurnAtEntry: report.activeTurnAtEntry,
+    ...(report.taskCheck ? { taskCheck: report.taskCheck, tasks: report.tasks ?? [] } : {}),
   };
 }
 
@@ -1113,6 +1147,110 @@ export async function tryQueryActiveTurnOnRunningOwner(
   }
 
   throw notAcceptingRequestsError(health, "query_active_turn");
+}
+
+/** brick ad6ba1c2 (Contract C4) — one hard deadline over connect AND answer. */
+export const BACKGROUND_TASKS_QUERY_DEADLINE_MS = 2_000;
+
+export type BackgroundTasksQuery =
+  | ({ queried: true } & BackgroundTaskAnswer)
+  | {
+      queried: false;
+      /**
+       * A live (or foreign) owner held the lease and gave no answer: an older acpx, another pod's
+       * owner, or a wedged one. Its tasks could not be checked, so a close WARNS (HoD R2-8).
+       * Absent when there was no owner to ask at all.
+       */
+      ownerUnanswered?: true;
+    };
+
+function isForeignOwner(owner: QueueOwnerRecord): boolean {
+  const recorded = classifyRecordedIdentity(owner.processIdentity);
+  return recorded.kind === "birth" && identityScope(recorded.birth) === "foreign";
+}
+
+async function submitQueryBackgroundTasksToQueueOwner(
+  owner: QueueOwnerRecord,
+  timeoutMs: number,
+): Promise<BackgroundTaskAnswer | undefined> {
+  const request: QueueQueryBackgroundTasksRequest = {
+    type: "query_background_tasks",
+    requestId: randomUUID(),
+    ownerGeneration: owner.ownerGeneration,
+  };
+  const response = await submitControlToQueueOwner(
+    owner,
+    request,
+    (message): message is QueueOwnerBackgroundTasksResultMessage =>
+      message.type === "query_background_tasks_result",
+    timeoutMs,
+  );
+  if (!response || response.requestId !== request.requestId) {
+    return undefined;
+  }
+  return {
+    source: response.source,
+    tasks: response.tasks,
+    monitorCommands: response.monitorCommands,
+  };
+}
+
+/**
+ * Asks the session's live owner for its background tasks. NEVER throws: no lease, a foreign owner,
+ * an old owner (`QUEUE_REQUEST_INVALID`), an error or the 2 s deadline all read `queried:false`,
+ * and the close gate then fails OPEN (Contract C2/C4).
+ *
+ * ⚠️ CONTROL PATH ONLY. Never route this through `trySubmitToRunningOwner`: its protocol-mismatch
+ * recovery auto-terminates an owner that answers unexpectedly — an OLD owner answering this verb
+ * would be killed before the close even started (AC8).
+ */
+export async function tryQueryBackgroundTasksOnRunningOwner(
+  sessionId: string,
+  deadlineMs: number = BACKGROUND_TASKS_QUERY_DEADLINE_MS,
+): Promise<BackgroundTasksQuery> {
+  const startedAt = Date.now();
+  let timer: NodeJS.Timeout | undefined;
+  // Pessimistic: until the lease is read and shows no live owner, a missing answer is unanswered.
+  let ownerAbsent = false;
+  const deadline = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), deadlineMs);
+    timer.unref();
+  });
+  const query = (async () => {
+    const owner = await readQueueOwnerRecord(sessionId);
+    // Only ESRCH proves the owner gone; a foreign pid is another namespace's and is never judged here.
+    if (!owner || (!isForeignOwner(owner) && isProcessDefinitelyDead(owner.pid))) {
+      ownerAbsent = true;
+      return undefined;
+    }
+    if (isForeignOwner(owner)) {
+      return undefined;
+    }
+    const remaining = Math.max(1, deadlineMs - (Date.now() - startedAt));
+    return await submitQueryBackgroundTasksToQueueOwner(owner, remaining);
+  })().catch(() => undefined);
+  const list = await Promise.race([query, deadline]);
+  clearTimeout(timer);
+  if (list) {
+    return { queried: true, ...list };
+  }
+  return ownerAbsent ? { queried: false } : { queried: false, ownerUnanswered: true };
+}
+
+/**
+ * v3 §5.2 — the closer asks the owner for `BG` immediately before it snapshots (recover, setters,
+ * the automatic terminations). Never throws; bounded by the query's 2 s deadline.
+ */
+export async function queryCloserTaskContext(sessionId: string): Promise<CloserTaskContext> {
+  const [query, record] = await Promise.all([
+    tryQueryBackgroundTasksOnRunningOwner(sessionId),
+    resolveSessionRecord(sessionId).catch(() => undefined),
+  ]);
+  // No answer ⇒ no `bg` ⇒ nothing admitted (`skipped:"no-task-set"`).
+  return {
+    bg: query.queried ? { tasks: query.tasks, monitorCommands: query.monitorCommands } : undefined,
+    acpSessionId: record?.acpSessionId,
+  };
 }
 
 export async function trySetModeOnRunningOwner(

@@ -154,6 +154,7 @@ function createRecordingOwnerServer(observed: ObservedRequest[], recordFile?: st
           type: string;
           reason?: string;
           timeoutMs?: number;
+          checkBackgroundTasks?: boolean;
         };
         let closedOnDisk: unknown;
         if (recordFile) {
@@ -168,6 +169,11 @@ function createRecordingOwnerServer(observed: ObservedRequest[], recordFile?: st
           type: request.type,
           ...(request.reason !== undefined ? { reason: request.reason } : {}),
           ...(request.timeoutMs !== undefined ? { timeoutMs: request.timeoutMs } : {}),
+          // brick ad6ba1c2 v3.1 (T-RACE-5 i): recorded, so the exact-match below proves the self arm
+          // never asks for the in-drain check even when its caller does.
+          ...(request.checkBackgroundTasks !== undefined
+            ? { checkBackgroundTasks: request.checkBackgroundTasks }
+            : {}),
           ...(recordFile ? { closedOnDisk } : {}),
         });
         socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
@@ -369,7 +375,9 @@ test("self-close: a live owner that is not an ancestor takes the non-self path",
 
       assert.deepEqual(
         observed.map((entry) => entry.type),
-        ["drain_deliveries", "close_session"],
+        // brick ad6ba1c2: the close reads the live task set (read-only) before the drain (v3), and
+        // once more right before the stop, to name a task started after consent (v3.1).
+        ["query_background_tasks", "drain_deliveries", "close_session", "query_background_tasks"],
         "a foreign live owner keeps the exact non-self sequence",
       );
       assert.equal(result.drain.attempted, true);

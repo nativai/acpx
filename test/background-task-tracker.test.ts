@@ -11,6 +11,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { AcpClient } from "../src/acp/client.js";
 import { createBackgroundTaskTracker } from "../src/cli/session/background-task-tracker.js";
+import { FIXTURE_LINES, FIXTURE_TASKS } from "./bg-task-fixtures.js";
 
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 
@@ -170,4 +171,40 @@ test("observeInbound sees a completion that lands while no event handler is set"
     await client.close();
     await fs.rm(cwd, { recursive: true, force: true });
   }
+});
+
+// brick ad6ba1c2 G6 — the five REAL `_claude/backgroundTasks` lines (Bash bg + Monitor; `toolName`
+// arrives in a SECOND notification 1–2 ms after the first). The owner keeps the full entries.
+test("G6: the tracker keeps the full entries of the real payloads, REPLACE semantics, toolName from the second line", () => {
+  const tracker = createBackgroundTaskTracker();
+  assert.deepEqual(tracker.list(), { source: "none", tasks: [] });
+  const seen: number[] = [];
+  for (const line of FIXTURE_LINES) {
+    tracker.observe("inbound", JSON.parse(line));
+    seen.push(tracker.list().tasks.length);
+    assert.equal(tracker.list().tasks.length, tracker.liveCount(), "list() and liveCount() agree");
+  }
+  assert.deepEqual(seen, [0, 1, 1, 2, 2]);
+  assert.deepEqual(tracker.list(), { source: "adapter", tasks: FIXTURE_TASKS });
+  // The third line (same task, now with toolName) REPLACES the second: no duplicate, toolName kept.
+  const afterThird = createBackgroundTaskTracker();
+  for (const line of FIXTURE_LINES.slice(0, 3)) {
+    afterThird.observe("inbound", JSON.parse(line));
+  }
+  assert.deepEqual(afterThird.list().tasks, [FIXTURE_TASKS[0]]);
+  // The returned list is a copy: mutating it never changes the owner's view.
+  const listed = tracker.list().tasks;
+  (listed[0] as { description: string }).description = "mutated";
+  assert.equal(tracker.list().tasks[0]?.description, "rig-s1 bash bg");
+  tracker.reset();
+  assert.deepEqual(tracker.list(), { source: "none", tasks: [] });
+});
+
+test("G6: a derived task (older adapter) carries taskId, toolName, taskType unknown and an empty description", () => {
+  const tracker = createBackgroundTaskTracker();
+  tracker.observe("inbound", monitorStarted("call-1", "bmon1"));
+  assert.deepEqual(tracker.list(), {
+    source: "derived",
+    tasks: [{ taskId: "bmon1", taskType: "unknown", description: "", toolName: "Monitor" }],
+  });
 });

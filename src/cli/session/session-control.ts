@@ -16,6 +16,7 @@ import {
   type ProcessBirthIdentity,
 } from "../../process-identity.js";
 import { terminateVerifiedProcess, type VerifiedTerminateOutcome } from "../../process-signal.js";
+import { unmeasuredReap, type ReapReport } from "../../process-tree-reap.js";
 import { switchSessionAccount } from "../../runtime/engine/account-seam.js";
 import { switchSessionSubscription } from "../../runtime/engine/subscription-switch.js";
 import { applyDepthOutcomeToRecord } from "../../session/depth-application.js";
@@ -60,6 +61,7 @@ import {
   type QueueOwnerRecoveryResult,
   readQueueOwnerLiveness,
   readQueueOwnerState,
+  queryCloserTaskContext,
   recoverQueueOwnerForSession,
   terminateQueueOwnerForSession,
   tryCancelOnRunningOwner,
@@ -70,7 +72,8 @@ import {
   trySetModelOnRunningOwner,
   trySetModeOnRunningOwner,
 } from "../queue/ipc.js";
-import { readQueueOwnerRecord } from "../queue/lease-store.js";
+import { readQueueOwnerRecord, type CloserTaskContext } from "../queue/lease-store.js";
+import type { LiveBackgroundTask } from "./background-task-tracker.js";
 import { DEFAULT_CLOSE_DRAIN_TIMEOUT_MS } from "./contracts.js";
 import type {
   SessionCancelOptions,
@@ -92,6 +95,7 @@ import type {
   SessionSetSubscriptionOptions,
   SessionSetSubscriptionResult,
 } from "./contracts.js";
+import { clearBackgroundTaskChipAfterReap } from "./owner-task-reap.js";
 import {
   runSessionSetConfigOptionDirect,
   runSessionSetDepthDirect,
@@ -185,7 +189,7 @@ async function refuseTurnInFlightForLiveOwner(
   return alive;
 }
 
-type OwnerRecycle = { ownerRestarted: boolean; ownerRestartSkipped?: string };
+type OwnerRecycle = { ownerRestarted: boolean; ownerRestartSkipped?: string; reap?: ReapReport };
 
 /**
  * Recycles a live owner after a setting changed — and reports what happened. `ownerRestarted:true`
@@ -193,10 +197,16 @@ type OwnerRecycle = { ownerRestarted: boolean; ownerRestartSkipped?: string };
  * (`ownerRestartSkipped`), and the setting takes effect at that owner's next start.
  */
 async function recycleLiveOwner(sessionId: string): Promise<OwnerRecycle> {
-  const outcome = await terminateQueueOwnerForSession(sessionId);
+  // v3: the closer proves task processes against the owner's live set, asked right before the stop.
+  const outcome = await terminateQueueOwnerForSession(
+    sessionId,
+    undefined,
+    await queryCloserTaskContext(sessionId),
+  );
+  await clearBackgroundTaskChipAfterReap(sessionId, outcome.reap);
   return outcome.stopped
-    ? { ownerRestarted: true }
-    : { ownerRestarted: false, ownerRestartSkipped: outcome.reason };
+    ? { ownerRestarted: true, reap: outcome.reap }
+    : { ownerRestarted: false, ownerRestartSkipped: outcome.reason, reap: outcome.reap };
 }
 
 export async function setSessionModel(
@@ -707,6 +717,14 @@ export type CloseSessionOptions = {
   // Default true. `--no-drain` is the explicit escape hatch back to the old
   // destroy-on-close behaviour.
   drain?: boolean;
+  /** brick ad6ba1c2 v3 — the gate's answer, so the close proves against the set it showed. */
+  taskContext?: CloserTaskContext;
+  /**
+   * brick ad6ba1c2 v3.1 — an UNFORCED close (no `--kill-background-tasks`): the owner re-checks for
+   * live tasks inside its drain and may refuse (`LiveBackgroundTasksDuringCloseError`). Never for a
+   * self-close (its record is written first) or an internal close.
+   */
+  checkBackgroundTasks?: boolean;
   drainTimeoutMs?: number;
   verbose?: boolean;
 };
@@ -723,7 +741,24 @@ export type SessionCloseDrainReport = {
   turnSettled?: boolean;
   activeTurnAtEntry?: boolean;
   undelivered: QueueDrainedDelivery[];
+  /** brick ad6ba1c2 v3.1 — the owner's in-drain consent check, when one was asked for. */
+  taskCheck?: "passed" | "refused";
 };
+
+/**
+ * brick ad6ba1c2 v3.1 (§6.4) — an UNFORCED close found a live background task INSIDE its drain (a task
+ * started after the upfront gate). Thrown BEFORE `close_session`, any signal and any record write; the
+ * owner has already returned to normal service. The handlers render it exactly like the upfront
+ * refusal (exit 7). Only a close that asked for the check (`checkBackgroundTasks`) can throw it.
+ */
+export class LiveBackgroundTasksDuringCloseError extends Error {
+  readonly tasks: LiveBackgroundTask[];
+  constructor(sessionId: string, tasks: LiveBackgroundTask[]) {
+    super(`session ${sessionId} has live background tasks that started during the close`);
+    this.name = "LiveBackgroundTasksDuringCloseError";
+    this.tasks = tasks;
+  }
+}
 
 // What the close actually verified on disk after writing — the record-derived
 // fact a caller (above all the CLI printer, brick 1bfb95ed deliverable 4) must
@@ -740,6 +775,10 @@ export type SessionCloseResult = {
   ownerStopped: boolean;
   ownerStopSkipped?: string;
   adapterKill: SessionCloseAdapterKill;
+  /** brick ad6ba1c2 — the session's task processes after the close. `measured:false` is no census. */
+  reap: ReapReport;
+  /** v3.1: live tasks the close found AFTER consent; reaped and named `startedDuringClose`. */
+  lateTasks: LiveBackgroundTask[];
 };
 
 // Re-reads `<id>.json` immediately after the terminal write, converting a
@@ -771,10 +810,14 @@ async function drainCustodyBeforeClose(
     reason: "session-close",
     timeoutMs: options.drainTimeoutMs ?? DEFAULT_CLOSE_DRAIN_TIMEOUT_MS,
     verbose: options.verbose,
+    checkBackgroundTasks: options.checkBackgroundTasks === true,
   }).catch(() => undefined);
 
   if (!report) {
     return { attempted: true, reachedOwner: false, undelivered: [] };
+  }
+  if (report.taskCheck === "refused") {
+    throw new LiveBackgroundTasksDuringCloseError(sessionId, report.tasks ?? []);
   }
   return {
     attempted: true,
@@ -782,7 +825,47 @@ async function drainCustodyBeforeClose(
     turnSettled: report.turnSettled,
     activeTurnAtEntry: report.activeTurnAtEntry,
     undelivered: report.undelivered,
+    ...(report.taskCheck ? { taskCheck: report.taskCheck } : {}),
   };
+}
+
+/**
+ * brick ad6ba1c2 v3.1 (§6.4 "Reporting the residual") — right before the stop the closer re-reads the
+ * live set, so its admission sees a task that started after consent (RV-8, or a pre-v3.1 owner), and
+ * that task is NAMED (`startedDuringClose`) rather than killed silently.
+ */
+async function withTasksStartedDuringClose(
+  sessionId: string,
+  consented: CloserTaskContext,
+): Promise<{ taskContext: CloserTaskContext; lateTasks: LiveBackgroundTask[] }> {
+  const latest = await queryCloserTaskContext(sessionId);
+  if (!latest.bg) {
+    return { taskContext: consented, lateTasks: [] };
+  }
+  const consentedSet = consented.bg ?? { tasks: [], monitorCommands: [] };
+  const consentedIds = new Set(consentedSet.tasks.map((task) => task.taskId));
+  const lateTasks = latest.bg.tasks.filter((task) => !consentedIds.has(task.taskId));
+  const commands = new Map(
+    [...consentedSet.monitorCommands, ...latest.bg.monitorCommands].map((entry) => [
+      entry.taskId,
+      entry,
+    ]),
+  );
+  return {
+    taskContext: {
+      acpSessionId: consented.acpSessionId ?? latest.acpSessionId,
+      bg: { tasks: [...consentedSet.tasks, ...lateTasks], monitorCommands: [...commands.values()] },
+    },
+    lateTasks: lateTasks as LiveBackgroundTask[],
+  };
+}
+
+/** The gate's answer when the handler gave one; otherwise ask the owner now (internal closes). */
+async function taskContextForClose(
+  sessionId: string,
+  options: CloseSessionOptions,
+): Promise<CloserTaskContext> {
+  return options.taskContext ?? (await queryCloserTaskContext(sessionId));
 }
 
 export async function closeSession(
@@ -805,12 +888,24 @@ export async function closeSession(
   // kills it. Until this existed, step 2 below actively killed the very process
   // that was mid-handoff of an accepted message, and the only record of that
   // message was a JavaScript array inside it.
+  // brick ad6ba1c2 v3 — the live task set is read BEFORE the drain and `close_session`: the adapter's
+  // teardown can make claude announce an empty set while its task processes still run.
+  const consented = await taskContextForClose(record.acpxRecordId, options);
+  // v3.1: an unforced close's drain may REFUSE here (throws, before anything is touched).
   const drain = await drainCustodyBeforeClose(record.acpxRecordId, options);
 
   await tryCloseSessionOnRunningOwner({ sessionId: record.acpxRecordId }).catch(() => {
     // Preserve local close semantics even if best-effort ACP session shutdown fails.
   });
-  const ownerStop = await terminateQueueOwnerForSession(record.acpxRecordId, drainedOwner);
+  const { taskContext, lateTasks } = await withTasksStartedDuringClose(
+    record.acpxRecordId,
+    consented,
+  );
+  const ownerStop = await terminateQueueOwnerForSession(
+    record.acpxRecordId,
+    drainedOwner,
+    taskContext,
+  );
   const adapterKill = await killRecordedAdapter(record);
   if (options.verbose && !adapterKill.signalled && adapterKill.reason !== "no-pid") {
     process.stderr.write(
@@ -839,6 +934,8 @@ export async function closeSession(
     ownerStopped: ownerStop.stopped,
     ...(ownerStop.stopped ? {} : { ownerStopSkipped: ownerStop.reason }),
     adapterKill,
+    reap: ownerStop.reap,
+    lateTasks,
   };
 }
 
@@ -1024,6 +1121,9 @@ async function closeSelfOwnedSession(
   const drain = await drainCustodyBeforeClose(record.acpxRecordId, {
     ...options,
     drainTimeoutMs: 0,
+    // v3.1 (§6.4): NO in-drain check — this record is already written closed; the handler's upfront
+    // gate, milliseconds earlier, is the self-close's check.
+    checkBackgroundTasks: false,
   });
 
   if (options.verbose) {
@@ -1046,6 +1146,9 @@ async function closeSelfOwnedSession(
     recordClosedState,
     ownerStopped: true,
     adapterKill: { signalled: false, reason: "self-close" },
+    // The own owner's SIGTERM handler reaps (§5.2 B/G) — this CLI may not live to census it.
+    reap: unmeasuredReap("self-close"),
+    lateTasks: [],
   };
 }
 
@@ -1532,5 +1635,11 @@ function classifySessionOwnerStatus(
 // the in-flight prompt is the caller's job (acpx-ui), not this command's.
 export async function recoverSession(sessionId: string): Promise<QueueOwnerRecoveryResult> {
   const record = await resolveSessionRecord(sessionId);
-  return await recoverQueueOwnerForSession(record.acpxRecordId);
+  const result = await recoverQueueOwnerForSession(
+    record.acpxRecordId,
+    await queryCloserTaskContext(record.acpxRecordId),
+  );
+  // HoD Q4, path C: the session stays open, so the killed tasks' "⧖ running" chip is cleared too.
+  await clearBackgroundTaskChipAfterReap(record.acpxRecordId, result.reap);
+  return result;
 }

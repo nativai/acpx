@@ -18,6 +18,7 @@ import {
   tryAcquireQueueOwnerLease,
 } from "../src/cli/queue/lease-store.js";
 import { queueBaseDir, queueLockFilePath, queueSocketBaseDir } from "../src/cli/queue/paths.js";
+import { unmeasuredReap } from "../src/process-tree-reap.js";
 import {
   queuePaths,
   startDetachedKeeperProcess,
@@ -635,6 +636,7 @@ test("terminateQueueOwnerForSession: a bare pid is never signalled; a verified i
       assert.deepEqual(await terminateQueueOwnerForSession(sessionId), {
         stopped: false,
         reason: "identity-unverified",
+        reap: unmeasuredReap("identity-unverified"),
       });
       assert.notEqual(await readQueueOwnerRecord(sessionId), undefined, "lease must stay");
       assert.equal(isProcessAlive(keeper.pid), true, "a bare pid was signalled");
@@ -652,6 +654,9 @@ test("terminateQueueOwnerForSession: a bare pid is never signalled; a verified i
         assert.deepEqual(await terminateQueueOwnerForSession(sessionId), {
           stopped: true,
           reason: "stopped",
+          // brick ad6ba1c2 v3: without a task set (no closer context) the stop proves and signals
+          // NOTHING beyond the owner, and says so — never a census.
+          reap: unmeasuredReap("no-task-set"),
         });
         assert.equal(await readQueueOwnerRecord(sessionId), undefined);
       }

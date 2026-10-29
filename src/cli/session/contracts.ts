@@ -1,5 +1,6 @@
 import type { AcpClient } from "../../acp/client.js";
 import type { SubscriptionLookupOptions } from "../../config/subscriptions.js";
+import type { ReapReport } from "../../process-tree-reap.js";
 import type { SessionAgentOptions } from "../../runtime/engine/session-options.js";
 import type {
   AcpJsonRpcMessage,
@@ -345,6 +346,8 @@ export type SessionSetSubscriptionResult = {
   /** True when a live queue owner existed and was restarted to bind the switch. */
   ownerRestarted: boolean;
   ownerRestartSkipped?: string;
+  /** brick ad6ba1c2 — what the owner recycle did to the session's task processes. */
+  reap?: ReapReport;
 };
 
 export type SessionSetProfileOptions = {
@@ -363,6 +366,8 @@ export type SessionSetProfileResult = {
   /** True when a live queue owner existed and was restarted to bind the move. */
   ownerRestarted: boolean;
   ownerRestartSkipped?: string;
+  /** brick ad6ba1c2 — what the owner recycle did to the session's task processes. */
+  reap?: ReapReport;
 };
 
 export type SessionSetAutoFailoverOptions = {
@@ -376,6 +381,8 @@ export type SessionSetAutoFailoverResult = {
   /** True when a live queue owner existed and was restarted to bind the change. */
   ownerRestarted?: boolean;
   ownerRestartSkipped?: string;
+  /** brick ad6ba1c2 — what the owner recycle did to the session's task processes. */
+  reap?: ReapReport;
 };
 
 // brick://874fee67 — enumerate an agent's output styles (the create-dialog feed).
@@ -419,6 +426,8 @@ export type SessionSetOutputStyleResult = {
    *  the change binds on the next prompt. */
   ownerRestarted?: boolean;
   ownerRestartSkipped?: string;
+  /** brick ad6ba1c2 — what the owner recycle did to the session's task processes. */
+  reap?: ReapReport;
   /**
    * True when the write was ACCEPTED but the recycle was deferred because a turn
    * was in flight. The change is durable and will bind at the turn boundary (or
@@ -440,6 +449,8 @@ export type SessionSetAutoSubscriptionResult = {
   /** True when a live queue owner existed and was restarted to bind the change. */
   ownerRestarted?: boolean;
   ownerRestartSkipped?: string;
+  /** brick ad6ba1c2 — what the owner recycle did to the session's task processes. */
+  reap?: ReapReport;
 };
 
 // brick://4d517be2 — the fable→opus degrade opt-in.
@@ -454,6 +465,8 @@ export type SessionSetFableDegradeResult = {
   /** True when a live queue owner existed and was restarted to bind the change. */
   ownerRestarted?: boolean;
   ownerRestartSkipped?: string;
+  /** brick ad6ba1c2 — what the owner recycle did to the session's task processes. */
+  reap?: ReapReport;
 };
 
 export type { SessionAgentOptions };
