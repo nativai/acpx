@@ -11,6 +11,12 @@ import { fileURLToPath } from "node:url";
 import { readFullSourceHistory } from "../src/cli/session/fork-at-log-index.js";
 import { runCompressSweep } from "../src/session/archive/compress-sweep.js";
 import { encodeArchiveZst, zstNameFor } from "../src/session/archive/compressed.js";
+import {
+  parseJournal,
+  readCompressionJournal,
+  type CompressionJournalRow,
+} from "../src/session/archive/compression-journal.js";
+import { findLoneBegins } from "../src/session/archive/compression-reconcile.js";
 import { createContext, runRestore } from "../src/session/archive/operations.js";
 import { resolveSessionRecord, serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import type { SessionMessage } from "../src/types.js";
@@ -1128,7 +1134,7 @@ test("--cat: verified logical bytes (a .zst suffix is accepted); corrupt or abse
 // ─── crash seams (AC-6) ───────────────────────────────────────────────────────
 
 for (const step of ["4", "5", "7", "8", "9"]) {
-  test(`AC-6 SIGKILL after step ${step}: every logical file stays readable; the next sweep finishes; journal shows begin then a resolution`, async () => {
+  test(`AC-6/AC-9 SIGKILL after step ${step}: files stay readable; the re-run closes every lone begin; every .zst has a full compress row`, async () => {
     await withFixture(async (fixture) => {
       const crashed = await runCli(fixture.home, COMPRESS_INIT, {
         ACPX_ARCHIVE_COMPRESS_CRASH_AFTER: step,
@@ -1139,15 +1145,52 @@ for (const step of ["4", "5", "7", "8", "9"]) {
         assert.equal(cat.code, 0, `${name} after crash ${step}: ${cat.stderr}`);
         assert.equal(sha(cat.stdout), sha(data), `${name} after crash ${step}`);
       }
+      const lone = findLoneBegins(await readCompressionJournal(fixture.archive));
+      assert.equal(lone.size, 1, `the crash leaves exactly one lone begin (step ${step})`);
+      const [crashedFile] = [...lone.keys()];
+
+      // A dry run REPORTS the reconcile and writes nothing.
+      const journalBefore = await fs.readFile(
+        path.join(fixture.archive, "COMPRESSION", "journal.tsv"),
+      );
+      const dry = await runCli(fixture.home, [
+        "sessions",
+        "archive",
+        "--compress",
+        "--dry-run",
+        "--json",
+      ]);
+      assert.equal(dry.code, 0, dry.stderr);
+      const dryBody = JSON.parse(dry.stdout) as { reconciled: { file: string; action: string }[] };
+      assert.deepEqual(
+        dryBody.reconciled.map((entry) => entry.file),
+        [crashedFile],
+      );
+      assert.deepEqual(
+        await fs.readFile(path.join(fixture.archive, "COMPRESSION", "journal.tsv")),
+        journalBefore,
+      );
+
+      const manifestOut = path.join(fixture.home, "manifest-out.tsv");
       const finish = await runCli(fixture.home, [
         "sessions",
         "archive",
         "--compress",
         "--apply",
         "--skip-reader-check",
+        "--manifest-out",
+        manifestOut,
         "--json",
       ]);
       assert.equal(finish.code, 0, finish.stderr);
+      const body = JSON.parse(finish.stdout) as { reconciled: { file: string; action: string }[] };
+      const expectedAction =
+        step === "4" || step === "5" ? "abort" : step === "9" ? "compress" : "resolve-both";
+      assert.deepEqual(
+        body.reconciled.map((entry) => [entry.file, entry.action]),
+        [[crashedFile, expectedAction]],
+      );
+
       const names = await listing(fixture.archive);
       for (const [name, data] of Object.entries(fixture.logical)) {
         if (name.endsWith(".json")) {
@@ -1160,17 +1203,96 @@ for (const step of ["4", "5", "7", "8", "9"]) {
         const cat = await runCli(fixture.home, ["sessions", "archive", "--cat", name]);
         assert.equal(sha(cat.stdout), sha(data));
       }
-      const journal = await fs.readFile(
-        path.join(fixture.archive, "COMPRESSION", "journal.tsv"),
-        "utf8",
+      const rows = await readCompressionJournal(fixture.archive);
+      assert.equal(
+        findLoneBegins(rows).size,
+        0,
+        `no lone begin survives the re-run (step ${step})`,
       );
-      assert.ok(
-        journal.indexOf("\tbegin\t") < journal.lastIndexOf("\tcompress\t") ||
-          journal.includes("\tresolve-both\t"),
-      );
+      // AC-9: every compressed file has a `compress` row with all four size/hash fields.
+      for (const [name, data] of Object.entries(fixture.logical)) {
+        if (name.endsWith(".json")) {
+          continue;
+        }
+        const zst = await fs.readFile(path.join(fixture.archive, zstNameFor(name)));
+        // `compress`, or — when the crash fell between commit and unlink — `resolve-both`.
+        const row = rows.findLast(
+          (entry) =>
+            (entry.action === "compress" || entry.action === "resolve-both") && entry.file === name,
+        );
+        assert.ok(row, `${name}: a compress/resolve-both row exists (step ${step})`);
+        assert.equal(row.logicalBytes, data.length);
+        assert.equal(row.logicalSha256, sha(data));
+        assert.equal(row.zstBytes, zst.length);
+        assert.equal(row.zstSha256, sha(zst));
+        assert.equal(row.verified, true);
+      }
+      if (step !== "4" && step !== "5") {
+        // The file committed before the crash is in THIS wave's manifest, all four fields set.
+        const out = parseJournal(await fs.readFile(manifestOut, "utf8"));
+        const recovered = out.find(
+          (entry) => entry.file === crashedFile && entry.action === expectedAction,
+        );
+        assert.ok(recovered, `--manifest-out lists the recovered file (step ${step})`);
+        if (step === "9") {
+          assert.match(recovered.detail ?? "", /^recovered: /);
+        }
+        assert.ok(
+          recovered.logicalBytes &&
+            recovered.logicalSha256 &&
+            recovered.zstBytes &&
+            recovered.zstSha256,
+        );
+      }
     });
   });
 }
+
+test("reconcile: a lone begin whose file was restored meanwhile is closed with an abort row", async () => {
+  await withFixture(async (fixture) => {
+    const crashed = await runCli(fixture.home, COMPRESS_INIT, {
+      ACPX_ARCHIVE_COMPRESS_CRASH_AFTER: "9",
+    });
+    assert.equal(crashed.code, -1);
+    const restore = await runCli(fixture.home, ["sessions", "restore", fixture.id, "--json"]);
+    assert.equal(restore.code, 0, restore.stderr);
+    const finish = await runCli(fixture.home, [
+      "sessions",
+      "archive",
+      "--compress",
+      "--apply",
+      "--skip-reader-check",
+      "--json",
+    ]);
+    assert.equal(finish.code, 0, finish.stderr);
+    const body = JSON.parse(finish.stdout) as { reconciled: { action: string; detail: string }[] };
+    assert.equal(body.reconciled.length, 1);
+    assert.equal(body.reconciled[0].action, "abort");
+    assert.match(body.reconciled[0].detail, /no longer in the archive/);
+    assert.equal(findLoneBegins(await readCompressionJournal(fixture.archive)).size, 0);
+  });
+});
+
+test("findLoneBegins: consecutive begins (an older build re-ran) all count; one resolving row closes them; other files are independent", () => {
+  const row = (action: string, file: string) =>
+    ({ at: "", wave: "w", action, file }) as CompressionJournalRow;
+  const lone = findLoneBegins([
+    row("begin", "a"),
+    row("begin", "a"),
+    row("begin", "b"),
+    row("compress", "b"),
+    row("begin", "c"),
+    row("abort", "c"),
+    row("begin", "c"),
+  ]);
+  assert.deepEqual(
+    [...lone],
+    [
+      ["a", 2],
+      ["c", 1],
+    ],
+  );
+});
 
 // ─── decompress (AC-13) and shards (AC-11) ───────────────────────────────────
 
