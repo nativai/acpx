@@ -183,6 +183,38 @@ export function acpAdapterKind(agentCommand: string): string | undefined {
   return ADAPTER_KIND_DETECTORS.find(([, detect]) => detect(command, args))?.[0];
 }
 
+// Harness-native self-scheduling and skill-injection tools that fight the
+// ACPX-owned wakeup mechanism (Skills/scheduling) and the Operating System's own
+// skill delivery when left enabled by default on a bare `claude` spawn. Applied
+// ONLY when the caller never passed --disallowed-tools at all — an explicit
+// `--disallowed-tools ""` (which parses to `[]`, not `undefined`) is the
+// documented escape hatch and must pass through untouched (acpx PROJECT.md brick
+// ab754b0d). The ONE copy of the list: session creation (command-handlers) and
+// the resume/load re-send for records that never persisted the field
+// (AcpClient.buildReconnectSessionMeta, brick a81e16a1) both resolve through it.
+const CLAUDE_DEFAULT_DISALLOWED_TOOLS: readonly string[] = [
+  "ScheduleWakeup",
+  "CronCreate",
+  "CronList",
+  "CronDelete",
+  "RemoteTrigger",
+  "Skill",
+];
+
+// Gated strictly on the `claude` adapter kind — NOT `CLAUDE_FAMILY_ADAPTER_KINDS`
+// (below). ABSENT ≠ EMPTY: only `undefined` takes the default; `[]` is kept.
+export function resolveClaudeDefaultDisallowedTools(
+  agentCommand: string,
+  requested: string[] | undefined,
+): string[] | undefined {
+  if (requested !== undefined) {
+    return requested;
+  }
+  return acpAdapterKind(agentCommand) === "claude"
+    ? [...CLAUDE_DEFAULT_DISALLOWED_TOOLS]
+    : undefined;
+}
+
 /** The adapter kinds whose credential IS a Claude account. Not a list to extend casually. */
 const CLAUDE_FAMILY_ADAPTER_KINDS: ReadonlySet<string> = new Set(["claude"]);
 

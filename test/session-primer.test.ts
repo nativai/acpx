@@ -8,6 +8,8 @@ import { AcpClient } from "../src/acp/client.js";
 import { HARNESS_FACTS, HARNESS_IDS } from "../src/acp/harness-capabilities.js";
 import { resetSessionPrimerMemoForTests, resolveSessionPrimer } from "../src/acp/session-primer.js";
 import { AGENT_REGISTRY } from "../src/agent-registry.js";
+import { sessionOptionsFromRecord } from "../src/runtime/engine/session-options.js";
+import type { SessionRecord } from "../src/types.js";
 
 // Unified OS-primer injection at the acpx layer (CONCEPTION §4). acpx runs the
 // session-context primer once per process and routes it to the right `_meta`
@@ -531,7 +533,10 @@ test("a81e16a1: the resume hint deep-merges BESIDE the options, never replacing 
 test("a81e16a1: a human --system-prompt string survives a resume (it replaced the primer at creation)", async () => {
   await withPrimerScript("printf 'PRIMER-SHOULD-NOT-APPEAR\\n'", async () => {
     const captured: CapturedConnection = {};
-    const client = makeClient(SDK_CLAUDE_COMMAND, { systemPrompt: "HUMAN-WHOLE-PROMPT" });
+    const client = makeClient(SDK_CLAUDE_COMMAND, {
+      systemPrompt: "HUMAN-WHOLE-PROMPT",
+      disallowedTools: CREATION_OPTIONS.disallowedTools,
+    });
     stubConnection(client, captured);
     await client.createSession("/tmp/acpx-a81e16a1-sp");
     await client.resumeSession("session-stub", "/tmp/acpx-a81e16a1-sp");
@@ -548,6 +553,88 @@ test("a81e16a1: codex resume stays _meta-free even WITH creation options (Claude
     await client.resumeSession("session-stub", "/tmp/acpx-a81e16a1-codex");
     assert.equal(captured.resumeMeta, "absent");
   });
+});
+
+// ---------------------------------------------------------------------------
+// brick a81e16a1 round 3 — LEGACY records. 127 open Claude records (created
+// before `disallowed_tools` was persisted) carry NO field; re-sending only what
+// the record holds would leave them with the scheduler tools forever. A resume
+// of such a record falls back to acpx's CURRENT default list. ABSENT ≠ EMPTY: a
+// stored list — `[]` included, the `--disallowed-tools ""` opt-out — is kept.
+// The sessionOptions come from a real record shape via sessionOptionsFromRecord,
+// the path the queue owner takes.
+// ---------------------------------------------------------------------------
+const TODAY_DEFAULT_DISALLOWED = [
+  "ScheduleWakeup",
+  "CronCreate",
+  "CronList",
+  "CronDelete",
+  "RemoteTrigger",
+  "Skill",
+];
+
+function recordOptions(sessionOptions: Record<string, unknown>): Record<string, unknown> {
+  const record = { acpx: { session_options: sessionOptions } } as unknown as SessionRecord;
+  return (sessionOptionsFromRecord(record) ?? {}) as Record<string, unknown>;
+}
+
+async function reconnectOptions(
+  agentCommand: string,
+  sessionOptions: Record<string, unknown>,
+  via: "resume" | "load",
+): Promise<unknown> {
+  let options: unknown = "never-sent";
+  await withPrimerScript("printf 'PRIMER-LEGACY\\n'", async () => {
+    const captured: CapturedConnection = {};
+    const client = makeClient(agentCommand, recordOptions(sessionOptions));
+    stubConnection(client, captured);
+    if (via === "resume") {
+      await client.resumeSession("session-stub", "/tmp/acpx-a81e16a1-legacy");
+    } else {
+      await client.loadSessionWithOptions("session-stub", "/tmp/acpx-a81e16a1-legacy", {
+        replayIdleMs: 0,
+        replayDrainTimeoutMs: 0,
+      });
+    }
+    const meta = via === "resume" ? captured.resumeMeta : captured.loadMeta;
+    options =
+      meta === "absent" || meta === undefined
+        ? "absent"
+        : (meta.claudeCode as { options?: unknown } | undefined)?.options;
+  });
+  return options;
+}
+
+for (const via of ["resume", "load"] as const) {
+  test(`a81e16a1 r3: a legacy Claude record WITHOUT disallowed_tools ${via}s with today's default list`, async () => {
+    assert.deepEqual(await reconnectOptions(SDK_CLAUDE_COMMAND, { model: "opus" }, via), {
+      model: "opus",
+      disallowedTools: TODAY_DEFAULT_DISALLOWED,
+    });
+  });
+
+  test(`a81e16a1 r3: an explicit stored list is kept on ${via} — never replaced by the default`, async () => {
+    assert.deepEqual(
+      await reconnectOptions(SDK_CLAUDE_COMMAND, { disallowed_tools: ["Bash"] }, via),
+      { disallowedTools: ["Bash"] },
+    );
+  });
+
+  test(`a81e16a1 r3: an explicit EMPTY stored list stays empty on ${via} (absent ≠ empty)`, async () => {
+    assert.deepEqual(await reconnectOptions(SDK_CLAUDE_COMMAND, { disallowed_tools: [] }, via), {
+      disallowedTools: [],
+    });
+  });
+}
+
+test("a81e16a1 r3: a legacy record with NO session options at all still resumes with the default list", async () => {
+  assert.deepEqual(await reconnectOptions(SDK_CLAUDE_COMMAND, {}, "resume"), {
+    disallowedTools: TODAY_DEFAULT_DISALLOWED,
+  });
+});
+
+test("a81e16a1 r3: the default is Claude-only — a codex record without the field resumes _meta-free", async () => {
+  assert.equal(await reconnectOptions(CODEX_COMMAND, { model: "gpt" }, "resume"), "absent");
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -86,6 +86,7 @@ import {
   composePrimerWithBrickContext,
   ensureCopilotAcpSupport,
   isClaudeAcpCommand,
+  resolveClaudeDefaultDisallowedTools,
   isCopilotAcpCommand,
   isGeminiAcpCommand,
   isQoderAcpCommand,
@@ -2212,12 +2213,26 @@ export class AcpClient {
    *
    * Claude adapter only, like the fork path: other adapters keep their resume
    * `_meta` unchanged (codex restores its developer item from thread history).
+   *
+   * A record that never persisted `disallowed_tools` (created before the field
+   * was written — 127 open records on devbox, 2026-10-28) gets acpx's CURRENT
+   * default list, i.e. what `session/new` sends today; otherwise it would keep
+   * the scheduler tools forever. ⚠️ Absent ≠ empty: a stored `[]` is the
+   * `--disallowed-tools ""` opt-out and is re-sent as `[]`.
    */
   private async buildReconnectSessionMeta(): Promise<Record<string, unknown> | undefined> {
     const { command, args } = splitCommandLine(this.options.agentCommand);
-    const optionsMeta = isClaudeAcpCommand(command, args)
-      ? buildClaudeCodeOptionsMeta(this.options.sessionOptions)
-      : undefined;
+    if (!isClaudeAcpCommand(command, args)) {
+      return await this.buildResumePrimerMeta();
+    }
+    const sessionOptions = this.options.sessionOptions;
+    const optionsMeta = buildClaudeCodeOptionsMeta({
+      ...sessionOptions,
+      disallowedTools: resolveClaudeDefaultDisallowedTools(
+        this.options.agentCommand,
+        sessionOptions?.disallowedTools,
+      ),
+    });
     return mergeOptionalRecords(optionsMeta, await this.buildResumePrimerMeta());
   }
 

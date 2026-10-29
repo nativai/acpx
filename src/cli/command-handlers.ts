@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
-import { acpAdapterKind } from "../acp/agent-command.js";
+import { acpAdapterKind, resolveClaudeDefaultDisallowedTools } from "../acp/agent-command.js";
 import { resolveAcpxUiBaseUrl } from "../acp/auth-env.js";
 import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
 import { exitCodeForOutputErrorCode, normalizeOutputError } from "../acp/error-normalization.js";
@@ -1030,36 +1030,6 @@ function inheritedProfileSelection(
     return undefined;
   }
   return selection;
-}
-
-// Harness-native self-scheduling and skill-injection tools that fight the
-// ACPX-owned wakeup mechanism (Skills/scheduling) and the Operating System's own
-// skill delivery when left enabled by default on a bare `claude` spawn. Applied
-// ONLY at session creation (below) and ONLY when the caller never passed
-// --disallowed-tools at all — an explicit `--disallowed-tools ""` (which parses
-// to `[]`, not `undefined`) is the documented escape hatch and must pass through
-// untouched (acpx PROJECT.md brick ab754b0d).
-const CLAUDE_DEFAULT_DISALLOWED_TOOLS: readonly string[] = [
-  "ScheduleWakeup",
-  "CronCreate",
-  "CronList",
-  "CronDelete",
-  "RemoteTrigger",
-  "Skill",
-];
-
-// Gated strictly on the `claude` adapter kind — NOT `CLAUDE_FAMILY_ADAPTER_KINDS`
-// (agent-command.ts).
-function resolveClaudeDefaultDisallowedTools(
-  agentCommand: string,
-  requested: string[] | undefined,
-): string[] | undefined {
-  if (requested !== undefined) {
-    return requested;
-  }
-  return acpAdapterKind(agentCommand) === "claude"
-    ? [...CLAUDE_DEFAULT_DISALLOWED_TOOLS]
-    : undefined;
 }
 
 // brick://5bac5564 R1: the PRIMARY Fable-leak site. A bare child of a Fable
