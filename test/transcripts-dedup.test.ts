@@ -1,8 +1,8 @@
+import "./install-owner-reaper.js";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -18,6 +18,7 @@ import {
 } from "../src/cli/transcripts-dedup.js";
 import { transcriptCwdHash } from "../src/config/subscription-transcript.js";
 import { reduceToExitTail } from "../src/config/transcript-dedup.js";
+import { withTempHome } from "./temp-home.js";
 import {
   ageFile,
   conversation,
@@ -42,14 +43,11 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 
 async function withHome(run: (home: string) => Promise<void>): Promise<void> {
-  const home = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-transcripts-"));
-  try {
+  await withTempHome("acpx-transcripts-", async (home) => {
     await writeRegistry(home, ["subA", "subB", "subC"], "subA");
     await fs.mkdir(path.join(home, ".acpx", "subscriptions", "sub4"), { recursive: true });
     await run(home);
-  } finally {
-    await fs.rm(home, { recursive: true, force: true });
-  }
+  });
 }
 
 function copyIn(home: string, sub: string, name: string): string {
@@ -599,7 +597,8 @@ async function reducedS4b(home: string) {
     b.pText + jsonl([exitLine("cost-state", id, b.leaf), exitLine("last-prompt", id, b.leaf)]),
   );
   const sha = await sha256File(original);
-  const mtimeMs = Math.floor((await fs.stat(original)).mtimeMs);
+  // Whole ms from the NANOSECOND mtime, as the header stores it (a float mtimeMs can round up).
+  const mtimeMs = Number((await fs.stat(original, { bigint: true })).mtimeNs / 1_000_000n);
   const outcome = await reduceToExitTail(original, witness, { reducedBy: "transcripts-dedup" });
   assert.equal(outcome.action, "reduced");
   const tailFile = outcome.action === "reduced" ? outcome.tailFile : "";
@@ -612,7 +611,7 @@ test("A11: restore rebuilds the original at its path, sha256 and mtime equal, ta
     const result = await restoreExitTail(tailFile, { stateHome: home, userHome: home });
     assert.equal(result.restored, original);
     assert.equal(await sha256File(original), sha);
-    assert.equal(Math.floor((await fs.stat(original)).mtimeMs), mtimeMs);
+    assert.equal(Number((await fs.stat(original, { bigint: true })).mtimeNs / 1_000_000n), mtimeMs);
     assert.equal(await exists(tailFile), true);
   });
 });

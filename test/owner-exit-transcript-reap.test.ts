@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
@@ -19,6 +18,7 @@ import {
   reapLeftBehindTranscripts,
 } from "../src/config/transcript-reap.js";
 import type { SessionRecord } from "../src/types.js";
+import { withTempHome } from "./temp-home.js";
 import {
   ageFile,
   conversation,
@@ -49,8 +49,7 @@ type Fixture = {
 };
 
 async function withFixture(run: (fx: Fixture) => Promise<void>): Promise<void> {
-  const home = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-reap-"));
-  try {
+  await withTempHome("acpx-reap-", async (home) => {
     const dir = (id: string) => path.join(home, ".acpx", "subscriptions", id);
     const [subA, subB, subC, sub4] = ["subA", "subB", "subC", "sub4"].map(dir);
     for (const configDir of [subA, subB, subC, sub4]) {
@@ -72,9 +71,7 @@ async function withFixture(run: (fx: Fixture) => Promise<void>): Promise<void> {
       active: transcriptJsonlPath(subB, CWD, SESSION_A),
       leftBehind: transcriptJsonlPath(subA, CWD, SESSION_A),
     });
-  } finally {
-    await fs.rm(home, { recursive: true, force: true });
-  }
+  });
 }
 
 function record(profile: string | null = "subB") {

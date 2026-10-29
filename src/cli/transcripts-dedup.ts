@@ -241,10 +241,10 @@ export async function transcriptRoots(homes: Homes): Promise<string[]> {
   const subscriptions = path.join(homes.stateHome, ".acpx", "subscriptions");
   const entries = await readDirents(subscriptions);
   const roots = entries
-    .filter((entry) => entry.isDirectory())
-    .flatMap((entry) => [
-      path.join(subscriptions, entry.name),
-      path.join(subscriptions, entry.name, ".claude"),
+    .filter((dirent) => dirent.isDirectory())
+    .flatMap((dirent) => [
+      path.join(subscriptions, dirent.name),
+      path.join(subscriptions, dirent.name, ".claude"),
     ]);
   roots.push(path.join(homes.userHome, ".claude"), path.join(homes.stateHome, ".claude"));
   return [...new Set(roots.map((root) => path.resolve(root)))];
@@ -273,9 +273,9 @@ async function scanTranscriptRoots(roots: string[]): Promise<ScanResult> {
 
 async function scanSlugDir(dir: string, result: ScanResult): Promise<void> {
   // Depth 1 only: `<id>/subagents/` is never touched.
-  for (const entry of await readDirents(dir)) {
-    if (entry.isFile()) {
-      await recordScannedFile(path.join(dir, entry.name), entry.name, result);
+  for (const dirent of await readDirents(dir)) {
+    if (dirent.isFile()) {
+      await recordScannedFile(path.join(dir, dirent.name), dirent.name, result);
     }
   }
 }
@@ -371,9 +371,9 @@ async function indexRecordFiles(ids: Set<string>, homes: Homes): Promise<RecordI
   const hotDir = path.join(homes.stateHome, ".acpx", "sessions");
   const index: RecordIndex = new Map();
   for (const dir of [hotDir, sessionArchiveDirFor(hotDir)]) {
-    for (const entry of await readDirents(dir)) {
-      if (entry.isFile() && entry.name.endsWith(".json") && entry.name !== "index.json") {
-        await indexRecordFile(path.join(dir, entry.name), ids, index);
+    for (const dirent of await readDirents(dir)) {
+      if (dirent.isFile() && dirent.name.endsWith(".json") && dirent.name !== "index.json") {
+        await indexRecordFile(path.join(dir, dirent.name), ids, index);
       }
     }
   }
@@ -952,10 +952,10 @@ async function indexSessionFiles(
   }
   const tailFiles = new Set<string>(files?.tailFiles ?? []);
   // The tail file's own dir, even outside the scanned roots.
-  for (const entry of await readDirents(path.dirname(tailFile))) {
+  for (const dirent of await readDirents(path.dirname(tailFile))) {
     collectSiblingFile(
-      path.join(path.dirname(tailFile), entry.name),
-      entry,
+      path.join(path.dirname(tailFile), dirent.name),
+      dirent,
       header.session_id,
       copies,
       tailFiles,
@@ -966,17 +966,17 @@ async function indexSessionFiles(
 
 function collectSiblingFile(
   filePath: string,
-  entry: Dirent,
+  dirent: Dirent,
   sessionId: string,
   copies: Set<string>,
   tailFiles: Set<string>,
 ): void {
-  if (!entry.isFile() || sessionIdFromTranscriptName(entry.name) !== sessionId) {
+  if (!dirent.isFile() || sessionIdFromTranscriptName(dirent.name) !== sessionId) {
     return;
   }
-  if (isExitTailFileName(entry.name)) {
+  if (isExitTailFileName(dirent.name)) {
     tailFiles.add(filePath);
-  } else if (CANONICAL_RE.test(entry.name) || SIDECAR_RE.test(entry.name)) {
+  } else if (CANONICAL_RE.test(dirent.name) || SIDECAR_RE.test(dirent.name)) {
     copies.add(filePath);
   }
 }
@@ -1094,8 +1094,10 @@ async function writeRestored(
         ? new TranscriptRestoreError("target-exists", `${target} exists; refusing to overwrite`)
         : error;
     }
-    const mtime = new Date(header.original_mtime_ms);
-    await fs.utimes(target, mtime, mtime);
+    // The MIDDLE of the header's millisecond, in seconds: `new Date(ms)` goes through a double and
+    // can land a few ns BELOW `ms`, which reads back as `ms - 1` (TEST-PLAN A11 caught it).
+    const mtimeSeconds = (header.original_mtime_ms + 0.5) / 1000;
+    await fs.utimes(target, mtimeSeconds, mtimeSeconds);
   } finally {
     await fs.rm(temp, { force: true });
   }

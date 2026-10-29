@@ -293,7 +293,7 @@ test("A10 (T): an exit-tail copy is reduced to a tail file with the full header"
   await withDir(async (dir) => {
     const { pText, block, witness, candidate } = await s4bPair(dir);
     const originalSha = await sha256File(candidate);
-    const originalStat = await fs.stat(candidate);
+    const originalStat = await fs.stat(candidate, { bigint: true });
     const outcome = await reduceToExitTail(candidate, witness, { reducedBy: "owner-exit" });
     assert.equal(outcome.action, "reduced", JSON.stringify(outcome));
     if (outcome.action !== "reduced") {
@@ -330,8 +330,8 @@ test("A10 (T): an exit-tail copy is reduced to a tail file with the full header"
     ]);
     assert.equal(header.session_id, SESSION_A);
     assert.equal(header.original_path, candidate);
-    assert.equal(header.original_size, originalStat.size);
-    assert.equal(header.original_mtime_ms, Math.floor(originalStat.mtimeMs));
+    assert.equal(header.original_size, Number(originalStat.size));
+    assert.equal(header.original_mtime_ms, Number(originalStat.mtimeNs / 1_000_000n));
     assert.equal(header.original_sha256, originalSha);
     assert.equal(header.prefix_bytes, Buffer.byteLength(pText));
     const witnessBytes = await fs.readFile(witness);
