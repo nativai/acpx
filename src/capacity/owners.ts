@@ -26,6 +26,12 @@ export type OwnerTree = {
   readonly measuredBytes: number;
   /** True for the owner whose tree holds the reading process — the CALLER's own session. */
   readonly self: boolean;
+  /**
+   * A pending reservation for this session that is still within its TTL (§5): the owner is charged
+   * `max(r_live, m, reserved)`, so a fresh owner keeps its newcomer reservation while it ramps up
+   * instead of dropping to its first-second ~50 MiB (§9).
+   */
+  readonly reservedBytes?: number;
 };
 
 export type LeaseExclusion =

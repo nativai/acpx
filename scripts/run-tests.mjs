@@ -20,7 +20,8 @@
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -130,8 +131,20 @@ const runTag =
     "-",
   );
 
+// brick 8622b752 — the create gate's isolation (CONCEPTION f7587c86 §10.1). The gate's ledger and
+// lock default to the PASSWD home (`~node/.acpx/admission`), not $HOME, so without this a test's
+// create would contend with — and reserve memory against — the real box's gate. And the podinfo
+// default points at a directory that never exists, so no create in the suite is gated by the
+// memory of whatever pod runs it (a workbench that one day mounts /etc/podinfo included). Rows that
+// test the gate set both to fixtures of their own. Caller wins, as for every knob here.
+const admissionDir =
+  process.env.ACPX_ADMISSION_DIR ?? mkdtempSync(join(tmpdir(), "acpx-admission-"));
+
 const env = {
   ...process.env,
+  ACPX_ADMISSION_DIR: admissionDir,
+  ACPX_CAPACITY_PODINFO_DIR:
+    process.env.ACPX_CAPACITY_PODINFO_DIR ?? join(admissionDir, "no-podinfo-unconfigured"),
   ACPX_TEST_OWNER_RUN_TAG: runTag,
   // An explicit setting from the caller wins — an operator tuning this for a
   // targeted run must not be silently overridden.
