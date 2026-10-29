@@ -802,6 +802,17 @@ export type SessionAcpxState = {
    */
   last_turn_provider?: LastTurnProviderBreadcrumb;
   /**
+   * The subscription that served the session's last COMPLETED turn, and when that
+   * turn ended (brick 6b7f8661) — the anchor of the 1-hour prompt-cache window that
+   * proactive selection keeps a session on its subscription inside.
+   *
+   * ⚠️ Written ONLY at turn end (`savePromptSuccess`), never at prompt start or by
+   * a control command. `lastUsedAt` / `lastPromptAt` / `served.at` are all also
+   * advanced without model traffic, and a prompt-start write would make every
+   * turn read its own window as just opened: a session that never moves back.
+   */
+  last_turn_subscription?: { subscription: string; at: string };
+  /**
    * The context fill the adapter LAST reported (brick 4f3fa88c) — what `acpx context`
    * shows and what the context alarm is computed from after an owner respawn.
    * `window_tokens: 0` is UNKNOWN (Daniel: an unknown window is 0, never a guess);

@@ -623,6 +623,12 @@ function subscriptionAutoSelectEnabledGlobally(): boolean {
 // <30% headroom / locked / errored) bypass this.
 const DEFAULT_SUBSCRIPTION_SELECT_COOLDOWN_MS = 300_000;
 
+// brick 6b7f8661 — the provider's prompt cache is per account and lives 1 h past the
+// last request that read it, so moving a session inside that hour re-writes its whole
+// conversation on the new account (91-97 % cache misses at every switch, measured).
+// Inside the window only FORCED switches happen; no knob, revert is by commit.
+const PROMPT_CACHE_TTL_MS = 3_600_000;
+
 function subscriptionSelectCooldownMs(): number {
   const raw = process.env.ACPX_SUBSCRIPTION_SELECT_COOLDOWN_MS?.trim();
   if (!raw) {
@@ -1091,6 +1097,9 @@ export type SubscriptionSelectionResult = {
   // brick://3356183e: the switch selection wanted, held back because the session's
   // adapter holds live background tasks that the switch would kill.
   deferredTo?: string;
+  // brick 6b7f8661: the OPTIMIZATION switch selection wanted, held back because the
+  // session is inside its prompt-cache window on the current subscription.
+  heldForCache?: string;
 };
 
 export type SubscriptionSelectionTurn = {
@@ -1178,46 +1187,58 @@ async function selectSubscriptionBeforeTurnUnsafe(
   }
 
   const held = holdSelectionSwitch({ record, usages, currentId: current.id, target, turn });
-  if (held) {
-    return held;
+  if ("result" in held) {
+    return held.result;
   }
 
   await switchSessionAccount(record, target.id, "selection", loadOpts);
   await writeSessionRecord(record);
+  process.stderr.write(
+    `[acpx] proactive subscription switch ${current.id} → ${target.id} ` +
+      `(${held.why}) session ${record.acpxRecordId}\n`,
+  );
   return { switchedTo: target.id };
 }
 
 // Why a switch to an eligible, different target does NOT happen this turn — the
-// thrash guard, or live background tasks — or undefined when it should happen.
+// thrash guard, the prompt cache, or live background tasks — as `result`; or, when it
+// should happen, `why` it does (the switch log names it).
 function holdSelectionSwitch(params: {
   record: SessionRecord;
   usages: SubscriptionUsage[];
   currentId: string;
   target: SubscriptionUsage;
   turn: SubscriptionSelectionTurn | undefined;
-}): SubscriptionSelectionResult | undefined {
+}): { result: SubscriptionSelectionResult } | { why: string } {
   const { record, usages, target } = params;
   const currentIndex = usages.findIndex((usage) => usage.id === params.currentId);
   const currentUsage = usages[currentIndex]; // undefined when currentIndex is -1 (not found)
   const targetIndex = usages.findIndex((usage) => usage.id === target.id);
-  if (
-    !shouldSwitchToSelectionTarget({
-      record,
-      target,
-      targetIndex,
-      currentUsage,
-      currentIndex,
-    })
-  ) {
-    return {};
+  const decision = selectionSwitchDecision({
+    record,
+    target,
+    targetIndex,
+    currentUsage,
+    currentIndex,
+  });
+  if (decision.kind === "stay") {
+    return { result: {} };
+  }
+  if (decision.kind === "held-for-cache") {
+    process.stderr.write(
+      `[acpx] proactive subscription switch ${params.currentId} → ${target.id} held for ` +
+        `prompt cache: last turn ${Math.floor(decision.ageMs / 60_000)}m ago ` +
+        `(window ${PROMPT_CACHE_TTL_MS / 60_000}m) session ${record.acpxRecordId}\n`,
+    );
+    return { result: { heldForCache: target.id } };
   }
   // brick://3356183e: the live-task gate sits HERE, after the decision, so the log
   // names a switch that would really have happened. Deferring is within selection's
   // best-effort contract; reactive failover is not gated and still switches.
   if (deferSwitchForLiveBackgroundTasks(record, params.currentId, target.id, params.turn)) {
-    return { deferredTo: target.id };
+    return { result: { deferredTo: target.id } };
   }
-  return undefined;
+  return { why: decision.kind === "forced" ? `forced:${decision.reason}` : "optimization" };
 }
 
 function deferSwitchForLiveBackgroundTasks(
@@ -1252,17 +1273,24 @@ function pickSelectionTarget(
   return pickFailoverTarget(usages, { exclude, threshold: maxedThreshold() });
 }
 
+export type SelectionSwitchDecision =
+  | { kind: "stay" }
+  | { kind: "forced"; reason: string }
+  | { kind: "optimization" }
+  | { kind: "held-for-cache"; ageMs: number };
+
 // Thrash guard (decision #3): FORCED when the current sub is ineligible (locked /
-// errored / <30% headroom) — bypasses the cooldown; OPTIMIZATION when the current
-// sub is still healthy but the target ranks strictly better AND no auto-selection
+// errored / <30% headroom) — bypasses the cooldown and the prompt cache; OPTIMIZATION
+// when the current sub is still healthy but the target ranks strictly better, the
+// session is outside its prompt-cache window (brick 6b7f8661) AND no auto-selection
 // switch happened within the cooldown.
-export function shouldSwitchToSelectionTarget(params: {
+export function selectionSwitchDecision(params: {
   record: SessionRecord;
   target: SubscriptionUsage;
   targetIndex: number;
   currentUsage: SubscriptionUsage | undefined;
   currentIndex: number;
-}): boolean {
+}): SelectionSwitchDecision {
   const { currentUsage } = params;
   // Current sub ineligible → FORCED switch (correctness floor; also covers a current
   // sub missing from the probe set, i.e. no headroom evidence). brick://67d2fd2f
@@ -1271,10 +1299,17 @@ export function shouldSwitchToSelectionTarget(params: {
   // diverge on the weekly guard again. threshold 0.70 = the primary 5h bar; empty
   // exclude (the current sub's own membership is irrelevant here). Now fires when
   // current lacks 5h OR weekly headroom (or is locked/errored/probe-missing).
-  if (!currentUsage || !isSubscriptionEligible(currentUsage, EMPTY_EXCLUDE, 0.7)) {
-    return true;
+  if (!currentUsage) {
+    return { kind: "forced", reason: "probe-missing" };
   }
-  // Current sub still healthy → OPTIMIZATION, cooldown-gated + strictly-better only.
+  if (!isSubscriptionEligible(currentUsage, EMPTY_EXCLUDE, 0.7)) {
+    return {
+      kind: "forced",
+      reason: subscriptionEligibilityVerdict(currentUsage, 0.7).reason ?? "ineligible",
+    };
+  }
+  // Current sub still healthy → OPTIMIZATION, strictly-better only, held inside the
+  // prompt-cache window, cooldown-gated outside it.
   if (
     !subscriptionRanksStrictlyBetter(
       params.target,
@@ -1283,27 +1318,69 @@ export function shouldSwitchToSelectionTarget(params: {
       params.currentIndex,
     )
   ) {
-    return false;
+    return { kind: "stay" };
   }
-  return !withinSelectionCooldown(params.record);
+  const ageMs = promptCacheAgeMs(params.record, currentUsage.id);
+  if (ageMs !== undefined) {
+    return { kind: "held-for-cache", ageMs };
+  }
+  return withinSelectionCooldown(params.record) ? { kind: "stay" } : { kind: "optimization" };
+}
+
+/**
+ * Stamp the prompt-cache window anchor: this record's current subscription served a
+ * turn that ended now. Call at turn END only — see `acpx.last_turn_subscription`.
+ */
+export function stampLastTurnSubscription(
+  record: SessionRecord,
+  loadOpts?: SubscriptionLookupOptions,
+): void {
+  const current = currentProfile(record, loadOpts);
+  if (!isSubscriptionProfile(current)) {
+    return;
+  }
+  (record.acpx ??= {}).last_turn_subscription = {
+    subscription: current.id,
+    at: new Date().toISOString(),
+  };
+}
+
+// How long ago the last turn on `currentId` ended, or undefined when the session is
+// outside its prompt-cache window: no anchor, an anchor on another subscription, an
+// unparseable or future time, ≥ 1 h old, or a switch at or after it (no turn has
+// warmed the subscription the session is on now).
+function promptCacheAgeMs(record: SessionRecord, currentId: string): number | undefined {
+  const anchor = record.acpx?.last_turn_subscription;
+  if (anchor?.subscription !== currentId) {
+    return undefined;
+  }
+  const at = Date.parse(anchor.at);
+  const ageMs = Date.now() - at;
+  if (!(ageMs >= 0 && ageMs < PROMPT_CACHE_TTL_MS)) {
+    return undefined;
+  }
+  return latestSwitchAt(record, () => true) >= at ? undefined : ageMs;
+}
+
+// The newest parseable `at` among the switch breadcrumbs that `include` keeps;
+// -Infinity when there is none.
+function latestSwitchAt(record: SessionRecord, include: (reason: string) => boolean): number {
+  const options = record.acpx?.session_options;
+  const times = [options?.subscription_switch, options?.account_switch]
+    .filter(
+      (breadcrumb): breadcrumb is NonNullable<typeof breadcrumb> =>
+        breadcrumb !== undefined && include(breadcrumb.reason),
+    )
+    .map((breadcrumb) => Date.parse(breadcrumb.at))
+    .filter((at) => !Number.isNaN(at));
+  return Math.max(Number.NEGATIVE_INFINITY, ...times);
 }
 
 // Read the last auto-selection switch time from the switch breadcrumbs (reason
 // "selection") and test it against the cooldown. Absent / unparseable ⇒ not within
 // cooldown (allow the switch).
 function withinSelectionCooldown(record: SessionRecord): boolean {
-  const options = record.acpx?.session_options;
-  const candidates = [options?.subscription_switch, options?.account_switch].filter(
-    (breadcrumb): breadcrumb is NonNullable<typeof breadcrumb> =>
-      breadcrumb !== undefined && breadcrumb.reason === "selection",
-  );
-  let lastAt = Number.NEGATIVE_INFINITY;
-  for (const breadcrumb of candidates) {
-    const at = Date.parse(breadcrumb.at);
-    if (!Number.isNaN(at) && at > lastAt) {
-      lastAt = at;
-    }
-  }
+  const lastAt = latestSwitchAt(record, (reason) => reason === "selection");
   if (lastAt === Number.NEGATIVE_INFINITY) {
     return false;
   }
