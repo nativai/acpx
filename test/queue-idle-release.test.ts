@@ -13,7 +13,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  BACKGROUND_TASK_IDLE_RELEASE_HOLD_MS,
   DEFAULT_OWNER_IDLE_RELEASE_MS,
   normalizeOwnerIdleReleaseMs,
 } from "../src/cli/session/contracts.js";
@@ -43,6 +42,7 @@ function input(overrides: Partial<DecideIdleOwnerReleaseInput> = {}): DecideIdle
     liveBackgroundTaskCount: 0,
     deployDiffers: () => false,
     outputStyleDiffers: () => false,
+    recordClosed: () => false,
     ...overrides,
   };
 }
@@ -395,12 +395,13 @@ test("P2 #17 cadence: a provably-idle owner IS released, and the clock is unchan
 });
 
 // ---------------------------------------------------------------------------
-// brick://a81e16a1 (2026-10-28) — 5-MIN DEFAULT + BACKGROUND-TASK HOLD.
-// Daniel moved the default idle-memory release from 30 min to 5 min. An owner
-// whose adapter still holds live background tasks keeps the old 30-min window,
-// because a release kills them and a silent background job never resets the
-// clock. These cases run against the REAL default (normalizeOwnerIdleReleaseMs of
-// an unset env), so a default that drifts away from 5 min reds them.
+// brick://a81e16a1 (2026-10-28) — 5-MIN DEFAULT, and brick://0c593c10
+// (2026-10-29) — A LIVE BACKGROUND TASK IS NEVER RELEASED. Daniel moved the default
+// idle-memory release from 30 min to 5 min, then decided that a session whose
+// adapter still holds a live background task is RUNNING: it closes the shared
+// gate for every reason, with no time cap (8f539d53's 30-min floor is gone). These
+// cases run against the REAL default (normalizeOwnerIdleReleaseMs of an unset
+// env), so a default that drifts away from 5 min reds them.
 // ---------------------------------------------------------------------------
 const MIN = 60_000;
 const REAL_DEFAULT_MS = normalizeOwnerIdleReleaseMs(undefined);
@@ -435,85 +436,187 @@ test("a81e16a1 #1: with no background task an idle owner is released at 5 min, n
   });
 });
 
-test("a81e16a1 #2: a live background task holds the owner between 5 and 30 min", async () => {
-  assert.equal(BACKGROUND_TASK_IDLE_RELEASE_HOLD_MS, 30 * MIN);
-  for (const idleForMs of [5 * MIN, 6 * MIN, 15 * MIN, 30 * MIN - 1]) {
-    for (const liveBackgroundTaskCount of [1, 3]) {
+// Idle ages from just past the 5-min default to a week, the ones 8f539d53 released
+// at (30 min) and the T9 self-test checkpoint (35 min) included.
+const BACKGROUND_IDLE_AGES = [5 * MIN, 30 * MIN, 35 * MIN, 24 * 60 * MIN, 7 * 24 * 60 * MIN];
+
+// The three release reasons, each made true on its own. The thunks count their
+// calls: with a live task the gate must refuse BEFORE either is consulted.
+function everyReason(): Array<{
+  reason: "idle-memory" | "deploy-staleness" | "output-style-change";
+  overrides: Partial<DecideIdleOwnerReleaseInput>;
+  consulted: () => number;
+}> {
+  let deployCalls = 0;
+  let styleCalls = 0;
+  const deployDiffers = () => {
+    deployCalls += 1;
+    return true;
+  };
+  const outputStyleDiffers = () => {
+    styleCalls += 1;
+    return true;
+  };
+  return [
+    { reason: "idle-memory", overrides: {}, consulted: () => 0 },
+    { reason: "deploy-staleness", overrides: { deployDiffers }, consulted: () => deployCalls },
+    {
+      reason: "output-style-change",
+      overrides: { outputStyleDiffers },
+      consulted: () => styleCalls,
+    },
+  ];
+}
+
+test("0c593c10 #1: a live background task blocks EVERY release reason at ANY idle age — no time cap", async () => {
+  for (const { reason, overrides, consulted } of everyReason()) {
+    for (const idleForMs of BACKGROUND_IDLE_AGES) {
+      for (const liveBackgroundTaskCount of [1, 3]) {
+        assert.deepEqual(
+          await decideIdleOwnerRelease(
+            prodIdle(idleForMs, { ...overrides, liveBackgroundTaskCount }),
+          ),
+          { release: false },
+          `${reason}: held at ${idleForMs}ms idle with ${liveBackgroundTaskCount} live task(s)`,
+        );
+      }
+    }
+    assert.equal(consulted(), 0, `${reason}: the gate refuses before the reason is consulted`);
+  }
+});
+
+test("0c593c10 #2: control — WITHOUT a live task the same inputs release for each reason, unchanged", async () => {
+  for (const { reason, overrides } of everyReason()) {
+    for (const idleForMs of BACKGROUND_IDLE_AGES) {
       assert.deepEqual(
-        await decideIdleOwnerRelease(prodIdle(idleForMs, { liveBackgroundTaskCount })),
-        { release: false },
-        `held at ${idleForMs}ms idle with ${liveBackgroundTaskCount} live background task(s)`,
+        await decideIdleOwnerRelease(
+          prodIdle(idleForMs, { ...overrides, liveBackgroundTaskCount: 0 }),
+        ),
+        { release: true, reason },
+        `${reason} at ${idleForMs}ms idle`,
       );
     }
   }
 });
 
-test("a81e16a1 #3: a live background task is released at 30 min — the hold is a floor, not forever", async () => {
-  for (const idleForMs of [30 * MIN, 45 * MIN]) {
+test("0c593c10 #4: a CLOSED record lifts the hold — released by the normal rules; an OPEN one stays held", async () => {
+  const closed = (value: boolean) => () => value;
+  for (const idleForMs of [5 * MIN, 35 * MIN]) {
     assert.deepEqual(
-      await decideIdleOwnerRelease(prodIdle(idleForMs, { liveBackgroundTaskCount: 1 })),
+      await decideIdleOwnerRelease(
+        prodIdle(idleForMs, { liveBackgroundTaskCount: 1, recordClosed: closed(true) }),
+      ),
       { release: true, reason: "idle-memory" },
-      `released at ${idleForMs}ms idle`,
+      `closed record + live task at ${idleForMs}ms ⇒ released`,
+    );
+    assert.deepEqual(
+      await decideIdleOwnerRelease(
+        prodIdle(idleForMs, { liveBackgroundTaskCount: 1, recordClosed: closed(false) }),
+      ),
+      { release: false },
+      `open record + live task at ${idleForMs}ms ⇒ held`,
     );
   }
+  // Closed lifts only the HOLD: the rest of the gate and the idle clock still apply.
+  assert.deepEqual(
+    await decideIdleOwnerRelease(
+      prodIdle(5 * MIN - 1, { liveBackgroundTaskCount: 1, recordClosed: closed(true) }),
+    ),
+    { release: false },
+    "closed, but the 5-min clock has not run out",
+  );
+  assert.deepEqual(
+    await decideIdleOwnerRelease(
+      prodIdle(35 * MIN, {
+        liveBackgroundTaskCount: 1,
+        hasActiveTurn: true,
+        recordClosed: closed(true),
+      }),
+    ),
+    { release: false },
+    "closed, but a turn is active",
+  );
 });
 
-test("a81e16a1 #4: the ACPX_OWNER_IDLE_RELEASE_MS override still wins", async () => {
+test("0c593c10 #5: the closed-record read is lazy — never consulted without a live task or when the gate already refuses", async () => {
+  let reads = 0;
+  const recordClosed = () => {
+    reads += 1;
+    return true;
+  };
+  await decideIdleOwnerRelease(prodIdle(35 * MIN, { liveBackgroundTaskCount: 0, recordClosed }));
+  await decideIdleOwnerRelease(
+    prodIdle(35 * MIN, { liveBackgroundTaskCount: 1, hasActiveTurn: true, recordClosed }),
+  );
+  await decideIdleOwnerRelease(
+    prodIdle(35 * MIN, {
+      liveBackgroundTaskCount: 1,
+      lastIdleDrainActivityAt: BASE_NOW + 34 * MIN,
+      recordClosed,
+    }),
+  );
+  assert.equal(reads, 0, "no record read on any of the three paths");
+  await decideIdleOwnerRelease(prodIdle(35 * MIN, { liveBackgroundTaskCount: 1, recordClosed }));
+  assert.equal(reads, 1, "read exactly once when the gate holds and a task is live");
+});
+
+test("a81e16a1 #4: the ACPX_OWNER_IDLE_RELEASE_MS override still wins — and never outranks a live task", async () => {
   // Shorter than the default, no background task: the override governs, not 5 min.
   const twoMin = normalizeOwnerIdleReleaseMs(2 * MIN);
   assert.deepEqual(await decideIdleOwnerRelease(prodIdle(2 * MIN, { idleReleaseMs: twoMin })), {
     release: true,
     reason: "idle-memory",
   });
-  // Longer than the hold: max() keeps the override, with or without a background task.
+  // Longer than the default: honoured exactly.
   const hour = normalizeOwnerIdleReleaseMs(60 * MIN);
+  assert.deepEqual(await decideIdleOwnerRelease(prodIdle(45 * MIN, { idleReleaseMs: hour })), {
+    release: false,
+  });
+  assert.deepEqual(await decideIdleOwnerRelease(prodIdle(60 * MIN, { idleReleaseMs: hour })), {
+    release: true,
+    reason: "idle-memory",
+  });
+  // With a live task neither a short nor a long override releases, at any age.
+  for (const idleReleaseMs of [twoMin, hour]) {
+    assert.deepEqual(
+      await decideIdleOwnerRelease(
+        prodIdle(24 * 60 * MIN, { idleReleaseMs, liveBackgroundTaskCount: 1 }),
+      ),
+      { release: false },
+    );
+  }
+});
+
+test("a81e16a1 #5: override 0 stays OFF for idle-memory, task or not", async () => {
   for (const liveBackgroundTaskCount of [0, 1]) {
     assert.deepEqual(
       await decideIdleOwnerRelease(
-        prodIdle(45 * MIN, { idleReleaseMs: hour, liveBackgroundTaskCount }),
+        prodIdle(10 * 60 * MIN, { idleReleaseMs: 0, liveBackgroundTaskCount }),
       ),
       { release: false },
-      `60-min override not yet reached at 45 min (bg=${liveBackgroundTaskCount})`,
-    );
-    assert.deepEqual(
-      await decideIdleOwnerRelease(
-        prodIdle(60 * MIN, { idleReleaseMs: hour, liveBackgroundTaskCount }),
-      ),
-      { release: true, reason: "idle-memory" },
-      `60-min override reached (bg=${liveBackgroundTaskCount})`,
     );
   }
-  // A short override with a background task is still floored at the hold.
-  assert.deepEqual(
-    await decideIdleOwnerRelease(
-      prodIdle(10 * MIN, { idleReleaseMs: twoMin, liveBackgroundTaskCount: 1 }),
-    ),
-    { release: false },
-  );
 });
 
-test("a81e16a1 #5: override 0 stays OFF with a background task — the hold must not re-enable it", async () => {
-  assert.deepEqual(
-    await decideIdleOwnerRelease(
-      prodIdle(10 * 60 * MIN, { idleReleaseMs: 0, liveBackgroundTaskCount: 1 }),
-    ),
-    { release: false },
-  );
-});
-
-test("a81e16a1 #6: the hold is idle-memory only — deploy-staleness and output-style still release", async () => {
-  assert.deepEqual(
-    await decideIdleOwnerRelease(
-      prodIdle(1 * MIN, { liveBackgroundTaskCount: 1, deployDiffers: () => true }),
-    ),
-    { release: true, reason: "deploy-staleness" },
-  );
-  assert.deepEqual(
-    await decideIdleOwnerRelease(
-      prodIdle(1 * MIN, { liveBackgroundTaskCount: 1, outputStyleDiffers: () => true }),
-    ),
-    { release: true, reason: "output-style-change" },
-  );
+test("0c593c10 #3: once the last task ends, the normal rules apply — the 5-min clock and the quiescence window", async () => {
+  // The task ran 40 min; its end arrived as a notification turn that completed at
+  // T+40 min (the clock restarts there), or as inter-turn relay at T+40 min (the
+  // 15-min quiescence window applies from there).
+  const ended = BASE_NOW + 40 * MIN;
+  const afterTurn = (minutes: number) =>
+    prodIdle(0, { now: BASE_NOW + minutes * MIN, lastTaskCompletedAt: ended });
+  assert.deepEqual(await decideIdleOwnerRelease(afterTurn(44)), { release: false });
+  assert.deepEqual(await decideIdleOwnerRelease(afterTurn(45)), {
+    release: true,
+    reason: "idle-memory",
+  });
+  const afterRelay = (minutes: number) =>
+    prodIdle(0, { now: BASE_NOW + minutes * MIN, lastIdleDrainActivityAt: ended });
+  assert.deepEqual(await decideIdleOwnerRelease(afterRelay(54)), { release: false });
+  assert.deepEqual(await decideIdleOwnerRelease(afterRelay(55)), {
+    release: true,
+    reason: "idle-memory",
+  });
 });
 
 test("a81e16a1 #7: the shared gate is unchanged — an active turn or recent relay blocks the 5-min release", async () => {

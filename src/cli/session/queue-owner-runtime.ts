@@ -64,7 +64,6 @@ import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
 import { createBackgroundTaskTracker } from "./background-task-tracker.js";
 import { resolveSessionBrickContext } from "./brick-link.js";
 import {
-  BACKGROUND_TASK_IDLE_RELEASE_HOLD_MS,
   DEFAULT_QUEUE_OWNER_TTL_MS,
   normalizeOwnerIdleReleaseMs,
   normalizeQueueOwnerTtlMs,
@@ -679,9 +678,15 @@ export type DecideIdleOwnerReleaseInput = {
   lastTaskCompletedAt: number;
   quiescenceWindowMs: number;
   idleReleaseMs: number;
-  // brick://a81e16a1 — background tasks the adapter still holds. Above zero, the
-  // idle-memory timeout is floored at BACKGROUND_TASK_IDLE_RELEASE_HOLD_MS.
+  // brick://0c593c10 — background tasks the adapter still holds. Above zero the
+  // shared gate stays CLOSED: no release for any reason, at any idle age —
+  // unless the session's record is closed (`recordClosed`).
   liveBackgroundTaskCount: number;
+  // brick://0c593c10 (ad6ba1c2 design) — whether the session RECORD is closed.
+  // Lazy, like outputStyleDiffers: it re-reads the record, and is consulted only
+  // when everything else in the gate holds AND a task is live, so the common
+  // path never pays for it.
+  recordClosed: () => boolean | Promise<boolean>;
   // Lazy so the deploy-file read happens ONLY after the safety gate already holds
   // (preserves the W13-24-10 short-circuit cost-ordering). Pure helper otherwise.
   deployDiffers: () => boolean | Promise<boolean>;
@@ -697,7 +702,7 @@ export type DecideIdleOwnerReleaseInput = {
 // how the queue module factors isRecoverableQueueOwnerState / classifyQueueOwnerState.
 //
 // Separation of concerns — state it once, here, so no future edit blurs it:
-//   * The SHARED GATE (`idleAndQuiescent`) decides WHETHER a maybe-active owner is
+//   * The SHARED GATE (`ownerIsIdleAndQuiescent`) decides WHETHER a maybe-active owner is
 //     protected. It is the North-Star invariant and is evaluated ONCE so a future
 //     edit cannot relax it for one release reason while keeping it for the other.
 //   * The accumulated-idle CLOCK (`idleReleaseMs`) decides only WHEN an owner that
@@ -731,10 +736,13 @@ export function idleCheckTimings(idleWindowMs: number | undefined): {
   };
 }
 
-export async function decideIdleOwnerRelease(
-  input: DecideIdleOwnerReleaseInput,
-): Promise<IdleOwnerReleaseDecision> {
-  // SHARED safety gate — BOTH reasons require provably-idle + quiescent:
+/**
+ * The SHARED safety gate, evaluated ONCE for every release reason — whether a
+ * maybe-active owner is protected. Factored out of decideIdleOwnerRelease so the
+ * gate stays one expression a reader can audit in one place.
+ */
+async function ownerIsIdleAndQuiescent(input: DecideIdleOwnerReleaseInput): Promise<boolean> {
+  // EVERY reason requires provably-idle + quiescent:
   //   - ttlMs !== 0    : `--ttl 0` is the master never-recycle opt-out
   //                      (belt-and-suspenders; nextTask(undefined) never times out,
   //                      so the idle branch is structurally unreachable at ttl 0).
@@ -743,11 +751,41 @@ export async function decideIdleOwnerRelease(
   //                      tool call keeps the turn active → the owner is never idle.
   //   - quiescent      : no inter-turn idle-drain relay within the check cadence,
   //                      so an owner relaying background work is never torn down.
+  //   - no live background task (brick://0c593c10, Daniel 2026-10-29): a release
+  //                      closes the adapter, and that KILLS every `run_in_background`
+  //                      Bash, Monitor and background Agent it holds. A live task
+  //                      means the session is still running, exactly like an active
+  //                      turn, so it closes the gate for EVERY reason — idle-memory,
+  //                      deploy-staleness, output-style-change — with NO time cap.
+  //                      (8f539d53 only floored the idle-memory clock at 30 min and
+  //                      then killed the task; the other two reasons ignored it.)
+  //                      ⚠️ ACCEPTED TRADE-OFF: a task that never ends — a Monitor
+  //                      following a log, a server started in the background — keeps
+  //                      this session's three processes alive until it ends or the
+  //                      session is closed (an explicit close: brick ad6ba1c2). Once
+  //                      the last task ends, the normal rules apply unchanged: the
+  //                      idle clock and the quiescence window after the task's
+  //                      notification turn.
+  //                      ⚠️ EXCEPT A CLOSED RECORD: the hold never applies to a
+  //                      session whose record is closed. In a mixed-version window
+  //                      (a new acpx refusing a close, an old acpx-ui stamping
+  //                      `closed` anyway) a closed session's owner with a never-
+  //                      ending Monitor would otherwise be held forever; released,
+  //                      its reap ends the tasks, which is what closing means.
   const idleAndQuiescent =
     input.ttlMs !== 0 &&
     !input.hasActiveTurn &&
     input.now - input.lastIdleDrainActivityAt >= input.quiescenceWindowMs;
   if (!idleAndQuiescent) {
+    return false;
+  }
+  return input.liveBackgroundTaskCount === 0 || (await input.recordClosed());
+}
+
+export async function decideIdleOwnerRelease(
+  input: DecideIdleOwnerReleaseInput,
+): Promise<IdleOwnerReleaseDecision> {
+  if (!(await ownerIsIdleAndQuiescent(input))) {
     return { release: false };
   }
 
@@ -778,23 +816,12 @@ export async function decideIdleOwnerRelease(
   if (
     input.idleReleaseMs > 0 &&
     input.now - Math.max(input.lastTaskCompletedAt, input.lastIdleDrainActivityAt) >=
-      idleMemoryReleaseAfterMs(input)
+      input.idleReleaseMs
   ) {
     return { release: true, reason: "idle-memory" };
   }
 
   return { release: false };
-}
-
-// brick://a81e16a1 — the background-task hold. Applies to the idle-memory path
-// ONLY: output-style-change and deploy-staleness above stay unaffected, and the
-// shared gate is untouched. ⚠️ Callers must keep the `idleReleaseMs > 0` check on
-// the RAW value: flooring 0 to 30 min here would silently re-enable a release the
-// operator disabled (test "a81e16a1 #5").
-function idleMemoryReleaseAfterMs(input: DecideIdleOwnerReleaseInput): number {
-  return input.liveBackgroundTaskCount > 0
-    ? Math.max(input.idleReleaseMs, BACKGROUND_TASK_IDLE_RELEASE_HOLD_MS)
-    : input.idleReleaseMs;
 }
 
 /** `5m02s` — whole minutes, then zero-padded seconds (floored). */
@@ -1042,6 +1069,16 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   const outputStyleChangeIsPending = async (): Promise<boolean> => {
     try {
       return outputStyleChangePending(await resolveSessionRecord(options.sessionId));
+    } catch {
+      return false;
+    }
+  };
+
+  // brick://0c593c10 — the closed-record exception to the background-task hold.
+  // An unreadable record reads as OPEN: on doubt the hold keeps the tasks alive.
+  const sessionRecordIsClosed = async (): Promise<boolean> => {
+    try {
+      return (await resolveSessionRecord(options.sessionId)).closed === true;
     } catch {
       return false;
     }
@@ -1394,6 +1431,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           // preserving the W13-24-10 short-circuit cost-ordering.
           deployDiffers: deployedBuildDiffersFromOwner,
           outputStyleDiffers: outputStyleChangeIsPending,
+          recordClosed: sessionRecordIsClosed,
         });
         if (!decision.release) {
           // Current code & within the idle window, OR busy / active / relaying
