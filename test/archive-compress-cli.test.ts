@@ -778,6 +778,34 @@ test("AC-2 restore of an id with a corrupt .zst: refused WHOLE — skipped ARCHI
   });
 });
 
+test("AC-2 restore with a TRUNCATED .zst (footer gone): skipped ARCHIVED_FILE_CORRUPT (footer), other ids still restored", async () => {
+  await withTempHome("acpx-zst-cli-", async (home) => {
+    const bad = await writeArchivedSession(home, "4e4e4e4e-1111-4222-8333-444455556666");
+    const good = await writeArchivedSession(home, "5f5f5f5f-1111-4222-8333-444455556666");
+    const result0 = await runCli(home, COMPRESS_INIT);
+    assert.equal(result0.code, 0, result0.stderr);
+    const zst = path.join(bad.archive, zstNameFor(`${bad.id}.messages.ndjson`));
+    const truncated = (await fs.readFile(zst)).subarray(0, -5);
+    await fs.writeFile(zst, truncated);
+    const result = await runCli(home, ["sessions", "restore", bad.id, good.id, "--json"]);
+    assert.equal(result.code, 1, result.stderr);
+    const body = JSON.parse(result.stdout) as {
+      restored: { id: string }[];
+      skipped: { id: string; reason: string; check: string }[];
+    };
+    assert.deepEqual(
+      body.skipped.map(({ id, reason, check }) => ({ id, reason, check })),
+      [{ id: bad.id, reason: "ARCHIVED_FILE_CORRUPT", check: "footer" }],
+    );
+    assert.deepEqual(
+      body.restored.map((entry) => entry.id),
+      [good.id],
+    );
+    assert.ok((await listing(bad.hot)).every((name) => !name.startsWith(bad.id)));
+    assert.equal(sha(await fs.readFile(zst)), sha(truncated));
+  });
+});
+
 test("AC-7(c) restore with both forms present: the hot dir gets the PLAIN's bytes", async () => {
   await withFixture(async (fixture) => {
     const name = `${fixture.id}.messages.ndjson`;
@@ -983,6 +1011,32 @@ test("--thaw refusals (exit 2, JSON error on stdout, --to left empty): non-empty
         "not-in-archive",
       );
     } finally {
+      await removeTempHome(to);
+    }
+  });
+});
+
+test("--json on an UNEXPECTED error still puts a JSON document on stdout (thaw into a read-only --to: EACCES)", async () => {
+  await withFixture(async (fixture) => {
+    const to = await fs.mkdtemp(path.join(fixture.home, "..", "thaw-"));
+    try {
+      await fs.chmod(to, 0o500);
+      const result = await runCli(fixture.home, [
+        "sessions",
+        "archive",
+        "--thaw",
+        fixture.id,
+        "--to",
+        to,
+        "--json",
+      ]);
+      assert.notEqual(result.code, 0);
+      const body = JSON.parse(result.stdout) as { error: { code: string } };
+      assert.equal(body.error.code, "EACCES");
+      await fs.chmod(to, 0o700);
+      assert.deepEqual(await listing(to), []);
+    } finally {
+      await fs.chmod(to, 0o700);
       await removeTempHome(to);
     }
   });

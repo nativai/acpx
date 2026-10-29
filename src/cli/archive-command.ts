@@ -243,8 +243,28 @@ export async function handleSessionsArchive(
       process.exitCode = ARCHIVE_EXIT_REFUSED;
       return;
     }
+    writeUnexpectedErrorJson(flags.json === true, error);
     throw error;
   }
+}
+
+/**
+ * ⚠️ `--json` MEANS A DOCUMENT ON STDOUT FOR EVERY OUTCOME, AN UNEXPECTED ERROR INCLUDED
+ * (cli-contract.md). atrium maps stdout; a bare stderr line followed by exit 1 reads to it
+ * as an unexplained failure (HoD/Lane B, 2026-10-29: a corrupt `.zst` during restore
+ * produced zero bytes on stdout). The error still propagates to the normal CLI handler.
+ */
+function writeUnexpectedErrorJson(json: boolean, error: unknown): void {
+  if (!json) {
+    return;
+  }
+  const code = (error as { code?: unknown } | undefined)?.code;
+  writeJson({
+    error: {
+      code: typeof code === "string" ? code : "internal-error",
+      message: error instanceof Error ? error.message : String(error),
+    },
+  });
 }
 
 async function dispatchArchive(flags: SessionsArchiveFlags, command: Command): Promise<number> {
@@ -996,6 +1016,7 @@ export async function handleSessionsRestore(
   } catch (error) {
     const refusal = asRestoreRefusal(error);
     if (!refusal) {
+      writeUnexpectedErrorJson(flags.json === true, error);
       throw error;
     }
     if (flags.json) {

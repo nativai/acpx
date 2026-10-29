@@ -713,7 +713,16 @@ async function planRestoreOrSkip(
     const detail = clobbers.slice(0, 3).join(", ");
     return { skip: { id: safeId, reason: "already-in-hot-dir", detail } };
   }
-  const planned = await planRestoreFiles(context.archiveDir, logical);
+  // ⚠️ PLANNING CAN ALREADY MEET CORRUPTION: a `.zst` whose footer is gone (truncated,
+  // 0-byte) fails `statArchivedFile`. Unhandled, that aborted the WHOLE restore with a
+  // bare error and no `skipped` row — found by the self-test, pinned by the
+  // "truncated .zst" restore test.
+  let planned: RestorePlanEntry[];
+  try {
+    planned = await planRestoreFiles(context.archiveDir, logical);
+  } catch (error) {
+    return { skip: corruptSkipOrThrow(safeId, error) };
+  }
   if (planned.length === 0) {
     return { skip: { id: safeId, reason: "nothing-to-move" } };
   }
@@ -731,15 +740,18 @@ async function stageOrSkip(
   try {
     return { staged: await stageRestoreZsts(context.archiveDir, planned) };
   } catch (error) {
-    if (!isArchivedFileCorrupt(error)) {
-      throw error;
-    }
-    const file = path.basename(error.file).replace(/\.zst$/, "");
-    const detail = `${file} (${error.check})`;
-    return {
-      skip: { id: safeId, reason: "ARCHIVED_FILE_CORRUPT", detail, file, check: error.check },
-    };
+    return { skip: corruptSkipOrThrow(safeId, error) };
   }
+}
+
+/** A corrupt `.zst` skips THIS id (cli-contract §2); anything else is a real error. */
+function corruptSkipOrThrow(safeId: string, error: unknown): RestoreSkip {
+  if (!isArchivedFileCorrupt(error)) {
+    throw error;
+  }
+  const file = path.basename(error.file).replace(/\.zst$/, "");
+  const detail = `${file} (${error.check})`;
+  return { id: safeId, reason: "ARCHIVED_FILE_CORRUPT", detail, file, check: error.check };
 }
 
 async function restoreOneId(
