@@ -1,6 +1,6 @@
 import "./install-owner-reaper.js";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import net from "node:net";
@@ -19,7 +19,7 @@ import {
   templateRetryArgs,
 } from "../src/cli/background-task-gate.js";
 import { tryQueryBackgroundTasksOnRunningOwner } from "../src/cli/queue/ipc.js";
-import { readQueueOwnerProcessIdentity } from "../src/cli/queue/lease-store.js";
+import { isProcessAlive, readQueueOwnerProcessIdentity } from "../src/cli/queue/lease-store.js";
 import { parseQueueOwnerMessage, parseQueueRequest } from "../src/cli/queue/messages.js";
 import { queueLockFilePath, queueSharedSocketDir } from "../src/cli/queue/paths.js";
 import { clearBackgroundTaskChip } from "../src/cli/session/owner-task-reap.js";
@@ -636,6 +636,7 @@ test("G3 / AC8 (v3): an OLD owner (QUEUE_REQUEST_INVALID) fails open — not aut
       try {
         assert.deepEqual(await tryQueryBackgroundTasksOnRunningOwner(sessionId), {
           queried: false,
+          ownerUnanswered: true,
         });
       } finally {
         process.env.HOME = prev;
@@ -667,6 +668,11 @@ test("G3 / AC8 (v3): an OLD owner (QUEUE_REQUEST_INVALID) fails open — not aut
       assert.ok(!aliveAs(rig.pids.ownerPid, rig.ticks.ownerPid), "the old owner was stopped");
       // RV-5, by design: an old owner's tasks orphan exactly as today (the rig kills them below).
       assert.ok(TASK_KEYS.every((key) => aliveAs(rig.pids[key], rig.ticks[key])));
+      // HoD R2-8: ...but never silently. The JSON carries no `warnings` field; stderr does, in json too.
+      assert.match(
+        closed.stderr,
+        /\[acpx\] WARNING: could not check g3-old's background tasks \(its owner runs an older acpx or did not answer\); any it had may still be running \(brick ad6ba1c2\)\n/,
+      );
     } finally {
       rig.kill();
     }
@@ -788,6 +794,51 @@ test("G1 negative: an owner with NO live tasks is not refused (plain close works
       const line = jsonLines(closed.stdout).find((entry) => entry.action === "session_closed");
       const bg = line?.backgroundTasks as Record<string, unknown>;
       assert.deepEqual([bg.queried, bg.killed, bg.tasks], [true, false, []]);
+      assert.doesNotMatch(
+        closed.stderr,
+        /could not check/,
+        "an answering owner is checked: no R2-8 warning",
+      );
+    } finally {
+      rig.kill();
+    }
+  });
+});
+
+// HoD Q4 path C: recover leaves the session OPEN, so after it reaped tasks the stream's last
+// `_claude/backgroundTasks` line must be the empty set (the "⧖ running" chip clears). The negative: a
+// recover that reaped nothing (no owner) writes no line.
+test("Q4 path C: a recover that reaped tasks clears the chip; one that reaped nothing writes no line", async (t) => {
+  if (!linux) {
+    t.skip("linux /proc");
+    return;
+  }
+  await withHome(async (homeDir) => {
+    const stream = (id: string) => path.join(homeDir, ".acpx", "sessions", `${id}.stream.ndjson`);
+    await writeRecord(homeDir, "q4c-idle");
+    const idle = await runCli(["--format", "json", "sessions", "recover", "q4c-idle"], homeDir);
+    assert.equal(idle.code, 0, idle.stderr);
+    assert.equal(fs.existsSync(stream("q4c-idle")), false, "nothing reaped ⇒ no chip line");
+
+    const sessionId = "q4c-live";
+    await writeRecord(homeDir, sessionId);
+    const rig = await startOwnerRig(homeDir, "owner", sessionId);
+    try {
+      const recovered = await runCli(
+        ["--format", "json", "sessions", "recover", sessionId],
+        homeDir,
+      );
+      assert.equal(recovered.code, 0, recovered.stderr);
+      const result = jsonLines(recovered.stdout).find((line) => "reap" in line);
+      assert.ok(result, recovered.stdout);
+      assert.equal((result.reap as { taskProcesses: number }).taskProcesses, 4);
+      const lines = (await fsp.readFile(stream(sessionId), "utf8")).trim().split("\n");
+      const last = JSON.parse(lines.at(-1) ?? "") as {
+        method: string;
+        params: { sessionId: string; tasks: unknown[] };
+      };
+      assert.equal(last.method, "_claude/backgroundTasks");
+      assert.deepEqual([last.params.sessionId, last.params.tasks], [sessionId, []]);
     } finally {
       rig.kill();
     }
@@ -864,7 +915,17 @@ test("C4 fail-open: no lease, and an owner that accepts but never answers, both 
       // accept, read nothing, answer nothing — a wedged owner
     });
     try {
+      // No owner to ask is not "unanswered" (R2-8): neither no lease nor a stale lease of a dead pid.
       assert.deepEqual(await tryQueryBackgroundTasksOnRunningOwner("c4-none"), { queried: false });
+      const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
+      assert.ok(deadPid && !isProcessAlive(deadPid));
+      await writeQueueOwnerLock({
+        lockPath: queueLockFilePath("c4-stale", homeDir),
+        pid: deadPid,
+        sessionId: "c4-stale",
+        socketPath: path.join(queueSharedSocketDir(homeDir), "c4-stale.sock"),
+      });
+      assert.deepEqual(await tryQueryBackgroundTasksOnRunningOwner("c4-stale"), { queried: false });
       const sessionId = "c4-silent";
       const socketPath = path.join(queueSharedSocketDir(homeDir), `${sessionId}.sock`);
       await listenServer(server, socketPath);
@@ -880,6 +941,7 @@ test("C4 fail-open: no lease, and an owner that accepts but never answers, both 
       const startedAt = Date.now();
       assert.deepEqual(await tryQueryBackgroundTasksOnRunningOwner(sessionId, 400), {
         queried: false,
+        ownerUnanswered: true,
       });
       assert.ok(Date.now() - startedAt < 1_500, "the deadline bounds connect AND answer");
     } finally {

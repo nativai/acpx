@@ -616,6 +616,8 @@ test("L1.11 close prints the record-derived closed state read back from disk", a
       homeDir,
     );
     assert.equal(jsonResult.code, 0, `stderr was:\n${jsonResult.stderr}`);
+    // brick ad6ba1c2 R2-8: no owner at all is not an unanswered owner — the idle close stays quiet.
+    assert.doesNotMatch(jsonResult.stderr, /could not check/);
     const payload = JSON.parse(jsonResult.stdout.trim()) as {
       recordClosed: unknown;
       recordClosedAt: unknown;

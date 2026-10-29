@@ -340,6 +340,23 @@ function reapOutcomeClause(reap: ReapReport): string {
     : `task processes could not be verified (${reap.skipped ?? "not measured"})`;
 }
 
+/**
+ * HoD R2-8 — an owner that held the lease but could not be asked (older acpx, foreign, wedged) leaves
+ * the close with no task set, so nothing was proven or reaped: never silent, in every format.
+ */
+export function warnUncheckedBackgroundTasks(
+  sessionId: string,
+  answer: BackgroundTasksQuery,
+): void {
+  if (answer.queried || answer.ownerUnanswered !== true) {
+    return;
+  }
+  process.stderr.write(
+    `[acpx] WARNING: could not check ${sessionId}'s background tasks (its owner runs an older ` +
+      `acpx or did not answer); any it had may still be running (brick ad6ba1c2)\n`,
+  );
+}
+
 /** The forced-close summary (text mode) plus the survivor and late-task WARNINGs (any format). */
 export function reportBackgroundTaskOutcome(
   sessionId: string,

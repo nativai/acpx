@@ -3,6 +3,7 @@ import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { QueueConnectionError, QueueProtocolError } from "../../errors.js";
 import { incrementPerfCounter } from "../../perf-metrics.js";
 import { classifyRecordedIdentity, identityScope } from "../../process-identity.js";
+import { isProcessDefinitelyDead } from "../../process-liveness.js";
 import type { DepthProjection } from "../../session/depth-projection.js";
 import { resolveSessionRecord } from "../../session/persistence.js";
 import type {
@@ -1151,7 +1152,17 @@ export async function tryQueryActiveTurnOnRunningOwner(
 /** brick ad6ba1c2 (Contract C4) — one hard deadline over connect AND answer. */
 export const BACKGROUND_TASKS_QUERY_DEADLINE_MS = 2_000;
 
-export type BackgroundTasksQuery = ({ queried: true } & BackgroundTaskAnswer) | { queried: false };
+export type BackgroundTasksQuery =
+  | ({ queried: true } & BackgroundTaskAnswer)
+  | {
+      queried: false;
+      /**
+       * A live (or foreign) owner held the lease and gave no answer: an older acpx, another pod's
+       * owner, or a wedged one. Its tasks could not be checked, so a close WARNS (HoD R2-8).
+       * Absent when there was no owner to ask at all.
+       */
+      ownerUnanswered?: true;
+    };
 
 function isForeignOwner(owner: QueueOwnerRecord): boolean {
   const recorded = classifyRecordedIdentity(owner.processIdentity);
@@ -1199,13 +1210,20 @@ export async function tryQueryBackgroundTasksOnRunningOwner(
 ): Promise<BackgroundTasksQuery> {
   const startedAt = Date.now();
   let timer: NodeJS.Timeout | undefined;
+  // Pessimistic: until the lease is read and shows no live owner, a missing answer is unanswered.
+  let ownerAbsent = false;
   const deadline = new Promise<undefined>((resolve) => {
     timer = setTimeout(() => resolve(undefined), deadlineMs);
     timer.unref();
   });
   const query = (async () => {
     const owner = await readQueueOwnerRecord(sessionId);
-    if (!owner || isForeignOwner(owner)) {
+    // Only ESRCH proves the owner gone; a foreign pid is another namespace's and is never judged here.
+    if (!owner || (!isForeignOwner(owner) && isProcessDefinitelyDead(owner.pid))) {
+      ownerAbsent = true;
+      return undefined;
+    }
+    if (isForeignOwner(owner)) {
       return undefined;
     }
     const remaining = Math.max(1, deadlineMs - (Date.now() - startedAt));
@@ -1213,7 +1231,10 @@ export async function tryQueryBackgroundTasksOnRunningOwner(
   })().catch(() => undefined);
   const list = await Promise.race([query, deadline]);
   clearTimeout(timer);
-  return list ? { queried: true, ...list } : { queried: false };
+  if (list) {
+    return { queried: true, ...list };
+  }
+  return ownerAbsent ? { queried: false } : { queried: false, ownerUnanswered: true };
 }
 
 /**

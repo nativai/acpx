@@ -1635,8 +1635,11 @@ function classifySessionOwnerStatus(
 // the in-flight prompt is the caller's job (acpx-ui), not this command's.
 export async function recoverSession(sessionId: string): Promise<QueueOwnerRecoveryResult> {
   const record = await resolveSessionRecord(sessionId);
-  return await recoverQueueOwnerForSession(
+  const result = await recoverQueueOwnerForSession(
     record.acpxRecordId,
     await queryCloserTaskContext(record.acpxRecordId),
   );
+  // HoD Q4, path C: the session stays open, so the killed tasks' "⧖ running" chip is cleared too.
+  await clearBackgroundTaskChipAfterReap(record.acpxRecordId, result.reap);
+  return result;
 }

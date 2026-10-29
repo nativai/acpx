@@ -119,6 +119,7 @@ import {
   reportBackgroundTaskOutcome,
   reportOwnerRecycleReap,
   warnReapSurvivors,
+  warnUncheckedBackgroundTasks,
   type BackgroundTasksJson,
 } from "./background-task-gate.js";
 import type { ResolvedAcpxConfig } from "./config.js";
@@ -2944,6 +2945,7 @@ export async function handleSessionsClose(
     globalFlags.format,
     closed.lateTasks,
   );
+  warnUncheckedBackgroundTasks(record.acpxRecordId, answer);
 
   applyCloseExitCode(closed, record, flags, warnUndeliveredCustody);
 }
@@ -3875,6 +3877,7 @@ export async function handleSessionsTemplate(
     backgroundTasksJson(gate, reap, ownerStopped, lateTasks),
   );
   reportBackgroundTaskOutcome(record.acpxRecordId, gate, reap, globalFlags.format, lateTasks);
+  warnUncheckedBackgroundTasks(record.acpxRecordId, answer);
 }
 
 function templateResultHumanLine(record: SessionRecord, enable: boolean): string {
