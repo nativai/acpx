@@ -637,6 +637,38 @@ test("a81e16a1 r3: the default is Claude-only — a codex record without the fie
   assert.equal(await reconnectOptions(CODEX_COMMAND, { model: "gpt" }, "resume"), "absent");
 });
 
+// brick a81e16a1 (A-R2-model): the caller's CURRENT model replaces the client's
+// start-time `sessionOptions.model`; `null` sends none; `undefined` keeps the copy.
+async function resumeModelWith(currentModelId: string | null | undefined): Promise<unknown> {
+  let options: unknown;
+  await withPrimerScript("printf 'PRIMER-MODEL\\n'", async () => {
+    const captured: CapturedConnection = {};
+    const client = makeClient(SDK_CLAUDE_COMMAND, CREATION_OPTIONS);
+    stubConnection(client, captured);
+    await client.resumeSession(
+      "session-stub",
+      "/tmp/acpx-a81e16a1-model",
+      currentModelId === undefined ? {} : { currentModelId },
+    );
+    options = ((captured.resumeMeta as Record<string, unknown>).claudeCode as { options?: unknown })
+      .options;
+  });
+  return options;
+}
+
+test("a81e16a1 A-R2-model: resume re-sends the CURRENT model, not the start-time one", async () => {
+  assert.deepEqual(await resumeModelWith("sonnet"), { ...CREATION_OPTIONS, model: "sonnet" });
+});
+
+test("a81e16a1 A-R2-model: a current model of null re-sends NO model", async () => {
+  const { model: _dropped, ...withoutModel } = CREATION_OPTIONS;
+  assert.deepEqual(await resumeModelWith(null), withoutModel);
+});
+
+test("a81e16a1 A-R2-model: control — no current model given keeps the client's own copy", async () => {
+  assert.deepEqual(await resumeModelWith(undefined), CREATION_OPTIONS);
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 // brick://968519c3 — THE TWO PRIMER CHANNELS, PINNED AGAINST EACH OTHER.
 //

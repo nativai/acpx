@@ -38,11 +38,12 @@ type FakeClient = {
   resumeSession?: (
     sessionId: string,
     cwd: string,
+    options?: { currentModelId?: string | null },
   ) => Promise<{ agentSessionId?: string; models?: SessionModelState }>;
   loadSessionWithOptions: (
     sessionId: string,
     cwd: string,
-    options: { suppressReplayUpdates: boolean },
+    options: { suppressReplayUpdates: boolean; currentModelId?: string | null },
   ) => Promise<{ agentSessionId?: string; models?: SessionModelState }>;
   createSession: (cwd: string) => Promise<{
     sessionId: string;
@@ -239,7 +240,8 @@ test("connectAndLoadSession replays desired config options after cold session/lo
       loadSessionWithOptions: async (sessionId, loadCwd, options) => {
         assert.equal(sessionId, "load-session");
         assert.equal(loadCwd, cwd);
-        assert.deepEqual(options, { suppressReplayUpdates: true });
+        // brick a81e16a1 (A-R2-model): no desired model on this record ⇒ none re-sent.
+        assert.deepEqual(options, { suppressReplayUpdates: true, currentModelId: null });
         return { agentSessionId: "loaded-runtime-session" };
       },
       createSession: async () => {
@@ -306,7 +308,7 @@ test("connectAndLoadSession resumes an existing load-capable session", async () 
       loadSessionWithOptions: async (sessionId, loadCwd, options) => {
         assert.equal(sessionId, "resume-session");
         assert.equal(loadCwd, cwd);
-        assert.deepEqual(options, { suppressReplayUpdates: true });
+        assert.deepEqual(options, { suppressReplayUpdates: true, currentModelId: null });
         return { agentSessionId: "runtime-session" };
       },
       createSession: async () => {
@@ -2111,7 +2113,11 @@ test("connectAndLoadSession replays desired model after cold session/load", asyn
       loadSessionWithOptions: async (sessionId, loadCwd, options) => {
         assert.equal(sessionId, "load-session");
         assert.equal(loadCwd, cwd);
-        assert.deepEqual(options, { suppressReplayUpdates: true });
+        // brick a81e16a1 (A-R2-model): the load carries the record's CURRENT model.
+        assert.deepEqual(options, {
+          suppressReplayUpdates: true,
+          currentModelId: "gpt-5.4[xhigh]",
+        });
         return {
           agentSessionId: "loaded-runtime-session",
           models: resumedModels,
@@ -2906,3 +2912,76 @@ for (const [source, expected] of [
     });
   });
 }
+
+// ---------------------------------------------------------------------------
+// brick a81e16a1 (A-R2-model) — THE CURRENT MODEL WINS ON A RESPAWN. A resume
+// re-sends `claudeCode.options.model`; it must be the model the post-resume
+// replay applies, read from the record NOW — never the owner's start-time copy,
+// which a switch applied without an owner restart leaves stale.
+// ---------------------------------------------------------------------------
+async function resumeModelVersusReplay(
+  acpx: NonNullable<Parameters<typeof makeSessionRecord>[0]["acpx"]>,
+): Promise<{ resumeModel: string | null | undefined; replayed: string[] }> {
+  let resumeModel: string | null | undefined = "resume-never-called";
+  const replayed: string[] = [];
+  await withTempHome(async (homeDir) => {
+    const cwd = path.join(homeDir, "workspace");
+    await fs.mkdir(cwd, { recursive: true });
+    const record = makeSessionRecord({
+      acpxRecordId: "a81e16a1-current-model",
+      acpSessionId: "resume-session",
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+      cwd,
+      acpx,
+    });
+    const client: FakeClient = {
+      hasReusableSession: () => false,
+      start: async () => {},
+      getAgentLifecycleSnapshot: () => ({ running: true }),
+      supportsLoadSession: () => true,
+      supportsResumeSession: () => true,
+      resumeSession: async (_sessionId, _cwd, options) => {
+        resumeModel = options?.currentModelId;
+        return { agentSessionId: "resumed", models: undefined };
+      },
+      loadSessionWithOptions: async () => {
+        throw new Error("loadSessionWithOptions should not be called");
+      },
+      createSession: async () => {
+        throw new Error("createSession should not be called");
+      },
+      setSessionMode: async () => {},
+      setSessionModel: async (_sessionId, modelId) => {
+        replayed.push(modelId);
+      },
+      setSessionConfigOption: async () => ({ configOptions: [] }),
+    };
+    await connectAndLoadSession({
+      client: client as never,
+      record,
+      activeController: ACTIVE_CONTROLLER,
+    }).catch(() => undefined);
+  });
+  return { resumeModel, replayed };
+}
+
+test("a81e16a1 A-R2-model: a resume re-sends the record's CURRENT model (switched haiku → sonnet)", async () => {
+  const { resumeModel } = await resumeModelVersusReplay({
+    current_model_id: "sonnet",
+    session_options: { model: "sonnet", model_source: "explicit" },
+  });
+  assert.equal(resumeModel, "sonnet");
+});
+
+test("a81e16a1 A-R2-model: a record with NO desired model re-sends NO model (null), never a stale copy", async () => {
+  const { resumeModel } = await resumeModelVersusReplay({ current_model_id: "default" });
+  assert.equal(resumeModel, null);
+});
+
+test("a81e16a1 A-R2-model: the resume model goes through the replay's Fable guard — an implicit fable is never re-sent", async () => {
+  const { resumeModel } = await resumeModelVersusReplay({
+    available_models: ["opus", "fable"],
+    session_options: { model: "fable", model_source: "inherited" },
+  });
+  assert.equal(resumeModel, "opus", "the guard's redirect, not the blocked pin");
+});

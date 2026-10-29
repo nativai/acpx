@@ -175,12 +175,19 @@ async function replayDesiredMode(params: {
 // desired pin is force-redirected to the non-Fable default (+ provenance/breadcrumb);
 // absent provenance (legacy) is left alone. Post the resolution-tier guard this is a
 // near-noop safety net for a Fable pin that slipped through non-explicit.
-function guardReplayDesiredModel(record: SessionRecord, desiredModelId: string): string {
-  const guarded = guardServedModel({
+function guardDesiredModel(
+  record: SessionRecord,
+  desiredModelId: string,
+): ReturnType<typeof guardServedModel> {
+  return guardServedModel({
     requestedModel: desiredModelId,
     modelSource: record.acpx?.session_options?.model_source,
     availableModels: record.acpx?.available_models,
   });
+}
+
+function guardReplayDesiredModel(record: SessionRecord, desiredModelId: string): string {
+  const guarded = guardDesiredModel(record, desiredModelId);
   if (guarded.forced && guarded.blocked) {
     setDesiredModelSource(record, "guard-forced");
     stampModelGuardBreadcrumb(record, {
@@ -762,17 +769,28 @@ function contextWindowHintOptions(record: SessionRecord): {
   };
 }
 
+/** brick a81e16a1 (A-R2-model): the model a resume/load re-sends as
+ *  `claudeCode.options.model` — the record's CURRENT desired model, read now, as
+ *  the post-resume replay will apply it (same guard, WITHOUT the replay's
+ *  provenance side effects), or `null` when the record holds none. Never the
+ *  client's start-time copy: a model switch applied without an owner restart
+ *  (a foreign/unverifiable owner, an internal non-recycling caller) leaves that
+ *  copy stale, and re-sending it would start the rebuilt query on the old model. */
+function currentResumeModelId(record: SessionRecord): string | null {
+  const desired = getDesiredModelId(record.acpx);
+  return desired ? (guardDesiredModel(record, desired).model ?? desired) : null;
+}
+
 async function runResumeRuntimeSession(params: {
   client: AcpClient;
   record: SessionRecord;
   timeoutMs?: number;
 }): Promise<RuntimeSessionLoadState> {
   const resumeResult = await withTimeout(
-    params.client.resumeSession(
-      params.record.acpSessionId,
-      params.record.cwd,
-      contextWindowHintOptions(params.record),
-    ),
+    params.client.resumeSession(params.record.acpSessionId, params.record.cwd, {
+      ...contextWindowHintOptions(params.record),
+      currentModelId: currentResumeModelId(params.record),
+    }),
     params.timeoutMs,
   );
   reconcileAgentSessionId(params.record, resumeResult.agentSessionId);
@@ -795,6 +813,7 @@ async function runLoadRuntimeSession(params: {
     params.client.loadSessionWithOptions(params.record.acpSessionId, params.record.cwd, {
       suppressReplayUpdates: true,
       ...contextWindowHintOptions(params.record),
+      currentModelId: currentResumeModelId(params.record),
     }),
     params.timeoutMs,
   );

@@ -215,11 +215,21 @@ type LoadSessionOptions = {
    *  the adapter re-apply it (instead of the heuristic) when the model settles
    *  on this id, so the replay doesn't clobber a restored 1M back to 200k. */
   contextWindowSizeHintModel?: string;
+  /** brick a81e16a1 (A-R2-model): the record's CURRENT model read at reconnect
+   *  time (`null` = the record holds none), re-sent as `claudeCode.options.model`
+   *  in place of the client's start-time `sessionOptions.model`. `undefined` = the
+   *  caller did not say; the client's own copy is used. */
+  currentModelId?: string | null;
 };
 
 type ResumeSessionOptions = {
   contextWindowSizeHint?: number;
   contextWindowSizeHintModel?: string;
+  /** brick a81e16a1 (A-R2-model): the record's CURRENT model read at reconnect
+   *  time (`null` = the record holds none), re-sent as `claudeCode.options.model`
+   *  in place of the client's start-time `sessionOptions.model`. `undefined` = the
+   *  caller did not say; the client's own copy is used. */
+  currentModelId?: string | null;
 };
 
 function isPositiveFiniteNumber(value: number | undefined): value is number {
@@ -2220,7 +2230,9 @@ export class AcpClient {
    * the scheduler tools forever. ⚠️ Absent ≠ empty: a stored `[]` is the
    * `--disallowed-tools ""` opt-out and is re-sent as `[]`.
    */
-  private async buildReconnectSessionMeta(): Promise<Record<string, unknown> | undefined> {
+  private async buildReconnectSessionMeta(
+    currentModelId: string | null | undefined,
+  ): Promise<Record<string, unknown> | undefined> {
     const { command, args } = splitCommandLine(this.options.agentCommand);
     if (!isClaudeAcpCommand(command, args)) {
       return await this.buildResumePrimerMeta();
@@ -2228,6 +2240,9 @@ export class AcpClient {
     const sessionOptions = this.options.sessionOptions;
     const optionsMeta = buildClaudeCodeOptionsMeta({
       ...sessionOptions,
+      // A-R2-model: the CURRENT model wins over the start-time copy (see
+      // ResumeSessionOptions.currentModelId).
+      model: currentModelId === undefined ? sessionOptions?.model : (currentModelId ?? undefined),
       disallowedTools: resolveClaudeDefaultDisallowedTools(
         this.options.agentCommand,
         sessionOptions?.disallowedTools,
@@ -2353,7 +2368,7 @@ export class AcpClient {
       // Re-supply the creation options and the primer on cold load (CONCEPTION
       // §4.5.2, brick a81e16a1) so a restarted adapter rebuilds the session it
       // was created as; codex gets neither (its developer item is in history).
-      const reconnectMeta = await this.buildReconnectSessionMeta();
+      const reconnectMeta = await this.buildReconnectSessionMeta(options.currentModelId);
       const loadMeta =
         this.mergeOutputStyleMeta(
           this.mergeContextWindowHint(
@@ -2394,7 +2409,7 @@ export class AcpClient {
     // Re-supply the creation options and the primer on cold resume (CONCEPTION
     // §4.5.2, brick a81e16a1): both are dropped on rebuild unless re-sent.
     // Idempotent; codex gets neither (restored from thread).
-    const reconnectMeta = await this.buildReconnectSessionMeta();
+    const reconnectMeta = await this.buildReconnectSessionMeta(options.currentModelId);
     const resumeMeta = this.mergeOutputStyleMeta(
       this.mergeContextWindowHint(
         reconnectMeta,
