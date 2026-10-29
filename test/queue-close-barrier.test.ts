@@ -184,6 +184,17 @@ async function teardownOwner(owner: PlantedOwner): Promise<void> {
   });
 }
 
+// The verb sequence of a close with no gate answer (brick ad6ba1c2): the closer
+// asks for the live task set before the drain (v3 §5.2, taskContextForClose) and
+// re-asks right before the stop (v3.1 RV-8, withTasksStartedDuringClose). The
+// drain still precedes close_session, and both precede the terminate.
+const CLOSE_PATH_SEQUENCE = [
+  "query_background_tasks",
+  "drain_deliveries",
+  "close_session",
+  "query_background_tasks",
+];
+
 // L1.9 — the drain must run BEFORE anything terminates the owner. Asserted by
 // observing the order requests actually arrive, and by checking the owner was
 // still alive when the drain reached it.
@@ -201,11 +212,11 @@ test("L1.9 closeSession drains before it terminates the owner", async () => {
 
       assert.deepEqual(
         observed.map((entry) => entry.type),
-        ["drain_deliveries", "close_session"],
+        CLOSE_PATH_SEQUENCE,
         "the drain is step 0.5: it must reach the owner before the ACP close and before terminate",
       );
       assert.equal(
-        observed[0].ownerAliveOnArrival,
+        observed.find((entry) => entry.type === "drain_deliveries")?.ownerAliveOnArrival,
         true,
         "the owner must still be alive when the drain arrives — draining a corpse saves nothing",
       );
@@ -265,7 +276,11 @@ test("L1.10/E3 an owner that does not know the drain verb degrades to reachedOwn
     try {
       const result = await closeSession(sessionId);
 
-      assert.equal(observed[0]?.type, "drain_deliveries", "we still ask");
+      assert.deepEqual(
+        observed.map((entry) => entry.type),
+        CLOSE_PATH_SEQUENCE,
+        "we still ask",
+      );
       assert.equal(result.drain.attempted, true);
       assert.equal(
         result.drain.reachedOwner,
@@ -345,7 +360,7 @@ test("a fully mute owner cannot hang the close path", async () => {
 
       assert.deepEqual(
         observed.map((entry) => entry.type),
-        ["drain_deliveries", "close_session"],
+        CLOSE_PATH_SEQUENCE,
         "both close-path verbs are still attempted against a mute owner",
       );
       assert.equal(result.drain.reachedOwner, false);
