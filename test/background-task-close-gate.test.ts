@@ -37,6 +37,10 @@ const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const CHILD_PATH = fileURLToPath(new URL("./bg-task-owner-child.js", import.meta.url));
 const PRODUCTION_AGENT_COMMAND = "node /opt/claude-agent-acp/dist/index.js";
 const linux = process.platform === "linux";
+// Per-process suffix for every session id a rig runs under. v3's proofs are box-wide and keyed by the
+// session id (task-file path segment, CLAUDE_CODE_SESSION_ID), so two concurrent copies of this file
+// with fixed ids would prove — and kill — each other's rig tasks. Base 36: no regex metacharacters.
+const RUN = `-${process.pid.toString(36)}`;
 
 type CliResult = { code: number | null; stdout: string; stderr: string };
 
@@ -485,7 +489,7 @@ test("G1 refusal: exit 7, exact JSON envelope, nothing touched — owner, adapte
     return;
   }
   await withHome(async (homeDir) => {
-    const sessionId = "g1-gate";
+    const sessionId = `g1-gate${RUN}`;
     await writeRecord(homeDir, sessionId);
     const rig = await startOwnerRig(homeDir, "owner", sessionId);
     try {
@@ -514,7 +518,9 @@ test("G1 refusal: exit 7, exact JSON envelope, nothing touched — owner, adapte
       assert.equal(text.stdout, "", "a text refusal prints nothing on stdout");
       assert.match(
         text.stderr,
-        /^sessions close: LIVE_BACKGROUND_TASKS: refused: session g1-gate has 2 live background tasks that closing it would kill:\n {2}- Bash "rig-s1 bash bg" \(task b343f35rh, running \d+m\d\ds\)\n {2}- Monitor "rig-s1 monitor" \(task b2g1k6brj, running \d+m\d\ds\)\nNothing was closed or stopped\. To close it anyway and kill these tasks, run:\n {2}acpx sessions close --session-id g1-gate --kill-background-tasks\n$/,
+        new RegExp(
+          String.raw`^sessions close: LIVE_BACKGROUND_TASKS: refused: session ${sessionId} has 2 live background tasks that closing it would kill:\n {2}- Bash "rig-s1 bash bg" \(task b343f35rh, running \d+m\d\ds\)\n {2}- Monitor "rig-s1 monitor" \(task b2g1k6brj, running \d+m\d\ds\)\nNothing was closed or stopped\. To close it anyway and kill these tasks, run:\n {2}acpx sessions close --session-id ${sessionId} --kill-background-tasks\n$`,
+        ),
       );
 
       const quiet = await runCli(
@@ -542,7 +548,7 @@ test("G2 + G4: the retryCommand, executed LITERALLY, closes and kills — every 
     return;
   }
   await withHome(async (homeDir) => {
-    const sessionId = "g2-force";
+    const sessionId = `g2-force${RUN}`;
     await writeRecord(homeDir, sessionId);
     const rig = await startOwnerRig(homeDir, "owner", sessionId);
     try {
@@ -588,7 +594,9 @@ test("G2 + G4: the retryCommand, executed LITERALLY, closes and kills — every 
       // The owner's own handler (path G) logged its reap to owner.log (its stderr here).
       assert.match(
         fs.readFileSync(rig.stderrFile, "utf8"),
-        /queue owner reaped 4 background task process\(es\) of session g2-force after SIGTERM/,
+        new RegExp(
+          String.raw`queue owner reaped 4 background task process\(es\) of session ${sessionId} after SIGTERM`,
+        ),
       );
     } finally {
       rig.kill();
@@ -602,7 +610,7 @@ test("G2 text: a forced close prints the kill summary on stderr", async (t) => {
     return;
   }
   await withHome(async (homeDir) => {
-    const sessionId = "g2-text";
+    const sessionId = `g2-text${RUN}`;
     await writeRecord(homeDir, sessionId);
     const rig = await startOwnerRig(homeDir, "owner", sessionId);
     try {
@@ -613,7 +621,9 @@ test("G2 text: a forced close prints the kill summary on stderr", async (t) => {
       assert.equal(forced.code, 0, forced.stderr);
       assert.match(
         forced.stderr,
-        /\[acpx\] killed 2 live background tasks of g2-text: Bash "rig-s1 bash bg" \(b343f35rh\), Monitor "rig-s1 monitor" \(b2g1k6brj\); 4 task processes ended, 0 survived\n/,
+        new RegExp(
+          String.raw`\[acpx\] killed 2 live background tasks of ${sessionId}: Bash "rig-s1 bash bg" \(b343f35rh\), Monitor "rig-s1 monitor" \(b2g1k6brj\); 4 task processes ended, 0 survived\n`,
+        ),
       );
     } finally {
       rig.kill();
@@ -627,7 +637,7 @@ test("G3 / AC8 (v3): an OLD owner (QUEUE_REQUEST_INVALID) fails open — not aut
     return;
   }
   await withHome(async (homeDir) => {
-    const sessionId = "g3-old";
+    const sessionId = `g3-old${RUN}`;
     await writeRecord(homeDir, sessionId);
     const rig = await startOwnerRig(homeDir, "old-owner", sessionId);
     try {
@@ -671,7 +681,9 @@ test("G3 / AC8 (v3): an OLD owner (QUEUE_REQUEST_INVALID) fails open — not aut
       // HoD R2-8: ...but never silently. The JSON carries no `warnings` field; stderr does, in json too.
       assert.match(
         closed.stderr,
-        /\[acpx\] WARNING: could not check g3-old's background tasks \(its owner runs an older acpx or did not answer\); any it had may still be running \(brick ad6ba1c2\)\n/,
+        new RegExp(
+          String.raw`\[acpx\] WARNING: could not check ${sessionId}'s background tasks \(its owner runs an older acpx or did not answer\); any it had may still be running \(brick ad6ba1c2\)\n`,
+        ),
       );
     } finally {
       rig.kill();
@@ -685,7 +697,7 @@ test("HoD (v3): a live task no proof matches is LOUD — stderr names K of N, an
     return;
   }
   await withHome(async (homeDir) => {
-    const sessionId = "ghost-warn";
+    const sessionId = `ghost-warn${RUN}`;
     await writeRecord(homeDir, sessionId);
     const rig = await startOwnerRig(homeDir, "owner-ghost", sessionId);
     try {
@@ -704,7 +716,9 @@ test("HoD (v3): a live task no proof matches is LOUD — stderr names K of N, an
       assert.equal(forced.code, 0, forced.stderr);
       assert.match(
         forced.stderr,
-        /\[acpx\] WARNING: session ghost-warn: proof matched 2 of 3 live background tasks — the unmatched ones may survive; Claude Code's task layout may have changed \(brick ad6ba1c2\)/,
+        new RegExp(
+          String.raw`\[acpx\] WARNING: session ${sessionId}: proof matched 2 of 3 live background tasks — the unmatched ones may survive; Claude Code's task layout may have changed \(brick ad6ba1c2\)`,
+        ),
       );
       const line = jsonLines(forced.stdout).find((entry) => entry.action === "session_closed");
       assert.ok(line, forced.stdout);
@@ -736,7 +750,7 @@ test("C4 v3: a Monitor's command (match-only) never appears in any CLI output �
     return;
   }
   await withHome(async (homeDir) => {
-    const sessionId = "no-command-leak";
+    const sessionId = `no-command-leak${RUN}`;
     await writeRecord(homeDir, sessionId);
     const rig = await startOwnerRig(homeDir, "owner", sessionId);
     try {
@@ -782,7 +796,7 @@ test("G1 negative: an owner with NO live tasks is not refused (plain close works
     return;
   }
   await withHome(async (homeDir) => {
-    const sessionId = "g1-none";
+    const sessionId = `g1-none${RUN}`;
     await writeRecord(homeDir, sessionId);
     const rig = await startOwnerRig(homeDir, "owner-none", sessionId);
     try {
@@ -815,12 +829,13 @@ test("Q4 path C: a recover that reaped tasks clears the chip; one that reaped no
   }
   await withHome(async (homeDir) => {
     const stream = (id: string) => path.join(homeDir, ".acpx", "sessions", `${id}.stream.ndjson`);
-    await writeRecord(homeDir, "q4c-idle");
-    const idle = await runCli(["--format", "json", "sessions", "recover", "q4c-idle"], homeDir);
+    const idleId = `q4c-idle${RUN}`;
+    await writeRecord(homeDir, idleId);
+    const idle = await runCli(["--format", "json", "sessions", "recover", idleId], homeDir);
     assert.equal(idle.code, 0, idle.stderr);
-    assert.equal(fs.existsSync(stream("q4c-idle")), false, "nothing reaped ⇒ no chip line");
+    assert.equal(fs.existsSync(stream(idleId)), false, "nothing reaped ⇒ no chip line");
 
-    const sessionId = "q4c-live";
+    const sessionId = `q4c-live${RUN}`;
     await writeRecord(homeDir, sessionId);
     const rig = await startOwnerRig(homeDir, "owner", sessionId);
     try {
@@ -851,7 +866,7 @@ test("G5 template: refused (exit 7, nothing marked), then --kill-background-task
     return;
   }
   await withHome(async (homeDir) => {
-    const sessionId = "g5-template";
+    const sessionId = `g5-template${RUN}`;
     await writeRecord(homeDir, sessionId);
     const rig = await startOwnerRig(homeDir, "owner", sessionId);
     try {
@@ -997,7 +1012,7 @@ test("HoD ruling: a template refusal with --slug and --auto-prompt prints a retr
     return;
   }
   await withHome(async (homeDir) => {
-    const sessionId = "g5-intent";
+    const sessionId = `g5-intent${RUN}`;
     const autoPrompt = "Don't stop: run the suite in $PWD, then `report`";
     await writeRecord(homeDir, sessionId);
     const rig = await startOwnerRig(homeDir, "owner", sessionId);
@@ -1040,7 +1055,7 @@ test("T-RACE-2 (v3.1): no task at the gate, one INSIDE the drain — exit 7 nami
     return;
   }
   await withHome(async (homeDir) => {
-    const sessionId = "race-cli";
+    const sessionId = `race-cli${RUN}`;
     await writeRecord(homeDir, sessionId);
     const rig = await startOwnerRig(homeDir, "race", sessionId);
     try {
@@ -1094,7 +1109,7 @@ test("T-RACE-4 (v3.1): a task appearing AFTER the commit is reaped AND named sta
     return;
   }
   await withHome(async (homeDir) => {
-    const sessionId = "race-late";
+    const sessionId = `race-late${RUN}`;
     await writeRecord(homeDir, sessionId);
     const rig = await startOwnerRig(homeDir, "late", sessionId);
     try {
@@ -1119,7 +1134,9 @@ test("T-RACE-4 (v3.1): a task appearing AFTER the commit is reaped AND named sta
       );
       assert.match(
         closed.stderr,
-        /WARNING: 2 background tasks of race-late started during the close and were ended without consent: Bash "rig-s1 bash bg" \(b343f35rh\), Monitor "rig-s1 monitor" \(b2g1k6brj\)/,
+        new RegExp(
+          String.raw`WARNING: 2 background tasks of ${sessionId} started during the close and were ended without consent: Bash "rig-s1 bash bg" \(b343f35rh\), Monitor "rig-s1 monitor" \(b2g1k6brj\)`,
+        ),
       );
       assert.ok(TASK_KEYS.every((key) => !aliveAs(rig.pids[key], rig.ticks[key])));
     } finally {

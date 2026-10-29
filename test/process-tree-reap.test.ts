@@ -38,6 +38,9 @@ import {
 // CAN fail: the v2 position rule, or the v2 leader-gated follow, selects what v3 must spare.
 
 const CHILD_PATH = fileURLToPath(new URL("./bg-task-owner-child.js", import.meta.url));
+// Per-process suffix for the child rigs' session ids: the proofs are box-wide and keyed by the session
+// id, so concurrent copies of this file must never share one. Base 36: no regex metacharacters.
+const RUN = `-${process.pid.toString(36)}`;
 const linux = process.platform === "linux";
 
 const LOOP = "while :; do sleep 5; done";
@@ -841,10 +844,14 @@ async function startChild(dir: string, mode: string): Promise<ChildRig> {
   const errFile = path.join(dir, `${mode}.err`);
   const taskRoot = path.join(dir, `claude-${os.userInfo().uid}`, "proj");
   const errFd = fs.openSync(errFile, "a");
-  const child = spawn(process.execPath, [CHILD_PATH, mode, outFile, `rig-${mode}`, taskRoot], {
-    detached: true,
-    stdio: ["ignore", "ignore", errFd],
-  });
+  const child = spawn(
+    process.execPath,
+    [CHILD_PATH, mode, outFile, `rig-${mode}${RUN}`, taskRoot],
+    {
+      detached: true,
+      stdio: ["ignore", "ignore", errFd],
+    },
+  );
   fs.closeSync(errFd);
   child.unref();
   const lines = () =>
@@ -923,7 +930,9 @@ test("O1: SIGTERM to an owner WITH the reaper ends its proven Bash and Monitor t
       );
       assert.match(
         withReaper.stderr(),
-        /queue owner reaped 4 background task process\(es\) of session rig-fatal after SIGTERM/,
+        new RegExp(
+          String.raw`queue owner reaped 4 background task process\(es\) of session rig-fatal${RUN} after SIGTERM`,
+        ),
       );
       // NEGATIVE CONTROL: the group SIGKILL alone took claude, never the task processes.
       assert.ok(!childAlive(without, "claudePid"));
@@ -956,7 +965,9 @@ test("O2: the graceful exit reap (admission before the client close) ends both t
       assert.ok(TASK_KEYS.every((key) => !childAlive(rig, key)));
       assert.match(
         rig.stderr(),
-        /queue owner reaped 4 background task process\(es\) of session rig-exit-reap after idle-memory \(survivors=0\)/,
+        new RegExp(
+          String.raw`queue owner reaped 4 background task process\(es\) of session rig-exit-reap${RUN} after idle-memory \(survivors=0\)`,
+        ),
       );
       assert.doesNotMatch(rig.stderr(), /proof matched/, "both tasks were proven: no warning");
     } finally {
