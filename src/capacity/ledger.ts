@@ -36,7 +36,16 @@ const LOG_RETENTION_DAYS = 14;
 
 export function admissionDir(env: NodeJS.ProcessEnv = process.env): string {
   const override = env.ACPX_ADMISSION_DIR?.trim();
-  return override ? path.resolve(override) : path.join(os.userInfo().homedir, ".acpx", "admission");
+  return override ? path.resolve(override) : path.join(passwdHome(), ".acpx", "admission");
+}
+
+/** `os.userInfo()` throws for a uid with no passwd entry; a gate must not crash a create on that. */
+function passwdHome(): string {
+  try {
+    return os.userInfo().homedir;
+  } catch {
+    return os.homedir();
+  }
 }
 
 export type AdmissionClass = "interactive" | "delivery" | "automation" | "spawn";
