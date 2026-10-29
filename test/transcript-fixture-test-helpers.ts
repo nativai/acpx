@@ -180,3 +180,77 @@ export async function ageFile(filePath: string, ms: number): Promise<void> {
   const when = new Date(Date.now() - ms);
   await fs.utimes(filePath, when, when);
 }
+
+/** A v3 registry with subscription profiles whose config dirs are `<home>/.acpx/subscriptions/<id>`. */
+export async function writeRegistry(home: string, ids: string[], defaultId: string): Promise<void> {
+  const root = path.join(home, ".acpx", "subscriptions");
+  for (const id of ids) {
+    await fs.mkdir(path.join(root, id), { recursive: true });
+  }
+  const profiles = ids.map((id) => ({
+    id,
+    label: id,
+    authMode: "subscription",
+    adapter: "claude",
+    account: `acct-${id}`,
+    credentialSource: path.join(root, id),
+  }));
+  await writeFileAt(
+    path.join(root, "registry.json"),
+    `${JSON.stringify({ version: 3, default: defaultId, profiles }, null, 2)}\n`,
+  );
+}
+
+/** A session record on disk (snake_case, as acpx writes it), bound to `profile`. */
+export async function writeRecordFixture(
+  home: string,
+  input: {
+    recordId: string;
+    acpSessionId: string;
+    cwd: string;
+    profile: string;
+    pid?: number;
+    archived?: boolean;
+  },
+): Promise<string> {
+  const { serializeSessionRecordForDisk } = await import("../src/session/persistence.js");
+  const record = {
+    schema: "acpx.session.v1",
+    acpxRecordId: input.recordId,
+    acpSessionId: input.acpSessionId,
+    agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+    cwd: input.cwd,
+    createdAt: "2026-10-01T00:00:00.000Z",
+    lastUsedAt: "2026-10-01T00:00:00.000Z",
+    lastSeq: 0,
+    eventLog: {
+      active_path: path.join(home, `${input.recordId}.stream.ndjson`),
+      segment_count: 1,
+      max_segment_bytes: 1024,
+      max_segments: 1,
+      last_write_at: "2026-10-01T00:00:00.000Z",
+      last_write_error: null,
+    },
+    title: null,
+    messages: [],
+    updated_at: "2026-10-01T00:00:00.000Z",
+    cumulative_token_usage: {},
+    request_token_usage: {},
+    ...(input.pid === undefined ? {} : { pid: input.pid }),
+    acpx: { session_options: { profile: input.profile } },
+  };
+  const dir = path.join(home, ".acpx", input.archived ? "sessions-archive" : "sessions");
+  const serialized = serializeSessionRecordForDisk(
+    record as unknown as Parameters<typeof serializeSessionRecordForDisk>[0],
+  );
+  return await writeFileAt(
+    path.join(dir, `${input.recordId}.json`),
+    `${JSON.stringify(serialized, null, 2)}\n`,
+  );
+}
+
+/** A deterministic uuid-shaped session id for a fixture label. */
+export function sessionIdFor(label: string): string {
+  const hex = createHash("sha256").update(`session:${label}`).digest("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}

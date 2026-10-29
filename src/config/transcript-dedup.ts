@@ -176,20 +176,105 @@ async function withOpenedPair(
   witnessPath: string,
   run: (pair: OpenedPair) => Promise<DedupOutcome>,
 ): Promise<DedupOutcome> {
+  return await withPair(candidatePath, witnessPath, run, kept);
+}
+
+async function withPair<T>(
+  candidatePath: string,
+  witnessPath: string,
+  run: (pair: OpenedPair) => Promise<T>,
+  failed: (reason: string) => T,
+): Promise<T> {
   let pair: OpenedPair | undefined;
   try {
     const opened = await openPair(candidatePath, witnessPath);
     if (typeof opened === "string") {
-      return kept(opened);
+      return failed(opened);
     }
     pair = opened;
     return await run(pair);
   } catch (error) {
-    return kept(`error:${errorCode(error)}`);
+    return failed(`error:${errorCode(error)}`);
   } finally {
     await pair?.candidate.handle.close().catch(() => {});
     await pair?.witness.handle.close().catch(() => {});
   }
+}
+
+export type WitnessRelation =
+  | { relation: "prefix"; sha256: string }
+  | { relation: "exit-tail"; prefixBytes: number; tailBytes: number; sha256: string }
+  | { relation: "none"; reason: string };
+
+/**
+ * READ-ONLY, for planning (`acpx transcripts dedup`'s dry run): would the prefix
+ * proof or the exit-tail reduction accept `candidatePath` against `witnessPath`?
+ * No writer scan, no write. Every removal still re-proves through the two functions
+ * above, so a plan can only ever be narrower than what is applied, never wider.
+ */
+export async function classifyAgainstWitness(
+  candidatePath: string,
+  witnessPath: string,
+): Promise<WitnessRelation> {
+  return await withPair(candidatePath, witnessPath, classifyOpened, (reason) => ({
+    relation: "none",
+    reason,
+  }));
+}
+
+async function classifyOpened(pair: OpenedPair): Promise<WitnessRelation> {
+  const { candidate, witness } = pair;
+  let prefixReason = prefixSizeReason(candidate.size, witness.size, true);
+  if (!prefixReason) {
+    const hash = createHash("sha256");
+    const mismatch = await firstMismatch(pair, 0, candidate.size, hash, undefined);
+    if (mismatch < 0) {
+      return { relation: "prefix", sha256: hash.digest("hex") };
+    }
+    prefixReason = `divergent-at:${mismatch}`;
+  }
+  const located = await locateExitTail(pair, undefined, false);
+  if (typeof located === "string") {
+    return { relation: "none", reason: located };
+  }
+  const digest = await hashCandidate(candidate, located.prefixBytes, undefined);
+  return {
+    relation: "exit-tail",
+    prefixBytes: located.prefixBytes,
+    tailBytes: located.tail.length,
+    sha256: digest.original,
+  };
+}
+
+/** The size of the exit-tail file a reduction would write (header line + T). */
+export function estimateExitTailFileBytes(input: {
+  originalPath: string;
+  originalSize: number;
+  originalMtimeMs: number;
+  prefixBytes: number;
+  tailBytes: number;
+  witnessPath: string;
+  witnessSize: number;
+}): number {
+  const placeholderSha = "0".repeat(64);
+  const header: ExitTailHeader = {
+    acpx_exit_tail: 1,
+    session_id: sessionIdFromTranscriptName(path.basename(input.originalPath)),
+    original_path: input.originalPath,
+    original_size: input.originalSize,
+    original_mtime_ms: Math.floor(input.originalMtimeMs),
+    original_sha256: placeholderSha,
+    prefix_bytes: input.prefixBytes,
+    prefix_sha256: placeholderSha,
+    tail_bytes: input.tailBytes,
+    tail_sha256: placeholderSha,
+    witness_path: input.witnessPath,
+    witness_size: input.witnessSize,
+    reduced_at: new Date().toISOString(),
+    reduced_by: "transcripts-dedup",
+    acpx_version: getAcpxVersion(),
+  };
+  return Buffer.byteLength(`${JSON.stringify(header)}\n`) + input.tailBytes;
 }
 
 async function openPair(candidatePath: string, witnessPath: string): Promise<OpenedPair | string> {
@@ -331,15 +416,20 @@ async function reduceOpened(
 async function locateExitTail(
   pair: OpenedPair,
   hooks: DedupHooks | undefined,
+  scanWriters = true,
 ): Promise<{ prefixBytes: number; tail: Buffer } | string> {
   const early = await exitTailPrecheck(pair, hooks);
   if (early) {
     return early;
   }
-  const writer = await writerScanReason(pair.candidate, hooks);
-  if (writer) {
-    return writer;
-  }
+  const writer = scanWriters ? await writerScanReason(pair.candidate, hooks) : undefined;
+  return writer ?? (await locateAfterPrecheck(pair, hooks));
+}
+
+async function locateAfterPrecheck(
+  pair: OpenedPair,
+  hooks: DedupHooks | undefined,
+): Promise<{ prefixBytes: number; tail: Buffer } | string> {
   const { candidate, witness } = pair;
   const limit = Math.min(candidate.size, witness.size);
   const mismatch = await firstMismatch(pair, 0, limit, undefined, hooks);

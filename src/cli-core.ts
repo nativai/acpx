@@ -93,6 +93,10 @@ export const TOP_LEVEL_VERBS = new Set([
   // `registerAgentFoldersCommand`. This entry is the second half of the two registrations that verb needs:
   // without it `acpx agent-folders bogus` is a prompt delivery to the cwd's session, not an error.
   "agent-folders",
+  // `transcripts` — `transcripts dedup` / `transcripts restore` (brick 81433524), registered by
+  // `registerTranscriptsCommand`. Second half of the two registrations: without it
+  // `acpx transcripts bogus` is a prompt delivery to the cwd's session, not an error.
+  "transcripts",
   "subscriptions",
   "profiles",
   // Without this entry `acpx models …` falls through to the AGENT registry and
