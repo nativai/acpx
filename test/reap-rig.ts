@@ -102,7 +102,9 @@ for (const shell of plan) {
   if (typeof out === 'number') { fs.closeSync(out); }
   pids[shell.name] = child.pid;
 }
-fs.writeFileSync(pidFile, JSON.stringify(pids));
+// Atomic: spawnRig waits for the file to EXIST, so it must never exist half-written.
+fs.writeFileSync(pidFile + '.tmp', JSON.stringify(pids));
+fs.renameSync(pidFile + '.tmp', pidFile);
 setInterval(() => {}, 1000);
 `;
 

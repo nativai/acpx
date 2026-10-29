@@ -229,7 +229,9 @@ test("R2: a nested acpx owner below an admitted SINGLE is pruned (argv token __q
     "const fs=require('node:fs');const{spawn}=require('node:child_process');" +
     "globalThis.k=fs.openSync(process.env.RIG_TASK_FILE,'a');" +
     "const nested=spawn(process.execPath,['-e',\"require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});setInterval(()=>{},1000)\",'__queue-owner'],{detached:true,stdio:'ignore'});" +
-    "fs.writeFileSync(process.env.RIG_NESTED_PID,String(nested.pid));setInterval(()=>{},1000);";
+    // Atomic (tmp + rename): the test waits for the file to EXIST and must never read it empty.
+    "fs.writeFileSync(process.env.RIG_NESTED_PID+'.tmp',String(nested.pid));" +
+    "fs.renameSync(process.env.RIG_NESTED_PID+'.tmp',process.env.RIG_NESTED_PID);setInterval(()=>{},1000);";
   await withDir(async (dir) => {
     const S = newSessionId();
     const nestedPidFile = path.join(dir, "nested.pid");

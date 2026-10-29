@@ -80,7 +80,9 @@ const CLAUDE_SCRIPT = [
   "mon.stdout.resume(); mon.stderr.resume();",
   // Like the real claude (measured): it holds NO task-file fd itself.
   "fs.closeSync(out);",
-  "fs.writeFileSync(pidFile, JSON.stringify({ shellPid: shell.pid, monShellPid: mon.pid }));",
+  // Atomic: the parent waits for the file to EXIST, so it must never exist half-written.
+  "fs.writeFileSync(pidFile + '.tmp', JSON.stringify({ shellPid: shell.pid, monShellPid: mon.pid }));",
+  "fs.renameSync(pidFile + '.tmp', pidFile);",
   "setInterval(() => {}, 1000);",
 ].join("\n");
 
