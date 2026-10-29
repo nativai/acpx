@@ -306,6 +306,42 @@ export function registerSessionsCommand(
     .option("--verify", "Check MANIFEST.tsv against both directories")
     .option("--repair", "Complete interrupted renames recorded in MANIFEST.tsv")
     .option("--reindex", "Rebuild ARCHIVE-INDEX shards from the archive directory")
+    .option("--deep", "With --verify: decode and check every .zst file (CORRUPT ⇒ exit 1)")
+    .option(
+      "--compress",
+      "Compression sweep (acpx-archive-zst/v1): compress fully-archived transcript files. Needs --dry-run or --apply.",
+    )
+    .option(
+      "--initialize",
+      "With --compress --apply: create COMPRESSION/ on this box (the operator's first run only; arms the nightly sweep)",
+    )
+    .option(
+      "--decompress [ids...]",
+      "Rollback primitive: decompress the .zst files of these ids (or --all) back to plain, inside the archive. Needs --dry-run or --apply.",
+    )
+    .option("--all", "With --decompress: every .zst in the archive")
+    .option(
+      "--thaw <id>",
+      "Copy an archived session's record + transcripts, verified and plain, into --to",
+    )
+    .option(
+      "--to <dir>",
+      "With --thaw: an existing EMPTY directory outside the hot and archive dirs",
+    )
+    .option("--cat <file>", "Print one archived file's verified logical bytes (plain or .zst)")
+    .option(
+      "--max-bytes <N>",
+      "--compress: logical-byte budget; --thaw: refuse above this size (K/M/G binary suffixes)",
+    )
+    .option("--pace-mbps <N>", "--compress: throttle to N MiB/s of input")
+    .option(
+      "--skip-reader-check",
+      "--compress --apply: skip the atrium capability probe and the runtime-state check (logged)",
+    )
+    .option(
+      "--manifest-out <path>",
+      "--compress --apply: also write this wave's journal rows to <path>",
+    )
     .option("--json", "Machine-readable output")
     .addHelpText(
       "after",

@@ -10,12 +10,18 @@ import {
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { SpawnLedger, openSpawnLedgerForRecord, type DiskRecord } from "../../spawn-ledger.js";
 import type { SessionAcpxState, SessionMessage, SessionRecord } from "../../types.js";
+import {
+  isArchivedFileCorrupt,
+  readArchivedFileVerified,
+  ZstdUnavailable,
+} from "../archive/compressed.js";
 import { sessionArchiveDirFor } from "../archive/paths.js";
 import { getLoggedMessageCount, setLoggedMessageCount } from "../messages-log-bookkeeping.js";
 import {
   appendFinalizedMessagesToLog,
   clearMissingMessagesLogPointerForWrite,
   compactMessagesLog,
+  hydrateSessionMessagesFromBuffer,
   hydrateSessionMessagesFromLog,
   initializeEmptyMessagesLog,
   messagesLogFileName,
@@ -106,11 +112,21 @@ async function resolveArchivedSessionRecord(sessionId: string): Promise<SessionR
       return undefined;
     }
     archivedRecords.add(record);
-    return await hydrateSessionMessagesFromLog(
-      record,
-      messagesLogPath(archiveDir, record.acpxRecordId),
+    // The log may be plain or `<log>.zst` (brick 1861b06d): read its VERIFIED logical
+    // bytes, never the plain path alone — that path is ENOENT once compressed, and
+    // ENOENT here used to mean "using inline messages only", i.e. silent empty history.
+    const log = await readArchivedFileVerified(
+      archiveDir,
+      messagesLogFileName(record.acpxRecordId),
     );
-  } catch {
+    return await hydrateSessionMessagesFromBuffer(record, log?.bytes);
+  } catch (error) {
+    // 🛑 RETHROW, OR A CORRUPT LOG READS AS "Session not found". This catch exists for
+    // an absent or unparseable RECORD; an integrity failure of the log is a loud error
+    // naming the file (AC-2), never a lookup miss.
+    if (isArchivedFileCorrupt(error) || error instanceof ZstdUnavailable) {
+      throw error;
+    }
     return undefined;
   }
 }

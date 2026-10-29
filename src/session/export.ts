@@ -5,14 +5,16 @@ import { isAcpJsonRpcMessage } from "../acp/jsonrpc.js";
 import { AcpxOperationalError } from "../errors.js";
 import { isRecordedPidPossiblyAlive } from "../process-identity.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
+import { readArchivedFileVerified } from "./archive/compressed.js";
+import { sessionArchiveDirFor } from "./archive/paths.js";
 import {
   sessionEventActivePath,
   sessionEventLockPath,
   sessionEventSegmentPath,
 } from "./event-log.js";
 import { getLoggedMessageCount } from "./messages-log-bookkeeping.js";
-import { messagesLogPath } from "./messages-log.js";
-import { resolveSessionRecord, sessionBaseDir } from "./persistence.js";
+import { messagesLogFileName, messagesLogPath } from "./messages-log.js";
+import { isArchivedRecord, resolveSessionRecord, sessionBaseDir } from "./persistence.js";
 import { judgeLockHolder } from "./persistence/identity-file-lock.js";
 import { serializeSessionRecordForDisk } from "./persistence/serialize.js";
 import { seatDisplayName } from "./seat-display-name.js";
@@ -104,6 +106,23 @@ async function readHistoryFile(filePath: string): Promise<AcpJsonRpcMessage[]> {
     }
     throw error;
   });
+  return parseHistoryPayload(payload);
+}
+
+/**
+ * An ARCHIVED record's stream file, by logical name, through the verified reader
+ * (plain or `.zst`; brick 1861b06d, reader A9). Absent in both forms ⇒ empty, as
+ * the hot path treats ENOENT; corrupt ⇒ `ArchivedFileCorrupt` propagates.
+ */
+async function readArchivedHistoryFile(hotPath: string): Promise<AcpJsonRpcMessage[]> {
+  const read = await readArchivedFileVerified(
+    sessionArchiveDirFor(sessionBaseDir()),
+    path.basename(hotPath),
+  );
+  return parseHistoryPayload(read ? read.bytes.toString("utf8") : "");
+}
+
+function parseHistoryPayload(payload: string): AcpJsonRpcMessage[] {
   const history: AcpJsonRpcMessage[] = [];
   for (const line of payload.split("\n").filter((entry) => entry.trim().length > 0)) {
     try {
@@ -118,17 +137,23 @@ async function readHistoryFile(filePath: string): Promise<AcpJsonRpcMessage[]> {
   return history;
 }
 
+/**
+ * ⚠️ AN ARCHIVED RECORD'S FILES ARE NOT IN THE HOT DIR. `sessionEvent*Path` build hot
+ * paths, so before brick 1861b06d an archived session exported EMPTY history (A9, a
+ * pre-existing defect) — the reads now follow the record to the directory it came from.
+ */
 async function readSessionHistory(record: SessionRecord): Promise<AcpJsonRpcMessage[]> {
+  const readFile = isArchivedRecord(record) ? readArchivedHistoryFile : readHistoryFile;
   const history: AcpJsonRpcMessage[] = [];
   const maxSegments = Number.isInteger(record.eventLog.max_segments)
     ? record.eventLog.max_segments
     : 0;
 
   for (let segment = maxSegments; segment >= 1; segment -= 1) {
-    history.push(...(await readHistoryFile(sessionEventSegmentPath(record.acpxRecordId, segment))));
+    history.push(...(await readFile(sessionEventSegmentPath(record.acpxRecordId, segment))));
   }
 
-  history.push(...(await readHistoryFile(sessionEventActivePath(record.acpxRecordId))));
+  history.push(...(await readFile(sessionEventActivePath(record.acpxRecordId))));
   return history;
 }
 
@@ -160,6 +185,23 @@ function serializeSessionRecordForArchive(
   return state;
 }
 
+/** The log's bytes from wherever the record lives — hot, or (verified) archived. */
+async function readMessagesLogBytes(record: SessionRecord): Promise<Buffer | undefined> {
+  if (isArchivedRecord(record)) {
+    const archiveDir = sessionArchiveDirFor(sessionBaseDir());
+    return (await readArchivedFileVerified(archiveDir, messagesLogFileName(record.acpxRecordId)))
+      ?.bytes;
+  }
+  try {
+    return await fs.readFile(messagesLogPath(sessionBaseDir(), record.acpxRecordId));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
 async function readMessagesLogForArchive(
   record: SessionRecord,
 ): Promise<ExportedSession["messages_log"] | undefined> {
@@ -168,15 +210,9 @@ async function readMessagesLogForArchive(
     return undefined;
   }
 
-  const filePath = messagesLogPath(sessionBaseDir(), record.acpxRecordId);
-  let payload: Buffer;
-  try {
-    payload = await fs.readFile(filePath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return undefined;
-    }
-    throw error;
+  const payload = await readMessagesLogBytes(record);
+  if (!payload) {
+    return undefined;
   }
 
   const committed = payload.subarray(0, Math.min(state.bytes, payload.length)).toString("utf8");

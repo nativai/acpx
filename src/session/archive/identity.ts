@@ -53,6 +53,10 @@ const RESERVED_ID_PARTS: ReadonlySet<string> = new Set([
   // each seat's active holder and next ordinal, nothing else holds either, and re-minting
   // a counter RE-ISSUES ordinals that must never repeat.
   "seats",
+  // `COMPRESSION/` (amendment §B, brick 1861b06d) — the compression journal, lock,
+  // staging and quarantine. A dot-less directory is already skipped by the claimers
+  // (its id-part is its whole name); listed so that stays true BY DESIGN.
+  "COMPRESSION",
 ]);
 
 /**
