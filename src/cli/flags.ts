@@ -707,9 +707,9 @@ export function addGlobalFlags(command: Command): Command {
       // (idleCheckTimings). 0 = never recycle or release (the master opt-out). WHEN
       // a quiet owner is released is a separate knob: env
       // ACPX_OWNER_IDLE_RELEASE_MS in ms since the last turn (default 300000 = 5
-      // min, floored at 30 min while background tasks are live; 0 disables only
+      // min; never while a background task is live, brick 0c593c10; 0 disables only
       // memory-release, keeping deploy-staleness recycle).
-      "Queue owner quiet period in seconds: after inter-turn relay activity (sub-agent or background output) an idle owner is not released until this long has passed with none; the release gate is checked every 5 s (0 = never recycle/release). Release after the last turn: env ACPX_OWNER_IDLE_RELEASE_MS (ms, default 300000; at least 1800000 while background tasks are live) (default: 900)",
+      "Queue owner quiet period in seconds: after inter-turn relay activity (sub-agent or background output) an idle owner is not released until this long has passed with none; the release gate is checked every 5 s (0 = never recycle/release). Release after the last turn: env ACPX_OWNER_IDLE_RELEASE_MS (ms, default 300000; never while a background task is live) (default: 900)",
       parseTtlSeconds,
     )
     .option("--verbose", "Enable verbose debug logs");

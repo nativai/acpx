@@ -51,18 +51,11 @@ export function normalizeQueueOwnerTtlMs(ttlMs: number | undefined): number {
 // (reliable post Phase 1). Daniel's decided default is 5 min (2026-10-28, down
 // from 30: idle owners held ~3.7 GiB on a memory-tight devbox and a cold respawn
 // takes seconds — brick://a81e16a1); tune per box via the
-// ACPX_OWNER_IDLE_RELEASE_MS env var (milliseconds). An owner with live background
-// tasks keeps the old 30-min window — see BACKGROUND_TASK_IDLE_RELEASE_HOLD_MS.
+// ACPX_OWNER_IDLE_RELEASE_MS env var (milliseconds). An owner with a live
+// background task is never released at all, however long it idles — see the
+// shared gate in decideIdleOwnerRelease (brick://0c593c10).
 // Mirrors the DEFAULT_QUEUE_OWNER_TTL_MS / normalizeQueueOwnerTtlMs pair above.
 export const DEFAULT_OWNER_IDLE_RELEASE_MS = 300_000; // 5 min
-
-// brick://a81e16a1 — the floor on the idle-memory timeout while the owner's
-// adapter still holds live background tasks (`run_in_background` Bash, Monitor,
-// background Agent). A release kills them, and a silent background job emits no
-// relay activity to reset the idle clock, so the 5-min default alone would kill
-// it 25 min sooner than before. Applied as max(idleReleaseMs, this) on the
-// idle-memory path only (decideIdleOwnerRelease).
-export const BACKGROUND_TASK_IDLE_RELEASE_HOLD_MS = 1_800_000; // 30 min
 
 export function normalizeOwnerIdleReleaseMs(value: number | undefined): number {
   if (value == null) {
