@@ -698,14 +698,18 @@ export function addGlobalFlags(command: Command): Command {
     .option("--timeout <seconds>", "Maximum time to wait for agent response", parseTimeoutSeconds)
     .option(
       "--ttl <seconds>",
-      // Since W13-24-10 the owner is NOT shut down at the TTL just for being quiet;
-      // this is the idle-CHECK cadence — how often an idle owner re-checks for a
-      // deploy-staleness recycle and the idle-memory release. 0 = never recycle or
-      // release (the master opt-out). The idle-memory release timeout itself is a
-      // separate knob: env ACPX_OWNER_IDLE_RELEASE_MS in ms (default 300000 = 5
+      // Since W13-24-10 the owner is NOT shut down at the TTL just for being quiet,
+      // and since the 2026-09-07 cadence/window split (d4dc23e4) the TTL is no
+      // longer the check cadence either: an idle owner asks its release gate every
+      // 5 s (IDLE_CHECK_CADENCE_MS), and the TTL is only the QUIESCENCE WINDOW —
+      // how long after inter-turn relay activity (sub-agent / background output
+      // relayed between turns) the owner must stay quiet before any release
+      // (idleCheckTimings). 0 = never recycle or release (the master opt-out). WHEN
+      // a quiet owner is released is a separate knob: env
+      // ACPX_OWNER_IDLE_RELEASE_MS in ms since the last turn (default 300000 = 5
       // min, floored at 30 min while background tasks are live; 0 disables only
       // memory-release, keeping deploy-staleness recycle).
-      "Queue owner idle-check cadence in seconds (0 = never recycle/release). Idle-memory release timeout: env ACPX_OWNER_IDLE_RELEASE_MS (ms, default 300000) (default: 900)",
+      "Queue owner quiet period in seconds: after inter-turn relay activity (sub-agent or background output) an idle owner is not released until this long has passed with none; the release gate is checked every 5 s (0 = never recycle/release). Release after the last turn: env ACPX_OWNER_IDLE_RELEASE_MS (ms, default 300000; at least 1800000 while background tasks are live) (default: 900)",
       parseTtlSeconds,
     )
     .option("--verbose", "Enable verbose debug logs");
