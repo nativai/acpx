@@ -21,6 +21,7 @@ import {
   type DecideIdleOwnerReleaseInput,
   IDLE_CHECK_CADENCE_MS,
   decideIdleOwnerRelease,
+  formatOwnerReleaseLine,
   idleCheckTimings,
 } from "../src/cli/session/queue-owner-runtime.js";
 
@@ -543,4 +544,61 @@ test("a81e16a1 #7: the shared gate is unchanged — an active turn or recent rel
     pollTimeoutMs: 5_000,
     quiescenceWindowMs: 900_000,
   });
+});
+
+// ---------------------------------------------------------------------------
+// brick a81e16a1 (R4) — the diagnosable release line. The old text must survive
+// BYTE-IDENTICAL up to and including `(reason=…)` and the sentence after it;
+// at=, idle= and live_background_tasks= are appended.
+// ---------------------------------------------------------------------------
+const PRE_R4_LINE =
+  "[acpx] queue owner releasing session s-1 (reason=idle-memory); next prompt cold-respawns with context";
+
+test("a81e16a1 R4: the release line keeps the old text byte-identical and appends at/idle/live_background_tasks", () => {
+  const line = formatOwnerReleaseLine({
+    sessionId: "s-1",
+    reason: "idle-memory",
+    at: Date.parse("2026-10-29T00:40:05.123Z"),
+    idleMs: 302_400,
+    liveBackgroundTasks: 0,
+  });
+  assert.equal(
+    line,
+    `${PRE_R4_LINE}; at=2026-10-29T00:40:05.123Z idle=5m02s live_background_tasks=0\n`,
+  );
+  assert.ok(line.startsWith(PRE_R4_LINE), "the pre-R4 text is a byte-identical prefix");
+});
+
+test("a81e16a1 R4: idle age floors to whole seconds and zero-pads them", () => {
+  const idle = (idleMs: number) =>
+    /idle=(\S+) /.exec(
+      formatOwnerReleaseLine({
+        sessionId: "s",
+        reason: "idle-memory",
+        at: 0,
+        idleMs,
+        liveBackgroundTasks: 0,
+      }),
+    )?.[1];
+  assert.equal(idle(0), "0m00s");
+  assert.equal(idle(59_999), "0m59s");
+  assert.equal(idle(60_000), "1m00s");
+  assert.equal(idle(1_800_000), "30m00s");
+  assert.equal(idle(3_725_000), "62m05s");
+  assert.equal(idle(-5), "0m00s", "a clock step backwards never prints a negative age");
+});
+
+test("a81e16a1 R4: the line names the reason and the live background-task count it killed", () => {
+  const line = formatOwnerReleaseLine({
+    sessionId: "s-2",
+    reason: "deploy-staleness",
+    at: 0,
+    idleMs: 61_000,
+    liveBackgroundTasks: 3,
+  });
+  assert.ok(
+    line.startsWith("[acpx] queue owner releasing session s-2 (reason=deploy-staleness); "),
+  );
+  assert.match(line, / live_background_tasks=3\n$/);
+  assert.match(line, / at=1970-01-01T00:00:00\.000Z /);
 });

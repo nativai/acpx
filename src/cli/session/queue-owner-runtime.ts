@@ -797,6 +797,35 @@ function idleMemoryReleaseAfterMs(input: DecideIdleOwnerReleaseInput): number {
     : input.idleReleaseMs;
 }
 
+/** `5m02s` — whole minutes, then zero-padded seconds (floored). */
+function formatIdleAge(idleMs: number): string {
+  const totalSeconds = Math.max(0, Math.floor(idleMs / 1000));
+  return `${Math.floor(totalSeconds / 60)}m${String(totalSeconds % 60).padStart(2, "0")}s`;
+}
+
+/**
+ * brick a81e16a1 (R4) — the owner.log release line. ⚠️ Everything up to and
+ * including `next prompt cold-respawns with context` is BYTE-IDENTICAL to the
+ * line before R4: log readers (the test-engineer's plans, the conception lane's
+ * census scripts) match on it. The diagnostics are APPENDED after `; ` so the
+ * line says when the release happened, how long the owner had been idle on the
+ * same clock `decideIdleOwnerRelease` used, and how many background tasks the
+ * release killed — without a second log line to correlate.
+ */
+export function formatOwnerReleaseLine(input: {
+  sessionId: string;
+  reason: IdleOwnerReleaseReason;
+  at: number;
+  idleMs: number;
+  liveBackgroundTasks: number;
+}): string {
+  return (
+    `[acpx] queue owner releasing session ${input.sessionId} (reason=${input.reason}); ` +
+    `next prompt cold-respawns with context; at=${new Date(input.at).toISOString()} ` +
+    `idle=${formatIdleAge(input.idleMs)} live_background_tasks=${input.liveBackgroundTasks}\n`
+  );
+}
+
 function logTurnBoundaryRecycle(sessionId: string, reason: string, liveBackgroundTasks: number) {
   process.stderr.write(
     `[acpx] queue owner recycling session ${sessionId} after turn (reason=${reason}); ` +
@@ -1386,8 +1415,15 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           // lifecycle diagnosable" recommendation; the TE asserts this line + its
           // reason=). Safe to emit unconditionally: the owner's stderr is its own
           // owner.log fd, never a --json-strict client's JSON-RPC stream.
+          const releasedAt = Date.now();
           process.stderr.write(
-            `[acpx] queue owner releasing session ${options.sessionId} (reason=${decision.reason}); next prompt cold-respawns with context\n`,
+            formatOwnerReleaseLine({
+              sessionId: options.sessionId,
+              reason: decision.reason,
+              at: releasedAt,
+              idleMs: releasedAt - Math.max(lastTaskCompletedAt, lastIdleDrainActivityAt),
+              liveBackgroundTasks: backgroundTasks.liveCount(),
+            }),
           );
           incrementPerfCounter(
             decision.reason === "deploy-staleness"
