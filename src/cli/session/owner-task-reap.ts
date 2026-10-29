@@ -1,5 +1,6 @@
 import { appendFile } from "node:fs/promises";
 import {
+  followUntilQuietSync,
   formatSurvivors,
   reapSnapshot,
   signalSnapshot,
@@ -105,6 +106,12 @@ export async function reapAndLogOnOwnerExit(
  * The signal handler's two synchronous passes (§5.2 G). TERM at entry, so the tasks get their
  * cleanup chance while the custody sweep runs; KILL right before the group SIGKILL. Never throws.
  */
+/**
+ * The signal handler's bounded follow between its TERM and KILL passes. Inside the 1.5 s the closer
+ * gives an owner after SIGTERM (`PROCESS_EXIT_GRACE_MS`), with room for the custody sweep and the scans.
+ */
+const SIGNAL_FOLLOW_BUDGET_MS = 500;
+
 export function createOwnerSignalReap(sessionId: string, reaper: OwnerTaskReaper | undefined) {
   let snapshot: ReapSnapshot | undefined;
   return {
@@ -124,6 +131,8 @@ export function createOwnerSignalReap(sessionId: string, reaper: OwnerTaskReaper
       }
       try {
         writeSignalReapLine(sessionId, signal, snapshot);
+        // Let a task's TERM handler finish (and TERM what it forks) before the KILL pass, bounded.
+        followUntilQuietSync(snapshot, SIGNAL_FOLLOW_BUDGET_MS);
         signalSnapshot(snapshot, "SIGKILL");
       } catch {
         // Never throw from a signal handler.

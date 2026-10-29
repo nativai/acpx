@@ -657,6 +657,40 @@ export function signalSnapshot(
   }
 }
 
+/**
+ * The signal-handler FOLLOW (§5.2 G, no closer): synchronous and bounded. Polls every 25 ms for at most
+ * `budgetMs`, TERMing any member first seen in a later pass, until a pass finds no member. ⚠️ Measured
+ * (brick ad6ba1c2 live rig `v3/fork-term`): a task's TERM handler forks AFTER a single immediate KILL
+ * scan, so the fork escaped with no closer to follow it (CONCEPTION RV-6 called that window µs; it is
+ * not). Blocks the owner's event loop by design: the owner is exiting and awaits nothing here.
+ */
+export function followUntilQuietSync(
+  snapshot: ReapSnapshot,
+  budgetMs: number,
+  signaller: Signaller = realSignaller,
+): void {
+  if (!snapshot.measured) {
+    return;
+  }
+  const termed = new Set(snapshot.members.map(memberKey));
+  const ended = new Set<number>();
+  const deadline = Date.now() + Math.max(0, budgetMs);
+  for (;;) {
+    const members = liveMembers(snapshot, ended);
+    if (members.length === 0 || Date.now() >= deadline) {
+      return;
+    }
+    const fresh = members.filter((member) => !termed.has(memberKey(member)));
+    signalMembers(snapshot, fresh, "SIGTERM", signaller);
+    for (const member of fresh) {
+      termed.add(memberKey(member));
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, REAP_POLL_SYNC_MS);
+  }
+}
+
+const REAP_POLL_SYNC_MS = 25;
+
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }

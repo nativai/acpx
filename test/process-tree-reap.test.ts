@@ -43,6 +43,36 @@ const linux = process.platform === "linux";
 const LOOP = "while :; do sleep 5; done";
 const FORK_ON_TERM = `bash -c 'trap "sleep 600 & exit 0" TERM; while :; do sleep 2 & wait $!; done'`;
 
+/** The fork-on-TERM task's inner bash, once its loop runs (its trap is installed by then). */
+async function forkLoopInner(rig: Rig): Promise<number> {
+  const inner = await waitFor(
+    () =>
+      rig.sessionMembers(rig.pids.bg).find((e) => e.comm === "bash" && e.ppid === rig.pids.bg)?.pid,
+    "inner bash",
+  );
+  await waitFor(
+    () =>
+      rig.sessionMembers(rig.pids.bg).some((e) => e.comm === "sleep" && e.ppid === inner)
+        ? true
+        : undefined,
+    "the loop's first sleep",
+  );
+  return inner;
+}
+
+/** The TERM handler's fork: the `sleep` still in the task's session once the inner bash has exited. */
+async function trapFork(rig: Rig, inner: number, exclude: ReadonlySet<number>): Promise<number> {
+  await waitFor(
+    () => (readEntry(inner) === undefined || readEntry(inner)?.state === "Z" ? true : undefined),
+    "the trap to exit",
+  );
+  return await waitFor(
+    () =>
+      rig.sessionMembers(rig.pids.bg).find((e) => e.comm === "sleep" && !exclude.has(e.pid))?.pid,
+    "the TERM handler's fork",
+  );
+}
+
 function bashTask(taskId: string): BackgroundTaskSet["tasks"][number] {
   return { taskId, taskType: "local_bash", toolName: "Bash" };
 }
@@ -540,31 +570,20 @@ test("N-FORK: a task whose TERM handler forks AFTER its leader died is followed 
     return;
   }
   const plan = [{ name: "bg", stdout: "task:BG1", script: `set -m; ${FORK_ON_TERM} & wait` }];
-  const inner = (rig: Rig) =>
-    waitFor(
-      () =>
-        rig.sessionMembers(rig.pids.bg).find((e) => e.comm === "bash" && e.pid !== rig.pids.bg)
-          ?.pid,
-      "inner bash",
-    );
   // Positive control (TE fkctl): SIGTERM the inner bash directly ⇒ a new `sleep 600` in the same sid.
   await withRig(plan, async (rig) => {
-    const innerPid = await inner(rig);
+    const innerPid = await forkLoopInner(rig);
     const before = new Set(rig.sessionMembers(rig.pids.bg).map((e) => e.pid));
     process.kill(rig.pids.bg, "SIGTERM");
     process.kill(innerPid, "SIGTERM");
-    const fork = await waitFor(
-      () =>
-        rig.sessionMembers(rig.pids.bg).find((e) => e.comm === "sleep" && !before.has(e.pid))?.pid,
-      "the fork",
-    );
+    const fork = await trapFork(rig, innerPid, before);
     rig.track(fork);
     // v2's leader-gated follow would skip it: the session's leader is already dead.
     assert.ok(!alive(rig, rig.pids.bg), "the leader must be dead for the control to mean anything");
     assert.ok(alive(rig, fork));
   });
   await withRig(plan, async (rig) => {
-    await inner(rig);
+    await forkLoopInner(rig);
     const snapshot = closerSnapshot(rig, { tasks: [bashTask("BG1")], monitorCommands: [] });
     const admitted = snapshot.members.length;
     const report = await reapSnapshot(snapshot);
@@ -577,7 +596,7 @@ test("N-FORK: a task whose TERM handler forks AFTER its leader died is followed 
     );
   });
   await withRig(plan, async (rig) => {
-    await inner(rig);
+    await forkLoopInner(rig);
     const snapshot = closerSnapshot(rig, { tasks: [bashTask("BG1")], monitorCommands: [] });
     const admittedPids = new Set(snapshot.members.map((m) => m.pid));
     // The seam refuses every signal for pids born after admission (the fork): it survives, so the
@@ -974,5 +993,62 @@ test("O3b: path I — claude dies first and BOTH task shells reparent out of the
     } finally {
       rig.killAll();
     }
+  });
+});
+
+test("N-FORK (owner signal handler, path G, no closer): the bounded follow between TERM and KILL catches the TERM-handler's fork; an immediate TERM→KILL (the control) lets it escape", async (t) => {
+  if (!linux) {
+    t.skip("linux /proc");
+    return;
+  }
+  const plan = [{ name: "bg", stdout: "task:BG1", script: `set -m; ${FORK_ON_TERM} & wait` }];
+  const bg = { tasks: [bashTask("BG1")], monitorCommands: [] };
+  // CONTROL (deterministic): KILL that does not FOLLOW — only the pids admitted before TERM, sent
+  // once the TERM handler's fork exists (a fork born after a single KILL scan). The fork survives it.
+  await withRig(plan, async (rig) => {
+    await forkLoopInner(rig);
+    const snapshot = closerSnapshot(rig, bg, { ownerPid: process.pid, excludeSelfAncestry: false });
+    const admitted = new Set(snapshot.members.map((m) => m.pid));
+    signalSnapshot(snapshot, "SIGTERM");
+    const fork = await waitFor(
+      () =>
+        rig.sessionMembers(rig.pids.bg).find((e) => e.comm === "sleep" && !admitted.has(e.pid))
+          ?.pid,
+      "the TERM handler's fork",
+    );
+    rig.track(fork);
+    for (const member of snapshot.members) {
+      if (alive(rig, member.pid)) {
+        process.kill(member.pid, "SIGKILL");
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.ok(
+      alive(rig, fork),
+      "the control must show a non-following KILL leaving the fork alive",
+    );
+  });
+  await withRig(plan, async (rig) => {
+    await forkLoopInner(rig);
+    const reaper = createOwnerTaskReaper({
+      getTaskSet: () => bg,
+      getAcpSessionId: () => rig.acpSessionId,
+    });
+    const signalReap = createOwnerSignalReap("fork-g", reaper);
+    const { text } = captureStderr(() => {
+      signalReap.term();
+      signalReap.kill("SIGTERM");
+    });
+    assert.match(text, /reaped \d+ background task process\(es\) of session fork-g after SIGTERM/);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const left = rig.sessionMembers(rig.pids.bg);
+    for (const member of left) {
+      rig.track(member.pid);
+    }
+    assert.deepEqual(
+      left.map((e) => e.comm),
+      [],
+      "a fork escaped the signal handler",
+    );
   });
 });
