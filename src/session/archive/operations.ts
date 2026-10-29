@@ -15,6 +15,21 @@ import {
   withArchiveIndexLock,
   type ArchiveIndexEntry,
 } from "./archive-index.js";
+import {
+  archivedFileExists,
+  commitStagedPlain,
+  decodeArchiveZst,
+  discardStaged,
+  isArchivedFileCorrupt,
+  logicalFileSet,
+  resolveArchivedFile,
+  sha256Hex,
+  stageDecompressed,
+  statArchivedFile,
+  zstNameFor,
+  type ArchivedFileStat,
+  type StagedPlain,
+} from "./compressed.js";
 import { claimArchiveFileSets, findRecordFile, recordFileNameFor } from "./identity.js";
 import {
   ArchiveManifestWriter,
@@ -33,7 +48,12 @@ import {
   revalidateBeforeApply,
   statFileSet,
 } from "./move.js";
-import { archiveIndexDir, archiveManifestPath, sessionArchiveDirFor } from "./paths.js";
+import {
+  archiveIndexDir,
+  archiveManifestPath,
+  compressionStagingDir,
+  sessionArchiveDirFor,
+} from "./paths.js";
 import { readArchiveRecord, type ArchiveRecordView } from "./record-view.js";
 import {
   anchorIdFor,
@@ -339,10 +359,10 @@ async function archiveOneId(
   }
 
   // Step 3: no-clobber. Never overwrite; skip instead.
-  const clobbers = await findClobbers(
-    context.archiveDir,
-    revalidated.stats.map((stat) => stat.file),
-  );
+  // ⚠️ A11: probe the `.zst` form too. Re-archiving a restored id whose `.zst` still
+  // lingers in the archive would otherwise create two diverging forms of one file.
+  const names = revalidated.stats.map((stat) => stat.file);
+  const clobbers = await findClobbers(context.archiveDir, [...names, ...names.map(zstNameFor)]);
   if (clobbers.length > 0) {
     result.skippedAtApply.push({
       id: candidate.id,
@@ -455,8 +475,11 @@ function groupByShard(entries: readonly ArchiveIndexEntry[]): Map<string, Archiv
 // ────────────────────────────────────────────────────────────────────────────────
 
 export type RestoreResult = {
-  restored: { id: string; files: string[]; bytes: number }[];
-  skipped: { id: string; reason: string; detail?: string }[];
+  /** `files` are LOGICAL names placed in the hot dir (record last); `decompressed` the subset that came from `.zst`. */
+  restored: { id: string; files: string[]; bytes: number; decompressed: string[] }[];
+  skipped: { id: string; reason: string; detail?: string; file?: string; check?: string }[];
+  /** A file that could not be placed AFTER the id's moves began (`missing`, or an errno code). */
+  failures: { id: string; file: string; error: string }[];
   warnings: string[];
   indexReconciled: boolean;
   /** Brick 87497c17: the seats of the restored holders, put back in `seats.json`. */
@@ -470,6 +493,7 @@ export async function runRestore(
   const result: RestoreResult = {
     restored: [],
     skipped: [],
+    failures: [],
     warnings: [],
     indexReconciled: false,
   };
@@ -602,6 +626,122 @@ async function fileExists(target: string): Promise<boolean> {
   }
 }
 
+const RESTORE_SPACE_HEADROOM_BYTES = 1024 ** 3;
+
+type RestorePlanEntry = ArchivedFileStat & { file: string };
+
+/** Resolve every logical file of the id (plain wins); absent ones drop out, like `statFileSet`. */
+async function planRestoreFiles(
+  archiveDir: string,
+  logical: readonly string[],
+): Promise<RestorePlanEntry[]> {
+  const planned: RestorePlanEntry[] = [];
+  for (const file of logical) {
+    const stat = await statArchivedFile(archiveDir, file);
+    if (stat) {
+      planned.push({ ...stat, file });
+    }
+  }
+  return planned;
+}
+
+/**
+ * Decompress-and-verify every `.zst` of the id into staging BEFORE anything moves.
+ * ⚠️ THIS IS WHAT MAKES A CORRUPT ID RESTORE "WHOLE OR NOT AT ALL": a corrupt `.zst`
+ * is found here, nothing of the id has moved yet, so no hot file is created and the
+ * `.zst` stays byte-identical (AC-2).
+ */
+async function stageRestoreZsts(
+  archiveDir: string,
+  planned: readonly RestorePlanEntry[],
+): Promise<Map<string, StagedPlain>> {
+  const staged = new Map<string, StagedPlain>();
+  const zsts = planned.filter((entry) => entry.form === "zst");
+  if (zsts.length === 0) {
+    return staged;
+  }
+  await fs.mkdir(compressionStagingDir(archiveDir), { recursive: true });
+  try {
+    for (const entry of zsts) {
+      staged.set(
+        entry.file,
+        await stageDecompressed(entry.path, entry.file, compressionStagingDir(archiveDir)),
+      );
+    }
+  } catch (error) {
+    for (const temp of staged.values()) {
+      await discardStaged(temp);
+    }
+    throw error;
+  }
+  return staged;
+}
+
+async function hasRestoreSpace(
+  hotDir: string,
+  planned: readonly RestorePlanEntry[],
+): Promise<string | undefined> {
+  const toDecompress = planned
+    .filter((entry) => entry.form === "zst")
+    .reduce((sum, entry) => sum + entry.logicalBytes, 0);
+  if (toDecompress === 0) {
+    return undefined;
+  }
+  const stat = await fs.statfs(hotDir);
+  const free = stat.bavail * stat.bsize;
+  const needed = toDecompress + RESTORE_SPACE_HEADROOM_BYTES;
+  return free < needed
+    ? `free ${free} B < ${needed} B (logical bytes to decompress + 1 GiB)`
+    : undefined;
+}
+
+type RestoreSkip = RestoreResult["skipped"][number];
+
+/** Everything decidable before a single byte moves: no-clobber, residency, space. */
+async function planRestoreOrSkip(
+  context: ArchiveContext,
+  safeId: string,
+  files: readonly string[],
+): Promise<{ planned: RestorePlanEntry[] } | { skip: RestoreSkip }> {
+  if (files.length === 0) {
+    return { skip: { id: safeId, reason: "not-in-archive" } };
+  }
+  // No-clobber against LOGICAL names: the hot dir only ever holds plain files.
+  const logical = logicalFileSet(safeId, files);
+  const clobbers = await findClobbers(context.hotDir, logical);
+  if (clobbers.length > 0) {
+    const detail = clobbers.slice(0, 3).join(", ");
+    return { skip: { id: safeId, reason: "already-in-hot-dir", detail } };
+  }
+  const planned = await planRestoreFiles(context.archiveDir, logical);
+  if (planned.length === 0) {
+    return { skip: { id: safeId, reason: "nothing-to-move" } };
+  }
+  const noSpace = await hasRestoreSpace(context.hotDir, planned);
+  return noSpace
+    ? { skip: { id: safeId, reason: "insufficient-space", detail: noSpace } }
+    : { planned };
+}
+
+async function stageOrSkip(
+  context: ArchiveContext,
+  safeId: string,
+  planned: readonly RestorePlanEntry[],
+): Promise<{ staged: Map<string, StagedPlain> } | { skip: RestoreSkip }> {
+  try {
+    return { staged: await stageRestoreZsts(context.archiveDir, planned) };
+  } catch (error) {
+    if (!isArchivedFileCorrupt(error)) {
+      throw error;
+    }
+    const file = path.basename(error.file).replace(/\.zst$/, "");
+    const detail = `${file} (${error.check})`;
+    return {
+      skip: { id: safeId, reason: "ARCHIVED_FILE_CORRUPT", detail, file, check: error.check },
+    };
+  }
+}
+
 async function restoreOneId(
   context: ArchiveContext,
   writer: ArchiveManifestWriter,
@@ -609,43 +749,157 @@ async function restoreOneId(
   files: readonly string[],
   result: RestoreResult,
 ): Promise<void> {
-  if (files.length === 0) {
-    result.skipped.push({ id: safeId, reason: "not-in-archive" });
+  const plan = await planRestoreOrSkip(context, safeId, files);
+  if ("skip" in plan) {
+    result.skipped.push(plan.skip);
     return;
   }
-  const clobbers = await findClobbers(context.hotDir, files);
-  if (clobbers.length > 0) {
-    result.skipped.push({
-      id: safeId,
-      reason: "already-in-hot-dir",
-      detail: clobbers.slice(0, 3).join(", "),
-    });
-    return;
-  }
-  const stats = await statFileSet(context.archiveDir, files);
-  if (stats.length === 0) {
-    result.skipped.push({ id: safeId, reason: "nothing-to-move" });
+  const staging = await stageOrSkip(context, safeId, plan.planned);
+  if ("skip" in staging) {
+    result.skipped.push(staging.skip);
     return;
   }
 
   const id = await resolveRestoredId(context, safeId, files);
-  // Write-ahead, same contract as the archive direction.
+  // Write-ahead, same contract as the archive direction — LOGICAL names and bytes.
+  const stats = plan.planned.map((entry) => ({
+    file: entry.file,
+    bytes: entry.logicalBytes,
+    mtimeMs: entry.mtimeMs,
+  }));
   await writer.appendIdBlock(buildRestoreRows(writer, id, stats));
-
-  // ⚠️ RECORD LAST HERE TOO. The id becomes visible to every reader the instant
-  // `<id>.json` lands, so it must land only once its transcript is already beside
-  // it — otherwise the restore has its own truncated-transcript window.
-  const outcome = await moveFileSet(
-    context.archiveDir,
-    context.hotDir,
-    safeId,
-    stats.map((stat) => stat.file),
+  result.restored.push(
+    await moveRestorePlan(context, id, safeId, plan.planned, staging.staged, result),
   );
-  result.restored.push({
-    id,
-    files: outcome.moved,
-    bytes: stats.reduce((sum, stat) => sum + stat.bytes, 0),
-  });
+}
+
+/**
+ * ⚠️ RECORD LAST HERE TOO. The id becomes visible to every reader the instant
+ * `<id>.json` lands, so it must land only once its transcript is already beside
+ * it — otherwise the restore has its own truncated-transcript window.
+ */
+async function moveRestorePlan(
+  context: ArchiveContext,
+  id: string,
+  safeId: string,
+  planned: readonly RestorePlanEntry[],
+  staged: Map<string, StagedPlain>,
+  result: RestoreResult,
+): Promise<RestoreResult["restored"][number]> {
+  const recordFile = recordFileNameFor(safeId);
+  const ordered = [
+    ...planned.filter((entry) => entry.file !== recordFile),
+    ...planned.filter((entry) => entry.file === recordFile),
+  ];
+  const restored = { id, files: [] as string[], bytes: 0, decompressed: [] as string[] };
+  for (const entry of ordered) {
+    try {
+      const how = await placeInHot(context, entry.file, staged.get(entry.file), result.warnings);
+      restored.files.push(entry.file);
+      restored.bytes += entry.logicalBytes;
+      if (how === "decompressed") {
+        restored.decompressed.push(entry.file);
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? "restore-failed";
+      result.failures.push({ id, file: entry.file, error: code });
+    } finally {
+      staged.delete(entry.file);
+    }
+  }
+  for (const leftover of staged.values()) {
+    await discardStaged(leftover);
+  }
+  return restored;
+}
+
+class MissingInBothForms extends Error {
+  readonly code = "missing";
+}
+
+/**
+ * Place ONE logical file in the hot dir, re-resolving at move time (CONCEPTION §3.6
+ * races): plain → `rename(2)`; `.zst` → link the verified staged plain, then unlink the
+ * `.zst`; neither → loud `missing`. ⚠️ ENOENT RE-RESOLVES ONCE: a sweep may have just
+ * replaced the plain by its `.zst`, and treating that as "already moved" — the old
+ * `moveFileSet` rule — would silently restore a session without its transcript.
+ */
+async function placeInHot(
+  context: ArchiveContext,
+  file: string,
+  staged: StagedPlain | undefined,
+  warnings: string[],
+): Promise<"renamed" | "decompressed"> {
+  try {
+    return await placeOnce(context, file, staged, warnings);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+    if (staged) {
+      await discardStaged(staged);
+    }
+    return await placeOnce(context, file, undefined, warnings);
+  }
+}
+
+async function placeOnce(
+  context: ArchiveContext,
+  file: string,
+  staged: StagedPlain | undefined,
+  warnings: string[],
+): Promise<"renamed" | "decompressed"> {
+  const dest = path.join(context.hotDir, file);
+  const resolved = await resolveArchivedFile(context.archiveDir, file);
+  if (resolved.form === "absent") {
+    throw new MissingInBothForms(`${file} is absent from the archive in both forms`);
+  }
+  if (resolved.form === "plain") {
+    await fs.rename(resolved.path, dest);
+    if (staged) {
+      await discardStaged(staged);
+    }
+    await settleLeftoverZst(context, file, dest, warnings);
+    return "renamed";
+  }
+  const stagingDir = compressionStagingDir(context.archiveDir);
+  const plain = staged ?? (await stageDecompressed(resolved.path, file, stagingDir));
+  await commitStagedPlain(plain, dest, resolved.path);
+  return "decompressed";
+}
+
+/**
+ * Both forms existed and the plain won: the `.zst` left in the archive is identical
+ * (an interrupted commit) ⇒ unlink it; it differs ⇒ leave it and say so (`--repair`
+ * reports it). Never a silent second copy.
+ */
+async function settleLeftoverZst(
+  context: ArchiveContext,
+  file: string,
+  hotPath: string,
+  warnings: string[],
+): Promise<void> {
+  const zstPath = path.join(context.archiveDir, zstNameFor(file));
+  let zst: Buffer;
+  try {
+    zst = await fs.readFile(zstPath);
+  } catch {
+    return;
+  }
+  try {
+    const decoded = decodeArchiveZst(zst, zstPath);
+    if (sha256Hex(decoded) === sha256Hex(await fs.readFile(hotPath))) {
+      await fs.unlink(zstPath);
+      return;
+    }
+  } catch (error) {
+    if (!isArchivedFileCorrupt(error)) {
+      throw error;
+    }
+  }
+  warnings.push(
+    `${zstNameFor(file)} remains in the archive and does not match the restored plain ${file}; left in place for --repair to report`,
+  );
 }
 
 async function resolveRestoredId(
@@ -846,7 +1100,14 @@ export type VerifyProblem = {
 
 export async function verifyArchive(
   context: ArchiveContext,
-): Promise<{ checked: number; problems: VerifyProblem[]; fold: ManifestFold }> {
+  options: { deep?: boolean } = {},
+): Promise<{
+  checked: number;
+  problems: VerifyProblem[];
+  fold: ManifestFold;
+  corrupt: VerifyCorrupt[];
+  deepChecked: number;
+}> {
   const fold = await foldArchiveManifest(context.archiveDir);
   const problems: VerifyProblem[] = [];
   for (const entry of fold.lastByFile.values()) {
@@ -856,7 +1117,43 @@ export async function verifyArchive(
       problems.push({ file: entry.file, id: entry.id, expected, found });
     }
   }
-  return { checked: fold.lastByFile.size, problems, fold };
+  const deep = options.deep
+    ? await verifyEveryZst(context.archiveDir)
+    : { checked: 0, corrupt: [] };
+  return {
+    checked: fold.lastByFile.size,
+    problems,
+    fold,
+    corrupt: deep.corrupt,
+    deepChecked: deep.checked,
+  };
+}
+
+export type VerifyCorrupt = { file: string; check: string };
+
+/** `--verify --deep`: decode and check EVERY `.zst` in the archive, one at a time. */
+async function verifyEveryZst(
+  archiveDir: string,
+): Promise<{ checked: number; corrupt: VerifyCorrupt[] }> {
+  const corrupt: VerifyCorrupt[] = [];
+  let checked = 0;
+  for (const name of (await fs.readdir(archiveDir)).toSorted()) {
+    if (!name.endsWith(".zst")) {
+      continue;
+    }
+    const zstPath = path.join(archiveDir, name);
+    try {
+      decodeArchiveZst(await fs.readFile(zstPath), zstPath);
+    } catch (error) {
+      if (isArchivedFileCorrupt(error)) {
+        corrupt.push({ file: name.slice(0, -".zst".length), check: error.check });
+      } else if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+    }
+    checked += 1;
+  }
+  return { checked, corrupt };
 }
 
 /**
@@ -864,12 +1161,15 @@ export async function verifyArchive(
  * directories, so a file named in an `archive` row is in the archive (done), in
  * the hot dir (interrupted), or in neither (LOST — report loudly). No state has to
  * be reconstructed, which is exactly what write-ahead journalling buys.
+ *
+ * ⚠️ RESIDENCY IS `<file>` OR `<file>.zst` (amendment §D). An exact-name test here
+ * reports every compressed file as LOST.
  */
 async function locateFile(
   context: ArchiveContext,
   file: string,
 ): Promise<"archive" | "hot" | "neither"> {
-  if (await fileExists(path.join(context.archiveDir, file))) {
+  if (await archivedFileExists(context.archiveDir, file)) {
     return "archive";
   }
   return (await fileExists(path.join(context.hotDir, file))) ? "hot" : "neither";
@@ -936,6 +1236,10 @@ async function completeRename(
   target: "archive" | "hot",
   result: RepairResult,
 ): Promise<void> {
+  if (target === "hot" && (await resolveArchivedFile(context.archiveDir, file)).form === "zst") {
+    await completeZstToHot(context, file, result);
+    return;
+  }
   const from = target === "archive" ? context.hotDir : context.archiveDir;
   const to = target === "archive" ? context.archiveDir : context.hotDir;
   try {
@@ -945,6 +1249,47 @@ async function completeRename(
     result.warnings.push(
       `could not complete ${file} -> ${target}: ${(error as NodeJS.ErrnoException).code ?? "rename-failed"}`,
     );
+  }
+}
+
+/**
+ * A `restore` row whose file still sits in the archive as `.zst` (CONCEPTION §3.10):
+ * hot plain present → verify identical → unlink the `.zst` (finishing a crash between
+ * the hot link and the archive unlink); hot plain absent → decompress-to-hot; a hot
+ * plain that DIFFERS, or a corrupt `.zst` → report, touch nothing.
+ */
+async function completeZstToHot(
+  context: ArchiveContext,
+  file: string,
+  result: RepairResult,
+): Promise<void> {
+  const zstPath = path.join(context.archiveDir, zstNameFor(file));
+  const hotPath = path.join(context.hotDir, file);
+  try {
+    if (await fileExists(hotPath)) {
+      const decoded = decodeArchiveZst(await fs.readFile(zstPath), zstPath);
+      if (sha256Hex(decoded) !== sha256Hex(await fs.readFile(hotPath))) {
+        result.warnings.push(
+          `conflict: ${file} is in the hot dir and as a DIFFERENT ${zstNameFor(file)} in the archive; touched nothing`,
+        );
+        return;
+      }
+      await fs.unlink(zstPath);
+    } else {
+      await fs.mkdir(compressionStagingDir(context.archiveDir), { recursive: true });
+      const staged = await stageDecompressed(
+        zstPath,
+        file,
+        compressionStagingDir(context.archiveDir),
+      );
+      await commitStagedPlain(staged, hotPath, zstPath);
+    }
+    result.completed.push({ file, direction: "to-hot" });
+  } catch (error) {
+    const reason = isArchivedFileCorrupt(error)
+      ? `ARCHIVED_FILE_CORRUPT (${error.check})`
+      : ((error as NodeJS.ErrnoException).code ?? "decompress-failed");
+    result.warnings.push(`could not complete ${file} -> hot: ${reason}; touched nothing`);
   }
 }
 

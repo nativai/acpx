@@ -365,6 +365,18 @@ export async function readMessagesLogEntries(
     }
     throw error;
   }
+  return messagesLogEntriesFromBuffer(buffer, endByte);
+}
+
+/**
+ * `readMessagesLogEntries` over bytes already in memory — an ARCHIVED log's verified
+ * logical bytes (plain or `.zst`, brick 1861b06d). Same parsing, same positions.
+ */
+export function messagesLogEntriesFromBuffer(
+  log: Buffer,
+  endByte: number,
+): { messages: SessionMessage[]; rawLines: string[] } {
+  const buffer = log.subarray(0, Math.min(endByte, log.length));
   const messages: SessionMessage[] = [];
   const rawLines: string[] = [];
   for (const line of splitBufferLines(buffer)) {
@@ -380,6 +392,73 @@ export async function readMessagesLogEntries(
     rawLines.push(line.toString("utf8"));
   }
   return { messages, rawLines };
+}
+
+/** The last `maxMessages` parseable entries of `log[0, endByte)` — the in-memory twin of `readMessagesLogTail`. */
+function messagesLogTailFromBuffer(
+  log: Buffer,
+  endByte: number,
+  maxMessages: number,
+): SessionMessage[] {
+  if (maxMessages <= 0 || endByte <= 0) {
+    return [];
+  }
+  const lines = splitBufferLines(log.subarray(0, Math.min(endByte, log.length)));
+  const fromTail: SessionMessage[] = [];
+  for (let index = lines.length - 1; index >= 0 && fromTail.length < maxMessages; index -= 1) {
+    if (lines[index].length === 0) {
+      continue;
+    }
+    const message = parseMessageLine(lines[index]);
+    if (message) {
+      fromTail.push(message);
+    } else {
+      warn("ignoring malformed messages log line");
+    }
+  }
+  return fromTail.toReversed();
+}
+
+type MessagesLogReader = {
+  size: number;
+  range(start: number, end: number): Promise<Buffer>;
+  tail(endByte: number, maxMessages: number): Promise<SessionMessage[]>;
+};
+
+async function hydrateFromLogReader(
+  record: SessionRecord,
+  logState: SessionMessagesLogState,
+  reader: MessagesLogReader,
+): Promise<SessionRecord> {
+  let inlineMessages = record.messages;
+  let effectiveBytes = Math.min(logState.bytes, reader.size);
+  let effectiveCount = logState.count;
+
+  if (logState.bytes > reader.size) {
+    warn(`messages log shorter than watermark for ${record.acpxRecordId}; using available tail`);
+  } else if (reader.size > logState.bytes) {
+    const delta = await reader.range(logState.bytes, reader.size);
+    const completeDelta = parseCompleteMessageLines(delta);
+    if (completeDelta.messages.length > 0) {
+      inlineMessages = inlineMessages.slice(
+        Math.min(completeDelta.messages.length, inlineMessages.length),
+      );
+      effectiveCount += completeDelta.messages.length;
+      effectiveBytes = logState.bytes + completeDelta.bytes;
+      record.messagesLog = {
+        ...logState,
+        count: effectiveCount,
+        bytes: effectiveBytes,
+      };
+    }
+  }
+
+  const neededFromLog = Math.max(0, MAX_RUNTIME_MESSAGES - inlineMessages.length);
+  const logTailLimit = Math.min(neededFromLog, effectiveCount);
+  const logTail = await reader.tail(effectiveBytes, logTailLimit);
+  record.messages = [...logTail, ...inlineMessages];
+  setLoggedMessageCount(record, logTail.length);
+  return record;
 }
 
 export async function hydrateSessionMessagesFromLog(
@@ -403,36 +482,38 @@ export async function hydrateSessionMessagesFromLog(
     }
     throw error;
   }
+  return await hydrateFromLogReader(record, logState, {
+    size: stat.size,
+    range: async (start, end) => await readFileRange(logPath, start, end),
+    tail: async (endByte, maxMessages) => await readMessagesLogTail(logPath, endByte, maxMessages),
+  });
+}
 
-  let inlineMessages = record.messages;
-  let effectiveBytes = Math.min(logState.bytes, stat.size);
-  let effectiveCount = logState.count;
-
-  if (logState.bytes > stat.size) {
-    warn(`messages log shorter than watermark for ${record.acpxRecordId}; using available tail`);
-  } else if (stat.size > logState.bytes) {
-    const delta = await readFileRange(logPath, logState.bytes, stat.size);
-    const completeDelta = parseCompleteMessageLines(delta);
-    if (completeDelta.messages.length > 0) {
-      inlineMessages = inlineMessages.slice(
-        Math.min(completeDelta.messages.length, inlineMessages.length),
-      );
-      effectiveCount += completeDelta.messages.length;
-      effectiveBytes = logState.bytes + completeDelta.bytes;
-      record.messagesLog = {
-        ...logState,
-        count: effectiveCount,
-        bytes: effectiveBytes,
-      };
-    }
+/**
+ * Hydrate an ARCHIVED record from its log's VERIFIED logical bytes (brick 1861b06d,
+ * reader A1). `undefined` = the log is genuinely absent in both forms — today's
+ * "missing" warning path. A CORRUPT log never reaches here: the caller's verified read
+ * throws `ArchivedFileCorrupt` first, so corruption can never read as empty history.
+ */
+export async function hydrateSessionMessagesFromBuffer(
+  record: SessionRecord,
+  log: Buffer | undefined,
+): Promise<SessionRecord> {
+  const logState = record.messagesLog;
+  if (!logState) {
+    setLoggedMessageCount(record, 0);
+    return record;
   }
-
-  const neededFromLog = Math.max(0, MAX_RUNTIME_MESSAGES - inlineMessages.length);
-  const logTailLimit = Math.min(neededFromLog, effectiveCount);
-  const logTail = await readMessagesLogTail(logPath, effectiveBytes, logTailLimit);
-  record.messages = [...logTail, ...inlineMessages];
-  setLoggedMessageCount(record, logTail.length);
-  return record;
+  if (!log) {
+    warn(`messages log missing for ${record.acpxRecordId}; using inline messages only`);
+    setLoggedMessageCount(record, 0);
+    return record;
+  }
+  return await hydrateFromLogReader(record, logState, {
+    size: log.length,
+    range: async (start, end) => log.subarray(start, end),
+    tail: async (endByte, maxMessages) => messagesLogTailFromBuffer(log, endByte, maxMessages),
+  });
 }
 
 export async function prepareMessagesLogForBoundary(

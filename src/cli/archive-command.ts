@@ -1,7 +1,18 @@
 import fs from "node:fs/promises";
 import type { Command } from "commander";
-import { resolveAcpxUiBaseUrl } from "../acp/auth-env.js";
+import {
+  readAcpxUiInternalOriginSources,
+  resolveAtriumLocalOrigin,
+} from "../acp/acpx-ui-internal-origin.js";
 import type { ArchiveIndexEntry } from "../session/archive/archive-index.js";
+import {
+  createAtriumReaderProbe,
+  runCompressSweep,
+  runDecompressSweep,
+  type CompressRunResult,
+  type DecompressRunResult,
+} from "../session/archive/compress-sweep.js";
+import { isArchivedFileCorrupt } from "../session/archive/compressed.js";
 import {
   createHttpLivenessProbe,
   loadWakeupLiveness,
@@ -25,6 +36,7 @@ import {
 } from "../session/archive/operations.js";
 import { isDetachedArchiveDir } from "../session/archive/paths.js";
 import { resolveBoundaries, type ArchivePlan } from "../session/archive/retention.js";
+import { catArchivedFile, thawArchivedSession, thawErrorJson } from "../session/archive/thaw.js";
 import { sessionBaseDir } from "../session/persistence/repository.js";
 import { seatArchiveReportLines } from "../session/persistence/seat-archive.js";
 
@@ -65,7 +77,67 @@ export type SessionsArchiveFlags = {
   reindex?: boolean;
   wave?: string;
   excludeIds?: string;
+  // brick 1861b06d — `acpx-archive-zst/v1`
+  compress?: boolean;
+  decompress?: boolean | string[];
+  all?: boolean;
+  thaw?: string;
+  to?: string;
+  cat?: string;
+  initialize?: boolean;
+  maxBytes?: string;
+  paceMbps?: string;
+  skipReaderCheck?: boolean;
+  manifestOut?: string;
+  deep?: boolean;
 };
+
+/** Where `/data/runtime/info.json` lives on a box (CONCEPTION §3.13 pre-flight). */
+const RUNTIME_INFO_PATH = "/data/runtime/info.json";
+
+const BYTE_UNITS: Record<string, number> = {
+  "": 1,
+  b: 1,
+  k: 1024,
+  kb: 1024,
+  kib: 1024,
+  m: 1024 ** 2,
+  mb: 1024 ** 2,
+  mib: 1024 ** 2,
+  g: 1024 ** 3,
+  gb: 1024 ** 3,
+  gib: 1024 ** 3,
+  t: 1024 ** 4,
+  tb: 1024 ** 4,
+  tib: 1024 ** 4,
+};
+
+/** A byte count, or a number with a BINARY suffix (`100M`, `4GiB`; K/KB/KiB all = 1024). */
+export function parseByteSize(value: string | undefined, label: string): number | undefined {
+  if (value == null) {
+    return undefined;
+  }
+  const match = /^(\d+(?:\.\d+)?)\s*([a-zA-Z]*)$/.exec(value.trim());
+  const unit = match ? BYTE_UNITS[match[2].toLowerCase()] : undefined;
+  if (!match || unit === undefined) {
+    throw new ArchiveRefusal(
+      `${label} must be a byte count or a number with K/M/G/T (binary) suffix, got '${value}'`,
+      "bad-argument",
+    );
+  }
+  return Math.floor(Number(match[1]) * unit);
+}
+
+function parsePositiveNumber(value: string | undefined, label: string): number | undefined {
+  if (value == null) {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new ArchiveRefusal(`${label} must be a positive number, got '${value}'`, "bad-argument");
+  }
+  return parsed;
+}
 
 /** `N` (days) or `YYYY-MM-DD`. Anything else is a refusal, not a silent default. */
 function parseBoundary(value: string | undefined, label: string): number | string | undefined {
@@ -116,9 +188,12 @@ async function buildLiveness(
   context: ArchiveContext,
   excludeIdsFile: string | undefined,
 ): Promise<LivenessGateOptions> {
-  const baseUrl = resolveAcpxUiBaseUrl(process.env);
+  // ⚠️ THE BOX-LOCAL ATRIUM, NOT `resolveAcpxUiBaseUrl` (the public mTLS host, on which
+  // every probe died in the TLS handshake and read as "unavailable") — see
+  // `resolveAtriumLocalOrigin`.
+  const origin = resolveAtriumLocalOrigin(process.env, readAcpxUiInternalOriginSources());
   return {
-    primary: baseUrl ? createHttpLivenessProbe(baseUrl) : undefined,
+    primary: createHttpLivenessProbe(origin),
     wakeups: await loadWakeupLiveness(context.hotDir),
     excludedIds: await readExcludeIdsFile(excludeIdsFile),
   };
@@ -175,30 +250,52 @@ export async function handleSessionsArchive(
 }
 
 async function dispatchArchive(flags: SessionsArchiveFlags, command: Command): Promise<number> {
-  const context = createContext(sessionBaseDir(), flags.wave ?? "cli");
+  if (flags.thaw != null) {
+    return await runThawVerb(flags);
+  }
+  if (flags.cat != null) {
+    return await runCatVerb(flags);
+  }
+  const context = createContext(sessionBaseDir(), flags.wave ?? wavePrefixFor(flags));
   warnIfDetached(context);
-
-  if (flags.status) {
-    return await runStatusVerb(context, flags);
-  }
-  if (flags.list || flags.listOrphans) {
-    return await runListVerb(context, flags);
-  }
-  if (flags.verify) {
-    return await runVerifyVerb(context, flags);
-  }
-  if (flags.repair) {
-    return await runRepairVerb(context, flags);
-  }
-  if (flags.reindex) {
-    return await runReindexVerb(context, flags);
+  const flagVerb = flagVerbFor(flags);
+  if (flagVerb) {
+    return await flagVerb(context, flags, command);
   }
   // ⚠️ EVERY READ-ONLY VERB HAS ALREADY RETURNED ABOVE, and that ordering is what
   // scopes the intent gate correctly. `--status`, `--list`, `--list-orphans`,
   // `--verify`, `--repair` and `--reindex` are FLAGS ON THIS SAME COMMAND, not
   // sub-commands, so a gate placed in `dispatchArchive` would refuse all of them.
-  // None is dry-run-able, so none has an intent to state.
+  // None is dry-run-able, so none has an intent to state. (`--compress` and
+  // `--decompress` ARE dry-run-able and state their own intent — `sweepIntent`.)
   return await runArchiveVerb(context, flags, command);
+}
+
+function wavePrefixFor(flags: SessionsArchiveFlags): string {
+  if (flags.compress) {
+    return "compress";
+  }
+  return flags.decompress ? "decompress" : "cli";
+}
+
+type FlagVerb = (
+  context: ArchiveContext,
+  flags: SessionsArchiveFlags,
+  command: Command,
+) => Promise<number>;
+
+/** The flag-verbs, in precedence order — the first flag set wins. */
+function flagVerbFor(flags: SessionsArchiveFlags): FlagVerb | undefined {
+  const verbs: [boolean, FlagVerb][] = [
+    [flags.status === true, runStatusVerb],
+    [flags.list === true || flags.listOrphans === true, runListVerb],
+    [flags.verify === true, runVerifyVerb],
+    [flags.repair === true, runRepairVerb],
+    [flags.reindex === true, runReindexVerb],
+    [flags.compress === true, runCompressVerb],
+    [flags.decompress != null && flags.decompress !== false, runDecompressVerb],
+  ];
+  return verbs.find(([enabled]) => enabled)?.[1];
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
@@ -575,21 +672,262 @@ async function runVerifyVerb(
   context: ArchiveContext,
   flags: SessionsArchiveFlags,
 ): Promise<number> {
-  const { checked, problems } = await verifyArchive(context);
+  const deep = flags.deep === true;
+  const report = await verifyArchive(context, { deep });
+  const { checked, problems, corrupt, deepChecked } = report;
   if (flags.json) {
-    writeJson({ checked, problems });
+    writeJson({ checked, problems, ...(deep ? { deepChecked, corrupt } : {}) });
   } else {
-    process.stdout.write(`verified ${checked} files from MANIFEST.tsv\n`);
-    for (const problem of problems) {
+    writeVerifyText(report, deep);
+  }
+  return problems.length > 0 || corrupt.length > 0 ? ARCHIVE_EXIT_PROBLEMS : ARCHIVE_EXIT_OK;
+}
+
+function writeVerifyText(report: Awaited<ReturnType<typeof verifyArchive>>, deep: boolean): void {
+  const lines = [`verified ${report.checked} files from MANIFEST.tsv`];
+  for (const problem of report.problems) {
+    const label = problem.found === "neither" ? "LOST" : "MISPLACED";
+    lines.push(
+      `  ${label} ${problem.file} (id ${problem.id}): expected ${problem.expected}, found ${problem.found}`,
+    );
+  }
+  if (deep) {
+    lines.push(`decoded ${report.deepChecked} .zst files`);
+  }
+  for (const entry of report.corrupt) {
+    lines.push(`  CORRUPT ${entry.file}.zst (${entry.check})`);
+  }
+  if (report.problems.length === 0 && report.corrupt.length === 0) {
+    lines.push(`  no problems`);
+  }
+  process.stdout.write(`${lines.join("\n")}\n`);
+}
+
+// ────────────────────────────────────────────────────────────────────────────────
+// brick 1861b06d — `acpx-archive-zst/v1` (cli-contract.md)
+// ────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * `--thaw <id> --to <dir>`. ⚠️ `--json` PUTS ONE DOCUMENT ON STDOUT ON SUCCESS AND ON
+ * EVERY FAILURE — atrium parses stdout to tell "corrupt" from "too large" from "the
+ * archive changed under me", and a refusal that only spoke on stderr would read to it
+ * as an unexplained exit 2.
+ */
+async function runThawVerb(flags: SessionsArchiveFlags): Promise<number> {
+  const id = flags.thaw ?? "";
+  const to = flags.to ?? "";
+  const hotDir = sessionBaseDir();
+  const context = createContext(hotDir, "thaw");
+  try {
+    if (!flags.to) {
+      throw new ArchiveRefusal("--thaw needs --to <empty dir>", "bad-argument");
+    }
+    const result = await thawArchivedSession({
+      id,
+      to,
+      hotDir,
+      archiveDir: context.archiveDir,
+      maxBytes: parseByteSize(flags.maxBytes, "--max-bytes"),
+    });
+    if (flags.json) {
+      writeJson(result);
+    } else {
       process.stdout.write(
-        `  ${problem.found === "neither" ? "LOST" : "MISPLACED"} ${problem.file} (id ${problem.id}): expected ${problem.expected}, found ${problem.found}\n`,
+        `thawed ${result.files.length} files (${formatBytes(result.logicalBytes)}) of ${id} into ${result.to}\n`,
       );
     }
-    if (problems.length === 0) {
-      process.stdout.write(`  no problems\n`);
+    return ARCHIVE_EXIT_OK;
+  } catch (error) {
+    if (!isThawFailure(error)) {
+      throw error;
     }
+    if (flags.json) {
+      writeJson(thawErrorJson(id, to, error));
+    }
+    process.stderr.write(`[acpx] thaw refused: ${error.message}\n`);
+    return ARCHIVE_EXIT_REFUSED;
   }
-  return problems.length > 0 ? ARCHIVE_EXIT_PROBLEMS : ARCHIVE_EXIT_OK;
+}
+
+function isThawFailure(error: unknown): error is Error & { code?: string } {
+  return (
+    error instanceof ArchiveRefusal ||
+    isArchivedFileCorrupt(error) ||
+    (error as { code?: unknown } | undefined)?.code === "zstd-unavailable"
+  );
+}
+
+/** `--cat <file>`: verified logical bytes to stdout; exit 2 on corruption or absence. */
+async function runCatVerb(flags: SessionsArchiveFlags): Promise<number> {
+  const context = createContext(sessionBaseDir(), "cat");
+  try {
+    const bytes = await catArchivedFile(context.archiveDir, flags.cat ?? "");
+    await new Promise<void>((resolve, reject) => {
+      process.stdout.write(bytes, (error) => (error ? reject(error) : resolve()));
+    });
+    return ARCHIVE_EXIT_OK;
+  } catch (error) {
+    if (!isThawFailure(error)) {
+      throw error;
+    }
+    process.stderr.write(`[acpx] ${error.message}\n`);
+    return ARCHIVE_EXIT_REFUSED;
+  }
+}
+
+function sweepIntent(flags: SessionsArchiveFlags, command: Command): "dry-run" | "apply" {
+  const intent = resolveRunIntent(flags, command);
+  if (intent === "unstated") {
+    throw new ArchiveRefusal(
+      "`--compress` / `--decompress` need an explicit intent: --dry-run (writes nothing) or --apply.",
+      "intent-unstated",
+    );
+  }
+  if (intent === "contradictory") {
+    throw new ArchiveRefusal(
+      "--apply and --dry-run were both given; pass exactly one.",
+      "intent-contradictory",
+    );
+  }
+  return intent;
+}
+
+function sweepExitCode(result: CompressRunResult | DecompressRunResult): number {
+  if (result.outcome !== "applied" && result.outcome !== "dry-run") {
+    return ARCHIVE_EXIT_REFUSED;
+  }
+  const corrupt = result.action === "decompress" ? result.corrupt.length : 0;
+  const problems =
+    result.failures.length + result.quarantined.length + result.conflicts.length + corrupt;
+  return problems > 0 ? ARCHIVE_EXIT_PROBLEMS : ARCHIVE_EXIT_OK;
+}
+
+function refusalEnvelope(
+  action: "compress" | "decompress",
+  context: ArchiveContext,
+  refusal: ArchiveRefusal,
+): unknown {
+  return {
+    action,
+    outcome: "refused",
+    applied: false,
+    archiveDir: context.archiveDir,
+    wave: context.wave,
+    at: context.at,
+    error: { code: refusal.code, message: refusal.message },
+  };
+}
+
+async function runCompressVerb(
+  context: ArchiveContext,
+  flags: SessionsArchiveFlags,
+  command: Command,
+): Promise<number> {
+  let result: CompressRunResult;
+  try {
+    const intent = sweepIntent(flags, command);
+    result = await runCompressSweep({
+      context,
+      apply: intent === "apply",
+      initialize: flags.initialize === true,
+      maxBytes: parseByteSize(flags.maxBytes, "--max-bytes"),
+      limit: parseCount(flags.limit, "--limit"),
+      paceMbps: parsePositiveNumber(flags.paceMbps, "--pace-mbps"),
+      skipReaderCheck: flags.skipReaderCheck === true,
+      manifestOut: flags.manifestOut,
+      readerProbe: createAtriumReaderProbe(
+        resolveAtriumLocalOrigin(process.env, readAcpxUiInternalOriginSources()),
+      ),
+      runtimeInfoPath: RUNTIME_INFO_PATH,
+    });
+  } catch (error) {
+    if (error instanceof ArchiveRefusal && flags.json) {
+      writeJson(refusalEnvelope("compress", context, error));
+    }
+    throw error;
+  }
+  writeSweepResult(result, flags);
+  return sweepExitCode(result);
+}
+
+async function runDecompressVerb(
+  context: ArchiveContext,
+  flags: SessionsArchiveFlags,
+  command: Command,
+): Promise<number> {
+  let result: DecompressRunResult;
+  try {
+    const intent = sweepIntent(flags, command);
+    const ids = Array.isArray(flags.decompress) ? flags.decompress : [];
+    if (ids.length > 0 === (flags.all === true)) {
+      throw new ArchiveRefusal(
+        "--decompress needs exactly one of: <id...> or --all",
+        "bad-argument",
+      );
+    }
+    result = await runDecompressSweep({
+      context,
+      ids: flags.all ? "all" : ids,
+      apply: intent === "apply",
+    });
+  } catch (error) {
+    if (error instanceof ArchiveRefusal && flags.json) {
+      writeJson(refusalEnvelope("decompress", context, error));
+    }
+    throw error;
+  }
+  writeSweepResult(result, flags);
+  return sweepExitCode(result);
+}
+
+function writeSweepResult(
+  result: CompressRunResult | DecompressRunResult,
+  flags: SessionsArchiveFlags,
+): void {
+  if (result.error) {
+    process.stderr.write(`[acpx] ${result.action} ${result.outcome}: ${result.error.message}\n`);
+  }
+  for (const warning of result.warnings) {
+    process.stderr.write(`[acpx] ⚠ ${warning}\n`);
+  }
+  if (flags.json) {
+    writeJson(result);
+    return;
+  }
+  process.stdout.write(`${sweepTextLines(result).join("\n")}\n`);
+}
+
+function sweepTextLines(result: CompressRunResult | DecompressRunResult): string[] {
+  const lines = [
+    `[${result.outcome.toUpperCase()}] ${result.action} wave ${result.wave}`,
+    `  archive: ${result.archiveDir}`,
+  ];
+  if (result.action === "compress") {
+    lines.push(
+      `  eligible: ${result.eligible.files} files / ${formatBytes(result.eligible.logicalBytes)}; selected ${result.selected}${result.budget.exhausted ? " (budget reached)" : ""}`,
+      `  compressed: ${result.compressed.length} files, ${formatBytes(result.bytesBefore)} -> ${formatBytes(result.bytesAfter)}`,
+    );
+    if (result.estimate) {
+      lines.push(
+        `  estimate: ratio ${result.estimate.ratio.toFixed(3)} -> ~${formatBytes(result.estimate.projectedZstBytes)} on disk`,
+      );
+    }
+    lines.push(
+      `  skipped ${result.skipped.length} · aborted ${result.aborted.length} · resolved ${result.resolved.length}`,
+    );
+  } else {
+    lines.push(
+      `  selected: ${result.selected.files} .zst files / ${formatBytes(result.selected.logicalBytes)} logical`,
+      `  decompressed: ${result.decompressed.length} · resolved ${result.resolved.length} · corrupt ${result.corrupt.length}`,
+    );
+  }
+  for (const entry of [...result.quarantined, ...result.conflicts]) {
+    lines.push(`  QUARANTINED ${entry.file}: ${entry.reason}`);
+  }
+  for (const failure of result.failures) {
+    lines.push(`  FAILED ${failure.file}: ${failure.error}`);
+  }
+  return lines;
 }
 
 async function runRepairVerb(
@@ -653,15 +991,29 @@ export async function handleSessionsRestore(
     } else {
       writeRestoreText(result);
     }
-    process.exitCode = result.skipped.length > 0 ? ARCHIVE_EXIT_PROBLEMS : ARCHIVE_EXIT_OK;
+    const problems = result.skipped.length + result.failures.length;
+    process.exitCode = problems > 0 ? ARCHIVE_EXIT_PROBLEMS : ARCHIVE_EXIT_OK;
   } catch (error) {
-    if (error instanceof ArchiveRefusal) {
-      process.stderr.write(`[acpx] refused: ${error.message}\n`);
-      process.exitCode = ARCHIVE_EXIT_REFUSED;
-      return;
+    const refusal = asRestoreRefusal(error);
+    if (!refusal) {
+      throw error;
     }
-    throw error;
+    if (flags.json) {
+      writeJson({ refused: true, error: { code: refusal.code, message: refusal.message } });
+    }
+    process.stderr.write(`[acpx] refused: ${refusal.message}\n`);
+    process.exitCode = ARCHIVE_EXIT_REFUSED;
   }
+}
+
+function asRestoreRefusal(error: unknown): ArchiveRefusal | undefined {
+  if (error instanceof ArchiveRefusal) {
+    return error;
+  }
+  if ((error as { code?: unknown } | undefined)?.code === "zstd-unavailable") {
+    return new ArchiveRefusal((error as Error).message, "zstd-unavailable");
+  }
+  return undefined;
 }
 
 function writeRestoreText(result: Awaited<ReturnType<typeof runRestore>>): void {
@@ -674,6 +1026,9 @@ function writeRestoreText(result: Awaited<ReturnType<typeof runRestore>>): void 
     process.stdout.write(
       `skipped ${skipped.id}: ${skipped.reason}${skipped.detail ? ` (${skipped.detail})` : ""}\n`,
     );
+  }
+  for (const failure of result.failures) {
+    process.stdout.write(`FAILED ${failure.id} ${failure.file}: ${failure.error} — run --repair\n`);
   }
   if (result.seatArchive) {
     for (const line of seatArchiveReportLines(result.seatArchive)) {

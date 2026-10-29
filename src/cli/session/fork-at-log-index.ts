@@ -4,9 +4,16 @@ import {
   assertForkAtIndexHonoured,
   resolveEffectiveForkIndex,
 } from "../../acp/harness-capabilities.js";
+import { readArchivedFileVerified } from "../../session/archive/compressed.js";
+import { sessionArchiveDirFor } from "../../session/archive/paths.js";
 import { getLoggedMessageCount } from "../../session/messages-log-bookkeeping.js";
-import { messagesLogPath, readMessagesLogEntries } from "../../session/messages-log.js";
-import { sessionBaseDir } from "../../session/persistence.js";
+import {
+  messagesLogEntriesFromBuffer,
+  messagesLogFileName,
+  messagesLogPath,
+  readMessagesLogEntries,
+} from "../../session/messages-log.js";
+import { isArchivedRecord, sessionBaseDir } from "../../session/persistence.js";
 import type { SessionMessage, SessionRecord } from "../../types.js";
 
 // brick 0dc53ac9 (conception 0d57058c D4) — `sessions copy --at-log-index <n>`.
@@ -91,6 +98,27 @@ export function forkEntryFingerprint(entry: SessionMessage, rawLine: string): st
 }
 
 /**
+ * ⚠️ AN ARCHIVED SOURCE'S LOG IS IN THE ARCHIVE DIR, NOT THE HOT ONE. Reading the hot
+ * path made `--fork-from <archived>` silently inherit only the inline tail (A10, a
+ * pre-existing defect, brick 1861b06d); it is now read verified, plain or `.zst`, and
+ * a corrupt log throws `ArchivedFileCorrupt` instead of forking from a fragment.
+ */
+async function readSourceLogEntries(
+  source: SessionRecord,
+  endByte: number,
+): Promise<{ messages: SessionMessage[]; rawLines: string[] }> {
+  if (!isArchivedRecord(source)) {
+    return await readMessagesLogEntries(
+      messagesLogPath(sessionBaseDir(), source.acpxRecordId),
+      endByte,
+    );
+  }
+  const archiveDir = sessionArchiveDirFor(sessionBaseDir());
+  const read = await readArchivedFileVerified(archiveDir, messagesLogFileName(source.acpxRecordId));
+  return read ? messagesLogEntriesFromBuffer(read.bytes, endByte) : { messages: [], rawLines: [] };
+}
+
+/**
  * The source's full history: every log line (up to the hydrated watermark), then
  * the inline tail hydration kept. `source` must be the record exactly as
  * `resolveSessionRecord` returned it — the logged-count bookkeeping that splits
@@ -103,10 +131,7 @@ export async function readFullSourceHistory(source: SessionRecord): Promise<{
 }> {
   const inlineTail = source.messages.slice(getLoggedMessageCount(source));
   const log = source.messagesLog
-    ? await readMessagesLogEntries(
-        messagesLogPath(sessionBaseDir(), source.acpxRecordId),
-        source.messagesLog.bytes,
-      )
+    ? await readSourceLogEntries(source, source.messagesLog.bytes)
     : { messages: [], rawLines: [] };
   return {
     baseIndex: source.messagesLog?.base_index ?? 0,

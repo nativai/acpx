@@ -77,3 +77,35 @@ export const ARCHIVE_MANIFEST_FILE_NAME = "MANIFEST.tsv";
  * on the assumption that directories are skipped there. They are not, by acpx-ui.
  */
 export const ARCHIVE_INDEX_DIR_NAME = "ARCHIVE-INDEX";
+
+/**
+ * `COMPRESSION/` (amendment §B) — reserved, dot-less, like `ARCHIVE-INDEX/`. Its
+ * EXISTENCE is the box's opt-in to unattended compression: only an operator's
+ * `--compress --apply --initialize` creates it, and `--compress --apply` without
+ * `--initialize` refuses while it is absent (the D2 first-run rule, for compression).
+ */
+export const COMPRESSION_DIR_NAME = "COMPRESSION";
+
+export function compressionDir(archiveDir: string): string {
+  return path.join(archiveDir, COMPRESSION_DIR_NAME);
+}
+
+export function compressionStagingDir(archiveDir: string): string {
+  return path.join(compressionDir(archiveDir), "staging");
+}
+
+export function compressionQuarantineDir(archiveDir: string): string {
+  return path.join(compressionDir(archiveDir), "quarantine");
+}
+
+export function compressionRunsDir(archiveDir: string): string {
+  return path.join(compressionDir(archiveDir), "runs");
+}
+
+export function compressionJournalPath(archiveDir: string): string {
+  return path.join(compressionDir(archiveDir), "journal.tsv");
+}
+
+export function compressionLockPath(archiveDir: string): string {
+  return path.join(compressionDir(archiveDir), ".lock");
+}
