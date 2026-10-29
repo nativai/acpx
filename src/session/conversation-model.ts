@@ -758,6 +758,9 @@ export function cloneSessionAcpxState(
     // served would be present mid-turn and GONE from the saved record. Proven
     // through a real Claude-via-OpenRouter turn on an isolated rig, not in memory.
     last_turn_provider: cloneOptional(state.last_turn_provider),
+    // brick 6b7f8661 — stamped at turn end and read by the NEXT turn's selection;
+    // dropped here, every session would read as outside its prompt-cache window.
+    last_turn_subscription: cloneOptional(state.last_turn_subscription),
     // brick://07dd62c9: the live served block + floor breadcrumbs MUST survive the
     // clone. savePromptSuccess stamps `served` then re-bases acpxState off this
     // clone; without these the served-truth surface + durable park are dropped on

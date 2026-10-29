@@ -32,6 +32,7 @@ import { resolveSessionRecord } from "../src/session/persistence.js";
 import type { PromptInput, SessionRecord } from "../src/types.js";
 import { makeSessionRecord, writeSessionRecordFile } from "./runtime-test-helpers.js";
 import { removeTempHome } from "./temp-home.js";
+import { withCapturedStderrWrites } from "./tty-test-helpers.js";
 
 const CLAUDE_AGENT = "node /opt/claude-agent-acp/dist/index.js";
 let uniqueId = 0;
@@ -1011,4 +1012,217 @@ test("proactive selection defers a switch while background tasks are live", asyn
       assert.match(switched.switchedTo ?? "", /^free-/u);
     },
   );
+});
+
+// ── brick 6b7f8661: cache-sticky proactive selection ───────────────────────────
+//
+// A session inside its 1-hour prompt-cache window on its current subscription is
+// not moved by an OPTIMIZATION switch; every FORCED reason still moves it. "warm" is
+// healthy but ranks below "better" (same weekly reset, higher weekly use), so without
+// the window every row here would switch.
+const CACHE_SPECS: ProfileSpec[] = [
+  { id: "warm", account: "warm-account", outcome: { fiveHour: 0.1, sevenDay: 0.5 } },
+  { id: "better", account: "better-account", outcome: { fiveHour: 0.1, sevenDay: 0.1 } },
+];
+
+function anchorLastTurn(session: SessionRecord, minutesAgo: number, subscription?: string): void {
+  const profile = session.acpx?.session_options?.profile;
+  assert(profile);
+  session.acpx = {
+    ...session.acpx,
+    last_turn_subscription: {
+      subscription: subscription ?? profile,
+      at: new Date(Date.now() - minutesAgo * 60_000).toISOString(),
+    },
+  };
+}
+
+test("cache window: a healthy session 10 min after its last turn is HELD on its sub", async () => {
+  await withCeilingRig(CACHE_SPECS, undefined, async ({ lookup, record }) => {
+    const session = record("warm");
+    const profileBefore = session.acpx?.session_options?.profile;
+    anchorLastTurn(session, 10);
+    const { selection, writes } = await withCapturedStderrWrites(async (writes) => ({
+      selection: await selectSubscriptionBeforeTurn(session, lookup),
+      writes,
+    }));
+    assert.equal(selection.switchedTo, undefined);
+    assert.match(selection.heldForCache ?? "", /^better-/u);
+    assert.equal(session.acpx?.session_options?.profile, profileBefore);
+    assert.equal(session.acpx?.session_options?.account_switch, undefined);
+    assert.match(
+      writes.join(""),
+      /proactive subscription switch warm-\d+ → better-\d+ held for prompt cache: last turn 10m ago \(window 60m\) session record-warm-\d+\n/u,
+    );
+  });
+});
+
+test("cache window: 61 min after the last turn the session moves back (optimization)", async () => {
+  await withCeilingRig(CACHE_SPECS, undefined, async ({ lookup, record }) => {
+    const session = record("warm");
+    anchorLastTurn(session, 61);
+    const { selection, writes } = await withCapturedStderrWrites(async (writes) => ({
+      selection: await selectSubscriptionBeforeTurn(session, lookup),
+      writes,
+    }));
+    assert.match(selection.switchedTo ?? "", /^better-/u);
+    assert.equal(selection.heldForCache, undefined);
+    assert.match(
+      writes.join(""),
+      /proactive subscription switch warm-\d+ → better-\d+ \(optimization\) session record-warm-\d+\n/u,
+    );
+  });
+});
+
+test("cache window: current 5h at 0.70 inside the window is still FORCED off", async () => {
+  await withCeilingRig(CACHE_SPECS, undefined, async ({ lookup, record, setOutcome }) => {
+    setOutcome("warm", { fiveHour: 0.7, sevenDay: 0.5 });
+    const session = record("warm");
+    anchorLastTurn(session, 5);
+    const { selection, writes } = await withCapturedStderrWrites(async (writes) => ({
+      selection: await selectSubscriptionBeforeTurn(session, lookup),
+      writes,
+    }));
+    assert.match(selection.switchedTo ?? "", /^better-/u);
+    assert.match(writes.join(""), /\(forced:five-hour-full\)/u);
+  });
+});
+
+// Rule 4 — the margin works independently of the cache: a sub past its configured
+// weekly ceiling is left even inside the window, with a healthy 5h.
+test("cache window: current past its weekly-ceiling margin inside the window is FORCED off", async () => {
+  await withCeilingRig(
+    CACHE_SPECS,
+    { accounts: { "warm-account": { autoWeeklyCeiling: 0.4 } } },
+    async ({ lookup, record }) => {
+      const session = record("warm");
+      anchorLastTurn(session, 5);
+      const { selection, writes } = await withCapturedStderrWrites(async (writes) => ({
+        selection: await selectSubscriptionBeforeTurn(session, lookup),
+        writes,
+      }));
+      assert.match(selection.switchedTo ?? "", /^better-/u);
+      assert.equal(selection.heldForCache, undefined);
+      assert.match(writes.join(""), /\(forced:weekly-ceiling\)/u);
+    },
+  );
+});
+
+test("cache window: a LOCKED current sub inside the window is FORCED off", async () => {
+  await withCeilingRig(
+    [
+      {
+        id: "warm",
+        account: "warm-account",
+        outcome: { fiveHour: 0.1, sevenDay: 0.5 },
+        locked: true,
+      },
+      { id: "better", account: "better-account", outcome: { fiveHour: 0.1, sevenDay: 0.1 } },
+    ],
+    undefined,
+    async ({ lookup, record }) => {
+      const session = record("warm");
+      anchorLastTurn(session, 5);
+      const { selection, writes } = await withCapturedStderrWrites(async (writes) => ({
+        selection: await selectSubscriptionBeforeTurn(session, lookup),
+        writes,
+      }));
+      assert.match(selection.switchedTo ?? "", /^better-/u);
+      assert.match(writes.join(""), /\(forced:locked\)/u);
+    },
+  );
+});
+
+test("cache window: a switch AFTER the last turn voids the window (no turn warmed this sub)", async () => {
+  await withCeilingRig(CACHE_SPECS, undefined, async ({ lookup, record }) => {
+    const session = record("warm");
+    anchorLastTurn(session, 10);
+    const options = session.acpx?.session_options;
+    assert(options?.profile);
+    options.account_switch = {
+      toProfile: options.profile,
+      toAccount: "warm-account",
+      reason: "failover",
+      at: new Date(Date.now() - 5 * 60_000).toISOString(),
+    };
+    const selection = await selectSubscriptionBeforeTurn(session, lookup);
+    assert.match(selection.switchedTo ?? "", /^better-/u);
+  });
+});
+
+test("cache window: an anchor on ANOTHER sub, unparseable or in the future does not hold", async () => {
+  for (const anchor of [
+    { subscription: "some-other-sub", at: new Date(Date.now() - 60_000).toISOString() },
+    { subscription: undefined, at: "not-a-time" },
+    { subscription: undefined, at: new Date(Date.now() + 10 * 60_000).toISOString() },
+  ]) {
+    await withCeilingRig(CACHE_SPECS, undefined, async ({ lookup, record }) => {
+      const session = record("warm");
+      const profile = session.acpx?.session_options?.profile;
+      assert(profile);
+      session.acpx = {
+        ...session.acpx,
+        last_turn_subscription: { subscription: anchor.subscription ?? profile, at: anchor.at },
+      };
+      const selection = await selectSubscriptionBeforeTurn(session, lookup);
+      assert.match(selection.switchedTo ?? "", /^better-/u, JSON.stringify(anchor));
+    });
+  }
+});
+
+// Requirement 3.1 on the real ingress path: the queued turn's own writes must not
+// advance the anchor before selection reads it. Anchored 61 min ago, the turn must
+// MOVE (an anchor bumped at enqueue / prompt start would read ~0 min and hold), and
+// the turn it then runs re-anchors on the NEW sub — read back from disk, so the stamp
+// also survives the turn path's `cloneSessionAcpxState` re-base and the parser.
+test("cache window: a queued turn reads the PREVIOUS turn's anchor, then re-anchors at its end", async () => {
+  await withCeilingRig(CACHE_SPECS, undefined, async ({ lookup, record }) => {
+    const session = record("warm");
+    anchorLastTurn(session, 61);
+    await writeSessionRecordFile(lookup.homeDir, session);
+    const sharedClient = makeSharedClient(async () => ({ stopReason: "end_turn" as const }));
+    const sent: QueueOwnerMessage[] = [];
+    const turnStart = Date.now();
+
+    await runQueuedTask(session.acpxRecordId, makeQueueTask("move", sent), {
+      sharedClient,
+      replaceSharedClient: async () => sharedClient,
+    });
+
+    assert.equal(
+      sent.find((message) => message.type === "error"),
+      undefined,
+    );
+    const stored = await resolveSessionRecord(session.acpxRecordId);
+    const moved = stored.acpx?.session_options?.profile;
+    assert.match(moved ?? "", /^better-/u);
+    const anchor = stored.acpx?.last_turn_subscription;
+    assert.equal(anchor?.subscription, moved);
+    assert.ok(Date.parse(anchor?.at ?? "") >= turnStart, `anchor ${anchor?.at} predates the turn`);
+  });
+});
+
+test("cache window: a held queued turn stays put and advances its own anchor at turn end", async () => {
+  await withCeilingRig(CACHE_SPECS, undefined, async ({ lookup, record }) => {
+    const session = record("warm");
+    const profile = session.acpx?.session_options?.profile;
+    anchorLastTurn(session, 10);
+    await writeSessionRecordFile(lookup.homeDir, session);
+    const sharedClient = makeSharedClient(async () => ({ stopReason: "end_turn" as const }));
+    const sent: QueueOwnerMessage[] = [];
+    const turnStart = Date.now();
+
+    await runQueuedTask(session.acpxRecordId, makeQueueTask("stay", sent), { sharedClient });
+
+    assert.equal(
+      sent.find((message) => message.type === "error"),
+      undefined,
+    );
+    const stored = await resolveSessionRecord(session.acpxRecordId);
+    assert.equal(stored.acpx?.session_options?.profile, profile);
+    assert.equal(stored.acpx?.session_options?.account_switch, undefined);
+    const anchor = stored.acpx?.last_turn_subscription;
+    assert.equal(anchor?.subscription, profile);
+    assert.ok(Date.parse(anchor?.at ?? "") >= turnStart, `anchor ${anchor?.at} predates the turn`);
+  });
 });

@@ -25,11 +25,14 @@ import {
   type ReaderFootprint,
   readReaderFootprint,
 } from "./owners.js";
+import { type PendingPartition, type PendingReservation, partitionPending } from "./pending.js";
 
 /**
  * One read-only capacity reading of THIS box's control container — the numbers behind
- * `acpx capacity` (CONCEPTION f7587c86 §8.1). Phase 1: no pending ledger (`pendingBytes` 0,
- * `owners.starting` 0) and no make-room (`slotsAfterMakeRoom` = `freeSlots`, nothing releasable).
+ * `acpx capacity` AND the create gate's decision (CONCEPTION f7587c86 §8.1, §6.1 A2): both call
+ * this one function with the admission ledger's reservations, so "`acpx capacity --need 1` fits"
+ * and "this create is admitted" cannot disagree. No make-room yet (`slotsAfterMakeRoom` =
+ * `freeSlots`, nothing releasable).
  */
 
 export const DEFAULT_PODINFO_DIR = "/etc/podinfo";
@@ -149,6 +152,8 @@ export type ReadCapacityOptions = {
   readonly constants?: CapacityConstants;
   readonly now?: Date;
   readonly box?: string;
+  /** The admission ledger's live reservations (`ledger.ts`); absent ⇒ none. */
+  readonly pending?: readonly PendingReservation[];
 };
 
 const nul = <T>(value: T | undefined): T | null => (value === undefined ? null : value);
@@ -162,6 +167,7 @@ type Gathered = {
   readonly budget: BudgetResolution;
   readonly census: OwnerCensus;
   readonly reader: ReaderFootprint;
+  readonly pending: PendingPartition;
 };
 
 function gather(options: ReadCapacityOptions): Gathered {
@@ -170,6 +176,18 @@ function gather(options: ReadCapacityOptions): Gathered {
   const { sources } = options;
   const cgroup = readCgroup(sources.cgroupRoot);
   const reader = readReaderFootprint(sources.procRoot);
+  const census = censusOwners({
+    queueDir: sources.queueDir,
+    sessionsDir: sources.sessionsDir,
+    procRoot: sources.procRoot,
+    nowMs: now.getTime(),
+    freshMs: constants.leaseFreshMs,
+    readerPid: reader.pid,
+  });
+  const pending = partitionPending(
+    options.pending ?? [],
+    new Set(census.owners.map((owner) => owner.sessionId)),
+  );
   return {
     reader,
     constants,
@@ -182,15 +200,14 @@ function gather(options: ReadCapacityOptions): Gathered {
       cgroupLimitBytes: cgroup.limitBytes,
       constants,
     }),
-    census: censusOwners({
-      queueDir: sources.queueDir,
-      sessionsDir: sources.sessionsDir,
-      procRoot: sources.procRoot,
-      nowMs: now.getTime(),
-      freshMs: constants.leaseFreshMs,
-      readerPid: reader.pid,
-    }),
+    census: { ...census, owners: census.owners.map((owner) => withReservation(owner, pending)) },
+    pending,
   };
+}
+
+function withReservation(owner: OwnerTree, pending: PendingPartition): OwnerTree {
+  const reservedBytes = pending.ownerReserved.get(owner.sessionId);
+  return reservedBytes === undefined ? owner : { ...owner, reservedBytes };
 }
 
 /** C, L and B — all three are needed for any slot figure; any one missing ⇒ unmeasured. */
@@ -273,7 +290,7 @@ function formulaFor(g: Gathered, m: Measured, budgetBytes: number): FormulaResul
     limitBytes: m.limit,
     committedBytes: m.committed,
     owners: g.census.owners,
-    pendingBytes: 0,
+    pendingBytes: g.pending.pendingBytes,
     nodeAvailableBytes: g.node.availableBytes,
     psiFullAvg10: g.cgroup.memoryPressure.fullAvg10,
     constants: g.constants,
@@ -359,7 +376,7 @@ function formulaFields(formula: FormulaResult | undefined): FormulaFields {
 function ownersField(g: Gathered): CapacitySnapshot["owners"] {
   return {
     live: g.census.owners.length,
-    starting: 0,
+    starting: g.pending.starting,
     idleReleasable: 0,
     releasableBytes: 0,
     byHarness: harnessCounts(g.census.owners),
@@ -408,7 +425,7 @@ export function readCapacity(options: ReadCapacityOptions): CapacitySnapshot {
     committedBytes: nul(committedOf(g)),
     readerBytes: g.reader.bytes,
     workingSetBytes: nul(workingSetOf(g)),
-    pendingBytes: 0,
+    pendingBytes: g.pending.pendingBytes,
     reserveNewBytes: { ...g.constants.reserveNewBytes },
     liveFloorBytes: { ...g.constants.liveFloorBytes },
     ...formulaFields(formula),

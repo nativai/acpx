@@ -1015,7 +1015,7 @@ type IndexedUsage = { usage: SubscriptionUsage; index: number };
 
 /**
  * Is `usage` an eligible subscription target? brick://67d2fd2f req1 exports this
- * so the forced-switch trigger (`shouldSwitchToSelectionTarget`) reuses the SAME
+ * so the forced-switch trigger (`selectionSwitchDecision`) reuses the SAME
  * predicate as target selection — the two can never diverge on the weekly guard
  * again (that divergence was REPRO-REQ1 Mech1).
  */

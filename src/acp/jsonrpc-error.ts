@@ -1,5 +1,6 @@
 import type {
   AutomationCapacityReservedDetail,
+  CapacityRefusalDetail,
   CodexSubscriptionCapDetail,
   OutputErrorAcpPayload,
   OutputErrorCode,
@@ -14,6 +15,7 @@ export const OUTPUT_ERROR_JSONRPC_CODES: Record<OutputErrorCode, number> = {
   PERMISSION_PROMPT_UNAVAILABLE: -32072,
   RUNTIME: -32603,
   USAGE: -32602,
+  CAPACITY: -32075,
 };
 
 type JsonRpcErrorObject = {
@@ -53,6 +55,7 @@ export type BuildJsonRpcErrorParams = {
   effectiveAccount?: EffectiveAccountMetadata;
   automationCapacityReserved?: AutomationCapacityReservedDetail;
   codexSubscriptionCap?: CodexSubscriptionCapDetail;
+  capacityRefusal?: CapacityRefusalDetail;
   /**
    * WHICH POLICY refused, as a stable token identical across the tiers that enforce
    * one policy (`AcpxErrorOptions.policyReason`).
@@ -98,6 +101,9 @@ function buildFallbackData(params: BuildJsonRpcErrorParams): Record<string, unkn
   }
   if (params.codexSubscriptionCap !== undefined) {
     Object.assign(data, params.codexSubscriptionCap);
+  }
+  if (params.capacityRefusal !== undefined) {
+    Object.assign(data, params.capacityRefusal);
   }
 
   for (const [key, value] of Object.entries(data)) {

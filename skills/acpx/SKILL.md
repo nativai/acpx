@@ -105,6 +105,8 @@ An explicitly configured account override or registry default is a hard automati
 
 `subscriptions usage --format json` exposes each account's `eligibility` verdict, including vendor availability, automation eligibility, effective ceiling, policy provenance, reason, and telemetry freshness. Unknown weekly telemetry is reported and does not count as a known ceiling hit.
 
+Proactive selection is cache-sticky: while a session's last completed turn on its current subscription ended less than an hour ago (`acpx.last_turn_subscription`), a better-ranked subscription does not move it; it moves once that window has passed. A forced move still happens at once inside the window — locked, an exhausted 5h/7d window, the account's weekly ceiling, unusable telemetry, or 5h use at 70 % or more — so the ceiling above works independently of the window. The owner log names each decision: `proactive subscription switch <from> → <to> (forced:<reason>|optimization)` or `… held for prompt cache: last turn <N>m ago (window 60m)`.
+
 ## Built-in agent registry
 
 Friendly agent names resolve to commands:

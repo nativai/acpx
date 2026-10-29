@@ -42,6 +42,7 @@ import {
   failoverEnabledForRecord,
   isSubscriptionLockBlockError,
   selectSubscriptionBeforeTurn,
+  stampLastTurnSubscription,
 } from "../../runtime/engine/failover.js";
 import { SpawnLedgerError } from "../../spawn-ledger.js";
 import {
@@ -4120,6 +4121,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     applyConversation(record, conversation);
     await mergeLatestDurablePreferencesFromDisk();
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
+    // brick 6b7f8661 — the prompt-cache window anchor, at turn END: the next turn's
+    // selection keeps the session on this subscription for an hour from here. The
+    // acpxState re-sync below carries it into the persisted write.
+    stampLastTurnSubscription(record);
     // Served-truth surface (brick://07dd62c9): stamp what the harness ACTUALLY
     // served this turn (last assistant.message.model + derived effort) onto the
     // LIVE `acpx.served` block — never the desired pin. Best-effort; no-op for

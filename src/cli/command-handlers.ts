@@ -17,6 +17,7 @@ import {
 } from "../acp/harness-capabilities.js";
 import { projectAdvertisedComposedModels } from "../acp/model-support.js";
 import { resolveAgentNameFromCommand } from "../agent-registry.js";
+import { type AdmissionTicket, admitCreate } from "../capacity/admission.js";
 import {
   findProfile,
   isSubscriptionProfileLocked,
@@ -3327,6 +3328,16 @@ async function createSessionFromNewFlags(
   });
   const spawnGlobalFlags =
     validatedModel === undefined ? globalFlags : { ...globalFlags, model: validatedModel };
+  // The create gate (CONCEPTION f7587c86 §6.1 A2): after every validation — a usage error must
+  // never read as "no capacity" — and BEFORE anything exists, so a refusal (exit 75) leaves no
+  // record, no seat and no transient adapter. A live `--from` predecessor is a succession and is
+  // never gated; that is also the `sessions handover` successor, which comes through here.
+  const admission = await admitCreate({
+    verb: flags.from === undefined ? "sessions new" : "sessions new --from",
+    agentCommand: effectiveAgent.agentCommand,
+    recordId: flags.recordId,
+    successorOf: from?.acpxRecordId,
+  });
   // brick://7a2d5c60 — a cold or stale cache makes the validation above stand
   // aside, which is why it was a production no-op on a box nobody had run
   // `acpx models` on. This kicks a refresh off and RETURNS IMMEDIATELY (detached
@@ -3337,24 +3348,46 @@ async function createSessionFromNewFlags(
   warmCatalogueInBackground();
   const { createSession } = await loadSessionModule();
 
-  const created = await createSession(
-    buildSessionStartOptions({
-      agent: effectiveAgent,
-      flags,
-      globalFlags: spawnGlobalFlags,
-      config,
-      permissionMode,
-      permissionPolicy,
-      parent,
-      spawnedBySessionId,
-      inherit,
-      from,
-      resolvedBrick,
-      resolvedBrickValidated,
-    }),
+  const created = await createAdmitted(admission, () =>
+    createSession(
+      buildSessionStartOptions({
+        agent: effectiveAgent,
+        flags,
+        globalFlags: spawnGlobalFlags,
+        config,
+        permissionMode,
+        permissionPolicy,
+        parent,
+        spawnedBySessionId,
+        inherit,
+        from,
+        resolvedBrick,
+        resolvedBrickValidated,
+      }),
+    ),
   );
   await maybeStampBrickLink(created);
   return { created, agentName: effectiveAgent.agentName, globalFlags };
+}
+
+/**
+ * Runs an admitted create: on failure its reservation is released at once; on success it is bound
+ * to the new record id, so the first turn's owner — whose lease names that id — is charged its
+ * reservation while it ramps up (§5).
+ */
+async function createAdmitted(
+  admission: AdmissionTicket | undefined,
+  create: () => Promise<SessionRecord>,
+): Promise<SessionRecord> {
+  let created: SessionRecord;
+  try {
+    created = await create();
+  } catch (error) {
+    await admission?.release();
+    throw error;
+  }
+  await admission?.bind(created.acpxRecordId);
+  return created;
 }
 
 export async function handleSessionsCopy(
@@ -3551,55 +3584,65 @@ async function runSessionCopy(
   const { value: resolvedBrick, validated: resolvedBrickValidated } = await resolveBrickFlagValue(
     flags.brick,
   );
+  // The create gate (§6.1 A2) — copy, fork, by-the-way and `--from-template` all come through
+  // here; see `createSessionFromNewFlags` for why it sits after validation and before the create.
+  const admission = await admitCreate({
+    verb: requireTemplate ? "sessions new --from-template" : "sessions copy",
+    agentCommand: source.agentCommand,
+    recordId: flags.recordId,
+  });
 
   const [{ createSession }, { printCreatedSessionBanner }] = await Promise.all([
     loadSessionModule(),
     loadOutputRenderModule(),
   ]);
-  const created = await createSession({
-    recordId: flags.recordId,
-    agentCommand: source.agentCommand,
-    agentName: source.agentName ?? resolveAgentNameFromCommand(source.agentCommand, config.agents),
-    cwd: resolveCopyDestinationCwd(command, globalFlags, source),
-    seatName: flags.name ?? (await sourceDefaultForkName(source)),
-    // metadata.brick carry: precedence = --brick flag > spawn-parent brick (--parent-id / byway)
-    // > none. A plain fork/copy carries NO brick by default (the 07-15 source.metadata.brick
-    // fallback was reversed, brick://1113da9d) so it does not impersonate the source's brick.
-    metadata: withInheritedBrick(
-      applyBrickFlag(
-        copyMetadata(flags, source, forkAtMessageIndex, forkAtLogIndex),
-        resolvedBrick,
+  const created = await createAdmitted(admission, async () =>
+    createSession({
+      recordId: flags.recordId,
+      agentCommand: source.agentCommand,
+      agentName:
+        source.agentName ?? resolveAgentNameFromCommand(source.agentCommand, config.agents),
+      cwd: resolveCopyDestinationCwd(command, globalFlags, source),
+      seatName: flags.name ?? (await sourceDefaultForkName(source)),
+      // metadata.brick carry: precedence = --brick flag > spawn-parent brick (--parent-id / byway)
+      // > none. A plain fork/copy carries NO brick by default (the 07-15 source.metadata.brick
+      // fallback was reversed, brick://1113da9d) so it does not impersonate the source's brick.
+      metadata: withInheritedBrick(
+        applyBrickFlag(
+          copyMetadata(flags, source, forkAtMessageIndex, forkAtLogIndex),
+          resolvedBrick,
+        ),
+        caller?.brick, // spawn-parent brick (byway via --parent-id) — KEEP; the CALLER's under --no-parent
+        resolvedBrick === false,
       ),
-      caller?.brick, // spawn-parent brick (byway via --parent-id) — KEEP; the CALLER's under --no-parent
-      resolvedBrick === false,
-    ),
-    // Brick `9984c510` — this path has no `explicitBrickFlag` (it exists only
-    // for the `--seat` JOIN comparison, which fork/copy can never reach —
-    // `refuseSeatJoinOnForkPath`), but it still MINTS a fresh seat
-    // (`seatFieldsForCreate`'s unconditional-mint default), so the hinge at
-    // `session-management.ts` still needs this signal independently.
-    explicitBrickFlagValidated: resolvedBrickValidated,
-    parentSessionId: parent?.acpxRecordId,
-    parentSessionUrl: parent?.sessionUrl,
-    parentSeatId: parent?.seatId,
-    spawnedBySessionId,
-    forkFromSessionId: source.acpxRecordId,
-    forkAtMessageIndex: flags.atIndex,
-    forkAtLogIndex: flags.atLogIndex,
-    forkExpectEntry: flags.expectEntry,
-    seatFavorite: flags.favorite,
-    mcpServers: config.mcpServers,
-    permissionMode,
-    nonInteractivePermissions: globalFlags.nonInteractivePermissions,
-    permissionPolicy,
-    authCredentials: config.auth,
-    authPolicy: globalFlags.authPolicy,
-    terminal: globalFlags.terminal,
-    timeoutMs: globalFlags.timeout,
-    verbose: globalFlags.verbose,
-    sessionOptions: copySessionOptionsWithOverride(source, globalFlags),
-    desiredConfigOptions: copyDesiredConfigOptionsWithOverride(source, globalFlags),
-  });
+      // Brick `9984c510` — this path has no `explicitBrickFlag` (it exists only
+      // for the `--seat` JOIN comparison, which fork/copy can never reach —
+      // `refuseSeatJoinOnForkPath`), but it still MINTS a fresh seat
+      // (`seatFieldsForCreate`'s unconditional-mint default), so the hinge at
+      // `session-management.ts` still needs this signal independently.
+      explicitBrickFlagValidated: resolvedBrickValidated,
+      parentSessionId: parent?.acpxRecordId,
+      parentSessionUrl: parent?.sessionUrl,
+      parentSeatId: parent?.seatId,
+      spawnedBySessionId,
+      forkFromSessionId: source.acpxRecordId,
+      forkAtMessageIndex: flags.atIndex,
+      forkAtLogIndex: flags.atLogIndex,
+      forkExpectEntry: flags.expectEntry,
+      seatFavorite: flags.favorite,
+      mcpServers: config.mcpServers,
+      permissionMode,
+      nonInteractivePermissions: globalFlags.nonInteractivePermissions,
+      permissionPolicy,
+      authCredentials: config.auth,
+      authPolicy: globalFlags.authPolicy,
+      terminal: globalFlags.terminal,
+      timeoutMs: globalFlags.timeout,
+      verbose: globalFlags.verbose,
+      sessionOptions: copySessionOptionsWithOverride(source, globalFlags),
+      desiredConfigOptions: copyDesiredConfigOptionsWithOverride(source, globalFlags),
+    }),
+  );
   await maybeStampBrickLink(created);
   warnIfContextEndsEarly(created, forkAtLogIndex);
   const sourceType = agentTypeLabel(source.agentCommand, config);

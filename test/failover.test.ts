@@ -22,7 +22,7 @@ import {
   classifyFailover,
   enforceSubscriptionLockBeforeTurn,
   FAILOVER_ERROR_KINDS,
-  shouldSwitchToSelectionTarget,
+  selectionSwitchDecision,
 } from "../src/runtime/engine/failover.js";
 import type { SessionRecord } from "../src/types.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
@@ -691,14 +691,14 @@ test("req1 Mech1: a session on a weekly-full sub (fresh 5h) is FORCED off it", (
     fiveHour: { utilization: 0.1, reset: null },
     sevenDay: { utilization: 0.3, reset: "2026-07-20T00:00:00Z" },
   });
-  const forced = shouldSwitchToSelectionTarget({
+  const forced = selectionSwitchDecision({
     record: selectionRecord(),
     target,
     targetIndex: 1,
     currentUsage,
     currentIndex: 0,
   });
-  assert.equal(forced, true);
+  assert.deepEqual(forced, { kind: "forced", reason: "weekly-ceiling" });
 });
 
 test("req1 Mech1: a session on a weekly-HEALTHY current sub is NOT force-switched (no thrash)", () => {
@@ -712,14 +712,14 @@ test("req1 Mech1: a session on a weekly-HEALTHY current sub is NOT force-switche
     fiveHour: { utilization: 0.1, reset: null },
     sevenDay: { utilization: 0.5, reset: "2026-07-25T00:00:00Z" },
   });
-  const shouldSwitch = shouldSwitchToSelectionTarget({
+  const decision = selectionSwitchDecision({
     record: selectionRecord(),
     target,
     targetIndex: 1,
     currentUsage,
     currentIndex: 0,
   });
-  assert.equal(shouldSwitch, false);
+  assert.deepEqual(decision, { kind: "stay" });
 });
 
 test("req1 Mech1: a missing current-usage probe forces a switch (no headroom evidence)", () => {
@@ -727,12 +727,12 @@ test("req1 Mech1: a missing current-usage probe forces a switch (no headroom evi
     fiveHour: { utilization: 0.1, reset: null },
     sevenDay: { utilization: 0.3, reset: "2026-07-20T00:00:00Z" },
   });
-  const forced = shouldSwitchToSelectionTarget({
+  const forced = selectionSwitchDecision({
     record: selectionRecord(),
     target,
     targetIndex: 0,
     currentUsage: undefined,
     currentIndex: -1,
   });
-  assert.equal(forced, true);
+  assert.deepEqual(forced, { kind: "forced", reason: "probe-missing" });
 });

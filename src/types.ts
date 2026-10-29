@@ -186,6 +186,8 @@ export const OUTPUT_ERROR_CODES = [
   "PERMISSION_PROMPT_UNAVAILABLE",
   "RUNTIME",
   "USAGE",
+  /** The create gate refused for memory (CONCEPTION f7587c86 §8.2): exit 75, nothing started. */
+  "CAPACITY",
 ] as const;
 export type OutputErrorCode = (typeof OUTPUT_ERROR_CODES)[number];
 
@@ -242,6 +244,24 @@ export type AutomationCapacityReservedDetail = {
   nextEligibilityAccountId?: string;
   nextEligibilityAccountLabel?: string;
   nextEligibilitySource?: AutomationEligibilitySource;
+};
+
+/** Why the create gate refused (CONCEPTION f7587c86 §8.2) — the `reason=` token on stderr. */
+export type CapacityRefusalReason =
+  | "no_capacity"
+  | "memory_pressure"
+  | "node_pressure"
+  | "admission_busy";
+
+/**
+ * Additive JSON-RPC data of a capacity refusal. `capacity` is the same snapshot `acpx capacity
+ * --format json` prints (absent only for `admission_busy`, which never took a reading).
+ */
+export type CapacityRefusalDetail = {
+  reason: CapacityRefusalReason;
+  nothingStarted: true;
+  retryAfterS: number;
+  capacity?: unknown;
 };
 
 /**
@@ -348,6 +368,7 @@ export interface OutputFormatter {
     effectiveAccount?: EffectiveAccountMetadata;
     automationCapacityReserved?: AutomationCapacityReservedDetail;
     codexSubscriptionCap?: CodexSubscriptionCapDetail;
+    capacityRefusal?: CapacityRefusalDetail;
     timestamp?: string;
   }): void;
   onPermissionEscalation(event: PermissionEscalationEvent): void;
@@ -802,6 +823,17 @@ export type SessionAcpxState = {
    * normalises at read time.
    */
   last_turn_provider?: LastTurnProviderBreadcrumb;
+  /**
+   * The subscription that served the session's last COMPLETED turn, and when that
+   * turn ended (brick 6b7f8661) — the anchor of the 1-hour prompt-cache window that
+   * proactive selection keeps a session on its subscription inside.
+   *
+   * ⚠️ Written ONLY at turn end (`savePromptSuccess`), never at prompt start or by
+   * a control command. `lastUsedAt` / `lastPromptAt` / `served.at` are all also
+   * advanced without model traffic, and a prompt-start write would make every
+   * turn read its own window as just opened: a session that never moves back.
+   */
+  last_turn_subscription?: { subscription: string; at: string };
   /**
    * The context fill the adapter LAST reported (brick 4f3fa88c) — what `acpx context`
    * shows and what the context alarm is computed from after an owner respawn.

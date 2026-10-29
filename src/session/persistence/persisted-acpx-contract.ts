@@ -137,6 +137,10 @@ export const PERSISTED_ACPX_SENTINEL = {
     response_id: "sentinel-last-response-id",
     at: "2026-09-10T00:00:03.000Z",
   },
+  last_turn_subscription: {
+    subscription: "sentinel-last-turn-subscription",
+    at: "2026-09-10T00:00:04.000Z",
+  },
   harness_config_dir: "/tmp/sentinel-harness-config-dir",
   pi_session_dir: "/tmp/sentinel-pi-session-dir",
   model_set_unsupported_for: "sentinel-model-set-unsupported",

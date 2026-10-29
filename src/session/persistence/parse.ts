@@ -362,6 +362,7 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
   // by the test — so the bug is invisible in exactly the rig that has no
   // late write, and present in production, where close() always runs.
   assignLastTurnProvider(state, record.last_turn_provider);
+  assignLastTurnSubscription(state, record.last_turn_subscription);
 
   if (isStringArray(record.available_models)) {
     state.available_models = [...record.available_models];
@@ -817,6 +818,25 @@ function assignLastTurnProvider(state: SessionAcpxState, value: unknown): void {
     response_id: typeof record.response_id === "string" ? record.response_id : null,
     at: record.at,
   };
+}
+
+/**
+ * `acpx.last_turn_subscription` — the prompt-cache window anchor (brick 6b7f8661).
+ * Both fields are required: an anchor that names no subscription or no time cannot
+ * hold a session anywhere, so a malformed block is dropped (= outside the window).
+ */
+function assignLastTurnSubscription(state: SessionAcpxState, value: unknown): void {
+  const record = asRecord(value);
+  if (
+    !record ||
+    typeof record.subscription !== "string" ||
+    record.subscription.length === 0 ||
+    typeof record.at !== "string" ||
+    record.at.length === 0
+  ) {
+    return;
+  }
+  state.last_turn_subscription = { subscription: record.subscription, at: record.at };
 }
 
 function assignSessionOptionRoutingPolicyWarning(
