@@ -1152,11 +1152,28 @@ test("AcpClient load/resume re-supplies fresh brick context on the system-prompt
       },
     );
 
+    // brick a81e16a1 r3: this client carries no `disallowedTools` — the shape of
+    // a legacy record — so a Claude load/resume re-sends acpx's default list.
+    const legacyDefaultOptions = {
+      claudeCode: {
+        options: {
+          disallowedTools: [
+            "ScheduleWakeup",
+            "CronCreate",
+            "CronList",
+            "CronDelete",
+            "RemoteTrigger",
+            "Skill",
+          ],
+        },
+      },
+    };
     assert.deepEqual(capturedLoadParams, {
       sessionId: "session-load",
       cwd: path.resolve("/tmp/acpx-client-load"),
       mcpServers: [],
       _meta: {
+        ...legacyDefaultOptions,
         systemPrompt: { append: "LOAD CONTEXT" },
       },
     });
@@ -1165,6 +1182,7 @@ test("AcpClient load/resume re-supplies fresh brick context on the system-prompt
       cwd: path.resolve("/tmp/acpx-client-resume"),
       mcpServers: [],
       _meta: {
+        ...legacyDefaultOptions,
         systemPrompt: { append: "RESUME CONTEXT" },
       },
     });
