@@ -170,7 +170,7 @@ async function refuseTurnInFlightForRecycle(
  * (the shared-volume socket works across pods), and refused only if it says so. The old rule read a
  * foreign owner as dead, skipped both the refusal and the recycle, and left it serving the old value.
  */
-function isOwnerPossiblyAlive(liveness: QueueOwnerLiveness): boolean {
+export function isOwnerPossiblyAlive(liveness: QueueOwnerLiveness): boolean {
   return liveness.ownerFound && liveness.alive !== false;
 }
 

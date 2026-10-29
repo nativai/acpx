@@ -82,6 +82,7 @@ import { registerSeatsCommand } from "./seats-command.js";
 import { DEFAULT_CLOSE_DRAIN_TIMEOUT_MS } from "./session/contracts.js";
 import { registerStatusCommand } from "./status-command.js";
 import { registerSubscriptionsCommand } from "./subscriptions-command.js";
+import { registerTranscriptsCommand } from "./transcripts-command.js";
 
 type FlowRunFlags = {
   inputJson?: string;
@@ -1193,6 +1194,8 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
   // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS` (`"agent-folders"`) — same commit, or the
   // token is absorbed as an agent name (C7, brick 09197f03).
   registerAgentFoldersCommand(program, config);
+  // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS` (`"transcripts"`, brick 81433524).
+  registerTranscriptsCommand(program, config);
   registerSubscriptionsCommand(program, config);
   registerProfilesCommand(program, config);
   registerAgentsCommand(program, config);

@@ -69,6 +69,7 @@ import {
   normalizeQueueOwnerTtlMs,
   type SessionSendOptions,
 } from "./contracts.js";
+import { reapTranscriptsAtOwnerExit, type OwnerExitKind } from "./owner-exit-transcript-reap.js";
 import {
   clearBackgroundTaskChip,
   createOwnerSignalReap,
@@ -420,6 +421,7 @@ async function closeQueueOwnerRuntime(params: {
   turnController: QueueOwnerTurnController;
   sharedClient: AcpClient;
   sessionId: string;
+  exitKind: OwnerExitKind;
   verbose?: boolean;
   /** brick ad6ba1c2 — absent only for owners that never built a client. */
   taskReaper?: OwnerTaskReaper;
@@ -464,6 +466,15 @@ async function closeQueueOwnerRuntime(params: {
   // drain it so the index reflects the final owner state (W2.3 / D6).
   await flushPendingSessionIndexUpdates().catch(() => {
     // best effort while queue owner is shutting down
+  });
+  // brick 81433524 D2: inside the lease, after the adapter is closed — the only point
+  // that can prove no writer of this session is left. Idle releases only; it settles
+  // (and if need be SIGKILLs) this owner's process group first. Never throws.
+  await reapTranscriptsAtOwnerExit({
+    sessionId: params.sessionId,
+    exitKind: params.exitKind,
+    isGroupLeader: ownerIsGroupLeader,
+    superseded: params.heartbeat.isSuperseded(),
   });
   await stopHeartbeatAndRelease(params.heartbeat, params.lease, params.owner);
   if (params.verbose) {
@@ -1034,6 +1045,10 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   // the owner (exit the loop, release the lease) after the current turn; the
   // next prompt cold-spawns a fresh owner on the new dir.
   let recycleOwnerAfterTask = false;
+  // brick 81433524 D2: how this owner's loop ended. Only an idle release reaps the
+  // session's left-behind transcript copies at exit; a recycle the next prompt waits
+  // on does not (CONCEPTION §2.4 table).
+  let ownerExitKind: OwnerExitKind = "other";
   // Wall-clock of the most recent inter-turn idle-drain activity (background
   // session/update relay of teammate/sub-agent work). 0 = no activity since
   // spawn. Stamped in the idle-drain onAcpMessage handler; read by the idle
@@ -1568,6 +1583,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           // Graceful close via the existing clean path (finally →
           // closeQueueOwnerRuntime). The next prompt cold-respawns, resuming WITH
           // context. No new kill primitive.
+          ownerExitKind = "idle-release";
           break;
         }
         // A task raced the release decision — process it instead of releasing.
@@ -1709,6 +1725,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           ? (recycleReason ?? "account-switch")
           : "output-style-change";
         logTurnBoundaryRecycle(options.sessionId, ownerExitReason, backgroundTasks.liveCount());
+        ownerExitKind = "turn-boundary-recycle";
         break;
       }
     }
@@ -1729,6 +1746,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       turnController,
       sharedClient,
       sessionId: options.sessionId,
+      exitKind: ownerExitKind,
       verbose: options.verbose,
       taskReaper,
       exitReason: ownerExitReason,

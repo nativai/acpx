@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -9,6 +10,14 @@ import {
   transcriptCwdHash,
   transcriptJsonlPath,
 } from "../src/config/subscription-transcript.js";
+import { readExitTailFile } from "../src/config/transcript-dedup.js";
+import {
+  conversation,
+  exitLine,
+  jsonl,
+  sha256File,
+  writeFileAt,
+} from "./transcript-fixture-test-helpers.js";
 
 const CWD = "/work/proj";
 const ACP_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -282,5 +291,271 @@ test("ensure: unparsable-timestamp candidates fall back to mtime ordering", asyn
     assert.equal(result.status, "ported");
     assert.match((await readIfExists(dstPath)) ?? "", /fresher/);
     assert.ok(await supersededSidecar(dst), "mtime-staler dest superseded");
+  });
+});
+
+// --- brick 81433524: D1 (the replaced destination is proven redundant at the port) ---
+// and D4 (a copy with no timestamped entry never wins the freshness selection).
+
+async function captureStderr<T>(run: () => Promise<T>): Promise<{ result: T; stderr: string }> {
+  const original = process.stderr.write.bind(process.stderr);
+  let text = "";
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    text += String(chunk);
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    return { result: await run(), stderr: text };
+  } finally {
+    process.stderr.write = original;
+  }
+}
+
+/** P + a later continuation, as JSONL text, for ACP_ID. */
+function shapes() {
+  const p = conversation(ACP_ID, { pairs: 16 });
+  const newer = conversation(ACP_ID, {
+    pairs: 3,
+    seed: "newer",
+    startMinute: 200,
+    parent: p.lastUuid,
+  });
+  return { p, pText: jsonl(p.lines), newerText: jsonl(newer.lines) };
+}
+
+async function dedupFixture(dir: string, dstBody: string, srcBody: string) {
+  const src = path.join(dir, "subA");
+  const dst = path.join(dir, "subB");
+  const srcPath = await writeFileAt(transcriptJsonlPath(src, CWD, ACP_ID), srcBody);
+  const dstPath = await writeFileAt(transcriptJsonlPath(dst, CWD, ACP_ID), dstBody);
+  return { src, dst, srcPath, dstPath };
+}
+
+async function sidecarsIn(configDir: string): Promise<string[]> {
+  const dir = path.dirname(transcriptJsonlPath(configDir, CWD, ACP_ID));
+  return (await fs.readdir(dir)).filter((name) => name.includes(".superseded-")).toSorted();
+}
+
+test("B1: a destination that is a byte-prefix of the source is deleted, not renamed aside", async () => {
+  await withTempDir(async (dir) => {
+    const { pText, newerText } = shapes();
+    const { src, dst, dstPath } = await dedupFixture(dir, pText, pText + newerText);
+    const { result, stderr } = await captureStderr(
+      async () =>
+        await ensureTranscriptAtConfigDir(transcriptRecord(), dst, ensureOpts(dir, [src])),
+    );
+    assert.equal(result.status, "ported");
+    assert.equal(await fs.readFile(dstPath, "utf8"), pText + newerText);
+    assert.deepEqual(await sidecarsIn(dst), [], "no sidecar may remain");
+    assert.equal(result.status === "ported" && result.supersededDisposition, "deleted");
+    assert.equal(result.status === "ported" && result.supersededPath, undefined);
+    assert.match(stderr, /decision=ported-superseded .*supersededDisposition=deleted /);
+    assert.match(stderr, new RegExp(`supersededBytes=${Buffer.byteLength(pText)}`));
+  });
+});
+
+test("B2 / negative 1: a divergent destination survives as a sidecar, byte-identical", async () => {
+  await withTempDir(async (dir) => {
+    const { p, pText, newerText } = shapes();
+    const branch = conversation(ACP_ID, {
+      pairs: 2,
+      seed: "branch",
+      startMinute: 100,
+      parent: p.lastUuid,
+    });
+    const dstBody = pText + jsonl(branch.lines);
+    const { src, dst } = await dedupFixture(dir, dstBody, pText + newerText);
+    const { result, stderr } = await captureStderr(
+      async () =>
+        await ensureTranscriptAtConfigDir(transcriptRecord(), dst, ensureOpts(dir, [src])),
+    );
+    assert.equal(result.status, "ported");
+    const sidecars = await sidecarsIn(dst);
+    assert.equal(sidecars.length, 1);
+    const sidecar = path.join(path.dirname(transcriptJsonlPath(dst, CWD, ACP_ID)), sidecars[0]);
+    assert.equal(await fs.readFile(sidecar, "utf8"), dstBody);
+    assert.equal(result.status === "ported" && result.supersededPath, sidecar);
+    assert.equal(result.status === "ported" && result.supersededDisposition, "kept");
+    assert.match(
+      stderr,
+      /supersededDisposition=kept supersededReason=divergent-[^ ]*tail-not-exit-block:uuid/,
+    );
+  });
+});
+
+test("B3a / negative 2a: ONE unique trailing byte on the destination survives the port", async () => {
+  await withTempDir(async (dir) => {
+    const { pText, newerText } = shapes();
+    const dstBody = `${pText}x`;
+    const { src, dst } = await dedupFixture(dir, dstBody, pText + newerText);
+    const { result, stderr } = await captureStderr(
+      async () =>
+        await ensureTranscriptAtConfigDir(transcriptRecord(), dst, ensureOpts(dir, [src])),
+    );
+    assert.equal(result.status, "ported");
+    assert.equal(result.status === "ported" && result.supersededDisposition, "kept");
+    const sidecar = result.status === "ported" ? result.supersededPath : undefined;
+    assert.ok(sidecar);
+    assert.equal(await fs.readFile(sidecar, "utf8"), dstBody);
+    assert.match(stderr, /supersededReason=divergent-[^ ]*\+tail-not-exit-block:partial/);
+  });
+});
+
+test("B3b / negative 2b: a destination = source + 1 byte is the freshest and is never ported over", async () => {
+  await withTempDir(async (dir) => {
+    const { pText, newerText } = shapes();
+    const dstBody = `${pText + newerText}x`;
+    const { src, dst, dstPath } = await dedupFixture(dir, dstBody, pText + newerText);
+    const result = await ensureTranscriptAtConfigDir(
+      transcriptRecord(),
+      dst,
+      ensureOpts(dir, [src]),
+    );
+    assert.equal(result.status, "already-present");
+    assert.equal(await fs.readFile(dstPath, "utf8"), dstBody);
+    assert.deepEqual(await sidecarsIn(dst), []);
+  });
+});
+
+test("B4 (T): a destination holding an exit block is reduced to a tail file at the port", async () => {
+  await withTempDir(async (dir) => {
+    const { p, pText, newerText } = shapes();
+    const block = jsonl([
+      exitLine("last-prompt", ACP_ID, p.lastUuid),
+      exitLine("ai-title", ACP_ID, p.lastUuid),
+      exitLine("mode", ACP_ID, p.lastUuid),
+      exitLine("atis-latch", ACP_ID, p.lastUuid),
+      exitLine("cost-state", ACP_ID, p.lastUuid),
+    ]);
+    const dstBody = pText + block;
+    const { src, dst, dstPath } = await dedupFixture(dir, dstBody, pText + newerText);
+    const oldSha = await sha256File(dstPath);
+    const { result, stderr } = await captureStderr(
+      async () =>
+        await ensureTranscriptAtConfigDir(transcriptRecord(), dst, ensureOpts(dir, [src])),
+    );
+    assert.equal(result.status, "ported");
+    assert.deepEqual(await sidecarsIn(dst), [], "no .superseded-*.jsonl remains");
+    assert.equal(result.status === "ported" && result.supersededDisposition, "reduced");
+    const tailFile = result.status === "ported" ? result.exitTailPath : undefined;
+    assert.ok(tailFile);
+    assert.match(stderr, new RegExp(`supersededDisposition=reduced .*exitTail=${tailFile}`));
+    // Rebuild the old destination from the active copy's prefix + the kept tail.
+    const { header, tail } = await readExitTailFile(tailFile);
+    const active = await fs.readFile(dstPath);
+    const rebuilt = Buffer.concat([active.subarray(0, header.prefix_bytes), tail]);
+    assert.equal(createHash("sha256").update(rebuilt).digest("hex"), oldSha);
+    assert.equal(header.reduced_by, "port");
+  });
+});
+
+test("B5: a failed copy leaves the destination untouched and no temp file", async () => {
+  await withTempDir(async (dir) => {
+    const { pText, newerText } = shapes();
+    const { src, dst, srcPath, dstPath } = await dedupFixture(dir, pText, pText + newerText);
+    await fs.chmod(srcPath, 0o000);
+    try {
+      await assert.rejects(
+        async () =>
+          await ensureTranscriptAtConfigDir(transcriptRecord(), dst, ensureOpts(dir, [src])),
+      );
+    } finally {
+      await fs.chmod(srcPath, 0o600);
+    }
+    assert.equal(await fs.readFile(dstPath, "utf8"), pText, "destination not renamed away");
+    const names = await fs.readdir(path.dirname(dstPath));
+    assert.deepEqual(names, [`${ACP_ID}.jsonl`], "no sidecar, no .tmp");
+  });
+});
+
+test("B7: a missing destination ports as before, with no supersede fields", async () => {
+  await withTempDir(async (dir) => {
+    const { pText } = shapes();
+    const src = path.join(dir, "subA");
+    const dst = path.join(dir, "subB");
+    await writeFileAt(transcriptJsonlPath(src, CWD, ACP_ID), pText);
+    const result = await ensureTranscriptAtConfigDir(
+      transcriptRecord(),
+      dst,
+      ensureOpts(dir, [src]),
+    );
+    assert.equal(result.status, "ported");
+    assert.equal(result.status === "ported" && result.supersededPath, undefined);
+    assert.equal(result.status === "ported" && result.supersededDisposition, undefined);
+    assert.equal(await fs.readFile(transcriptJsonlPath(dst, CWD, ACP_ID), "utf8"), pText);
+  });
+});
+
+test("D1 / negative 6: a metadata-only fragment with mtime=now never wins over a timestamped active copy", async () => {
+  await withTempDir(async (dir) => {
+    const { p, pText } = shapes();
+    const fragment = jsonl([
+      exitLine("cost-state", ACP_ID, p.lastUuid),
+      exitLine("last-prompt", ACP_ID, p.lastUuid),
+    ]);
+    const { src, dst, srcPath, dstPath } = await dedupFixture(dir, pText, fragment);
+    // The active copy is old on disk; the fragment was "just written".
+    const old = new Date("2026-07-01T00:00:00.000Z");
+    await fs.utimes(dstPath, old, old);
+    const now = new Date();
+    await fs.utimes(srcPath, now, now);
+    const result = await ensureTranscriptAtConfigDir(
+      transcriptRecord(),
+      dst,
+      ensureOpts(dir, [src]),
+    );
+    assert.equal(result.status, "already-present");
+    assert.equal(await fs.readFile(dstPath, "utf8"), pText, "the active copy is untouched");
+  });
+});
+
+test("D3: a huge last line is read back to its timestamp (content basis), not mtime", async () => {
+  await withTempDir(async (dir) => {
+    const { pText } = shapes();
+    const huge = JSON.stringify({
+      type: "user",
+      message: { role: "user", content: "r".repeat(6 * 1024 * 1024) },
+      uuid: "huge-line",
+      timestamp: "2026-07-25T00:00:00.000Z",
+    });
+    const stale = jsonl([
+      JSON.stringify({ type: "user", uuid: "s1", timestamp: "2026-07-17T00:00:00.000Z" }),
+    ]);
+    const { src, dst, srcPath, dstPath } = await dedupFixture(dir, stale, `${pText}${huge}\n`);
+    // Only CONTENT can make the source win: its mtime is older than the destination's.
+    const old = new Date("2026-07-01T00:00:00.000Z");
+    await fs.utimes(srcPath, old, old);
+    const result = await ensureTranscriptAtConfigDir(
+      transcriptRecord(),
+      dst,
+      ensureOpts(dir, [src]),
+    );
+    assert.equal(result.status, "ported");
+    assert.equal((await fs.stat(dstPath)).size, (await fs.stat(srcPath)).size);
+  });
+});
+
+test("D4: a last line longer than the 16 MiB scan cap falls back to mtime, never to `none`", async () => {
+  await withTempDir(async (dir) => {
+    const huge = JSON.stringify({
+      type: "user",
+      message: { content: "q".repeat(17 * 1024 * 1024) },
+      timestamp: "2026-07-25T00:00:00.000Z",
+    });
+    const stale = jsonl([
+      JSON.stringify({ type: "user", uuid: "s1", timestamp: "2026-07-17T00:00:00.000Z" }),
+    ]);
+    const { src, dst, srcPath, dstPath } = await dedupFixture(dir, stale, `${huge}\n`);
+    const old = new Date("2026-07-01T00:00:00.000Z");
+    await fs.utimes(dstPath, old, old);
+    const fresh = new Date();
+    await fs.utimes(srcPath, fresh, fresh);
+    // mtime basis (fresh) beats the destination's content timestamp; `none` would lose.
+    const result = await ensureTranscriptAtConfigDir(
+      transcriptRecord(),
+      dst,
+      ensureOpts(dir, [src]),
+    );
+    assert.equal(result.status, "ported");
   });
 });

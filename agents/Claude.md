@@ -28,3 +28,14 @@ acpx subscriptions ceiling clear-default
 ```
 
 Explicit registry policy is hard for automatic sessions at turn boundaries: acpx switches away from a known at-ceiling account or returns `automation-capacity-reserved` before prompt submission. Pinned/manual sessions may override that reserve; account locks may not. Registries with no explicit policy retain the legacy soft 0.90 behavior, and `ACPX_SUBSCRIPTION_AUTO_SELECT=off` disables both selection and hard admission for rollback. Usage JSON reports the policy-aware eligibility verdict and telemetry freshness; unknown weekly telemetry is not treated as a known ceiling.
+
+## Transcript copies across subscriptions
+
+Claude Code keeps a session's transcript inside the subscription's config dir, so switching a session to another subscription copies `<id>.jsonl` there. acpx keeps one live copy per session:
+
+- The port removes the destination it replaces when that destination is a byte-prefix of the new copy. When it is the new copy's prefix plus the exit-metadata block Claude Code appends when it exits (`last-prompt`, `cost-state`, …), it is reduced: the block goes byte-exactly into `<id>.exit-tail-<ISO>.acpx`. A real divergence stays as `<id>.superseded-<ISO>.jsonl`.
+- The copy left in the previous subscription is removed or reduced at the queue owner's idle exit, after the owner's process group (adapter and Claude Code included) is empty. It is never removed at the port, because the old Claude Code process is still alive there and would recreate the file when it exits.
+- A copy with no timestamped entry (only exit metadata) never wins the freshest-copy selection.
+- `acpx transcripts dedup` cleans up copies that already exist (dry run unless `--apply --manifest <file>`). `acpx transcripts restore <tail-file>` rebuilds a reduced copy, checked against its sha256.
+
+The exit-block types are the ones Claude Code's loader treats as last-wins. A type outside that list keeps the copy.
