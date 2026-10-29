@@ -1,28 +1,38 @@
-// brick ad6ba1c2 — a stand-in queue owner for the background-task gate and reap tests.
+// brick ad6ba1c2 — a stand-in queue owner for the background-task gate and reap tests (v3).
 //
 // Compiled to `dist-test/test/bg-task-owner-child.js` and spawned `detached: true` (a process-group
-// leader, like the real owner). It builds the PRODUCTION interaction shape at process level:
+// and session leader, like the real owner). It builds the PRODUCTION interaction shape at process
+// level, with the two kernel facts v3's proofs read (REPRODUCTION.md "v3 measurement"):
 //
-//   this owner (group leader) → fake adapter (same group) → task shell (setsid: its own session and
-//   group, like Claude Code's `detached:true` shell) → `sleep` (bash job control: a THIRD group)
+//   this owner → fake claude (same session) ─┬→ Bash task shell (setsid), fds 1/2 WR|APPEND on
+//                                            │  <taskRoot>/<S>/tasks/b343f35rh.output → `sleep`
+//                                            │  (bash job control: a THIRD group)          Proof F
+//                                            └→ Monitor shell (setsid), fds 1/2 a SOCKET to claude,
+//                                               CLAUDE_CODE_SESSION_ID=<S>, argv `eval '<cmd>'`
+//                                               → `sleep`                                    Proof M
 //
-// so a process-group kill of this owner provably misses the task pair (REPRODUCTION.md). Not a test
-// file — only spawned. Writes `{ownerPid, adapterPid, shellPid, sleepPid}` (and per-mode results) to
-// `<outFile>` as JSON lines. Never prints argv or environ.
+// A process-group kill of this owner provably misses both. Not a test file — only spawned. Writes
+// `{ready, ownerPid, claudePid, shellPid, sleepPid, monShellPid, monSleepPid}` (and per-mode results)
+// to `<outFile>` as JSON lines. Never prints argv or environ.
+//
+// argv: <mode> <outFile> <sessionId = S> <taskRoot: a dir whose path has a `claude-<uid>` segment>
 //
 // Modes:
-//   owner         real SessionQueueOwner answering query_background_tasks with the fixture tasks,
-//                 fatal handler WITH the task reaper (production after this brick)
+//   owner         real SessionQueueOwner answering query_background_tasks with the fixture tasks and
+//                 the Monitor's command; fatal handler WITH the task reaper (production)
 //   owner-none    the same, but the owner reports no live tasks
-//   old-owner     a raw socket that answers every request with QUEUE_REQUEST_INVALID (an owner
-//                 built before this verb existed), fatal handler WITHOUT the task reaper
+//   owner-ghost   the fixture tasks plus a Bash task whose process does not exist (unprovable)
+//   old-owner     a raw socket answering every request QUEUE_REQUEST_INVALID (an owner built before
+//                 this verb), fatal handler WITHOUT the task reaper
 //   fatal         only the fatal handler, WITH the task reaper (O1)
 //   fatal-noreap  only the fatal handler, WITHOUT it (O1's negative control: today's code)
-//   exit-reap     owner-side exit reap after a client close that kills only the adapter (O2)
-//   remembered    the adapter (the "claude") dies first, orphaning the task; then the exit reap (O3)
+//   exit-reap     owner-side exit reap after a client close that kills only the fake claude (O2)
+//   crash         the fake claude dies FIRST (both task shells reparent out of the tree), then the
+//                 exit reap (O3b, path I: box-wide proofs, no memo)
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
+import path from "node:path";
 import {
   type QueueOwnerControlHandlers,
   SessionQueueOwner,
@@ -34,12 +44,12 @@ import {
   reapAndLogOnOwnerExit,
 } from "../src/cli/session/owner-task-reap.js";
 import { installQueueOwnerFatalShutdown } from "../src/cli/session/queue-owner-runtime.js";
-import { scanProcTable, snapshotSessionTree } from "../src/process-tree-reap.js";
-import { FIXTURE_TASKS } from "./bg-task-fixtures.js";
+import { scanProcTable } from "../src/process-tree-reap.js";
+import { FIXTURE_MONITOR_COMMAND, FIXTURE_TASKS, GHOST_TASK } from "./bg-task-fixtures.js";
 
-const [mode, outFile, sessionId] = process.argv.slice(2);
-if (!mode || !outFile) {
-  process.stderr.write("usage: bg-task-owner-child <mode> <outFile> [sessionId]\n");
+const [mode, outFile, sessionId, taskRoot] = process.argv.slice(2);
+if (!mode || !outFile || !sessionId || !taskRoot) {
+  process.stderr.write("usage: bg-task-owner-child <mode> <outFile> <sessionId> <taskRoot>\n");
   process.exit(2);
 }
 
@@ -51,35 +61,70 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-const ADAPTER_SCRIPT = [
+const BASH_TASK_ID = "b343f35rh";
+const taskFile = path.join(taskRoot, sessionId, "tasks", `${BASH_TASK_ID}.output`);
+
+// The fake claude. Its stdout pipes to the Monitor shell stay open in it (the socket's other end).
+const CLAUDE_SCRIPT = [
   "const { spawn } = require('node:child_process');",
   "const fs = require('node:fs');",
-  "const shell = spawn('bash', ['-c', 'set -m; sleep 300 & wait'], { detached: true, stdio: 'ignore' });",
-  "fs.writeFileSync(process.argv[1], String(shell.pid));",
+  "const [pidFile, taskFile, session, monitorShellArg] = process.argv.slice(1);",
+  "const out = fs.openSync(taskFile, 'a');",
+  "const shell = spawn('bash', ['-c', 'set -m; sleep 300 & wait'], { detached: true, stdio: ['ignore', out, out] });",
+  "const mon = spawn('bash', ['-c', monitorShellArg], {",
+  "  detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, CLAUDE_CODE_SESSION_ID: session } });",
+  "mon.stdout.resume(); mon.stderr.resume();",
+  // Like the real claude (measured): it holds NO task-file fd itself.
+  "fs.closeSync(out);",
+  "fs.writeFileSync(pidFile, JSON.stringify({ shellPid: shell.pid, monShellPid: mon.pid }));",
   "setInterval(() => {}, 1000);",
 ].join("\n");
 
-async function spawnAdapterWithTask(): Promise<{
-  adapterPid: number;
+type RigPids = {
+  claudePid: number;
   shellPid: number;
   sleepPid: number;
-}> {
-  const pidFile = `${outFile}.shell-pid`;
-  const adapter = spawn(process.execPath, ["-e", ADAPTER_SCRIPT, pidFile], { stdio: "ignore" });
+  monShellPid: number;
+  monSleepPid: number;
+};
+
+function sleepIn(sid: number): number | undefined {
+  return [...scanProcTable().byPid.values()].find(
+    (entry) => entry.sid === sid && entry.pid !== sid && entry.comm === "sleep",
+  )?.pid;
+}
+
+async function spawnClaudeWithTasks(): Promise<RigPids> {
+  fs.mkdirSync(path.dirname(taskFile), { recursive: true });
+  const pidFile = `${outFile}.claude-pids`;
+  const claude = spawn(
+    process.execPath,
+    // Claude Code's Monitor shell carries its command in argv inside an `eval '…'` (measured).
+    ["-e", CLAUDE_SCRIPT, pidFile, taskFile, sessionId, `eval '${FIXTURE_MONITOR_COMMAND}'`],
+    { stdio: "ignore" },
+  );
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
-    const shellPid = Number(fs.existsSync(pidFile) ? fs.readFileSync(pidFile, "utf8") : 0);
-    const sleepEntry = shellPid
-      ? [...scanProcTable().byPid.values()].find(
-          (entry) => entry.sid === shellPid && entry.pid !== shellPid && entry.comm === "sleep",
-        )
+    const written = fs.existsSync(pidFile)
+      ? (JSON.parse(fs.readFileSync(pidFile, "utf8")) as { shellPid: number; monShellPid: number })
       : undefined;
-    if (sleepEntry) {
-      return { adapterPid: adapter.pid as number, shellPid, sleepPid: sleepEntry.pid };
+    const sleepPid = written ? sleepIn(written.shellPid) : undefined;
+    const monSleepPid = written ? sleepIn(written.monShellPid) : undefined;
+    if (written && sleepPid && monSleepPid) {
+      return { claudePid: claude.pid as number, ...written, sleepPid, monSleepPid };
     }
     await sleep(20);
   }
-  throw new Error("bg-task-owner-child: the task shell never started");
+  throw new Error("bg-task-owner-child: the task shells never started");
+}
+
+const MONITOR_COMMANDS = [{ taskId: "b2g1k6brj", command: FIXTURE_MONITOR_COMMAND }];
+
+function reaperFor(tasks: LiveBackgroundTask[]) {
+  return createOwnerTaskReaper({
+    getTaskSet: () => ({ tasks, monitorCommands: MONITOR_COMMANDS }),
+    getAcpSessionId: () => sessionId,
+  });
 }
 
 function stubHandlers(
@@ -97,7 +142,7 @@ function stubHandlers(
     setSessionConfigOption: async () => ({ configOptions: [] }),
     setDepth: async (requested: string) => ({ kind: "send-nothing", requested }),
     queryActiveTurn: () => false,
-    queryBackgroundTasks: () => ({ source: "adapter", tasks }),
+    queryBackgroundTasks: () => ({ source: "adapter", tasks, monitorCommands: MONITOR_COMMANDS }),
   };
 }
 
@@ -106,8 +151,8 @@ async function runOwner(tasks: LiveBackgroundTask[]): Promise<void> {
   if (!lease) {
     throw new Error("bg-task-owner-child: could not acquire the lease");
   }
-  const pids = await spawnAdapterWithTask();
-  const reaper = createOwnerTaskReaper({ getAgentPid: () => pids.adapterPid });
+  const pids = await spawnClaudeWithTasks();
+  const reaper = reaperFor(tasks);
   let owner: SessionQueueOwner | undefined;
   installQueueOwnerFatalShutdown({
     sessionId: sessionId,
@@ -133,7 +178,7 @@ async function runOldOwner(): Promise<void> {
   if (!lease) {
     throw new Error("bg-task-owner-child: could not acquire the lease");
   }
-  const pids = await spawnAdapterWithTask();
+  const pids = await spawnClaudeWithTasks();
   installQueueOwnerFatalShutdown({ sessionId: sessionId, lease });
   const server = net.createServer((socket) => {
     socket.setEncoding("utf8");
@@ -157,45 +202,43 @@ async function runOldOwner(): Promise<void> {
 }
 
 async function runFatal(withReaper: boolean): Promise<void> {
-  const pids = await spawnAdapterWithTask();
-  const reaper = createOwnerTaskReaper({ getAgentPid: () => pids.adapterPid });
+  const pids = await spawnClaudeWithTasks();
+  const reaper = reaperFor(FIXTURE_TASKS);
   installQueueOwnerFatalShutdown({
-    sessionId: sessionId ?? "fatal-rig",
+    sessionId: sessionId,
     ...(withReaper ? { getTaskReaper: () => reaper } : {}),
   });
   emit({ ready: true, ownerPid: process.pid, ...pids });
   setInterval(() => {}, 1000);
 }
 
-function killAdapter(adapterPid: number): void {
+function killClaude(claudePid: number): void {
   try {
-    process.kill(adapterPid, "SIGKILL");
+    process.kill(claudePid, "SIGKILL");
   } catch {
     // already gone
   }
 }
 
-async function runExitReap(remembered: boolean): Promise<void> {
-  const pids = await spawnAdapterWithTask();
-  const reaper = createOwnerTaskReaper({ getAgentPid: () => pids.adapterPid });
+async function runExitReap(crashFirst: boolean): Promise<void> {
+  const pids = await spawnClaudeWithTasks();
+  const reaper = reaperFor(FIXTURE_TASKS);
   emit({ ready: true, ownerPid: process.pid, ...pids });
-  if (remembered) {
-    // A task-set change was observed while the tree was intact (§5.4).
-    reaper.noteTaskSetChange();
-    await sleep(50);
-    // The "claude" crashes: its task shell is reparented out of this owner's tree (path I).
-    killAdapter(pids.adapterPid);
+  if (crashFirst) {
+    // Path I: claude crashes, both task shells reparent OUT of this owner's tree.
+    killClaude(pids.claudePid);
     await sleep(300);
-    const treeOnly = snapshotSessionTree({ rootPid: process.pid, includeRoot: false });
+    const byPid = scanProcTable().byPid;
     emit({
-      treeOnlyTaskMembers: treeOnly.members.filter((member) => member.inTaskSession).length,
-      remembered: reaper.remembered().length,
+      reparented: [pids.shellPid, pids.monShellPid].map(
+        (pid) => byPid.get(pid)?.ppid !== pids.claudePid,
+      ),
     });
   }
-  // §5.2 E: snapshot BEFORE the client close; the close kills only the adapter (this owner's group).
-  const snapshot = reaper.snapshotOwnerExit();
-  killAdapter(pids.adapterPid);
-  const report = await reapAndLogOnOwnerExit(sessionId ?? "exit-rig", "idle-memory", snapshot);
+  // §5.2 E: admission BEFORE the client close; the close kills only the fake claude (this session).
+  const snapshot = reaper.snapshot();
+  killClaude(pids.claudePid);
+  const report = await reapAndLogOnOwnerExit(sessionId, "idle-memory", snapshot);
   emit({ report: report ?? null, snapshotPids: snapshot.members.map((member) => member.pid) });
   process.exit(0);
 }
@@ -203,11 +246,12 @@ async function runExitReap(remembered: boolean): Promise<void> {
 const modes: Record<string, () => Promise<void>> = {
   owner: async () => await runOwner(FIXTURE_TASKS),
   "owner-none": async () => await runOwner([]),
+  "owner-ghost": async () => await runOwner([...FIXTURE_TASKS, GHOST_TASK]),
   "old-owner": runOldOwner,
   fatal: async () => await runFatal(true),
   "fatal-noreap": async () => await runFatal(false),
   "exit-reap": async () => await runExitReap(false),
-  remembered: async () => await runExitReap(true),
+  crash: async () => await runExitReap(true),
 };
 
 const run = modes[mode];

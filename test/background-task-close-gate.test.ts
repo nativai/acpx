@@ -15,6 +15,7 @@ import {
   closeRetryArgs,
   liveBackgroundTasksErrorMessage,
   liveBackgroundTasksRefusalText,
+  taskOutcome,
   templateRetryArgs,
 } from "../src/cli/background-task-gate.js";
 import { tryQueryBackgroundTasksOnRunningOwner } from "../src/cli/queue/ipc.js";
@@ -23,7 +24,7 @@ import { parseQueueOwnerMessage, parseQueueRequest } from "../src/cli/queue/mess
 import { queueLockFilePath, queueSharedSocketDir } from "../src/cli/queue/paths.js";
 import { clearBackgroundTaskChip } from "../src/cli/session/owner-task-reap.js";
 import { parseProcStat, unmeasuredReap, type ReapReport } from "../src/process-tree-reap.js";
-import { FIXTURE_TASKS } from "./bg-task-fixtures.js";
+import { FIXTURE_MONITOR_COMMAND, FIXTURE_TASKS } from "./bg-task-fixtures.js";
 import { listenServer, writeQueueOwnerLock } from "./queue-test-helpers.js";
 import { makeSessionRecord, writeSessionRecordFile } from "./runtime-test-helpers.js";
 import { removeTempHome } from "./temp-home.js";
@@ -139,7 +140,17 @@ function startTicksOf(pid: number): string {
   return entry.startTicks;
 }
 
-type RigPids = { ownerPid: number; adapterPid: number; shellPid: number; sleepPid: number };
+// v3 rig (bg-task-owner-child.ts): a proven Bash task (shell + sleep) and a proven Monitor (shell + sleep).
+const RIG_KEYS = [
+  "ownerPid",
+  "claudePid",
+  "shellPid",
+  "sleepPid",
+  "monShellPid",
+  "monSleepPid",
+] as const;
+const TASK_KEYS = ["shellPid", "sleepPid", "monShellPid", "monSleepPid"] as const;
+type RigPids = Record<(typeof RIG_KEYS)[number], number>;
 type Rig = {
   pids: RigPids;
   ticks: Record<keyof RigPids, string>;
@@ -153,7 +164,8 @@ async function startOwnerRig(homeDir: string, mode: string, sessionId: string): 
   const outFile = path.join(homeDir, `${mode}-${sessionId}.out`);
   const stderrFile = path.join(homeDir, `${mode}-${sessionId}.err`);
   const errFd = fs.openSync(stderrFile, "a");
-  const child = spawn(process.execPath, [CHILD_PATH, mode, outFile, sessionId], {
+  const taskRoot = path.join(homeDir, `claude-${os.userInfo().uid}`, "proj");
+  const child = spawn(process.execPath, [CHILD_PATH, mode, outFile, sessionId, taskRoot], {
     env: cliEnv(homeDir),
     cwd: homeDir,
     detached: true,
@@ -179,15 +191,13 @@ async function startOwnerRig(homeDir: string, mode: string, sessionId: string): 
   }
   assert.ok(ready, `rig ${mode} never became ready: ${fs.readFileSync(stderrFile, "utf8")}`);
   const pids = ready as unknown as RigPids;
-  const ticks = {
-    ownerPid: startTicksOf(pids.ownerPid),
-    adapterPid: startTicksOf(pids.adapterPid),
-    shellPid: startTicksOf(pids.shellPid),
-    sleepPid: startTicksOf(pids.sleepPid),
-  };
+  const ticks = Object.fromEntries(RIG_KEYS.map((key) => [key, startTicksOf(pids[key])])) as Record<
+    (typeof RIG_KEYS)[number],
+    string
+  >;
   const kill = () => {
     // Rig teardown BY VERIFIED PID only (start ticks re-checked), never by pattern.
-    for (const key of ["sleepPid", "shellPid", "adapterPid", "ownerPid"] as const) {
+    for (const key of [...RIG_KEYS].toReversed()) {
       if (aliveAs(pids[key], ticks[key])) {
         try {
           process.kill(pids[key], "SIGKILL");
@@ -195,6 +205,12 @@ async function startOwnerRig(homeDir: string, mode: string, sessionId: string): 
           // gone meanwhile
         }
       }
+    }
+    // SIGKILL is asynchronous: wait (bounded) until the deaths are visible before the temp-home
+    // teardown checks for processes still holding it.
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline && RIG_KEYS.some((key) => aliveAs(pids[key], ticks[key]))) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
     }
   };
   return { pids, ticks, outFile, stderrFile, lines, kill };
@@ -312,7 +328,7 @@ test("HoD ruling: the retry command carries EVERY user-supplied verb option, she
   );
 });
 
-test("C2 outcome rule: ended only when measured with 0 survivors; measured:false is never a census", () => {
+test("C2 outcome rule (v3, per task): ended needs a measured reap, no survivor, and a PROOF for that task; measured:false is never a census", () => {
   const gate = { queried: true, killed: true, tasks: FIXTURE_TASKS };
   const ended: ReapReport = {
     measured: true,
@@ -320,18 +336,28 @@ test("C2 outcome rule: ended only when measured with 0 survivors; measured:false
     survivors: 0,
     survivorPids: [],
     survivorDetails: [],
+    processTaskIds: ["b343f35rh", "b2g1k6brj"],
+    provenTaskIds: ["b343f35rh", "b2g1k6brj"],
+    survivingTaskIds: [],
   };
   assert.deepEqual(
-    backgroundTasksJson(gate, ended).tasks.map((task) => task.outcome),
+    backgroundTasksJson(gate, ended, true).tasks.map((task) => task.outcome),
     ["ended", "ended"],
+  );
+  // An unproven live task never reads "ended", even with survivors:0 (RV-3).
+  const oneUnproven = { ...ended, provenTaskIds: ["b343f35rh"] };
+  assert.deepEqual(
+    backgroundTasksJson(gate, oneUnproven, true).tasks.map((task) => task.outcome),
+    ["ended", "unverified"],
   );
   const survived = {
     ...ended,
     survivors: 1,
     survivorPids: [42],
     survivorDetails: [{ pid: 42, comm: "sleep", startTicks: "7" }],
+    survivingTaskIds: ["b343f35rh"],
   };
-  const withSurvivor = backgroundTasksJson(gate, survived);
+  const withSurvivor = backgroundTasksJson(gate, survived, true);
   assert.deepEqual(
     withSurvivor.tasks.map((task) => task.outcome),
     ["unverified", "unverified"],
@@ -342,14 +368,20 @@ test("C2 outcome rule: ended only when measured with 0 survivors; measured:false
     survivors: 1,
     survivorPids: [42],
   });
+  // In-process task types end with claude; remote/unknown never read "ended".
+  const agent = { taskId: "a1", taskType: "local_agent", description: "" };
+  const remote = { taskId: "r1", taskType: "remote_agent", description: "" };
+  assert.equal(taskOutcome(agent, ended, true), "ended");
+  assert.equal(taskOutcome(agent, ended, false), "unverified");
+  assert.equal(taskOutcome(remote, ended, true), "unverified");
   // R4 at the wire: an unmeasured reap is never "0 survivors" with measured:true.
-  const unmeasured = backgroundTasksJson(gate, unmeasuredReap("no-owner"));
+  const unmeasured = backgroundTasksJson(gate, unmeasuredReap("no-task-set"), true);
   assert.deepEqual(unmeasured.reap, {
     measured: false,
     taskProcesses: 0,
     survivors: 0,
     survivorPids: [],
-    skipped: "no-owner",
+    skipped: "no-task-set",
   });
   assert.deepEqual(
     unmeasured.tasks.map((task) => task.outcome),
@@ -368,8 +400,14 @@ test("gate decision: fails open on queried:false; refuses live tasks without the
     queried: true as const,
     source: "adapter" as const,
     tasks: FIXTURE_TASKS,
+    monitorCommands: [],
   });
-  const none = async () => ({ queried: true as const, source: "adapter" as const, tasks: [] });
+  const none = async () => ({
+    queried: true as const,
+    source: "adapter" as const,
+    tasks: [],
+    monitorCommands: [],
+  });
   const unknown = async () => ({ queried: false as const });
   const base = { record, explicitAgentName: undefined, verb: "close" as const };
   const refused = await evaluateBackgroundTaskGate({
@@ -485,7 +523,7 @@ test("G1 refusal: exit 7, exact JSON envelope, nothing touched — owner, adapte
       assert.equal(quiet.stdout + quiet.stderr, "");
 
       assert.equal(await recordClosed(homeDir, sessionId), false);
-      for (const key of ["ownerPid", "adapterPid", "shellPid", "sleepPid"] as const) {
+      for (const key of RIG_KEYS) {
         assert.ok(aliveAs(rig.pids[key], rig.ticks[key]), `${key} was signalled by a refusal`);
       }
       const requests = rig.lines().filter((line) => "request" in line);
@@ -535,11 +573,11 @@ test("G2 + G4: the retryCommand, executed LITERALLY, closes and kills — every 
       );
       assert.deepEqual(bg.reap, {
         measured: true,
-        taskProcesses: 2,
+        taskProcesses: 4,
         survivors: 0,
         survivorPids: [],
       });
-      for (const key of ["ownerPid", "adapterPid", "shellPid", "sleepPid"] as const) {
+      for (const key of RIG_KEYS) {
         assert.ok(
           await waitUntil(() => !aliveAs(rig.pids[key], rig.ticks[key]), 3_000),
           `${key} survived the forced close`,
@@ -548,7 +586,7 @@ test("G2 + G4: the retryCommand, executed LITERALLY, closes and kills — every 
       // The owner's own handler (path G) logged its reap to owner.log (its stderr here).
       assert.match(
         fs.readFileSync(rig.stderrFile, "utf8"),
-        /queue owner reaped 2 background task process\(es\) of session g2-force after SIGTERM/,
+        /queue owner reaped 4 background task process\(es\) of session g2-force after SIGTERM/,
       );
     } finally {
       rig.kill();
@@ -573,7 +611,7 @@ test("G2 text: a forced close prints the kill summary on stderr", async (t) => {
       assert.equal(forced.code, 0, forced.stderr);
       assert.match(
         forced.stderr,
-        /\[acpx\] killed 2 live background tasks of g2-text: Bash "rig-s1 bash bg" \(b343f35rh\), Monitor "rig-s1 monitor" \(b2g1k6brj\); 2 task processes ended, 0 survived\n/,
+        /\[acpx\] killed 2 live background tasks of g2-text: Bash "rig-s1 bash bg" \(b343f35rh\), Monitor "rig-s1 monitor" \(b2g1k6brj\); 4 task processes ended, 0 survived\n/,
       );
     } finally {
       rig.kill();
@@ -581,7 +619,7 @@ test("G2 text: a forced close prints the kill summary on stderr", async (t) => {
   });
 });
 
-test("G3 / AC8: an OLD owner (QUEUE_REQUEST_INVALID) fails open — not auto-terminated by the query; the close is not refused and the CLOSER's reap ends the task pair its group kill missed", async (t) => {
+test("G3 / AC8 (v3): an OLD owner (QUEUE_REQUEST_INVALID) fails open — not auto-terminated by the query, the close is not refused, and with NO task set the closer signals nothing and says so (RV-5)", async (t) => {
   if (!linux) {
     t.skip("linux /proc");
     return;
@@ -616,14 +654,113 @@ test("G3 / AC8: an OLD owner (QUEUE_REQUEST_INVALID) fails open — not auto-ter
       assert.equal(bg.queried, false);
       assert.equal(bg.killed, false);
       assert.deepEqual(bg.tasks, []);
+      // Never a false all-clear: no census without a task set.
       assert.deepEqual(bg.reap, {
-        measured: true,
-        taskProcesses: 2,
+        measured: false,
+        taskProcesses: 0,
         survivors: 0,
         survivorPids: [],
+        skipped: "no-task-set",
       });
-      for (const key of ["ownerPid", "adapterPid", "shellPid", "sleepPid"] as const) {
-        assert.ok(!aliveAs(rig.pids[key], rig.ticks[key]), `${key} survived (no orphan, AC8)`);
+      assert.ok(!aliveAs(rig.pids.ownerPid, rig.ticks.ownerPid), "the old owner was stopped");
+      // RV-5, by design: an old owner's tasks orphan exactly as today (the rig kills them below).
+      assert.ok(TASK_KEYS.every((key) => aliveAs(rig.pids[key], rig.ticks[key])));
+    } finally {
+      rig.kill();
+    }
+  });
+});
+
+test("HoD (v3): a live task no proof matches is LOUD — stderr names K of N, and that task reads unverified while the proven ones end", async (t) => {
+  if (!linux) {
+    t.skip("linux /proc");
+    return;
+  }
+  await withHome(async (homeDir) => {
+    const sessionId = "ghost-warn";
+    await writeRecord(homeDir, sessionId);
+    const rig = await startOwnerRig(homeDir, "owner-ghost", sessionId);
+    try {
+      const forced = await runCli(
+        [
+          "--format",
+          "json",
+          "sessions",
+          "close",
+          "--session-id",
+          sessionId,
+          "--kill-background-tasks",
+        ],
+        homeDir,
+      );
+      assert.equal(forced.code, 0, forced.stderr);
+      assert.match(
+        forced.stderr,
+        /\[acpx\] WARNING: session ghost-warn: proof matched 2 of 3 live background tasks — the unmatched ones may survive; Claude Code's task layout may have changed \(brick ad6ba1c2\)/,
+      );
+      const line = jsonLines(forced.stdout).find((entry) => entry.action === "session_closed");
+      assert.ok(line, forced.stdout);
+      const tasks = (line.backgroundTasks as { tasks: Array<{ taskId: string; outcome: string }> })
+        .tasks;
+      assert.deepEqual(
+        tasks.map((task) => [task.taskId, task.outcome]),
+        [
+          ["b343f35rh", "ended"],
+          ["b2g1k6brj", "ended"],
+          ["bghost0001", "unverified"],
+        ],
+      );
+      // The owner's own handler wrote it to owner.log too.
+      assert.match(
+        fs.readFileSync(rig.stderrFile, "utf8"),
+        /proof matched 2 of 3 live background tasks/,
+      );
+      assert.ok(TASK_KEYS.every((key) => !aliveAs(rig.pids[key], rig.ticks[key])));
+    } finally {
+      rig.kill();
+    }
+  });
+});
+
+test("C4 v3: a Monitor's command (match-only) never appears in any CLI output — refusal or success, any format", async (t) => {
+  if (!linux) {
+    t.skip("linux /proc");
+    return;
+  }
+  await withHome(async (homeDir) => {
+    const sessionId = "no-command-leak";
+    await writeRecord(homeDir, sessionId);
+    const rig = await startOwnerRig(homeDir, "owner", sessionId);
+    try {
+      const outputs: string[] = [];
+      for (const format of ["json", "text"]) {
+        const refused = await runCli(
+          ["--format", format, "sessions", "close", "--session-id", sessionId],
+          homeDir,
+        );
+        assert.equal(refused.code, 7);
+        outputs.push(refused.stdout, refused.stderr);
+      }
+      const forced = await runCli(
+        [
+          "--format",
+          "json",
+          "sessions",
+          "close",
+          "--session-id",
+          sessionId,
+          "--kill-background-tasks",
+        ],
+        homeDir,
+      );
+      assert.equal(forced.code, 0, forced.stderr);
+      outputs.push(forced.stdout, forced.stderr);
+      for (const output of outputs) {
+        assert.ok(
+          !output.includes(FIXTURE_MONITOR_COMMAND),
+          "the Monitor command leaked into CLI output",
+        );
+        assert.ok(!output.includes("monitorCommands"), "monitorCommands leaked into CLI output");
       }
     } finally {
       rig.kill();
@@ -701,7 +838,7 @@ test("G5 template: refused (exit 7, nothing marked), then --kill-background-task
       assert.equal(bg.killed, true);
       assert.deepEqual(bg.reap, {
         measured: true,
-        taskProcesses: 2,
+        taskProcesses: 4,
         survivors: 0,
         survivorPids: [],
       });

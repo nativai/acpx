@@ -1,6 +1,8 @@
 import {
   formatSurvivors,
+  isProcessBackedTask,
   publicReap,
+  unprovenTaskWarning,
   type ReapReport,
   type ReapSummary,
 } from "../process-tree-reap.js";
@@ -8,6 +10,7 @@ import type { SessionRecord } from "../types.js";
 import type { OutputFormat } from "../types.js";
 import { emitJsonResult } from "./output/json-output.js";
 import type { BackgroundTasksQuery } from "./queue/ipc.js";
+import type { CloserTaskContext } from "./queue/lease-store.js";
 import type { LiveBackgroundTask } from "./session/background-task-tracker.js";
 
 /**
@@ -172,7 +175,12 @@ export async function evaluateBackgroundTaskGate(params: {
   /** The caller's own verb options, reproduced in the retry command. */
   retryArgs?: readonly string[];
   query?: (sessionId: string) => Promise<BackgroundTasksQuery>;
-}): Promise<{ refusal?: LiveBackgroundTasksRefusal; gate: BackgroundTasksGate }> {
+}): Promise<{
+  refusal?: LiveBackgroundTasksRefusal;
+  gate: BackgroundTasksGate;
+  /** The owner's raw answer: the close proves against exactly this set (v3). Never printed. */
+  answer: BackgroundTasksQuery;
+}> {
   // Lazy: this module is on every CLI start path; the queue client is needed only by a close.
   const query =
     params.query ?? (await import("./queue/ipc.js")).tryQueryBackgroundTasksOnRunningOwner;
@@ -181,10 +189,11 @@ export async function evaluateBackgroundTaskGate(params: {
   const force = params.killBackgroundTasks === true;
   const gate = { queried: answer.queried, tasks, killed: tasks.length > 0 && force };
   if (tasks.length === 0 || force) {
-    return { gate };
+    return { gate, answer };
   }
   return {
     gate,
+    answer,
     refusal: {
       verb: params.verb,
       sessionId: params.record.acpxRecordId,
@@ -196,6 +205,22 @@ export async function evaluateBackgroundTaskGate(params: {
         params.retryArgs,
       ),
     },
+  };
+}
+
+/**
+ * v3: the close proves against EXACTLY the set the gate read (and showed, on a refusal). No answer
+ * ⇒ no `bg` ⇒ the closer admits nothing and reports `skipped:"no-task-set"`.
+ */
+export function gateTaskContext(
+  answer: BackgroundTasksQuery,
+  acpSessionId: string | undefined,
+): CloserTaskContext {
+  return {
+    bg: answer.queried
+      ? { tasks: answer.tasks, monitorCommands: answer.monitorCommands }
+      : undefined,
+    acpSessionId,
   };
 }
 
@@ -221,15 +246,46 @@ export function emitLiveBackgroundTasksRefusal(
 }
 
 /** `outcome` is "ended" iff the reap measured AND nothing survived; anything else is unverified. */
+const IN_PROCESS_TASK_TYPES: ReadonlySet<string> = new Set([
+  "local_agent",
+  "in_process_teammate",
+  "local_workflow",
+  "monitor_mcp",
+  "monitor_ws",
+]);
+
+/**
+ * Contract C2, AMENDED v3 — per task. `"ended"` needs a measured reap with no survivor at all, and:
+ *   - a Bash or Monitor task: a process was PROVEN for it (§5.1) and none of its processes survive.
+ *     ⚠️ Without the proof requirement an unprovable live task would read `ended` (RV-3);
+ *   - an in-process task (sub-agent, workflow, MCP monitor): claude is confirmed gone;
+ *   - `remote_agent` or an unknown type: never — its work does not run in this pod.
+ * Anything else is `"unverified"`.
+ */
+export function taskOutcome(
+  task: LiveBackgroundTask,
+  reap: ReapReport,
+  claudeGone: boolean,
+): "ended" | "unverified" {
+  if (!reap.measured || reap.survivors > 0) {
+    return "unverified";
+  }
+  if (isProcessBackedTask(task)) {
+    const proven = reap.provenTaskIds.includes(task.taskId);
+    return proven && !reap.survivingTaskIds.includes(task.taskId) ? "ended" : "unverified";
+  }
+  return IN_PROCESS_TASK_TYPES.has(task.taskType) && claudeGone ? "ended" : "unverified";
+}
+
 export function backgroundTasksJson(
   gate: BackgroundTasksGate,
   reap: ReapReport,
+  claudeGone: boolean,
 ): BackgroundTasksJson {
-  const outcome = reap.measured && reap.survivors === 0 ? "ended" : "unverified";
   return {
     queried: gate.queried,
     killed: gate.killed,
-    tasks: gate.tasks.map((task) => ({ ...task, outcome })),
+    tasks: gate.tasks.map((task) => ({ ...task, outcome: taskOutcome(task, reap, claudeGone) })),
     reap: publicReap(reap),
   };
 }
@@ -243,6 +299,11 @@ export function backgroundTasksField(backgroundTasks: BackgroundTasksJson | unde
 
 /** A survivor is never silent: stderr, in every format (Contract C2/C6). */
 export function warnReapSurvivors(sessionId: string, reap: ReapReport): void {
+  // HoD (v3): a proof that matched fewer live tasks than listed is LOUD, in every format.
+  const unproven = unprovenTaskWarning(sessionId, reap);
+  if (unproven) {
+    process.stderr.write(unproven);
+  }
   if (!reap.measured || reap.survivors === 0) {
     return;
   }

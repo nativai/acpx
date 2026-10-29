@@ -4,6 +4,7 @@ import { QueueConnectionError, QueueProtocolError } from "../../errors.js";
 import { incrementPerfCounter } from "../../perf-metrics.js";
 import { classifyRecordedIdentity, identityScope } from "../../process-identity.js";
 import type { DepthProjection } from "../../session/depth-projection.js";
+import { resolveSessionRecord } from "../../session/persistence.js";
 import type {
   AcpClientOptions,
   NonInteractivePermissionPolicy,
@@ -16,12 +17,13 @@ import type {
   SessionEnqueueResult,
   SessionSendOutcome,
 } from "../../types.js";
-import type { BackgroundTaskList } from "../session/background-task-tracker.js";
+import type { BackgroundTaskAnswer } from "../session/background-task-tracker.js";
 import { clearBackgroundTaskChipAfterReap } from "../session/owner-task-reap.js";
 import { probeQueueOwnerHealth, type QueueOwnerHealth } from "./ipc-health.js";
 import type { QueueOwnerDrainReport } from "./ipc-server.js";
 import { connectToQueueOwner } from "./ipc-transport.js";
 import {
+  type CloserTaskContext,
   type QueueOwnerRecord,
   readQueueOwnerRecord,
   readQueueOwnerState,
@@ -105,7 +107,11 @@ async function recoverOwnerAfterShutdownError(params: {
   detailCode?: string;
   verbose?: boolean;
 }): Promise<boolean> {
-  const stopped = await terminateQueueOwnerForSession(params.sessionId, params.owner).catch(
+  const stopped = await terminateQueueOwnerForSession(
+    params.sessionId,
+    params.owner,
+    await queryCloserTaskContext(params.sessionId),
+  ).catch(
     () => undefined, // Preserve the original shutdown error if cleanup fails.
   );
   if (stopped) {
@@ -173,9 +179,11 @@ async function maybeRecoverStaleOwnerAfterProtocolMismatch(params: {
 
   // Q9: the protocol-mismatch kill is kept, but it targets ONLY the generation that answered, and
   // signals only through signalVerifiedProcess (a foreign or replaced lease is untouched, T36).
-  const outcome = await terminateQueueOwnerForSession(params.sessionId, params.owner).catch(
-    () => undefined,
-  );
+  const outcome = await terminateQueueOwnerForSession(
+    params.sessionId,
+    params.owner,
+    await queryCloserTaskContext(params.sessionId),
+  ).catch(() => undefined);
   if (!outcome?.stopped) {
     return false;
   }
@@ -1127,7 +1135,7 @@ export async function tryQueryActiveTurnOnRunningOwner(
 /** brick ad6ba1c2 (Contract C4) — one hard deadline over connect AND answer. */
 export const BACKGROUND_TASKS_QUERY_DEADLINE_MS = 2_000;
 
-export type BackgroundTasksQuery = ({ queried: true } & BackgroundTaskList) | { queried: false };
+export type BackgroundTasksQuery = ({ queried: true } & BackgroundTaskAnswer) | { queried: false };
 
 function isForeignOwner(owner: QueueOwnerRecord): boolean {
   const recorded = classifyRecordedIdentity(owner.processIdentity);
@@ -1137,7 +1145,7 @@ function isForeignOwner(owner: QueueOwnerRecord): boolean {
 async function submitQueryBackgroundTasksToQueueOwner(
   owner: QueueOwnerRecord,
   timeoutMs: number,
-): Promise<BackgroundTaskList | undefined> {
+): Promise<BackgroundTaskAnswer | undefined> {
   const request: QueueQueryBackgroundTasksRequest = {
     type: "query_background_tasks",
     requestId: randomUUID(),
@@ -1153,7 +1161,11 @@ async function submitQueryBackgroundTasksToQueueOwner(
   if (!response || response.requestId !== request.requestId) {
     return undefined;
   }
-  return { source: response.source, tasks: response.tasks };
+  return {
+    source: response.source,
+    tasks: response.tasks,
+    monitorCommands: response.monitorCommands,
+  };
 }
 
 /**
@@ -1186,6 +1198,22 @@ export async function tryQueryBackgroundTasksOnRunningOwner(
   const list = await Promise.race([query, deadline]);
   clearTimeout(timer);
   return list ? { queried: true, ...list } : { queried: false };
+}
+
+/**
+ * v3 §5.2 — the closer asks the owner for `BG` immediately before it snapshots (recover, setters,
+ * the automatic terminations). Never throws; bounded by the query's 2 s deadline.
+ */
+export async function queryCloserTaskContext(sessionId: string): Promise<CloserTaskContext> {
+  const [query, record] = await Promise.all([
+    tryQueryBackgroundTasksOnRunningOwner(sessionId),
+    resolveSessionRecord(sessionId).catch(() => undefined),
+  ]);
+  // No answer ⇒ no `bg` ⇒ nothing admitted (`skipped:"no-task-set"`).
+  return {
+    bg: query.queried ? { tasks: query.tasks, monitorCommands: query.monitorCommands } : undefined,
+    acpSessionId: record?.acpSessionId,
+  };
 }
 
 export async function trySetModeOnRunningOwner(

@@ -113,6 +113,7 @@ import {
   templateRetryArgs,
   emitLiveBackgroundTasksRefusal,
   evaluateBackgroundTaskGate,
+  gateTaskContext,
   reportBackgroundTaskOutcome,
   reportOwnerRecycleReap,
   warnReapSurvivors,
@@ -145,7 +146,7 @@ import { type MessageLedgerKind, withMessageLedger } from "./message-ledger.js";
 import { emitJsonResult } from "./output/json-output.js";
 // Type-only, so the render module stays lazily imported at runtime.
 import type { FirstTurnOutcome, PruneRefusal, PruneScope } from "./output/render.js";
-import type { QueueOwnerRecoveryResult } from "./queue/lease-store.js";
+import type { CloserTaskContext, QueueOwnerRecoveryResult } from "./queue/lease-store.js";
 import {
   addressedSeatIdFromSelector,
   NoSessionError,
@@ -2888,7 +2889,7 @@ export async function handleSessionsClose(
 
   // brick ad6ba1c2 (Contract C2) — same rule as the byway guard: decided BEFORE anything is
   // touched. A refusal drains nothing, sends no close_session, signals nothing, writes no record.
-  const { refusal, gate } = await evaluateBackgroundTaskGate({
+  const { refusal, gate, answer } = await evaluateBackgroundTaskGate({
     record,
     killBackgroundTasks: flags.killBackgroundTasks,
     explicitAgentName,
@@ -2906,6 +2907,7 @@ export async function handleSessionsClose(
     drain: flags.drain !== false,
     drainTimeoutMs: flags.drainTimeout,
     verbose: globalFlags.verbose,
+    taskContext: gateTaskContext(answer, record.acpSessionId),
   });
   printClosedSessionByFormat(
     closed.record,
@@ -2917,7 +2919,7 @@ export async function handleSessionsClose(
       ownerStopSkipped: closed.ownerStopSkipped,
       adapterKill: closed.adapterKill,
     },
-    backgroundTasksJson(gate, closed.reap),
+    backgroundTasksJson(gate, closed.reap, closed.ownerStopped),
   );
   reportBackgroundTaskOutcome(record.acpxRecordId, gate, closed.reap, globalFlags.format);
 
@@ -3673,11 +3675,12 @@ function resolveMarkAutoPrompt(
 async function markSessionAsTemplate(
   sessionId: string,
   flags: SessionsTemplateFlags,
-): Promise<{ record: SessionRecord; reap: ReapReport }> {
+  taskContext: CloserTaskContext,
+): Promise<{ record: SessionRecord; reap: ReapReport; ownerStopped: boolean }> {
   const initial = await resolveSessionRecord(sessionId);
   const { closeSession } = await loadSessionModule();
   // Default drain here too — see the note at the soft-close site above.
-  const closed = await closeSession(initial.acpxRecordId);
+  const closed = await closeSession(initial.acpxRecordId, { taskContext });
   const record = await resolveSessionRecord(sessionId);
   record.template = {
     enabled: true,
@@ -3692,7 +3695,7 @@ async function markSessionAsTemplate(
   };
   record.closed = true;
   record.closedAt = record.closedAt ?? isoNow();
-  return { record, reap: closed.reap };
+  return { record, reap: closed.reap, ownerStopped: closed.ownerStopped };
 }
 
 // Clear the template marker. Disable un-templates only — leave closed/closedAt as-is
@@ -3737,8 +3740,9 @@ export async function handleSessionsTemplate(
 
   // brick ad6ba1c2 (Contract C3) — marking a template CLOSES the session: the same gate, before
   // anything is touched.
-  const { refusal, gate } = await evaluateBackgroundTaskGate({
-    record: await resolveSessionRecord(sessionId),
+  const gateRecord = await resolveSessionRecord(sessionId);
+  const { refusal, gate, answer } = await evaluateBackgroundTaskGate({
+    record: gateRecord,
     killBackgroundTasks: flags.killBackgroundTasks,
     explicitAgentName: _explicitAgentName,
     verb: "template",
@@ -3748,11 +3752,20 @@ export async function handleSessionsTemplate(
     emitLiveBackgroundTasksRefusal(refusal, globalFlags.format);
     return;
   }
-  const { record, reap } = await markSessionAsTemplate(sessionId, flags);
+  const { record, reap, ownerStopped } = await markSessionAsTemplate(
+    sessionId,
+    flags,
+    gateTaskContext(answer, gateRecord.acpSessionId),
+  );
   // Assigns slug (default slugify(name), overridable via --slug) + version =
   // max+1 for the slug group, under the index lock (E6), then PRIVILEGED-writes.
   await persistTemplateMark(record, { slug: flags.slug });
-  printTemplateResult(record, enable, globalFlags.format, backgroundTasksJson(gate, reap));
+  printTemplateResult(
+    record,
+    enable,
+    globalFlags.format,
+    backgroundTasksJson(gate, reap, ownerStopped),
+  );
   reportBackgroundTaskOutcome(record.acpxRecordId, gate, reap, globalFlags.format);
 }
 

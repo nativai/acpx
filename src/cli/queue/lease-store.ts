@@ -19,9 +19,23 @@ import {
   reapSnapshot,
   snapshotSessionTree,
   unmeasuredReap,
+  type BackgroundTaskSet,
   type ReapReport,
   type ReapSnapshot,
 } from "../../process-tree-reap.js";
+
+/**
+ * brick ad6ba1c2 v3 — what a CLOSER knows about the session's background tasks: the live set `BG`
+ * (the gate's answer, or a `query_background_tasks` made just before the stop) and S, the record's
+ * `acp_session_id`. Without `bg` the closer can prove nothing, so it signals nothing and reports
+ * `skipped:"no-task-set"` (RV-5); the owner's own handler still reaps whenever it runs.
+ */
+export type CloserTaskContext = {
+  bg: BackgroundTaskSet | undefined;
+  acpSessionId: string | undefined;
+};
+
+const NO_TASK_CONTEXT: CloserTaskContext = { bg: undefined, acpSessionId: undefined };
 import { tryCreateLockFile } from "../../session/persistence/identity-file-lock.js";
 import { pingQueueSocket, type QueueSocketPing } from "./ipc-transport.js";
 import { isQueueLeaseGuardTimeout, withQueueLeaseMutation } from "./lease-mutation.js";
@@ -1149,6 +1163,7 @@ function isSuccessor(
 export async function terminateQueueOwnerForSession(
   sessionId: string,
   expectedOwner?: QueueOwnerRecord | null,
+  tasks?: CloserTaskContext,
 ): Promise<QueueOwnerStopOutcome> {
   const owner = await readQueueOwnerRecord(sessionId);
   if (!owner) {
@@ -1162,19 +1177,25 @@ export async function terminateQueueOwnerForSession(
   if (isSuccessor(expectedOwner, owner)) {
     return { stopped: false, reason: "successor", reap: unmeasuredReap("no-owner") };
   }
-  return await stopJudgedOwner(sessionId, owner);
+  return await stopJudgedOwner(sessionId, owner, tasks);
 }
 
 /**
- * brick ad6ba1c2 §5.2 A/C/D — the closer's snapshot of a VERIFIED local owner's tree, taken BEFORE
- * it is signalled: once the owner and claude are dead the task processes are no longer descendants
- * of anything this process can name. Excludes this process and its ancestors (§5.3).
+ * brick ad6ba1c2 v3 §5.2 A/C/D — the closer's ADMISSION for a VERIFIED local owner, taken BEFORE it
+ * is signalled: only processes proven to be a live background task's (§5.1). The owner's whole
+ * session (owner, adapter, claude) is spared; so are this process and its ancestors (§5.3).
  */
-function snapshotOwnerTree(pid: number, identity: ProcessBirthIdentity): ReapSnapshot {
+function snapshotOwnerTasks(
+  pid: number,
+  identity: ProcessBirthIdentity,
+  context: CloserTaskContext | undefined,
+): ReapSnapshot {
+  const tasks = context ?? NO_TASK_CONTEXT;
   return snapshotSessionTree({
-    rootPid: pid,
-    rootStartTicks: identity.kind === "linux-proc" ? identity.startTicks : undefined,
-    includeRoot: true,
+    bg: tasks.bg,
+    acpSessionId: tasks.acpSessionId,
+    ownerPid: pid,
+    ownerStartTicks: identity.kind === "linux-proc" ? identity.startTicks : undefined,
     excludeSelfAncestry: true,
   });
 }
@@ -1187,6 +1208,7 @@ async function reapAfterOwnerStop(snapshot: ReapSnapshot, ownerGone: boolean): P
 async function stopJudgedOwner(
   sessionId: string,
   owner: QueueOwnerRecord,
+  tasks: CloserTaskContext | undefined,
 ): Promise<QueueOwnerStopOutcome> {
   const judgement = await judgeLease(sessionId, owner);
   if (judgement.liveness.recoverable) {
@@ -1197,7 +1219,7 @@ async function stopJudgedOwner(
     const reason = judgement.skipReason ?? "identity-unverified";
     return { stopped: false, reason, reap: unmeasuredReap(reason) };
   }
-  const snapshot = snapshotOwnerTree(owner.pid, judgement.signalIdentity);
+  const snapshot = snapshotOwnerTasks(owner.pid, judgement.signalIdentity, tasks);
   const { gone } = await stopVerifiedOwner(sessionId, owner, judgement.signalIdentity);
   if (!gone) {
     return { stopped: false, reason: "survived", reap: unmeasuredReap("owner-survived") };
@@ -1277,6 +1299,7 @@ function skippedRecovery(
 // owner as "already gone; cleared stale lease" with exit 0, and acpx-ui then re-drove into it.
 export async function recoverQueueOwnerForSession(
   sessionId: string,
+  tasks?: CloserTaskContext,
 ): Promise<QueueOwnerRecoveryResult> {
   const owner = await readQueueOwnerRecord(sessionId);
   if (!owner) {
@@ -1293,7 +1316,7 @@ export async function recoverQueueOwnerForSession(
     return skippedRecovery(sessionId, owner, judgement);
   }
   const identity = judgement.signalIdentity;
-  const snapshot = snapshotOwnerTree(owner.pid, identity);
+  const snapshot = snapshotOwnerTasks(owner.pid, identity, tasks);
   const { gone, signalled } = await stopVerifiedOwner(sessionId, owner, identity);
   if (signalled) {
     await sweepVerifiedOwnerGroup(owner.pid, identity);

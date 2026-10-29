@@ -369,7 +369,8 @@ test("self-close: a live owner that is not an ancestor takes the non-self path",
 
       assert.deepEqual(
         observed.map((entry) => entry.type),
-        ["drain_deliveries", "close_session"],
+        // brick ad6ba1c2 v3: the close reads the live task set (read-only) before the drain.
+        ["query_background_tasks", "drain_deliveries", "close_session"],
         "a foreign live owner keeps the exact non-self sequence",
       );
       assert.equal(result.drain.attempted, true);

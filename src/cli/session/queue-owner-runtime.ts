@@ -485,7 +485,7 @@ function beginOwnerExitReap(params: {
   liveBackgroundTasks?: () => number;
 }): () => Promise<void> {
   const liveTasksAtExit = params.liveBackgroundTasks?.() ?? 0;
-  const snapshot = params.taskReaper?.snapshotOwnerExit();
+  const snapshot = params.taskReaper?.snapshot();
   return async () => {
     if (!snapshot) {
       return;
@@ -919,8 +919,8 @@ async function replaceSharedClientAfterSwitch(params: {
     );
     return undefined;
   }
-  // brick ad6ba1c2 §5.2 F — the old adapter's tree, snapshotted before its client closes.
-  const snapshot = params.taskReaper?.snapshotAdapter(params.current.getAgentPid());
+  // brick ad6ba1c2 §5.2 F — the old adapter's tasks, admitted before its client closes.
+  const snapshot = params.taskReaper?.snapshot();
   await params.current.close().catch(() => {});
   if (snapshot) {
     const reaped = await reapAndLogOnOwnerExit(
@@ -1024,21 +1024,16 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   // (replaceSharedClient below). Every closure here reads the binding, never a copy.
   let sharedClient = await createQueueOwnerSharedClient(options, sessionRecord);
   const backgroundTasks = createBackgroundTaskTracker();
-  const ownerTaskReaper = createOwnerTaskReaper({ getAgentPid: () => sharedClient.getAgentPid() });
+  // brick ad6ba1c2 v3 — admission reads the LIVE set at reap time; no remembered state (§5.4).
+  const ownerTaskReaper = createOwnerTaskReaper({
+    getTaskSet: () => ({
+      tasks: backgroundTasks.list().tasks,
+      monitorCommands: backgroundTasks.monitorCommands(),
+    }),
+    getAcpSessionId: () => backgroundTasks.acpSessionId() ?? sessionRecord.acpSessionId,
+  });
   taskReaper = ownerTaskReaper;
-  // brick ad6ba1c2 §5.4 — every task-set change refreshes the remembered task sessions.
-  let taskSetSignature = "";
-  const observeBackgroundTasks = (message: unknown) => {
-    backgroundTasks.observe("inbound", message);
-    const signature = backgroundTasks
-      .list()
-      .tasks.map((task) => task.taskId)
-      .join(",");
-    if (signature !== taskSetSignature) {
-      taskSetSignature = signature;
-      ownerTaskReaper.noteTaskSetChange();
-    }
-  };
+  const observeBackgroundTasks = (message: unknown) => backgroundTasks.observe("inbound", message);
   let stopObservingBackgroundTasks = sharedClient.observeInbound(observeBackgroundTasks);
   let recycleReason: string | undefined;
   // brick ad6ba1c2 — named in the owner.log reap line of the graceful exit.
@@ -1224,7 +1219,10 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           });
         },
         queryActiveTurn: () => turnController.hasActiveTurn(),
-        queryBackgroundTasks: () => backgroundTasks.list(),
+        queryBackgroundTasks: () => ({
+          ...backgroundTasks.list(),
+          monitorCommands: backgroundTasks.monitorCommands(),
+        }),
       },
       {
         maxQueueDepth,
@@ -1578,7 +1576,6 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
                   stopObservingBackgroundTasks();
                   sharedClient = replaced;
                   backgroundTasks.reset();
-                  ownerTaskReaper.resetRemembered();
                   stopObservingBackgroundTasks =
                     sharedClient.observeInbound(observeBackgroundTasks);
                 }

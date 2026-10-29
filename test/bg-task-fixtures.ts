@@ -30,3 +30,14 @@ export const FIXTURE_TASKS: LiveBackgroundTask[] = [
     toolName: "Monitor",
   },
 ];
+
+/** The command of the fixture's Monitor task (b2g1k6brj), for Proof M in the rigs. */
+export const FIXTURE_MONITOR_COMMAND = "sleep 301; echo done";
+
+/** A live Bash task that no process proves (v3 K-of-N warning). */
+export const GHOST_TASK: LiveBackgroundTask = {
+  taskId: "bghost0001",
+  taskType: "local_bash",
+  description: "ghost job",
+  toolName: "Bash",
+};

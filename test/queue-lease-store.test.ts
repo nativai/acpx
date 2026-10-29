@@ -654,15 +654,9 @@ test("terminateQueueOwnerForSession: a bare pid is never signalled; a verified i
         assert.deepEqual(await terminateQueueOwnerForSession(sessionId), {
           stopped: true,
           reason: "stopped",
-          // brick ad6ba1c2: the verified stop censused the owner's tree (the keeper alone) before
-          // signalling it, and reaped it after the proven death.
-          reap: {
-            measured: true,
-            taskProcesses: 0,
-            survivors: 0,
-            survivorPids: [],
-            survivorDetails: [],
-          },
+          // brick ad6ba1c2 v3: without a task set (no closer context) the stop proves and signals
+          // NOTHING beyond the owner, and says so — never a census.
+          reap: unmeasuredReap("no-task-set"),
         });
         assert.equal(await readQueueOwnerRecord(sessionId), undefined);
       }

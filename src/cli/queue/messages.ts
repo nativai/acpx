@@ -253,6 +253,8 @@ export type QueueOwnerBackgroundTasksResultMessage = {
   ownerGeneration?: number;
   source: BackgroundTaskSource;
   tasks: LiveBackgroundTask[];
+  /** v3: match-only input to the closer's Proof M. Never printed, logged or put in any JSON. */
+  monitorCommands: Array<{ taskId: string; command: string }>;
 };
 
 // One item of custody the drain took off the owner and terminalized. `messageId`
@@ -954,6 +956,18 @@ function parseLiveBackgroundTask(value: unknown): LiveBackgroundTask | undefined
   };
 }
 
+function parseMonitorCommands(value: unknown): Array<{ taskId: string; command: string }> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((entry) => {
+    const record = asRecord(entry);
+    return typeof record?.taskId === "string" && typeof record.command === "string"
+      ? [{ taskId: record.taskId, command: record.command }]
+      : [];
+  });
+}
+
 function parseBackgroundTasksResultOwnerMessage(
   message: Record<string, unknown>,
   context: QueueOwnerMessageContext,
@@ -974,6 +988,9 @@ function parseBackgroundTasksResultOwnerMessage(
     ...context,
     source: message.source as BackgroundTaskSource,
     tasks: tasks as LiveBackgroundTask[],
+    // An owner built before v3 sends none: its Monitors are then unprovable from the closer side,
+    // which loses coverage, never correctness.
+    monitorCommands: parseMonitorCommands(message.monitorCommands),
   };
 }
 

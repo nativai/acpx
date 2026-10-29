@@ -61,6 +61,7 @@ import {
   type QueueOwnerRecoveryResult,
   readQueueOwnerLiveness,
   readQueueOwnerState,
+  queryCloserTaskContext,
   recoverQueueOwnerForSession,
   terminateQueueOwnerForSession,
   tryCancelOnRunningOwner,
@@ -71,7 +72,7 @@ import {
   trySetModelOnRunningOwner,
   trySetModeOnRunningOwner,
 } from "../queue/ipc.js";
-import { readQueueOwnerRecord } from "../queue/lease-store.js";
+import { readQueueOwnerRecord, type CloserTaskContext } from "../queue/lease-store.js";
 import { DEFAULT_CLOSE_DRAIN_TIMEOUT_MS } from "./contracts.js";
 import type {
   SessionCancelOptions,
@@ -195,7 +196,12 @@ type OwnerRecycle = { ownerRestarted: boolean; ownerRestartSkipped?: string; rea
  * (`ownerRestartSkipped`), and the setting takes effect at that owner's next start.
  */
 async function recycleLiveOwner(sessionId: string): Promise<OwnerRecycle> {
-  const outcome = await terminateQueueOwnerForSession(sessionId);
+  // v3: the closer proves task processes against the owner's live set, asked right before the stop.
+  const outcome = await terminateQueueOwnerForSession(
+    sessionId,
+    undefined,
+    await queryCloserTaskContext(sessionId),
+  );
   await clearBackgroundTaskChipAfterReap(sessionId, outcome.reap);
   return outcome.stopped
     ? { ownerRestarted: true, reap: outcome.reap }
@@ -710,6 +716,8 @@ export type CloseSessionOptions = {
   // Default true. `--no-drain` is the explicit escape hatch back to the old
   // destroy-on-close behaviour.
   drain?: boolean;
+  /** brick ad6ba1c2 v3 — the gate's answer, so the close proves against the set it showed. */
+  taskContext?: CloserTaskContext;
   drainTimeoutMs?: number;
   verbose?: boolean;
 };
@@ -790,6 +798,14 @@ async function drainCustodyBeforeClose(
   };
 }
 
+/** The gate's answer when the handler gave one; otherwise ask the owner now (internal closes). */
+async function taskContextForClose(
+  sessionId: string,
+  options: CloseSessionOptions,
+): Promise<CloserTaskContext> {
+  return options.taskContext ?? (await queryCloserTaskContext(sessionId));
+}
+
 export async function closeSession(
   sessionId: string,
   options: CloseSessionOptions = {},
@@ -810,12 +826,19 @@ export async function closeSession(
   // kills it. Until this existed, step 2 below actively killed the very process
   // that was mid-handoff of an accepted message, and the only record of that
   // message was a JavaScript array inside it.
+  // brick ad6ba1c2 v3 — the live task set is read BEFORE the drain and `close_session`: the adapter's
+  // teardown can make claude announce an empty set while its task processes still run.
+  const taskContext = await taskContextForClose(record.acpxRecordId, options);
   const drain = await drainCustodyBeforeClose(record.acpxRecordId, options);
 
   await tryCloseSessionOnRunningOwner({ sessionId: record.acpxRecordId }).catch(() => {
     // Preserve local close semantics even if best-effort ACP session shutdown fails.
   });
-  const ownerStop = await terminateQueueOwnerForSession(record.acpxRecordId, drainedOwner);
+  const ownerStop = await terminateQueueOwnerForSession(
+    record.acpxRecordId,
+    drainedOwner,
+    taskContext,
+  );
   const adapterKill = await killRecordedAdapter(record);
   if (options.verbose && !adapterKill.signalled && adapterKill.reason !== "no-pid") {
     process.stderr.write(
@@ -1540,5 +1563,8 @@ function classifySessionOwnerStatus(
 // the in-flight prompt is the caller's job (acpx-ui), not this command's.
 export async function recoverSession(sessionId: string): Promise<QueueOwnerRecoveryResult> {
   const record = await resolveSessionRecord(sessionId);
-  return await recoverQueueOwnerForSession(record.acpxRecordId);
+  return await recoverQueueOwnerForSession(
+    record.acpxRecordId,
+    await queryCloserTaskContext(record.acpxRecordId),
+  );
 }

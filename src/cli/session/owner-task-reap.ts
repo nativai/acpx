@@ -1,111 +1,60 @@
-import fs from "node:fs";
 import { appendFile } from "node:fs/promises";
 import {
   formatSurvivors,
-  mergeTaskSessions,
-  parseProcStat,
-  pruneDeadTaskSessions,
   reapSnapshot,
   signalSnapshot,
   snapshotSessionTree,
+  unprovenTaskWarning,
+  type BackgroundTaskSet,
   type ReapReport,
   type ReapSnapshot,
   type Signaller,
-  type TaskSessionMemo,
 } from "../../process-tree-reap.js";
 import { sessionEventActivePath } from "../../session/event-log.js";
 import { resolveSessionRecord } from "../../session/persistence.js";
 
 /**
- * brick ad6ba1c2 — the queue owner's side of the reap (CONCEPTION §5.2 E, F, G; §5.4).
+ * brick ad6ba1c2 — the queue owner's side of the reap (CONCEPTION v3 §5.2 E, F, G).
  *
- * The owner remembers the task sessions its adapter's tree has created, so a task orphaned by a
- * `claude` crash (reparented to init, out of the tree) is still ended when the owner ends (path I).
- * On every owner exit the owner snapshots its own tree BEFORE it closes anything and reaps the
- * members OUTSIDE its own process group: the adapter and `claude` stay owned by the existing group
- * SIGKILL, so their teardown is exactly today's.
+ * On every owner exit the owner admits, BEFORE it closes anything, the processes PROVABLY of its
+ * live background tasks (v3 §5.1 proofs, from the tracker's live set), and reaps them after. Its own
+ * session (the owner, the adapter, claude) is never signalled by these passes: the existing group
+ * SIGKILL keeps owning them, so their teardown is exactly today's.
+ *
+ * ⚠️ NO REMEMBERED STATE (v3 §5.4). v2 memoized every session under claude at each task-set change,
+ * foreground tool shells included, and later killed a FOREGROUND call's deliberate daemon on a
+ * release of a still-open session (TE ADV-DAEMON). The proofs are session-unique and box-wide, so a
+ * task a `claude` crash orphaned still proves itself here (path I) without a memo.
  */
 export type OwnerTaskReaper = {
-  /** A task-set change was observed: refresh the memos (coalesced, one scan per burst). */
-  noteTaskSetChange: () => void;
-  remembered: () => TaskSessionMemo[];
-  /** The adapter that held the tasks was replaced: nothing it held is remembered any more. */
-  resetRemembered: () => void;
-  /** Sync. The owner's own tree minus itself and its own process group, plus the memos. */
-  snapshotOwnerExit: () => ReapSnapshot;
-  /** Sync. The (old) adapter's whole tree, plus the memos — a client switch (path F). */
-  snapshotAdapter: (adapterPid: number | undefined) => ReapSnapshot;
+  /** Sync. Admission for this owner's live background tasks (its own session spared). */
+  snapshot: () => ReapSnapshot;
 };
 
-function ownProcessGroup(): number | undefined {
-  try {
-    return parseProcStat(fs.readFileSync("/proc/self/stat", "utf8"))?.pgid;
-  } catch {
-    return undefined;
-  }
-}
-
 export function createOwnerTaskReaper(params: {
-  getAgentPid: () => number | undefined;
+  getTaskSet: () => BackgroundTaskSet;
+  getAcpSessionId: () => string | undefined;
   procRoot?: string;
 }): OwnerTaskReaper {
-  let memos: TaskSessionMemo[] = [];
-  let refreshScheduled = false;
-  // Resolved once: a process's group does not change after start, and the exit path must not do
-  // avoidable I/O.
-  const spareProcessGroup = ownProcessGroup();
   const exclude = new Set([process.pid]);
-
-  const refresh = (): void => {
-    refreshScheduled = false;
-    try {
-      const snapshot = snapshotSessionTree({
-        rootPid: params.getAgentPid(),
-        includeRoot: false,
-        exclude,
-        procRoot: params.procRoot,
-      });
-      if (snapshot.measured) {
-        memos = pruneDeadTaskSessions(
-          mergeTaskSessions(memos, snapshot.taskSessions),
-          params.procRoot,
-        );
-      }
-    } catch {
-      // Best effort: a missed refresh only weakens path I, never a turn.
-    }
-  };
-
   return {
-    noteTaskSetChange: () => {
-      if (refreshScheduled) {
-        return;
-      }
-      refreshScheduled = true;
-      setImmediate(refresh);
-    },
-    remembered: () => memos.map((memo) => ({ ...memo, members: [...memo.members] })),
-    resetRemembered: () => {
-      memos = [];
-    },
-    snapshotOwnerExit: () =>
+    snapshot: () =>
       snapshotSessionTree({
-        rootPid: process.pid,
-        includeRoot: false,
-        remembered: memos,
-        exclude,
-        spareProcessGroup,
-        procRoot: params.procRoot,
-      }),
-    snapshotAdapter: (adapterPid) =>
-      snapshotSessionTree({
-        rootPid: adapterPid,
-        includeRoot: true,
-        remembered: memos,
+        bg: params.getTaskSet(),
+        acpSessionId: params.getAcpSessionId(),
+        ownerPid: process.pid,
         exclude,
         procRoot: params.procRoot,
       }),
   };
+}
+
+/** HoD (v3): the K-of-N proof warning, on the owner's stderr (owner.log). Never throws. */
+function warnUnproven(sessionId: string, facts: Parameters<typeof unprovenTaskWarning>[1]): void {
+  const warning = unprovenTaskWarning(sessionId, facts);
+  if (warning) {
+    process.stderr.write(warning);
+  }
 }
 
 /** A line is due when anything was found, anything survived, or nothing could be measured. */
@@ -141,6 +90,7 @@ export async function reapAndLogOnOwnerExit(
 ): Promise<ReapReport | undefined> {
   try {
     const report = await reapSnapshot(snapshot, options);
+    warnUnproven(sessionId, report);
     if (ownerReapLineDue(report)) {
       process.stderr.write(formatOwnerReapLine(sessionId, reason, report));
     }
@@ -160,7 +110,7 @@ export function createOwnerSignalReap(sessionId: string, reaper: OwnerTaskReaper
   return {
     term: (): void => {
       try {
-        snapshot = reaper?.snapshotOwnerExit();
+        snapshot = reaper?.snapshot();
         if (snapshot) {
           signalSnapshot(snapshot, "SIGTERM");
         }
@@ -173,22 +123,31 @@ export function createOwnerSignalReap(sessionId: string, reaper: OwnerTaskReaper
         return;
       }
       try {
-        const taskProcesses = snapshot.members.filter((m) => m.inTaskSession).length;
-        if (!snapshot.measured || taskProcesses > 0) {
-          process.stderr.write(
-            snapshot.measured
-              ? `[acpx] queue owner reaped ${taskProcesses} background task process(es) of session ` +
-                  `${sessionId} after ${signal} (SIGTERM sent; SIGKILL follows)\n`
-              : `[acpx] queue owner could NOT census the background task processes of session ` +
-                  `${sessionId} after ${signal} (measured=false); task processes may survive\n`,
-          );
-        }
+        writeSignalReapLine(sessionId, signal, snapshot);
         signalSnapshot(snapshot, "SIGKILL");
       } catch {
         // Never throw from a signal handler.
       }
     },
   };
+}
+
+function writeSignalReapLine(sessionId: string, signal: string, snapshot: ReapSnapshot): void {
+  warnUnproven(sessionId, snapshot);
+  if (!snapshot.measured) {
+    process.stderr.write(
+      `[acpx] queue owner could NOT census the background task processes of session ` +
+        `${sessionId} after ${signal} (measured=false${snapshot.skipped ? `, skipped=${snapshot.skipped}` : ""}); ` +
+        `task processes may survive\n`,
+    );
+    return;
+  }
+  if (snapshot.members.length > 0) {
+    process.stderr.write(
+      `[acpx] queue owner reaped ${snapshot.members.length} background task process(es) of session ` +
+        `${sessionId} after ${signal} (SIGTERM sent; SIGKILL follows)\n`,
+    );
+  }
 }
 
 /**

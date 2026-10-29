@@ -22,7 +22,7 @@ import type {
   PromptInput,
   SessionResumePolicy,
 } from "../../types.js";
-import type { BackgroundTaskList } from "../session/background-task-tracker.js";
+import type { BackgroundTaskAnswer } from "../session/background-task-tracker.js";
 import {
   CONSUMED_CUT_BY_SESSION_CLOSE,
   consumedBeforeCutNote,
@@ -356,7 +356,7 @@ export type QueueOwnerControlHandlers = {
   setDepth: (requested: string, timeoutMs?: number) => Promise<DepthProjection>;
   queryActiveTurn: () => boolean;
   /** brick ad6ba1c2 (Contract C4): the live background tasks, read-only. Optional: test owners omit it. */
-  queryBackgroundTasks?: () => BackgroundTaskList;
+  queryBackgroundTasks?: () => BackgroundTaskAnswer;
 };
 
 type SessionQueueOwnerOptions = {
@@ -998,7 +998,11 @@ export class SessionQueueOwner {
       return true;
     }
     if (request.type === "query_background_tasks") {
-      const list = this.controlHandlers.queryBackgroundTasks?.() ?? { source: "none", tasks: [] };
+      const list = this.controlHandlers.queryBackgroundTasks?.() ?? {
+        source: "none",
+        tasks: [],
+        monitorCommands: [],
+      };
       this.handleControlRequest({
         socket,
         requestId: request.requestId,
