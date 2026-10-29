@@ -373,6 +373,7 @@ test("--max-bytes stops BEFORE the file that would exceed it; --limit caps the c
 test("a second sweep while the lock is held: exit 2 lock-held, nothing compressed", async () => {
   await withFixture(async (fixture) => {
     await fs.mkdir(path.join(fixture.archive, "COMPRESSION"), { recursive: true });
+    await fs.writeFile(path.join(fixture.archive, "COMPRESSION", "INITIALIZED"), "{}\n");
     // A live holder in this pid namespace — the test process itself — is never taken over.
     await fs.writeFile(
       path.join(fixture.archive, "COMPRESSION", ".lock"),
@@ -806,6 +807,61 @@ test("AC-2 restore with a TRUNCATED .zst (footer gone): skipped ARCHIVED_FILE_CO
   });
 });
 
+test("a restore that creates COMPRESSION/staging does NOT arm the sweep: --apply without --initialize ⇒ exit 2, nothing compressed", async () => {
+  await withTempHome("acpx-zst-cli-", async (home) => {
+    const restored = await writeArchivedSession(home, "6a6a6a6a-1111-4222-8333-444455556666");
+    const stays = await writeArchivedSession(home, "7b7b7b7b-1111-4222-8333-444455556666");
+    // A .zst on a box that never had an operator pass (no COMPRESSION/ at all).
+    const name = `${restored.id}.stream.ndjson`;
+    await fs.writeFile(
+      path.join(restored.archive, zstNameFor(name)),
+      encodeArchiveZst(restored.logical[name]),
+    );
+    await fs.unlink(path.join(restored.archive, name));
+    const restore = await runCli(home, ["sessions", "restore", restored.id, "--json"]);
+    assert.equal(restore.code, 0, restore.stderr);
+    assert.deepEqual(
+      (JSON.parse(restore.stdout) as { restored: { decompressed: string[] }[] }).restored[0]
+        .decompressed,
+      [name],
+    );
+    const compressionDir = path.join(restored.archive, "COMPRESSION");
+    await fs.access(path.join(compressionDir, "staging"));
+    assert.ok(
+      !(await listing(compressionDir)).includes("INITIALIZED"),
+      "restore never writes the marker",
+    );
+
+    const before = await treeFingerprint(stays.archive);
+    const result = await runCli(home, [
+      "sessions",
+      "archive",
+      "--compress",
+      "--apply",
+      "--skip-reader-check",
+      "--json",
+    ]);
+    assert.equal(result.code, 2, result.stderr);
+    const body = JSON.parse(result.stdout) as { outcome: string; compressed: unknown[] };
+    assert.equal(body.outcome, "compression-not-initialized");
+    assert.deepEqual(body.compressed, []);
+    assert.equal(
+      await treeFingerprint(stays.archive),
+      before,
+      "nothing compressed, nothing written",
+    );
+    assert.ok((await listing(stays.archive)).every((file) => !file.endsWith(".zst")));
+
+    const armed = await runCli(home, COMPRESS_INIT);
+    assert.equal(armed.code, 0, armed.stderr);
+    assert.equal((JSON.parse(armed.stdout) as { initialized: boolean }).initialized, true);
+    assert.ok(
+      (await listing(compressionDir)).includes("INITIALIZED"),
+      "only --initialize writes it",
+    );
+  });
+});
+
 test("AC-7(c) restore with both forms present: the hot dir gets the PLAIN's bytes", async () => {
   await withFixture(async (fixture) => {
     const name = `${fixture.id}.messages.ndjson`;
@@ -827,6 +883,8 @@ test("AC-8 restore racing a sweep in one process (10 rounds): always exactly one
         process.env.ACPX_STATE_HOME = fixture.home;
         try {
           await fs.mkdir(path.join(fixture.archive, "COMPRESSION", "staging"), { recursive: true });
+          // Armed, or the sweep is refused up front and the "race" never races.
+          await fs.writeFile(path.join(fixture.archive, "COMPRESSION", "INITIALIZED"), "{}\n");
           const context = createContext(fixture.hot, `race-${round}`);
           await Promise.all([
             runRestore(context, [fixture.id]),

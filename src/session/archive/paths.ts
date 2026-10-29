@@ -79,10 +79,10 @@ export const ARCHIVE_MANIFEST_FILE_NAME = "MANIFEST.tsv";
 export const ARCHIVE_INDEX_DIR_NAME = "ARCHIVE-INDEX";
 
 /**
- * `COMPRESSION/` (amendment §B) — reserved, dot-less, like `ARCHIVE-INDEX/`. Its
- * EXISTENCE is the box's opt-in to unattended compression: only an operator's
- * `--compress --apply --initialize` creates it, and `--compress --apply` without
- * `--initialize` refuses while it is absent (the D2 first-run rule, for compression).
+ * `COMPRESSION/` (amendment §B) — reserved, dot-less, like `ARCHIVE-INDEX/`: journal,
+ * lock, staging, quarantine, runs. ⚠️ ITS EXISTENCE IS NOT THE OPT-IN — restore and
+ * `--decompress` create `staging/` freely; the box's opt-in to unattended compression is
+ * the `INITIALIZED` marker inside it (`compressionInitializedMarkerPath`).
  */
 export const COMPRESSION_DIR_NAME = "COMPRESSION";
 
@@ -108,4 +108,19 @@ export function compressionJournalPath(archiveDir: string): string {
 
 export function compressionLockPath(archiveDir: string): string {
   return path.join(compressionDir(archiveDir), ".lock");
+}
+
+/**
+ * `COMPRESSION/INITIALIZED` — THE box's opt-in to unattended compression. Written ONLY
+ * by `--compress --apply --initialize`; `--compress --apply` without `--initialize`
+ * refuses while it is absent.
+ *
+ * ⚠️ THE MARKER, NOT THE DIRECTORY. restore, `--decompress` and `--repair` create
+ * `COMPRESSION/staging/` whenever they decompress, so "the directory exists" can become
+ * true without any operator pass — and would then arm the nightly sweep on that box.
+ * `test/archive-compress-cli.test.ts` ("a restore that creates COMPRESSION/staging does
+ * NOT arm the sweep") goes red if this check is moved back to the directory.
+ */
+export function compressionInitializedMarkerPath(archiveDir: string): string {
+  return path.join(compressionDir(archiveDir), "INITIALIZED");
 }

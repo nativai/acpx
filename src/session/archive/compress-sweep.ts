@@ -47,6 +47,7 @@ import { foldArchiveManifest, type ManifestFold } from "./manifest.js";
 import { ArchiveRefusal, statFileSet } from "./move.js";
 import {
   compressionDir,
+  compressionInitializedMarkerPath,
   compressionLockPath,
   compressionQuarantineDir,
   compressionRunsDir,
@@ -557,9 +558,9 @@ async function preflightBase(context: SweepContext, initialize: boolean): Promis
     );
   }
   assertZstdAvailable();
-  if (!initialize && !(await directoryExists(compressionDir(context.archiveDir)))) {
+  if (!initialize && !(await isCompressionInitialized(context.archiveDir))) {
     throw new SweepRefusal(
-      `compression is not initialised on this box: ${compressionDir(context.archiveDir)} does not exist. The first compression of a box is an operator run with --initialize; the nightly sweep never initialises.`,
+      `compression is not initialised on this box: ${compressionInitializedMarkerPath(context.archiveDir)} does not exist. The first compression of a box is an operator run with --initialize; the nightly sweep never initialises.`,
       "compression-not-initialized",
       "compression-not-initialized",
     );
@@ -582,6 +583,30 @@ async function preflightSpace(archiveDir: string, largest: number): Promise<numb
 // ────────────────────────────────────────────────────────────────────────────────
 // lock + directories
 // ────────────────────────────────────────────────────────────────────────────────
+
+/** The arming signal — see `compressionInitializedMarkerPath`. */
+export async function isCompressionInitialized(archiveDir: string): Promise<boolean> {
+  try {
+    return (await fs.stat(compressionInitializedMarkerPath(archiveDir))).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** Write the marker once (`wx`); `true` when THIS run armed the box. */
+async function writeInitializedMarker(context: SweepContext): Promise<boolean> {
+  const body = `${JSON.stringify({ format: ARCHIVE_ZST_FORMAT, at: context.at, wave: context.wave, pid: process.pid })}\n`;
+  try {
+    await fs.writeFile(compressionInitializedMarkerPath(context.archiveDir), body, { flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      return false;
+    }
+    throw error;
+  }
+  await fsyncDir(compressionDir(context.archiveDir));
+  return true;
+}
 
 export async function initializeCompressionDirs(archiveDir: string): Promise<void> {
   await fs.mkdir(compressionStagingDir(archiveDir), { recursive: true });
@@ -911,10 +936,12 @@ export async function runCompressSweep(options: CompressSweepOptions): Promise<C
     const budgeted = applyBudget(preview.candidates, options.maxBytes, options.limit);
     const largest = budgeted.selected.reduce((max, c) => Math.max(max, c.logicalBytes), 0);
     result.freeBytes = await preflightSpace(context.archiveDir, largest);
-    // Every refusal is behind us: only now may `--initialize` create COMPRESSION/
-    // (which arms the nightly sweep on this box), so a refused run writes nothing.
-    result.initialized = !(await directoryExists(compressionDir(context.archiveDir)));
+    // Every refusal is behind us: only now may `--initialize` write the marker (which
+    // arms the nightly sweep on this box), so a refused run writes nothing.
     await initializeCompressionDirs(context.archiveDir);
+    if (options.initialize) {
+      result.initialized = await writeInitializedMarker(context);
+    }
     await withCompressionLock(
       context.archiveDir,
       async () => await compressUnderLock(options, result),
@@ -1001,7 +1028,7 @@ async function compressDryRun(
       return undefined;
     }
   });
-  if (!(await directoryExists(compressionDir(context.archiveDir)))) {
+  if (!(await isCompressionInitialized(context.archiveDir))) {
     result.warnings.push(
       "compression is not initialised on this box: an --apply needs --initialize (operator run)",
     );
