@@ -37,6 +37,7 @@ import {
   serializeJournalRow,
   COMPRESSION_JOURNAL_HEADER,
 } from "./compression-journal.js";
+import { planReconcile, type ReconcilePlan } from "./compression-reconcile.js";
 import {
   claimArchiveFileSets,
   claimFileSets,
@@ -131,6 +132,11 @@ export type CompressRunResult = {
   quarantined: { file: string; reason: string; check?: string }[];
   conflicts: { file: string; reason: string }[];
   failures: { file: string; error: string; detail?: string }[];
+  /**
+   * Lone `begin` rows of an interrupted earlier wave, closed BEFORE new work (written on
+   * `--apply`, reported as-is on `--dry-run`). `action` is the journal row written.
+   */
+  reconciled: { file: string; action: string; detail: string }[];
   stagingRemoved: number;
   shardsRewritten: string[];
   bytesBefore: number;
@@ -193,6 +199,7 @@ function emptyResult(
     quarantined: [],
     conflicts: [],
     failures: [],
+    reconciled: [],
     stagingRemoved: 0,
     shardsRewritten: [],
     bytesBefore: 0,
@@ -669,7 +676,13 @@ async function removeStaleStaging(archiveDir: string, nowMs: number): Promise<nu
 // ────────────────────────────────────────────────────────────────────────────────
 
 export type BothFormsVerdict =
-  | { verdict: "identical" }
+  | {
+      verdict: "identical";
+      logicalBytes: number;
+      logicalSha256: string;
+      zstBytes: number;
+      zstSha256: string;
+    }
   | { verdict: "corrupt"; check: string }
   | { verdict: "differs" };
 
@@ -684,8 +697,15 @@ export async function compareBothForms(
   ]);
   try {
     const decoded = decodeArchiveZst(zst, zstPath);
-    return sha256Hex(decoded) === sha256Hex(plain)
-      ? { verdict: "identical" }
+    const logicalSha256 = sha256Hex(decoded);
+    return logicalSha256 === sha256Hex(plain)
+      ? {
+          verdict: "identical",
+          logicalBytes: decoded.length,
+          logicalSha256,
+          zstBytes: zst.length,
+          zstSha256: sha256Hex(zst),
+        }
       : { verdict: "differs" };
   } catch (error) {
     if (isArchivedFileCorrupt(error)) {
@@ -724,9 +744,15 @@ async function resolveBothForms(
     // Finishing an interrupted commit: the verified .zst already holds these bytes.
     await fs.unlink(path.join(context.archiveDir, file)).catch(() => undefined);
     await fsyncDir(context.archiveDir);
+    // The four size/hash fields ride along: after a crash between commit and unlink this
+    // row is the ONLY record of the file's compression (AC-9: every compressed file).
     await journal.append({
       action: "resolve-both",
       file,
+      logicalBytes: verdict.logicalBytes,
+      logicalSha256: verdict.logicalSha256,
+      zstBytes: verdict.zstBytes,
+      zstSha256: verdict.zstSha256,
       verified: true,
       detail: "identical; plain unlinked",
     });
@@ -980,6 +1006,8 @@ async function compressUnderLock(
   const touchedIds = new Set<string>();
   const journal = await CompressionJournalWriter.open(context.archiveDir, context.at, context.wave);
   try {
+    // FIRST, before any new `begin`: close what an interrupted wave left open.
+    await applyReconcile(context, journal, result, touchedIds);
     for (const both of selection.bothForms) {
       if (await resolveBothForms(context, journal, both.file, result)) {
         touchedIds.add(both.safeId);
@@ -997,6 +1025,70 @@ async function compressUnderLock(
   if (options.manifestOut) {
     await writeManifestOut(context, options.manifestOut);
   }
+}
+
+/**
+ * Close every lone `begin` (see `compression-reconcile.ts`). A recovered `compress` row
+ * carries this run's wave, so it lands in this wave's `--manifest-out` too.
+ */
+async function applyReconcile(
+  context: SweepContext,
+  journal: CompressionJournalWriter,
+  result: CompressRunResult,
+  touchedIds: Set<string>,
+): Promise<void> {
+  const plans = await planReconcile(
+    context.archiveDir,
+    await readCompressionJournal(context.archiveDir),
+  );
+  for (const plan of plans) {
+    const action = await writeReconcileRow(context, journal, plan, result);
+    result.reconciled.push({ file: plan.file, action, detail: plan.detail });
+    if (
+      plan.safeId &&
+      (action === "compress" || action === "resolve-both" || action === "quarantine")
+    ) {
+      touchedIds.add(plan.safeId);
+    }
+  }
+}
+
+async function writeReconcileRow(
+  context: SweepContext,
+  journal: CompressionJournalWriter,
+  plan: ReconcilePlan,
+  result: CompressRunResult,
+): Promise<string> {
+  if (plan.action === "resolve-both") {
+    const before = result.quarantined.length + result.conflicts.length;
+    if (await resolveBothForms(context, journal, plan.file, result)) {
+      return result.quarantined.length + result.conflicts.length > before
+        ? "quarantine"
+        : "resolve-both";
+    }
+    await journal.append({
+      action: "abort",
+      file: plan.file,
+      detail: `${plan.detail}; forms changed meanwhile`,
+    });
+    return "abort";
+  }
+  const { file, action, detail, logicalBytes, logicalSha256, zstBytes, zstSha256 } = plan;
+  const verified = action === "compress" ? true : action === "fail" ? false : undefined;
+  await journal.append({
+    action,
+    file,
+    detail,
+    logicalBytes,
+    logicalSha256,
+    zstBytes,
+    zstSha256,
+    verified,
+  });
+  if (action === "fail") {
+    result.failures.push({ file, error: "corrupt", detail });
+  }
+  return action;
 }
 
 async function compressDryRun(
@@ -1020,6 +1112,12 @@ async function compressDryRun(
   for (const file of selection.previouslySkipped) {
     result.skipped.push({ file, reason: "previously-skipped" });
   }
+  // Reported, never written: what an --apply would close first.
+  const plans = await planReconcile(
+    context.archiveDir,
+    await readCompressionJournal(context.archiveDir),
+  );
+  result.reconciled = plans.map(({ file, action, detail }) => ({ file, action, detail }));
   result.freeBytes = await freeBytesAt(context.archiveDir);
   result.estimate = await estimateCompression(selection.candidates, async (candidate) => {
     try {
