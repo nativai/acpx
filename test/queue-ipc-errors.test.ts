@@ -65,6 +65,36 @@ function recordingOutputFormatter(detailCodes: string[]): OutputFormatter {
   };
 }
 
+type ObservedRequest = { type: string; ownerAliveOnArrival: boolean };
+
+/**
+ * brick ad6ba1c2 v3 §5.2: an automatic terminate first asks the owner for its live task set
+ * (`queryCloserTaskContext`) on a connection of its own. Records every request, answers that query
+ * with nothing (it reads `queried:false`), and returns true when the request was that query.
+ */
+function recordRequest(
+  observed: ObservedRequest[],
+  socket: { end(): void },
+  request: { type: string },
+  ownerPid: number,
+): boolean {
+  observed.push({ type: request.type, ownerAliveOnArrival: isProcessAlive(ownerPid) });
+  if (request.type !== "query_background_tasks") {
+    return false;
+  }
+  socket.end();
+  return true;
+}
+
+/** The automatic terminate asked for the task set, after the submit and while the owner lived. */
+function assertQueriedBeforeTerminate(observed: ObservedRequest[]): void {
+  assert.deepEqual(
+    observed.map((entry) => entry.type),
+    ["submit_prompt", "query_background_tasks"],
+  );
+  assert.equal(observed[1]?.ownerAliveOnArrival, true, "the query precedes the terminate");
+}
+
 test("trySubmitToRunningOwner propagates typed queue prompt errors", async () => {
   await withTempHome(async (homeDir) => {
     const sessionId = "prompt-error-session";
@@ -153,8 +183,11 @@ test("trySubmitToRunningOwner treats owner shutdown errors as no usable owner", 
         processIdentity: await readQueueOwnerProcessIdentity(pidOf(keeper)),
       });
 
+      const observed: ObservedRequest[] = [];
       const server = createSingleRequestServer((socket, request) => {
-        assert.equal(request.type, "submit_prompt");
+        if (recordRequest(observed, socket, request, pidOf(keeper))) {
+          return;
+        }
         socket.write(
           `${JSON.stringify({
             type: "error",
@@ -182,6 +215,7 @@ test("trySubmitToRunningOwner treats owner shutdown errors as no usable owner", 
         });
         assert.equal(result, undefined);
         assert.deepEqual(emittedErrors, []);
+        assertQueriedBeforeTerminate(observed);
         await assert.rejects(async () => await fs.access(lockPath), {
           code: "ENOENT",
         });
@@ -809,8 +843,11 @@ test("trySubmitToRunningOwner clears stale owner lock on protocol mismatch", asy
       processIdentity: await readQueueOwnerProcessIdentity(pidOf(keeper)),
     });
 
+    const observed: ObservedRequest[] = [];
     const server = createSingleRequestServer((socket, request) => {
-      assert.equal(request.type, "submit_prompt");
+      if (recordRequest(observed, socket, request, pidOf(keeper))) {
+        return;
+      }
       socket.write(
         `${JSON.stringify({
           type: "accepted",
@@ -840,6 +877,7 @@ test("trySubmitToRunningOwner clears stale owner lock on protocol mismatch", asy
         waitForCompletion: true,
       });
       assert.equal(outcome, undefined);
+      assertQueriedBeforeTerminate(observed);
       await assert.rejects(fs.access(lockPath));
     } finally {
       await closeServer(server);

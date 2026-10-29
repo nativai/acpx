@@ -38,7 +38,9 @@ for (;;) {
 }
 
 try {
-  const result = await closeSession(sessionId);
+  // brick ad6ba1c2 v3.1 — asked exactly like an unforced `sessions close` asks: the self arm must
+  // still send its drain WITHOUT the in-drain check (its record is written first, §6.4).
+  const result = await closeSession(sessionId, { checkBackgroundTasks: true });
   // Only reached when this process survives its own close — the fixed order
   // makes that possible (the write lands before the owner kill), but the
   // faithful cascade in the intermediate may still kill us first. Either way

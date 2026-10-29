@@ -43,6 +43,7 @@ import {
 import { warmCatalogueInBackground } from "../models/catalogue-warm.js";
 import { validateSessionModelFlags } from "../models/model-slug-validation.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
+import { publicReap, type ReapReport } from "../process-tree-reap.js";
 import {
   mergePromptSourceWithText,
   parsePromptSource,
@@ -106,6 +107,21 @@ import type {
   SessionUserContent,
   PermissionPolicy,
 } from "../types.js";
+import {
+  backgroundTasksField,
+  backgroundTasksJson,
+  backgroundTasksRefusal,
+  closeRetryArgs,
+  templateRetryArgs,
+  emitLiveBackgroundTasksRefusal,
+  evaluateBackgroundTaskGate,
+  gateTaskContext,
+  reportBackgroundTaskOutcome,
+  reportOwnerRecycleReap,
+  warnReapSurvivors,
+  warnUncheckedBackgroundTasks,
+  type BackgroundTasksJson,
+} from "./background-task-gate.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import {
   hasExplicitPermissionModeFlag,
@@ -133,7 +149,7 @@ import { type MessageLedgerKind, withMessageLedger } from "./message-ledger.js";
 import { emitJsonResult } from "./output/json-output.js";
 // Type-only, so the render module stays lazily imported at runtime.
 import type { FirstTurnOutcome, PruneRefusal, PruneScope } from "./output/render.js";
-import type { QueueOwnerRecoveryResult } from "./queue/lease-store.js";
+import type { CloserTaskContext, QueueOwnerRecoveryResult } from "./queue/lease-store.js";
 import {
   addressedSeatIdFromSelector,
   NoSessionError,
@@ -145,6 +161,7 @@ import {
   resolveSeatActiveHolder,
   resolveSessionTargetSelector,
 } from "./session-selector.js";
+import type { LiveBackgroundTask } from "./session/background-task-tracker.js";
 import {
   maybeStampBrickLink,
   resolveBrickFlagRef,
@@ -1833,6 +1850,7 @@ function printSetModelResultByFormat(
     resumed: boolean;
     ownerRestarted?: boolean;
     ownerRestartSkipped?: string;
+    reap?: ReapReport;
   },
   format: OutputFormat,
 ): void {
@@ -1843,6 +1861,7 @@ function printSetModelResultByFormat(
       resumed: result.resumed,
       ownerRestarted: result.ownerRestarted ?? false,
       ...(result.ownerRestartSkipped ? { ownerRestartSkipped: result.ownerRestartSkipped } : {}),
+      ...reportOwnerRecycleReap(result.record.acpxRecordId, result.reap, format),
       acpxRecordId: result.record.acpxRecordId,
       acpxSessionId: result.record.acpSessionId,
       agentSessionId: result.record.agentSessionId,
@@ -1862,6 +1881,7 @@ function printSetConfigOptionResultByFormat(
     response: { configOptions: unknown[] };
     ownerRestarted?: boolean;
     ownerRestartSkipped?: string;
+    reap?: ReapReport;
   },
   format: OutputFormat,
 ): void {
@@ -1873,6 +1893,7 @@ function printSetConfigOptionResultByFormat(
       resumed: result.resumed,
       ownerRestarted: result.ownerRestarted ?? false,
       ...(result.ownerRestartSkipped ? { ownerRestartSkipped: result.ownerRestartSkipped } : {}),
+      ...reportOwnerRecycleReap(result.record.acpxRecordId, result.reap, format),
       configOptions: result.response.configOptions,
       acpxRecordId: result.record.acpxRecordId,
       acpxSessionId: result.record.acpSessionId,
@@ -1903,6 +1924,7 @@ function printSetOutputStyleResultByFormat(
     record: SessionRecord;
     ownerRestarted?: boolean;
     ownerRestartSkipped?: string;
+    reap?: ReapReport;
     pending?: boolean;
   },
   format: OutputFormat,
@@ -1914,6 +1936,7 @@ function printSetOutputStyleResultByFormat(
       outputStyle,
       ownerRestarted: result.ownerRestarted ?? false,
       ...(result.ownerRestartSkipped ? { ownerRestartSkipped: result.ownerRestartSkipped } : {}),
+      ...reportOwnerRecycleReap(result.record.acpxRecordId, result.reap, format),
       pending,
       // The style the CURRENT query was built with — what the session is really
       // running until the recycle lands. Never the harness readback.
@@ -2339,7 +2362,7 @@ export async function handleSetAutoFailover(
 }
 
 function printSetAutoFailoverResultByFormat(
-  result: { record: SessionRecord; autoFailover: boolean },
+  result: { record: SessionRecord; autoFailover: boolean; reap?: ReapReport },
   format: OutputFormat,
 ): void {
   const label = result.autoFailover ? "on" : "off";
@@ -2347,6 +2370,7 @@ function printSetAutoFailoverResultByFormat(
     emitJsonResult(format, {
       action: "auto_failover_set",
       autoFailover: result.autoFailover,
+      ...reportOwnerRecycleReap(result.record.acpxRecordId, result.reap, format),
       acpxRecordId: result.record.acpxRecordId,
       acpxSessionId: result.record.acpSessionId,
       agentSessionId: result.record.agentSessionId,
@@ -2403,6 +2427,7 @@ export async function handleSetAutoSubscription(
       key: "autoSubscription",
       value: result.autoSubscription,
       record: result.record,
+      reap: result.reap,
     },
     "auto-subscription",
     globalFlags.format,
@@ -2445,6 +2470,7 @@ export async function handleSetFableDegrade(
       key: "fableDegradeOk",
       value: result.fableDegradeOk,
       record: result.record,
+      reap: result.reap,
     },
     "fable-degrade",
     globalFlags.format,
@@ -2452,7 +2478,13 @@ export async function handleSetFableDegrade(
 }
 
 function printOnOffResultByFormat(
-  payload: { action: string; key: string; value: boolean; record: SessionRecord },
+  payload: {
+    action: string;
+    key: string;
+    value: boolean;
+    record: SessionRecord;
+    reap?: ReapReport;
+  },
   label: string,
   format: OutputFormat,
 ): void {
@@ -2461,6 +2493,7 @@ function printOnOffResultByFormat(
     emitJsonResult(format, {
       action: payload.action,
       [payload.key]: payload.value,
+      ...reportOwnerRecycleReap(payload.record.acpxRecordId, payload.reap, format),
       acpxRecordId: payload.record.acpxRecordId,
       acpxSessionId: payload.record.acpSessionId,
       agentSessionId: payload.record.agentSessionId,
@@ -2515,6 +2548,7 @@ function printSetSubscriptionResultByFormat(
     transcriptCopied: boolean;
     ownerRestarted: boolean;
     ownerRestartSkipped?: string;
+    reap?: ReapReport;
   },
   format: OutputFormat,
 ): void {
@@ -2526,6 +2560,7 @@ function printSetSubscriptionResultByFormat(
       transcriptCopied: result.transcriptCopied,
       ownerRestarted: result.ownerRestarted,
       ...(result.ownerRestartSkipped ? { ownerRestartSkipped: result.ownerRestartSkipped } : {}),
+      ...reportOwnerRecycleReap(result.record.acpxRecordId, result.reap, format),
       acpxRecordId: result.record.acpxRecordId,
       acpxSessionId: result.record.acpSessionId,
     })
@@ -2623,6 +2658,7 @@ function printSetProfileResultByFormat(
     transcriptCopied: boolean;
     ownerRestarted: boolean;
     ownerRestartSkipped?: string;
+    reap?: ReapReport;
   },
   format: OutputFormat,
 ): void {
@@ -2634,6 +2670,7 @@ function printSetProfileResultByFormat(
       transcriptCopied: result.transcriptCopied,
       ownerRestarted: result.ownerRestarted,
       ...(result.ownerRestartSkipped ? { ownerRestartSkipped: result.ownerRestartSkipped } : {}),
+      ...reportOwnerRecycleReap(result.record.acpxRecordId, result.reap, format),
       acpxRecordId: result.record.acpxRecordId,
       acpxSessionId: result.record.acpSessionId,
     })
@@ -2854,13 +2891,41 @@ export async function handleSessionsClose(
     return;
   }
 
+  // brick ad6ba1c2 (Contract C2) — same rule as the byway guard: decided BEFORE anything is
+  // touched. A refusal drains nothing, sends no close_session, signals nothing, writes no record.
+  const { refusal, gate, answer } = await evaluateBackgroundTaskGate({
+    record,
+    killBackgroundTasks: flags.killBackgroundTasks,
+    explicitAgentName,
+    verb: "close",
+    retryArgs: closeRetryArgs(flags),
+  });
+  if (refusal) {
+    emitLiveBackgroundTasksRefusal(refusal, globalFlags.format);
+    return;
+  }
+
   // Commander maps `--no-drain` onto `flags.drain === false`; absent means the
   // barrier runs.
-  const closed = await closeSession(record.acpxRecordId, {
-    drain: flags.drain !== false,
-    drainTimeoutMs: flags.drainTimeout,
-    verbose: globalFlags.verbose,
-  });
+  const refusalContext = {
+    record,
+    explicitAgentName,
+    verb: "close" as const,
+    retryArgs: closeRetryArgs(flags),
+  };
+  const closed = await closeOrRefuseLate(globalFlags.format, refusalContext, () =>
+    closeSession(record.acpxRecordId, {
+      drain: flags.drain !== false,
+      drainTimeoutMs: flags.drainTimeout,
+      verbose: globalFlags.verbose,
+      taskContext: gateTaskContext(answer, record.acpSessionId),
+      // v3.1 (§6.4): an UNFORCED close re-checks inside its drain, abortably.
+      checkBackgroundTasks: flags.killBackgroundTasks !== true,
+    }),
+  );
+  if (!closed) {
+    return;
+  }
   printClosedSessionByFormat(
     closed.record,
     closed.drain,
@@ -2871,9 +2936,39 @@ export async function handleSessionsClose(
       ownerStopSkipped: closed.ownerStopSkipped,
       adapterKill: closed.adapterKill,
     },
+    backgroundTasksJson(gate, closed.reap, closed.ownerStopped, closed.lateTasks),
   );
+  reportBackgroundTaskOutcome(
+    record.acpxRecordId,
+    gate,
+    closed.reap,
+    globalFlags.format,
+    closed.lateTasks,
+  );
+  warnUncheckedBackgroundTasks(record.acpxRecordId, answer);
 
   applyCloseExitCode(closed, record, flags, warnUndeliveredCustody);
+}
+
+/**
+ * brick ad6ba1c2 v3.1 — runs a close that may REFUSE from inside its drain (a task started after the
+ * upfront gate): the refusal is emitted exactly like the gate's (exit 7) and `undefined` returned.
+ */
+async function closeOrRefuseLate<T>(
+  format: OutputFormat,
+  refusalContext: Parameters<typeof backgroundTasksRefusal>[0],
+  run: () => Promise<T>,
+): Promise<T | undefined> {
+  try {
+    return await run();
+  } catch (error) {
+    if (error instanceof Error && error.name === "LiveBackgroundTasksDuringCloseError") {
+      const { tasks } = error as Error & { tasks: LiveBackgroundTask[] };
+      emitLiveBackgroundTasksRefusal(backgroundTasksRefusal(refusalContext, tasks), format);
+      return undefined;
+    }
+    throw error;
+  }
 }
 
 /** Rendered in the seat refusals' shape (`seats-command.ts` `runSeatMutation`): exit 1. */
@@ -3667,11 +3762,20 @@ function resolveMarkAutoPrompt(
 async function markSessionAsTemplate(
   sessionId: string,
   flags: SessionsTemplateFlags,
-): Promise<SessionRecord> {
+  taskContext: CloserTaskContext,
+): Promise<{
+  record: SessionRecord;
+  reap: ReapReport;
+  ownerStopped: boolean;
+  lateTasks: LiveBackgroundTask[];
+}> {
   const initial = await resolveSessionRecord(sessionId);
   const { closeSession } = await loadSessionModule();
-  // Default drain here too — see the note at the soft-close site above.
-  await closeSession(initial.acpxRecordId);
+  // Default drain here too — see the note at the soft-close site above. v3.1: unforced ⇒ checked.
+  const closed = await closeSession(initial.acpxRecordId, {
+    taskContext,
+    checkBackgroundTasks: flags.killBackgroundTasks !== true,
+  });
   const record = await resolveSessionRecord(sessionId);
   record.template = {
     enabled: true,
@@ -3686,7 +3790,12 @@ async function markSessionAsTemplate(
   };
   record.closed = true;
   record.closedAt = record.closedAt ?? isoNow();
-  return record;
+  return {
+    record,
+    reap: closed.reap,
+    ownerStopped: closed.ownerStopped,
+    lateTasks: closed.lateTasks,
+  };
 }
 
 // Clear the template marker. Disable un-templates only — leave closed/closedAt as-is
@@ -3719,23 +3828,56 @@ export async function handleSessionsTemplate(
   // Default action when neither flag is passed = enable (the verb's job is to make
   // a template).
   const enable = flags.disable !== true;
-
-  const record = enable
-    ? await markSessionAsTemplate(sessionId, flags)
-    : await unmarkSessionTemplate(sessionId);
-
-  if (enable) {
-    // Assigns slug (default slugify(name), overridable via --slug) + version =
-    // max+1 for the slug group, under the index lock (E6), then PRIVILEGED-writes.
-    await persistTemplateMark(record, { slug: flags.slug });
-  } else {
+  if (!enable) {
+    const record = await unmarkSessionTemplate(sessionId);
     // PRIVILEGED write — see the function doc-comment. Never use plain
     // writeSessionRecord here; it would read-preserve the on-disk template/closed
     // and drop the clear.
     await writeSessionRecordWithLifecycle(record);
+    printTemplateResult(record, enable, globalFlags.format);
+    return;
   }
 
-  printTemplateResult(record, enable, globalFlags.format);
+  // brick ad6ba1c2 (Contract C3) — marking a template CLOSES the session: the same gate, before
+  // anything is touched.
+  const gateRecord = await resolveSessionRecord(sessionId);
+  const { refusal, gate, answer } = await evaluateBackgroundTaskGate({
+    record: gateRecord,
+    killBackgroundTasks: flags.killBackgroundTasks,
+    explicitAgentName: _explicitAgentName,
+    verb: "template",
+    retryArgs: templateRetryArgs(flags),
+  });
+  if (refusal) {
+    emitLiveBackgroundTasksRefusal(refusal, globalFlags.format);
+    return;
+  }
+  const marked = await closeOrRefuseLate(
+    globalFlags.format,
+    {
+      record: gateRecord,
+      explicitAgentName: _explicitAgentName,
+      verb: "template",
+      retryArgs: templateRetryArgs(flags),
+    },
+    () => markSessionAsTemplate(sessionId, flags, gateTaskContext(answer, gateRecord.acpSessionId)),
+  );
+  if (!marked) {
+    // v3.1: refused inside the drain — the close did not happen, so NO template marker is written.
+    return;
+  }
+  const { record, reap, ownerStopped, lateTasks } = marked;
+  // Assigns slug (default slugify(name), overridable via --slug) + version =
+  // max+1 for the slug group, under the index lock (E6), then PRIVILEGED-writes.
+  await persistTemplateMark(record, { slug: flags.slug });
+  printTemplateResult(
+    record,
+    enable,
+    globalFlags.format,
+    backgroundTasksJson(gate, reap, ownerStopped, lateTasks),
+  );
+  reportBackgroundTaskOutcome(record.acpxRecordId, gate, reap, globalFlags.format, lateTasks);
+  warnUncheckedBackgroundTasks(record.acpxRecordId, answer);
 }
 
 function templateResultHumanLine(record: SessionRecord, enable: boolean): string {
@@ -3748,7 +3890,12 @@ function templateResultHumanLine(record: SessionRecord, enable: boolean): string
   return `enabled (closed)${slugNote}${autoPromptNote}`;
 }
 
-function printTemplateResult(record: SessionRecord, enable: boolean, format: OutputFormat): void {
+function printTemplateResult(
+  record: SessionRecord,
+  enable: boolean,
+  format: OutputFormat,
+  backgroundTasks?: BackgroundTasksJson,
+): void {
   const result = {
     action: enable ? ("template_enabled" as const) : ("template_disabled" as const),
     acpxRecordId: record.acpxRecordId,
@@ -3759,6 +3906,7 @@ function printTemplateResult(record: SessionRecord, enable: boolean, format: Out
     auto_prompt: record.template?.auto_prompt,
     slug: record.template?.slug,
     version: record.template?.version,
+    ...backgroundTasksField(backgroundTasks),
   };
   if (!emitJsonResult(format, result)) {
     process.stdout.write(
@@ -4489,9 +4637,11 @@ export async function handleSessionsRecover(
 
   const result = await recoverSession(sessionId);
 
-  if (!emitJsonResult(globalFlags.format, result)) {
+  // brick ad6ba1c2 §5.2 C — the wire `reap` (Contract C2 shape), and a survivor is never silent.
+  if (!emitJsonResult(globalFlags.format, { ...result, reap: publicReap(result.reap) })) {
     process.stdout.write(`recover ${result.sessionId}: ${recoverSummary(result)}\n`);
   }
+  warnReapSurvivors(result.sessionId, result.reap);
 
   // brick ae547131 §8.2 — THE EXIT CODE IS THE CONTRACT WITH acpx-ui: it re-drives on exit 0. So
   // every live owner this did NOT stop exits non-zero — including one it deliberately did not
@@ -4519,6 +4669,15 @@ export async function handleSessionsRecover(
   }
 }
 
+function recoverReapClause(reap: ReapReport): string {
+  if (!reap.measured) {
+    return `; background task processes not verified (${reap.skipped ?? "not measured"})`;
+  }
+  return reap.taskProcesses > 0
+    ? `; ended ${reap.taskProcesses} background task process(es), ${reap.survivors} survived`
+    : "";
+}
+
 function recoverSummary(result: QueueOwnerRecoveryResult): string {
   const target = result.pid != null ? `owner pid ${result.pid}` : "owner";
   if (!result.ownerFound) {
@@ -4528,7 +4687,7 @@ function recoverSummary(result: QueueOwnerRecoveryResult): string {
     return `NOT signalled ${target} (${result.skipReason ?? "identity-unverified"}); lease left in place`;
   }
   if (result.killed) {
-    return `killed ${target} and its process group`;
+    return `killed ${target} and its process group${recoverReapClause(result.reap)}`;
   }
   return result.alive !== false
     ? `FAILED to kill ${target} (still alive)`

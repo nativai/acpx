@@ -28,6 +28,7 @@ import {
   setProcReaderForTests,
 } from "../src/process-identity.js";
 import { signalVerifiedProcess } from "../src/process-signal.js";
+import { unmeasuredReap } from "../src/process-tree-reap.js";
 import type { OutputFormatter } from "../src/types.js";
 import {
   closeServer,
@@ -609,6 +610,8 @@ for (const foreign of [true, false]) {
             assert.deepEqual(await terminateQueueOwnerForSession(sessionId), {
               stopped: false,
               reason: "foreign-owner",
+              // brick ad6ba1c2: a foreign owner's tree is never censused from here.
+              reap: unmeasuredReap("foreign-owner"),
             });
             assert.deepEqual(
               readProcessBirthIdentity(pidOf(sacrificial)),
@@ -822,11 +825,13 @@ test("T33 close never signals a successor: terminate with the drained generation
       assert.deepEqual(await terminateQueueOwnerForSession(sessionId, drained), {
         stopped: false,
         reason: "successor",
+        reap: unmeasuredReap("no-owner"),
       });
       // no lease at the drain (null) and one now ⇒ also a successor
       assert.deepEqual(await terminateQueueOwnerForSession(sessionId, null), {
         stopped: false,
         reason: "successor",
+        reap: unmeasuredReap("no-owner"),
       });
       assert.equal(successor.exitCode, null);
       assert.equal(successor.signalCode, null);

@@ -312,7 +312,9 @@ for (const [selectorName, selectorArgs] of Object.entries(SELECTORS)) {
         assert.equal((await readIndexEntry(rig.homeDir, CHILD_ID))?.closed, true);
         assert.deepEqual(
           rig.child.observed.map((entry) => entry.type),
-          ["drain_deliveries", "close_session"],
+          // brick ad6ba1c2: the background-task gate's READ-ONLY query comes first, before anything
+          // is touched; then the ordinary arm; then (v3.1) a re-read right before the stop.
+          ["query_background_tasks", "drain_deliveries", "close_session", "query_background_tasks"],
           "the child's close takes the ordinary arm",
         );
         assert.equal(
@@ -371,7 +373,11 @@ for (const [selectorName, selectorArgs] of Object.entries(SELECTORS)) {
         assert.equal(await fs.readFile(rig.markerFile, "utf8"), "SIGTERM\n");
         assert.deepEqual(
           await readJsonLines(rig.observedFile),
-          [{ type: "drain_deliveries", reason: "session-close", timeoutMs: 0 }],
+          // brick ad6ba1c2: the gate's read-only query precedes the self arm's single drain.
+          [
+            { type: "query_background_tasks" },
+            { type: "drain_deliveries", reason: "session-close", timeoutMs: 0 },
+          ],
           "the self arm sends the owner one zero-timeout close drain and no close_session",
         );
         const parentRecord = await readRecordOnDisk(rig.homeDir, PARENT_ID);

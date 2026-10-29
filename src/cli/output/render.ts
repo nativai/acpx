@@ -3,6 +3,7 @@ import { resolveAcpxUiBaseUrl } from "../../acp/auth-env.js";
 import { consumeAutoSubscriptionSelection } from "../../runtime/engine/auto-subscription.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import type { AgentSessionListResult, OutputFormat, SessionRecord } from "../../types.js";
+import { backgroundTasksField, type BackgroundTasksJson } from "../background-task-gate.js";
 import { probeQueueOwnerHealth } from "../queue/ipc.js";
 import type {
   SessionCloseDrainReport,
@@ -190,6 +191,8 @@ export function printClosedSessionByFormat(
   recordClosedState: SessionCloseRecordState,
   format: OutputFormat,
   processReport?: SessionCloseProcessReport,
+  // brick ad6ba1c2 (Contract C2) — always present on an acpx with the gate; absent = an older acpx.
+  backgroundTasks?: BackgroundTasksJson,
 ): void {
   if (
     emitJsonResult(format, {
@@ -213,6 +216,7 @@ export function printClosedSessionByFormat(
       // acpx-ui, test/close-json-contract.test.ts). `ownerStopped:false` + `ownerStopSkipped`
       // (e.g. "foreign-owner") means the close landed but the owner was deliberately not signalled.
       ...processReportForJson(processReport),
+      ...backgroundTasksField(backgroundTasks),
     })
   ) {
     return;
