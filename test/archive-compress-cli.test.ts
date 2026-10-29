@@ -15,7 +15,7 @@ import { createContext, runRestore } from "../src/session/archive/operations.js"
 import { resolveSessionRecord, serializeSessionRecordForDisk } from "../src/session/persistence.js";
 import type { SessionMessage } from "../src/types.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
-import { withTempHome } from "./temp-home.js";
+import { removeTempHome, withTempHome } from "./temp-home.js";
 
 // Brick 1861b06d, Lane A — `acpx-archive-zst/v1` driven as the REAL compiled CLI against a
 // temp HOME (cli-contract.md is the surface under test). Fixtures are synthetic but shaped
@@ -913,7 +913,7 @@ test("--thaw: record + four families, plain, verified, with mtimes; the archive 
       }
       assert.equal(await treeFingerprint(fixture.archive), before);
     } finally {
-      await fs.rm(to, { recursive: true, force: true });
+      await removeTempHome(to);
     }
   });
 });
@@ -983,7 +983,7 @@ test("--thaw refusals (exit 2, JSON error on stdout, --to left empty): non-empty
         "not-in-archive",
       );
     } finally {
-      await fs.rm(to, { recursive: true, force: true });
+      await removeTempHome(to);
     }
   });
 });
