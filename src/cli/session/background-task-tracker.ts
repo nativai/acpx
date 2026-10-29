@@ -17,7 +17,24 @@
 
 type AcpMessage = Record<string, unknown>;
 
-type TrackedTask = { toolCallId?: string; taskId: string };
+/**
+ * brick ad6ba1c2 (Contract C1) — exactly one entry of claude-agent-acp's
+ * `_claude/backgroundTasks` payload, which is also acpx-ui's `BackgroundTask`. The
+ * owner keeps the FULL entries (not only ids) so a refused close can name them.
+ */
+export type LiveBackgroundTask = {
+  taskId: string;
+  taskType: string;
+  description: string;
+  startedAt?: string;
+  toolName?: string;
+};
+
+export type BackgroundTaskSource = "adapter" | "derived" | "none";
+
+export type BackgroundTaskList = { source: BackgroundTaskSource; tasks: LiveBackgroundTask[] };
+
+type TrackedTask = { toolCallId?: string; taskId: string; toolName?: string };
 
 const BACKGROUND_TASKS_NOTIFICATION = "_claude/backgroundTasks";
 const TERMINAL_TASK_STATUSES = new Set(["task_completed", "task_failed", "task_stopped"]);
@@ -25,6 +42,8 @@ const TERMINAL_TASK_STATUSES = new Set(["task_completed", "task_failed", "task_s
 export type BackgroundTaskTracker = {
   observe: (direction: "inbound" | "outbound", message: unknown) => void;
   liveCount: () => number;
+  /** The live set itself (Contract C4). Its length always equals `liveCount()`. */
+  list: () => BackgroundTaskList;
   // The adapter that held the tasks was closed: nothing it held is live any more.
   reset: () => void;
 };
@@ -35,6 +54,37 @@ function asRecord(value: unknown): AcpMessage | undefined {
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+// The adapter's own entry, strings only. `description` may legitimately be "".
+function forwardedTask(value: unknown): LiveBackgroundTask | undefined {
+  const task = asRecord(value);
+  const taskId = asString(task?.taskId);
+  if (!task || !taskId) {
+    return undefined;
+  }
+  const startedAt = asString(task.startedAt);
+  const toolName = asString(task.toolName);
+  return {
+    taskId,
+    taskType: asString(task.taskType) ?? "unknown",
+    description: typeof task.description === "string" ? task.description : "",
+    ...(startedAt ? { startedAt } : {}),
+    ...(toolName ? { toolName } : {}),
+  };
+}
+
+function copyTask(task: LiveBackgroundTask): LiveBackgroundTask {
+  return Object.assign({}, task);
+}
+
+function derivedTask(task: TrackedTask): LiveBackgroundTask {
+  return {
+    taskId: task.taskId,
+    taskType: "unknown",
+    description: "",
+    ...(task.toolName ? { toolName: task.toolName } : {}),
+  };
 }
 
 // ⚠️ `.taskId` ONLY FOR Monitor. TaskStop and TaskOutput results carry the
@@ -54,7 +104,7 @@ function startedTaskId(claudeCode: AcpMessage): string | undefined {
 
 export function createBackgroundTaskTracker(): BackgroundTaskTracker {
   const derived = new Map<string, TrackedTask>();
-  let forwarded: Set<string> | undefined;
+  let forwarded: Map<string, LiveBackgroundTask> | undefined;
 
   const end = (toolCallId: string | undefined, taskId: string | undefined): void => {
     for (const [key, task] of derived) {
@@ -78,7 +128,8 @@ export function createBackgroundTaskTracker(): BackgroundTaskTracker {
     const taskId =
       status === "teammate_spawned" ? asString(claudeCode.subagentId) : startedTaskId(claudeCode);
     if (taskId) {
-      derived.set(taskId, { toolCallId, taskId });
+      const toolName = asString(claudeCode.toolName);
+      derived.set(taskId, { toolCallId, taskId, ...(toolName ? { toolName } : {}) });
     }
   };
 
@@ -87,10 +138,11 @@ export function createBackgroundTaskTracker(): BackgroundTaskTracker {
     if (!Array.isArray(tasks)) {
       return;
     }
-    forwarded = new Set(
+    forwarded = new Map(
       tasks
-        .map((task) => asString(asRecord(task)?.taskId))
-        .filter((id): id is string => id !== undefined),
+        .map(forwardedTask)
+        .filter((task): task is LiveBackgroundTask => task !== undefined)
+        .map((task) => [task.taskId, task] as const),
     );
   };
 
@@ -113,6 +165,14 @@ export function createBackgroundTaskTracker(): BackgroundTaskTracker {
       }
     },
     liveCount: () => (forwarded ? forwarded.size : derived.size),
+    list: () => {
+      if (forwarded) {
+        return { source: "adapter", tasks: [...forwarded.values()].map(copyTask) };
+      }
+      return derived.size > 0
+        ? { source: "derived", tasks: [...derived.values()].map(derivedTask) }
+        : { source: "none", tasks: [] };
+    },
     reset: () => {
       derived.clear();
       forwarded = undefined;

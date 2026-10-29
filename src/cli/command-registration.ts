@@ -355,6 +355,11 @@ export function registerSessionsCommand(
         "session has no name to derive one from, so without it the template is slug-less " +
         "and resolves by id only.",
     )
+    .option(
+      "--kill-background-tasks",
+      "Mark it as a template even though the session has live background tasks (Monitor, " +
+        "background Bash, background Agent). Those tasks are killed.",
+    )
     .action(async function (this: Command, id: string, flags: SessionsTemplateFlags) {
       await handleSessionsTemplate(explicitAgentName, id, flags, this, config);
     });
@@ -489,6 +494,12 @@ export function registerSessionsCommand(
     .option(
       "--fail-on-undelivered",
       "Exit 3 instead of 0 when the close found undelivered messages in the queue owner's custody",
+    )
+    // brick ad6ba1c2 (Contract C2). Shown in --help on purpose: agents SHOULD read this one.
+    .option(
+      "--kill-background-tasks",
+      "Close even though the session has live background tasks (Monitor, background Bash, " +
+        "background Agent). Those tasks are killed.",
     );
   addSessionIdentityOptions(closeCommand);
   addSeatSelectorOption(closeCommand);
@@ -589,7 +600,7 @@ export function registerSessionsCommand(
   sessionsCommand
     .command("recover")
     .description(
-      "Force-restart a wedged session: SIGKILL its queue-owner process group and clear the lease so the next prompt cold-respawns a fresh owner. Idempotent (no owner = success).",
+      "Force-restart a wedged session: SIGKILL its queue-owner process group and clear the lease so the next prompt cold-respawns a fresh owner; also kills the session's background tasks. Idempotent (no owner = success).",
     )
     .argument(
       "<id>",

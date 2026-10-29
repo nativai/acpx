@@ -71,6 +71,13 @@ import {
   type SessionSendOptions,
 } from "./contracts.js";
 import {
+  clearBackgroundTaskChip,
+  createOwnerSignalReap,
+  createOwnerTaskReaper,
+  reapAndLogOnOwnerExit,
+  type OwnerTaskReaper,
+} from "./owner-task-reap.js";
+import {
   applySetConfigOptionToConnectedSession,
   applySetModeToConnectedSession,
   applySetModelToConnectedSession,
@@ -415,6 +422,10 @@ async function closeQueueOwnerRuntime(params: {
   sharedClient: AcpClient;
   sessionId: string;
   verbose?: boolean;
+  /** brick ad6ba1c2 — absent only for owners that never built a client. */
+  taskReaper?: OwnerTaskReaper;
+  exitReason?: string;
+  liveBackgroundTasks?: () => number;
 }): Promise<void> {
   // brick ae547131 §7.3 — the heartbeat keeps beating THROUGH shutdown (adapter close, snapshot,
   // index flush) and is cleared immediately before the release, so a closing owner never reads as
@@ -441,10 +452,14 @@ async function closeQueueOwnerRuntime(params: {
         `${absorbedTerminals.deliveredAtClose} delivered_at_close terminal(s) for session ${params.sessionId}\n`,
     );
   }
+  // brick ad6ba1c2 §5.2 E — snapshot BEFORE anything is closed: claude's own cleanup (S2) runs
+  // inside the client close, and whatever it leaves outside this owner's group is reaped after.
+  const reapOwnerExit = beginOwnerExitReap(params);
   await params.owner?.close();
   await params.sharedClient.close().catch(() => {
     // best effort while queue owner is shutting down
   });
+  await reapOwnerExit();
   await writeQueueOwnerLifecycleSnapshot(params.sessionId, params.sharedClient);
   // The exit snapshot's index update may be in the coalesced scalar class —
   // drain it so the index reflects the final owner state (W2.3 / D6).
@@ -459,6 +474,36 @@ async function closeQueueOwnerRuntime(params: {
   // The leader guard prevents sweeping an embedding parent's unrelated group.
   if (ownerIsGroupLeader() && hasLiveProcessGroup(process.pid)) {
     signalProcessGroup(process.pid, "SIGKILL");
+  }
+}
+
+/** Takes the exit snapshot now; the returned step reaps it once the client is closed. */
+function beginOwnerExitReap(params: {
+  sessionId: string;
+  taskReaper?: OwnerTaskReaper;
+  exitReason?: string;
+  liveBackgroundTasks?: () => number;
+}): () => Promise<void> {
+  const liveTasksAtExit = params.liveBackgroundTasks?.() ?? 0;
+  const snapshot = params.taskReaper?.snapshotOwnerExit();
+  return async () => {
+    if (!snapshot) {
+      return;
+    }
+    const reason = params.exitReason ?? "owner-exit";
+    const reaped = await reapAndLogOnOwnerExit(params.sessionId, reason, snapshot);
+    await clearChipIfStillOpen(params.sessionId, liveTasksAtExit, reaped?.taskProcesses ?? 0);
+  };
+}
+
+/** HoD Q4: the session stays open after a release/recycle reap — clear its "⧖ running" chip. */
+async function clearChipIfStillOpen(
+  sessionId: string,
+  liveTasks: number,
+  taskProcesses: number,
+): Promise<void> {
+  if (liveTasks > 0 || taskProcesses > 0) {
+    await clearBackgroundTaskChip(sessionId);
   }
 }
 
@@ -520,6 +565,8 @@ export function installQueueOwnerFatalShutdown(params: {
   owner?: SessionQueueOwner;
   getOwner?: () => SessionQueueOwner | undefined;
   lease?: QueueOwnerLease;
+  /** brick ad6ba1c2 §5.2 G — a getter like `getOwner`: the reaper exists only once the client does. */
+  getTaskReaper?: () => OwnerTaskReaper | undefined;
 }): QueueOwnerFatalShutdown {
   const getOwner = params.getOwner ?? (() => params.owner);
   let handling = false;
@@ -536,6 +583,11 @@ export function installQueueOwnerFatalShutdown(params: {
     }
     handling = true;
     const owner = getOwner();
+    // brick ad6ba1c2 §5.2 G — TERM the task processes OUTSIDE this owner's group first (they get
+    // their cleanup chance while the sweep below runs). The adapter and claude are never signalled
+    // here: the group SIGKILL below keeps owning them. Synchronous, bounded, never throws.
+    const taskReap = createOwnerSignalReap(params.sessionId, params.getTaskReaper?.());
+    taskReap.term();
 
     // THE ORDER BELOW IS LOAD-BEARING, NOT INCIDENTAL. The custody sweep must
     // COMPLETE before the process-group reap, because when this owner leads the
@@ -551,6 +603,10 @@ export function installQueueOwnerFatalShutdown(params: {
     if (params.lease) {
       releaseQueueOwnerLeaseSync(params.lease, owner?.getSocketInode(), fs);
     }
+
+    // brick ad6ba1c2 — the owner.log line, then SIGKILL to whatever task process outlived the TERM.
+    // Above the group reap: anything below it is dead code when this owner leads the group.
+    taskReap.kill(signal);
 
     // Adapter descendants share this owner's process group. The leader guard is
     // what stops an owner embedded in someone else's group from sweeping a group
@@ -846,6 +902,7 @@ async function replaceSharedClientAfterSwitch(params: {
   newProfileId: string;
   trigger: AccountSwitchTrigger;
   liveBackgroundTasks: number;
+  taskReaper?: OwnerTaskReaper;
 }): Promise<AcpClient | undefined> {
   const { options } = params;
   const startedAt = Date.now();
@@ -862,7 +919,21 @@ async function replaceSharedClientAfterSwitch(params: {
     );
     return undefined;
   }
+  // brick ad6ba1c2 §5.2 F — the old adapter's tree, snapshotted before its client closes.
+  const snapshot = params.taskReaper?.snapshotAdapter(params.current.getAgentPid());
   await params.current.close().catch(() => {});
+  if (snapshot) {
+    const reaped = await reapAndLogOnOwnerExit(
+      options.sessionId,
+      `a switch to ${params.newProfileId}`,
+      snapshot,
+    );
+    await clearChipIfStillOpen(
+      options.sessionId,
+      params.liveBackgroundTasks,
+      reaped?.taskProcesses ?? 0,
+    );
+  }
   // The time this adds to the turn: building the client spawns nothing (the adapter
   // starts when the turn connects, as on any cold owner); closing the old one costs
   // nothing on a cold owner and one graceful adapter exit on a warm one.
@@ -886,10 +957,12 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   // signal handlers are live, so a SIGTERM during startup still releases the lease (aligns with
   // openclaw/acpx bad3e934). Both used to start only after `listen`.
   let owner: SessionQueueOwner | undefined;
+  let taskReaper: OwnerTaskReaper | undefined;
   const fatalShutdown = installQueueOwnerFatalShutdown({
     sessionId: options.sessionId,
     getOwner: () => owner,
     lease,
+    getTaskReaper: () => taskReaper,
   });
   const heartbeat = createQueueOwnerHeartbeat({
     lease,
@@ -951,9 +1024,25 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   // (replaceSharedClient below). Every closure here reads the binding, never a copy.
   let sharedClient = await createQueueOwnerSharedClient(options, sessionRecord);
   const backgroundTasks = createBackgroundTaskTracker();
-  const observeBackgroundTasks = (message: unknown) => backgroundTasks.observe("inbound", message);
+  const ownerTaskReaper = createOwnerTaskReaper({ getAgentPid: () => sharedClient.getAgentPid() });
+  taskReaper = ownerTaskReaper;
+  // brick ad6ba1c2 §5.4 — every task-set change refreshes the remembered task sessions.
+  let taskSetSignature = "";
+  const observeBackgroundTasks = (message: unknown) => {
+    backgroundTasks.observe("inbound", message);
+    const signature = backgroundTasks
+      .list()
+      .tasks.map((task) => task.taskId)
+      .join(",");
+    if (signature !== taskSetSignature) {
+      taskSetSignature = signature;
+      ownerTaskReaper.noteTaskSetChange();
+    }
+  };
   let stopObservingBackgroundTasks = sharedClient.observeInbound(observeBackgroundTasks);
   let recycleReason: string | undefined;
+  // brick ad6ba1c2 — named in the owner.log reap line of the graceful exit.
+  let ownerExitReason = "owner-exit";
   const ttlMs = normalizeQueueOwnerTtlMs(options.ttlMs);
   // W13-24-14 Phase 2 — memory-release idle timeout (ms), read from env at owner
   // start (reaches the owner via ...process.env, like ACPX_DEPLOY_VERSION_FILE).
@@ -1135,6 +1224,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           });
         },
         queryActiveTurn: () => turnController.hasActiveTurn(),
+        queryBackgroundTasks: () => backgroundTasks.list(),
       },
       {
         maxQueueDepth,
@@ -1436,6 +1526,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           // the process 'exit' perf flush — so a checkpoint here is what makes the
           // counter observable, the same call the turn-completion path uses.
           checkpointPerfMetricsCapture();
+          ownerExitReason = decision.reason;
           // Graceful close via the existing clean path (finally →
           // closeQueueOwnerRuntime). The next prompt cold-respawns, resuming WITH
           // context. No new kill primitive.
@@ -1481,11 +1572,13 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
                   newProfileId,
                   trigger,
                   liveBackgroundTasks: backgroundTasks.liveCount(),
+                  taskReaper: ownerTaskReaper,
                 });
                 if (replaced) {
                   stopObservingBackgroundTasks();
                   sharedClient = replaced;
                   backgroundTasks.reset();
+                  ownerTaskReaper.resetRemembered();
                   stopObservingBackgroundTasks =
                     sharedClient.observeInbound(observeBackgroundTasks);
                 }
@@ -1575,11 +1668,10 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         // brick://3356183e: this exit used to be silent unless --verbose, so an owner
         // that took the session's background tasks with it left two adapter lines and
         // no reason. Non-verbose, like the idle-release line.
-        logTurnBoundaryRecycle(
-          options.sessionId,
-          recycleOwnerAfterTask ? (recycleReason ?? "account-switch") : "output-style-change",
-          backgroundTasks.liveCount(),
-        );
+        ownerExitReason = recycleOwnerAfterTask
+          ? (recycleReason ?? "account-switch")
+          : "output-style-change";
+        logTurnBoundaryRecycle(options.sessionId, ownerExitReason, backgroundTasks.liveCount());
         break;
       }
     }
@@ -1601,6 +1693,9 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       sharedClient,
       sessionId: options.sessionId,
       verbose: options.verbose,
+      taskReaper,
+      exitReason: ownerExitReason,
+      liveBackgroundTasks: backgroundTasks.liveCount,
     });
     fatalShutdown.remove();
   }

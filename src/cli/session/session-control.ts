@@ -16,6 +16,7 @@ import {
   type ProcessBirthIdentity,
 } from "../../process-identity.js";
 import { terminateVerifiedProcess, type VerifiedTerminateOutcome } from "../../process-signal.js";
+import { unmeasuredReap, type ReapReport } from "../../process-tree-reap.js";
 import { switchSessionAccount } from "../../runtime/engine/account-seam.js";
 import { switchSessionSubscription } from "../../runtime/engine/subscription-switch.js";
 import { applyDepthOutcomeToRecord } from "../../session/depth-application.js";
@@ -92,6 +93,7 @@ import type {
   SessionSetSubscriptionOptions,
   SessionSetSubscriptionResult,
 } from "./contracts.js";
+import { clearBackgroundTaskChipAfterReap } from "./owner-task-reap.js";
 import {
   runSessionSetConfigOptionDirect,
   runSessionSetDepthDirect,
@@ -185,7 +187,7 @@ async function refuseTurnInFlightForLiveOwner(
   return alive;
 }
 
-type OwnerRecycle = { ownerRestarted: boolean; ownerRestartSkipped?: string };
+type OwnerRecycle = { ownerRestarted: boolean; ownerRestartSkipped?: string; reap?: ReapReport };
 
 /**
  * Recycles a live owner after a setting changed — and reports what happened. `ownerRestarted:true`
@@ -194,9 +196,10 @@ type OwnerRecycle = { ownerRestarted: boolean; ownerRestartSkipped?: string };
  */
 async function recycleLiveOwner(sessionId: string): Promise<OwnerRecycle> {
   const outcome = await terminateQueueOwnerForSession(sessionId);
+  await clearBackgroundTaskChipAfterReap(sessionId, outcome.reap);
   return outcome.stopped
-    ? { ownerRestarted: true }
-    : { ownerRestarted: false, ownerRestartSkipped: outcome.reason };
+    ? { ownerRestarted: true, reap: outcome.reap }
+    : { ownerRestarted: false, ownerRestartSkipped: outcome.reason, reap: outcome.reap };
 }
 
 export async function setSessionModel(
@@ -740,6 +743,8 @@ export type SessionCloseResult = {
   ownerStopped: boolean;
   ownerStopSkipped?: string;
   adapterKill: SessionCloseAdapterKill;
+  /** brick ad6ba1c2 — the session's task processes after the close. `measured:false` is no census. */
+  reap: ReapReport;
 };
 
 // Re-reads `<id>.json` immediately after the terminal write, converting a
@@ -839,6 +844,7 @@ export async function closeSession(
     ownerStopped: ownerStop.stopped,
     ...(ownerStop.stopped ? {} : { ownerStopSkipped: ownerStop.reason }),
     adapterKill,
+    reap: ownerStop.reap,
   };
 }
 
@@ -1046,6 +1052,8 @@ async function closeSelfOwnedSession(
     recordClosedState,
     ownerStopped: true,
     adapterKill: { signalled: false, reason: "self-close" },
+    // The own owner's SIGTERM handler reaps (§5.2 B/G) — this CLI may not live to census it.
+    reap: unmeasuredReap("self-close"),
   };
 }
 

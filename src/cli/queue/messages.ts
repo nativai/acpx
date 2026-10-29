@@ -24,6 +24,10 @@ import type {
   SessionResumePolicy,
   SessionSendResult,
 } from "../../types.js";
+import type {
+  BackgroundTaskSource,
+  LiveBackgroundTask,
+} from "../session/background-task-tracker.js";
 
 type QueueSessionOptions = NonNullable<AcpClientOptions["sessionOptions"]>;
 
@@ -115,6 +119,15 @@ export type QueueQueryActiveTurnRequest = {
   ownerGeneration?: number;
 };
 
+// brick ad6ba1c2 (Contract C4) — read-only: the background tasks the owner's
+// adapter still holds. A `sessions close` asks this BEFORE touching anything, and
+// refuses while any is live unless the caller passed --kill-background-tasks.
+export type QueueQueryBackgroundTasksRequest = {
+  type: "query_background_tasks";
+  requestId: string;
+  ownerGeneration?: number;
+};
+
 // D1 (brick://53437107) — the close-drain barrier's control verb. Asks a live
 // owner to quiesce (reject new submissions from that instant) and terminalize
 // everything it holds but has NOT handed to the agent, WITHOUT injecting any of
@@ -143,6 +156,7 @@ export type QueueRequest =
   | QueueSetDepthRequest
   | QueueCloseSessionRequest
   | QueueQueryActiveTurnRequest
+  | QueueQueryBackgroundTasksRequest
   | QueueDrainDeliveriesRequest;
 
 export type QueueOwnerAcceptedMessage = {
@@ -233,6 +247,14 @@ export type QueueOwnerActiveTurnResultMessage = {
   active: boolean;
 };
 
+export type QueueOwnerBackgroundTasksResultMessage = {
+  type: "query_background_tasks_result";
+  requestId: string;
+  ownerGeneration?: number;
+  source: BackgroundTaskSource;
+  tasks: LiveBackgroundTask[];
+};
+
 // One item of custody the drain took off the owner and terminalized. `messageId`
 // is absent for a plain CLI `prompt` submission, which has no acpx-ui delivery
 // counterpart (DESIGN §12 E10) — the drain still reports it, because the closing
@@ -280,6 +302,7 @@ export type QueueOwnerMessage =
   | QueueOwnerSetDepthResultMessage
   | QueueOwnerCloseSessionResultMessage
   | QueueOwnerActiveTurnResultMessage
+  | QueueOwnerBackgroundTasksResultMessage
   | QueueOwnerDrainResultMessage
   | QueueOwnerErrorMessage;
 
@@ -600,8 +623,9 @@ function parsePayloadlessQueueRequest(
     case "close_session":
       return { type: "close_session", ...context };
     case "query_active_turn":
+    case "query_background_tasks":
       return {
-        type: "query_active_turn",
+        type,
         requestId: context.requestId,
         ownerGeneration: context.ownerGeneration,
       };
@@ -891,6 +915,7 @@ const QUEUE_OWNER_MESSAGE_PARSERS: Record<string, QueueOwnerMessageParser> = {
     }
     return { type: "query_active_turn_result", ...context, active: message.active };
   },
+  query_background_tasks_result: parseBackgroundTasksResultOwnerMessage,
   set_mode_result: (message, context) =>
     parseStringResultOwnerMessage(message, context, "set_mode_result", "modeId"),
   set_model_result: (message, context) =>
@@ -905,6 +930,51 @@ function queueOwnerMessageParser(type: string): QueueOwnerMessageParser | undefi
   return Object.hasOwn(QUEUE_OWNER_MESSAGE_PARSERS, type)
     ? QUEUE_OWNER_MESSAGE_PARSERS[type]
     : undefined;
+}
+
+const BACKGROUND_TASK_SOURCES: ReadonlySet<string> = new Set(["adapter", "derived", "none"]);
+
+function parseLiveBackgroundTask(value: unknown): LiveBackgroundTask | undefined {
+  const task = asRecord(value);
+  if (
+    !task ||
+    typeof task.taskId !== "string" ||
+    task.taskId.length === 0 ||
+    typeof task.taskType !== "string" ||
+    typeof task.description !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    taskId: task.taskId,
+    taskType: task.taskType,
+    description: task.description,
+    ...(typeof task.startedAt === "string" ? { startedAt: task.startedAt } : {}),
+    ...(typeof task.toolName === "string" ? { toolName: task.toolName } : {}),
+  };
+}
+
+function parseBackgroundTasksResultOwnerMessage(
+  message: Record<string, unknown>,
+  context: QueueOwnerMessageContext,
+): QueueOwnerBackgroundTasksResultMessage | null {
+  if (
+    typeof message.source !== "string" ||
+    !BACKGROUND_TASK_SOURCES.has(message.source) ||
+    !Array.isArray(message.tasks)
+  ) {
+    return null;
+  }
+  const tasks = message.tasks.map(parseLiveBackgroundTask);
+  if (tasks.some((task) => task === undefined)) {
+    return null;
+  }
+  return {
+    type: "query_background_tasks_result",
+    ...context,
+    source: message.source as BackgroundTaskSource,
+    tasks: tasks as LiveBackgroundTask[],
+  };
 }
 
 function parseEventOwnerMessage(

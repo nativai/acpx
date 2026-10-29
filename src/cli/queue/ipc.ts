@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { QueueConnectionError, QueueProtocolError } from "../../errors.js";
 import { incrementPerfCounter } from "../../perf-metrics.js";
+import { classifyRecordedIdentity, identityScope } from "../../process-identity.js";
 import type { DepthProjection } from "../../session/depth-projection.js";
 import type {
   AcpClientOptions,
@@ -15,6 +16,8 @@ import type {
   SessionEnqueueResult,
   SessionSendOutcome,
 } from "../../types.js";
+import type { BackgroundTaskList } from "../session/background-task-tracker.js";
+import { clearBackgroundTaskChipAfterReap } from "../session/owner-task-reap.js";
 import { probeQueueOwnerHealth, type QueueOwnerHealth } from "./ipc-health.js";
 import type { QueueOwnerDrainReport } from "./ipc-server.js";
 import { connectToQueueOwner } from "./ipc-transport.js";
@@ -32,6 +35,7 @@ import {
   type QueueDrainDeliveriesRequest,
   type QueueDrainReason,
   type QueueOwnerActiveTurnResultMessage,
+  type QueueOwnerBackgroundTasksResultMessage,
   type QueueOwnerCancelResultMessage,
   type QueueOwnerCloseSessionResultMessage,
   type QueueOwnerDrainResultMessage,
@@ -41,6 +45,7 @@ import {
   type QueueOwnerSetModelResultMessage,
   type QueueOwnerSetModeResultMessage,
   type QueueQueryActiveTurnRequest,
+  type QueueQueryBackgroundTasksRequest,
   type QueueRequest,
   type QueueSetConfigOptionRequest,
   type QueueSetDepthRequest,
@@ -100,9 +105,12 @@ async function recoverOwnerAfterShutdownError(params: {
   detailCode?: string;
   verbose?: boolean;
 }): Promise<boolean> {
-  await terminateQueueOwnerForSession(params.sessionId, params.owner).catch(() => {
-    // Preserve the original shutdown error if cleanup fails.
-  });
+  const stopped = await terminateQueueOwnerForSession(params.sessionId, params.owner).catch(
+    () => undefined, // Preserve the original shutdown error if cleanup fails.
+  );
+  if (stopped) {
+    await clearBackgroundTaskChipAfterReap(params.sessionId, stopped.reap);
+  }
 
   const currentOwner = await readQueueOwnerRecord(params.sessionId);
   if (currentOwner && isSameQueueOwner(currentOwner, params.owner)) {
@@ -171,6 +179,7 @@ async function maybeRecoverStaleOwnerAfterProtocolMismatch(params: {
   if (!outcome?.stopped) {
     return false;
   }
+  await clearBackgroundTaskChipAfterReap(params.sessionId, outcome.reap);
   incrementPerfCounter("queue.owner.stale_recovered");
 
   if (params.verbose) {
@@ -1113,6 +1122,70 @@ export async function tryQueryActiveTurnOnRunningOwner(
   }
 
   throw notAcceptingRequestsError(health, "query_active_turn");
+}
+
+/** brick ad6ba1c2 (Contract C4) — one hard deadline over connect AND answer. */
+export const BACKGROUND_TASKS_QUERY_DEADLINE_MS = 2_000;
+
+export type BackgroundTasksQuery = ({ queried: true } & BackgroundTaskList) | { queried: false };
+
+function isForeignOwner(owner: QueueOwnerRecord): boolean {
+  const recorded = classifyRecordedIdentity(owner.processIdentity);
+  return recorded.kind === "birth" && identityScope(recorded.birth) === "foreign";
+}
+
+async function submitQueryBackgroundTasksToQueueOwner(
+  owner: QueueOwnerRecord,
+  timeoutMs: number,
+): Promise<BackgroundTaskList | undefined> {
+  const request: QueueQueryBackgroundTasksRequest = {
+    type: "query_background_tasks",
+    requestId: randomUUID(),
+    ownerGeneration: owner.ownerGeneration,
+  };
+  const response = await submitControlToQueueOwner(
+    owner,
+    request,
+    (message): message is QueueOwnerBackgroundTasksResultMessage =>
+      message.type === "query_background_tasks_result",
+    timeoutMs,
+  );
+  if (!response || response.requestId !== request.requestId) {
+    return undefined;
+  }
+  return { source: response.source, tasks: response.tasks };
+}
+
+/**
+ * Asks the session's live owner for its background tasks. NEVER throws: no lease, a foreign owner,
+ * an old owner (`QUEUE_REQUEST_INVALID`), an error or the 2 s deadline all read `queried:false`,
+ * and the close gate then fails OPEN (Contract C2/C4).
+ *
+ * ⚠️ CONTROL PATH ONLY. Never route this through `trySubmitToRunningOwner`: its protocol-mismatch
+ * recovery auto-terminates an owner that answers unexpectedly — an OLD owner answering this verb
+ * would be killed before the close even started (AC8).
+ */
+export async function tryQueryBackgroundTasksOnRunningOwner(
+  sessionId: string,
+  deadlineMs: number = BACKGROUND_TASKS_QUERY_DEADLINE_MS,
+): Promise<BackgroundTasksQuery> {
+  const startedAt = Date.now();
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), deadlineMs);
+    timer.unref();
+  });
+  const query = (async () => {
+    const owner = await readQueueOwnerRecord(sessionId);
+    if (!owner || isForeignOwner(owner)) {
+      return undefined;
+    }
+    const remaining = Math.max(1, deadlineMs - (Date.now() - startedAt));
+    return await submitQueryBackgroundTasksToQueueOwner(owner, remaining);
+  })().catch(() => undefined);
+  const list = await Promise.race([query, deadline]);
+  clearTimeout(timer);
+  return list ? { queried: true, ...list } : { queried: false };
 }
 
 export async function trySetModeOnRunningOwner(

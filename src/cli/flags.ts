@@ -174,6 +174,8 @@ export type SessionsTemplateFlags = {
   // default slug = slugify(name). The refresh skill passes this when the target
   // slug differs from slugify(the candidate's name).
   slug?: string;
+  // brick ad6ba1c2 (Contract C3) — mark it even though it has live background tasks; they are killed.
+  killBackgroundTasks?: boolean;
 };
 
 export type SessionsHistoryFlags = SessionSelectorFlags & {
@@ -210,6 +212,8 @@ export type SessionsCloseFlags = StatusFlags & {
   drain?: boolean;
   drainTimeout?: number;
   failOnUndelivered?: boolean;
+  // brick ad6ba1c2 (Contract C2) — close even though it has live background tasks; they are killed.
+  killBackgroundTasks?: boolean;
 };
 
 export type SessionsPruneFlags = {
