@@ -42,6 +42,7 @@ function input(overrides: Partial<DecideIdleOwnerReleaseInput> = {}): DecideIdle
     liveBackgroundTaskCount: 0,
     deployDiffers: () => false,
     outputStyleDiffers: () => false,
+    recordClosed: () => false,
     ...overrides,
   };
 }
@@ -496,6 +497,67 @@ test("0c593c10 #2: control — WITHOUT a live task the same inputs release for e
       );
     }
   }
+});
+
+test("0c593c10 #4: a CLOSED record lifts the hold — released by the normal rules; an OPEN one stays held", async () => {
+  const closed = (value: boolean) => () => value;
+  for (const idleForMs of [5 * MIN, 35 * MIN]) {
+    assert.deepEqual(
+      await decideIdleOwnerRelease(
+        prodIdle(idleForMs, { liveBackgroundTaskCount: 1, recordClosed: closed(true) }),
+      ),
+      { release: true, reason: "idle-memory" },
+      `closed record + live task at ${idleForMs}ms ⇒ released`,
+    );
+    assert.deepEqual(
+      await decideIdleOwnerRelease(
+        prodIdle(idleForMs, { liveBackgroundTaskCount: 1, recordClosed: closed(false) }),
+      ),
+      { release: false },
+      `open record + live task at ${idleForMs}ms ⇒ held`,
+    );
+  }
+  // Closed lifts only the HOLD: the rest of the gate and the idle clock still apply.
+  assert.deepEqual(
+    await decideIdleOwnerRelease(
+      prodIdle(5 * MIN - 1, { liveBackgroundTaskCount: 1, recordClosed: closed(true) }),
+    ),
+    { release: false },
+    "closed, but the 5-min clock has not run out",
+  );
+  assert.deepEqual(
+    await decideIdleOwnerRelease(
+      prodIdle(35 * MIN, {
+        liveBackgroundTaskCount: 1,
+        hasActiveTurn: true,
+        recordClosed: closed(true),
+      }),
+    ),
+    { release: false },
+    "closed, but a turn is active",
+  );
+});
+
+test("0c593c10 #5: the closed-record read is lazy — never consulted without a live task or when the gate already refuses", async () => {
+  let reads = 0;
+  const recordClosed = () => {
+    reads += 1;
+    return true;
+  };
+  await decideIdleOwnerRelease(prodIdle(35 * MIN, { liveBackgroundTaskCount: 0, recordClosed }));
+  await decideIdleOwnerRelease(
+    prodIdle(35 * MIN, { liveBackgroundTaskCount: 1, hasActiveTurn: true, recordClosed }),
+  );
+  await decideIdleOwnerRelease(
+    prodIdle(35 * MIN, {
+      liveBackgroundTaskCount: 1,
+      lastIdleDrainActivityAt: BASE_NOW + 34 * MIN,
+      recordClosed,
+    }),
+  );
+  assert.equal(reads, 0, "no record read on any of the three paths");
+  await decideIdleOwnerRelease(prodIdle(35 * MIN, { liveBackgroundTaskCount: 1, recordClosed }));
+  assert.equal(reads, 1, "read exactly once when the gate holds and a task is live");
 });
 
 test("a81e16a1 #4: the ACPX_OWNER_IDLE_RELEASE_MS override still wins — and never outranks a live task", async () => {

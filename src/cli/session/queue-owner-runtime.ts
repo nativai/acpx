@@ -679,8 +679,14 @@ export type DecideIdleOwnerReleaseInput = {
   quiescenceWindowMs: number;
   idleReleaseMs: number;
   // brick://0c593c10 — background tasks the adapter still holds. Above zero the
-  // shared gate stays CLOSED: no release for any reason, at any idle age.
+  // shared gate stays CLOSED: no release for any reason, at any idle age —
+  // unless the session's record is closed (`recordClosed`).
   liveBackgroundTaskCount: number;
+  // brick://0c593c10 (ad6ba1c2 design) — whether the session RECORD is closed.
+  // Lazy, like outputStyleDiffers: it re-reads the record, and is consulted only
+  // when everything else in the gate holds AND a task is live, so the common
+  // path never pays for it.
+  recordClosed: () => boolean | Promise<boolean>;
   // Lazy so the deploy-file read happens ONLY after the safety gate already holds
   // (preserves the W13-24-10 short-circuit cost-ordering). Pure helper otherwise.
   deployDiffers: () => boolean | Promise<boolean>;
@@ -735,7 +741,7 @@ export function idleCheckTimings(idleWindowMs: number | undefined): {
  * maybe-active owner is protected. Factored out of decideIdleOwnerRelease so the
  * gate stays one expression a reader can audit in one place.
  */
-function ownerIsIdleAndQuiescent(input: DecideIdleOwnerReleaseInput): boolean {
+async function ownerIsIdleAndQuiescent(input: DecideIdleOwnerReleaseInput): Promise<boolean> {
   // EVERY reason requires provably-idle + quiescent:
   //   - ttlMs !== 0    : `--ttl 0` is the master never-recycle opt-out
   //                      (belt-and-suspenders; nextTask(undefined) never times out,
@@ -760,18 +766,26 @@ function ownerIsIdleAndQuiescent(input: DecideIdleOwnerReleaseInput): boolean {
   //                      the last task ends, the normal rules apply unchanged: the
   //                      idle clock and the quiescence window after the task's
   //                      notification turn.
-  return (
+  //                      ⚠️ EXCEPT A CLOSED RECORD: the hold never applies to a
+  //                      session whose record is closed. In a mixed-version window
+  //                      (a new acpx refusing a close, an old acpx-ui stamping
+  //                      `closed` anyway) a closed session's owner with a never-
+  //                      ending Monitor would otherwise be held forever; released,
+  //                      its reap ends the tasks, which is what closing means.
+  const idleAndQuiescent =
     input.ttlMs !== 0 &&
     !input.hasActiveTurn &&
-    input.liveBackgroundTaskCount === 0 &&
-    input.now - input.lastIdleDrainActivityAt >= input.quiescenceWindowMs
-  );
+    input.now - input.lastIdleDrainActivityAt >= input.quiescenceWindowMs;
+  if (!idleAndQuiescent) {
+    return false;
+  }
+  return input.liveBackgroundTaskCount === 0 || (await input.recordClosed());
 }
 
 export async function decideIdleOwnerRelease(
   input: DecideIdleOwnerReleaseInput,
 ): Promise<IdleOwnerReleaseDecision> {
-  if (!ownerIsIdleAndQuiescent(input)) {
+  if (!(await ownerIsIdleAndQuiescent(input))) {
     return { release: false };
   }
 
@@ -1055,6 +1069,16 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   const outputStyleChangeIsPending = async (): Promise<boolean> => {
     try {
       return outputStyleChangePending(await resolveSessionRecord(options.sessionId));
+    } catch {
+      return false;
+    }
+  };
+
+  // brick://0c593c10 — the closed-record exception to the background-task hold.
+  // An unreadable record reads as OPEN: on doubt the hold keeps the tasks alive.
+  const sessionRecordIsClosed = async (): Promise<boolean> => {
+    try {
+      return (await resolveSessionRecord(options.sessionId)).closed === true;
     } catch {
       return false;
     }
@@ -1407,6 +1431,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           // preserving the W13-24-10 short-circuit cost-ordering.
           deployDiffers: deployedBuildDiffersFromOwner,
           outputStyleDiffers: outputStyleChangeIsPending,
+          recordClosed: sessionRecordIsClosed,
         });
         if (!decision.release) {
           // Current code & within the idle window, OR busy / active / relaying
