@@ -158,6 +158,17 @@ Repo: https://github.com/openclaw/acpx
   refuses or skips one with `BYWAY_PARENT_IMMUTABLE`; a byway copy no longer
   stamps `session-started` on its inherited brick; `sessions list --local`
   hides them unless `--include-byways`. (brick 6867bbfc)
+- Subscriptions: proactive selection is **cache-sticky**. A session whose last
+  completed turn on its current subscription ended less than an hour ago (the
+  provider's prompt-cache window, recorded as `acpx.last_turn_subscription`)
+  is no longer moved to a better-ranked subscription that became available —
+  the move would re-write its whole conversation into the new account's cache.
+  It moves once the window has passed. Forced moves are unchanged and still
+  happen at once inside the window: a locked subscription, an exhausted 5h/7d
+  window, the account's weekly-ceiling margin, unusable telemetry, or 5h use at
+  70 % or more. Each proactive switch now logs whether it was
+  `forced:<reason>` or `optimization`, and a hold logs its own
+  `held for prompt cache` line. (brick 6b7f8661)
 
 ### Breaking
 
