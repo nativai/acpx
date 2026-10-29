@@ -30,6 +30,7 @@ acpx [global_options] set <key> <value> [-s <name>]
 acpx [global_options] status [-s <name> | --session-id <id> | --session-url <url>]
 acpx [global_options] sessions [list | new [--name <name>] | close [name] | show [name] | history [name] [--limit <count>] | export [name] --output <path> | import <archive> [--name <name>] [--cwd <dir>]]
 acpx [global_options] config [show | init]
+acpx [global_options] transcripts [dedup [--apply --manifest <file>] [--session <id>]... | restore <exit-tail-file> [--to <path>]]
 
 acpx [global_options] <agent> [prompt_options] [prompt_text...]
 acpx [global_options] <agent> prompt [prompt_options] [prompt_text...]
@@ -400,6 +401,31 @@ acpx [global_options] models show <source>:<id> | <id> [--json]
 - each such row carries `advertisedBy` (adapter, adapter commit, SDK version, probe time, `source`), `models show` prints it as a `labels` line, and the text footer cites it. The JSON envelope's `claudeAdvertisement` reports `state`: `fresh` (probed for the deployed build), `stale` (the last good probe was of an older build) or `none` (never probed successfully — the rows then carry version-free alias names such as `Opus`)
 - the probe runs at most once per deployed adapter build, in a detached background refresh; no session create ever waits for it. A failed probe keeps the last good names and is retried automatically after an hour
 - `--refresh` forces a fresh catalogue fetch **and** a fresh Claude probe, in the foreground. It exits `0` whenever the catalogue was served, including after a failed probe; the failure is in the footer and in `claudeAdvertisement.error`
+
+## `transcripts` command
+
+```bash
+acpx [global_options] transcripts dedup [--apply --manifest <file>] [--session <acpSessionId>]... [--format text|json|quiet]
+acpx [global_options] transcripts restore <exit-tail-file> [--to <path>] [--format text|json|quiet]
+```
+
+Claude keeps a session's transcript per subscription (`<config dir>/projects/<cwd slug>/<id>.jsonl`), so a subscription switch copies it into the new subscription's dir. acpx removes the copies this leaves behind on its own:
+
+- **At the port**, an existing destination is renamed aside as before. The sidecar is then **deleted** when it is a byte-prefix of the copy just placed, or **reduced** when it is that copy's prefix plus one block of Claude Code's own exit metadata (`last-prompt`, `cost-state`, `ai-title`, …). Otherwise it stays as `<id>.superseded-<ISO>.jsonl`.
+- **At the queue owner's idle exit**, once the owner's process group is empty, every quiet (≥ 10 min) copy the session left in another registered subscription is deleted or reduced by the same rules.
+- A copy holding any conversation line found in no other copy is never removed. Neither is the copy the session resumes from.
+
+**Reduced** means the exit block is written byte-exactly into `<id>.exit-tail-<ISO>.acpx` beside the copy, under a one-line JSON header (sizes and sha256s of the original and of the prefix it shares). Then the copy is removed. No `*.jsonl` reader lists `.acpx` files.
+
+`transcripts dedup` applies the same proofs to copies that already exist, in every config dir on the HOME, including unregistered ones. It is a **dry run unless `--apply`**, and `--apply` requires `--manifest`: one JSON line is appended and fsynced before each removal (`action`), and one after it (`outcome`). It skips any session with a possibly-alive queue owner or adapter, a copy written in the last hour, or records that disagree on the active copy. Every file is re-verified right before its removal. A file that fails re-verification is kept, printed as `KEPT <path> reason=<reason>`, and makes the exit code `1`. The last line is machine-quotable:
+
+```text
+transcripts dedup DRY-RUN box=<host> ids=<n> copies=<n> | deleted=<n>/<bytes>B reduced=<n>/<bytes>B tail-files=<n>/<bytes>B freed=<bytes>B (<GiB> GiB) | kept: active=<n> branch=<n> exit-block-not-eligible=<n> other=<n> | skipped-ids: live-owner=<n> live-pid=<n> recent=<n> ambiguous=<n> | recheck-failed=<n>
+```
+
+`ids` and `copies` count the sessions that have more than one copy. `freed` is deleted + reduced bytes minus the tail files written. `--format quiet` prints `<deleted> <reduced> <freed_bytes> <recheck_failed>`.
+
+`transcripts restore` rebuilds the original copy an exit-tail file stands for. It writes to the copy's original path, or to `--to`, and never overwrites. It takes the prefix from any copy of the session whose first bytes hash to the header's `prefix_sha256`, or from another tail file rebuilt first. The result is checked against `original_sha256` before it is written. The tail file is kept.
 
 ## `status` command
 

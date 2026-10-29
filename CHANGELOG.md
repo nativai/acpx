@@ -169,6 +169,17 @@ Repo: https://github.com/openclaw/acpx
   70 % or more. Each proactive switch now logs whether it was
   `forced:<reason>` or `optimization`, and a hold logs its own
   `held for prompt cache` line. (brick 6b7f8661)
+- Claude transcripts: a subscription switch no longer leaves duplicate transcript
+  copies behind. The port copies first and swaps in. The replaced destination is
+  deleted when it is a byte-prefix of the new copy, or reduced when it is that copy
+  plus Claude Code's exit-metadata block: the block is kept byte-exactly in an
+  `<id>.exit-tail-<ISO>.acpx` file beside it. A real divergence still stays as
+  `.superseded-*.jsonl`. The queue owner's idle exit does the same for the copy the
+  session left in its previous subscription, after the owner's process group is
+  empty. A copy with no timestamped entry no longer wins the freshest-copy selection.
+  New `acpx transcripts dedup` (dry run unless `--apply --manifest <file>`) cleans up
+  copies that already exist. `acpx transcripts restore` rebuilds a reduced copy bit
+  for bit. (brick 81433524)
 
 ### Breaking
 

@@ -375,6 +375,26 @@ A prune takes everything acpx owns for that session: the JSON record, the messag
 
 ⚠️ `bytesFreed` therefore reports roughly **5x** what it did before this default flipped: stream files are ~82% of a session store's bytes against the messages sidecar's ~17%. Same field, same meaning, much larger number.
 
+### Claude transcript copies
+
+A Claude subscription switch copies the session's transcript JSONL into the new subscription's dir. acpx removes the duplicates on its own: at the port, and at the queue owner's idle exit. A duplicate is deleted when it is a byte-prefix of the live copy. It is reduced to an `<id>.exit-tail-<ISO>.acpx` file when it is the live copy's prefix plus Claude Code's exit metadata. A copy with its own conversation lines is never touched.
+
+For copies that already exist on a box:
+
+```bash
+# Dry run: what would go, against which kept copy, and the final summary line.
+acpx transcripts dedup
+acpx transcripts dedup --session <acpSessionId> --format json
+
+# Apply. Every action is logged to the manifest before its removal.
+acpx transcripts dedup --apply --manifest ./dedup-manifest.jsonl
+
+# Rebuild a reduced copy bit for bit (never overwrites; the tail file stays).
+acpx transcripts restore <dir>/<id>.exit-tail-<ISO>.acpx --to /tmp/check.jsonl
+```
+
+Sessions with a live owner or adapter, or a copy written in the last hour, are skipped. Run it on an idle box, one box at a time.
+
 ## Config files
 
 Config files are merged in this order (later wins):
