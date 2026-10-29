@@ -1,5 +1,6 @@
 import {
   AutomationCapacityReservedError,
+  CapacityRefusedError,
   CodexSubscriptionCapError,
   AuthPolicyError,
   PermissionDeniedError,
@@ -11,6 +12,7 @@ import {
   OUTPUT_ERROR_ORIGINS,
   type ExitCode,
   type AutomationCapacityReservedDetail,
+  type CapacityRefusalDetail,
   type CodexSubscriptionCapDetail,
   type OutputErrorAcpPayload,
   type OutputErrorCode,
@@ -37,6 +39,7 @@ type ErrorMeta = {
   effectiveAccount?: EffectiveAccountMetadata;
   automationCapacityReserved?: AutomationCapacityReservedDetail;
   codexSubscriptionCap?: CodexSubscriptionCapDetail;
+  capacityRefusal?: CapacityRefusalDetail;
   policyReason?: string;
 };
 
@@ -50,6 +53,7 @@ export type NormalizedOutputError = {
   effectiveAccount?: EffectiveAccountMetadata;
   automationCapacityReserved?: AutomationCapacityReservedDetail;
   codexSubscriptionCap?: CodexSubscriptionCapDetail;
+  capacityRefusal?: CapacityRefusalDetail;
   /**
    * WHICH POLICY refused, as a stable token — see `AcpxErrorOptions.policyReason`.
    *
@@ -74,6 +78,7 @@ export type NormalizeOutputErrorOptions = {
   effectiveAccount?: EffectiveAccountMetadata;
   automationCapacityReserved?: AutomationCapacityReservedDetail;
   codexSubscriptionCap?: CodexSubscriptionCapDetail;
+  capacityRefusal?: CapacityRefusalDetail;
   /** Fallback when the error itself carries none — the error's own value wins. */
   policyReason?: string;
 };
@@ -204,6 +209,10 @@ function codexSubscriptionCapFromError(error: unknown): CodexSubscriptionCapDeta
   return error instanceof CodexSubscriptionCapError ? error.codexSubscriptionCap : undefined;
 }
 
+function capacityRefusalFromError(error: unknown): CapacityRefusalDetail | undefined {
+  return error instanceof CapacityRefusedError ? error.capacityRefusal : undefined;
+}
+
 /** A trimmed non-empty string, or `undefined`. Split out for the complexity budget. */
 function nonEmptyStringField(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value : undefined;
@@ -229,6 +238,7 @@ function readOutputErrorMeta(error: unknown): ErrorMeta {
   const acp = extractAcpError(record.acp);
   const automationCapacityReserved = automationCapacityReservedFromError(error);
   const codexSubscriptionCap = codexSubscriptionCapFromError(error);
+  const capacityRefusal = capacityRefusalFromError(error);
   const policyReason = nonEmptyStringField(record.policyReason);
   return {
     outputCode,
@@ -239,6 +249,7 @@ function readOutputErrorMeta(error: unknown): ErrorMeta {
     effectiveAccount,
     automationCapacityReserved,
     codexSubscriptionCap,
+    capacityRefusal,
     policyReason,
   };
 }
@@ -330,11 +341,15 @@ export function normalizeOutputError(
 function resolvedStructuredErrorDetails(
   meta: ErrorMeta,
   options: NormalizeOutputErrorOptions,
-): Pick<NormalizedOutputError, "automationCapacityReserved" | "codexSubscriptionCap"> {
+): Pick<
+  NormalizedOutputError,
+  "automationCapacityReserved" | "codexSubscriptionCap" | "capacityRefusal"
+> {
   return {
     automationCapacityReserved:
       meta.automationCapacityReserved ?? options.automationCapacityReserved,
     codexSubscriptionCap: meta.codexSubscriptionCap ?? options.codexSubscriptionCap,
+    capacityRefusal: meta.capacityRefusal ?? options.capacityRefusal,
   };
 }
 
@@ -462,6 +477,10 @@ export function exitCodeForOutputErrorCode(code: OutputErrorCode): ExitCode {
     case "PERMISSION_DENIED":
     case "PERMISSION_PROMPT_UNAVAILABLE":
       return EXIT_CODES.PERMISSION_DENIED;
+    // ⚠️ WITHOUT THIS CASE A CAPACITY REFUSAL EXITS 1: the default maps every unknown code to
+    // ERROR, so the refusal would read as a crash rather than "temporary, nothing ran" (§8.2).
+    case "CAPACITY":
+      return EXIT_CODES.CAPACITY;
     case "RUNTIME":
     default:
       return EXIT_CODES.ERROR;

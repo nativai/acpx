@@ -1,4 +1,5 @@
 import { type Command, InvalidArgumentError } from "commander";
+import { readPendingReservationsForProbe } from "../capacity/admission.js";
 import { type Harness, HARNESSES, isHarness, MIB } from "../capacity/constants.js";
 import {
   type CapacitySnapshot,
@@ -14,7 +15,9 @@ import { emitJsonResult } from "./output/json-output.js";
 
 /**
  * `acpx capacity [--agent claude|codex|pi] [--need N]` — how many more agent sessions fit in THIS
- * box's control-pod memory (CONCEPTION f7587c86 §8.1). Read-only: Phase 1 gates nothing.
+ * box's control-pod memory (CONCEPTION f7587c86 §8.1). Read-only. It reads the admission ledger
+ * the create gate writes, so creates in flight show as `pendingBytes` / `owners.starting`, and the
+ * gate (`capacity/admission.ts`) admits exactly when `--need 1` here is met.
  *
  * Exit 0 on a successful reading (with `--need N`: at least N slots for `--agent`), 75 when
  * `--need N` is not met, 2 on usage, 1 on an internal error. An unconfigured or unmeasured box
@@ -76,9 +79,11 @@ const yours = (s: CapacitySnapshot): string =>
 function chargeLine(s: CapacitySnapshot, charged: number, base: number): string {
   const ownerCharge = s.owners.trees.reduce((sum, tree) => sum + tree.chargedBytes, 0);
   const workingSet = s.workingSetBytes === null ? "" : ` · working set ${gib(s.workingSetBytes)}`;
+  const starting =
+    s.owners.starting > 0 ? ` + ${s.owners.starting} starting ${gib(s.pendingBytes)}` : "";
   return (
     `charged ${gib(charged)} = base ${gib(base)} + ${plural(s.owners.live, "owner")}${yours(s)} ` +
-    `${gib(ownerCharge)} · committed ${gib(s.committedBytes ?? 0)} (anon + kernel) · margin ` +
+    `${gib(ownerCharge)}${starting} · committed ${gib(s.committedBytes ?? 0)} (anon + kernel) · margin ` +
     `${gib(s.marginBytes ?? 0)}${workingSet}`
   );
 }
@@ -153,11 +158,16 @@ function writeCapacity(
   }
 }
 
-function handleCapacity(flags: CapacityFlags, command: Command, config: ResolvedAcpxConfig): void {
+async function handleCapacity(
+  flags: CapacityFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
   const { format } = resolveGlobalFlags(command, config);
   const snapshot = readCapacity({
     agent: flags.agent ?? "claude",
     sources: capacitySourcesFromEnv(),
+    pending: await readPendingReservationsForProbe(),
   });
   const met = flags.need === undefined || needMet(snapshot, flags.need);
   writeCapacity(format, snapshot, flags.need, met);
@@ -193,7 +203,7 @@ export function registerCapacityCommand(parent: Command, config: ResolvedAcpxCon
     .exitOverride((error) => {
       throw error;
     })
-    .action(function (this: Command, flags: CapacityFlags) {
-      handleCapacity(flags, this, config);
+    .action(async function (this: Command, flags: CapacityFlags) {
+      await handleCapacity(flags, this, config);
     });
 }

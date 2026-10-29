@@ -2,6 +2,7 @@ import type { EffectiveAccountMetadata } from "../../acp/auth-env.js";
 import { buildJsonRpcErrorResponse } from "../../acp/jsonrpc-error.js";
 import type {
   AutomationCapacityReservedDetail,
+  CapacityRefusalDetail,
   CodexSubscriptionCapDetail,
   OutputErrorAcpPayload,
   OutputErrorCode,
@@ -244,6 +245,7 @@ class JsonOutputFormatter implements OutputFormatter {
     effectiveAccount?: EffectiveAccountMetadata;
     automationCapacityReserved?: AutomationCapacityReservedDetail;
     codexSubscriptionCap?: CodexSubscriptionCapDetail;
+    capacityRefusal?: CapacityRefusalDetail;
     timestamp?: string;
     policyReason?: string;
   }): void {
@@ -266,6 +268,7 @@ class JsonOutputFormatter implements OutputFormatter {
           effectiveAccount: params.effectiveAccount,
           automationCapacityReserved: params.automationCapacityReserved,
           codexSubscriptionCap: params.codexSubscriptionCap,
+          capacityRefusal: params.capacityRefusal,
         }),
       )}\n`,
     );

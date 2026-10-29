@@ -9,6 +9,7 @@ import {
 } from "./acp/error-normalization.js";
 import { listBuiltInAgents } from "./agent-registry.js";
 import { InterruptedError } from "./async-control.js";
+import { takeAdmissionClassFromEnv } from "./capacity/admission.js";
 import { configurePublicCli } from "./cli-public.js";
 import { handlePrompt } from "./cli/command-handlers.js";
 import { registerAgentCommand, registerDefaultCommands } from "./cli/command-registration.js";
@@ -529,6 +530,9 @@ async function handleProgramParseError(
 }
 
 export async function main(argv: string[] = process.argv): Promise<void> {
+  // FIRST, before anything can be spawned: the class is atrium's word about THIS invocation and
+  // must not reach an owner, a harness or an agent's shell (CONCEPTION f7587c86 §16).
+  takeAdmissionClassFromEnv();
   const rawArgs = normalizeLifecycleScriptArgs(argv.slice(2));
   const normalizedArgv = [argv[0] ?? "node", argv[1] ?? "acpx", ...rawArgs];
 

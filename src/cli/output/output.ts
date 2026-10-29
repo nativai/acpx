@@ -322,6 +322,17 @@ function renderAuthRequiredHint(params: RenderableOutputError): string {
   return `hint: run \`acpx config show\` to locate the active config, then add ${formatDisjunction(configKeys)} and retry.`;
 }
 
+function hintsForCode(code: OutputErrorCode): string[] | undefined {
+  if (code === "TIMEOUT") {
+    return [
+      "hint: increase `--timeout <seconds>` for long-running prompts, or check whether the agent/provider is stalled.",
+    ];
+  }
+  // A capacity refusal's second line IS its remedy (CONCEPTION f7587c86 §8.2); a pattern hint
+  // below could only contradict it.
+  return code === "CAPACITY" ? [] : undefined;
+}
+
 export function getTextErrorRemediationHints(params: RenderableOutputError): string[] {
   const lowerMessage = params.message.toLowerCase();
 
@@ -346,10 +357,9 @@ export function getTextErrorRemediationHints(params: RenderableOutputError): str
     return [renderAuthRequiredHint(params)];
   }
 
-  if (params.code === "TIMEOUT") {
-    return [
-      "hint: increase `--timeout <seconds>` for long-running prompts, or check whether the agent/provider is stalled.",
-    ];
+  const byCode = hintsForCode(params.code);
+  if (byCode) {
+    return byCode;
   }
 
   if (params.code === "NO_SESSION") {

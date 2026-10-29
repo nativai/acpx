@@ -185,6 +185,8 @@ export const OUTPUT_ERROR_CODES = [
   "PERMISSION_PROMPT_UNAVAILABLE",
   "RUNTIME",
   "USAGE",
+  /** The create gate refused for memory (CONCEPTION f7587c86 §8.2): exit 75, nothing started. */
+  "CAPACITY",
 ] as const;
 export type OutputErrorCode = (typeof OUTPUT_ERROR_CODES)[number];
 
@@ -241,6 +243,24 @@ export type AutomationCapacityReservedDetail = {
   nextEligibilityAccountId?: string;
   nextEligibilityAccountLabel?: string;
   nextEligibilitySource?: AutomationEligibilitySource;
+};
+
+/** Why the create gate refused (CONCEPTION f7587c86 §8.2) — the `reason=` token on stderr. */
+export type CapacityRefusalReason =
+  | "no_capacity"
+  | "memory_pressure"
+  | "node_pressure"
+  | "admission_busy";
+
+/**
+ * Additive JSON-RPC data of a capacity refusal. `capacity` is the same snapshot `acpx capacity
+ * --format json` prints (absent only for `admission_busy`, which never took a reading).
+ */
+export type CapacityRefusalDetail = {
+  reason: CapacityRefusalReason;
+  nothingStarted: true;
+  retryAfterS: number;
+  capacity?: unknown;
 };
 
 /**
@@ -347,6 +367,7 @@ export interface OutputFormatter {
     effectiveAccount?: EffectiveAccountMetadata;
     automationCapacityReserved?: AutomationCapacityReservedDetail;
     codexSubscriptionCap?: CodexSubscriptionCapDetail;
+    capacityRefusal?: CapacityRefusalDetail;
     timestamp?: string;
   }): void;
   onPermissionEscalation(event: PermissionEscalationEvent): void;

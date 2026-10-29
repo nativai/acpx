@@ -8,11 +8,11 @@ import {
 import type { OwnerTree } from "./owners.js";
 
 /**
- * The charged admission formula, read-only (CONCEPTION f7587c86 §4.1, §4.2). Phase 1 has no
- * pending ledger, so `P = 0`, and no make-room, so nothing is releasable for room.
+ * The charged admission formula, read-only (CONCEPTION f7587c86 §4.1, §4.2). `P` comes from the
+ * admission ledger (`pending.ts`); there is no make-room yet, so nothing is releasable for room.
  *
  *   b = max(b_floor, C − Σ m_i)                    measured base
- *   K = b + Σ max(r_live_h(i), m_i) + P            charged total
+ *   K = b + Σ max(r_live_h(i), m_i, reserved_i) + P   charged total
  *   free slots for h = min of
  *     ⌊(B − M − Q − K) / r_new_h⌋                  G1 (agent class; interactive drops Q)
  *     ⌊(L − M_oom − C − P) / r_new_h⌋              G2, the cgroup-OOM guard
@@ -49,7 +49,11 @@ export type FormulaResult = {
 };
 
 export function ownerCharge(owner: OwnerTree, constants: CapacityConstants): number {
-  return Math.max(liveFloorFor(owner.harness, constants), owner.measuredBytes);
+  return Math.max(
+    liveFloorFor(owner.harness, constants),
+    owner.measuredBytes,
+    owner.reservedBytes ?? 0,
+  );
 }
 
 function perHarness<T>(fn: (h: Harness) => T): PerHarness<T> {

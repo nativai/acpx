@@ -1,5 +1,6 @@
 import type {
   AutomationCapacityReservedDetail,
+  CapacityRefusalDetail,
   CodexSubscriptionCapDetail,
   OutputErrorAcpPayload,
   OutputErrorCode,
@@ -343,6 +344,31 @@ export class AllSubscriptionsExhaustedError extends AcpxOperationalError {
       detailCode: "all-subscriptions-exhausted",
       origin: "runtime",
     });
+  }
+}
+
+/**
+ * The create gate refused an agent's new session for memory (CONCEPTION f7587c86 §8.2 — wire
+ * format, hard to reverse). Exit 75 via the `CAPACITY` output code. Text mode prints the message:
+ * line 1 is the machine token acpx-ui and agents match (`acpx: REFUSED reason=… nothing_started=true
+ * …`), line 2 one plain sentence saying what to do. JSON mode carries `capacityRefusal` in
+ * `error.data` and keeps line 1 on stderr (`stderrLine`), so a stderr-only reader still sees it.
+ *
+ * Thrown only BEFORE anything is created: no record, no seat, no owner, nothing queued.
+ */
+export class CapacityRefusedError extends AcpxOperationalError {
+  readonly capacityRefusal: CapacityRefusalDetail;
+  readonly stderrLine: string;
+
+  constructor(params: { tokenLine: string; sentence: string; detail: CapacityRefusalDetail }) {
+    super(`${params.tokenLine}\n${params.sentence}`, {
+      outputCode: "CAPACITY",
+      detailCode: params.detail.reason.replaceAll("_", "-"),
+      origin: "cli",
+      retryable: true,
+    });
+    this.capacityRefusal = params.detail;
+    this.stderrLine = params.tokenLine;
   }
 }
 
