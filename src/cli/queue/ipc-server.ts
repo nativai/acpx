@@ -22,7 +22,10 @@ import type {
   PromptInput,
   SessionResumePolicy,
 } from "../../types.js";
-import type { BackgroundTaskAnswer } from "../session/background-task-tracker.js";
+import type {
+  BackgroundTaskAnswer,
+  LiveBackgroundTask,
+} from "../session/background-task-tracker.js";
 import {
   CONSUMED_CUT_BY_SESSION_CLOSE,
   consumedBeforeCutNote,
@@ -30,6 +33,8 @@ import {
   deliveredAtCloseNote,
   type OwnerExitCause,
   ownerExitDeliveryError,
+  QUEUE_OWNER_CLOSE_PENDING_DETAIL_CODE,
+  QUEUE_OWNER_CLOSE_PENDING_MESSAGE,
   QUEUE_OWNER_CLOSING_DETAIL_CODE,
   QUEUE_OWNER_CLOSING_MESSAGE,
   SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE,
@@ -339,6 +344,9 @@ export type QueueOwnerDrainReport = {
   undelivered: QueueDrainedDelivery[];
   turnSettled: boolean;
   activeTurnAtEntry: boolean;
+  /** brick ad6ba1c2 v3.1 — only for a drain that asked for the background-task check. */
+  taskCheck?: "passed" | "refused";
+  tasks?: LiveBackgroundTask[];
 };
 
 export type QueueOwnerControlHandlers = {
@@ -393,6 +401,10 @@ export class SessionQueueOwner {
   // closes — at the only process that is authoritative about its own liveness,
   // rather than in an acpx-ui route that reads a file and hopes.
   private draining = false;
+  // brick ad6ba1c2 v3.1 (§6.4) — P1 of an UNFORCED close: fully reversible. While set, submissions get
+  // the RETRYABLE QUEUE_OWNER_CLOSE_PENDING, no work is handed out, and nothing is noted or
+  // terminalized. Cleared by ABORT (a live task: the close is refused) or by COMMIT (today's drain).
+  private closePending = false;
   private drainCause: OwnerExitCause = "owner-exit";
 
   private constructor(
@@ -491,27 +503,111 @@ export class SessionQueueOwner {
   async drainDeliveries(
     reason: QueueDrainReason,
     timeoutMs?: number,
+    checkBackgroundTasks?: boolean,
   ): Promise<QueueOwnerDrainReport> {
     const activeTurnAtEntry = this.controlHandlers.queryActiveTurn();
-
-    // 1. Quiesce, before any await. From this instant `submit_prompt` is
-    //    rejected, so nothing can arrive between here and the SIGTERM that
-    //    follows (E5). That is what lets the signal handler trust its
-    //    QUEUE_OWNER_SHUTDOWN default — on every path where the drain ran. See
-    //    `OwnerExitCause` for the one path where it does not (`--no-drain`) and
-    //    why the default is still honest there.
-    this.draining = true;
-    this.drainCause = reason === "session-close" ? "session-close" : "owner-exit";
-    if (this.drainCause === "session-close") {
-      // 71fdcaf2 — the runtime writes the terminal for a delivery the close cancels; tell it a close is on.
-      noteSessionCloseDrain(this.sessionId);
+    if (checkBackgroundTasks === true && !this.draining && !this.closePending) {
+      return await this.drainWithTaskCheck(reason, timeoutMs, activeTurnAtEntry);
     }
+
+    this.quiesceForClose(reason);
 
     // 2. Settle what is already WITH the agent. Never cancel it: the answer to a
     //    running turn is not ours to destroy, and an absorbed injection whose
     //    turn never ends is F3's ABSORBED_TURN_NEVER_ENDED to label (E1).
     const turnSettled = await this.waitForTurnToSettle(timeoutMs);
 
+    return { ...this.terminalizeDrainedCustody(turnSettled), activeTurnAtEntry };
+  }
+
+  /**
+   * brick ad6ba1c2 v3.1 (§6.4) — the consent window of an UNFORCED close is the whole drain, so the
+   * drain re-checks, abortably. P1 waits for the turn exactly as today's drain does, and on every poll
+   * (and once more at its end) reads the tracker. A live task ⇒ ABORT: leave close-pending, wake a
+   * parked `nextTask` so held items start normally, write NOTHING, and reply `taskCheck:"refused"`.
+   * None ⇒ COMMIT, in the same synchronous step as the final CHECK (no await between them): today's
+   * drain, unchanged. ⚠️ Do not move an `await` between the last CHECK and `quiesceForClose` — that gap
+   * is exactly the window a task could start in unnamed.
+   */
+  private async drainWithTaskCheck(
+    reason: QueueDrainReason,
+    timeoutMs: number | undefined,
+    activeTurnAtEntry: boolean,
+  ): Promise<QueueOwnerDrainReport> {
+    this.closePending = true;
+    const deadline = Date.now() + Math.max(0, timeoutMs ?? 0);
+    let turnSettled = !this.controlHandlers.queryActiveTurn();
+    for (;;) {
+      const live = this.liveBackgroundTasks();
+      if (live.length > 0) {
+        this.abortClosePending();
+        return {
+          drained: 0,
+          undelivered: [],
+          turnSettled,
+          activeTurnAtEntry,
+          taskCheck: "refused",
+          tasks: live,
+        };
+      }
+      if (turnSettled || Date.now() >= deadline) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, DRAIN_TURN_POLL_INTERVAL_MS));
+      turnSettled = !this.controlHandlers.queryActiveTurn();
+    }
+    // COMMIT — synchronous with the CHECK above.
+    this.closePending = false;
+    this.quiesceForClose(reason);
+    return {
+      ...this.terminalizeDrainedCustody(turnSettled),
+      activeTurnAtEntry,
+      taskCheck: "passed",
+    };
+  }
+
+  private liveBackgroundTasks(): LiveBackgroundTask[] {
+    try {
+      return this.controlHandlers.queryBackgroundTasks?.().tasks ?? [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** ABORT: back to normal service. A runtime parked in `nextTask` gets the oldest held item. */
+  private abortClosePending(): void {
+    this.closePending = false;
+    // A concurrent (forced) close may have committed meanwhile: then nothing is handed out.
+    if (this.pending.length > 0 && !this.closed && !this.draining) {
+      const waiter = this.waiters.shift();
+      if (waiter) {
+        const task = this.pending.shift();
+        this.emitQueueDepth();
+        waiter(task);
+      }
+    }
+  }
+
+  isClosePending(): boolean {
+    return this.closePending;
+  }
+
+  // 1. Quiesce, before any await. From this instant `submit_prompt` is rejected, so nothing can arrive
+  //    between here and the SIGTERM that follows (E5). That is what lets the signal handler trust its
+  //    QUEUE_OWNER_SHUTDOWN default — on every path where the drain ran. See `OwnerExitCause` for the
+  //    one path where it does not (`--no-drain`) and why the default is still honest there.
+  private quiesceForClose(reason: QueueDrainReason): void {
+    this.draining = true;
+    this.drainCause = reason === "session-close" ? "session-close" : "owner-exit";
+    if (this.drainCause === "session-close") {
+      // 71fdcaf2 — the runtime writes the terminal for a delivery the close cancels; tell it a close is on.
+      noteSessionCloseDrain(this.sessionId);
+    }
+  }
+
+  private terminalizeDrainedCustody(
+    turnSettled: boolean,
+  ): Omit<QueueOwnerDrainReport, "activeTurnAtEntry"> {
     // 3. Terminalize what never reached the agent. Both custody structures are
     //    spliced in ONE synchronous pass, so an item this sweep took can no
     //    longer be reached by `close()`, by a concurrent drain, or by the signal
@@ -520,12 +616,7 @@ export class SessionQueueOwner {
     const undelivered = this.terminalizeCustody(custody, this.drainCause);
     this.emitQueueDepth();
 
-    return {
-      drained: undelivered.length,
-      undelivered,
-      turnSettled,
-      activeTurnAtEntry,
-    };
+    return { drained: undelivered.length, undelivered, turnSettled };
   }
 
   /**
@@ -758,7 +849,9 @@ export class SessionQueueOwner {
     // `outcome_unknown`. Falling through to the waiter (rather than returning
     // immediately) parks the runtime loop instead of spinning it hot; nothing
     // can feed that waiter, because `enqueue` is quiesced.
-    if (!this.draining && this.pending.length > 0) {
+    // brick ad6ba1c2 v3.1: nor does a close-pending one — the close may still commit. On ABORT the
+    // parked waiter is woken with the oldest held item (`abortClosePending`).
+    if (!this.draining && !this.closePending && this.pending.length > 0) {
       const task = this.pending.shift();
       this.emitQueueDepth();
       if (task) {
@@ -925,10 +1018,11 @@ export class SessionQueueOwner {
     requestId: string,
     message: string,
     detailCode: string,
+    retryable = false,
   ): void {
     writeQueueMessage(socket, {
       ...makeQueueOwnerError(requestId, message, detailCode, {
-        retryable: false,
+        retryable,
       }),
       ownerGeneration: this.ownerGeneration,
     });
@@ -1095,7 +1189,11 @@ export class SessionQueueOwner {
         run: async () => ({
           type: "drain_deliveries_result",
           requestId: request.requestId,
-          ...(await this.drainDeliveries(request.reason, request.timeoutMs)),
+          ...(await this.drainDeliveries(
+            request.reason,
+            request.timeoutMs,
+            request.checkBackgroundTasks,
+          )),
         }),
       });
       return true;
@@ -1122,6 +1220,18 @@ export class SessionQueueOwner {
         request.requestId,
         QUEUE_OWNER_CLOSING_MESSAGE,
         QUEUE_OWNER_CLOSING_DETAIL_CODE,
+      );
+      return;
+    }
+    // brick ad6ba1c2 v3.1 — P1: rejected BEFORE `accepted` too (KD-4), but RETRYABLE, and with text
+    // acpx-ui re-drives: the close may yet be refused (§6.4).
+    if (this.closePending) {
+      this.failRequest(
+        socket,
+        request.requestId,
+        QUEUE_OWNER_CLOSE_PENDING_MESSAGE,
+        QUEUE_OWNER_CLOSE_PENDING_DETAIL_CODE,
+        true,
       );
       return;
     }

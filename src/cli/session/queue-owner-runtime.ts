@@ -1471,7 +1471,9 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         const quiescenceWindowMs = gateWindowMs;
         const decision = await decideIdleOwnerRelease({
           ttlMs,
-          hasActiveTurn: turnController.hasActiveTurn(),
+          // brick ad6ba1c2 v3.1 (§6.4): an owner in an unforced close's reversible check phase is
+          // never released from under it — that close may be refused and the session resume.
+          hasActiveTurn: turnController.hasActiveTurn() || owner.isClosePending(),
           now: Date.now(),
           lastIdleDrainActivityAt,
           lastTaskCompletedAt,

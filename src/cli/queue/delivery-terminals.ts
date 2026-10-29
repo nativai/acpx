@@ -150,6 +150,21 @@ export const QUEUE_OWNER_CLOSING_DETAIL_CODE = "QUEUE_OWNER_CLOSING";
 export const QUEUE_OWNER_CLOSING_MESSAGE =
   "Session is closed — the queue owner is draining for close and is not accepting new messages.";
 
+// brick ad6ba1c2 v3.1 (CONCEPTION §6.4) — the rejection a `submit_prompt` gets while an UNFORCED close is
+// still checking for live background tasks (P1, close-pending). It is RETRYABLE: the close may yet be
+// refused, and the owner then returns to normal service.
+//
+// ⚠️ THE WORDING IS LOAD-BEARING, IN THE OPPOSITE DIRECTION TO QUEUE_OWNER_CLOSING. acpx-ui's
+// `isTerminalEnqueueFailure` (server/delivery-runner.ts) fails a delivery for good when the text holds
+// "session is closed", "read-only" or "template"; anything else is re-driven after a backoff. This text
+// must contain NONE of them (`test/close-pending-drain.test.ts` pins it), or a message sent during a
+// close that is then refused would be lost as "closed".
+// ⚠️ And never add this code to `OWNER_SHUTDOWN_DETAIL_CODES` (ipc.ts): that set makes a sender's CLI
+// terminate the owner.
+export const QUEUE_OWNER_CLOSE_PENDING_DETAIL_CODE = "QUEUE_OWNER_CLOSE_PENDING";
+export const QUEUE_OWNER_CLOSE_PENDING_MESSAGE =
+  "Session close pending — the queue owner is checking for live background tasks; retry shortly.";
+
 // brick e09628a1 (R-CONSUMED, CONCEPTION §5) — the NON-FAILING NOTE on a `done` written at a cut for a message
 // the model had already consumed (`src/session/delivery-consumption.ts`). Its `detailCode` keeps the code the
 // cut would otherwise have written, so the stream still says what cut the turn (crash census, C-3 forensics);

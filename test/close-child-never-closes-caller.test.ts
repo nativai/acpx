@@ -313,8 +313,8 @@ for (const [selectorName, selectorArgs] of Object.entries(SELECTORS)) {
         assert.deepEqual(
           rig.child.observed.map((entry) => entry.type),
           // brick ad6ba1c2: the background-task gate's READ-ONLY query comes first, before anything
-          // is touched; then the ordinary arm.
-          ["query_background_tasks", "drain_deliveries", "close_session"],
+          // is touched; then the ordinary arm; then (v3.1) a re-read right before the stop.
+          ["query_background_tasks", "drain_deliveries", "close_session", "query_background_tasks"],
           "the child's close takes the ordinary arm",
         );
         assert.equal(

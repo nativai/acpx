@@ -27,6 +27,10 @@
 //   fatal         only the fatal handler, WITH the task reaper (O1)
 //   fatal-noreap  only the fatal handler, WITHOUT it (O1's negative control: today's code)
 //   exit-reap     owner-side exit reap after a client close that kills only the fake claude (O2)
+//   race          (v3.1 T-RACE-2) the owner reports NO task to the upfront query, then the Monitor from the
+//                 next read on (the in-drain CHECK): a task started during the drain
+//   late          (v3.1 T-RACE-4) no task to the gate nor to the in-drain CHECK, then both tasks from the
+//                 third read on (the closer's pre-snapshot re-query): a task started after the commit
 //   crash         the fake claude dies FIRST (both task shells reparent out of the tree), then the
 //                 exit reap (O3b, path I: box-wide proofs, no memo)
 import { spawn } from "node:child_process";
@@ -127,10 +131,17 @@ function reaperFor(tasks: LiveBackgroundTask[]) {
   });
 }
 
+type TaskSchedule = (read: number) => LiveBackgroundTask[];
+
 function stubHandlers(
   log: (what: string) => void,
-  tasks: LiveBackgroundTask[],
+  tasks: LiveBackgroundTask[] | TaskSchedule,
 ): QueueOwnerControlHandlers {
+  let reads = 0;
+  const live = (): LiveBackgroundTask[] => {
+    reads += 1;
+    return typeof tasks === "function" ? tasks(reads) : tasks;
+  };
   return {
     cancelPrompt: async () => false,
     closeSession: async () => {
@@ -142,17 +153,22 @@ function stubHandlers(
     setSessionConfigOption: async () => ({ configOptions: [] }),
     setDepth: async (requested: string) => ({ kind: "send-nothing", requested }),
     queryActiveTurn: () => false,
-    queryBackgroundTasks: () => ({ source: "adapter", tasks, monitorCommands: MONITOR_COMMANDS }),
+    queryBackgroundTasks: () => {
+      const now = live();
+      emit({ taskRead: now.length });
+      return { source: "adapter", tasks: now, monitorCommands: MONITOR_COMMANDS };
+    },
   };
 }
 
-async function runOwner(tasks: LiveBackgroundTask[]): Promise<void> {
+async function runOwner(tasks: LiveBackgroundTask[] | TaskSchedule): Promise<void> {
   const lease = await tryAcquireQueueOwnerLease(sessionId);
   if (!lease) {
     throw new Error("bg-task-owner-child: could not acquire the lease");
   }
   const pids = await spawnClaudeWithTasks();
-  const reaper = reaperFor(tasks);
+  // The owner's own handler (path G) reaps what IS running: both rig tasks.
+  const reaper = reaperFor(typeof tasks === "function" ? FIXTURE_TASKS : tasks);
   let owner: SessionQueueOwner | undefined;
   installQueueOwnerFatalShutdown({
     sessionId: sessionId,
@@ -247,6 +263,11 @@ const modes: Record<string, () => Promise<void>> = {
   owner: async () => await runOwner(FIXTURE_TASKS),
   "owner-none": async () => await runOwner([]),
   "owner-ghost": async () => await runOwner([...FIXTURE_TASKS, GHOST_TASK]),
+  race: async () =>
+    await runOwner((read) =>
+      read === 1 ? [] : FIXTURE_TASKS.filter((t) => t.toolName === "Monitor"),
+    ),
+  late: async () => await runOwner((read) => (read <= 2 ? [] : FIXTURE_TASKS)),
   "old-owner": runOldOwner,
   fatal: async () => await runFatal(true),
   "fatal-noreap": async () => await runFatal(false),

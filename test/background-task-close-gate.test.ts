@@ -253,6 +253,8 @@ async function recordClosed(homeDir: string, sessionId: string): Promise<unknown
   return (JSON.parse(await fsp.readFile(file, "utf8")) as { closed?: unknown }).closed;
 }
 
+type LiveBackgroundTaskShape = { taskId: string };
+
 const NOW = Date.parse("2026-10-29T13:26:12.417Z");
 
 // ---------------------------------------------------------------------------
@@ -964,6 +966,100 @@ test("HoD ruling: a template refusal with --slug and --auto-prompt prints a retr
         "the auto-prompt survived the shell byte for byte",
       );
       assert.ok(!aliveAs(rig.pids.sleepPid, rig.ticks.sleepPid));
+    } finally {
+      rig.kill();
+    }
+  });
+});
+
+test("T-RACE-2 (v3.1): no task at the gate, one INSIDE the drain — exit 7 naming it, record open, NO close_session, owner alive", async (t) => {
+  if (!linux) {
+    t.skip("linux /proc");
+    return;
+  }
+  await withHome(async (homeDir) => {
+    const sessionId = "race-cli";
+    await writeRecord(homeDir, sessionId);
+    const rig = await startOwnerRig(homeDir, "race", sessionId);
+    try {
+      const refused = await runCli(
+        [
+          "--format",
+          "json",
+          "sessions",
+          "close",
+          "--session-id",
+          sessionId,
+          "--drain-timeout",
+          "30000",
+        ],
+        homeDir,
+      );
+      assert.equal(refused.code, 7, refused.stderr);
+      const line = jsonLines(refused.stdout)[0];
+      assert.ok(line, refused.stdout);
+      assert.equal(line.code, "LIVE_BACKGROUND_TASKS");
+      assert.deepEqual(
+        (line.liveBackgroundTasks as LiveBackgroundTaskShape[]).map((task) => task.taskId),
+        ["b2g1k6brj"],
+      );
+      assert.equal(
+        line.retryCommand,
+        `acpx sessions close --session-id ${sessionId} --drain-timeout 30000 --kill-background-tasks`,
+      );
+      assert.equal(await recordClosed(homeDir, sessionId), false);
+      const requests = rig
+        .lines()
+        .filter((entry) => "request" in entry)
+        .map((entry) => entry.request);
+      assert.deepEqual(
+        requests,
+        ["drain_deliveries"],
+        "no close_session after an in-drain refusal",
+      );
+      for (const key of RIG_KEYS) {
+        assert.ok(aliveAs(rig.pids[key], rig.ticks[key]), `${key} was signalled`);
+      }
+    } finally {
+      rig.kill();
+    }
+  });
+});
+
+test("T-RACE-4 (v3.1): a task appearing AFTER the commit is reaped AND named startedDuringClose, with a stderr WARNING", async (t) => {
+  if (!linux) {
+    t.skip("linux /proc");
+    return;
+  }
+  await withHome(async (homeDir) => {
+    const sessionId = "race-late";
+    await writeRecord(homeDir, sessionId);
+    const rig = await startOwnerRig(homeDir, "late", sessionId);
+    try {
+      const closed = await runCli(
+        ["--format", "json", "sessions", "close", "--session-id", sessionId],
+        homeDir,
+      );
+      assert.equal(closed.code, 0, closed.stderr);
+      const line = jsonLines(closed.stdout).find((entry) => entry.action === "session_closed");
+      assert.ok(line, closed.stdout);
+      const bg = line.backgroundTasks as {
+        killed: boolean;
+        tasks: Array<{ taskId: string; outcome: string; startedDuringClose?: boolean }>;
+      };
+      assert.equal(bg.killed, false, "nothing was consented");
+      assert.deepEqual(
+        bg.tasks.map((task) => [task.taskId, task.startedDuringClose, task.outcome]),
+        [
+          ["b343f35rh", true, "ended"],
+          ["b2g1k6brj", true, "ended"],
+        ],
+      );
+      assert.match(
+        closed.stderr,
+        /WARNING: 2 background tasks of race-late started during the close and were ended without consent: Bash "rig-s1 bash bg" \(b343f35rh\), Monitor "rig-s1 monitor" \(b2g1k6brj\)/,
+      );
+      assert.ok(TASK_KEYS.every((key) => !aliveAs(rig.pids[key], rig.ticks[key])));
     } finally {
       rig.kill();
     }

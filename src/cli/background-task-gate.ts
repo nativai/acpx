@@ -45,7 +45,7 @@ export type LiveBackgroundTasksRefusal = {
 export type BackgroundTasksJson = {
   queried: boolean;
   killed: boolean;
-  tasks: Array<LiveBackgroundTask & { outcome: "ended" | "unverified" }>;
+  tasks: Array<LiveBackgroundTask & { outcome: "ended" | "unverified"; startedDuringClose?: true }>;
   reap: ReapSummary;
 };
 
@@ -191,20 +191,32 @@ export async function evaluateBackgroundTaskGate(params: {
   if (tasks.length === 0 || force) {
     return { gate, answer };
   }
+  return { gate, answer, refusal: backgroundTasksRefusal(params, tasks) };
+}
+
+/**
+ * The refusal for `tasks` — the upfront gate's, and (v3.1) the in-drain one: a task that started
+ * after the gate makes an unforced close refuse exactly the same way, same text, JSON and retry.
+ */
+export function backgroundTasksRefusal(
+  params: {
+    record: SessionRecord;
+    explicitAgentName: string | undefined;
+    verb: BackgroundTaskGateVerb;
+    retryArgs?: readonly string[];
+  },
+  tasks: LiveBackgroundTask[],
+): LiveBackgroundTasksRefusal {
   return {
-    gate,
-    answer,
-    refusal: {
-      verb: params.verb,
-      sessionId: params.record.acpxRecordId,
-      tasks,
-      retryCommand: backgroundTaskRetryCommand(
-        params.verb,
-        params.record.acpxRecordId,
-        params.explicitAgentName,
-        params.retryArgs,
-      ),
-    },
+    verb: params.verb,
+    sessionId: params.record.acpxRecordId,
+    tasks,
+    retryCommand: backgroundTaskRetryCommand(
+      params.verb,
+      params.record.acpxRecordId,
+      params.explicitAgentName,
+      params.retryArgs,
+    ),
   };
 }
 
@@ -281,11 +293,20 @@ export function backgroundTasksJson(
   gate: BackgroundTasksGate,
   reap: ReapReport,
   claudeGone: boolean,
+  lateTasks: readonly LiveBackgroundTask[] = [],
 ): BackgroundTasksJson {
   return {
     queried: gate.queried,
     killed: gate.killed,
-    tasks: gate.tasks.map((task) => ({ ...task, outcome: taskOutcome(task, reap, claudeGone) })),
+    tasks: [
+      ...gate.tasks.map((task) => ({ ...task, outcome: taskOutcome(task, reap, claudeGone) })),
+      // v3.1: never ended without being named (§6.4 "Reporting the residual").
+      ...lateTasks.map((task) => ({
+        ...task,
+        outcome: taskOutcome(task, reap, claudeGone),
+        startedDuringClose: true as const,
+      })),
+    ],
     reap: publicReap(reap),
   };
 }
@@ -319,13 +340,21 @@ function reapOutcomeClause(reap: ReapReport): string {
     : `task processes could not be verified (${reap.skipped ?? "not measured"})`;
 }
 
-/** The forced-close summary (text mode) plus the survivor WARNING (any format). */
+/** The forced-close summary (text mode) plus the survivor and late-task WARNINGs (any format). */
 export function reportBackgroundTaskOutcome(
   sessionId: string,
   gate: BackgroundTasksGate,
   reap: ReapReport,
   format: OutputFormat,
+  lateTasks: readonly LiveBackgroundTask[] = [],
 ): void {
+  if (lateTasks.length > 0) {
+    const list = lateTasks.map((task) => `${taskLabel(task)} (${task.taskId})`).join(", ");
+    process.stderr.write(
+      `[acpx] WARNING: ${countPhrase(lateTasks.length).replace("live ", "")} of ${sessionId} ` +
+        `started during the close and ${lateTasks.length === 1 ? "was" : "were"} ended without consent: ${list}\n`,
+    );
+  }
   if (gate.killed && format === "text") {
     const list = gate.tasks.map((task) => `${taskLabel(task)} (${task.taskId})`).join(", ");
     process.stderr.write(

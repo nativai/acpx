@@ -110,6 +110,7 @@ import type {
 import {
   backgroundTasksField,
   backgroundTasksJson,
+  backgroundTasksRefusal,
   closeRetryArgs,
   templateRetryArgs,
   emitLiveBackgroundTasksRefusal,
@@ -159,6 +160,7 @@ import {
   resolveSeatActiveHolder,
   resolveSessionTargetSelector,
 } from "./session-selector.js";
+import type { LiveBackgroundTask } from "./session/background-task-tracker.js";
 import {
   maybeStampBrickLink,
   resolveBrickFlagRef,
@@ -2904,12 +2906,25 @@ export async function handleSessionsClose(
 
   // Commander maps `--no-drain` onto `flags.drain === false`; absent means the
   // barrier runs.
-  const closed = await closeSession(record.acpxRecordId, {
-    drain: flags.drain !== false,
-    drainTimeoutMs: flags.drainTimeout,
-    verbose: globalFlags.verbose,
-    taskContext: gateTaskContext(answer, record.acpSessionId),
-  });
+  const refusalContext = {
+    record,
+    explicitAgentName,
+    verb: "close" as const,
+    retryArgs: closeRetryArgs(flags),
+  };
+  const closed = await closeOrRefuseLate(globalFlags.format, refusalContext, () =>
+    closeSession(record.acpxRecordId, {
+      drain: flags.drain !== false,
+      drainTimeoutMs: flags.drainTimeout,
+      verbose: globalFlags.verbose,
+      taskContext: gateTaskContext(answer, record.acpSessionId),
+      // v3.1 (§6.4): an UNFORCED close re-checks inside its drain, abortably.
+      checkBackgroundTasks: flags.killBackgroundTasks !== true,
+    }),
+  );
+  if (!closed) {
+    return;
+  }
   printClosedSessionByFormat(
     closed.record,
     closed.drain,
@@ -2920,11 +2935,38 @@ export async function handleSessionsClose(
       ownerStopSkipped: closed.ownerStopSkipped,
       adapterKill: closed.adapterKill,
     },
-    backgroundTasksJson(gate, closed.reap, closed.ownerStopped),
+    backgroundTasksJson(gate, closed.reap, closed.ownerStopped, closed.lateTasks),
   );
-  reportBackgroundTaskOutcome(record.acpxRecordId, gate, closed.reap, globalFlags.format);
+  reportBackgroundTaskOutcome(
+    record.acpxRecordId,
+    gate,
+    closed.reap,
+    globalFlags.format,
+    closed.lateTasks,
+  );
 
   applyCloseExitCode(closed, record, flags, warnUndeliveredCustody);
+}
+
+/**
+ * brick ad6ba1c2 v3.1 — runs a close that may REFUSE from inside its drain (a task started after the
+ * upfront gate): the refusal is emitted exactly like the gate's (exit 7) and `undefined` returned.
+ */
+async function closeOrRefuseLate<T>(
+  format: OutputFormat,
+  refusalContext: Parameters<typeof backgroundTasksRefusal>[0],
+  run: () => Promise<T>,
+): Promise<T | undefined> {
+  try {
+    return await run();
+  } catch (error) {
+    if (error instanceof Error && error.name === "LiveBackgroundTasksDuringCloseError") {
+      const { tasks } = error as Error & { tasks: LiveBackgroundTask[] };
+      emitLiveBackgroundTasksRefusal(backgroundTasksRefusal(refusalContext, tasks), format);
+      return undefined;
+    }
+    throw error;
+  }
 }
 
 /** Rendered in the seat refusals' shape (`seats-command.ts` `runSeatMutation`): exit 1. */
@@ -3719,11 +3761,19 @@ async function markSessionAsTemplate(
   sessionId: string,
   flags: SessionsTemplateFlags,
   taskContext: CloserTaskContext,
-): Promise<{ record: SessionRecord; reap: ReapReport; ownerStopped: boolean }> {
+): Promise<{
+  record: SessionRecord;
+  reap: ReapReport;
+  ownerStopped: boolean;
+  lateTasks: LiveBackgroundTask[];
+}> {
   const initial = await resolveSessionRecord(sessionId);
   const { closeSession } = await loadSessionModule();
-  // Default drain here too — see the note at the soft-close site above.
-  const closed = await closeSession(initial.acpxRecordId, { taskContext });
+  // Default drain here too — see the note at the soft-close site above. v3.1: unforced ⇒ checked.
+  const closed = await closeSession(initial.acpxRecordId, {
+    taskContext,
+    checkBackgroundTasks: flags.killBackgroundTasks !== true,
+  });
   const record = await resolveSessionRecord(sessionId);
   record.template = {
     enabled: true,
@@ -3738,7 +3788,12 @@ async function markSessionAsTemplate(
   };
   record.closed = true;
   record.closedAt = record.closedAt ?? isoNow();
-  return { record, reap: closed.reap, ownerStopped: closed.ownerStopped };
+  return {
+    record,
+    reap: closed.reap,
+    ownerStopped: closed.ownerStopped,
+    lateTasks: closed.lateTasks,
+  };
 }
 
 // Clear the template marker. Disable un-templates only — leave closed/closedAt as-is
@@ -3795,11 +3850,21 @@ export async function handleSessionsTemplate(
     emitLiveBackgroundTasksRefusal(refusal, globalFlags.format);
     return;
   }
-  const { record, reap, ownerStopped } = await markSessionAsTemplate(
-    sessionId,
-    flags,
-    gateTaskContext(answer, gateRecord.acpSessionId),
+  const marked = await closeOrRefuseLate(
+    globalFlags.format,
+    {
+      record: gateRecord,
+      explicitAgentName: _explicitAgentName,
+      verb: "template",
+      retryArgs: templateRetryArgs(flags),
+    },
+    () => markSessionAsTemplate(sessionId, flags, gateTaskContext(answer, gateRecord.acpSessionId)),
   );
+  if (!marked) {
+    // v3.1: refused inside the drain — the close did not happen, so NO template marker is written.
+    return;
+  }
+  const { record, reap, ownerStopped, lateTasks } = marked;
   // Assigns slug (default slugify(name), overridable via --slug) + version =
   // max+1 for the slug group, under the index lock (E6), then PRIVILEGED-writes.
   await persistTemplateMark(record, { slug: flags.slug });
@@ -3807,9 +3872,9 @@ export async function handleSessionsTemplate(
     record,
     enable,
     globalFlags.format,
-    backgroundTasksJson(gate, reap, ownerStopped),
+    backgroundTasksJson(gate, reap, ownerStopped, lateTasks),
   );
-  reportBackgroundTaskOutcome(record.acpxRecordId, gate, reap, globalFlags.format);
+  reportBackgroundTaskOutcome(record.acpxRecordId, gate, reap, globalFlags.format, lateTasks);
 }
 
 function templateResultHumanLine(record: SessionRecord, enable: boolean): string {

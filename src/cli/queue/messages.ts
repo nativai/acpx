@@ -145,6 +145,11 @@ export type QueueDrainDeliveriesRequest = {
   ownerGeneration?: number;
   reason: QueueDrainReason;
   timeoutMs?: number;
+  /**
+   * brick ad6ba1c2 v3.1 (§6.4) — an UNFORCED close: drain in two phases, re-checking for live background
+   * tasks on every poll; a live task ABORTS the close (`taskCheck:"refused"`) and the owner resumes.
+   */
+  checkBackgroundTasks?: boolean;
 };
 
 export type QueueRequest =
@@ -266,6 +271,8 @@ export type QueueDrainedDelivery = {
   messageId?: string;
 };
 
+export type DrainTaskCheck = "passed" | "refused";
+
 export type QueueOwnerDrainResultMessage = {
   type: "drain_deliveries_result";
   requestId: string;
@@ -274,6 +281,9 @@ export type QueueOwnerDrainResultMessage = {
   undelivered: QueueDrainedDelivery[];
   turnSettled: boolean;
   activeTurnAtEntry: boolean;
+  /** v3.1: present only when the request asked for the check. */
+  taskCheck?: DrainTaskCheck;
+  tasks?: LiveBackgroundTask[];
 };
 
 export type QueueOwnerErrorMessage = {
@@ -780,7 +790,12 @@ function parseDrainDeliveriesRequest(
   if (request.reason !== "session-close") {
     return null;
   }
-  return { type: "drain_deliveries", ...context, reason: "session-close" };
+  return {
+    type: "drain_deliveries",
+    ...context,
+    reason: "session-close",
+    ...(request.checkBackgroundTasks === true ? { checkBackgroundTasks: true } : {}),
+  };
 }
 
 function parseSetConfigOptionRequest(
@@ -1151,7 +1166,20 @@ function parseDrainResultOwnerMessage(
     undelivered,
     turnSettled: message.turnSettled,
     activeTurnAtEntry: message.activeTurnAtEntry,
+    ...parseDrainTaskCheck(message),
   };
+}
+
+function parseDrainTaskCheck(
+  message: Record<string, unknown>,
+): Pick<QueueOwnerDrainResultMessage, "taskCheck" | "tasks"> {
+  if (message.taskCheck !== "passed" && message.taskCheck !== "refused") {
+    return {};
+  }
+  const tasks = Array.isArray(message.tasks)
+    ? message.tasks.map(parseLiveBackgroundTask).filter((task) => task !== undefined)
+    : [];
+  return { taskCheck: message.taskCheck, tasks };
 }
 
 function parseErrorOwnerMessage(

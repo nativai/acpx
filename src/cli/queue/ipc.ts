@@ -83,9 +83,11 @@ const STALE_OWNER_PROTOCOL_DETAIL_CODES = new Set([
   "QUEUE_PROTOCOL_MALFORMED_MESSAGE",
   "QUEUE_PROTOCOL_UNEXPECTED_RESPONSE",
 ]);
+// ⚠️ brick ad6ba1c2 v3.1: QUEUE_OWNER_CLOSE_PENDING must NEVER join this set — it would make a sender's
+// CLI terminate an owner whose close may yet be refused (`test/close-pending-drain.test.ts` pins it).
 const OWNER_SHUTDOWN_DETAIL_CODES = new Set(["QUEUE_OWNER_CLOSED", "QUEUE_OWNER_SHUTTING_DOWN"]);
 
-function isOwnerShutdownDetailCode(detailCode: string | undefined): boolean {
+export function isOwnerShutdownDetailCode(detailCode: string | undefined): boolean {
   return detailCode !== undefined && OWNER_SHUTDOWN_DETAIL_CODES.has(detailCode);
 }
 
@@ -906,6 +908,7 @@ async function submitDrainDeliveriesToQueueOwner(
   owner: QueueOwnerRecord,
   reason: QueueDrainReason,
   timeoutMs: number | undefined,
+  checkBackgroundTasks: boolean,
 ): Promise<QueueOwnerDrainResultMessage | undefined> {
   const request: QueueDrainDeliveriesRequest = {
     type: "drain_deliveries",
@@ -913,6 +916,7 @@ async function submitDrainDeliveriesToQueueOwner(
     ownerGeneration: owner.ownerGeneration,
     reason,
     timeoutMs,
+    ...(checkBackgroundTasks ? { checkBackgroundTasks: true } : {}),
   };
   const response = await submitControlToQueueOwner(
     owner,
@@ -955,6 +959,8 @@ export async function drainQueueOwnerForSession(options: {
   reason: QueueDrainReason;
   timeoutMs?: number;
   verbose?: boolean;
+  /** brick ad6ba1c2 v3.1 — an UNFORCED close: the owner re-checks for live tasks, abortably (§6.4). */
+  checkBackgroundTasks?: boolean;
 }): Promise<QueueOwnerDrainReport | undefined> {
   const owner = await readQueueOwnerRecord(options.sessionId);
   if (!owner) {
@@ -963,7 +969,12 @@ export async function drainQueueOwnerForSession(options: {
 
   let report: QueueOwnerDrainResultMessage | undefined;
   try {
-    report = await submitDrainDeliveriesToQueueOwner(owner, options.reason, options.timeoutMs);
+    report = await submitDrainDeliveriesToQueueOwner(
+      owner,
+      options.reason,
+      options.timeoutMs,
+      options.checkBackgroundTasks === true,
+    );
   } catch (error) {
     if (options.verbose) {
       process.stderr.write(
@@ -983,11 +994,16 @@ export async function drainQueueOwnerForSession(options: {
         `(${report.drained} undelivered, turnSettled=${report.turnSettled})\n`,
     );
   }
+  return drainReportFrom(report);
+}
+
+function drainReportFrom(report: QueueOwnerDrainResultMessage): QueueOwnerDrainReport {
   return {
     drained: report.drained,
     undelivered: report.undelivered,
     turnSettled: report.turnSettled,
     activeTurnAtEntry: report.activeTurnAtEntry,
+    ...(report.taskCheck ? { taskCheck: report.taskCheck, tasks: report.tasks ?? [] } : {}),
   };
 }
 
