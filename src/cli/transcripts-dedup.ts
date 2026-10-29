@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import {
   activeTranscriptConfigDir,
+  knownTranscriptConfigDirs,
+  legacyTranscriptJsonlPath,
   transcriptJsonlPath,
 } from "../config/subscription-transcript.js";
 import { loadSubscriptionRegistry, type SubscriptionRegistry } from "../config/subscriptions.js";
@@ -17,6 +19,7 @@ import {
   readExitTailFile,
   reduceToExitTail,
   sessionIdFromTranscriptName,
+  uniqueTailKind,
   type DedupHooks,
   type DedupOutcome,
   type ExitTailHeader,
@@ -450,6 +453,46 @@ function activePathsFor(records: SessionRecord[], context: DedupContext): Set<st
   return active;
 }
 
+/**
+ * D3 (TE, brick 81433524): the witnesses resume selection can REACH for an id that has records
+ * (live or archived) — every canonical `<id>.jsonl`, both slug forms, in the dirs
+ * `selectFreshestTranscript` probes (`knownTranscriptConfigDirs` with the record's active dir).
+ * `undefined` for an id with no record: acpx cannot resume it, so any kept copy may witness.
+ *
+ * ⚠️ DO NOT LET A COPY IN AN UNREGISTERED DIR (`sub4`) OR A SIDECAR WITNESS A REMOVAL HERE. Selection
+ * cannot see either. A copy FRESHER than the active one, removed against such a witness, would make
+ * the next turn resume from the older active copy: no byte lost, but the session's context rolled
+ * back — CONCEPTION §0's second condition. A reachable witness W with X ⊑ W (or X = W[0..L) + an
+ * exit block) holds every timestamped line of X, so selection then picks W or something fresher.
+ * `test/transcripts-dedup.test.ts` "D3" pins both directions.
+ */
+function reachableWitnessPaths(
+  records: SessionRecord[],
+  registry: SubscriptionRegistry,
+  userHome: string,
+): Set<string> | undefined {
+  if (records.length === 0) {
+    return undefined;
+  }
+  const reachable = new Set<string>();
+  for (const record of records) {
+    const lookup = { registry, homeDir: userHome };
+    const activeConfigDir = activeTranscriptConfigDir(record, lookup);
+    for (const dir of knownTranscriptConfigDirs({ ...lookup, activeConfigDir })) {
+      reachable.add(path.resolve(transcriptJsonlPath(dir, record.cwd, record.acpSessionId)));
+      reachable.add(path.resolve(legacyTranscriptJsonlPath(dir, record.cwd, record.acpSessionId)));
+    }
+  }
+  return reachable;
+}
+
+function isReachableWitness(witness: string, reachable: Set<string> | undefined): boolean {
+  return reachable === undefined || reachable.has(path.resolve(witness));
+}
+
+/** The reason both the planner and the act-time re-check give for a copy kept by the D3 rule. */
+export const WITNESS_UNREACHABLE = "witness-unreachable";
+
 async function guardReason(
   group: SessionFiles,
   found: SessionRecords,
@@ -497,7 +540,12 @@ async function planGroups(
       report.skippedIds.push({ sessionId: group.sessionId, reason: skip });
       continue;
     }
-    plans.push(await planSession(group, activePathsFor(found.records, context), report));
+    const reachable = reachableWitnessPaths(
+      found.records,
+      context.registry,
+      context.homes.userHome,
+    );
+    plans.push(await planSession(group, activePathsFor(found.records, context), reachable, report));
   }
   return plans;
 }
@@ -511,6 +559,7 @@ async function planGroups(
 async function planSession(
   group: SessionFiles,
   activePaths: Set<string>,
+  reachable: Set<string> | undefined,
   report: DedupReport,
 ): Promise<SessionPlan> {
   const kept = group.copies.filter((copy) => activePaths.has(path.resolve(copy.path)));
@@ -518,16 +567,22 @@ async function planSession(
   const actions: DedupAction[] = [];
   const rest = group.copies.filter((copy) => !activePaths.has(path.resolve(copy.path)));
   for (const copy of rankCopies(rest)) {
-    const decision = await decideCopy(copy, witnessOrder(kept, activePaths));
+    const decision = await decideCopy(copy, witnessOrder(kept, activePaths), reachable);
     if ("category" in decision) {
       kept.push(copy);
       report.keptByReason[decision.category] += 1;
+      if (decision.reason) {
+        report.keptFiles.push({ path: copy.path, reason: decision.reason });
+      }
     } else {
       actions.push(decision);
     }
   }
+  const tempWitnesses = witnessOrder(kept, activePaths).filter((witness) =>
+    isReachableWitness(witness.path, reachable),
+  );
   for (const temp of group.temps) {
-    await planOrphanTemp(temp, witnessOrder(kept, activePaths), actions, report);
+    await planOrphanTemp(temp, tempWitnesses, actions, report);
   }
   return { sessionId: group.sessionId, actions };
 }
@@ -553,12 +608,32 @@ function witnessOrder(kept: TranscriptCopy[], activePaths: Set<string>): Transcr
   return kept.toSorted((a, b) => rank(a) - rank(b) || kindRank(a) - kindRank(b) || b.size - a.size);
 }
 
+type KeepDecision = { category: KeepCategory; reason?: string };
+
 async function decideCopy(
   copy: TranscriptCopy,
   witnesses: TranscriptCopy[],
-): Promise<DedupAction | { category: KeepCategory }> {
+  reachable: Set<string> | undefined,
+): Promise<DedupAction | KeepDecision> {
+  const usable = witnesses.filter((witness) => isReachableWitness(witness.path, reachable));
+  const decided = await removalAgainst(copy, usable);
+  if (decided) {
+    return decided;
+  }
+  const unreachable = witnesses.filter((witness) => !isReachableWitness(witness.path, reachable));
+  if (await removalAgainst(copy, unreachable)) {
+    // Provable, but only against a copy resume selection cannot see (D3): kept, and said so.
+    return { category: "other", reason: WITNESS_UNREACHABLE };
+  }
+  return { category: await keepCategory(copy, witnesses[0]) };
+}
+
+/** The first proof that holds: a byte-prefix of any witness, else an exit tail of the preferred one. */
+async function removalAgainst(
+  copy: TranscriptCopy,
+  witnesses: TranscriptCopy[],
+): Promise<DedupAction | undefined> {
   let reduceWith: DedupAction | undefined;
-  let firstReason: string | undefined;
   for (const witness of witnesses) {
     const relation = await classifyAgainstWitness(copy.path, witness.path);
     if (relation.relation === "prefix") {
@@ -566,11 +641,9 @@ async function decideCopy(
     }
     if (relation.relation === "exit-tail") {
       reduceWith ??= reduceAction(copy, witness, relation);
-    } else {
-      firstReason ??= relation.reason;
     }
   }
-  return reduceWith ?? { category: keepCategory(firstReason) };
+  return reduceWith;
 }
 
 function deleteAction(copy: TranscriptCopy, witness: string, sha256: string): DedupAction {
@@ -610,11 +683,24 @@ function reduceAction(
   };
 }
 
-function keepCategory(reason: string | undefined): KeepCategory {
-  if (reason === "tail-not-exit-block:uuid" || reason === "tail-not-exit-block:too-big") {
+/**
+ * COUNTING ONLY (TE defect D1) — what is kept never depends on this. Judged on the copy's whole
+ * unique tail against the preferred kept copy: any uuid- or timestamp-bearing line (a real turn,
+ * `queue-operation` included) is a `branch`; a metadata-only tail T refused (unknown type, size
+ * cap, partial line) is `exit-block-not-eligible`; no witness or no unique tail is `other`.
+ */
+async function keepCategory(
+  copy: TranscriptCopy,
+  witness: TranscriptCopy | undefined,
+): Promise<KeepCategory> {
+  if (!witness) {
+    return "other";
+  }
+  const kind = await uniqueTailKind(copy.path, witness.path);
+  if (kind === "conversation") {
     return "branch";
   }
-  return reason?.startsWith("tail-not-exit-block:") ? "exit-block-not-eligible" : "other";
+  return kind === "metadata" ? "exit-block-not-eligible" : "other";
 }
 
 async function planOrphanTemp(
@@ -657,8 +743,14 @@ async function applyPlans(
         report.skippedIds.push({ sessionId: plan.sessionId, reason: skip });
         continue;
       }
+      // Re-derived from a FRESH registry: a dir unregistered since the plan stops witnessing.
+      const reachable = reachableWitnessPaths(
+        found.records,
+        loadSubscriptionRegistry({ homeDir: context.homes.stateHome }),
+        context.homes.userHome,
+      );
       for (const action of plan.actions) {
-        await applyAction(action, manifest, report, options.hooks);
+        await applyAction(action, manifest, report, { hooks: options.hooks, reachable });
       }
     }
   } finally {
@@ -670,7 +762,7 @@ async function applyAction(
   action: DedupAction,
   manifest: FileHandle,
   report: DedupReport,
-  hooks: DedupHooks | undefined,
+  options: { hooks: DedupHooks | undefined; reachable: Set<string> | undefined },
 ): Promise<void> {
   await appendManifest(manifest, {
     action: action.action === "delete" ? "deleted-prefix" : "reduced-exit-tail",
@@ -682,7 +774,9 @@ async function applyAction(
     tail_file: null,
     at: new Date().toISOString(),
   });
-  const outcome = await runRemoval(action, hooks);
+  const outcome = isReachableWitness(action.witness, options.reachable)
+    ? await runRemoval(action, options.hooks)
+    : ({ action: "kept", reason: WITNESS_UNREACHABLE } as const);
   if (outcome.action === "kept") {
     await appendManifest(manifest, outcomeLine(action.path, "kept", { reason: outcome.reason }));
     report.recheckFailed += 1;

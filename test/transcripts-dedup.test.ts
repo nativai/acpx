@@ -10,6 +10,7 @@ import { TOP_LEVEL_VERBS } from "../src/cli-core.js";
 import {
   formatDedupFinalLine,
   renderDedupJson,
+  renderDedupText,
   restoreExitTail,
   runTranscriptsDedup,
   TranscriptRestoreError,
@@ -353,9 +354,11 @@ test("E1 / E2: the dry run plans exactly the eligible set and changes no byte", 
     assert.deepEqual(plannedPaths(report, "delete"), tree.deletes.toSorted());
     assert.deepEqual(plannedPaths(report, "reduce"), tree.reduces.toSorted());
     assert.deepEqual(report.keptByReason, {
+      // D1: S7's unique tail holds a timestamped queue-operation → a branch, like S8 and S9;
+      // only S11's metadata-only partial tail is exit-block-not-eligible.
       active: 14,
-      branch: 2,
-      "exit-block-not-eligible": 2,
+      branch: 3,
+      "exit-block-not-eligible": 1,
       other: 1,
     });
     assert.deepEqual(report.skippedIds.map((entry) => entry.reason).toSorted(), [
@@ -464,8 +467,8 @@ test("E4 / E5 / E13: --apply removes exactly the plan, every reduction restores,
     // the four ids whose second copy is legitimately kept (S7, S8, S9, S11).
     assert.deepEqual(rerun.keptByReason, {
       active: 4,
-      branch: 2,
-      "exit-block-not-eligible": 2,
+      branch: 3,
+      "exit-block-not-eligible": 1,
       other: 0,
     });
   });
@@ -518,6 +521,195 @@ test("E7: a witness deleted between plan and act keeps the copy (witness-missing
     assert.equal(report.recheckFailed, 1);
     assert.deepEqual(report.keptFiles, [{ path: sidecar, reason: "witness-missing" }]);
     assert.match(formatDedupFinalLine(report), /recheck-failed=1$/);
+  });
+});
+
+// --- TE defects D3, D2, D1 (fix round) -----------------------------------------
+
+/**
+ * D3's shape: the record is bound to subB, whose (active) copy is the OLDEST; subA (registered)
+ * holds a FRESHER copy; the full copy sits in `fullSub`. With `fullSub` = sub4 (unregistered,
+ * invisible to resume selection) subA must be KEPT; with a registered `fullSub` it is removed.
+ */
+async function d3Tree(home: string, fullSub: string) {
+  const id = sessionIdFor(`d3-${fullSub}`);
+  const p = conversation(id, { pairs: 16 });
+  const mid = conversation(id, { pairs: 2, seed: "mid", startMinute: 100, parent: p.lastUuid });
+  const late = conversation(id, { pairs: 2, seed: "late", startMinute: 200, parent: mid.lastUuid });
+  const active = await writeFileAt(copyIn(home, "subB", `${id}.jsonl`), jsonl(p.lines));
+  const fresher = await writeFileAt(
+    copyIn(home, "subA", `${id}.jsonl`),
+    jsonl(p.lines) + jsonl(mid.lines),
+  );
+  const full = await writeFileAt(
+    copyIn(home, fullSub, `${id}.jsonl`),
+    jsonl(p.lines) + jsonl(mid.lines) + jsonl(late.lines),
+  );
+  for (const file of [active, fresher, full]) {
+    await ageFile(file, TWO_HOURS);
+  }
+  await writeRecordFixture(home, {
+    recordId: `rec-d3-${fullSub}`,
+    acpSessionId: id,
+    cwd: CWD,
+    profile: "subB",
+  });
+  return { id, active, fresher, full };
+}
+
+test("D3 / negative: a copy fresher than the active one is NEVER removed against a witness selection cannot reach", async () => {
+  await withHome(async (home) => {
+    const { fresher, full, active } = await d3Tree(home, "sub4");
+    const before = await sha256File(fresher);
+    const dry = await runTranscriptsDedup({ apply: false, stateHome: home, userHome: home });
+    assert.equal(
+      dry.actions.some((a) => a.path === fresher),
+      false,
+      "no plan against sub4",
+    );
+    assert.deepEqual(dry.keptFiles, [{ path: fresher, reason: "witness-unreachable" }]);
+    assert.match(renderDedupText(dry), new RegExp(`KEPT ${fresher} reason=witness-unreachable`));
+    const applied = await runTranscriptsDedup({
+      apply: true,
+      manifest: path.join(home, "m.jsonl"),
+      stateHome: home,
+      userHome: home,
+    });
+    assert.equal(applied.actions.length, 0);
+    assert.equal(await sha256File(fresher), before, "the fresher copy is byte-identical");
+    assert.equal(await exists(full), true);
+    assert.equal(await exists(active), true);
+  });
+});
+
+test("D3 / positive: the same shape with the full copy in a REGISTERED dir is removed", async () => {
+  await withHome(async (home) => {
+    const { fresher, full } = await d3Tree(home, "subC");
+    const report = await runTranscriptsDedup({
+      apply: true,
+      manifest: path.join(home, "m.jsonl"),
+      stateHome: home,
+      userHome: home,
+    });
+    assert.deepEqual(
+      report.actions.map((a) => [a.action, a.path, a.witness]),
+      [["delete", fresher, full]],
+    );
+    assert.deepEqual(report.keptFiles, []);
+  });
+});
+
+test("D3 / act time: a witness whose dir leaves the registry after the plan keeps the copy (same reason)", async () => {
+  await withHome(async (home) => {
+    const { fresher } = await d3Tree(home, "subC");
+    const report = await runTranscriptsDedup({
+      apply: true,
+      manifest: path.join(home, "m.jsonl"),
+      stateHome: home,
+      userHome: home,
+      hooks: { afterPlan: async () => await writeRegistry(home, ["subA", "subB"], "subA") },
+    });
+    assert.equal(await exists(fresher), true);
+    assert.equal(report.recheckFailed, 1);
+    assert.deepEqual(report.keptFiles, [{ path: fresher, reason: "witness-unreachable" }]);
+  });
+});
+
+test("D2: an identical canonical + sidecar pair gets ONE tail file EACH, each restoring its own path and mtime", async () => {
+  await withHome(async (home) => {
+    const id = sessionIdFor("d2-pair");
+    const b = bodies(id);
+    const body = b.pText + jsonl([exitLine("cost-state", id, b.leaf)]);
+    await writeFileAt(copyIn(home, "subB", `${id}.jsonl`), b.full);
+    const canonical = await writeFileAt(copyIn(home, "subA", `${id}.jsonl`), body);
+    const sidecar = await writeFileAt(
+      copyIn(home, "subA", `${id}.superseded-2026-10-05T00-00-00.000Z.jsonl`),
+      body,
+    );
+    for (const file of [copyIn(home, "subB", `${id}.jsonl`), canonical]) {
+      await ageFile(file, TWO_HOURS);
+    }
+    await ageFile(sidecar, TWO_HOURS + 60_000);
+    const mtimeOf = async (f: string) =>
+      Number((await fs.stat(f, { bigint: true })).mtimeNs / 1_000_000n);
+    const before = new Map([
+      [canonical, { sha: await sha256File(canonical), mtime: await mtimeOf(canonical) }],
+      [sidecar, { sha: await sha256File(sidecar), mtime: await mtimeOf(sidecar) }],
+    ]);
+    await writeRecordFixture(home, {
+      recordId: "rec-d2",
+      acpSessionId: id,
+      cwd: CWD,
+      profile: "subB",
+    });
+    const dry = await runTranscriptsDedup({ apply: false, stateHome: home, userHome: home });
+    const report = await runTranscriptsDedup({
+      apply: true,
+      manifest: path.join(home, "m.jsonl"),
+      stateHome: home,
+      userHome: home,
+    });
+    const reduces = report.actions.filter((a) => a.action === "reduce");
+    assert.equal(reduces.length, 2);
+    assert.equal(new Set(reduces.map((a) => a.tailFile)).size, 2, "one tail file per reduced copy");
+    const tailFiles = (line: string) => /tail-files=(\d+)\//.exec(line)?.[1];
+    assert.equal(tailFiles(formatDedupFinalLine(dry)), "2");
+    assert.equal(
+      tailFiles(formatDedupFinalLine(report)),
+      "2",
+      "the dry run counts what --apply writes",
+    );
+    for (const action of reduces) {
+      // No --to: each rebuilds at ITS OWN original path, sidecar name included, with its own mtime.
+      const restored = await restoreExitTail(action.tailFile ?? "", {
+        stateHome: home,
+        userHome: home,
+      });
+      assert.equal(restored.restored, action.path);
+      assert.equal(await sha256File(action.path), before.get(action.path)?.sha);
+      assert.equal(await mtimeOf(action.path), before.get(action.path)?.mtime);
+    }
+  });
+});
+
+test("D1: keep categories are judged on the whole unique tail (counting only)", async () => {
+  await withHome(async (home) => {
+    const add = async (label: string, tail: string[]) => {
+      const id = sessionIdFor(label);
+      const b = bodies(id);
+      await writeFileAt(copyIn(home, "subB", `${id}.jsonl`), b.full);
+      await writeFileAt(copyIn(home, "subA", `${id}.jsonl`), b.pText + jsonl(tail));
+      await ageFile(copyIn(home, "subB", `${id}.jsonl`), TWO_HOURS);
+      await ageFile(copyIn(home, "subA", `${id}.jsonl`), TWO_HOURS);
+      await writeRecordFixture(home, {
+        recordId: `rec-${label}`,
+        acpSessionId: id,
+        cwd: CWD,
+        profile: "subB",
+      });
+      return { id, b };
+    };
+    // A real continuation begins with timestamped queue-operation lines, then user/assistant turns.
+    const cont = sessionIdFor("d1-continuation");
+    const cb = bodies(cont);
+    const turns = conversation(cont, { pairs: 1, seed: "cont", startMinute: 50, parent: cb.leaf });
+    // It ENDS with a timestamped, uuid-less `api-request` line (as real turns do): judged on that
+    // last line alone it would read `tail-not-exit-block:timestamp` → exit-block-not-eligible.
+    const apiRequest = JSON.stringify({
+      type: "api-request",
+      timestamp: "2026-10-01T01:00:00.000Z",
+    });
+    await add("d1-continuation", [queueOperationLine(cont, 49), ...turns.lines, apiRequest]);
+    // Metadata only, but a type T does not know: kept as exit-block-not-eligible.
+    await add("d1-unknown-type", [JSON.stringify({ type: "worktree-state", sessionId: "x" })]);
+    const report = await runTranscriptsDedup({ apply: false, stateHome: home, userHome: home });
+    assert.equal(report.actions.length, 0, "nothing removed");
+    assert.deepEqual(report.keptByReason, {
+      active: 2,
+      branch: 1,
+      "exit-block-not-eligible": 1,
+      other: 0,
+    });
   });
 });
 

@@ -2,6 +2,7 @@ import { createHash, randomBytes, type Hash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { getAcpxVersion } from "../version.js";
 
 // The ONLY place acpx removes a Claude transcript file (brick 81433524, CONCEPTION
@@ -244,6 +245,66 @@ async function classifyOpened(pair: OpenedPair): Promise<WitnessRelation> {
     tailBytes: located.tail.length,
     sha256: digest.original,
   };
+}
+
+export type UniqueTailKind = "conversation" | "metadata" | "none";
+
+/**
+ * READ-ONLY, for the verb's keep COUNTS only (never for a decision to remove): what the copy holds
+ * beyond its common prefix with `witnessPath`, from the last line boundary at or before that prefix
+ * to EOF. `conversation`: at least one line carries a `uuid` or a `timestamp` (a real turn — a
+ * `queue-operation` line included). `metadata`: none does (an exit-block-like tail T refused for
+ * its type, size or a partial line). `none`: no unique tail at all (the copy is a prefix).
+ */
+export async function uniqueTailKind(
+  candidatePath: string,
+  witnessPath: string,
+): Promise<UniqueTailKind> {
+  return await withPair(candidatePath, witnessPath, uniqueTailKindOpened, () => "none");
+}
+
+async function uniqueTailKindOpened(pair: OpenedPair): Promise<UniqueTailKind> {
+  const { candidate, witness } = pair;
+  const limit = Math.min(candidate.size, witness.size);
+  const mismatch = await firstMismatch(pair, 0, limit, undefined, undefined);
+  const lcp = mismatch >= 0 ? mismatch : limit;
+  if (lcp >= candidate.size) {
+    return "none";
+  }
+  const start = await lineStartAtOrBefore(candidate, lcp);
+  return (await tailHasConversationLine(candidate, start)) ? "conversation" : "metadata";
+}
+
+async function lineStartAtOrBefore(file: OpenedFile, offset: number): Promise<number> {
+  for (let end = offset; end > 0; end = Math.max(0, end - TAIL_CHECK_BYTES)) {
+    const from = Math.max(0, end - TAIL_CHECK_BYTES);
+    const index = (await readAt(file.handle, from, end - from)).lastIndexOf(NEWLINE);
+    if (index >= 0) {
+      return from + index + 1;
+    }
+  }
+  return 0;
+}
+
+async function tailHasConversationLine(file: OpenedFile, start: number): Promise<boolean> {
+  // A decoder, not chunk.toString(): a multi-byte character split across two chunks must not
+  // garble the line it sits in.
+  const decoder = new StringDecoder("utf8");
+  let carry = "";
+  for (let offset = start; offset < file.size; offset += CHUNK_BYTES) {
+    const chunk = await readAt(file.handle, offset, Math.min(CHUNK_BYTES, file.size - offset));
+    const lines = (carry + decoder.write(chunk)).split("\n");
+    carry = lines.pop() ?? "";
+    if (lines.some(isConversationLine)) {
+      return true;
+    }
+  }
+  return isConversationLine(carry);
+}
+
+function isConversationLine(line: string): boolean {
+  const parsed = parseJsonObject(line);
+  return parsed !== undefined && ("uuid" in parsed || "timestamp" in parsed);
 }
 
 /** The size of the exit-tail file a reduction would write (header line + T). */
@@ -896,8 +957,16 @@ async function findMatchingExitTailFile(
   return undefined;
 }
 
+/**
+ * The SAME copy reduced again: same path and mtime as well as the same bytes. ⚠️ Matching on the
+ * bytes alone would let two identical copies (a canonical and its sidecar) share one tail file,
+ * and the second copy's NAME and MTIME would then be recorded nowhere: `restore` could only ever
+ * rebuild the first (TE defect D2). Every reduced copy gets its own file.
+ */
 function sameReduction(a: ExitTailHeader, b: ExitTailHeader): boolean {
   return (
+    a.original_path === b.original_path &&
+    a.original_mtime_ms === b.original_mtime_ms &&
     a.original_sha256 === b.original_sha256 &&
     a.prefix_bytes === b.prefix_bytes &&
     a.prefix_sha256 === b.prefix_sha256 &&
