@@ -4,6 +4,7 @@ import {
   readAcpxUiInternalOriginSources,
   resolveAtriumLocalOrigin,
 } from "../acp/acpx-ui-internal-origin.js";
+import { runtimeInfoPathFor } from "../models/claude-advertisement.js";
 import type { ArchiveIndexEntry } from "../session/archive/archive-index.js";
 import {
   createAtriumReaderProbe,
@@ -91,9 +92,6 @@ export type SessionsArchiveFlags = {
   manifestOut?: string;
   deep?: boolean;
 };
-
-/** Where `/data/runtime/info.json` lives on a box (CONCEPTION §3.13 pre-flight). */
-const RUNTIME_INFO_PATH = "/data/runtime/info.json";
 
 const BYTE_UNITS: Record<string, number> = {
   "": 1,
@@ -838,7 +836,9 @@ async function runCompressVerb(
       readerProbe: createAtriumReaderProbe(
         resolveAtriumLocalOrigin(process.env, readAcpxUiInternalOriginSources()),
       ),
-      runtimeInfoPath: RUNTIME_INFO_PATH,
+      // The box's runtime record (CONCEPTION §3.13 pre-flight) — the same resolver and
+      // test seam (`ACPX_RUNTIME_INFO_PATH`) the adapter advertisement uses.
+      runtimeInfoPath: runtimeInfoPathFor(process.env),
     });
   } catch (error) {
     if (error instanceof ArchiveRefusal && flags.json) {

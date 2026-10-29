@@ -1027,10 +1027,14 @@ export async function rewriteShardBytes(
   if (touchedSafeIds.size === 0) {
     return [];
   }
+  const shardKeys = await listArchiveIndexShardKeys(context.archiveDir);
+  if (shardKeys.length === 0) {
+    return [];
+  }
   const fileSets = claimArchiveFileSets(await fs.readdir(context.archiveDir));
   const rewritten: string[] = [];
   await withArchiveIndexLock(context.archiveDir, async () => {
-    for (const shardKey of await listArchiveIndexShardKeys(context.archiveDir)) {
+    for (const shardKey of shardKeys) {
       const read = await readArchiveIndexShard(context.archiveDir, shardKey);
       if (read.status !== "ok") {
         continue;

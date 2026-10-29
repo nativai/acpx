@@ -512,9 +512,17 @@ export async function writeNewFileSynced(target: string, data: Buffer): Promise<
   }
 }
 
-/** mtime to node's utimes precision (sub-microsecond digits are lost). */
+/**
+ * Give `target` the mtime `mtimeMs`, exact to the MICROSECOND.
+ *
+ * ⚠️ NOT `utimes(target, ms / 1000, ms / 1000)`. node passes float seconds and libuv
+ * TRUNCATES them to a timespec; a double near 1.8e9 s carries ~0.24 µs of error, so a
+ * plain `…123 ms` came back as `…122.999 ms` (measured). Rounding to whole µs and adding
+ * half a µs makes the truncation land on the intended microsecond.
+ */
 export async function setMtime(target: string, mtimeMs: number): Promise<void> {
-  await fs.utimes(target, mtimeMs / 1000, mtimeMs / 1000);
+  const seconds = (Math.round(mtimeMs * 1000) + 0.5) / 1e6;
+  await fs.utimes(target, seconds, seconds);
 }
 
 export function stagingTempName(stagingDir: string, logicalName: string): string {
