@@ -109,6 +109,8 @@ import type {
 import {
   backgroundTasksField,
   backgroundTasksJson,
+  closeRetryArgs,
+  templateRetryArgs,
   emitLiveBackgroundTasksRefusal,
   evaluateBackgroundTaskGate,
   reportBackgroundTaskOutcome,
@@ -2891,6 +2893,7 @@ export async function handleSessionsClose(
     killBackgroundTasks: flags.killBackgroundTasks,
     explicitAgentName,
     verb: "close",
+    retryArgs: closeRetryArgs(flags),
   });
   if (refusal) {
     emitLiveBackgroundTasksRefusal(refusal, globalFlags.format);
@@ -3739,6 +3742,7 @@ export async function handleSessionsTemplate(
     killBackgroundTasks: flags.killBackgroundTasks,
     explicitAgentName: _explicitAgentName,
     verb: "template",
+    retryArgs: templateRetryArgs(flags),
   });
   if (refusal) {
     emitLiveBackgroundTasksRefusal(refusal, globalFlags.format);

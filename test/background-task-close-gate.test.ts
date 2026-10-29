@@ -12,8 +12,10 @@ import {
   backgroundTaskRetryCommand,
   backgroundTasksJson,
   evaluateBackgroundTaskGate,
+  closeRetryArgs,
   liveBackgroundTasksErrorMessage,
   liveBackgroundTasksRefusalText,
+  templateRetryArgs,
 } from "../src/cli/background-task-gate.js";
 import { tryQueryBackgroundTasksOnRunningOwner } from "../src/cli/queue/ipc.js";
 import { readQueueOwnerProcessIdentity } from "../src/cli/queue/lease-store.js";
@@ -70,6 +72,42 @@ async function runCli(args: string[], homeDir: string): Promise<CliResult> {
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error(`acpx ${args.join(" ")} timed out`));
+    }, 60_000);
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
+
+/**
+ * Runs a printed command LITERALLY through `sh -c`, with an `acpx` on PATH that is this build —
+ * what an agent does when it pastes the retry line into its Bash tool.
+ */
+async function runShellLiterally(command: string, homeDir: string): Promise<CliResult> {
+  const binDir = path.join(homeDir, "shim-bin");
+  await fsp.mkdir(binDir, { recursive: true });
+  const shim = path.join(binDir, "acpx");
+  await fsp.writeFile(shim, `#!/bin/sh\nexec "${process.execPath}" "${CLI_PATH}" "$@"\n`);
+  await fsp.chmod(shim, 0o755);
+  const env = { ...cliEnv(homeDir), PATH: `${binDir}:${process.env.PATH ?? ""}` };
+  return await new Promise((resolve, reject) => {
+    const child = spawn("sh", ["-c", command], {
+      env,
+      cwd: homeDir,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`sh -c ${command} timed out`));
     }, 60_000);
     child.once("exit", (code) => {
       clearTimeout(timer);
@@ -245,6 +283,32 @@ test("C2 JSON error text and C3 template wording", () => {
   assert.equal(
     backgroundTaskRetryCommand("template", "s1", undefined),
     "acpx sessions template s1 --kill-background-tasks",
+  );
+});
+
+test("HoD ruling: the retry command carries EVERY user-supplied verb option, shell-quoted", () => {
+  assert.deepEqual(closeRetryArgs({}), []);
+  assert.equal(
+    backgroundTaskRetryCommand(
+      "close",
+      "s1",
+      "claude",
+      closeRetryArgs({ drain: false, drainTimeout: 1234, failOnUndelivered: true }),
+    ),
+    "acpx claude sessions close --session-id s1 --no-drain --drain-timeout 1234 --fail-on-undelivered --kill-background-tasks",
+  );
+  assert.equal(
+    backgroundTaskRetryCommand(
+      "template",
+      "s1",
+      undefined,
+      templateRetryArgs({ enable: true, slug: "my-slug", autoPrompt: "Don't stop: run $HOME `x`" }),
+    ),
+    "acpx sessions template s1 --enable --slug my-slug --auto-prompt 'Don'\\''t stop: run $HOME `x`' --kill-background-tasks",
+  );
+  assert.equal(
+    backgroundTaskRetryCommand("template", "s1", undefined, templateRetryArgs({ autoPrompt: "" })),
+    "acpx sessions template s1 --auto-prompt '' --kill-background-tasks",
   );
 });
 
@@ -448,9 +512,13 @@ test("G2 + G4: the retryCommand, executed LITERALLY, closes and kills — every 
       );
       assert.equal(refused.code, 7);
       const retry = String(jsonLines(refused.stdout)[0]?.retryCommand);
-      const argv = retry.split(" ");
-      assert.equal(argv[0], "acpx");
-      const forced = await runCli(["--format", "json", ...argv.slice(1)], homeDir);
+      assert.match(retry, /^acpx /);
+      // JSON for the assertions: `--format` is a GLOBAL option, so it goes right after `acpx`; the
+      // rest of the printed command is pasted unchanged.
+      const forced = await runShellLiterally(
+        retry.replace(/^acpx /, "acpx --format json "),
+        homeDir,
+      );
       assert.equal(forced.code, 0, forced.stderr);
       const closed = jsonLines(forced.stdout).find((line) => line.action === "session_closed");
       assert.ok(closed, forced.stdout);
@@ -607,7 +675,8 @@ test("G5 template: refused (exit 7, nothing marked), then --kill-background-task
       assert.match(String(refusal?.error), /marking it as a template closes it/);
       assert.equal(
         refusal?.retryCommand,
-        `acpx sessions template ${sessionId} --kill-background-tasks`,
+        // HoD ruling: the caller's own options are carried into the retry.
+        `acpx sessions template ${sessionId} --slug g5 --kill-background-tasks`,
       );
       assert.equal(await recordClosed(homeDir, sessionId), false);
       assert.ok(aliveAs(rig.pids.sleepPid, rig.ticks.sleepPid));
@@ -717,6 +786,49 @@ test("HoD Q4: the chip-clear line is the adapter's own shape with tasks:[], and 
       );
     } finally {
       process.env.HOME = prev;
+    }
+  });
+});
+
+test("HoD ruling: a template refusal with --slug and --auto-prompt prints a retryCommand that, run LITERALLY through a shell, yields the SAME template", async (t) => {
+  if (!linux) {
+    t.skip("linux /proc");
+    return;
+  }
+  await withHome(async (homeDir) => {
+    const sessionId = "g5-intent";
+    const autoPrompt = "Don't stop: run the suite in $PWD, then `report`";
+    await writeRecord(homeDir, sessionId);
+    const rig = await startOwnerRig(homeDir, "owner", sessionId);
+    try {
+      const refused = await runCli(
+        ["sessions", "template", sessionId, "--slug", "intent-slug", "--auto-prompt", autoPrompt],
+        homeDir,
+      );
+      assert.equal(refused.code, 7, refused.stderr);
+      const printed = refused.stderr.trimEnd().split("\n").at(-1)?.trim() ?? "";
+      assert.match(printed, /--slug intent-slug --auto-prompt '.*' --kill-background-tasks$/);
+      assert.equal(await recordClosed(homeDir, sessionId), false, "a refusal marks nothing");
+
+      const forced = await runShellLiterally(printed, homeDir);
+      assert.equal(forced.code, 0, forced.stderr);
+      const record = JSON.parse(
+        await fsp.readFile(path.join(homeDir, ".acpx", "sessions", `${sessionId}.json`), "utf8"),
+      ) as {
+        closed?: boolean;
+        template?: { enabled?: boolean; slug?: string; auto_prompt?: string };
+      };
+      assert.equal(record.closed, true);
+      assert.equal(record.template?.enabled, true);
+      assert.equal(record.template?.slug, "intent-slug");
+      assert.equal(
+        record.template?.auto_prompt,
+        autoPrompt,
+        "the auto-prompt survived the shell byte for byte",
+      );
+      assert.ok(!aliveAs(rig.pids.sleepPid, rig.ticks.sleepPid));
+    } finally {
+      rig.kill();
     }
   });
 });

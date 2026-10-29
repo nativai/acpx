@@ -47,20 +47,62 @@ export type BackgroundTasksJson = {
 };
 
 /**
- * ⚠️ THE RETRY COMMAND MUST DO THE RIGHT THING WHEN RUN LITERALLY. Always `--session-id <the
- * resolved acpxRecordId>` — never the caller's `--seat` or a name, which could resolve to another
- * session by the time it runs — the agent token only if the caller gave one, and no `--format`.
- * `test/background-task-close-gate.test.ts` EXECUTES it.
+ * ⚠️ THE RETRY COMMAND MUST DO THE RIGHT THING WHEN RUN LITERALLY, AND REPRODUCE THE CALLER'S
+ * INTENT (HoD ruling 2026-10-29, amending the Contract's template example). It is the caller's own
+ * command plus `--kill-background-tasks`:
+ *   - `--session-id <the resolved acpxRecordId>` — never the caller's `--seat` or a name, which could
+ *     resolve to another session by the time it runs;
+ *   - the agent token only if the caller gave one, and no `--format`;
+ *   - EVERY option the caller gave the verb (`retryArgs`, from {@link closeRetryArgs} /
+ *     {@link templateRetryArgs}), shell-quoted — a retry that dropped `--slug` or `--auto-prompt`
+ *     would mark a DIFFERENT template.
+ * `test/background-task-close-gate.test.ts` EXECUTES it through a shell.
  */
 export function backgroundTaskRetryCommand(
   verb: BackgroundTaskGateVerb,
   acpxRecordId: string,
   explicitAgentName: string | undefined,
+  retryArgs: readonly string[] = [],
 ): string {
   const agent = explicitAgentName ? [explicitAgentName] : [];
   const target =
     verb === "close" ? ["close", "--session-id", acpxRecordId] : ["template", acpxRecordId];
-  return ["acpx", ...agent, "sessions", ...target, KILL_BACKGROUND_TASKS_FLAG].join(" ");
+  return ["acpx", ...agent, "sessions", ...target, ...retryArgs, KILL_BACKGROUND_TASKS_FLAG]
+    .map(shellQuote)
+    .join(" ");
+}
+
+const SHELL_SAFE = /^[A-Za-z0-9_@%+=:,./-]+$/;
+
+/** POSIX single-quoting for anything that is not plainly safe (`''` for the empty string). */
+export function shellQuote(arg: string): string {
+  return SHELL_SAFE.test(arg) ? arg : `'${arg.replaceAll("'", "'\\''")}'`;
+}
+
+/** The `sessions close` options the caller gave, as argv (Commander's `--no-drain` is `drain:false`). */
+export function closeRetryArgs(flags: {
+  drain?: boolean;
+  drainTimeout?: number;
+  failOnUndelivered?: boolean;
+}): string[] {
+  return [
+    ...(flags.drain === false ? ["--no-drain"] : []),
+    ...(flags.drainTimeout !== undefined ? ["--drain-timeout", String(flags.drainTimeout)] : []),
+    ...(flags.failOnUndelivered ? ["--fail-on-undelivered"] : []),
+  ];
+}
+
+/** The `sessions template` options the caller gave, as argv. `--auto-prompt ""` (clear) is kept. */
+export function templateRetryArgs(flags: {
+  enable?: boolean;
+  slug?: string;
+  autoPrompt?: string;
+}): string[] {
+  return [
+    ...(flags.enable ? ["--enable"] : []),
+    ...(flags.slug !== undefined ? ["--slug", flags.slug] : []),
+    ...(flags.autoPrompt !== undefined ? ["--auto-prompt", flags.autoPrompt] : []),
+  ];
 }
 
 /** `7m24s`, `1m03s`, `0m09s` — the owner log's age format. */
@@ -127,6 +169,8 @@ export async function evaluateBackgroundTaskGate(params: {
   killBackgroundTasks: boolean | undefined;
   explicitAgentName: string | undefined;
   verb: BackgroundTaskGateVerb;
+  /** The caller's own verb options, reproduced in the retry command. */
+  retryArgs?: readonly string[];
   query?: (sessionId: string) => Promise<BackgroundTasksQuery>;
 }): Promise<{ refusal?: LiveBackgroundTasksRefusal; gate: BackgroundTasksGate }> {
   // Lazy: this module is on every CLI start path; the queue client is needed only by a close.
@@ -149,6 +193,7 @@ export async function evaluateBackgroundTaskGate(params: {
         params.verb,
         params.record.acpxRecordId,
         params.explicitAgentName,
+        params.retryArgs,
       ),
     },
   };

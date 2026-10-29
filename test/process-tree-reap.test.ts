@@ -111,12 +111,23 @@ async function spawnTree(dir: string, options: { nested?: boolean } = {}): Promi
   let nestedOwnerPid: number | undefined;
   let nestedChildPid: number | undefined;
   if (options.nested) {
+    // Scoped to THIS tree: other test files spawn real `__queue-owner` processes concurrently, so a
+    // box-wide match would latch onto a foreign owner (it did, once, in the full suite).
+    const cliPid = await waitFor(
+      () =>
+        all().find((pid) => {
+          const e = entry(pid);
+          return e?.sid === written.shellPid && e.comm === "node";
+        }),
+      "the nested cli",
+    );
     nestedOwnerPid = await waitFor(
       () =>
         all().find((pid) => {
           const e = entry(pid);
           return (
             e !== undefined &&
+            e.ppid === cliPid &&
             e.pid === e.sid &&
             fs.readFileSync(`/proc/${pid}/cmdline`, "latin1").includes("\0__queue-owner")
           );
