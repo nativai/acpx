@@ -596,15 +596,32 @@ async function corruptStagedForTest(temp: string): Promise<void> {
   }
 }
 
-type PlainIdentity = { dev: number; ino: number; size: number; mtimeMs: number };
+type PlainIdentity = { dev: number; ino: number; size: number; mtimeMs: number; mode: number };
 
 function identityOf(stat: {
   dev: number;
   ino: number;
   size: number;
   mtimeMs: number;
+  mode: number;
 }): PlainIdentity {
-  return { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs };
+  return {
+    dev: stat.dev,
+    ino: stat.ino,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    mode: permissionBits(stat.mode),
+  };
+}
+
+/**
+ * The permission bits of a file — carried by the `.zst` FILE (not the footer) and handed
+ * back on decompression. ⚠️ Without this, a decompressed file kept the staging temp's
+ * 0600 where the original was 0644 (TE, 2026-10-29); `writeNewFileSynced` creates 0600
+ * on purpose, so the mode must be set explicitly after the fact.
+ */
+export function permissionBits(mode: number): number {
+  return mode & 0o7777;
 }
 
 function sameIdentity(a: PlainIdentity, b: PlainIdentity): boolean {
@@ -659,7 +676,7 @@ async function stageCompressed(
   encoded: Buffer,
   logical: Buffer,
   logicalSha256: string,
-  mtimeMs: number,
+  plain: PlainIdentity,
 ): Promise<{ ok: true } | { ok: false; error: string; detail: string }> {
   try {
     await writeNewFileSynced(temp, encoded);
@@ -680,7 +697,8 @@ async function stageCompressed(
     return { ok: false, error: "verify-failed", detail: (error as Error).message };
   }
   crashSeam(5);
-  await setMtime(temp, mtimeMs);
+  await fs.chmod(temp, plain.mode);
+  await setMtime(temp, plain.mtimeMs);
   return { ok: true };
 }
 
@@ -788,7 +806,7 @@ export async function compressArchivedFile(params: {
 
   await params.journal.begin(logicalName, logical.length, logicalSha256);
   const temp = stagingTempName(stagingDir, logicalName);
-  const staged = await stageCompressed(temp, encoded, logical, logicalSha256, identity.mtimeMs);
+  const staged = await stageCompressed(temp, encoded, logical, logicalSha256, identity);
   if (!staged.ok) {
     return { status: "failed", error: staged.error, detail: staged.detail, ...sizes };
   }
@@ -850,8 +868,11 @@ export async function stageDecompressed(
   const handle = await fs.open(zstPath, "r");
   let data: Buffer;
   let mtimeMs: number;
+  let mode: number;
   try {
-    mtimeMs = (await handle.stat()).mtimeMs;
+    const stat = await handle.stat();
+    mtimeMs = stat.mtimeMs;
+    mode = permissionBits(stat.mode);
     data = await handle.readFile();
   } finally {
     await handle.close();
@@ -865,6 +886,8 @@ export async function stageDecompressed(
     if (reread.length !== logical.length || sha256Hex(reread) !== logicalSha256) {
       throw new ArchivedFileCorrupt(temp, "hash", "staged plain re-read differs");
     }
+    // The `.zst` carries the original's mode (see `permissionBits`); give it back.
+    await fs.chmod(temp, mode);
     await setMtime(temp, mtimeMs);
   } catch (error) {
     await unlinkQuietly(temp);

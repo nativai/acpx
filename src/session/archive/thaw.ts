@@ -6,6 +6,7 @@ import {
   compressibleFamilyOf,
   logicalFileSet,
   readArchivedFileVerified,
+  resolveArchivedFile,
   setMtime,
   statArchivedFile,
   type TranscriptFamily,
@@ -224,15 +225,41 @@ export function thawErrorJson(id: string, to: string, error: Error & { code?: st
 }
 
 /**
- * `--cat <logical-file>` — verified logical bytes. A bare name resolves in the archive
- * dir; a `.zst` suffix is accepted and stripped (the logical name is what is read).
+ * `--cat <name>` — the verified logical bytes of ONE archive file, by its archive NAME.
+ * A `.zst` suffix is accepted and stripped (the logical name is what is read).
+ *
+ * ⚠️ NAMES ONLY, NEVER PATHS (TE, 2026-10-29): a slash-bearing argument used to resolve
+ * against the cwd and an absolute one was read as-is (`--cat /etc/hostname` printed it),
+ * and `--cat ''` died with EISDIR. Anything that is not a plain file name of a session
+ * file (`<id>.<suffix>`: no `/`, no `..`, not hidden, non-empty) is refused, exit 2.
  */
 export async function catArchivedFile(archiveDir: string, name: string): Promise<Buffer> {
-  const dir = name.includes("/") ? path.dirname(path.resolve(name)) : archiveDir;
-  const logical = path.basename(name).replace(/\.zst$/, "");
-  const read = await readArchivedFileVerified(dir, logical);
+  const logical = assertArchiveFileName(name).replace(/\.zst$/, "");
+  const resolved = await resolveArchivedFile(archiveDir, logical);
+  if (resolved.form !== "absent" && !(await fs.stat(resolved.path)).isFile()) {
+    throw new ArchiveRefusal(`--cat ${name}: ${logical} is not a regular file`, "bad-argument");
+  }
+  const read = await readArchivedFileVerified(archiveDir, logical);
   if (!read) {
-    throw new ArchiveRefusal(`${path.join(dir, logical)} is absent in both forms`, "absent");
+    throw new ArchiveRefusal(`${path.join(archiveDir, logical)} is absent in both forms`, "absent");
   }
   return read.bytes;
+}
+
+/** A session file NAME in the archive dir: `<id>.<suffix>`, nothing that walks a path. */
+export function assertArchiveFileName(name: string): string {
+  const reason =
+    name.length === 0
+      ? "is empty"
+      : /[/\\]/.test(name) || name.includes("\u0000")
+        ? "contains a path separator — pass an archive file NAME, not a path"
+        : name.startsWith(".")
+          ? "is a hidden name or a relative path component"
+          : !name.includes(".")
+            ? "is not a session file name (<id>.<suffix>)"
+            : undefined;
+  if (reason) {
+    throw new ArchiveRefusal(`--cat '${name}' ${reason}`, "bad-argument");
+  }
+  return name;
 }

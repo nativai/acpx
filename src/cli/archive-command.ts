@@ -10,6 +10,7 @@ import {
   createAtriumReaderProbe,
   runCompressSweep,
   runDecompressSweep,
+  uniqueSweepWave,
   type CompressRunResult,
   type DecompressRunResult,
 } from "../session/archive/compress-sweep.js";
@@ -274,7 +275,7 @@ async function dispatchArchive(flags: SessionsArchiveFlags, command: Command): P
   if (flags.cat != null) {
     return await runCatVerb(flags);
   }
-  const context = createContext(sessionBaseDir(), flags.wave ?? wavePrefixFor(flags));
+  const context = contextFor(flags);
   warnIfDetached(context);
   const flagVerb = flagVerbFor(flags);
   if (flagVerb) {
@@ -287,6 +288,19 @@ async function dispatchArchive(flags: SessionsArchiveFlags, command: Command): P
   // None is dry-run-able, so none has an intent to state. (`--compress` and
   // `--decompress` ARE dry-run-able and state their own intent — `sweepIntent`.)
   return await runArchiveVerb(context, flags, command);
+}
+
+/**
+ * Sweeps get a per-RUN wave (ms + random): their run record and `--manifest-out` are
+ * keyed on it. Every other verb keeps `waveToken` — MANIFEST.tsv rows depend on it.
+ */
+function contextFor(flags: SessionsArchiveFlags): ArchiveContext {
+  const created = createContext(sessionBaseDir(), flags.wave ?? wavePrefixFor(flags));
+  const isSweep =
+    flags.compress === true || (flags.decompress != null && flags.decompress !== false);
+  return isSweep
+    ? { ...created, wave: uniqueSweepWave(flags.wave ?? wavePrefixFor(flags), created.nowMs) }
+    : created;
 }
 
 function wavePrefixFor(flags: SessionsArchiveFlags): string {
