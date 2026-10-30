@@ -35,6 +35,7 @@ Claude Code keeps a session's transcript inside the subscription's config dir, s
 
 - The port removes the destination it replaces when that destination is a byte-prefix of the new copy. When it is the new copy's prefix plus the exit-metadata block Claude Code appends when it exits (`last-prompt`, `cost-state`, …), it is reduced: the block goes byte-exactly into `<id>.exit-tail-<ISO>.acpx`. A real divergence stays as `<id>.superseded-<ISO>.jsonl`.
 - The copy left in the previous subscription is removed or reduced at the queue owner's idle exit, after the owner's process group (adapter and Claude Code included) is empty. It is never removed at the port, because the old Claude Code process is still alive there and would recreate the file when it exits.
+- A close from outside (`acpx sessions close`, acpx-ui) does the same as its last step, once the queue owner, its process group and the recorded adapter are proven gone and the record reads back closed. A session that closes itself keeps the copy for `acpx transcripts dedup`.
 - A copy with no timestamped entry (only exit metadata) never wins the freshest-copy selection.
 - `acpx transcripts dedup` cleans up copies that already exist (dry run unless `--apply --manifest <file>`). `acpx transcripts restore <tail-file>` rebuilds a reduced copy, checked against its sha256.
 

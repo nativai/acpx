@@ -180,6 +180,14 @@ Repo: https://github.com/openclaw/acpx
   New `acpx transcripts dedup` (dry run unless `--apply --manifest <file>`) cleans up
   copies that already exist. `acpx transcripts restore` rebuilds a reduced copy bit
   for bit. (brick 81433524)
+- Claude transcripts: closing a session from outside (`acpx sessions close`, acpx-ui)
+  now also removes the copy it left in its previous subscription, as the close's
+  last step. It runs once the queue owner, its whole process group and the recorded
+  adapter are proven gone and `closed:true` is read back. The rules are the
+  idle-exit ones: a byte-prefix is deleted, an exit-block copy is reduced, anything
+  else is kept. It skips a copy written in the last 60 s and is bounded to
+  2 s / 256 MiB. The close's output is unchanged. A session that closes itself keeps
+  the copy for `acpx transcripts dedup`. (brick 1e77037f)
 
 ### Breaking
 

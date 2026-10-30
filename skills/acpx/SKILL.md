@@ -377,7 +377,7 @@ A prune takes everything acpx owns for that session: the JSON record, the messag
 
 ### Claude transcript copies
 
-A Claude subscription switch copies the session's transcript JSONL into the new subscription's dir. acpx removes the duplicates on its own: at the port, and at the queue owner's idle exit. A duplicate is deleted when it is a byte-prefix of the live copy. It is reduced to an `<id>.exit-tail-<ISO>.acpx` file when it is the live copy's prefix plus Claude Code's exit metadata. A copy with its own conversation lines is never touched.
+A Claude subscription switch copies the session's transcript JSONL into the new subscription's dir. acpx removes the duplicates on its own: at the port, at the queue owner's idle exit, and as the last step of a close from outside (`acpx sessions close`; not a self-close). A duplicate is deleted when it is a byte-prefix of the live copy. It is reduced to an `<id>.exit-tail-<ISO>.acpx` file when it is the live copy's prefix plus Claude Code's exit metadata. A copy with its own conversation lines is never touched.
 
 For copies that already exist on a box:
 
