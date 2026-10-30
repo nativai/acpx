@@ -95,6 +95,7 @@ import type {
   SessionSetSubscriptionOptions,
   SessionSetSubscriptionResult,
 } from "./contracts.js";
+import { observeOwnerBeforeStop, reapTranscriptsAfterClose } from "./owner-exit-transcript-reap.js";
 import { clearBackgroundTaskChipAfterReap } from "./owner-task-reap.js";
 import {
   runSessionSetConfigOptionDirect,
@@ -872,6 +873,7 @@ export async function closeSession(
   sessionId: string,
   options: CloseSessionOptions = {},
 ): Promise<SessionCloseResult> {
+  const closeStartedAt = Date.now();
   const record = await resolveSessionRecord(sessionId);
 
   // Self-close detection FIRST — it decides which of the two arms runs.
@@ -883,6 +885,9 @@ export async function closeSession(
   // The owner generation this close drains and sends `close_session` to — the ONLY one it may
   // retire (port of openclaw/acpx 44a0a18e). A successor that started meanwhile is never signalled.
   const drainedOwner = (await readQueueOwnerRecord(record.acpxRecordId)) ?? null;
+  // brick 1e77037f D5: the owner as it was BEFORE the stop (alive + verified, group leader?), so the
+  // close-time transcript reap can prove that owner and its whole group dead afterwards.
+  const ownerBeforeStop = observeOwnerBeforeStop(drainedOwner);
 
   // Step 0.5 — ask the owner to give up its custody honestly BEFORE anything
   // kills it. Until this existed, step 2 below actively killed the very process
@@ -913,6 +918,7 @@ export async function closeSession(
     );
   }
 
+  const adapterAtClose = { pid: record.pid, pidIdentity: record.pidIdentity };
   record.pid = undefined;
   record.pidIdentity = undefined;
   record.closed = true;
@@ -924,6 +930,19 @@ export async function closeSession(
   const recordClosedState = await readBackRecordClosedState(record.acpxRecordId);
 
   releaseConfigDirOnTerminalClose(record);
+
+  // brick 1e77037f D5 — the LAST step: remove the copy this session left in another subscription,
+  // now that the record is durably closed and the owner, its group and the adapter are proven gone.
+  // Never throws, prints nothing on stdout, and is skipped once the close has run ≥ 8 s.
+  await reapTranscriptsAfterClose({
+    sessionId: record.acpxRecordId,
+    closeStartedAt,
+    observation: ownerBeforeStop,
+    ownerStop,
+    adapter: adapterAtClose,
+    recordClosedState,
+    verbose: options.verbose,
+  });
 
   // The close landed either way (an owner refuses turns on a closed record); whether the owner was
   // actually stopped is reported, never assumed. Phase 1b stops a foreign owner via its launcher.

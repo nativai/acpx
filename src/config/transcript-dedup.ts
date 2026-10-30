@@ -57,7 +57,7 @@ const CHUNK_BYTES = 1024 * 1024;
 const O_ACCMODE = 3;
 const NEWLINE = 0x0a;
 
-export type ReducedBy = "port" | "owner-exit" | "transcripts-dedup";
+export type ReducedBy = "port" | "owner-exit" | "session-close" | "transcripts-dedup";
 
 export type DedupTraceEvent =
   | { kind: "read"; file: "candidate" | "witness"; bytes: number }

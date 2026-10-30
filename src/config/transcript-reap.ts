@@ -11,7 +11,7 @@ import {
   type SubscriptionLookupOptions,
   type SubscriptionRegistry,
 } from "./subscriptions.js";
-import { removeRedundantCopy, type DedupHooks } from "./transcript-dedup.js";
+import { removeRedundantCopy, type DedupHooks, type ReducedBy } from "./transcript-dedup.js";
 
 // D2 (brick 81433524, CONCEPTION §2.4) — the copy a session LEFT in another
 // subscription is removed at queue-owner exit, never at the port.
@@ -56,6 +56,8 @@ export async function reapLeftBehindTranscripts(params: {
   budget?: { wallMs: number; bytes: number };
   now?: () => number;
   hooks?: DedupHooks;
+  /** Who removes (the tail file's `reduced_by`): the owner's idle exit, or the close (brick 1e77037f). */
+  reducedBy?: ReducedBy;
 }): Promise<TranscriptReapSummary> {
   const { record } = params;
   const registry = params.lookup?.registry ?? loadSubscriptionRegistry(params.lookup);
@@ -83,12 +85,29 @@ export async function reapLeftBehindTranscripts(params: {
   return summary;
 }
 
+/**
+ * Does this session have any canonical copy besides its active one in the dirs selection probes?
+ * Read-only (a freshness probe per copy). Used only to decide whether a skipped close-time reap
+ * is worth a log line (brick 1e77037f).
+ */
+export async function hasLeftBehindTranscript(
+  record: ReapRecord,
+  lookup?: SubscriptionLookupOptions & { registry?: SubscriptionRegistry },
+): Promise<boolean> {
+  const registry = lookup?.registry ?? loadSubscriptionRegistry(lookup);
+  const withRegistry = { ...lookup, registry };
+  const activeDir = activeTranscriptConfigDir(record, withRegistry);
+  const selection = await selectFreshestTranscript(record, activeDir, withRegistry);
+  return selection.candidates.some((candidate) => !candidate.isDest);
+}
+
 type ReapLimits = {
   budget: { wallMs: number; bytes: number };
   quietMs: number;
   startedAt: number;
   now: () => number;
   hooks?: DedupHooks;
+  reducedBy: ReducedBy;
 };
 
 async function reapCandidates(
@@ -99,6 +118,7 @@ async function reapCandidates(
     budget?: { wallMs: number; bytes: number };
     now?: () => number;
     hooks?: DedupHooks;
+    reducedBy?: ReducedBy;
   },
 ): Promise<void> {
   const now = params.now ?? Date.now;
@@ -108,6 +128,7 @@ async function reapCandidates(
     startedAt: now(),
     now,
     hooks: params.hooks,
+    reducedBy: params.reducedBy ?? "owner-exit",
   };
   let comparedBytes = 0;
   for (const candidate of leftBehind) {
@@ -139,7 +160,7 @@ async function reapCandidate(
     countKept(summary, "recent");
     return 0;
   }
-  await reapOne(copyPath, summary, limits.hooks);
+  await reapOne(copyPath, summary, limits);
   return info.size;
 }
 
@@ -161,11 +182,11 @@ function reapVerdict(
 async function reapOne(
   copyPath: string,
   summary: TranscriptReapSummary,
-  hooks: DedupHooks | undefined,
+  limits: ReapLimits,
 ): Promise<void> {
   const { outcome, reasons } = await removeRedundantCopy(copyPath, summary.active, {
-    reducedBy: "owner-exit",
-    hooks,
+    reducedBy: limits.reducedBy,
+    hooks: limits.hooks,
   });
   if (outcome.action === "kept") {
     countKept(summary, reasons.join("+") || outcome.reason);
@@ -193,11 +214,18 @@ function countKept(summary: TranscriptReapSummary, reason: string): void {
  * The owner.log lines (CONCEPTION §2.9). One summary per exit that found anything
  * to decide; one line per removed file. Grep the fleet with `transcript-reap`.
  */
-export function formatTranscriptReapLines(summary: TranscriptReapSummary): string[] {
+export function formatTranscriptReapLines(
+  summary: TranscriptReapSummary,
+  options: { trigger?: string } = {},
+): string[] {
   const kept = Object.values(summary.keptReasons).reduce((sum, count) => sum + count, 0);
   if (summary.files.length === 0 && kept === 0 && summary.skipped.length === 0) {
     return [];
   }
+  return [summaryLine(summary, kept, options.trigger), ...summary.files.map(fileLine)];
+}
+
+function summaryLine(summary: TranscriptReapSummary, kept: number, trigger?: string): string {
   const deleted = summary.files.filter((file) => file.action === "deleted");
   const reduced = summary.files.filter((file) => file.action === "reduced");
   const removedBytes = summary.files.reduce((sum, file) => sum + file.bytes, 0);
@@ -205,18 +233,20 @@ export function formatTranscriptReapLines(summary: TranscriptReapSummary): strin
   const keptReasons = Object.entries(summary.keptReasons)
     .map(([reason, count]) => `${reason}:${count}`)
     .join(",");
-  const lines = [
+  // No trigger key means the owner's idle exit (D2's lines are byte-identical to before).
+  const triggerKey = trigger ? ` trigger=${trigger}` : "";
+  return (
     `[acpx] transcript-reap session=${summary.session} active=${summary.active} ` +
-      `deleted=${deleted.length} reduced=${reduced.length} freedBytes=${removedBytes - tailBytes} ` +
-      `tailBytes=${tailBytes} kept=${kept} keptReasons=${keptReasons || "none"} ` +
-      `skipped=${summary.skipped.join(",") || "none"}\n`,
-  ];
-  for (const file of summary.files) {
-    const tail = file.tailFile ? ` tail=${file.tailFile}` : "";
-    lines.push(
-      `[acpx] transcript-reap-file action=${file.action} path=${file.path} bytes=${file.bytes} ` +
-        `witness=${file.witness}${tail}\n`,
-    );
-  }
-  return lines;
+    `deleted=${deleted.length} reduced=${reduced.length} freedBytes=${removedBytes - tailBytes} ` +
+    `tailBytes=${tailBytes} kept=${kept} keptReasons=${keptReasons || "none"} ` +
+    `skipped=${summary.skipped.join(",") || "none"}${triggerKey}\n`
+  );
+}
+
+function fileLine(file: TranscriptReapFile): string {
+  const tail = file.tailFile ? ` tail=${file.tailFile}` : "";
+  return (
+    `[acpx] transcript-reap-file action=${file.action} path=${file.path} bytes=${file.bytes} ` +
+    `witness=${file.witness}${tail}\n`
+  );
 }

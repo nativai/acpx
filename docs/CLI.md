@@ -350,7 +350,7 @@ Behavior:
 - `sessions set-parent --session-id <id> --no-parent` clears one session's parent (parent session, parent seat, parent URL and the re-parent marker, in the record and the index). `spawned_by_session_id` is kept. Refused with `--children-of` and with any `--parent-*` flag; an empty parent flag (`--parent-id ''`) is still refused as `PARENT_DETACH_UNSUPPORTED`. A forked session keeps its fork source, and acpx-ui's board and relations views place a fork with no parent under that source (reported in `warnings`)
 - text and quiet output print the local `acpxRecordId`; JSON output also includes
   `acpxSessionId` and, when the adapter exposes one, `agentSessionId`
-- `sessions close --session-id <id>` soft-closes that session
+- `sessions close --session-id <id>` soft-closes that session. For a Claude session closed from outside (not by itself), the last step removes the transcript copy it left in another subscription once the owner, its process group and the adapter are proven gone (see `transcripts`; logged as `transcript-reap … trigger=session-close` in the session's owner log)
 - `sessions close` run by an agent refuses a by-the-way side-thread (a human's
   side conversation) other than the agent's own session: exit 1, code
   `BYWAY_CLOSE_REFUSED` (`{ok:false, code, error, sessionId, sourceSessionId}`
@@ -413,6 +413,7 @@ Claude keeps a session's transcript per subscription (`<config dir>/projects/<cw
 
 - **At the port**, an existing destination is renamed aside as before. The sidecar is then **deleted** when it is a byte-prefix of the copy just placed, or **reduced** when it is that copy's prefix plus one block of Claude Code's own exit metadata (`last-prompt`, `cost-state`, `ai-title`, …). Otherwise it stays as `<id>.superseded-<ISO>.jsonl`.
 - **At the queue owner's idle exit**, once the owner's process group is empty, every quiet (≥ 10 min) copy the session left in another registered subscription is deleted or reduced by the same rules.
+- **At a close from outside** (`sessions close`, not a self-close), as the close's last step, once the owner, its group and the recorded adapter are proven gone and `closed:true` is read back: the same, for copies quiet ≥ 60 s, within 2 s / 256 MiB. A close that has already run 8 s skips it.
 - A copy holding any conversation line found in no other copy is never removed. Neither is the copy the session resumes from.
 
 **Reduced** means the exit block is written byte-exactly into `<id>.exit-tail-<ISO>.acpx` beside the copy, under a one-line JSON header (sizes and sha256s of the original and of the prefix it shares). Then the copy is removed. No `*.jsonl` reader lists `.acpx` files.

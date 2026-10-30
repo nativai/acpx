@@ -9,7 +9,7 @@ import {
   statSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { SessionAgentOptions } from "../../runtime/engine/session-options.js";
 import type {
   AuthPolicy,
@@ -207,11 +207,20 @@ export const OWNER_LOG_MAX_BYTES = 1024 * 1024;
 // mid-turn owner/adapter death left connection_close/null/null with NO crash
 // output (the records-non-diagnostic weakness). Returns an fd, or null if logging
 // can't be set up (never block the spawn on it).
+/**
+ * The per-session queue-owner log path — bare `homedir()`, deliberately not state-home-isolated
+ * (see `readQueueOwnerStartupFailureDetail`). Also where the close-time transcript reap appends
+ * its lines (brick 1e77037f), so `grep transcript-reap` finds both reap paths in one place.
+ */
+export function queueOwnerLogPath(sessionId: string): string {
+  return join(homedir(), ".acpx", "sessions", `${sessionId}.owner.log`);
+}
+
 function openQueueOwnerLogFd(sessionId: string): number | null {
   try {
-    const dir = join(homedir(), ".acpx", "sessions");
-    mkdirSync(dir, { recursive: true });
-    return openOwnerLogFile(join(dir, `${sessionId}.owner.log`));
+    const logPath = queueOwnerLogPath(sessionId);
+    mkdirSync(dirname(logPath), { recursive: true });
+    return openOwnerLogFile(logPath);
   } catch {
     return null;
   }
