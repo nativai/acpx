@@ -142,10 +142,18 @@ export class CompressionJournalWriter {
     return new CompressionJournalWriter(handle, at, wave);
   }
 
+  /**
+   * Every row THIS writer appended, in order — what `--manifest-out` lists. ⚠️ Not a
+   * filter of the journal by wave: two runs that share a wave id (an operator reusing
+   * `--wave`) would otherwise mix their rows (TE, 2026-10-29).
+   */
+  readonly written: CompressionJournalRow[] = [];
+
   async append(row: Omit<CompressionJournalRow, "at" | "wave">): Promise<void> {
-    const line = `${serializeJournalRow({ ...row, at: new Date().toISOString(), wave: this.wave })}\n`;
-    await this.handle.write(line);
+    const full = { ...row, at: new Date().toISOString(), wave: this.wave };
+    await this.handle.write(`${serializeJournalRow(full)}\n`);
     await this.handle.sync();
+    this.written.push(full);
   }
 
   async close(): Promise<void> {

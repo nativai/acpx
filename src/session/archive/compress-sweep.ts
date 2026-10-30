@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -36,6 +37,7 @@ import {
   readCompressionJournal,
   serializeJournalRow,
   COMPRESSION_JOURNAL_HEADER,
+  type CompressionJournalRow,
 } from "./compression-journal.js";
 import { planReconcile, type ReconcilePlan } from "./compression-reconcile.js";
 import {
@@ -1023,7 +1025,7 @@ async function compressUnderLock(
   result.outcome = "applied";
   await writeRunRecord(context, result);
   if (options.manifestOut) {
-    await writeManifestOut(context, options.manifestOut);
+    await writeManifestOut(journal.written, options.manifestOut);
   }
 }
 
@@ -1232,24 +1234,53 @@ export async function rewriteArchiveReadme(archiveDir: string, warnings: string[
   }
 }
 
+/**
+ * `COMPRESSION/runs/<wave>.json`, written `wx` — ⚠️ A RUN RECORD IS NEVER OVERWRITTEN.
+ * Waves are unique per run (`uniqueSweepWave`); an explicit `--wave` reused by an
+ * operator gets a suffixed name instead of replacing the earlier run's record.
+ */
 async function writeRunRecord(
   context: SweepContext,
   result: CompressRunResult | DecompressRunResult,
 ): Promise<void> {
-  const target = path.join(compressionRunsDir(context.archiveDir), `${context.wave}.json`);
-  await fs.mkdir(path.dirname(target), { recursive: true });
-  await fs.writeFile(target, `${JSON.stringify(result, undefined, 2)}\n`, "utf8");
+  const dir = compressionRunsDir(context.archiveDir);
+  await fs.mkdir(dir, { recursive: true });
+  const payload = `${JSON.stringify(result, undefined, 2)}\n`;
+  for (const name of [
+    `${context.wave}.json`,
+    `${context.wave}.${randomBytes(4).toString("hex")}.json`,
+  ]) {
+    try {
+      await fs.writeFile(path.join(dir, name), payload, { encoding: "utf8", flag: "wx" });
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+    }
+  }
+  throw new Error(`could not create a fresh run record for wave ${context.wave} in ${dir}`);
 }
 
-/** `--manifest-out`: this wave's journal rows (names, sizes, hashes — no content). */
-async function writeManifestOut(context: SweepContext, target: string): Promise<void> {
-  const rows = (await readCompressionJournal(context.archiveDir)).filter(
-    (row) => row.wave === context.wave,
-  );
+/** `--manifest-out`: exactly the rows THIS run wrote (names, sizes, hashes — no content). */
+async function writeManifestOut(
+  rows: readonly CompressionJournalRow[],
+  target: string,
+): Promise<void> {
   const payload = [COMPRESSION_JOURNAL_HEADER, ...rows.map((row) => serializeJournalRow(row))].join(
     "\n",
   );
   await fs.writeFile(target, `${payload}\n`, "utf8");
+}
+
+/**
+ * A sweep's wave id: `<prefix>-<UTC to the ms>Z-<random>`. ⚠️ NOT `waveToken`, which is
+ * minute-granular: two sweeps in one minute shared a wave, the second overwrote the
+ * first's run record and `--manifest-out` mixed both (TE, 2026-10-29).
+ */
+export function uniqueSweepWave(prefix: string, nowMs: number): string {
+  const stamp = new Date(nowMs).toISOString().replace(/[-:]/g, "").replace(".", "").slice(0, 18);
+  return `${prefix}-${stamp}Z-${randomBytes(3).toString("hex")}`;
 }
 
 // ────────────────────────────────────────────────────────────────────────────────

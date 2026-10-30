@@ -15,6 +15,7 @@ import {
   withArchiveIndexLock,
   type ArchiveIndexEntry,
 } from "./archive-index.js";
+import { quarantineZst } from "./compress-sweep.js";
 import {
   archivedFileExists,
   commitStagedPlain,
@@ -30,6 +31,7 @@ import {
   type ArchivedFileStat,
   type StagedPlain,
 } from "./compressed.js";
+import { CompressionJournalWriter } from "./compression-journal.js";
 import { claimArchiveFileSets, findRecordFile, recordFileNameFor } from "./identity.js";
 import {
   ArchiveManifestWriter,
@@ -882,8 +884,12 @@ async function placeOnce(
 
 /**
  * Both forms existed and the plain won: the `.zst` left in the archive is identical
- * (an interrupted commit) ⇒ unlink it; it differs ⇒ leave it and say so (`--repair`
- * reports it). Never a silent second copy.
+ * (an interrupted commit) ⇒ unlink it; it differs or is corrupt ⇒ move it to
+ * `COMPRESSION/quarantine/` (NEVER deleted) with a journal row, and say so.
+ *
+ * ⚠️ NOT "LEAVE IT FOR --repair". A divergent `.zst` left beside a restored session is
+ * resolved by no tool, and it makes the id un-re-archivable forever (A11 rightly treats
+ * it as a clobber) — the TE's finding, 2026-10-29.
  */
 async function settleLeftoverZst(
   context: ArchiveContext,
@@ -898,20 +904,40 @@ async function settleLeftoverZst(
   } catch {
     return;
   }
+  const verdict = await leftoverVerdict(zst, zstPath, hotPath);
+  if (verdict === "identical") {
+    await fs.unlink(zstPath);
+    return;
+  }
+  const target = await quarantineZst(context.archiveDir, file);
+  const journal = await CompressionJournalWriter.open(context.archiveDir, context.at, context.wave);
+  try {
+    await journal.append({
+      action: "quarantine",
+      file,
+      verified: false,
+      detail: `restore: the plain won and was restored; the leftover .zst ${verdict}; -> ${path.basename(target)}`,
+    });
+  } finally {
+    await journal.close();
+  }
+  warnings.push(
+    `${zstNameFor(file)} ${verdict} the restored plain ${file}; moved to COMPRESSION/quarantine/${path.basename(target)} (never deleted)`,
+  );
+}
+
+async function leftoverVerdict(zst: Buffer, zstPath: string, hotPath: string): Promise<string> {
   try {
     const decoded = decodeArchiveZst(zst, zstPath);
-    if (sha256Hex(decoded) === sha256Hex(await fs.readFile(hotPath))) {
-      await fs.unlink(zstPath);
-      return;
-    }
+    return sha256Hex(decoded) === sha256Hex(await fs.readFile(hotPath))
+      ? "identical"
+      : "differs from";
   } catch (error) {
     if (!isArchivedFileCorrupt(error)) {
       throw error;
     }
+    return `is corrupt (${error.check}), unlike`;
   }
-  warnings.push(
-    `${zstNameFor(file)} remains in the archive and does not match the restored plain ${file}; left in place for --repair to report`,
-  );
 }
 
 async function resolveRestoredId(

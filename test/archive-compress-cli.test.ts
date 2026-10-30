@@ -1434,3 +1434,182 @@ test("capability probe: an https (public mTLS) ACPX_UI_BASE_URL is never probed 
     );
   });
 });
+
+// ─── TE final round (2026-10-29): items 1-4 ──────────────────────────────────
+
+test("item 1: two sweeps in the same minute ⇒ two waves, two run records, each --manifest-out lists only its own rows", async () => {
+  await withFixture(async (fixture) => {
+    const out1 = path.join(fixture.home, "m1.tsv");
+    const out2 = path.join(fixture.home, "m2.tsv");
+    const first = await runCli(fixture.home, [
+      ...COMPRESS_INIT,
+      "--limit",
+      "2",
+      "--manifest-out",
+      out1,
+    ]);
+    assert.equal(first.code, 0, first.stderr);
+    const second = await runCli(fixture.home, [
+      "sessions",
+      "archive",
+      "--compress",
+      "--apply",
+      "--skip-reader-check",
+      "--json",
+      "--manifest-out",
+      out2,
+    ]);
+    assert.equal(second.code, 0, second.stderr);
+    const a = JSON.parse(first.stdout) as { wave: string; compressed: { file: string }[] };
+    const b = JSON.parse(second.stdout) as { wave: string; compressed: { file: string }[] };
+    assert.notEqual(a.wave, b.wave, "a wave id is unique per run");
+    assert.match(a.wave, /^compress-\d{8}T\d{9}Z-[0-9a-f]{6}$/);
+    const runs = await listing(path.join(fixture.archive, "COMPRESSION", "runs"));
+    assert.deepEqual(runs, [`${a.wave}.json`, `${b.wave}.json`].toSorted());
+    for (const [file, body] of [
+      [out1, a],
+      [out2, b],
+    ] as const) {
+      const rows = parseJournal(await fs.readFile(file, "utf8"));
+      assert.ok(
+        rows.every((row) => row.wave === body.wave),
+        `${file}: only its own wave`,
+      );
+      assert.deepEqual(
+        rows
+          .filter((row) => row.action === "compress")
+          .map((row) => row.file)
+          .toSorted(),
+        body.compressed.map((entry) => entry.file).toSorted(),
+      );
+    }
+  });
+});
+
+test("item 1: an explicit --wave reused by two runs never overwrites the first run record", async () => {
+  await withFixture(async (fixture) => {
+    for (const extra of [["--limit", "1"], []]) {
+      const run = await runCli(fixture.home, [...COMPRESS_INIT, "--wave", "operator", ...extra]);
+      assert.equal(run.code, 0, run.stderr);
+    }
+    assert.equal((await listing(path.join(fixture.archive, "COMPRESSION", "runs"))).length, 2);
+  });
+});
+
+test("item 2: --cat refuses anything that is not an archive file NAME — exit 2, nothing on stdout", async () => {
+  await withFixture(async (fixture) => {
+    for (const name of [
+      "",
+      "/etc/hostname",
+      "sub/x.stream.ndjson",
+      "..",
+      ".hidden.json",
+      "COMPRESSION",
+      "a\\b.json",
+    ]) {
+      const result = await runCli(fixture.home, ["sessions", "archive", "--cat", name]);
+      assert.equal(result.code, 2, `--cat '${name}': ${result.stderr}`);
+      assert.equal(result.stdout, "", `--cat '${name}' printed something`);
+      assert.match(result.stderr, /--cat '/, `--cat '${name}': names the refused argument`);
+    }
+    const ok = await runCli(fixture.home, ["sessions", "archive", "--cat", `${fixture.id}.json`]);
+    assert.equal(ok.code, 0, "a plain sidecar name still reads");
+  });
+});
+
+test("item 3: restore with a DIVERGING both-forms pair quarantines the leftover .zst (journalled), so the id can be re-archived", async () => {
+  await withFixture(async (fixture) => {
+    const name = `${fixture.id}.messages.ndjson`;
+    await fs.mkdir(path.join(fixture.archive, "COMPRESSION"), { recursive: true });
+    await fs.writeFile(
+      path.join(fixture.archive, zstNameFor(name)),
+      encodeArchiveZst(Buffer.from("other bytes\n".repeat(500))),
+    );
+    const restore = await runCli(fixture.home, ["sessions", "restore", fixture.id, "--json"]);
+    assert.equal(restore.code, 0, restore.stderr);
+    assert.equal(
+      sha(await fs.readFile(path.join(fixture.hot, name))),
+      sha(fixture.logical[name]),
+      "the plain won",
+    );
+    assert.ok(
+      (await listing(fixture.archive)).every((file) => !file.startsWith(fixture.id)),
+      "nothing of the id left",
+    );
+    const quarantine = await listing(path.join(fixture.archive, "COMPRESSION", "quarantine"));
+    assert.equal(quarantine.length, 1);
+    assert.ok(quarantine[0].startsWith(zstNameFor(name)));
+    const rows = await readCompressionJournal(fixture.archive);
+    assert.ok(
+      rows.some((row) => row.action === "quarantine" && row.file === name),
+      "journalled",
+    );
+    assert.match(
+      (JSON.parse(restore.stdout) as { warnings: string[] }).warnings.join("\n"),
+      /quarantine/,
+    );
+
+    for (const file of await listing(fixture.hot)) {
+      await fs.utimes(path.join(fixture.hot, file), OLD_MTIME_S, OLD_MTIME_S);
+    }
+    const again = await runCli(fixture.home, [
+      "sessions",
+      "archive",
+      "--apply",
+      "--ids",
+      fixture.id,
+      "--restore-grace-days",
+      "0",
+      "--json",
+    ]);
+    const body = JSON.parse(again.stdout) as { moved: { id: string }[]; skippedAtApply: unknown[] };
+    assert.deepEqual(body.skippedAtApply, [], again.stdout);
+    assert.equal(body.moved.length, 1, "re-archivable");
+  });
+});
+
+test("item 4: file modes survive compress → restore and compress → --decompress (no 0600 from staging)", async () => {
+  await withFixture(async (fixture) => {
+    const modes: Record<string, number> = {};
+    for (const [index, name] of Object.keys(fixture.logical).entries()) {
+      const mode = index % 2 === 0 ? 0o644 : 0o640;
+      await fs.chmod(path.join(fixture.archive, name), mode);
+      modes[name] = mode;
+    }
+    const modeOf = async (target: string): Promise<number> => (await fs.stat(target)).mode & 0o7777;
+    await compressAll(fixture);
+    for (const name of Object.keys(fixture.logical).filter((n) => !n.endsWith(".json"))) {
+      assert.equal(
+        await modeOf(path.join(fixture.archive, zstNameFor(name))),
+        modes[name],
+        `${name}.zst`,
+      );
+    }
+    const decompress = await runCli(fixture.home, [
+      "sessions",
+      "archive",
+      "--decompress",
+      fixture.id,
+      "--apply",
+      "--json",
+    ]);
+    assert.equal(decompress.code, 0, decompress.stderr);
+    for (const name of Object.keys(fixture.logical)) {
+      assert.equal(
+        await modeOf(path.join(fixture.archive, name)),
+        modes[name],
+        `${name} after --decompress`,
+      );
+    }
+    await compressAll(fixture);
+    const restore = await runCli(fixture.home, ["sessions", "restore", fixture.id, "--json"]);
+    assert.equal(restore.code, 0, restore.stderr);
+    for (const name of Object.keys(fixture.logical)) {
+      assert.equal(
+        (await modeOf(path.join(fixture.hot, name))).toString(8),
+        modes[name].toString(8),
+        `${name} after restore`,
+      );
+    }
+  });
+});
