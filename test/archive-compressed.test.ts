@@ -190,6 +190,270 @@ test("zstdFrameLength: undefined for non-frames, cut frames, and reserved block 
   assert.equal(zstdFrameLength(Buffer.concat([frame, frame])), frame.length, "measures ONE frame");
 });
 
+// ─── one frame at k × 16 KiB (brick 8bc7b561) ─────────────────────────────────
+// node's sync zstd loop re-enters the encoder when a call leaves its 16 KiB output chunk
+// exactly full; if the frame ended there, libzstd emits a SECOND, empty 13-byte frame.
+// Two devbox files hit it (frames of 8 and 11 × 16 KiB) and failed the writer's read-back.
+
+const WRITER_PARAMS = {
+  [zlib.constants.ZSTD_c_compressionLevel]: 9,
+  [zlib.constants.ZSTD_c_enableLongDistanceMatching]: 1,
+  [zlib.constants.ZSTD_c_windowLog]: 27,
+  [zlib.constants.ZSTD_c_checksumFlag]: 1,
+  [zlib.constants.ZSTD_c_contentSizeFlag]: 1,
+};
+const EMPTY_FRAME_BYTES = 13;
+
+function noise(length: number): Buffer {
+  let state = 0x8bc7b561;
+  const out = Buffer.alloc(length);
+  for (let i = 0; i < length; i += 1) {
+    state = (Math.imul(state, 1103515245) + 12345) >>> 0;
+    out[i] = state >>> 24;
+  }
+  return out;
+}
+
+/** node's DEFAULT-chunk one-shot output (what the writer used to emit, footer aside). */
+function defaultChunkFrames(logical: Buffer): Buffer {
+  return zlib.zstdCompressSync(logical, { params: WRITER_PARAMS });
+}
+
+/**
+ * The devbox shape, synthetic: compressible ndjson + a noise tail tuned so the frame is
+ * EXACTLY k × 16 KiB (compressed blocks, 4-byte content size, single segment, checksum —
+ * frame header descriptor 0b10100100, as both devbox files). Searched, not hard-coded, so a
+ * libzstd change cannot quietly turn this into a shape that no longer hits the boundary.
+ */
+function exactMultipleShape(): Buffer {
+  const head = logicalSample();
+  let tail = 0;
+  let target: number | undefined;
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const logical = Buffer.concat([head, noise(tail)]);
+    const first = zstdFrameLength(defaultChunkFrames(logical));
+    assert.ok(first !== undefined);
+    target ??= Math.ceil((first + 1) / 16384) * 16384;
+    if (first === target) {
+      return logical;
+    }
+    if (first > target) {
+      target += 16384;
+    }
+    tail += target - first;
+  }
+  throw new Error("no input found whose frame is an exact multiple of 16 KiB");
+}
+
+test("one frame at k × 16 KiB: raw-block frames of exactly 16/32/64 KiB still encode to ONE frame", () => {
+  // n random bytes ⇒ one raw block: 4 magic + 1 descriptor + 2 content size + 3 block
+  // header + n + 4 checksum = n + 14 bytes of frame.
+  for (const frameBytes of [16384, 32768, 65536]) {
+    const logical = noise(frameBytes - 14);
+    const old = defaultChunkFrames(logical);
+    assert.equal(zstdFrameLength(old), frameBytes, "pin: the real frame fills the chunk exactly");
+    assert.equal(
+      old.length,
+      frameBytes + EMPTY_FRAME_BYTES,
+      "pin: node appends an empty frame — if this stops holding, the shape no longer reproduces",
+    );
+    const encoded = encodeArchiveZst(logical);
+    const region = encoded.subarray(0, encoded.length - FOOTER_BYTES);
+    assert.equal(region.length, frameBytes, `${frameBytes}: no trailing empty frame`);
+    assert.equal(zstdFrameLength(region), region.length);
+    assert.deepEqual(decodeArchiveZst(encoded, "x"), logical);
+  }
+});
+
+test("one frame at k × 16 KiB: the writer compresses the devbox shape instead of failing its read-back", async () => {
+  const logical = exactMultipleShape();
+  const old = defaultChunkFrames(logical);
+  const first = zstdFrameLength(old) ?? 0;
+  assert.equal(first % 16384, 0);
+  assert.equal(old.length, first + EMPTY_FRAME_BYTES, "pin: the old encoding is two frames");
+  assert.equal(old[4], 0b10100100, "pin: the devbox files' frame header descriptor");
+  assert.ok(zlib.zstdDecompressSync(old).equals(logical), "pin: the raw decoder does not notice");
+
+  const dir = await tempDir();
+  try {
+    await fs.mkdir(path.join(dir, "staging"));
+    const name = "k.stream.ndjson";
+    await writePlain(dir, name, logical, Date.parse("2026-10-09T20:40:27.000Z"));
+    const outcome = await compressArchivedFile({
+      dir,
+      logicalName: name,
+      stagingDir: path.join(dir, "staging"),
+      journal: { begin: async () => undefined },
+    });
+    assert.equal(outcome.status, "compressed", JSON.stringify(outcome));
+    assert.deepEqual((await fs.readdir(dir)).toSorted(), [`${name}.zst`, "staging"]);
+    const zst = await fs.readFile(path.join(dir, `${name}.zst`));
+    assert.equal(zstdFrameLength(zst.subarray(0, -FOOTER_BYTES)), zst.length - FOOTER_BYTES);
+    assert.deepEqual((await readArchivedFileVerified(dir, name))?.bytes, logical);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ─── zstdFrameLength over every frame-header and block variant (RFC 8878 §3.1.1) ─
+
+type Block = { type: "raw" | "rle"; size: number };
+
+/**
+ * A frame built by hand from raw and RLE blocks, so that header variants no node encoder
+ * writes can be measured: a non-minimal 8-byte content size, a dictionary id of 1/2/4
+ * bytes, the unused descriptor bit, an RLE block of the maximum size, empty blocks.
+ */
+function handFrame(options: {
+  fcsFlag: 0 | 1 | 2 | 3;
+  singleSegment: boolean;
+  dictIdBytes?: 0 | 1 | 2 | 4;
+  unusedBit?: boolean;
+  blocks: Block[];
+}): { frame: Buffer; content: Buffer } {
+  const content: Buffer[] = [];
+  const body: Buffer[] = [];
+  options.blocks.forEach((block, index) => {
+    const last = index === options.blocks.length - 1 ? 1 : 0;
+    const header = Buffer.alloc(3);
+    header.writeUIntLE((block.size << 3) | ((block.type === "rle" ? 1 : 0) << 1) | last, 0, 3);
+    const data = block.type === "raw" ? noise(block.size) : Buffer.alloc(block.size, 0x2a);
+    content.push(data);
+    body.push(header, block.type === "raw" ? data : Buffer.from([0x2a]));
+  });
+  const size = content.reduce((sum, part) => sum + part.length, 0);
+  const dictIdFlag = [0, 1, 2, -1, 3][options.dictIdBytes ?? 0];
+  const descriptor =
+    (options.fcsFlag << 6) |
+    ((options.singleSegment ? 1 : 0) << 5) |
+    ((options.unusedBit ? 1 : 0) << 4) |
+    dictIdFlag;
+  const fields: Buffer[] = [Buffer.from([0x28, 0xb5, 0x2f, 0xfd, descriptor])];
+  if (!options.singleSegment) {
+    fields.push(Buffer.from([(17 - 10) << 3])); // window 128 KiB
+  }
+  fields.push(Buffer.alloc(options.dictIdBytes ?? 0, 0x07));
+  const fcsBytes = [options.singleSegment ? 1 : 0, 2, 4, 8][options.fcsFlag];
+  const fcs = Buffer.alloc(fcsBytes);
+  if (fcsBytes === 1) {
+    fcs.writeUInt8(size);
+  } else if (fcsBytes === 2) {
+    fcs.writeUInt16LE(size - 256);
+  } else if (fcsBytes === 4) {
+    fcs.writeUInt32LE(size);
+  } else if (fcsBytes === 8) {
+    fcs.writeBigUInt64LE(BigInt(size));
+  }
+  fields.push(fcs);
+  return { frame: Buffer.concat([...fields, ...body]), content: Buffer.concat(content) };
+}
+
+function assertMeasuresExactly(frame: Buffer, label: string): void {
+  assert.equal(zstdFrameLength(frame), frame.length, `${label}: the whole frame`);
+  assert.equal(
+    zstdFrameLength(Buffer.concat([frame, zlib.zstdCompressSync(Buffer.from("next"))])),
+    frame.length,
+    `${label}: stops at its own end when another frame follows`,
+  );
+  assert.equal(zstdFrameLength(frame.subarray(0, -1)), undefined, `${label}: one byte short`);
+}
+
+test("zstdFrameLength: every content-size field size, with and without Single_Segment (hand-built, decodable)", () => {
+  const cases = [
+    { fcsFlag: 0, singleSegment: true, blocks: [{ type: "raw", size: 100 }] }, // 1-byte FCS
+    { fcsFlag: 0, singleSegment: false, blocks: [{ type: "raw", size: 100 }] }, // no FCS, window
+    { fcsFlag: 1, singleSegment: true, blocks: [{ type: "raw", size: 300 }] }, // 2-byte FCS
+    { fcsFlag: 1, singleSegment: false, blocks: [{ type: "rle", size: 60000 }] },
+    { fcsFlag: 2, singleSegment: true, blocks: [{ type: "raw", size: 70000 }] }, // 4-byte FCS
+    { fcsFlag: 2, singleSegment: false, blocks: [{ type: "raw", size: 0 }] },
+    { fcsFlag: 3, singleSegment: true, blocks: [{ type: "rle", size: 40 }] }, // 8-byte FCS
+    { fcsFlag: 3, singleSegment: false, blocks: [{ type: "raw", size: 5 }] },
+  ] as const;
+  for (const shape of cases) {
+    const { frame, content } = handFrame({ ...shape, blocks: [...shape.blocks] });
+    const label = `fcsFlag=${shape.fcsFlag} singleSegment=${shape.singleSegment}`;
+    assert.deepEqual(zlib.zstdDecompressSync(frame), content, `${label}: a valid frame`);
+    assertMeasuresExactly(frame, label);
+  }
+});
+
+test("zstdFrameLength: raw, RLE and empty blocks — an RLE block carries ONE byte whatever its size", () => {
+  const blockSets: Block[][] = [
+    [{ type: "raw", size: 0 }],
+    [
+      { type: "raw", size: 0 },
+      { type: "raw", size: 0 },
+      { type: "rle", size: 50 },
+    ],
+    [
+      { type: "raw", size: 70000 },
+      { type: "rle", size: 131072 },
+      { type: "raw", size: 3 },
+    ],
+    [
+      { type: "rle", size: 131072 },
+      { type: "rle", size: 131072 },
+      { type: "raw", size: 0 },
+    ],
+    [
+      { type: "raw", size: 131072 },
+      { type: "raw", size: 12 },
+    ],
+  ];
+  for (const blocks of blockSets) {
+    const { frame, content } = handFrame({ fcsFlag: 2, singleSegment: true, blocks });
+    const label = blocks.map((block) => `${block.type}${block.size}`).join("+");
+    assert.deepEqual(zlib.zstdDecompressSync(frame), content, `${label}: a valid frame`);
+    assertMeasuresExactly(frame, label);
+  }
+});
+
+test("zstdFrameLength: a dictionary id of 1, 2 or 4 bytes and the unused descriptor bit are measured, not refused", () => {
+  // No decode here: a frame naming a dictionary needs that dictionary to decode.
+  for (const dictIdBytes of [1, 2, 4] as const) {
+    for (const singleSegment of [true, false]) {
+      const { frame } = handFrame({
+        fcsFlag: 1,
+        singleSegment,
+        dictIdBytes,
+        blocks: [{ type: "raw", size: 400 }],
+      });
+      assertMeasuresExactly(frame, `dictIdBytes=${dictIdBytes} singleSegment=${singleSegment}`);
+    }
+  }
+  const { frame, content } = handFrame({
+    fcsFlag: 2,
+    singleSegment: true,
+    unusedBit: true,
+    blocks: [{ type: "raw", size: 1000 }],
+  });
+  assert.deepEqual(zlib.zstdDecompressSync(frame), content, "libzstd ignores the unused bit");
+  assertMeasuresExactly(frame, "unused bit");
+});
+
+test("zstdFrameLength: frames node's encoder writes — checksum on/off, content size on/off, small windows, compressed blocks", () => {
+  const logical = Buffer.concat([logicalSample(), noise(5000), Buffer.alloc(150_000, 0x41)]);
+  const { constants } = zlib;
+  for (const checksum of [0, 1]) {
+    for (const contentSize of [0, 1]) {
+      for (const windowLog of [10, 17, 27]) {
+        const frame = zlib.zstdCompressSync(logical, {
+          chunkSize: logical.length + 128 * 1024,
+          params: {
+            [constants.ZSTD_c_compressionLevel]: 3,
+            [constants.ZSTD_c_checksumFlag]: checksum,
+            [constants.ZSTD_c_contentSizeFlag]: contentSize,
+            [constants.ZSTD_c_windowLog]: windowLog,
+          },
+        });
+        const label = `checksum=${checksum} contentSize=${contentSize} windowLog=${windowLog}`;
+        assert.equal((frame[4] >> 2) & 1, checksum, `${label}: checksum flag as asked`);
+        assertMeasuresExactly(frame, label);
+      }
+    }
+  }
+});
+
 // ─── families and names ───────────────────────────────────────────────────────
 
 test("families: exactly the four transcript families; the record and everything else stay plain", () => {

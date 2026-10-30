@@ -185,10 +185,31 @@ export function buildFooter(logical: Buffer): Buffer {
   return footer;
 }
 
-/** One frame + footer. One-shot compression ⇒ exactly one frame (verified on read). */
+/**
+ * Output chunk for `zstdCompressSync`: strictly larger than any frame `n` bytes can
+ * encode to (ZSTD_COMPRESSBOUND(n) ≤ n + n/256 + 64), so the chunk is never filled.
+ */
+function encodeChunkSize(logicalBytes: number): number {
+  return logicalBytes + Math.ceil(logicalBytes / 256) + 128 * 1024;
+}
+
+/**
+ * One frame + footer.
+ *
+ * ⚠️ `chunkSize` IS WHAT MAKES THIS ONE FRAME — DO NOT DROP IT AS A "TUNING" OPTION.
+ * One-shot `zstdCompressSync` does NOT guarantee one frame: node's sync loop calls the
+ * encoder again whenever a call leaves its output chunk exactly full, and if the frame
+ * had just ended there libzstd answers that extra `ZSTD_e_end` with a SECOND, empty
+ * 13-byte frame — which the reader rightly refuses. With the default 16 KiB chunk that
+ * is every input whose frame is a multiple of 16,384 B (brick 8bc7b561: 2 of 18,260
+ * devbox files, frames of exactly 8 and 11 × 16 KiB). A chunk that can never be filled
+ * means the encoder is entered exactly once. Negative cases: `test/archive-compressed.test.ts`
+ * "one frame at k × 16 KiB".
+ */
 export function encodeArchiveZst(logical: Buffer): Buffer {
   const { constants } = zlib;
   const frame = zlib.zstdCompressSync(logical, {
+    chunkSize: encodeChunkSize(logical.length),
     params: {
       [constants.ZSTD_c_compressionLevel]: COMPRESSION_LEVEL,
       [constants.ZSTD_c_enableLongDistanceMatching]: 1,
