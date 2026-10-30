@@ -1030,7 +1030,10 @@ export async function requestSessionClose(
 }
 
 // ---------------------------------------------------------------------------
-// brick://f4f1fa54 — SELF-CLOSE. A session may be closed BY ITSELF: the agent
+// brick://f4f1fa54 — SELF-CLOSE, the IMMEDIATE arm (`--now`; since brick 9d34a178 a
+// self-close without it is deferred to the end of the turn — `requestSessionClose`
+// above — because this arm ends the caller's turn on the spot and nothing the agent
+// would write after it is generated). A session may be closed BY ITSELF: the agent
 // running inside the session executes `acpx sessions close <own id>` (or an
 // equivalent UI-driven request), so the CLI process performing the close is a
 // DESCENDANT of the very queue owner the close must terminate (owner → ACP

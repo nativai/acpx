@@ -380,6 +380,40 @@ test("--after-turn from OUTSIDE: scheduled while a turn runs (nothing cut), and 
   });
 });
 
+test("FAIL OPEN: an owner that dies inside the deferred window leaves the session open and serviceable", async () => {
+  await withSession(async (rig) => {
+    const flag = path.join(rig.homeDir, "closed-returned");
+    // Deliver-now, so no waiting client re-drives the turn into a fresh owner after the kill.
+    const queued = await runCli(
+      [
+        "--cwd",
+        rig.cwd,
+        "--format",
+        "json",
+        "codex",
+        "prompt",
+        "--session-id",
+        rig.id,
+        "--no-wait",
+        runThenSay({ argv: closeFromInside(rig, [], flag), say: "never-reached", holdMs: 30_000 }),
+      ],
+      rig.homeDir,
+    );
+    assert.equal(queued.code, 0, queued.stderr);
+    await waitFor("the close command returning inside the turn", 30_000, () => exists(flag));
+    const ownerPid = await ownerPidOf(rig);
+    process.kill(ownerPid, "SIGKILL");
+    await waitFor("the owner dying", 10_000, async () => !isProcessAlive(ownerPid));
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    assert.equal((await recordOf(rig)).closed, false, "nothing was written before the turn end");
+
+    const next = await prompt(rig, "echo SERVED-AFTER-OWNER-DEATH");
+    assert.equal(next.code, 0, next.stderr);
+    assert.match(next.stdout, /SERVED-AFTER-OWNER-DEATH/);
+    assert.equal((await recordOf(rig)).closed, false, "the lost request does not resurface");
+  });
+});
+
 test("--now and --after-turn together are refused before anything is touched", async () => {
   await withSession(async (rig) => {
     const result = await runCli(

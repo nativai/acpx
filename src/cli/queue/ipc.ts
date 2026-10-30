@@ -1214,7 +1214,11 @@ async function submitScheduleCloseToQueueOwner(
     : { kind: "idle", ownerPid: owner.pid };
 }
 
-/** An older owner answers the unknown verb `QUEUE_REQUEST_INVALID`: the detail code says so. */
+/**
+ * The detail the refusal names. An owner from before this verb fails it as `QUEUE_REQUEST_INVALID`
+ * under requestId `unknown`, which this client reads as `QUEUE_PROTOCOL_MALFORMED_MESSAGE` (measured
+ * live 2026-10-30 against the deployed owner, session 889b9087).
+ */
 function scheduleCloseErrorDetail(error: unknown): string {
   if (error instanceof QueueConnectionError || error instanceof QueueProtocolError) {
     return error.detailCode ?? error.message;
