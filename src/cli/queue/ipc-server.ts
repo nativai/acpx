@@ -47,6 +47,7 @@ import {
   type QueueOwnerDrainResultMessage,
   type QueueOwnerErrorMessage,
   type QueueOwnerMessage,
+  type QueueOwnerScheduleCloseResultMessage,
   type QueueRequest,
 } from "./messages.js";
 import { noteSessionCloseDrain } from "./session-close-intent.js";
@@ -349,6 +350,26 @@ export type QueueOwnerDrainReport = {
   tasks?: LiveBackgroundTask[];
 };
 
+/**
+ * brick 9d34a178 — a close the owner performs itself at the end of the turn in flight. In memory
+ * ONLY: an owner that dies before that turn ends takes the request with it and the session stays
+ * open with a consistent record (fail open). Nothing about it is ever written to `record.acpx`.
+ */
+export type DeferredCloseRequest = {
+  killBackgroundTasks: boolean;
+  requestedAt: string;
+};
+
+function mergeDeferredClose(
+  existing: DeferredCloseRequest | undefined,
+  killBackgroundTasks: boolean,
+): DeferredCloseRequest {
+  if (!existing) {
+    return { killBackgroundTasks, requestedAt: new Date().toISOString() };
+  }
+  return { ...existing, killBackgroundTasks: existing.killBackgroundTasks || killBackgroundTasks };
+}
+
 export type QueueOwnerControlHandlers = {
   cancelPrompt: () => Promise<boolean>;
   closeSession: (timeoutMs?: number) => Promise<boolean>;
@@ -406,6 +427,8 @@ export class SessionQueueOwner {
   // terminalized. Cleared by ABORT (a live task: the close is refused) or by COMMIT (today's drain).
   private closePending = false;
   private drainCause: OwnerExitCause = "owner-exit";
+  // brick 9d34a178 — set by `schedule_close`, taken by the runtime at the turn boundary.
+  private deferredClose?: DeferredCloseRequest;
 
   private constructor(
     server: net.Server,
@@ -590,6 +613,39 @@ export class SessionQueueOwner {
 
   isClosePending(): boolean {
     return this.closePending;
+  }
+
+  /**
+   * brick 9d34a178 — record a close for the end of the turn in flight. Synchronous, so the answer
+   * and the runtime's own turn-end check agree on one reading of `queryActiveTurn`: recorded while a
+   * turn runs ⇒ the check after that turn sees it. With no turn in flight a `onlyIfActiveTurn`
+   * request records nothing (the caller closes now); any other is recorded and a runtime parked in
+   * `nextTask` is woken so it closes at once. A second request only ever ADDS force.
+   */
+  scheduleClose(params: { killBackgroundTasks: boolean; onlyIfActiveTurn: boolean }): {
+    scheduled: boolean;
+    activeTurn: boolean;
+  } {
+    const activeTurn = this.controlHandlers.queryActiveTurn();
+    if (params.onlyIfActiveTurn && !activeTurn) {
+      return { scheduled: false, activeTurn };
+    }
+    this.deferredClose = mergeDeferredClose(this.deferredClose, params.killBackgroundTasks);
+    if (!activeTurn) {
+      this.waiters.shift()?.(undefined);
+    }
+    return { scheduled: true, activeTurn };
+  }
+
+  /** The pending deferred close, removed — the runtime then either performs it or drops it. */
+  takeDeferredClose(): DeferredCloseRequest | undefined {
+    const request = this.deferredClose;
+    this.deferredClose = undefined;
+    return request;
+  }
+
+  hasDeferredClose(): boolean {
+    return this.deferredClose !== undefined;
   }
 
   // 1. Quiesce, before any await. From this instant `submit_prompt` is rejected, so nothing can arrive
@@ -851,6 +907,11 @@ export class SessionQueueOwner {
     // can feed that waiter, because `enqueue` is quiesced.
     // brick ad6ba1c2 v3.1: nor does a close-pending one — the close may still commit. On ABORT the
     // parked waiter is woken with the oldest held item (`abortClosePending`).
+    // brick 9d34a178: nor while a deferred close waits — the runtime must reach its turn-boundary
+    // check instead, so a queued prompt can never start between that turn's end and the close.
+    if (this.deferredClose) {
+      return undefined;
+    }
     if (!this.draining && !this.closePending && this.pending.length > 0) {
       const task = this.pending.shift();
       this.emitQueueDepth();
@@ -925,6 +986,10 @@ export class SessionQueueOwner {
     this.onQueueDepthChanged?.(this.pending.length);
   }
 
+  private injectMidTurn(task: QueueTask): boolean {
+    return !this.deferredClose && this.midTurnHandler?.(task) === true;
+  }
+
   private enqueue(task: QueueTask): void {
     if (this.closed) {
       if (task.waitForCompletion) {
@@ -944,8 +1009,10 @@ export class SessionQueueOwner {
     }
 
     // When a mid-turn handler is registered, new tasks are injected directly
-    // into the active prompt turn instead of being queued.
-    if (this.midTurnHandler?.(task)) {
+    // into the active prompt turn instead of being queued — except while a deferred close waits
+    // (brick 9d34a178): the turn is ending, so the task queues and the close's drain terminalizes
+    // it SESSION_CLOSED_UNDELIVERED (sender told) — or it starts normally if the close fails open.
+    if (this.injectMidTurn(task)) {
       return;
     }
 
@@ -1178,6 +1245,21 @@ export class SessionQueueOwner {
           type: "query_active_turn_result",
           requestId: request.requestId,
           active: this.controlHandlers.queryActiveTurn(),
+        }),
+      });
+      return true;
+    }
+    if (request.type === "schedule_close") {
+      this.handleControlRequest<QueueOwnerScheduleCloseResultMessage>({
+        socket,
+        requestId: request.requestId,
+        run: async () => ({
+          type: "schedule_close_result",
+          requestId: request.requestId,
+          ...this.scheduleClose({
+            killBackgroundTasks: request.killBackgroundTasks === true,
+            onlyIfActiveTurn: request.onlyIfActiveTurn === true,
+          }),
         }),
       });
       return true;

@@ -354,14 +354,14 @@ for (const [selectorName, selectorArgs] of Object.entries(SELECTORS)) {
 }
 
 // The planted positives: the SAME rig, the SAME caller, but the close is addressed at P's OWN
-// seat / id. That is the self-close arm — P's owner is told (one zero-timeout drain), terminated
-// as the final act, and P's record lands closed:true — so every negative row above is proven able
-// to fail. The child is untouched.
+// seat / id. With `--now` that is the immediate self-close arm — P's owner is told (one
+// zero-timeout drain), terminated as the final act, and P's record lands closed:true — so every
+// negative row above is proven able to fail. The child is untouched.
 for (const [selectorName, selectorArgs] of Object.entries(SELECTORS)) {
-  test(`planted positive: close ${selectorName} <parent's own> from under its owner DOES self-close it`, async () => {
+  test(`planted positive: close ${selectorName} <parent's own> --now from under its owner DOES self-close it`, async () => {
     await withCallerRig(
       CWD_SHAPES["shared cwd"],
-      () => selectorArgs({ seat: PARENT_SEAT, sessionId: PARENT_ID }),
+      () => [...selectorArgs({ seat: PARENT_SEAT, sessionId: PARENT_ID }), "--now"],
       async (rig) => {
         await waitFor(
           "the parent's owner being terminated by the self-close",
@@ -390,6 +390,38 @@ for (const [selectorName, selectorArgs] of Object.entries(SELECTORS)) {
           rig.child.keeper.pid !== undefined && isProcessAlive(rig.child.keeper.pid),
           true,
         );
+      },
+    );
+  });
+}
+
+// brick 9d34a178 — WITHOUT `--now` the same self-close DEFERS: the parent's owner is asked to close
+// at the end of its turn (one `schedule_close`, after the gate's read-only query) and is neither
+// drained nor signalled, the CLI returns 0 at once, and nothing is written yet — the owner performs
+// the close itself when the turn ends (test/deferred-self-close.test.ts, real owner). The child is
+// untouched either way.
+for (const [selectorName, selectorArgs] of Object.entries(SELECTORS)) {
+  test(`self-close ${selectorName} <parent's own> without --now is SCHEDULED for the end of the turn, killing nothing`, async () => {
+    await withCallerRig(
+      CWD_SHAPES["shared cwd"],
+      () => selectorArgs({ seat: PARENT_SEAT, sessionId: PARENT_ID }),
+      async (rig) => {
+        const cli = await readCliResult(rig.resultFile);
+        assert.equal(cli.code, 0, `CLI rc; stderr=${cli.stderr}`);
+        assert.match(
+          cli.stdout,
+          /close scheduled: this session closes when your current turn ends/,
+        );
+        assert.match(cli.stdout, /Write your final reply now/);
+        assert.deepEqual(
+          await readJsonLines(rig.observedFile),
+          [{ type: "query_background_tasks" }, { type: "schedule_close" }],
+          "the deferral sends one schedule_close and no drain or close_session",
+        );
+        assert.equal(isProcessAlive(rig.parentPid), true, "the parent's owner is not signalled");
+        await assert.rejects(fs.stat(rig.markerFile), "no SIGTERM reached the parent's owner");
+        assert.equal((await readRecordOnDisk(rig.homeDir, PARENT_ID)).closed, false);
+        assert.deepEqual(rig.child.observed, []);
       },
     );
   });

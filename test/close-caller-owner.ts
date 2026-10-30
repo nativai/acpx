@@ -120,6 +120,16 @@ const server = net.createServer((socket) => {
             closed: true,
           })}\n`,
         );
+      } else if (request.type === "schedule_close") {
+        // brick 9d34a178 — the deferred self-close: recorded for the end of the (pretend) turn.
+        socket.write(
+          `${JSON.stringify({
+            type: "schedule_close_result",
+            requestId: request.requestId,
+            scheduled: true,
+            activeTurn: true,
+          })}\n`,
+        );
       }
       socket.end();
     }

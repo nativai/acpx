@@ -29,10 +29,15 @@ import { queueOwnerLogPath } from "./queue-owner-process.js";
 // turn) is waited on by the retry or the next prompt, so it takes no group step and
 // no reap — its left-behind copy is handled at the next generation's idle exit. The
 // fatal-signal and superseded exits never get here.
-export type OwnerExitKind = "idle-release" | "turn-boundary-recycle" | "other";
+//
+// A `session-close` exit (brick 9d34a178 — the owner closing its own session at the end of a turn,
+// the deferred self-close) reaps too, with the CLOSE's parameters (quiet window, budget,
+// `reduced_by`, trigger): it IS the session's close, so it removes what the non-self close's last
+// step would — proven from inside, like an idle exit, because no closer outside survives to prove it.
+export type OwnerExitKind = "idle-release" | "turn-boundary-recycle" | "session-close" | "other";
 
 export function ownerExitReapsTranscripts(kind: OwnerExitKind): boolean {
-  return kind === "idle-release";
+  return kind === "idle-release" || kind === "session-close";
 }
 
 /** Wait this long for the owner's process group to empty on its own, then SIGKILL the rest. */
@@ -195,7 +200,7 @@ export async function reapTranscriptsAtOwnerExit(params: {
     ...params.deps,
   };
   try {
-    await runOwnerExitReap(params.sessionId, params.isGroupLeader, deps);
+    await runOwnerExitReap(params.sessionId, params.isGroupLeader, deps, params.exitKind);
   } catch (error) {
     deps.write(
       `[acpx] transcript-reap session=${params.sessionId} skipped=error:${(error as Error).message}\n`,
@@ -207,6 +212,7 @@ async function runOwnerExitReap(
   sessionId: string,
   isGroupLeader: () => boolean,
   deps: OwnerExitReapDeps,
+  exitKind: OwnerExitKind,
 ): Promise<void> {
   const record = await deps.resolveRecord(sessionId);
   if (ownerExitReapGateReason(record)) {
@@ -229,9 +235,26 @@ async function runOwnerExitReap(
   if (ownerExitReapGateReason(latest)) {
     return;
   }
-  for (const line of formatTranscriptReapLines(await deps.reap({ record: latest }))) {
+  for (const line of await reapAtOwnerExit(latest, exitKind, deps)) {
     deps.write(line);
   }
+}
+
+async function reapAtOwnerExit(
+  record: SessionRecord,
+  exitKind: OwnerExitKind,
+  deps: OwnerExitReapDeps,
+): Promise<string[]> {
+  if (exitKind !== "session-close") {
+    return formatTranscriptReapLines(await deps.reap({ record }));
+  }
+  const summary = await deps.reap({
+    record,
+    quietMs: CLOSE_REAP_QUIET_MS,
+    budget: CLOSE_REAP_BUDGET,
+    reducedBy: "session-close",
+  });
+  return formatTranscriptReapLines(summary, { trigger: "session-close" });
 }
 
 // ---------------------------------------------------------------------------

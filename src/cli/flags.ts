@@ -214,6 +214,10 @@ export type SessionsCloseFlags = StatusFlags & {
   failOnUndelivered?: boolean;
   // brick ad6ba1c2 (Contract C2) — close even though it has live background tasks; they are killed.
   killBackgroundTasks?: boolean;
+  // brick 9d34a178 — a self-close defers to the end of the turn unless `--now`; `--after-turn`
+  // gives any caller that deferral.
+  now?: boolean;
+  afterTurn?: boolean;
 };
 
 export type SessionsPruneFlags = {

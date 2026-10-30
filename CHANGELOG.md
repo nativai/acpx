@@ -186,8 +186,18 @@ Repo: https://github.com/openclaw/acpx
   adapter are proven gone and `closed:true` is read back. The rules are the
   idle-exit ones: a byte-prefix is deleted, an exit-block copy is reduced, anything
   else is kept. It skips a copy written in the last 60 s and is bounded to
-  2 s / 256 MiB. The close's output is unchanged. A session that closes itself keeps
-  the copy for `acpx transcripts dedup`. (brick 1e77037f)
+  2 s / 256 MiB. The close's output is unchanged. A session that closes itself with
+  `--now` keeps the copy for `acpx transcripts dedup`. (brick 1e77037f)
+- Sessions: **an agent closing its own session keeps its final reply** (brick
+  9d34a178). `sessions close` run from inside the session it closes used to
+  terminate that session's queue owner on the spot, which killed the agent inside
+  its tool call — nothing it would have written afterwards was ever generated. The
+  close is now scheduled with the owner and performed when the turn ends (the
+  command returns at once: `session_close_scheduled`, `deferred: true`); queued
+  messages end `SESSION_CLOSED_UNDELIVERED`, a background task started after the
+  request keeps the session open unless `--kill-background-tasks` was given, and an
+  owner that dies first leaves the session open. `--now` keeps the immediate close;
+  `--after-turn` gives any caller the deferral.
 
 ### Breaking
 

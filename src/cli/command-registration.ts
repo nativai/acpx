@@ -537,6 +537,29 @@ export function registerSessionsCommand(
       "--kill-background-tasks",
       "Close even though the session has live background tasks (Monitor, background Bash, " +
         "background Agent). Those tasks are killed.",
+    )
+    // brick 9d34a178 — shown in --help on purpose: an agent closing ITSELF must read these two.
+    .option(
+      "--now",
+      "Closing your OWN session: close immediately instead of at the end of your turn. This ends " +
+        "your turn on the spot — nothing you would write after it is generated.",
+    )
+    .option(
+      "--after-turn",
+      "Any caller: if the session has a turn in flight, close it when that turn ends (returns at " +
+        "once); if it is idle, close now. A close of your OWN session does this by default.",
+    )
+    .addHelpText(
+      "after",
+      `
+Closing your OWN session (run from inside it, e.g. --seat "$ACPX_SEAT_URL"):
+  The close is scheduled, the command returns at once, and the session closes when your
+  current turn ends. Write your final reply AFTER the command — it is kept and delivered.
+  Messages that arrive in the meantime are not started; they end SESSION_CLOSED_UNDELIVERED
+  and their senders are told. --now restores the immediate close (nothing after it is
+  generated). --drain-timeout, --no-drain and --fail-on-undelivered apply only to an
+  immediate close.
+`,
     );
   addSessionIdentityOptions(closeCommand);
   addSeatSelectorOption(closeCommand);
@@ -828,7 +851,8 @@ OTHER THINGS WORTH KNOWING.
 The two steps of a handover, in order:
   1. acpx sessions new --seat <seat>            # create the successor, prepared, no ordinal
   2. acpx sessions activate <seat> <new>        # retire the old holder, point the seat, draw the ordinal
-  3. acpx sessions close --session-id <old>     # YOUR duty — printed by step 2
+  3. acpx sessions close --session-id <old>     # YOUR duty — printed by step 2; from inside
+                                                #   <old> it closes when that turn ends
 
 Two concurrent activations on one seat are safe: both read the seat row fresh under a
 lock, exactly one wins, and the loser refuses rather than overwriting. The ordinal is a

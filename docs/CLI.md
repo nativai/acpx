@@ -351,6 +351,8 @@ Behavior:
 - text and quiet output print the local `acpxRecordId`; JSON output also includes
   `acpxSessionId` and, when the adapter exposes one, `agentSessionId`
 - `sessions close --session-id <id>` soft-closes that session. For a Claude session closed from outside (not by itself), the last step removes the transcript copy it left in another subscription once the owner, its process group and the adapter are proven gone (see `transcripts`; logged as `transcript-reap … trigger=session-close` in the session's owner log)
+- `sessions close` run by an agent on its OWN session (from inside it, e.g. `--seat "$ACPX_SEAT_URL"`) does not close it on the spot: the session's queue owner records the close and the command returns at once (exit 0, `action: session_close_scheduled`, `deferred: true` in JSON). The owner closes the session when the current turn ends, so whatever the agent writes after the command is kept and delivered. Messages that arrive meanwhile are not started; they end `SESSION_CLOSED_UNDELIVERED` and their senders are told. A background task that went live after the request leaves the session open (logged in the owner log) unless the close was given `--kill-background-tasks`. If the owner dies before the turn ends, the session simply stays open. `--now` closes immediately instead — it ends the turn on the spot and nothing after it is generated. An owner from an acpx without this behaviour refuses the deferral (exit 1, `DEFERRED_CLOSE_UNAVAILABLE`, nothing closed)
+- `sessions close --after-turn` gives any caller the same deferral: a session with a turn in flight closes when that turn ends (`session_close_scheduled`), an idle one closes now
 - `sessions close` run by an agent refuses a by-the-way side-thread (a human's
   side conversation) other than the agent's own session: exit 1, code
   `BYWAY_CLOSE_REFUSED` (`{ok:false, code, error, sessionId, sourceSessionId}`
@@ -413,7 +415,8 @@ Claude keeps a session's transcript per subscription (`<config dir>/projects/<cw
 
 - **At the port**, an existing destination is renamed aside as before. The sidecar is then **deleted** when it is a byte-prefix of the copy just placed, or **reduced** when it is that copy's prefix plus one block of Claude Code's own exit metadata (`last-prompt`, `cost-state`, `ai-title`, …). Otherwise it stays as `<id>.superseded-<ISO>.jsonl`.
 - **At the queue owner's idle exit**, once the owner's process group is empty, every quiet (≥ 10 min) copy the session left in another registered subscription is deleted or reduced by the same rules.
-- **At a close from outside** (`sessions close`, not a self-close), as the close's last step, once the owner, its group and the recorded adapter are proven gone and `closed:true` is read back: the same, for copies quiet ≥ 60 s, within 2 s / 256 MiB. A close that has already run 8 s skips it.
+- **At a close from outside** (`sessions close`, not an immediate `--now` self-close), as the close's last step, once the owner, its group and the recorded adapter are proven gone and `closed:true` is read back: the same, for copies quiet ≥ 60 s, within 2 s / 256 MiB. A close that has already run 8 s skips it.
+- **At a deferred close** (a self-close, or `--after-turn`), the owner closing its own session at the end of the turn: the idle-exit procedure with the close's quiet window and budget.
 - A copy holding any conversation line found in no other copy is never removed. Neither is the copy the session resumes from.
 
 **Reduced** means the exit block is written byte-exactly into `<id>.exit-tail-<ISO>.acpx` beside the copy, under a one-line JSON header (sizes and sha256s of the original and of the prefix it shares). Then the copy is removed. No `*.jsonl` reader lists `.acpx` files.
