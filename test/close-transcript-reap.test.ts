@@ -478,5 +478,5 @@ test("N6 / N7: the step is reached only on the non-self arm, after every refusal
   assert.ok(calls[0] > start && calls[0] < end, "the call is inside closeSession");
   assert.ok(inside("return await closeSelfOwnedSession(") < calls[0], "after the self arm returns");
   assert.ok(inside("await drainCustodyBeforeClose(") < calls[0], "after the refusing drain");
-  assert.ok(inside("await readBackRecordClosedState(") < calls[0], "after the read-back");
+  assert.ok(inside("await writeTerminalCloseRecord(") < calls[0], "after the write + read-back");
 });

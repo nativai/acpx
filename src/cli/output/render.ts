@@ -244,6 +244,45 @@ export function printClosedSessionByFormat(
 }
 
 /**
+ * brick 9d34a178 — a close scheduled for the end of the turn. Says plainly WHEN it closes and, to an
+ * agent closing itself, that its final reply belongs after this command: that reply is the whole
+ * point of the deferral (the immediate self-close used to destroy it).
+ */
+export function printScheduledCloseByFormat(
+  scheduled: {
+    record: SessionRecord;
+    self: boolean;
+    activeTurn: boolean;
+    killBackgroundTasks: boolean;
+  },
+  format: OutputFormat,
+): void {
+  const { record } = scheduled;
+  if (
+    emitJsonResult(format, {
+      action: "session_close_scheduled",
+      deferred: true,
+      acpxRecordId: record.acpxRecordId,
+      acpxSessionId: record.acpSessionId,
+      self: scheduled.self,
+      activeTurn: scheduled.activeTurn,
+      closesAt: "end_of_turn",
+      killBackgroundTasks: scheduled.killBackgroundTasks,
+    }) ||
+    format === "quiet"
+  ) {
+    return;
+  }
+  process.stdout.write(`${record.acpxRecordId}\n`);
+  process.stdout.write(
+    scheduled.self
+      ? `close scheduled: this session closes when your current turn ends.\n` +
+          `Write your final reply now — everything you write after this command is kept and delivered.\n`
+      : `close scheduled: session ${record.acpxRecordId} closes when its current turn ends; nothing was cut.\n`,
+  );
+}
+
+/**
  * The loud, greppable block a closing agent sees when it lost custody
  * (DESIGN §2.4). STDERR, always — including under `--format json`, whose consumer
  * reads stdout — because the whole defect was that this loss was SILENT.

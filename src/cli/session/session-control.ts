@@ -1,5 +1,4 @@
 import fs from "node:fs/promises";
-import { releaseHarnessConfigDir } from "../../acp/harness-config-dir.js";
 import {
   ConfigOptionQueuedWorkError,
   ConfigOptionTurnInFlightError,
@@ -38,14 +37,11 @@ import {
   resolveSessionRecord,
   listSessionIndexEntries,
   loadSessionRecordBodyFromIndexEntry,
-  readRawRecordClosedState,
   sessionBaseDir,
   writeSessionRecord,
-  writeSessionRecordAtBoundaryWithLifecycle,
   writeSessionRecordWithLifecycle,
   isoNow,
 } from "../../session/persistence.js";
-import type { RawRecordFieldState } from "../../session/persistence.js";
 import type { SessionIndexEntry } from "../../session/persistence/index.js";
 import type {
   SessionRecord,
@@ -67,6 +63,8 @@ import {
   tryCancelOnRunningOwner,
   tryCloseSessionOnRunningOwner,
   tryQueryActiveTurnOnRunningOwner,
+  tryScheduleCloseOnRunningOwner,
+  type ScheduleCloseOutcome,
   trySetConfigOptionOnRunningOwner,
   trySetDepthOnRunningOwner,
   trySetModelOnRunningOwner,
@@ -103,6 +101,11 @@ import {
   runSessionSetModelDirect,
   runSessionSetModeDirect,
 } from "./prompt-runner.js";
+import {
+  releaseConfigDirOnTerminalClose,
+  type SessionCloseRecordState,
+  writeTerminalCloseRecord,
+} from "./terminal-close.js";
 
 export async function cancelSessionPrompt(
   options: SessionCancelOptions,
@@ -761,12 +764,7 @@ export class LiveBackgroundTasksDuringCloseError extends Error {
   }
 }
 
-// What the close actually verified on disk after writing — the record-derived
-// fact a caller (above all the CLI printer, brick 1bfb95ed deliverable 4) must
-// report, instead of inferring success from the write call's own exit status.
-export type SessionCloseRecordState =
-  | { status: "read"; closed: RawRecordFieldState; closedAt: RawRecordFieldState }
-  | { status: "read_failed"; error: string };
+export type { SessionCloseRecordState };
 
 export type SessionCloseResult = {
   record: SessionRecord;
@@ -781,18 +779,6 @@ export type SessionCloseResult = {
   /** v3.1: live tasks the close found AFTER consent; reaped and named `startedDuringClose`. */
   lateTasks: LiveBackgroundTask[];
 };
-
-// Re-reads `<id>.json` immediately after the terminal write, converting a
-// throw (missing file, invalid JSON) into its own distinct outcome rather than
-// letting it propagate and mask a close that otherwise succeeded.
-async function readBackRecordClosedState(acpxRecordId: string): Promise<SessionCloseRecordState> {
-  try {
-    const raw = await readRawRecordClosedState(acpxRecordId);
-    return { status: "read", closed: raw.closed, closedAt: raw.closedAt };
-  } catch (error) {
-    return { status: "read_failed", error: error instanceof Error ? error.message : String(error) };
-  }
-}
 
 // D1 step 0.5 — THE BARRIER. Best-effort exactly like step 1
 // (`tryCloseSessionOnRunningOwner`): a drain that cannot happen never blocks a
@@ -919,15 +905,8 @@ export async function closeSession(
   }
 
   const adapterAtClose = { pid: record.pid, pidIdentity: record.pidIdentity };
-  record.pid = undefined;
-  record.pidIdentity = undefined;
-  record.closed = true;
-  record.closedAt = isoNow();
-  // Privileged write: this is a daemon-authorized close — bypass the
-  // read-preserve-lifecycle step so `closed: true` actually lands on disk.
-  // See writeSessionRecord doc comment in repository.ts for the ownership rules.
-  await writeSessionRecordAtBoundaryWithLifecycle(record);
-  const recordClosedState = await readBackRecordClosedState(record.acpxRecordId);
+  // The privileged terminal write + its read-back (`terminal-close.ts`, shared by every close arm).
+  const recordClosedState = await writeTerminalCloseRecord(record);
 
   releaseConfigDirOnTerminalClose(record);
 
@@ -959,6 +938,98 @@ export async function closeSession(
 }
 
 // ---------------------------------------------------------------------------
+// brick 9d34a178 — WHEN a close happens: now, or at the end of the target's turn.
+//
+// A self-close (`acpx sessions close` run by the agent inside the session it closes) used to run the
+// self arm below: it SIGTERMs the session's own queue owner, which takes the adapter and the agent
+// with it — the close tool call never returns, the turn never ends, and the agent's final reply is
+// never generated (live: bd264aec, brick f1f7a68d). So a self-close now DEFERS by default: the live
+// owner records the request and performs the close itself when the turn ends (queue-owner-runtime
+// `performDeferredClose`), and this returns at once. `--now` keeps the immediate self arm.
+// `--after-turn` gives ANY caller the same deferral when the target has a turn in flight (an idle or
+// owner-less target closes now) — the form a server-side close requested BY the session needs,
+// since that closer is no descendant of the owner and cannot be detected as a self-close.
+// ---------------------------------------------------------------------------
+
+export type SessionCloseMode = "default" | "now" | "after-turn";
+
+export type SessionCloseScheduled = {
+  record: SessionRecord;
+  /** The caller runs inside the session it closes. */
+  self: boolean;
+  /** A turn was in flight when the owner recorded the request (false: it closes right away). */
+  activeTurn: boolean;
+  killBackgroundTasks: boolean;
+};
+
+export type SessionCloseRequestResult =
+  | { deferred: false; closed: SessionCloseResult }
+  | { deferred: true; scheduled: SessionCloseScheduled };
+
+/**
+ * The deferral was asked for but the live owner could not record it — above all an owner still
+ * running an acpx from before this verb (owners outlive a deploy until their idle release). Thrown
+ * BEFORE anything is touched: nothing is closed, drained or signalled. Deliberately NOT a fallback
+ * to the immediate close, which for a self-close is the very reply-destroying act the deferral
+ * replaces; the caller chooses `--now` knowingly.
+ */
+export class DeferredCloseUnavailableError extends Error {
+  readonly sessionId: string;
+  readonly self: boolean;
+  readonly detail: string;
+  constructor(sessionId: string, self: boolean, outcome: ScheduleCloseOutcome) {
+    const detail = outcome.kind === "unsupported" ? outcome.detail : outcome.kind;
+    super(
+      `session ${sessionId}: its queue owner could not schedule a close for the end of its turn ` +
+        `(${detail}); nothing was closed. ` +
+        (self
+          ? "Re-run with --now to close immediately — that ends your turn on the spot and nothing you would write after it is generated."
+          : "Re-run without --after-turn to close now (an in-flight turn is cut)."),
+    );
+    this.name = "DeferredCloseUnavailableError";
+    this.sessionId = sessionId;
+    this.self = self;
+    this.detail = detail;
+  }
+}
+
+/** Whether this close waits for the end of the target's turn. */
+export function closeDefersToTurnEnd(self: boolean, mode: SessionCloseMode): boolean {
+  return self ? mode !== "now" : mode === "after-turn";
+}
+
+export async function requestSessionClose(
+  sessionId: string,
+  options: CloseSessionOptions & { mode: SessionCloseMode; killBackgroundTasks: boolean },
+): Promise<SessionCloseRequestResult> {
+  const record = await resolveSessionRecord(sessionId);
+  const self = (await detectSelfOwnedOwner(record.acpxRecordId)) !== undefined;
+  if (!closeDefersToTurnEnd(self, options.mode)) {
+    return { deferred: false, closed: await closeSession(record.acpxRecordId, options) };
+  }
+  const outcome = await tryScheduleCloseOnRunningOwner(record.acpxRecordId, {
+    killBackgroundTasks: options.killBackgroundTasks,
+    onlyIfActiveTurn: !self,
+  });
+  if (outcome.kind === "scheduled") {
+    return {
+      deferred: true,
+      scheduled: {
+        record,
+        self,
+        activeTurn: outcome.activeTurn,
+        killBackgroundTasks: options.killBackgroundTasks,
+      },
+    };
+  }
+  // `--after-turn` from outside on an idle or owner-less target: nothing to wait for — close now.
+  if (!self && (outcome.kind === "idle" || outcome.kind === "no-owner")) {
+    return { deferred: false, closed: await closeSession(record.acpxRecordId, options) };
+  }
+  throw new DeferredCloseUnavailableError(record.acpxRecordId, self, outcome);
+}
+
+// ---------------------------------------------------------------------------
 // brick://f4f1fa54 — SELF-CLOSE. A session may be closed BY ITSELF: the agent
 // running inside the session executes `acpx sessions close <own id>` (or an
 // equivalent UI-driven request), so the CLI process performing the close is a
@@ -979,7 +1050,7 @@ export async function closeSession(
 // adapter sits on the doomed owner→caller path and taking it down kills the
 // caller before it can return. The config-dir release is skipped as well — with
 // the owner still ALIVE at that point, `dropStaleHolders` would retain the
-// directory anyway (see the 433f6bf8 block above); the orphan sweep remains the
+// directory anyway (see the 433f6bf8 block in terminal-close.ts); the orphan sweep remains the
 // guarantee, and it collects the dir once the owner is gone. The lease/socket
 // tidy-up is likewise left to the next cold spawn: a dead-owner lease is the
 // `recoverable` state, auto-cleaned on the next submit (North Star invariant —
@@ -1120,14 +1191,8 @@ async function closeSelfOwnedSession(
   options: CloseSessionOptions,
 ): Promise<SessionCloseResult> {
   const ownerPid = selfOwner.pid;
-  record.pid = undefined;
-  record.pidIdentity = undefined;
-  record.closed = true;
-  record.closedAt = isoNow();
-  // Privileged write: same daemon-authorized close as the non-self path —
-  // bypass the read-preserve-lifecycle step so `closed: true` lands on disk.
-  await writeSessionRecordAtBoundaryWithLifecycle(record);
-  const recordClosedState = await readBackRecordClosedState(record.acpxRecordId);
+  // Same privileged terminal write as the non-self path — `closed: true` lands on disk first.
+  const recordClosedState = await writeTerminalCloseRecord(record);
   await landOrDropIndexUpdatesBeforeSelfTerminate();
 
   // brick e50e171d — TELL the own owner a close is on, without waiting. Its SIGTERM sweep then writes `done /
@@ -1169,58 +1234,6 @@ async function closeSelfOwnedSession(
     reap: unmeasuredReap("self-close"),
     lateTasks: [],
   };
-}
-
-/**
- * THE TERMINAL CLOSE IS WHERE THE CONFIG DIR GOES (brick 433f6bf8).
- *
- * ## Why here and not in `AcpClient.close()`, which already releases
- *
- * `AcpClient.close()` releases too, and that is the fast path — but it needs a
- * LIVE CLIENT. The sessions that leak are exactly the ones with no client left:
- * an owner released for idleness, `kill -9`, a pod eviction. **Measured on the
- * deployed build 2026-09-08: eight `/tmp/acpx-pi-<id>` dirs, ~320 KB each, every
- * record `closed:true` carrying the right `harness_config_dir`, and EVERY holder
- * pid dead** — eight instances of "the client that would have released it was
- * already gone". They had survived ~16 h and more than two sweep intervals.
- *
- * `closeSession` is the one place that cannot be skipped by that: it is the
- * canonical terminal close, acpx-ui delegates to the verb that calls it, and
- * `markSessionAsTemplate` — the second authorized writer of `closed` — calls it
- * too. Releasing here therefore covers every close path there is.
- *
- * ## ⚠️ IT RELEASES, IT DOES NOT DELETE — and the ordering is what makes that work
- *
- * `terminateQueueOwnerForSession` above WAITS for the owner to exit (SIGTERM,
- * grace, SIGKILL, grace), so by this line the owner's holder pid is genuinely
- * dead and `dropStaleHolders` drops it deterministically. A second client that is
- * still ALIVE keeps its holder, the directory is RETAINED, and the orphan sweep
- * collects it later — which is the 4a6fdda0 invariant (one session, two clients,
- * one directory) preserved rather than re-litigated. This can therefore never
- * delete a directory out from under a live turn.
- *
- * ## ⚠️ BEST-EFFORT, AND NEVER FATAL TO A CLOSE
- *
- * A close that failed because the tidy-up threw would be strictly worse than a
- * directory that survives to the sweep. The sweep remains the guarantee; this is
- * the deterministic fast path.
- *
- * ⚠️ Consequence worth knowing: acpx-ui's "Show injected primer" reads this
- * directory for its `exact:true` config-dir source, so a closed pi session loses
- * that source at close rather than at the next sweep. That is a move of an
- * existing loss, not a new one — the sweep already removes these on a
- * `closedRecord` verdict — and the modal has a documented fallback.
- */
-function releaseConfigDirOnTerminalClose(record: SessionRecord): void {
-  const dir = record.acpx?.harness_config_dir;
-  if (dir === undefined) {
-    return;
-  }
-  try {
-    releaseHarnessConfigDir(dir, undefined);
-  } catch {
-    // Best-effort by design — see above. The orphan sweep is the guarantee.
-  }
 }
 
 export type SessionReopenResult = {

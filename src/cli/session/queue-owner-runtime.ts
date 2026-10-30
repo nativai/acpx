@@ -37,6 +37,7 @@ import {
 } from "../../session/persistence.js";
 import { seatDisplayName } from "../../session/seat-display-name.js";
 import type { AcpJsonRpcMessage, SessionRecord, SessionSendOutcome } from "../../types.js";
+import type { DeferredCloseRequest } from "../queue/ipc-server.js";
 import {
   appendDeliveryStreamEvent,
   QUEUE_CONNECT_RETRY_MS,
@@ -97,6 +98,7 @@ import {
   spawnQueueOwnerProcess,
 } from "./queue-owner-process.js";
 import { runQueuedTask, type AccountSwitchTrigger } from "./runtime.js";
+import { releaseConfigDirOnTerminalClose, writeTerminalCloseRecord } from "./terminal-close.js";
 
 // Wall-clock budget for a cold-respawn owner startup, shared across all re-spawn
 // attempts. It is a TIME bound, not a poll count: once the owner's lease exists a
@@ -461,6 +463,11 @@ async function closeQueueOwnerRuntime(params: {
     // best effort while queue owner is shutting down
   });
   await reapOwnerExit();
+  if (params.exitKind === "session-close") {
+    // brick 9d34a178 — the deferred close's config-dir step, now that this owner's client has
+    // released its holder (the order `releaseConfigDirOnTerminalClose` relies on).
+    await releaseConfigDirAfterOwnClose(params.sessionId);
+  }
   await writeQueueOwnerLifecycleSnapshot(params.sessionId, params.sharedClient);
   // The exit snapshot's index update may be in the coalesced scalar class —
   // drain it so the index reflects the final owner state (W2.3 / D6).
@@ -485,6 +492,80 @@ async function closeQueueOwnerRuntime(params: {
   if (ownerIsGroupLeader() && hasLiveProcessGroup(process.pid)) {
     signalProcessGroup(process.pid, "SIGKILL");
   }
+}
+
+async function releaseConfigDirAfterOwnClose(sessionId: string): Promise<void> {
+  try {
+    releaseConfigDirOnTerminalClose(await resolveSessionRecord(sessionId));
+  } catch {
+    // best effort, like every other close's release — the orphan sweep remains the guarantee
+  }
+}
+
+// The deferred close's best-effort ACP `session/close` — the step the non-self close sends as
+// `close_session` — is bounded so a wedged adapter cannot hold the close open.
+const DEFERRED_CLOSE_BACKEND_TIMEOUT_MS = 5_000;
+
+/**
+ * brick 9d34a178 — THE DEFERRED CLOSE, performed by this owner at a turn boundary: right after the
+ * turn that asked for it ended (its messages persisted, its `acpx/turn` idle event and its own
+ * `done` delivery terminal written by the runtime), and before the loop can hand out another task.
+ * Returns true when the record is now closed and the owner must leave through its graceful exit
+ * (`session-close`), which closes the adapter, reaps the task processes, releases the config dir,
+ * runs the transcript reap with the close's parameters, releases the lease and exits.
+ *
+ * It is the existing close, run from inside: the SAME drain barrier the non-self close sends over
+ * IPC (quiesce; every queued item `SESSION_CLOSED_UNDELIVERED`, sender told; an unforced close's
+ * background-task check), the same ACP close, the same terminal record write.
+ *
+ * ⚠️ An UNFORCED request whose session has a background task live NOW (one started after the
+ * request — the CLI's upfront gate refused any earlier one) is NOT performed: the drain's own check
+ * refuses, the owner resumes normal service, the session stays open, and owner.log says so. Fail
+ * open — nothing is destroyed — exactly as the non-self close refuses from inside its drain.
+ */
+async function performDeferredClose(params: {
+  sessionId: string;
+  owner: SessionQueueOwner;
+  closeBackend: (timeoutMs?: number) => Promise<boolean>;
+}): Promise<boolean> {
+  const request = params.owner.takeDeferredClose();
+  if (!request) {
+    return false;
+  }
+  const drain = await params.owner.drainDeliveries(
+    "session-close",
+    0,
+    !request.killBackgroundTasks,
+  );
+  if (drain.taskCheck === "refused") {
+    process.stderr.write(formatDeferredCloseRefusedLine(params.sessionId, request, drain));
+    return false;
+  }
+  await params.closeBackend(DEFERRED_CLOSE_BACKEND_TIMEOUT_MS).catch(() => {
+    // best effort, as on the non-self close
+  });
+  const state = await writeTerminalCloseRecord(await resolveSessionRecord(params.sessionId));
+  process.stderr.write(
+    `[acpx] deferred close: session ${params.sessionId} closed at the end of its turn ` +
+      `(requested ${request.requestedAt}${request.killBackgroundTasks ? ", --kill-background-tasks" : ""}; ` +
+      `${drain.undelivered.length} undelivered SESSION_CLOSED_UNDELIVERED; record read-back ` +
+      `${state.status === "read" && state.closed.present ? `closed=${String(state.closed.value)}` : "FAILED"})\n`,
+  );
+  return true;
+}
+
+export function formatDeferredCloseRefusedLine(
+  sessionId: string,
+  request: DeferredCloseRequest,
+  drain: { tasks?: Array<{ taskId: string }> },
+): string {
+  const ids = (drain.tasks ?? []).map((task) => task.taskId).join(",");
+  return (
+    `[acpx] deferred close NOT performed for session ${sessionId}: ` +
+    `${drain.tasks?.length ?? 0} background task(s) went live after the request ` +
+    `(requested ${request.requestedAt}; tasks ${ids || "?"}); the session stays OPEN — ` +
+    `close it again once they end, or with --kill-background-tasks\n`
+  );
 }
 
 /** Takes the exit snapshot now; the returned step reaps it once the client is closed. */
@@ -1479,6 +1560,11 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       });
     }
 
+    const deferredCloseParams = {
+      sessionId: options.sessionId,
+      owner,
+      closeBackend: closeActiveBackendSession,
+    };
     let isFirstTask = true;
     while (true) {
       // The QUIESCENCE WINDOW handed to the shared gate. TTL-derived, unchanged.
@@ -1503,6 +1589,13 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       // collapse these back into one variable.
       const { pollTimeoutMs, quiescenceWindowMs: gateWindowMs } = idleCheckTimings(idleWindowMs);
       let task = await owner.nextTask(pollTimeoutMs);
+      // brick 9d34a178 — a deferred close requested while no turn ran (or that waited out a turn
+      // the boundary check below never saw) is performed here, before any release decision.
+      if (!task && (await performDeferredClose(deferredCloseParams))) {
+        ownerExitKind = "session-close";
+        ownerExitReason = "session-close";
+        break;
+      }
       if (!task) {
         // A full idle window elapsed; subsequent waits use the steady cadence.
         isFirstTask = false;
@@ -1686,6 +1779,14 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
             appendDeliveryStreamEvent(options.sessionId, leftover, "queued");
           }
         }
+      }
+      // brick 9d34a178 — THE TURN BOUNDARY of a deferred close. Directly after the turn, before
+      // the loop's next `nextTask`: no queued prompt can start between this turn's end and the
+      // close. ⚠️ Do not move this below an `await owner.nextTask(...)`.
+      if (await performDeferredClose(deferredCloseParams)) {
+        ownerExitKind = "session-close";
+        ownerExitReason = "session-close";
+        break;
       }
       // If the advertised pathname disappeared during a turn, restore it only
       // after the authoritative local turn state is idle and no queued work

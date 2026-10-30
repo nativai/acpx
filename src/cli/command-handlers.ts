@@ -2877,8 +2877,11 @@ export async function handleSessionsClose(
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const [{ closeSession }, { printClosedSessionByFormat, warnUndeliveredCustody }] =
-    await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
+  const [
+    { requestSessionClose },
+    { printClosedSessionByFormat, printScheduledCloseByFormat, warnUndeliveredCustody },
+  ] = await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
+  const mode = sessionCloseMode(flags);
 
   const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
   const record = await requireExplicitSessionRecord(selector, agent.agentName);
@@ -2913,8 +2916,10 @@ export async function handleSessionsClose(
     verb: "close" as const,
     retryArgs: closeRetryArgs(flags),
   };
-  const closed = await closeOrRefuseLate(globalFlags.format, refusalContext, () =>
-    closeSession(record.acpxRecordId, {
+  const requested = await closeOrRefuseLate(globalFlags.format, refusalContext, () =>
+    requestSessionClose(record.acpxRecordId, {
+      mode,
+      killBackgroundTasks: flags.killBackgroundTasks === true,
       drain: flags.drain !== false,
       drainTimeoutMs: flags.drainTimeout,
       verbose: globalFlags.verbose,
@@ -2923,9 +2928,16 @@ export async function handleSessionsClose(
       checkBackgroundTasks: flags.killBackgroundTasks !== true,
     }),
   );
-  if (!closed) {
+  if (!requested) {
     return;
   }
+  // brick 9d34a178 — scheduled for the end of the turn: nothing was closed yet, so there is no
+  // drain, read-back or reap to report; the owner performs and logs those when the turn ends.
+  if (requested.deferred) {
+    printScheduledCloseByFormat(requested.scheduled, globalFlags.format);
+    return;
+  }
+  const closed = requested.closed;
   printClosedSessionByFormat(
     closed.record,
     closed.drain,
@@ -2950,9 +2962,21 @@ export async function handleSessionsClose(
   applyCloseExitCode(closed, record, flags, warnUndeliveredCustody);
 }
 
+/** brick 9d34a178 — `--now` and `--after-turn` are opposites; refused before anything resolves. */
+function sessionCloseMode(flags: SessionsCloseFlags): "default" | "now" | "after-turn" {
+  if (flags.now === true && flags.afterTurn === true) {
+    throw new InvalidArgumentError("--now and --after-turn cannot be combined");
+  }
+  if (flags.now === true) {
+    return "now";
+  }
+  return flags.afterTurn === true ? "after-turn" : "default";
+}
+
 /**
  * brick ad6ba1c2 v3.1 — runs a close that may REFUSE from inside its drain (a task started after the
  * upfront gate): the refusal is emitted exactly like the gate's (exit 7) and `undefined` returned.
+ * brick 9d34a178 — likewise a deferral the live owner could not record (exit 1, nothing touched).
  */
 async function closeOrRefuseLate<T>(
   format: OutputFormat,
@@ -2967,8 +2991,22 @@ async function closeOrRefuseLate<T>(
       emitLiveBackgroundTasksRefusal(backgroundTasksRefusal(refusalContext, tasks), format);
       return undefined;
     }
+    if (error instanceof Error && error.name === "DeferredCloseUnavailableError") {
+      emitDeferredCloseUnavailable(error, refusalContext.record.acpxRecordId, format);
+      return undefined;
+    }
     throw error;
   }
+}
+
+function emitDeferredCloseUnavailable(error: Error, sessionId: string, format: OutputFormat): void {
+  const code = "DEFERRED_CLOSE_UNAVAILABLE";
+  if (!emitJsonResult(format, { ok: false, code, error: error.message, sessionId })) {
+    if (format !== "quiet") {
+      process.stderr.write(`sessions close: ${code}: ${error.message}\n`);
+    }
+  }
+  process.exitCode = 1;
 }
 
 /** Rendered in the seat refusals' shape (`seats-command.ts` `runSeatMutation`): exit 1. */
@@ -5074,7 +5112,10 @@ function printActivationText(
     process.stdout.write(
       `Retired (NOT closed): ${result.predecessorId}\n` +
         `🛑 YOUR DUTY — close it yourself; nothing else will:\n` +
-        `     acpx sessions close --session-id ${result.predecessorId}\n`,
+        `     acpx sessions close --session-id ${result.predecessorId}\n` +
+        // brick 9d34a178 — run from inside that session, the close waits for its turn to end.
+        `   From inside ${result.predecessorId}: it closes when your turn ends — write your final ` +
+        `reply after it; that reply is kept.\n`,
     );
   }
   // c85c42bf (HOD-R46 (b), AC6 "one command and no follow-up"): the notice is DELIVERED to

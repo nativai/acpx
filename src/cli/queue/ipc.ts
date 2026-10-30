@@ -49,7 +49,9 @@ import {
   type QueueOwnerSetModeResultMessage,
   type QueueQueryActiveTurnRequest,
   type QueueQueryBackgroundTasksRequest,
+  type QueueOwnerScheduleCloseResultMessage,
   type QueueRequest,
+  type QueueScheduleCloseRequest,
   type QueueSetConfigOptionRequest,
   type QueueSetDepthRequest,
   type QueueSetModelRequest,
@@ -1147,6 +1149,77 @@ export async function tryQueryActiveTurnOnRunningOwner(
   }
 
   throw notAcceptingRequestsError(health, "query_active_turn");
+}
+
+/** brick 9d34a178 — what asking the live owner to close at the end of its turn produced. */
+export type ScheduleCloseOutcome =
+  /** Recorded: the owner closes itself when the turn in flight ends (at once if none ran). */
+  | { kind: "scheduled"; activeTurn: boolean; ownerPid: number }
+  /** `onlyIfActiveTurn` and no turn in flight: nothing was recorded. */
+  | { kind: "idle"; ownerPid: number }
+  /** No owner to ask (no lease, or its socket did not answer). */
+  | { kind: "no-owner" }
+  /** The owner answered but cannot schedule — above all an owner still running an older acpx. */
+  | { kind: "unsupported"; detail: string };
+
+const SCHEDULE_CLOSE_DEADLINE_MS = 5_000;
+
+/**
+ * brick 9d34a178 — `schedule_close` on the session's live owner. NEVER throws. Control path only,
+ * like the background-task query: never routed through `trySubmitToRunningOwner`, whose
+ * protocol-mismatch recovery terminates an owner that answers unexpectedly — an OLD owner
+ * answering this verb must be reported (`unsupported`), never killed.
+ */
+export async function tryScheduleCloseOnRunningOwner(
+  sessionId: string,
+  options: { killBackgroundTasks: boolean; onlyIfActiveTurn: boolean },
+): Promise<ScheduleCloseOutcome> {
+  const owner = await readQueueOwnerRecord(sessionId).catch(() => undefined);
+  if (!owner) {
+    return { kind: "no-owner" };
+  }
+  try {
+    return await submitScheduleCloseToQueueOwner(owner, options);
+  } catch (error) {
+    return { kind: "unsupported", detail: scheduleCloseErrorDetail(error) };
+  }
+}
+
+async function submitScheduleCloseToQueueOwner(
+  owner: QueueOwnerRecord,
+  options: { killBackgroundTasks: boolean; onlyIfActiveTurn: boolean },
+): Promise<ScheduleCloseOutcome> {
+  const request: QueueScheduleCloseRequest = {
+    type: "schedule_close",
+    requestId: randomUUID(),
+    ownerGeneration: owner.ownerGeneration,
+    ...(options.killBackgroundTasks ? { killBackgroundTasks: true } : {}),
+    ...(options.onlyIfActiveTurn ? { onlyIfActiveTurn: true } : {}),
+  };
+  const response = await submitControlToQueueOwner(
+    owner,
+    request,
+    (message): message is QueueOwnerScheduleCloseResultMessage =>
+      message.type === "schedule_close_result",
+    SCHEDULE_CLOSE_DEADLINE_MS,
+  );
+  if (!response) {
+    return { kind: "no-owner" };
+  }
+  if (response.requestId !== request.requestId) {
+    return { kind: "unsupported", detail: "mismatched schedule_close response" };
+  }
+  return response.scheduled
+    ? { kind: "scheduled", activeTurn: response.activeTurn, ownerPid: owner.pid }
+    : { kind: "idle", ownerPid: owner.pid };
+}
+
+/** An older owner answers the unknown verb `QUEUE_REQUEST_INVALID`: the detail code says so. */
+function scheduleCloseErrorDetail(error: unknown): string {
+  if (error instanceof QueueConnectionError || error instanceof QueueProtocolError) {
+    return error.detailCode ?? error.message;
+  }
+  return error instanceof Error ? error.message : String(error);
 }
 
 /** brick ad6ba1c2 (Contract C4) — one hard deadline over connect AND answer. */

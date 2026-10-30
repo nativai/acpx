@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -1625,6 +1626,42 @@ class MockAgent implements Agent {
     return `started ${taskId}`;
   }
 
+  // brick 9d34a178 — `run-then-say <base64url JSON>`: the production shape of an agent closing
+  // itself. THIS process (the agent) spawns the command — owner → adapter/agent → command, as
+  // Claude Code's Bash tool does — waits for it, optionally starts a background task
+  // (`bgTask: [ms, taskId]`, see `bg-task`) and holds (`holdMs`), and then answers with the
+  // command's output followed by `say`. That answer is the "final reply" a self-close used to destroy.
+  private async runThenSay(sessionId: SessionId, payload: string, signal: AbortSignal) {
+    const spec = JSON.parse(Buffer.from(payload.trim(), "base64url").toString("utf8")) as {
+      argv: string[];
+      say: string;
+      holdMs?: number;
+      bgTask?: [number, string];
+    };
+    const [command, ...args] = spec.argv;
+    if (!command) {
+      throw new Error("run-then-say: empty argv");
+    }
+    const output = await new Promise<string>((resolve) => {
+      const child = spawn(command, args, { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+      let text = "";
+      child.stdout.on("data", (chunk: Buffer) => {
+        text += chunk.toString("utf8");
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        text += chunk.toString("utf8");
+      });
+      child.once("close", (code) => resolve(`${text.trimEnd()}\nexit: ${String(code)}`));
+    });
+    if (spec.bgTask) {
+      await this.startBackgroundTask(sessionId, `${spec.bgTask[0]} ${spec.bgTask[1]}`);
+    }
+    if (spec.holdMs) {
+      await sleepWithCancel(spec.holdMs, signal);
+    }
+    return `${output}\n${spec.say}`;
+  }
+
   private ensureSession(sessionId: SessionId): SessionState {
     let session = this.sessions.get(sessionId);
     if (!session) {
@@ -1661,6 +1698,9 @@ class MockAgent implements Agent {
 
     if (text.startsWith("bg-task ")) {
       return await this.startBackgroundTask(sessionId, text.slice("bg-task ".length));
+    }
+    if (text.startsWith("run-then-say ")) {
+      return await this.runThenSay(sessionId, text.slice("run-then-say ".length), signal);
     }
     if (text.startsWith("rate-limited-on ")) {
       return "served after failover";

@@ -152,6 +152,19 @@ export type QueueDrainDeliveriesRequest = {
   checkBackgroundTasks?: boolean;
 };
 
+// brick 9d34a178 — register a close the owner performs ITSELF when the turn in flight ends, so the
+// agent that asked for it (a self-close) keeps every word it writes after the request. The owner
+// answers at once and kills nothing; the request lives in its memory only (an owner that dies first
+// leaves the session open — fail open). `onlyIfActiveTurn` is the `--after-turn` form for a caller
+// outside the session: an idle owner records nothing and the caller closes now.
+export type QueueScheduleCloseRequest = {
+  type: "schedule_close";
+  requestId: string;
+  ownerGeneration?: number;
+  killBackgroundTasks?: boolean;
+  onlyIfActiveTurn?: boolean;
+};
+
 export type QueueRequest =
   | QueueSubmitRequest
   | QueueCancelRequest
@@ -162,7 +175,8 @@ export type QueueRequest =
   | QueueCloseSessionRequest
   | QueueQueryActiveTurnRequest
   | QueueQueryBackgroundTasksRequest
-  | QueueDrainDeliveriesRequest;
+  | QueueDrainDeliveriesRequest
+  | QueueScheduleCloseRequest;
 
 export type QueueOwnerAcceptedMessage = {
   type: "accepted";
@@ -286,6 +300,15 @@ export type QueueOwnerDrainResultMessage = {
   tasks?: LiveBackgroundTask[];
 };
 
+export type QueueOwnerScheduleCloseResultMessage = {
+  type: "schedule_close_result";
+  requestId: string;
+  ownerGeneration?: number;
+  /** false only for `onlyIfActiveTurn` with no turn in flight: nothing was recorded. */
+  scheduled: boolean;
+  activeTurn: boolean;
+};
+
 export type QueueOwnerErrorMessage = {
   type: "error";
   requestId: string;
@@ -316,6 +339,7 @@ export type QueueOwnerMessage =
   | QueueOwnerActiveTurnResultMessage
   | QueueOwnerBackgroundTasksResultMessage
   | QueueOwnerDrainResultMessage
+  | QueueOwnerScheduleCloseResultMessage
   | QueueOwnerErrorMessage;
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -614,6 +638,8 @@ function parseTypedQueueRequest(
       return parseSetConfigOptionRequest(request, context);
     case "set_depth":
       return parseSetDepthRequest(request, context);
+    case "schedule_close":
+      return parseScheduleCloseRequest(request, context);
     default:
       return parsePayloadlessQueueRequest(request.type, context);
   }
@@ -798,6 +824,19 @@ function parseDrainDeliveriesRequest(
   };
 }
 
+function parseScheduleCloseRequest(
+  request: Record<string, unknown>,
+  context: QueueRequestContext,
+): QueueScheduleCloseRequest {
+  return {
+    type: "schedule_close",
+    requestId: context.requestId,
+    ownerGeneration: context.ownerGeneration,
+    ...(request.killBackgroundTasks === true ? { killBackgroundTasks: true } : {}),
+    ...(request.onlyIfActiveTurn === true ? { onlyIfActiveTurn: true } : {}),
+  };
+}
+
 function parseSetConfigOptionRequest(
   request: Record<string, unknown>,
   context: QueueRequestContext,
@@ -940,6 +979,7 @@ const QUEUE_OWNER_MESSAGE_PARSERS: Record<string, QueueOwnerMessageParser> = {
   set_config_option_result: parseSetConfigOptionOwnerMessage,
   set_depth_result: parseSetDepthResultOwnerMessage,
   drain_deliveries_result: parseDrainResultOwnerMessage,
+  schedule_close_result: parseScheduleCloseResultOwnerMessage,
   error: parseErrorOwnerMessage,
 };
 
@@ -947,6 +987,21 @@ function queueOwnerMessageParser(type: string): QueueOwnerMessageParser | undefi
   return Object.hasOwn(QUEUE_OWNER_MESSAGE_PARSERS, type)
     ? QUEUE_OWNER_MESSAGE_PARSERS[type]
     : undefined;
+}
+
+function parseScheduleCloseResultOwnerMessage(
+  message: Record<string, unknown>,
+  context: QueueOwnerMessageContext,
+): QueueOwnerScheduleCloseResultMessage | null {
+  if (typeof message.scheduled !== "boolean" || typeof message.activeTurn !== "boolean") {
+    return null;
+  }
+  return {
+    type: "schedule_close_result",
+    ...context,
+    scheduled: message.scheduled,
+    activeTurn: message.activeTurn,
+  };
 }
 
 const BACKGROUND_TASK_SOURCES: ReadonlySet<string> = new Set(["adapter", "derived", "none"]);
