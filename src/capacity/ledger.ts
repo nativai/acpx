@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -14,6 +14,7 @@ import {
 import {
   acquireIdentityFileLock,
   type IdentityLockPolicy,
+  judgeLockHolder,
   releaseIdentityFileLock,
 } from "../session/persistence/identity-file-lock.js";
 import type { Harness } from "./constants.js";
@@ -29,6 +30,13 @@ import type { PendingReservation } from "./pending.js";
  */
 
 export const ADMISSION_TTL_MS = 180_000;
+/**
+ * An `automation` reservation lives 10 min from bind (CONCEPTION e8abe1e8 §3.2.2, R4): its owner
+ * starts only when atrium delivers the first prompt, and no delivery runs before atrium's port latch
+ * — a restart's bind window (~3–5 min under load) plus one 2-min delivery retry. 180 s would let two
+ * back-to-back starts be admitted against the same memory.
+ */
+export const ADMISSION_TTL_AUTOMATION_MS = 600_000;
 const LOCK_BUDGET_MS = 5_000;
 /** Only an UNJUDGEABLE holder (another namespace, legacy body) is broken by age; a live one never. */
 const LOCK_STALE_MS = 4_000;
@@ -59,6 +67,8 @@ export type PendingEntry = {
   readonly origin: string;
   readonly admittedAt: string;
   readonly expiresAt: string;
+  /** When `ticket.bind` tied it to its created record (CONCEPTION e8abe1e8 §3.2.2, R14). */
+  readonly boundAt?: string;
   /** The container this entry was written in: pid namespace + PID 1's start time (§5). */
   readonly instance: string;
   readonly admitterPid: number;
@@ -97,6 +107,58 @@ export async function withAdmissionLock<T>(dir: string, action: () => Promise<T>
     await releaseIdentityFileLock(lockPath, content);
   }
 }
+
+export type AdmissionLockState = {
+  /** A create starting now would be refused `admission_busy`. */
+  readonly busy: boolean;
+  /** The `admission_busy` refusal's own retry hint while busy; null while free. */
+  readonly retryAfterS: number | null;
+};
+
+const LOCK_FREE: AdmissionLockState = { busy: false, retryAfterS: null };
+
+/**
+ * Is the admission lock held so that a create starting NOW would be refused `admission_busy` (TE
+ * defect D2, HoD decision P rev 2)? Busy = the holder is judged LIVE (`judgeLockHolder`, the gate's
+ * own judge) AND the lock is at least one lock budget (5 s) old. READ-ONLY: it never takes, waits on
+ * or breaks the lock.
+ *
+ * ⚠️ DO NOT DROP THE AGE FLOOR. Every create holds this lock for milliseconds; without the floor a
+ * probe landing inside one reads `busy` for a lock that frees at once, and `--need` turns that into a
+ * spurious exit 75. A lock younger than the budget would still be waited out by the gate, not refused.
+ * A dead or unjudgeable holder is never busy here: the gate breaks the first at once and the second
+ * past its stale age. Rows: "admissionLock:" in test/capacity-admission.test.ts.
+ */
+export function readAdmissionLockState(
+  dir: string,
+  nowMs: number = Date.now(),
+): AdmissionLockState {
+  const lockPath = path.join(dir, "admission.lock");
+  let raw: string;
+  let ageMs: number;
+  try {
+    ageMs = nowMs - statSync(lockPath).mtimeMs;
+    raw = readFileSync(lockPath, "utf8");
+  } catch {
+    return LOCK_FREE; // no lock (or it vanished between the two reads)
+  }
+  if (ageMs < LOCK_BUDGET_MS) {
+    return LOCK_FREE;
+  }
+  let body: Record<string, unknown> | undefined;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    body = isRecordObject(parsed) ? parsed : undefined;
+  } catch {
+    body = undefined;
+  }
+  return judgeLockHolder(body) === "live"
+    ? { busy: true, retryAfterS: ADMISSION_BUSY_RETRY_AFTER_S }
+    : LOCK_FREE;
+}
+
+/** The `retry_after_s` of an `admission_busy` refusal: one lock budget. */
+export const ADMISSION_BUSY_RETRY_AFTER_S = LOCK_BUDGET_MS / 1000;
 
 let instanceCache: string | undefined;
 
@@ -181,13 +243,58 @@ function admitterAlive(entry: PendingEntry): boolean {
   return observeProcessIncarnation(entry.admitterPid, identity) !== "gone";
 }
 
-export function reservationsOf(entries: readonly PendingEntry[]): PendingReservation[] {
-  return entries.map((entry) => ({
-    key: entry.key,
-    sessionId: entry.sessionId,
-    bytes: entry.bytes,
-    admitterAlive: admitterAlive(entry),
-  }));
+export function ttlFor(admissionClass: AdmissionClass | undefined): number {
+  return admissionClass === "automation" ? ADMISSION_TTL_AUTOMATION_MS : ADMISSION_TTL_MS;
+}
+
+/** `ticket.bind`: tie the entry to its record and re-stamp its class TTL from now. */
+export function boundEntry(entry: PendingEntry, sessionId: string, now: Date): PendingEntry {
+  return {
+    ...entry,
+    sessionId,
+    boundAt: now.toISOString(),
+    expiresAt: new Date(now.getTime() + ttlFor(entry.class)).toISOString(),
+  };
+}
+
+/**
+ * N1 (CONCEPTION e8abe1e8, review re-check): has the bound session already RUN — a turn started at
+ * or after `boundAt` (`last_prompt_at`), or the record is closed? A missing or unreadable record is
+ * not spent: the reservation keeps counting until its TTL (rounds up, §9).
+ */
+function sessionSpent(sessionsDir: string, sessionId: string, boundAt: string): boolean {
+  let record: unknown;
+  try {
+    record = JSON.parse(readFileSync(path.join(sessionsDir, `${sessionId}.json`), "utf8"));
+  } catch {
+    return false;
+  }
+  if (!isRecordObject(record)) {
+    return false;
+  }
+  if (record.closed === true) {
+    return true;
+  }
+  const lastPrompt = typeof record.last_prompt_at === "string" ? record.last_prompt_at : "";
+  return Date.parse(lastPrompt) >= Date.parse(boundAt);
+}
+
+export function reservationsOf(
+  entries: readonly PendingEntry[],
+  sessionsDir: string,
+): PendingReservation[] {
+  return entries.map((entry) => {
+    const { sessionId, boundAt } = entry;
+    const bound = typeof boundAt === "string" && sessionId !== undefined;
+    return {
+      key: entry.key,
+      sessionId,
+      bytes: entry.bytes,
+      admitterAlive: admitterAlive(entry),
+      bound,
+      spent: bound && sessionSpent(sessionsDir, sessionId, boundAt),
+    };
+  });
 }
 
 export function newEntry(params: {
@@ -208,7 +315,7 @@ export function newEntry(params: {
     class: params.admissionClass,
     origin: params.origin,
     admittedAt: params.now.toISOString(),
-    expiresAt: new Date(params.now.getTime() + ADMISSION_TTL_MS).toISOString(),
+    expiresAt: new Date(params.now.getTime() + ttlFor(params.admissionClass)).toISOString(),
     instance: containerInstance(),
     admitterPid: process.pid,
     ...(identity ? { admitterIdentity: serializeProcessBirthIdentity(identity) } : {}),

@@ -1,7 +1,13 @@
 import { type Command, InvalidArgumentError } from "commander";
-import { readPendingReservationsForProbe } from "../capacity/admission.js";
+import { readPendingReservationsForProbe, readWaitingForProbe } from "../capacity/admission.js";
 import { type Harness, HARNESSES, isHarness, MIB } from "../capacity/constants.js";
 import {
+  type AdmissionLockState,
+  admissionDir,
+  readAdmissionLockState,
+} from "../capacity/ledger.js";
+import {
+  type CapacityClass,
   type CapacitySnapshot,
   capacitySourcesFromEnv,
   needMet,
@@ -14,17 +20,32 @@ import { parseOutputFormat, resolveGlobalFlags } from "./flags.js";
 import { emitJsonResult } from "./output/json-output.js";
 
 /**
- * `acpx capacity [--agent claude|codex|pi] [--need N]` — how many more agent sessions fit in THIS
- * box's control-pod memory (CONCEPTION f7587c86 §8.1). Read-only. It reads the admission ledger
- * the create gate writes, so creates in flight show as `pendingBytes` / `owners.starting`, and the
- * gate (`capacity/admission.ts`) admits exactly when `--need 1` here is met.
+ * `acpx capacity [--agent claude|codex|pi] [--need N] [--class spawn|automation]` — how many more
+ * agent sessions fit in THIS box's control-pod memory (CONCEPTION f7587c86 §8.1). Read-only. It
+ * reads the admission ledger the create gate writes, so creates in flight show as `pendingBytes` /
+ * `owners.starting`, and the gate (`capacity/admission.ts`) admits exactly when `--need 1` here is
+ * met for the same class.
+ *
+ * `--class` (CONCEPTION e8abe1e8 §3.2.4): `spawn` (default — an agent's view) reports slots net of
+ * the automation sessions queued for room; `automation` (atrium's drainer probe) reports them gross.
+ * Both list what waits (`waiting` in JSON, one `waiting:` line in text).
  *
  * Exit 0 on a successful reading (with `--need N`: at least N slots for `--agent`), 75 when
  * `--need N` is not met, 2 on usage, 1 on an internal error. An unconfigured or unmeasured box
  * exits 0 — fail open.
  */
 
-type CapacityFlags = { agent?: Harness; need?: number };
+type CapacityFlags = { agent?: Harness; need?: number; class?: CapacityClass };
+
+const CLASSES: readonly CapacityClass[] = ["spawn", "automation"];
+
+function parseClass(value: string): CapacityClass {
+  const trimmed = value.trim();
+  if (!(CLASSES as readonly string[]).includes(trimmed)) {
+    throw new InvalidArgumentError(`Expected one of: ${CLASSES.join(", ")}`);
+  }
+  return trimmed as CapacityClass;
+}
 
 function parseAgent(value: string): Harness {
   if (!isHarness(value)) {
@@ -98,6 +119,50 @@ function slotLines(s: CapacitySnapshot): string[] {
   ];
 }
 
+/** `14:05Z` today (UTC), else `2026-10-30 23:58Z`; the raw value when it is not a date. */
+function sinceLabel(since: string, now: Date): string {
+  const at = new Date(since);
+  if (Number.isNaN(at.getTime())) {
+    return since || "?";
+  }
+  const iso = at.toISOString();
+  const time = `${iso.slice(11, 16)}Z`;
+  return iso.slice(0, 10) === now.toISOString().slice(0, 10) ? time : `${iso.slice(0, 10)} ${time}`;
+}
+
+const SHOWN_ITEMS = 5;
+
+function itemLabel(item: CapacitySnapshot["waiting"]["items"][number]): string {
+  if (item.kind === "wakeup") {
+    return `wakeup ${item.label || item.ref}`;
+  }
+  if (item.kind === "trigger-run") {
+    const label = item.label ? ` "${item.label}"` : "";
+    return `brick run ${item.ref.slice(0, 6)}…${label}`;
+  }
+  return `${item.kind} ${item.label || item.ref}`;
+}
+
+/** One line while automation waits for room — agent-facing wording (CONCEPTION e8abe1e8 §12.3). */
+export function waitingLine(s: CapacitySnapshot, now: Date = new Date()): string | undefined {
+  const { count, items } = s.waiting;
+  if (count === 0) {
+    return undefined;
+  }
+  const shown = items.slice(0, SHOWN_ITEMS).map(itemLabel);
+  if (count > SHOWN_ITEMS) {
+    shown.push(`+${count - SHOWN_ITEMS} more`);
+  }
+  const effect =
+    s.class === "spawn"
+      ? "they start before new agent sessions; the slots above already leave room for them"
+      : "class automation: the slots above are gross, the queue orders itself";
+  return (
+    `waiting: ${plural(count, "automation session")} queued since ` +
+    `${sinceLabel(items[0]?.since ?? "", now)} (${shown.join(", ")}) — ${effect}`
+  );
+}
+
 function pressureLine(s: CapacitySnapshot): string {
   const p = s.pressure;
   const parts: Array<string | undefined> = [
@@ -115,9 +180,11 @@ function pressureLine(s: CapacitySnapshot): string {
 }
 
 export function renderCapacityText(s: CapacitySnapshot): string {
+  const waiting = waitingLine(s);
   const lines = [
     headLine(s),
     ...slotLines(s),
+    ...(waiting ? [waiting] : []),
     pressureLine(s),
     ...s.alternatives.map(
       (alt) =>
@@ -129,33 +196,79 @@ export function renderCapacityText(s: CapacitySnapshot): string {
   return `${lines.join("\n")}\n`;
 }
 
+type NeedVerdict = { readonly met: boolean; readonly reason: string };
+
+/**
+ * `--need N` (TE defect D2, HoD decision P rev 2): a busy admission lock means a create starting now
+ * is refused `admission_busy`, so the probe says NOT MET too — for every class, because "the probe
+ * and an admitted create cannot disagree" is class-free. Except on an UNCONFIGURED box, whose gate
+ * never takes the lock (`admission.ts`) and so is never refused for it.
+ */
+function needVerdict(
+  snapshot: CapacitySnapshot,
+  need: number,
+  lock: AdmissionLockState,
+): NeedVerdict {
+  if (lock.busy && snapshot.verdict !== "unconfigured") {
+    return {
+      met: false,
+      reason:
+        `admission_busy: the box's admission lock is held by a live process, so creates are ` +
+        `refused until it frees; retry after ${lock.retryAfterS ?? "?"} s`,
+    };
+  }
+  return { met: needMet(snapshot, need), reason: needMetReason(snapshot, need) };
+}
+
+function lockLine(lock: AdmissionLockState): string | undefined {
+  return lock.busy
+    ? `admission lock: BUSY — held by a live process for 5 s or more; creates are refused admission_busy until it frees (retry after ${lock.retryAfterS ?? "?"} s)`
+    : undefined;
+}
+
+type NeedRequest = { readonly need: number; readonly verdict: NeedVerdict };
+
+function writeCapacityText(
+  snapshot: CapacitySnapshot,
+  lock: AdmissionLockState,
+  request: NeedRequest | undefined,
+): void {
+  process.stdout.write(renderCapacityText(snapshot));
+  const busyLine = lockLine(lock);
+  if (busyLine) {
+    process.stdout.write(`${busyLine}\n`);
+  }
+  if (request) {
+    const label = request.verdict.met ? "met (exit 0)" : "NOT MET (exit 75)";
+    process.stdout.write(
+      `need ${plural(request.need, `${snapshot.agent} slot`)}: ${label} — ${request.verdict.reason}\n`,
+    );
+  }
+}
+
 function writeCapacity(
   format: OutputFormat,
   snapshot: CapacitySnapshot,
-  need: number | undefined,
-  met: boolean,
+  lock: AdmissionLockState,
+  request: NeedRequest | undefined,
 ): void {
-  if (
-    emitJsonResult(
-      format,
-      need === undefined
-        ? snapshot
-        : { ...snapshot, need, needMet: met, needMetReason: needMetReason(snapshot, need) },
-    )
-  ) {
+  const body = { ...snapshot, admissionLock: lock };
+  const json = request
+    ? {
+        ...body,
+        need: request.need,
+        needMet: request.verdict.met,
+        needMetReason: request.verdict.reason,
+      }
+    : body;
+  if (emitJsonResult(format, json)) {
     return;
   }
   if (format === "quiet") {
     process.stdout.write(`${snapshot.slotsAfterMakeRoom?.[snapshot.agent] ?? snapshot.verdict}\n`);
     return;
   }
-  process.stdout.write(renderCapacityText(snapshot));
-  if (need !== undefined) {
-    const verdict = met ? "met (exit 0)" : "NOT MET (exit 75)";
-    process.stdout.write(
-      `need ${plural(need, `${snapshot.agent} slot`)}: ${verdict} — ${needMetReason(snapshot, need)}\n`,
-    );
-  }
+  writeCapacityText(snapshot, lock, request);
 }
 
 async function handleCapacity(
@@ -168,10 +281,16 @@ async function handleCapacity(
     agent: flags.agent ?? "claude",
     sources: capacitySourcesFromEnv(),
     pending: await readPendingReservationsForProbe(),
+    waiting: readWaitingForProbe(),
+    admissionClass: flags.class ?? "spawn",
   });
-  const met = flags.need === undefined || needMet(snapshot, flags.need);
-  writeCapacity(format, snapshot, flags.need, met);
-  if (!met) {
+  const lock = readAdmissionLockState(admissionDir());
+  const request =
+    flags.need === undefined
+      ? undefined
+      : { need: flags.need, verdict: needVerdict(snapshot, flags.need, lock) };
+  writeCapacity(format, snapshot, lock, request);
+  if (request && !request.verdict.met) {
     process.exitCode = EXIT_CODES.CAPACITY;
   }
 }
@@ -194,6 +313,11 @@ export function registerCapacityCommand(parent: Command, config: ResolvedAcpxCon
       parseAgent,
     )
     .option("--need <n>", "Exit 75 unless at least n new sessions of --agent fit", parseNeed)
+    .option(
+      "--class <class>",
+      "Whose slots: spawn (default; net of queued automation) or automation (gross)",
+      parseClass,
+    )
     .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
     // Subcommands are registered BEFORE `program.exitOverride()` (cli-core `main`), so without
     // this commander exits a usage error with its own 1. Thrown, it reaches

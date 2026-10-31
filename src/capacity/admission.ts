@@ -5,11 +5,12 @@ import type { CapacityRefusalReason } from "../types.js";
 import { readPodInfo } from "./budget.js";
 import { type Harness, isHarness, MIB } from "./constants.js";
 import {
-  ADMISSION_TTL_MS,
+  ADMISSION_BUSY_RETRY_AFTER_S,
   type AdmissionClass,
   AdmissionLockTimeoutError,
   admissionDir,
   appendDecisionLog,
+  boundEntry,
   liveEntries,
   newEntry,
   type PendingEntry,
@@ -19,7 +20,14 @@ import {
   writeLedgerFile,
 } from "./ledger.js";
 import { partitionPending } from "./pending.js";
-import { type CapacitySnapshot, capacitySourcesFromEnv, needMet, readCapacity } from "./reading.js";
+import {
+  type CapacityClass,
+  type CapacitySnapshot,
+  capacitySourcesFromEnv,
+  needMet,
+  readCapacity,
+} from "./reading.js";
+import { readWaiting, type WaitingQueue } from "./waiting.js";
 
 /**
  * The create gate (CONCEPTION f7587c86 §6.1 A2, AMENDMENT 2026-10-29): `sessions new`, `sessions
@@ -28,8 +36,14 @@ import { type CapacitySnapshot, capacitySourcesFromEnv, needMet, readCapacity } 
  * --need 1` would say "met" — same `readCapacity`, same fresh readings, same ledger — and otherwise
  * throws {@link CapacityRefusedError} (exit 75) with nothing created.
  *
- * WHO IS GATED (v1): only an AGENT creating a session (class `spawn`).
- *   1. `ACPX_ADMISSION_CLASS`, when set to a known class, decides: only `spawn` is gated. It is read
+ * WHO IS GATED: an AGENT creating a session (class `spawn`) and AUTOMATION (class `automation`,
+ * CONCEPTION e8abe1e8 §3.2.1 — atrium's wakeup and brick-trigger creates, which wait in atrium's
+ * queue when refused). Same check (`--need 1` on the agent figures, the human reserve kept back),
+ * same reservation, same exit 75 with nothing created; `spawn` figures are net of the queued
+ * automation (`reading.ts`), `automation` figures gross. `automation` is never INFERRED: only atrium,
+ * which parks a refused create instead of failing it, sends it.
+ *   1. `ACPX_ADMISSION_CLASS`, when set to a known class, decides: `spawn` and `automation` are
+ *      gated, `interactive` and `delivery` are not. It is read
  *      once at CLI start and DELETED from the environment (`takeAdmissionClassFromEnv`), so it never
  *      reaches an owner, a harness or an agent's shell (§16). An acpx that predates it ignores it —
  *      why it is an env var and not a flag (review finding 1).
@@ -44,9 +58,9 @@ import { type CapacitySnapshot, capacitySourcesFromEnv, needMet, readCapacity } 
  *     before any atrium knows what exit 75 means. Atrium runs under the entrypoint supervisor
  *     (dumb-init → bash → node), never inside an owner tree, so ancestry is what keeps it ungated.
  *   - Ancestry alone is not enough: the brick CLI's local-mode trigger create runs INSIDE an agent's
- *     tree, and v1 must not gate automation (refusing a trigger's first prompt is a silent loss until
- *     the durable-first-prompt work lands). acpx-ui strips the caller identity from every create it
- *     spawns (`withoutCallerIdentity`), which is what tells that create apart.
+ *     tree and sends no class, and it must stay ungated: its failure path would lose the run
+ *     (CONCEPTION e8abe1e8 §4.3). acpx-ui strips the caller identity from every create it spawns
+ *     (`withoutCallerIdentity`), which is what tells that create apart.
  *   Rows: "class: …" in test/capacity-admission.test.ts.
  *
  * NEVER GATED, whatever the class: a handover successor — `--from <id>` while <id>'s owner is live
@@ -129,14 +143,24 @@ function reasonOf(snapshot: CapacitySnapshot, harness: Harness): CapacityRefusal
   return guard === "G3" ? "node_pressure" : "no_capacity";
 }
 
+/** For an agent (class `spawn`): the queued automation that takes the next free slots first. */
+function queuedClause(snapshot: CapacitySnapshot): string {
+  const w = snapshot.waiting.count;
+  if (snapshot.class !== "spawn" || w === 0) {
+    return "";
+  }
+  return ` ${w} automation session${w === 1 ? " is" : "s are"} queued for room ahead of new agent sessions and start${w === 1 ? "s" : ""} first.`;
+}
+
 function refusalSentence(
   reason: CapacityRefusalReason,
   snapshot: CapacitySnapshot | undefined,
 ): string {
-  const nothing = "Nothing was started or queued.";
   if (reason === "admission_busy" || !snapshot) {
+    const nothing = "Nothing was started or queued.";
     return `acpx: other session creations held the box's admission lock for 5 s. ${nothing} Retry in a few seconds; 'acpx capacity' shows the room left.`;
   }
+  const nothing = `Nothing was started or queued.${queuedClause(snapshot)}`;
   if (reason === "memory_pressure") {
     return `acpx: the box is stalling on memory right now (PSI full avg10 ${snapshot.pressure.psiFullAvg10 ?? "?"} %). ${nothing} See 'acpx capacity'; retry in a minute.`;
   }
@@ -151,22 +175,35 @@ function refusalSentence(
   );
 }
 
+function snapshotTokenFields(snapshot: CapacitySnapshot): string[] {
+  return [
+    `box=${snapshot.box}`,
+    `basis=${snapshot.basis}`,
+    `free_slots=${snapshot.freeSlots?.[snapshot.agent] ?? 0}`,
+    `need_mib=${Math.round(snapshot.reserveNewBytes[snapshot.agent] / MIB)}`,
+    "releasable_mib=0",
+  ];
+}
+
+/**
+ * The refusal. `queued_ahead=<W>` (CONCEPTION e8abe1e8 §3.2.5) is APPENDED last on every token line,
+ * `admission_busy` included: the queued automation the gate saw at decision time (for an
+ * `automation` create, the whole queue, itself included). Additive — `protocol=1` keeps its meaning.
+ */
 export function capacityRefusal(
   reason: CapacityRefusalReason,
   snapshot?: CapacitySnapshot,
+  queuedAhead: number = snapshot?.waiting.count ?? 0,
 ): CapacityRefusedError {
-  const retryAfterS = reason === "admission_busy" ? 5 : 60;
-  const fields = [`reason=${reason}`, "nothing_started=true", "protocol=1"];
-  if (snapshot) {
-    fields.push(
-      `box=${snapshot.box}`,
-      `basis=${snapshot.basis}`,
-      `free_slots=${snapshot.freeSlots?.[snapshot.agent] ?? 0}`,
-      `need_mib=${Math.round(snapshot.reserveNewBytes[snapshot.agent] / MIB)}`,
-      "releasable_mib=0",
-    );
-  }
-  fields.push(`retry_after_s=${retryAfterS}`);
+  const retryAfterS = reason === "admission_busy" ? ADMISSION_BUSY_RETRY_AFTER_S : 60;
+  const fields = [
+    `reason=${reason}`,
+    "nothing_started=true",
+    "protocol=1",
+    ...(snapshot ? snapshotTokenFields(snapshot) : []),
+    `retry_after_s=${retryAfterS}`,
+    `queued_ahead=${queuedAhead}`,
+  ];
   return new CapacityRefusedError({
     tokenLine: `acpx: REFUSED ${fields.join(" ")}`,
     sentence: refusalSentence(reason, snapshot),
@@ -174,6 +211,7 @@ export function capacityRefusal(
       reason,
       nothingStarted: true,
       retryAfterS,
+      queuedAhead,
       ...(snapshot ? { capacity: snapshot } : {}),
     },
   });
@@ -184,6 +222,8 @@ type GateContext = {
   readonly env: NodeJS.ProcessEnv;
   readonly dir: string;
   readonly explicit: AdmissionClass | undefined;
+  /** `automation` only when sent explicitly; every other gated create sizes as `spawn`. */
+  readonly capacityClass: CapacityClass;
   readonly harness: Harness;
 };
 
@@ -211,6 +251,7 @@ function logLine(
   decision: string,
   snapshot: CapacitySnapshot | undefined,
   extra: Record<string, unknown>,
+  waiting: WaitingQueue,
 ): Record<string, unknown> {
   const invalid = explicitClass && !explicitClass.value ? { invalidClass: explicitClass.raw } : {};
   return {
@@ -223,6 +264,7 @@ function logLine(
     caller: ctx.env.ACPX_SESSION_URL ?? ctx.env.ACPX_SESSION_RECORD_ID ?? null,
     callerPid: process.pid,
     harness: ctx.harness,
+    waiting: waiting.count,
     ...(snapshot ? snapshotFields(snapshot, ctx.harness) : {}),
     ...extra,
   };
@@ -255,7 +297,7 @@ function admitOrRefuse(ctx: GateContext, snapshot: CapacitySnapshot, now: Date):
     sessionId: ctx.request.recordId,
     harness: ctx.harness,
     bytes: snapshot.reserveNewBytes[ctx.harness],
-    admissionClass: ctx.explicit ?? "spawn",
+    admissionClass: ctx.capacityClass,
     origin: ctx.request.verb,
     now,
   });
@@ -274,12 +316,16 @@ function decisionExtra(decision: Decision): Record<string, unknown> {
 /** Everything between lock and unlock (§5 steps 1–5): read, decide, write the entry and the log. */
 async function decideUnderLock(ctx: GateContext): Promise<Decision> {
   const now = new Date();
+  const sources = capacitySourcesFromEnv(ctx.env);
   const entries = liveEntries(await readLedgerFile(ctx.dir), now.getTime());
-  const reservations = reservationsOf(entries);
+  const reservations = reservationsOf(entries, sources.sessionsDir);
+  const waiting = readWaiting(ctx.dir, now);
   const snapshot = readCapacity({
     agent: ctx.harness,
-    sources: capacitySourcesFromEnv(ctx.env),
+    sources,
     pending: reservations,
+    waiting,
+    admissionClass: ctx.capacityClass,
     now,
   });
   const liveIds = new Set(snapshot.owners.trees.map((tree) => tree.sessionId));
@@ -294,7 +340,7 @@ async function decideUnderLock(ctx: GateContext): Promise<Decision> {
   }
   await appendDecisionLog(
     ctx.dir,
-    logLine(ctx, decision.kind, snapshot, decisionExtra(decision)),
+    logLine(ctx, decision.kind, snapshot, decisionExtra(decision), waiting),
     now,
   );
   return decision;
@@ -321,16 +367,12 @@ function ticketFor(dir: string, key: string): AdmissionTicket {
   };
   return {
     key,
+    // Bound ⇒ the reservation outlives this CLI until its session runs or its class TTL ends
+    // (`pending.ts`): atrium prompts the record from ANOTHER process, maybe after a restart.
     bind: (sessionId) =>
       update((entries) =>
         entries.map((entry) =>
-          entry.key === key
-            ? {
-                ...entry,
-                sessionId,
-                expiresAt: new Date(Date.now() + ADMISSION_TTL_MS).toISOString(),
-              }
-            : entry,
+          entry.key === key ? boundEntry(entry, sessionId, new Date()) : entry,
         ),
       ),
     release: () => update((entries) => entries.filter((entry) => entry.key !== key)),
@@ -343,7 +385,10 @@ function gateContextFor(
   env: NodeJS.ProcessEnv,
 ): GateContext | undefined {
   const explicit = explicitClass?.value;
-  const gatedClass = explicit === undefined ? hasAgentIdentity(env) : explicit === "spawn";
+  const gatedClass =
+    explicit === undefined
+      ? hasAgentIdentity(env)
+      : explicit === "spawn" || explicit === "automation";
   if (!gatedClass) {
     return undefined;
   }
@@ -355,6 +400,7 @@ function gateContextFor(
     env,
     dir: admissionDir(env),
     explicit,
+    capacityClass: explicit === "automation" ? "automation" : "spawn",
     harness: newcomerHarness(request.agentCommand),
   };
 }
@@ -366,12 +412,17 @@ async function decide(ctx: GateContext): Promise<Decision | undefined> {
     if (!(error instanceof AdmissionLockTimeoutError)) {
       return failOpen("lock or ledger", error);
     }
+    // The waiting dir needs no lock (temp + rename writes), so even a busy refusal says what waits.
+    const waiting = readWaiting(ctx.dir);
     await appendDecisionLog(
       ctx.dir,
-      logLine(ctx, "refused", undefined, { reason: "admission_busy" }),
+      logLine(ctx, "refused", undefined, { reason: "admission_busy" }, waiting),
       new Date(),
     );
-    return { kind: "refused", error: capacityRefusal("admission_busy") };
+    return {
+      kind: "refused",
+      error: capacityRefusal("admission_busy", undefined, waiting.count),
+    };
   }
 }
 
@@ -396,8 +447,16 @@ export async function readPendingReservationsForProbe(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<ReturnType<typeof reservationsOf>> {
   try {
-    return reservationsOf(liveEntries(await readLedgerFile(admissionDir(env)), Date.now()));
+    return reservationsOf(
+      liveEntries(await readLedgerFile(admissionDir(env)), Date.now()),
+      capacitySourcesFromEnv(env).sessionsDir,
+    );
   } catch {
     return [];
   }
+}
+
+/** The waiting dir the gate reads, for `acpx capacity` — the same queue, the same freshness rule. */
+export function readWaitingForProbe(env: NodeJS.ProcessEnv = process.env): WaitingQueue {
+  return readWaiting(admissionDir(env));
 }

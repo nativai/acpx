@@ -7,6 +7,7 @@ import { type CgroupReading, type NodeReading, readCgroup, readNode } from "./cg
 import {
   CAPACITY_CONSTANTS,
   type CapacityConstants,
+  HARNESSES,
   type Harness,
   type PerHarness,
 } from "./constants.js";
@@ -26,6 +27,7 @@ import {
   readReaderFootprint,
 } from "./owners.js";
 import { type PendingPartition, type PendingReservation, partitionPending } from "./pending.js";
+import { NO_WAITING, type WaitingQueue } from "./waiting.js";
 
 /**
  * One read-only capacity reading of THIS box's control container — the numbers behind
@@ -33,7 +35,17 @@ import { type PendingPartition, type PendingReservation, partitionPending } from
  * this one function with the admission ledger's reservations, so "`acpx capacity --need 1` fits"
  * and "this create is admitted" cannot disagree. No make-room yet (`slotsAfterMakeRoom` =
  * `freeSlots`, nothing releasable).
+ *
+ * QUEUED AUTOMATION GOES FIRST (CONCEPTION e8abe1e8 §3.2.3). For class `spawn` — agents, their gate
+ * and `acpx capacity` by default — every agent slot figure (`freeSlots`, `slotsAfterMakeRoom`, the
+ * alternatives' `freeSlots`, hence `needMet` and the verdict) is net of the waiting count W:
+ * `max(0, slots − W)`. Class `automation` (atrium's drainer probe and the automation gate) gets the
+ * gross figures: the queue orders itself. `freeSlotsInteractive` is never reduced — humans never
+ * wait behind automation.
  */
+
+/** The classes `readCapacity` sizes for; every other class is never gated (`admission.ts`). */
+export type CapacityClass = "spawn" | "automation";
 
 export const DEFAULT_PODINFO_DIR = "/etc/podinfo";
 export const DEFAULT_CGROUP_ROOT = "/sys/fs/cgroup";
@@ -85,6 +97,19 @@ export type CapacitySnapshot = {
   readonly action: "capacity";
   readonly schema: 1;
   readonly box: string;
+  /** Whose slots these are: `spawn` figures are net of {@link waiting}, `automation` gross. */
+  readonly class: CapacityClass;
+  /** Automation sessions queued for room (`waiting.ts`); for `spawn`, already taken off the slots. */
+  readonly waiting: {
+    readonly count: number;
+    readonly items: ReadonlyArray<{
+      readonly kind: string;
+      readonly ref: string;
+      readonly label: string;
+      readonly harness: string;
+      readonly since: string;
+    }>;
+  };
   readonly measuredAt: string;
   readonly agent: Harness;
   readonly basis: Basis;
@@ -154,6 +179,10 @@ export type ReadCapacityOptions = {
   readonly box?: string;
   /** The admission ledger's live reservations (`ledger.ts`); absent ⇒ none. */
   readonly pending?: readonly PendingReservation[];
+  /** The waiting dir's queue (`waiting.ts`); absent ⇒ nothing waits. */
+  readonly waiting?: WaitingQueue;
+  /** Default `spawn`. */
+  readonly admissionClass?: CapacityClass;
 };
 
 const nul = <T>(value: T | undefined): T | null => (value === undefined ? null : value);
@@ -168,6 +197,8 @@ type Gathered = {
   readonly census: OwnerCensus;
   readonly reader: ReaderFootprint;
   readonly pending: PendingPartition;
+  /** W, taken off every agent slot figure — 0 for class `automation`. */
+  readonly slotDeduction: number;
 };
 
 function gather(options: ReadCapacityOptions): Gathered {
@@ -202,6 +233,7 @@ function gather(options: ReadCapacityOptions): Gathered {
     }),
     census: { ...census, owners: census.owners.map((owner) => withReservation(owner, pending)) },
     pending,
+    slotDeduction: options.admissionClass === "automation" ? 0 : (options.waiting?.count ?? 0),
   };
 }
 
@@ -283,18 +315,32 @@ function collectWarnings(g: Gathered, measured: Measured | undefined): string[] 
   return warnings;
 }
 
+/** The agent slot figures net of queued automation (class `spawn`); interactive ones untouched. */
+function netOfWaiting(formula: FormulaResult, deduction: number): FormulaResult {
+  if (deduction === 0) {
+    return formula;
+  }
+  const freeSlots = Object.fromEntries(
+    HARNESSES.map((h) => [h, Math.max(0, formula.freeSlots[h] - deduction)]),
+  ) as PerHarness<number>;
+  return { ...formula, freeSlots };
+}
+
 function formulaFor(g: Gathered, m: Measured, budgetBytes: number): FormulaResult {
-  return computeFormula({
-    budgetBytes,
-    requestBytes: g.budget.requestBytes,
-    limitBytes: m.limit,
-    committedBytes: m.committed,
-    owners: g.census.owners,
-    pendingBytes: g.pending.pendingBytes,
-    nodeAvailableBytes: g.node.availableBytes,
-    psiFullAvg10: g.cgroup.memoryPressure.fullAvg10,
-    constants: g.constants,
-  });
+  return netOfWaiting(
+    computeFormula({
+      budgetBytes,
+      requestBytes: g.budget.requestBytes,
+      limitBytes: m.limit,
+      committedBytes: m.committed,
+      owners: g.census.owners,
+      pendingBytes: g.pending.pendingBytes,
+      nodeAvailableBytes: g.node.availableBytes,
+      psiFullAvg10: g.cgroup.memoryPressure.fullAvg10,
+      constants: g.constants,
+    }),
+    g.slotDeduction,
+  );
 }
 
 /** The reading under each basis NOT in force, so request and limit are both visible (§14 Q1). */
@@ -406,6 +452,19 @@ function pressureField(g: Gathered): CapacitySnapshot["pressure"] {
   };
 }
 
+function waitingField(queue: WaitingQueue): CapacitySnapshot["waiting"] {
+  return {
+    count: queue.count,
+    items: queue.items.map(({ kind, ref, label, harness, since }) => ({
+      kind,
+      ref,
+      label,
+      harness,
+      since,
+    })),
+  };
+}
+
 export function readCapacity(options: ReadCapacityOptions): CapacitySnapshot {
   const g = gather(options);
   const measured = measuredOf(g);
@@ -414,6 +473,8 @@ export function readCapacity(options: ReadCapacityOptions): CapacitySnapshot {
     action: "capacity",
     schema: 1,
     box: options.box ?? boxName(),
+    class: options.admissionClass ?? "spawn",
+    waiting: waitingField(options.waiting ?? NO_WAITING),
     measuredAt: g.now.toISOString(),
     agent: options.agent,
     basis: g.budget.basis,
@@ -452,7 +513,11 @@ export function needMetReason(snapshot: CapacitySnapshot, need: number): string 
     return "unmeasured box (memory unreadable): admission is not enforced; nothing is refused";
   }
   const slots = snapshot.slotsAfterMakeRoom?.[snapshot.agent] ?? 0;
-  return `${slots} new ${snapshot.agent} session(s) fit; ${need} needed`;
+  const queued =
+    snapshot.class === "spawn" && snapshot.waiting.count > 0
+      ? ` (after ${snapshot.waiting.count} queued automation session(s), which start first)`
+      : "";
+  return `${slots} new ${snapshot.agent} session(s) fit${queued}; ${need} needed`;
 }
 
 export function needMet(snapshot: CapacitySnapshot, need: number): boolean {

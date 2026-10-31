@@ -261,6 +261,8 @@ export type CapacityRefusalDetail = {
   reason: CapacityRefusalReason;
   nothingStarted: true;
   retryAfterS: number;
+  /** Automation sessions queued for room at decision time (`queued_ahead=` on the token line). */
+  queuedAhead: number;
   capacity?: unknown;
 };
 
