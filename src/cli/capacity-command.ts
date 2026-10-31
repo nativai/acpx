@@ -2,6 +2,11 @@ import { type Command, InvalidArgumentError } from "commander";
 import { readPendingReservationsForProbe, readWaitingForProbe } from "../capacity/admission.js";
 import { type Harness, HARNESSES, isHarness, MIB } from "../capacity/constants.js";
 import {
+  type AdmissionLockState,
+  admissionDir,
+  readAdmissionLockState,
+} from "../capacity/ledger.js";
+import {
   type CapacityClass,
   type CapacitySnapshot,
   capacitySourcesFromEnv,
@@ -191,33 +196,79 @@ export function renderCapacityText(s: CapacitySnapshot): string {
   return `${lines.join("\n")}\n`;
 }
 
+type NeedVerdict = { readonly met: boolean; readonly reason: string };
+
+/**
+ * `--need N` (TE defect D2, HoD decision P rev 2): a busy admission lock means a create starting now
+ * is refused `admission_busy`, so the probe says NOT MET too — for every class, because "the probe
+ * and an admitted create cannot disagree" is class-free. Except on an UNCONFIGURED box, whose gate
+ * never takes the lock (`admission.ts`) and so is never refused for it.
+ */
+function needVerdict(
+  snapshot: CapacitySnapshot,
+  need: number,
+  lock: AdmissionLockState,
+): NeedVerdict {
+  if (lock.busy && snapshot.verdict !== "unconfigured") {
+    return {
+      met: false,
+      reason:
+        `admission_busy: the box's admission lock is held by a live process, so creates are ` +
+        `refused until it frees; retry after ${lock.retryAfterS ?? "?"} s`,
+    };
+  }
+  return { met: needMet(snapshot, need), reason: needMetReason(snapshot, need) };
+}
+
+function lockLine(lock: AdmissionLockState): string | undefined {
+  return lock.busy
+    ? `admission lock: BUSY — held by a live process for 5 s or more; creates are refused admission_busy until it frees (retry after ${lock.retryAfterS ?? "?"} s)`
+    : undefined;
+}
+
+type NeedRequest = { readonly need: number; readonly verdict: NeedVerdict };
+
+function writeCapacityText(
+  snapshot: CapacitySnapshot,
+  lock: AdmissionLockState,
+  request: NeedRequest | undefined,
+): void {
+  process.stdout.write(renderCapacityText(snapshot));
+  const busyLine = lockLine(lock);
+  if (busyLine) {
+    process.stdout.write(`${busyLine}\n`);
+  }
+  if (request) {
+    const label = request.verdict.met ? "met (exit 0)" : "NOT MET (exit 75)";
+    process.stdout.write(
+      `need ${plural(request.need, `${snapshot.agent} slot`)}: ${label} — ${request.verdict.reason}\n`,
+    );
+  }
+}
+
 function writeCapacity(
   format: OutputFormat,
   snapshot: CapacitySnapshot,
-  need: number | undefined,
-  met: boolean,
+  lock: AdmissionLockState,
+  request: NeedRequest | undefined,
 ): void {
-  if (
-    emitJsonResult(
-      format,
-      need === undefined
-        ? snapshot
-        : { ...snapshot, need, needMet: met, needMetReason: needMetReason(snapshot, need) },
-    )
-  ) {
+  const body = { ...snapshot, admissionLock: lock };
+  const json = request
+    ? {
+        ...body,
+        need: request.need,
+        needMet: request.verdict.met,
+        needMetReason: request.verdict.reason,
+      }
+    : body;
+  if (emitJsonResult(format, json)) {
     return;
   }
   if (format === "quiet") {
     process.stdout.write(`${snapshot.slotsAfterMakeRoom?.[snapshot.agent] ?? snapshot.verdict}\n`);
     return;
   }
-  process.stdout.write(renderCapacityText(snapshot));
-  if (need !== undefined) {
-    const verdict = met ? "met (exit 0)" : "NOT MET (exit 75)";
-    process.stdout.write(
-      `need ${plural(need, `${snapshot.agent} slot`)}: ${verdict} — ${needMetReason(snapshot, need)}\n`,
-    );
-  }
+  writeCapacityText(snapshot, lock, request);
 }
 
 async function handleCapacity(
@@ -233,9 +284,13 @@ async function handleCapacity(
     waiting: readWaitingForProbe(),
     admissionClass: flags.class ?? "spawn",
   });
-  const met = flags.need === undefined || needMet(snapshot, flags.need);
-  writeCapacity(format, snapshot, flags.need, met);
-  if (!met) {
+  const lock = readAdmissionLockState(admissionDir());
+  const request =
+    flags.need === undefined
+      ? undefined
+      : { need: flags.need, verdict: needVerdict(snapshot, flags.need, lock) };
+  writeCapacity(format, snapshot, lock, request);
+  if (request && !request.verdict.met) {
     process.exitCode = EXIT_CODES.CAPACITY;
   }
 }

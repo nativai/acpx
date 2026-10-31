@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -14,6 +14,7 @@ import {
 import {
   acquireIdentityFileLock,
   type IdentityLockPolicy,
+  judgeLockHolder,
   releaseIdentityFileLock,
 } from "../session/persistence/identity-file-lock.js";
 import type { Harness } from "./constants.js";
@@ -106,6 +107,58 @@ export async function withAdmissionLock<T>(dir: string, action: () => Promise<T>
     await releaseIdentityFileLock(lockPath, content);
   }
 }
+
+export type AdmissionLockState = {
+  /** A create starting now would be refused `admission_busy`. */
+  readonly busy: boolean;
+  /** The `admission_busy` refusal's own retry hint while busy; null while free. */
+  readonly retryAfterS: number | null;
+};
+
+const LOCK_FREE: AdmissionLockState = { busy: false, retryAfterS: null };
+
+/**
+ * Is the admission lock held so that a create starting NOW would be refused `admission_busy` (TE
+ * defect D2, HoD decision P rev 2)? Busy = the holder is judged LIVE (`judgeLockHolder`, the gate's
+ * own judge) AND the lock is at least one lock budget (5 s) old. READ-ONLY: it never takes, waits on
+ * or breaks the lock.
+ *
+ * ⚠️ DO NOT DROP THE AGE FLOOR. Every create holds this lock for milliseconds; without the floor a
+ * probe landing inside one reads `busy` for a lock that frees at once, and `--need` turns that into a
+ * spurious exit 75. A lock younger than the budget would still be waited out by the gate, not refused.
+ * A dead or unjudgeable holder is never busy here: the gate breaks the first at once and the second
+ * past its stale age. Rows: "admissionLock:" in test/capacity-admission.test.ts.
+ */
+export function readAdmissionLockState(
+  dir: string,
+  nowMs: number = Date.now(),
+): AdmissionLockState {
+  const lockPath = path.join(dir, "admission.lock");
+  let raw: string;
+  let ageMs: number;
+  try {
+    ageMs = nowMs - statSync(lockPath).mtimeMs;
+    raw = readFileSync(lockPath, "utf8");
+  } catch {
+    return LOCK_FREE; // no lock (or it vanished between the two reads)
+  }
+  if (ageMs < LOCK_BUDGET_MS) {
+    return LOCK_FREE;
+  }
+  let body: Record<string, unknown> | undefined;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    body = isRecordObject(parsed) ? parsed : undefined;
+  } catch {
+    body = undefined;
+  }
+  return judgeLockHolder(body) === "live"
+    ? { busy: true, retryAfterS: ADMISSION_BUSY_RETRY_AFTER_S }
+    : LOCK_FREE;
+}
+
+/** The `retry_after_s` of an `admission_busy` refusal: one lock budget. */
+export const ADMISSION_BUSY_RETRY_AFTER_S = LOCK_BUDGET_MS / 1000;
 
 let instanceCache: string | undefined;
 

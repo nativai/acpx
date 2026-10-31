@@ -1068,3 +1068,102 @@ test("refusal token: queued_ahead is appended last on every reason, admission_bu
   assert.equal(busy.capacityRefusal.queuedAhead, 3);
   assert.match(capacityRefusal("no_capacity").stderrLine, / queued_ahead=0$/u);
 });
+
+// ---------------------------------------------------------------------------------------------
+// admissionLock (TE defect D2, HoD decision P rev 2): the probe sees what a waiting create would see
+// ---------------------------------------------------------------------------------------------
+
+/** Plants admission.lock held by `pid` (with its birth identity when readable), `ageMs` old. */
+function plantLock(
+  f: Fixture,
+  pid: number,
+  ageMs: number,
+  identity = readProcessBirthIdentity(pid),
+) {
+  const dir = path.join(f.root, "admission");
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "admission.lock");
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      pid,
+      createdAt: new Date().toISOString(),
+      ...(identity ? { processIdentity: serializeProcessBirthIdentity(identity) } : {}),
+    }),
+  );
+  const at = new Date(Date.now() - ageMs);
+  fs.utimesSync(file, at, at);
+}
+
+const lockOf = (json: Record<string, unknown>) =>
+  json.admissionLock as { busy: boolean; retryAfterS: number | null };
+
+test("admissionLock: a LIVE holder for >= 5 s ⇒ busy, and --need exits 75 with admission_busy: — for automation AND spawn", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  assert.ok(readProcessBirthIdentity(process.pid), "this test process can be judged live");
+  plantLock(f, process.pid, 10_000);
+  for (const cls of ["automation", "spawn"]) {
+    const probe = await probeJson(f, asAgent(f), ["--class", cls, "--need", "1"]);
+    assert.equal(probe.code, 75, cls);
+    assert.deepEqual(lockOf(probe.json), { busy: true, retryAfterS: 5 }, cls);
+    assert.equal(probe.json.needMet, false, cls);
+    assert.match(String(probe.json.needMetReason), /^admission_busy: /u, cls);
+    assert.equal(slotsOf(probe.json, "freeSlots") > 0, true, `${cls}: memory itself has room`);
+  }
+  // …which is exactly what a create starting now gets (the probe/gate invariant):
+  const create = await newSession(f, asAgent(f));
+  assert.equal(create.code, 75);
+  assert.match(create.stderr, /^acpx: REFUSED reason=admission_busy /mu);
+});
+
+test("NEGATIVE admissionLock: a live holder YOUNGER than 5 s is not busy — a create's millisecond hold never reads as no room", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  plantLock(f, process.pid, 0);
+  const probe = await probeJson(f, asAgent(f), ["--class", "automation", "--need", "1"]);
+  assert.equal(probe.code, 0);
+  assert.deepEqual(lockOf(probe.json), { busy: false, retryAfterS: null });
+});
+
+test("NEGATIVE admissionLock: a DEAD holder, and an unjudgeable one, are free however old — the gate would break both", async () => {
+  const gone = await goneAdmitter();
+  const f = makeBox({ requestMib: 4000 });
+  fs.mkdirSync(path.join(f.root, "admission"), { recursive: true });
+  fs.writeFileSync(
+    path.join(f.root, "admission", "admission.lock"),
+    JSON.stringify({ pid: gone.admitterPid, processIdentity: gone.admitterIdentity }),
+  );
+  const old = new Date(Date.now() - 60_000);
+  fs.utimesSync(path.join(f.root, "admission", "admission.lock"), old, old);
+  const dead = await probeJson(f, asAgent(f), ["--class", "automation", "--need", "1"]);
+  assert.equal(dead.code, 0);
+  assert.equal(lockOf(dead.json).busy, false);
+
+  fs.writeFileSync(path.join(f.root, "admission", "admission.lock"), "not a lock body");
+  fs.utimesSync(path.join(f.root, "admission", "admission.lock"), old, old);
+  const unjudgeable = await probeJson(f, asAgent(f), ["--class", "automation", "--need", "1"]);
+  assert.equal(unjudgeable.code, 0);
+  assert.equal(lockOf(unjudgeable.json).busy, false);
+});
+
+test("admissionLock: always present — every class, with and without --need, lock or no lock; without --need a busy lock keeps exit 0", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  for (const args of [[], ["--class", "spawn"], ["--class", "automation"], ["--need", "1"]]) {
+    const probe = await probeJson(f, asAgent(f), args);
+    assert.equal(probe.code, 0, args.join(" "));
+    assert.deepEqual(lockOf(probe.json), { busy: false, retryAfterS: null }, args.join(" "));
+  }
+  plantLock(f, process.pid, 10_000);
+  const noNeed = await probeJson(f, asAgent(f), ["--class", "automation"]);
+  assert.equal(noNeed.code, 0, "no --need: exit codes unchanged");
+  assert.equal(lockOf(noNeed.json).busy, true);
+  const text = await runCli(["capacity"], asAgent(f), f.root);
+  assert.match(text.stdout, /^admission lock: BUSY — /mu);
+});
+
+test("admissionLock: on an UNCONFIGURED box a busy lock is reported but never turns --need into 75 — that box's gate takes no lock", async () => {
+  const f = makeBox({});
+  plantLock(f, process.pid, 10_000);
+  const probe = await probeJson(f, asAgent(f), ["--class", "automation", "--need", "1"]);
+  assert.equal(probe.code, 0);
+  assert.equal(lockOf(probe.json).busy, true);
+});

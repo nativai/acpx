@@ -5,6 +5,7 @@ import type { CapacityRefusalReason } from "../types.js";
 import { readPodInfo } from "./budget.js";
 import { type Harness, isHarness, MIB } from "./constants.js";
 import {
+  ADMISSION_BUSY_RETRY_AFTER_S,
   type AdmissionClass,
   AdmissionLockTimeoutError,
   admissionDir,
@@ -194,7 +195,7 @@ export function capacityRefusal(
   snapshot?: CapacitySnapshot,
   queuedAhead: number = snapshot?.waiting.count ?? 0,
 ): CapacityRefusedError {
-  const retryAfterS = reason === "admission_busy" ? 5 : 60;
+  const retryAfterS = reason === "admission_busy" ? ADMISSION_BUSY_RETRY_AFTER_S : 60;
   const fields = [
     `reason=${reason}`,
     "nothing_started=true",
