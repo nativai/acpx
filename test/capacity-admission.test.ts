@@ -11,12 +11,15 @@ import { MIB } from "../src/capacity/constants.js";
 import { CAPACITY_CONSTANTS } from "../src/capacity/constants.js";
 import { ownerCharge } from "../src/capacity/formula.js";
 import {
+  ADMISSION_TTL_AUTOMATION_MS,
   ADMISSION_TTL_MS,
+  boundEntry,
   containerInstance,
   liveEntries,
   newEntry,
   type PendingEntry,
   readLedgerFile,
+  reservationsOf,
   withAdmissionLock,
   writeLedgerFile,
 } from "../src/capacity/ledger.js";
@@ -241,7 +244,7 @@ function leaseFiles(f: Fixture): string[] {
 }
 
 const TOKEN =
-  /^acpx: REFUSED reason=no_capacity nothing_started=true protocol=1 box=\S+ basis=request free_slots=0 need_mib=450 releasable_mib=0 retry_after_s=60$/mu;
+  /^acpx: REFUSED reason=no_capacity nothing_started=true protocol=1 box=\S+ basis=request free_slots=0 need_mib=450 releasable_mib=0 retry_after_s=60 queued_ahead=0$/mu;
 
 // ---------------------------------------------------------------------------------------------
 // The two guarantees that matter (committed negative cases, §10.1)
@@ -367,9 +370,9 @@ test("class: an identity that leaked into a process OUTSIDE every owner tree (at
   assert.match(lines, /"decision":"not-gated".*"why":"not-in-owner-tree"/u);
 });
 
-test("class: ACPX_ADMISSION_CLASS decides when set — interactive/delivery/automation pass, spawn is gated without inference", async () => {
+test("class: ACPX_ADMISSION_CLASS decides when set — interactive/delivery pass, spawn and automation are gated without inference", async () => {
   const f = makeBox({ requestMib: 2048 });
-  for (const cls of ["interactive", "delivery", "automation"]) {
+  for (const cls of ["interactive", "delivery"]) {
     const run = await newSession(f, asAgent(f, { ACPX_ADMISSION_CLASS: cls }));
     assert.equal(run.code, 0, `${cls}: ${run.stderr}`);
   }
@@ -377,6 +380,13 @@ test("class: ACPX_ADMISSION_CLASS decides when set — interactive/delivery/auto
   const outside = makeBox({ requestMib: 2048, inOwnerTree: false });
   const spawned = await newSession(outside, { ...outside.env, ACPX_ADMISSION_CLASS: "spawn" });
   assert.equal(spawned.code, 75, spawned.stderr);
+  // `automation` likewise (CONCEPTION e8abe1e8 §3.2.1): atrium's wakeup / trigger create, outside
+  // every owner tree and with the identity stripped, is gated because it SAYS it is automation.
+  const automation = await newSession(outside, {
+    ...outside.env,
+    ACPX_ADMISSION_CLASS: "automation",
+  });
+  assert.equal(automation.code, 75, automation.stderr);
   // An unknown value is no class at all: inference decides, and the agent is gated.
   const bogus = await newSession(f, asAgent(f, { ACPX_ADMISSION_CLASS: "human-please" }));
   assert.equal(bogus.code, 75, bogus.stderr);
@@ -588,7 +598,7 @@ test("lock: contention past 5 s refuses with reason=admission_busy, exit 75, not
   assert.equal(run.code, 75, run.stderr);
   assert.match(
     run.stderr,
-    /^acpx: REFUSED reason=admission_busy nothing_started=true protocol=1 retry_after_s=5$/mu,
+    /^acpx: REFUSED reason=admission_busy nothing_started=true protocol=1 retry_after_s=5 queued_ahead=0$/mu,
   );
   assert.deepEqual(createdRecords(f), []);
 });
@@ -628,10 +638,31 @@ test("partitionPending: owner-bound ⇒ raises the owner; no owner + live admitt
   const live = new Set(["s-live"]);
   const result = partitionPending(
     [
-      { key: "a", sessionId: "s-live", bytes: 450, admitterAlive: false },
-      { key: "b", sessionId: "s-gone", bytes: 450, admitterAlive: true },
-      { key: "c", bytes: 340, admitterAlive: true },
-      { key: "d", sessionId: "s-gone", bytes: 450, admitterAlive: false },
+      {
+        key: "a",
+        sessionId: "s-live",
+        bytes: 450,
+        admitterAlive: false,
+        bound: true,
+        spent: false,
+      },
+      {
+        key: "b",
+        sessionId: "s-gone",
+        bytes: 450,
+        admitterAlive: true,
+        bound: false,
+        spent: false,
+      },
+      { key: "c", bytes: 340, admitterAlive: true, bound: false, spent: false },
+      {
+        key: "d",
+        sessionId: "s-gone",
+        bytes: 450,
+        admitterAlive: false,
+        bound: false,
+        spent: false,
+      },
     ],
     live,
   );
@@ -695,4 +726,345 @@ test("refusal token: every reason carries nothing_started=true and protocol=1", 
     assert.equal(error.retryable, true);
     assert.equal(error.capacityRefusal.nothingStarted, true);
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// brick e8abe1e8 — automation waits for room (CONCEPTION e8abe1e8 §3.2, §5, §10.2)
+// ---------------------------------------------------------------------------------------------
+
+/** The shared waiting-dir fixture (2 items) — acpx-ui copies it byte-identical. */
+const WAITING_FIXTURE = fileURLToPath(
+  new URL("../../test/fixtures/capacity/waiting/atrium-example.json", import.meta.url),
+);
+
+/** Atrium's create: outside every owner tree, identity stripped, the class said out loud. */
+const asAutomation = (f: Fixture): NodeJS.ProcessEnv => ({
+  ...f.env,
+  ACPX_ADMISSION_CLASS: "automation",
+});
+
+/** Publishes the fixture's queue (its first `count` items) as one writer, `ageMs` old. */
+function publishWaiting(f: Fixture, count = 2, ageMs = 0): void {
+  const body = JSON.parse(fs.readFileSync(WAITING_FIXTURE, "utf8")) as { items: unknown[] };
+  const dir = path.join(f.root, "admission", "waiting");
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, "atrium-test.json");
+  fs.writeFileSync(file, JSON.stringify({ ...body, items: body.items.slice(0, count) }));
+  const at = new Date(Date.now() - ageMs);
+  fs.utimesSync(file, at, at);
+}
+
+async function probeJson(f: Fixture, env: NodeJS.ProcessEnv, args: string[]) {
+  const run = await runCli(["--format", "json", "capacity", ...args], env, f.root);
+  return { code: run.code, json: JSON.parse(run.stdout) as Record<string, unknown> };
+}
+
+function decisionLog(f: Fixture): Array<Record<string, unknown>> {
+  const dir = path.join(f.root, "admission", "log");
+  return fs
+    .readdirSync(dir)
+    .flatMap((name) => fs.readFileSync(path.join(dir, name), "utf8").trim().split("\n"))
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+const slotsOf = (json: Record<string, unknown>, field: string): number =>
+  (json[field] as { claude: number }).claude;
+
+test("NEGATIVE automation: atrium's automation create on a full box exits 75 and leaves NOTHING — no record, seat, adapter or owner", async () => {
+  const f = makeBox({ requestMib: 2048, inOwnerTree: false });
+  const run = await newSession(f, asAutomation(f));
+  assert.equal(run.code, 75, run.stderr);
+  assert.match(run.stderr, TOKEN);
+  assert.deepEqual(createdRecords(f), [], "no session record");
+  assert.equal(fs.existsSync(seatStore(f)), false, "no seat");
+  assert.deepEqual(agentStarts(f), [], "no transient adapter was started");
+  assert.deepEqual(leaseFiles(f), ["caller.lock"], "no owner was started");
+  assert.deepEqual(await readLedgerFile(path.join(f.root, "admission")), []);
+  const [line] = decisionLog(f);
+  assert.equal(line.decision, "refused");
+  assert.equal(line.class, "automation");
+  assert.equal(line.classSource, "env");
+  assert.equal(line.waiting, 0);
+});
+
+test("NEGATIVE control: the SAME automation create with room is admitted, reserved as class automation", async () => {
+  const f = makeBox({ requestMib: 4000, inOwnerTree: false });
+  const run = await newSession(f, asAutomation(f));
+  assert.equal(run.code, 0, run.stderr);
+  assert.equal(createdRecords(f).length, 1);
+  const [entry] = await readLedgerFile(path.join(f.root, "admission"));
+  assert.equal(entry.class, "automation");
+});
+
+test("queue first: W = 2 with 2 gross slots — spawn gets 0 and is refused with queued_ahead=2; automation gets 2 and is admitted", async () => {
+  const f = makeBox({ requestMib: 3200 });
+  const gross = await probeJson(f, asAgent(f), ["--class", "automation", "--need", "2"]);
+  assert.equal(gross.code, 0, "2 gross slots before anything waits");
+  publishWaiting(f, 2);
+
+  const agent = await probeJson(f, asAgent(f), ["--need", "1"]);
+  assert.equal(agent.code, 75);
+  assert.equal(agent.json.class, "spawn");
+  assert.equal((agent.json.waiting as { count: number }).count, 2);
+  assert.equal(slotsOf(agent.json, "freeSlots"), 0);
+  assert.equal(slotsOf(agent.json, "slotsAfterMakeRoom"), 0);
+  assert.equal(agent.json.verdict, "tight", "the human reserve is still there");
+  assert.match(String(agent.json.needMetReason), /after 2 queued automation session\(s\)/u);
+
+  const drainer = await probeJson(f, asAgent(f), ["--class", "automation", "--need", "2"]);
+  assert.equal(drainer.code, 0);
+  assert.equal(drainer.json.class, "automation");
+  assert.equal(slotsOf(drainer.json, "freeSlots"), 2);
+  assert.equal(
+    slotsOf(drainer.json, "freeSlotsInteractive"),
+    slotsOf(agent.json, "freeSlotsInteractive"),
+    "humans are never reduced by the queue",
+  );
+
+  const refused = await newSession(f, asAgent(f));
+  assert.equal(refused.code, 75, refused.stderr);
+  assert.match(
+    refused.stderr,
+    /^acpx: REFUSED reason=no_capacity nothing_started=true protocol=1 box=\S+ basis=request free_slots=0 need_mib=450 releasable_mib=0 retry_after_s=60 queued_ahead=2$/mu,
+  );
+  assert.match(
+    refused.stderr,
+    /Nothing was started or queued\. 2 automation sessions are queued for room ahead of new agent sessions and start first\./u,
+  );
+  assert.deepEqual(createdRecords(f), [], "the agent's refused create left nothing");
+
+  const admitted = await newSession(f, asAutomation(f));
+  assert.equal(admitted.code, 0, admitted.stderr);
+  const lines = decisionLog(f);
+  assert.deepEqual(
+    lines.map((line) => [line.decision, line.class, line.waiting]),
+    [
+      ["refused", "spawn", 2],
+      ["admitted", "automation", 2],
+    ],
+  );
+});
+
+test("queue first, JSON: an agent's refusal carries queuedAhead in error.data", async () => {
+  const f = makeBox({ requestMib: 3200 });
+  publishWaiting(f, 2);
+  const run = await runCli(
+    ["--format", "json", "--agent", f.agent, "--cwd", path.join(f.root, "work"), "sessions", "new"],
+    asAgent(f),
+    f.root,
+  );
+  assert.equal(run.code, 75, run.stderr);
+  const data = (
+    JSON.parse(run.stdout.trim().split("\n").at(-1) ?? "") as {
+      error: { data: Record<string, unknown> };
+    }
+  ).error.data;
+  assert.equal(data.queuedAhead, 2);
+});
+
+test("queue first: W = 1 takes exactly one agent slot — --need 1 met, --need 2 not", async () => {
+  const f = makeBox({ requestMib: 3200 });
+  publishWaiting(f, 1);
+  assert.equal((await probeJson(f, asAgent(f), ["--need", "1"])).code, 0);
+  assert.equal((await probeJson(f, asAgent(f), ["--need", "2"])).code, 75);
+});
+
+test("NEGATIVE queue first: a STALE (6 min) or FUTURE waiting file is not counted — the agent gets the gross slots (fail open)", async () => {
+  for (const ageMs of [6 * 60_000, -60_000]) {
+    const f = makeBox({ requestMib: 3200 });
+    publishWaiting(f, 2, ageMs);
+    const probe = await probeJson(f, asAgent(f), ["--need", "2"]);
+    assert.equal(probe.code, 0, `age ${ageMs} ms`);
+    assert.equal((probe.json.waiting as { count: number }).count, 0);
+    const create = await newSession(f, asAgent(f));
+    assert.equal(create.code, 0, create.stderr);
+  }
+});
+
+test("text: `acpx capacity` names what waits, in order — and says nothing when nothing waits", async () => {
+  const f = makeBox({ requestMib: 3200 });
+  const quiet = await runCli(["capacity"], asAgent(f), f.root);
+  assert.equal(quiet.code, 0);
+  assert.doesNotMatch(quiet.stdout, /^waiting:/mu);
+  publishWaiting(f, 2);
+  const spawnView = await runCli(["capacity"], asAgent(f), f.root);
+  assert.match(
+    spawnView.stdout,
+    /^waiting: 2 automation sessions queued since (?:2026-10-31 )?01:00Z \(wakeup re-baker-2026-10-31, brick run 3f2a1c… "Implement X"\) — they start before new agent sessions; the slots above already leave room for them$/mu,
+  );
+  assert.match(spawnView.stdout, /^tight: 0 new claude sessions/mu);
+  const drainerView = await runCli(["capacity", "--class", "automation"], asAgent(f), f.root);
+  assert.match(drainerView.stdout, /^room: 2 new claude sessions/mu);
+  assert.match(
+    drainerView.stdout,
+    /^waiting: 2 automation sessions .* class automation: the slots above are gross/mu,
+  );
+});
+
+test("NEGATIVE --class: an unknown class is a usage error (exit 2), never a reading", async () => {
+  const f = makeBox({ requestMib: 3200 });
+  const run = await runCli(
+    ["--format", "json", "capacity", "--class", "interactive"],
+    asAgent(f),
+    f.root,
+  );
+  assert.equal(run.code, 2, run.stderr);
+  assert.doesNotMatch(run.stdout, /"action":"capacity"/u);
+});
+
+test("reservation: an automation create's reservation OUTLIVES its CLI — bound, counted after the admitter exited, 10-min TTL — so back-to-back starts cannot double-book", async () => {
+  // Atrium creates prompt-less and delivers the first prompt from ANOTHER process (CONCEPTION
+  // e8abe1e8 §3.2.2, AC14): with v1's rule this reservation vanished when `sessions new` exited.
+  const f = makeBox({ requestMib: 3200, inOwnerTree: false });
+  const first = await newSession(f, asAutomation(f));
+  assert.equal(first.code, 0, first.stderr);
+  const [entry] = await readLedgerFile(path.join(f.root, "admission"));
+  assert.equal(`${entry.sessionId}.json`, createdRecords(f)[0]);
+  assert.ok(entry.boundAt, "bind stamped boundAt");
+  assert.equal(
+    Date.parse(entry.expiresAt) - Date.parse(entry.boundAt),
+    ADMISSION_TTL_AUTOMATION_MS,
+  );
+
+  const after = await probeJson(f, f.env, ["--class", "automation"]);
+  assert.equal(
+    after.json.pendingBytes,
+    450 * MIB,
+    "still reserved: its admitter is gone, it is bound",
+  );
+  assert.equal((after.json.owners as { starting: number }).starting, 1);
+  assert.equal(slotsOf(after.json, "freeSlots"), 1);
+
+  assert.equal((await newSession(f, asAutomation(f))).code, 0, "the second takes the last slot");
+  const third = await newSession(f, asAutomation(f));
+  assert.equal(third.code, 75, "…and a third is refused, not admitted against the same memory");
+});
+
+test("reservation: an agent's prompt-less create stays bound for 180 s after its CLI exits (the named R10 change)", async () => {
+  const f = makeBox({ requestMib: 3200 });
+  assert.equal((await newSession(f, asAgent(f))).code, 0);
+  const [entry] = await readLedgerFile(path.join(f.root, "admission"));
+  assert.equal(entry.class, "spawn");
+  assert.equal(Date.parse(entry.expiresAt) - Date.parse(entry.boundAt ?? ""), ADMISSION_TTL_MS);
+  const after = await probeJson(f, asAgent(f), []);
+  assert.equal(after.json.pendingBytes, 450 * MIB);
+});
+
+/** A process that lived and is now provably gone — an admitter that exited. */
+async function goneAdmitter(): Promise<Pick<PendingEntry, "admitterPid" | "admitterIdentity">> {
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 300)"]);
+  const pid = child.pid ?? 0;
+  const identity = readProcessBirthIdentity(pid);
+  await new Promise((resolve) => child.once("exit", resolve));
+  assert.ok(identity, "the admitter's identity was read while it lived");
+  return { admitterPid: pid, admitterIdentity: serializeProcessBirthIdentity(identity) };
+}
+
+function sessionsDirWith(records: Record<string, Record<string, unknown>>): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-n1-sessions-"));
+  for (const [id, record] of Object.entries(records)) {
+    fs.writeFileSync(
+      path.join(dir, `${id}.json`),
+      JSON.stringify({ acpx_record_id: id, ...record }),
+    );
+  }
+  return dir;
+}
+
+/** P after the partition, with no live owner anywhere. */
+const pendingOf = (entries: PendingEntry[], sessionsDir: string) =>
+  partitionPending(reservationsOf(entries, sessionsDir), new Set());
+
+test("NEGATIVE reservation (R14): a --record-id create killed BEFORE bind is dropped; the same entry bound is counted", async () => {
+  const gone = await goneAdmitter();
+  const sessions = sessionsDirWith({});
+  const unbound = entryFor({ key: "killed", sessionId: "rec-1", ...gone });
+  assert.equal(pendingOf([unbound], sessions).pendingBytes, 0, "sessionId alone is not 'bound'");
+  const bound = { ...boundEntry(unbound, "rec-1", new Date()), ...gone };
+  assert.equal(pendingOf([bound], sessions).pendingBytes, 450 * MIB);
+});
+
+test("N1: a bound reservation whose session already RAN a turn (at or after boundAt) is dropped", async () => {
+  const gone = await goneAdmitter();
+  const now = new Date();
+  const bound = {
+    ...boundEntry(entryFor({ class: "automation" }), "rec-ran", now),
+    ...gone,
+  };
+  const ran = sessionsDirWith({
+    "rec-ran": { last_prompt_at: new Date(now.getTime() + 1_000).toISOString() },
+  });
+  assert.equal(pendingOf([bound], ran).pendingBytes, 0);
+  // Exactly at boundAt counts as a turn ("at or after").
+  const atBind = sessionsDirWith({ "rec-ran": { last_prompt_at: bound.boundAt } });
+  assert.equal(pendingOf([bound], atBind).pendingBytes, 0);
+});
+
+test("N1: a bound reservation whose record is CLOSED is dropped (self-closing job, human close, prompt-less create closed)", async () => {
+  const gone = await goneAdmitter();
+  const bound = { ...boundEntry(entryFor(), "rec-closed", new Date()), ...gone };
+  const closed = sessionsDirWith({
+    "rec-closed": { closed: true, closed_at: new Date().toISOString() },
+  });
+  assert.equal(pendingOf([bound], closed).pendingBytes, 0);
+});
+
+test("NEGATIVE N1: bound, no turn since bind, no owner, within its TTL ⇒ STILL counted — a turn from BEFORE bind, or a missing record, does not spend it", async () => {
+  const gone = await goneAdmitter();
+  const now = new Date();
+  const bound = { ...boundEntry(entryFor(), "rec-waiting", now), ...gone };
+  for (const [what, records] of [
+    ["no turn at all", { "rec-waiting": {} }],
+    [
+      "a turn copied from before bind",
+      { "rec-waiting": { last_prompt_at: new Date(now.getTime() - 60_000).toISOString() } },
+    ],
+    ["reopened (closed: false)", { "rec-waiting": { closed: false } }],
+    ["no record on disk", {}],
+  ] as const) {
+    assert.equal(pendingOf([bound], sessionsDirWith(records)).pendingBytes, 450 * MIB, what);
+  }
+});
+
+test("TTL by class: automation lives 10 min, every other class 180 s — at admission and again from bind", () => {
+  const admitted = new Date("2026-10-31T01:00:00.000Z");
+  const automation = newEntry({
+    key: "a",
+    harness: "claude",
+    bytes: 450 * MIB,
+    admissionClass: "automation",
+    origin: "test",
+    now: admitted,
+  });
+  assert.equal(Date.parse(automation.expiresAt) - admitted.getTime(), ADMISSION_TTL_AUTOMATION_MS);
+  assert.equal(ADMISSION_TTL_AUTOMATION_MS, 600_000);
+  const bindAt = new Date("2026-10-31T01:00:20.000Z");
+  const bound = boundEntry(automation, "rec", bindAt);
+  assert.equal(bound.boundAt, bindAt.toISOString());
+  assert.equal(bound.sessionId, "rec");
+  assert.equal(Date.parse(bound.expiresAt) - bindAt.getTime(), ADMISSION_TTL_AUTOMATION_MS);
+  for (const cls of ["spawn", "interactive", "delivery"] as const) {
+    const entry = newEntry({
+      key: cls,
+      harness: "claude",
+      bytes: 1,
+      origin: "t",
+      admissionClass: cls,
+      now: admitted,
+    });
+    assert.equal(Date.parse(entry.expiresAt) - admitted.getTime(), ADMISSION_TTL_MS, cls);
+    assert.equal(
+      Date.parse(boundEntry(entry, "r", bindAt).expiresAt) - bindAt.getTime(),
+      ADMISSION_TTL_MS,
+      cls,
+    );
+  }
+});
+
+test("refusal token: queued_ahead is appended last on every reason, admission_busy included", () => {
+  const busy = capacityRefusal("admission_busy", undefined, 3);
+  assert.match(busy.stderrLine, / retry_after_s=5 queued_ahead=3$/u);
+  assert.equal(busy.capacityRefusal.queuedAhead, 3);
+  assert.match(capacityRefusal("no_capacity").stderrLine, / queued_ahead=0$/u);
 });

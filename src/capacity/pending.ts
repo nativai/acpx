@@ -6,7 +6,17 @@
  *
  *   its session has a live owner           → that owner is charged max(r_live, m, reservation)
  *   no owner yet, its admitter still lives  → counted in P (the transient adapter, the starting owner)
- *   no owner, admitter gone                 → dropped: nothing was started, or it already exited
+ *   no owner, admitter gone, BOUND, unspent → counted in P (CONCEPTION e8abe1e8 §3.2.2): the record
+ *                                             exists and its first prompt is still to come — atrium
+ *                                             creates with one process and prompts with another,
+ *                                             possibly after a restart's bind window
+ *   anything else                           → dropped: nothing was created, or the job already ran
+ *
+ * "Bound" = `ticket.bind` ran (`boundAt`), never "has a sessionId": a `--record-id` create carries
+ * its id from admission on, so a create killed before it created anything must still drop (R14).
+ * "Spent" = the record shows a turn at or after `boundAt`, or is closed (N1): once the job ran, its
+ * owner was charged while it lived, and a bound reservation that outlived it would hold a slot for
+ * the rest of its TTL (10 min for `automation`) against nothing.
  *
  * TTL and container-instance expiry are applied by the ledger before this partition (§5).
  */
@@ -18,12 +28,16 @@ export type PendingReservation = {
   readonly bytes: number;
   /** False only when the admitter is PROVABLY gone; an unjudgeable admitter counts as alive. */
   readonly admitterAlive: boolean;
+  /** `ticket.bind` ran: the record exists (`boundAt` in the ledger). */
+  readonly bound: boolean;
+  /** Bound, and its record shows a turn at or after `boundAt`, or is closed. */
+  readonly spent: boolean;
 };
 
 export type PendingPartition = {
   /** Reservation per live owner's session id — raises that owner's charge while within TTL. */
   readonly ownerReserved: ReadonlyMap<string, number>;
-  /** `P`: reservations with no owner yet whose admitter still lives. */
+  /** `P`: reservations with no owner yet whose admitter still lives, or that are bound and unspent. */
   readonly pendingBytes: number;
   /** How many reservations make up `P` (`owners.starting`). */
   readonly starting: number;
@@ -44,7 +58,7 @@ export function partitionPending(
       const previous = ownerReserved.get(reservation.sessionId) ?? 0;
       ownerReserved.set(reservation.sessionId, Math.max(previous, reservation.bytes));
       keptKeys.add(reservation.key);
-    } else if (reservation.admitterAlive) {
+    } else if (reservation.admitterAlive || (reservation.bound && !reservation.spent)) {
       pendingBytes += reservation.bytes;
       starting += 1;
       keptKeys.add(reservation.key);

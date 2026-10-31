@@ -1,7 +1,8 @@
 import { type Command, InvalidArgumentError } from "commander";
-import { readPendingReservationsForProbe } from "../capacity/admission.js";
+import { readPendingReservationsForProbe, readWaitingForProbe } from "../capacity/admission.js";
 import { type Harness, HARNESSES, isHarness, MIB } from "../capacity/constants.js";
 import {
+  type CapacityClass,
   type CapacitySnapshot,
   capacitySourcesFromEnv,
   needMet,
@@ -14,17 +15,32 @@ import { parseOutputFormat, resolveGlobalFlags } from "./flags.js";
 import { emitJsonResult } from "./output/json-output.js";
 
 /**
- * `acpx capacity [--agent claude|codex|pi] [--need N]` — how many more agent sessions fit in THIS
- * box's control-pod memory (CONCEPTION f7587c86 §8.1). Read-only. It reads the admission ledger
- * the create gate writes, so creates in flight show as `pendingBytes` / `owners.starting`, and the
- * gate (`capacity/admission.ts`) admits exactly when `--need 1` here is met.
+ * `acpx capacity [--agent claude|codex|pi] [--need N] [--class spawn|automation]` — how many more
+ * agent sessions fit in THIS box's control-pod memory (CONCEPTION f7587c86 §8.1). Read-only. It
+ * reads the admission ledger the create gate writes, so creates in flight show as `pendingBytes` /
+ * `owners.starting`, and the gate (`capacity/admission.ts`) admits exactly when `--need 1` here is
+ * met for the same class.
+ *
+ * `--class` (CONCEPTION e8abe1e8 §3.2.4): `spawn` (default — an agent's view) reports slots net of
+ * the automation sessions queued for room; `automation` (atrium's drainer probe) reports them gross.
+ * Both list what waits (`waiting` in JSON, one `waiting:` line in text).
  *
  * Exit 0 on a successful reading (with `--need N`: at least N slots for `--agent`), 75 when
  * `--need N` is not met, 2 on usage, 1 on an internal error. An unconfigured or unmeasured box
  * exits 0 — fail open.
  */
 
-type CapacityFlags = { agent?: Harness; need?: number };
+type CapacityFlags = { agent?: Harness; need?: number; class?: CapacityClass };
+
+const CLASSES: readonly CapacityClass[] = ["spawn", "automation"];
+
+function parseClass(value: string): CapacityClass {
+  const trimmed = value.trim();
+  if (!(CLASSES as readonly string[]).includes(trimmed)) {
+    throw new InvalidArgumentError(`Expected one of: ${CLASSES.join(", ")}`);
+  }
+  return trimmed as CapacityClass;
+}
 
 function parseAgent(value: string): Harness {
   if (!isHarness(value)) {
@@ -98,6 +114,50 @@ function slotLines(s: CapacitySnapshot): string[] {
   ];
 }
 
+/** `14:05Z` today (UTC), else `2026-10-30 23:58Z`; the raw value when it is not a date. */
+function sinceLabel(since: string, now: Date): string {
+  const at = new Date(since);
+  if (Number.isNaN(at.getTime())) {
+    return since || "?";
+  }
+  const iso = at.toISOString();
+  const time = `${iso.slice(11, 16)}Z`;
+  return iso.slice(0, 10) === now.toISOString().slice(0, 10) ? time : `${iso.slice(0, 10)} ${time}`;
+}
+
+const SHOWN_ITEMS = 5;
+
+function itemLabel(item: CapacitySnapshot["waiting"]["items"][number]): string {
+  if (item.kind === "wakeup") {
+    return `wakeup ${item.label || item.ref}`;
+  }
+  if (item.kind === "trigger-run") {
+    const label = item.label ? ` "${item.label}"` : "";
+    return `brick run ${item.ref.slice(0, 6)}…${label}`;
+  }
+  return `${item.kind} ${item.label || item.ref}`;
+}
+
+/** One line while automation waits for room — agent-facing wording (CONCEPTION e8abe1e8 §12.3). */
+export function waitingLine(s: CapacitySnapshot, now: Date = new Date()): string | undefined {
+  const { count, items } = s.waiting;
+  if (count === 0) {
+    return undefined;
+  }
+  const shown = items.slice(0, SHOWN_ITEMS).map(itemLabel);
+  if (count > SHOWN_ITEMS) {
+    shown.push(`+${count - SHOWN_ITEMS} more`);
+  }
+  const effect =
+    s.class === "spawn"
+      ? "they start before new agent sessions; the slots above already leave room for them"
+      : "class automation: the slots above are gross, the queue orders itself";
+  return (
+    `waiting: ${plural(count, "automation session")} queued since ` +
+    `${sinceLabel(items[0]?.since ?? "", now)} (${shown.join(", ")}) — ${effect}`
+  );
+}
+
 function pressureLine(s: CapacitySnapshot): string {
   const p = s.pressure;
   const parts: Array<string | undefined> = [
@@ -115,9 +175,11 @@ function pressureLine(s: CapacitySnapshot): string {
 }
 
 export function renderCapacityText(s: CapacitySnapshot): string {
+  const waiting = waitingLine(s);
   const lines = [
     headLine(s),
     ...slotLines(s),
+    ...(waiting ? [waiting] : []),
     pressureLine(s),
     ...s.alternatives.map(
       (alt) =>
@@ -168,6 +230,8 @@ async function handleCapacity(
     agent: flags.agent ?? "claude",
     sources: capacitySourcesFromEnv(),
     pending: await readPendingReservationsForProbe(),
+    waiting: readWaitingForProbe(),
+    admissionClass: flags.class ?? "spawn",
   });
   const met = flags.need === undefined || needMet(snapshot, flags.need);
   writeCapacity(format, snapshot, flags.need, met);
@@ -194,6 +258,11 @@ export function registerCapacityCommand(parent: Command, config: ResolvedAcpxCon
       parseAgent,
     )
     .option("--need <n>", "Exit 75 unless at least n new sessions of --agent fit", parseNeed)
+    .option(
+      "--class <class>",
+      "Whose slots: spawn (default; net of queued automation) or automation (gross)",
+      parseClass,
+    )
     .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
     // Subcommands are registered BEFORE `program.exitOverride()` (cli-core `main`), so without
     // this commander exits a usage error with its own 1. Thrown, it reaches
