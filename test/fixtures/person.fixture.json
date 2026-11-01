@@ -81,6 +81,140 @@
     "how": "negative: well-formed lookalikes a reader rejects; it never pads, case-folds or prefix-matches",
     "values": ["p_fb566154c0bf245b7538", "P-FB566154C0BF245B7538", "p-fb566154c0"]
   },
+  "telegram_actors": [
+    {
+      "label": "T1",
+      "how": "positive: the K7 actor with a well-formed person_id gives that id (it is stored, not derived)",
+      "actor": {
+        "kind": "human",
+        "channel": "telegram",
+        "verified": false,
+        "name": "Daniel Laatz",
+        "telegram_user_id": 4711,
+        "person_id": "p-fb566154c0bf245b7538",
+        "box": "devbox"
+      },
+      "id": "p-fb566154c0bf245b7538"
+    },
+    {
+      "label": "T2",
+      "how": "negative: a telegram actor with no person_id",
+      "actor": {
+        "kind": "human",
+        "channel": "telegram",
+        "verified": false,
+        "name": "Daniel Laatz",
+        "telegram_user_id": 4711,
+        "box": "devbox"
+      },
+      "id": null
+    },
+    {
+      "label": "T3",
+      "how": "negative: person_id of the wrong length (prefix, 10 hex)",
+      "actor": {
+        "kind": "human",
+        "channel": "telegram",
+        "verified": false,
+        "person_id": "p-fb566154c0"
+      },
+      "id": null
+    },
+    {
+      "label": "T4",
+      "how": "negative: person_id of the wrong length (one hex too many)",
+      "actor": {
+        "kind": "human",
+        "channel": "telegram",
+        "verified": false,
+        "person_id": "p-fb566154c0bf245b75380"
+      },
+      "id": null
+    },
+    {
+      "label": "T5",
+      "how": "negative: person_id in uppercase",
+      "actor": {
+        "kind": "human",
+        "channel": "telegram",
+        "verified": false,
+        "person_id": "P-FB566154C0BF245B7538"
+      },
+      "id": null
+    },
+    {
+      "label": "T6",
+      "how": "negative: person_id without the p- prefix",
+      "actor": {
+        "kind": "human",
+        "channel": "telegram",
+        "verified": false,
+        "person_id": "fb566154c0bf245b7538"
+      },
+      "id": null
+    },
+    {
+      "label": "T7",
+      "how": "negative: person_id with a trailing LF",
+      "actor": {
+        "kind": "human",
+        "channel": "telegram",
+        "verified": false,
+        "person_id": "p-fb566154c0bf245b7538\n"
+      },
+      "id": null
+    },
+    {
+      "label": "T8",
+      "how": "negative: person_id that is not a string",
+      "actor": {
+        "kind": "human",
+        "channel": "telegram",
+        "verified": false,
+        "person_id": ["p-fb566154c0bf245b7538"]
+      },
+      "id": null
+    },
+    {
+      "label": "T9",
+      "how": "negative: another channel (web) carrying a person_id",
+      "actor": {
+        "kind": "human",
+        "channel": "web",
+        "verified": false,
+        "person_id": "p-fb566154c0bf245b7538"
+      },
+      "id": null
+    },
+    {
+      "label": "T10",
+      "how": "negative: no channel at all, carrying a person_id",
+      "actor": { "kind": "human", "verified": false, "person_id": "p-fb566154c0bf245b7538" },
+      "id": null
+    },
+    {
+      "label": "T11",
+      "how": "negative: the channel name is exact (case differs), carrying a person_id",
+      "actor": {
+        "kind": "human",
+        "channel": "Telegram",
+        "verified": false,
+        "person_id": "p-fb566154c0bf245b7538"
+      },
+      "id": null
+    },
+    {
+      "label": "T12",
+      "how": "negative: an agent actor that claims the telegram channel",
+      "actor": {
+        "kind": "agent",
+        "channel": "telegram",
+        "session_id": "s",
+        "person_id": "p-fb566154c0bf245b7538"
+      },
+      "id": null
+    }
+  ],
   "handles": [
     {
       "name": "Daniel Brammertz",

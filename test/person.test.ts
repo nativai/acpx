@@ -24,8 +24,8 @@ import {
 const SOURCE_PATH = path.resolve(process.cwd(), "src/session/persistence/person.ts");
 const FIXTURE_PATH = path.resolve(process.cwd(), "test/fixtures/person.fixture.json");
 // ---- everything below this line is the same in both repos' person tests ----
-const PERSON_TS_SHA256 = "3653c451a81409c5f97cbf74060a596072a0d83bf05aea5563d695c8b55f185d";
-const FIXTURE_SHA256 = "fd40e9d0c4fada6858969433100c2b948ddb60e12477ad77e3e73e09c41feaaa";
+const PERSON_TS_SHA256 = "61dbd0575cec8b02c80b2de63f1c63b4286f957d8e3e0d9c63787e074ee33d9b";
+const FIXTURE_SHA256 = "898ab29f987ae27a40c9b29775de1886fb090bc863575dab330765870853b032";
 
 interface IdRow {
   label: string;
@@ -43,9 +43,16 @@ interface HandleRow {
   taken: string[];
   expect: string;
 }
+interface TelegramRow {
+  label: string;
+  how: string;
+  actor: unknown;
+  id: string | null;
+}
 interface Fixture {
   ids: IdRow[];
   not_ids: { label: string; values: string[] };
+  telegram_actors: TelegramRow[];
   handles: HandleRow[];
 }
 
@@ -105,8 +112,7 @@ test("person.ts is the pinned text (sha256) — the same bytes as the other repo
 
 test("the pin check reports a mismatch for a copy that differs by one byte in a code line (and in a comment)", () => {
   const original = fs.readFileSync(SOURCE_PATH, "utf8");
-  const code =
-    "return dns === null ? null : `p-${sha256Hex(`${dns.issuer}\\n${dns.subject}`).slice(0, 20)}`;";
+  const code = ": `p-${sha256Hex(`${dns.issuer}\\n${dns.subject}`).slice(0, 20)}`;";
   assert.ok(original.includes(code), "the code line this case edits is gone — update the case");
   const changedCode = Buffer.from(
     original.replace(code, code.replace("slice(0, 20)", "slice(0, 21)")),
@@ -136,6 +142,10 @@ test("person.fixture.json is the pinned file (sha256) and holds the rows the pla
   );
   assert.equal(fixture.not_ids.label, "N8");
   assert.equal(idRows, 11);
+  assert.deepEqual(
+    fixture.telegram_actors.map((row) => row.label),
+    ["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9", "T10", "T11", "T12"],
+  );
   assert.equal(fixture.handles.length, 9);
 });
 
@@ -287,6 +297,52 @@ test("C2.1: only a verified human carrying both DNs has an id", () => {
     42,
   ];
   for (const actor of refused) {
+    assert.equal(personIdOf(actor), null, JSON.stringify(actor) ?? String(actor));
+  }
+});
+
+test("Telegram leg (Telegram CONCEPTION 5.5, K7): T1 gives its stored id, T2-T12 give null", () => {
+  const rows = readFixture().telegram_actors;
+  assert.equal(rows.length, 12);
+  for (const row of rows) {
+    assert.equal(personIdOf(row.actor), row.id, `${row.label}: ${row.how}`);
+  }
+  assert.deepEqual(
+    rows.filter((row) => row.id !== null).map((row) => row.label),
+    ["T1"],
+  );
+});
+
+test("Telegram leg: the certificate path still wins, and a certificate-less human is a person only by the leg", () => {
+  const issuer = "C=DE,O=NativAI,CN=konsiq-dev-ca";
+  const subject = "C=DE,O=NativAI,CN=Daniel Laatz";
+  const other = "p-0123456789abcdef0123";
+  // C2.1: a verified human with both DNs is the hash, even when it also carries a telegram person_id
+  assert.equal(
+    personIdOf({
+      kind: "human",
+      channel: "telegram",
+      verified: true,
+      issuer,
+      subject,
+      person_id: other,
+    }),
+    V2,
+  );
+  // an unverified human with DNs and no telegram channel stays null, whatever else it carries
+  assert.equal(
+    personIdOf({ kind: "human", channel: "web", verified: false, issuer, subject }),
+    null,
+  );
+  assert.equal(
+    personIdOf({ kind: "human", channel: "telegram", verified: false, issuer, subject }),
+    null,
+    "DNs without a person_id are not a Telegram person",
+  );
+  // the leg returns the stored id, never a hash of it or of the other fields
+  assert.equal(personIdOf({ kind: "human", channel: "telegram", person_id: other }), other);
+  const notActors: unknown[] = [null, undefined, "telegram", 42, [], {}];
+  for (const actor of notActors) {
     assert.equal(personIdOf(actor), null, JSON.stringify(actor) ?? String(actor));
   }
 });

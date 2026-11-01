@@ -178,13 +178,31 @@ function humanDns(actor: unknown): { issuer: string; subject: string } | null {
 }
 
 /**
+ * The Telegram leg (Telegram CONCEPTION 5.5, K7). A forwarded Telegram message carries the actor
+ * `{kind:'human', channel:'telegram', verified:false, name, telegram_user_id, person_id, box}`; its person
+ * is the `person_id` the bridge wrote, and only when that is a well-formed id (C1.1: exact, no padding, no
+ * case-folding). It is a stored id, never a hash of anything, and nothing else about the actor is read:
+ * another channel carrying a `person_id` is not a person by it.
+ */
+function telegramPersonId(actor: unknown): string | null {
+  if (typeof actor !== "object" || actor === null) {
+    return null;
+  }
+  const { kind, channel, person_id } = actor as Record<string, unknown>;
+  return kind === "human" && channel === "telegram" && isPersonId(person_id) ? person_id : null;
+}
+
+/**
  * C1.1 + C2.1. `p-` + the first 20 hex of sha256(UTF-8(issuer + "\n" + subject)), the DNs exactly as stored
  * (no trim, no case-folding, no re-ordering). `null` for every non-person: an agent, a system component,
  * an unverified or anonymous human, a human without both DNs. Does not throw for any JSON-shaped input.
+ * A human actor without a verified certificate is a person only through the Telegram leg above.
  */
 export function personIdOf(actor: unknown): string | null {
   const dns = humanDns(actor);
-  return dns === null ? null : `p-${sha256Hex(`${dns.issuer}\n${dns.subject}`).slice(0, 20)}`;
+  return dns === null
+    ? telegramPersonId(actor)
+    : `p-${sha256Hex(`${dns.issuer}\n${dns.subject}`).slice(0, 20)}`;
 }
 
 // ---------------------------------------------------------------------------
