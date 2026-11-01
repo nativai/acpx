@@ -181,6 +181,7 @@ import {
   withInheritedOutputStyle,
   withInheritedReasoningEffort,
 } from "./session/inherited-metadata.js";
+import { refuseCloseOverOpenPersonRequests } from "./session/open-person-requests-guard.js";
 import { mergeSessionMetadata, validateSessionMetadataValue } from "./session/session-metadata.js";
 import type {
   SetParentRefusalCode,
@@ -2912,6 +2913,18 @@ export async function handleSessionsClose(
   const bywayRefusal = bywayCloseRefusal(record);
   if (bywayRefusal) {
     emitBywayCloseRefusal(bywayRefusal, globalFlags.format);
+    return;
+  }
+
+  // brick 2587d30e (addressing v3 §8.3) — same rule: decided before anything is touched.
+  if (
+    await refuseCloseOverOpenPersonRequests({
+      record,
+      force: flags.force,
+      format: globalFlags.format,
+      verbose: globalFlags.verbose,
+    })
+  ) {
     return;
   }
 

@@ -87,8 +87,10 @@ export function closeRetryArgs(flags: {
   drain?: boolean;
   drainTimeout?: number;
   failOnUndelivered?: boolean;
+  force?: boolean;
 }): string[] {
   return [
+    ...(flags.force ? ["--force"] : []),
     ...(flags.drain === false ? ["--no-drain"] : []),
     ...(flags.drainTimeout !== undefined ? ["--drain-timeout", String(flags.drainTimeout)] : []),
     ...(flags.failOnUndelivered ? ["--fail-on-undelivered"] : []),
