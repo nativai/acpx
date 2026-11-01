@@ -915,6 +915,25 @@ async function firstHolderOfSeat(seatId: string): Promise<PrincipalCreator | und
   return first?.creator;
 }
 
+/**
+ * Who may answer for a create INTO a seat (brick 509d3884 O1, X-1). C8.2 rule order: rule 2
+ * (`spawned_by_session_id`, written by `--no-parent` when there is a caller) outranks rule 3 (a seat
+ * successor answers its seat's first holder). So rule 3 answers only for a create with no `--from` and no
+ * recorded spawned-by session; otherwise `undefined`, and the caller / `--from` session stays the creator.
+ * Create shapes: fresh no `--seat` -> rule 4 (parent) or 5 (none); `--no-parent` with a caller -> rule 2;
+ * `--seat`, no `--no-parent` or no caller -> rule 3; `--from` -> the predecessor's answer (unchanged).
+ */
+async function seatJoinFor(
+  joining: string | undefined,
+  from: SessionRecord | undefined,
+  spawnedBySessionId: string | undefined,
+): Promise<{ firstHolder: PrincipalCreator | undefined } | undefined> {
+  if (joining === undefined || from !== undefined || spawnedBySessionId !== undefined) {
+    return undefined;
+  }
+  return { firstHolder: await firstHolderOfSeat(joining) };
+}
+
 async function resolveAndValidateParentSessionId(
   flags: ParentFlagSource,
   options: { allowEnvFallback?: boolean } = {},
@@ -1186,8 +1205,9 @@ function buildSessionStartOptions(params: {
   /** Brick `9984c510` — the leg `resolveBrickFlagValue` took for `resolvedBrick`,
    * when it is a string. See `SessionCreateOptions.explicitBrickFlagValidated`. */
   resolvedBrickValidated?: boolean;
-  /** Present only for a create INTO an existing seat with no `--from` (brick 509d3884 O1): the seat's first
-   * holder, whose answer the new holder copies (C8.2 rule 3) instead of the caller's or a bare shell's `none`. */
+  /** Present only for a create INTO an existing seat with no `--from` and no recorded spawned-by session
+   * (brick 509d3884 O1, X-1): the seat's first holder, whose answer the new holder copies (C8.2 rule 3)
+   * instead of the caller's or a bare shell's `none`. Absent when rule 2 (`--no-parent`) applies. */
   seatJoin?: { firstHolder: PrincipalCreator | undefined };
 }): Parameters<SessionModule["createSession"]>[0] {
   return {
@@ -3443,10 +3463,7 @@ async function createSessionFromNewFlags(
   if (flags.favorite === true && joining !== undefined) {
     throw new InvalidArgumentError(favoriteOnJoinMessage(joining));
   }
-  const seatJoin =
-    from === undefined && joining !== undefined
-      ? { firstHolder: await firstHolderOfSeat(joining) }
-      : undefined;
+  const seatJoin = await seatJoinFor(joining, from, spawnedBySessionId);
   const { value: resolvedBrick, validated: resolvedBrickValidated } = await resolveBrickFlagValue(
     flags.brick,
   );

@@ -469,6 +469,43 @@ test("O1: the CALLER is not the creator of a seat successor — a person's sessi
   });
 });
 
+// X-1 (brick 509d3884, TE): C8.2 rule 2 (`spawned_by_session_id`, which `--no-parent` writes) outranks rule 3,
+// and atrium's walk has the same order — so the record must equal the walk: the CALLER, not the first holder.
+test("X-1: `sessions new --seat <seat> --no-parent` inside another person's session records the CALLER (rule 2 over rule 3); the bare-shell `--no-parent` control records the first holder", async () => {
+  await withMockHome(async (f) => {
+    const first = await createChild(f, QX); // Laatz's seat
+    const seat = await seatOf(f, first);
+    await seed(f, "caller-p", P); // Brammertz's session
+    const viaCaller = await createChild(f, ["--seat", seat, "--no-parent"], {
+      ACPX_SESSION_URL: urlOf("caller-p"),
+    });
+    const stored = JSON.parse(await fs.readFile(sessionFilePath(f.home, viaCaller), "utf8")) as {
+      spawned_by_session_id?: string;
+      parent_session_id?: string;
+    };
+    assert.equal(
+      stored.spawned_by_session_id,
+      "caller-p",
+      "the control: rule 2's field is written",
+    );
+    assert.equal(stored.parent_session_id, undefined, "and --no-parent dropped the parent edge");
+    assert.deepEqual(principalKeys(await metadataOf(f.home, viaCaller)), {
+      principal_via: "inherited",
+      principal_id: P_ID,
+      principal_name: "Daniel Brammertz",
+      principal_from: "caller-p",
+    });
+    // the control: no caller means no spawned-by session, so rule 3 answers even with --no-parent
+    const bare = await createChild(f, ["--seat", seat, "--no-parent"]);
+    assert.deepEqual(principalKeys(await metadataOf(f.home, bare)), {
+      principal_via: "inherited",
+      principal_id: Q_ID,
+      principal_name: "Daniel Laatz",
+      principal_from: first,
+    });
+  });
+});
+
 test("O1: a first holder that answers nobody is inherited as nobody; one that predates the keys leaves NO principal_* (the walk answers) — never `none` over rule 3", async () => {
   await withMockHome(async (f) => {
     const nobody = await createChild(f); // a bare shell: records principal_via=none
