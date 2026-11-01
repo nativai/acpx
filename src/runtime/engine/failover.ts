@@ -222,26 +222,26 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 // fallback cap) rather than whole-account exhaustion — it is exactly the premise
 // FableShareExhaustedError asserts, so we must VERIFY it before raising that error.
 function unifiedUsageHealthy(usages: SubscriptionUsage[], threshold: number): boolean {
-  return usages.some(
-    (usage) =>
-      usage.error === undefined &&
-      usage.fiveHour !== null &&
-      usage.fiveHour.utilization < threshold,
-  );
+  return usages.some((usage) => unifiedWindowHealthy(usage, threshold));
+}
+
+// The binding unified window is 5h — or, on an account with NO 5h limit
+// (`noFiveHourLimit`), the 7d window, its only one.
+function unifiedWindowHealthy(usage: SubscriptionUsage, threshold: number): boolean {
+  if (usage.error !== undefined) {
+    return false;
+  }
+  const binding = usage.noFiveHourLimit === true ? usage.sevenDay : usage.fiveHour;
+  return binding !== null && binding.utilization < threshold;
 }
 
 // Evidence string for the FableShareExhaustedError message — carries the ACTUAL
 // unified figures just read (so "unified windows healthy" is backed by numbers,
 // not asserted) plus the fable-429 count.
 function fableShareEvidence(usages: SubscriptionUsage[], threshold: number): string {
-  const healthy = usages.find(
-    (usage) =>
-      usage.error === undefined &&
-      usage.fiveHour !== null &&
-      usage.fiveHour.utilization < threshold,
-  );
+  const healthy = usages.find((usage) => unifiedWindowHealthy(usage, threshold));
   const unified = healthy
-    ? `unified 5h ${pctText(healthy.fiveHour?.utilization)}/7d ${pctText(healthy.sevenDay?.utilization)} — healthy on ${healthy.id}`
+    ? `unified 5h ${healthy.noFiveHourLimit === true ? "no limit" : pctText(healthy.fiveHour?.utilization)}/7d ${pctText(healthy.sevenDay?.utilization)} — healthy on ${healthy.id}`
     : "unified maxed everywhere";
   const exhausted = usages.filter(
     (usage) => usage.fable?.available === false && usage.fable.error === undefined,

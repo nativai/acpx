@@ -373,7 +373,7 @@ function renderUsageEntryText(entry: SubscriptionUsage): string {
   const sevenReset = entry.sevenDay?.reset ? ` (resets ${entry.sevenDay.reset})` : "";
   return (
     `  ${entry.id}\t${entry.label}` +
-    `\t5h ${formatPercent(entry.fiveHour)}${fiveReset}` +
+    `\t5h ${entry.noFiveHourLimit === true ? "no limit" : formatPercent(entry.fiveHour)}${fiveReset}` +
     `\t7d ${formatPercent(entry.sevenDay)}${sevenReset}` +
     `\t${formatFable(entry)}\n`
   );

@@ -437,7 +437,7 @@ function autoPickLine(picked: SubscriptionUsage, eligible: number, fable?: Fable
   return (
     `[acpx] subscription auto → "${picked.label}" (${picked.id}) — ` +
     `7d ${formatPercent(picked.sevenDay?.utilization)}, ` +
-    `5h ${formatPercent(picked.fiveHour?.utilization)}; ` +
+    `5h ${picked.noFiveHourLimit === true ? "no limit" : formatPercent(picked.fiveHour?.utilization)}; ` +
     `${eligible} eligible [soonest-7d-reset]${fableSuffix(fable)}\n`
   );
 }
