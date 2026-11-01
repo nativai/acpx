@@ -114,6 +114,10 @@ const ALLOWED_NAME_READS: ReadonlyMap<string, { count: number; why: string }> = 
   ["cli/output/output.ts", { count: 1, why: "a function value's `name` in a log renderer" }],
   ["cli/session/agent-folders-migrate.ts", { count: 10, why: "fs Dirent names" }],
   ["session/conversation-model.ts", { count: 1, why: "a tool entry's `name`" }],
+  [
+    "session/persistence/person.ts",
+    { count: 3, why: "a people-list row's display name (C4 leg 3), not a session's name" },
+  ],
 ]);
 
 async function sourceFiles(dir: string): Promise<string[]> {
