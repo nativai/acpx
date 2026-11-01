@@ -153,7 +153,10 @@ export function registerSessionsCommand(
 
   const templatesCommand = sessionsCommand
     .command("templates")
-    .description("List saved templates for this agent (subcommands: rollback, migrate-slugs)")
+    .description(
+      "List saved templates for this agent: machine-wide ones plus your own (ACPX_PRINCIPAL_ID) " +
+        "(subcommands: rollback, migrate-slugs)",
+    )
     .action(async function (this: Command, flags: SessionsListFlags) {
       await handleSessionsTemplates(explicitAgentName, flags, this, config);
     });
@@ -161,7 +164,7 @@ export function registerSessionsCommand(
   templatesCommand
     .command("rollback")
     .description(
-      "Retract a template slug's latest version (default: soft-retract, reversible; --delete hard-removes)",
+      "Retract a template name's latest version (default: soft-retract, reversible; --delete hard-removes). The name is `reviewer` or `<handle>/<base>`",
     )
     .argument("<slug>", "Template slug to roll back", (value: string) =>
       parseNonEmptyValue("Template slug", value),
@@ -381,7 +384,10 @@ export function registerSessionsCommand(
       (value: string) => parseNonEmptyValue("Session id", value),
     )
     .option("--enable", "Mark the session as a template (also closes it); the default action")
-    .option("--disable", "Clear the template marker (leaves the session closed as-is)")
+    .option(
+      "--disable",
+      "Retract the template (soft: the record, slug and version are kept; --enable restores it)",
+    )
     .option(
       "--auto-prompt <text>",
       "Prompt auto-sent on every spawn from this template (empty string clears it). " +
@@ -389,9 +395,17 @@ export function registerSessionsCommand(
     )
     .option(
       "--slug <slug>",
-      "Template slug for --enable (canonicalized). Required for a new template: a " +
-        "session has no name to derive one from, so without it the template is slug-less " +
-        "and resolves by id only.",
+      "Template BASE name for --enable (canonicalized; '/' is refused). Required for a new " +
+        "template: a session has no name to derive one from, so without it the template is " +
+        "slug-less and resolves by id only.",
+    )
+    .option(
+      "--owner <person>",
+      "Make the template one person's (private: listed only to them, still startable by name " +
+        "with --from-template <handle>/<base>). A handle, former handle, person id or full name " +
+        "from `acpx people list`. Needs --slug, applies on the first mark only, and a different " +
+        "owner on a re-mark is an error. Absent ⇒ machine-wide.",
+      (value: string) => parseNonEmptyValue("Owner", value),
     )
     .option(
       "--kill-background-tasks",
@@ -482,7 +496,10 @@ export function registerSessionsCommand(
     .option("--no-brick", "Do not link, and do not inherit the spawning session's brick.")
     .option(
       "--from-template <id>",
-      "Instantiate from a saved template (acpx record id, ACP session id, or unique suffix). " +
+      "Instantiate from a saved template: an acpx record id, ACP session id or unique suffix; a " +
+        "machine-wide template name (`reviewer`); or a person's template (`<handle>/<base>`, e.g. " +
+        "`laatz/reviewer`; the person id form `p-…/<base>` also works). A plain name never " +
+        "matches a person's template, and an unknown person is an error, never a fallback. " +
         "Inherits the template's agent type + context; the new session is a normal open session. " +
         "Combine with --cwd to place it elsewhere and -s to name its seat.",
       (value: string) => parseNonEmptyValue("Template id", value),
