@@ -5,7 +5,7 @@
  * The rules themselves live below the CLI: the key grammar (`template-name-key.ts`), typed-name resolution
  * and the fixed-owner rule (`template-owner.ts`), attribution (`template-actor.ts`).
  */
-import { readPeopleFile } from "../session/persistence/people-file.js";
+import { readPeopleFile, reportSkippedPeopleRows } from "../session/persistence/people-file.js";
 import { isPersonId } from "../session/persistence/person.js";
 import { isVisibleTemplateKey, parseNameKey } from "../session/persistence/template-name-key.js";
 import {
@@ -82,7 +82,11 @@ export async function templateAgentName(key: string | undefined): Promise<string
   if (parsed.owner !== "person") {
     return key;
   }
-  const rows = await readPeopleFile().catch(() => []);
+  const read = await readPeopleFile().catch(() => undefined);
+  if (read !== undefined) {
+    reportSkippedPeopleRows(read);
+  }
+  const rows = read?.rows ?? [];
   const row = rows.find((candidate) => candidate.id === parsed.personId);
   return row === undefined ? key : `${row.handle}/${parsed.base}`;
 }

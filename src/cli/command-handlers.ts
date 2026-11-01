@@ -75,6 +75,7 @@ import {
 import {
   isoNow,
   isTemplateRecord,
+  listSessionIndexEntries,
   migrateTemplateSlugs,
   persistTemplateMark,
   matchesPruneSessionId,
@@ -93,7 +94,12 @@ import {
   writeSessionRecordWithLifecycle,
 } from "../session/persistence.js";
 import type { MigrateSlugsResult, TemplateRollbackResult } from "../session/persistence.js";
-import { principalEntriesOf, withRecordedPrincipal } from "../session/persistence/principal.js";
+import {
+  type PrincipalCreator,
+  principalEntriesOf,
+  withRecordedPrincipal,
+  withSeatJoinPrincipal,
+} from "../session/persistence/principal.js";
 import { templateActorFromEnv } from "../session/persistence/template-actor.js";
 import { SeatBrickReassignRequiredError, writeBrickLink } from "../session/seat-brick-write.js";
 import { decideSessionBrick } from "../session/seat-brick.js";
@@ -887,6 +893,28 @@ async function parentInheritableFields(parent: SessionRecord): Promise<ResolvedP
   };
 }
 
+/**
+ * The first holder of `seatId` as a principal creator (brick 509d3884 O1): its record id and the
+ * `principal_*` entries its index entry projects. Lowest ordinal wins; a holder that has none yet (a
+ * prepared successor) is not a candidate. `undefined` when the seat has no numbered holder. A scan over the
+ * index, run only when a session is created INTO a seat — a rare, operator-or-handover path.
+ */
+async function firstHolderOfSeat(seatId: string): Promise<PrincipalCreator | undefined> {
+  let first: { ordinal: number; creator: PrincipalCreator } | undefined;
+  for (const entry of await listSessionIndexEntries()) {
+    if (entry.seatId !== seatId || entry.holderOrdinal === undefined) {
+      continue;
+    }
+    if (first === undefined || entry.holderOrdinal < first.ordinal) {
+      first = {
+        ordinal: entry.holderOrdinal,
+        creator: { acpxRecordId: entry.acpxRecordId, principal: entry.principal ?? {} },
+      };
+    }
+  }
+  return first?.creator;
+}
+
 async function resolveAndValidateParentSessionId(
   flags: ParentFlagSource,
   options: { allowEnvFallback?: boolean } = {},
@@ -1126,6 +1154,18 @@ function inheritedSpawnSessionOptions(
   };
 }
 
+function recordPrincipal(
+  metadata: Record<string, string> | undefined,
+  params: {
+    inherit: ResolvedParentSession | undefined;
+    seatJoin?: { firstHolder?: PrincipalCreator };
+  },
+): Record<string, string> | undefined {
+  return params.seatJoin === undefined
+    ? withRecordedPrincipal(metadata, params.inherit)
+    : withSeatJoinPrincipal(metadata, params.seatJoin.firstHolder);
+}
+
 function buildSessionStartOptions(params: {
   agent: EffectiveSpawnAgent;
   flags: SessionsNewFlags;
@@ -1146,6 +1186,9 @@ function buildSessionStartOptions(params: {
   /** Brick `9984c510` — the leg `resolveBrickFlagValue` took for `resolvedBrick`,
    * when it is a string. See `SessionCreateOptions.explicitBrickFlagValidated`. */
   resolvedBrickValidated?: boolean;
+  /** Present only for a create INTO an existing seat with no `--from` (brick 509d3884 O1): the seat's first
+   * holder, whose answer the new holder copies (C8.2 rule 3) instead of the caller's or a bare shell's `none`. */
+  seatJoin?: { firstHolder: PrincipalCreator | undefined };
 }): Parameters<SessionModule["createSession"]>[0] {
   return {
     agentCommand: params.agent.agentCommand,
@@ -1180,14 +1223,15 @@ function buildSessionStartOptions(params: {
     // which has the seat row in hand — this function has no I/O and cannot
     // read it, so it cannot make that distinction itself.
     // brick b0968426 (C8.3): the principal is the CREATOR's — the spawning caller, or the old session under
-    // `--from` (a handover successor answers its seat's principal) — resolved as `params.inherit`.
-    metadata: withRecordedPrincipal(
+    // `--from` (a handover successor answers its seat's principal) — resolved as `params.inherit`. Into an
+    // existing seat with no `--from` the creator is the seat's first holder (C8.2 rule 3; brick 509d3884 O1).
+    metadata: recordPrincipal(
       withInheritedBrick(
         applyBrickFlag(params.flags.metadata, params.resolvedBrick),
         params.inherit?.brick,
         params.resolvedBrick === false,
       ),
-      params.inherit,
+      params,
     ),
     // The RAW flag, never mixed with inheritance — `resolveJoinedSeatBrickMetadata`
     // needs to tell "the operator explicitly said X" apart from "nothing was
@@ -3399,6 +3443,10 @@ async function createSessionFromNewFlags(
   if (flags.favorite === true && joining !== undefined) {
     throw new InvalidArgumentError(favoriteOnJoinMessage(joining));
   }
+  const seatJoin =
+    from === undefined && joining !== undefined
+      ? { firstHolder: await firstHolderOfSeat(joining) }
+      : undefined;
   const { value: resolvedBrick, validated: resolvedBrickValidated } = await resolveBrickFlagValue(
     flags.brick,
   );
@@ -3479,6 +3527,7 @@ async function createSessionFromNewFlags(
         from,
         resolvedBrick,
         resolvedBrickValidated,
+        seatJoin,
       }),
     ),
   );

@@ -9,7 +9,8 @@
  *                                       0 recorded (the principal may be null) · 6 not recorded · 2 unknown session
  *
  * Exit 1 is a people file that cannot be read as the C6.2 schema (never an empty list); exit 2 is a usage
- * error. The matching itself is `matchRef` in `person.ts` (byte-identical with acpx-ui).
+ * error. A single row that cannot be used is not exit 1: it is skipped and named on stderr, as atrium keeps
+ * it and serves the rest (`people-file.ts`, brick 509d3884 O4). The matching itself is `matchRef` in `person.ts` (byte-identical with acpx-ui).
  *
  * ⚠️ A NEW TOP-LEVEL VERB NEEDS TWO REGISTRATIONS: this one, and `"people"` in `TOP_LEVEL_VERBS`
  * (`src/cli-core.ts`). Without the second, `acpx people resolve laatz` is absorbed as an AGENT NAME and, in a
@@ -21,6 +22,7 @@ import {
   PeopleFileError,
   type PeopleFileRow,
   readPeopleFile,
+  reportSkippedPeopleRows,
 } from "../session/persistence/people-file.js";
 import { type MatchResult, type PersonHit, matchRef } from "../session/persistence/person.js";
 import { type RecordedPrincipal, recordedPrincipalOf } from "../session/persistence/principal.js";
@@ -72,7 +74,9 @@ async function withPeople(
   run: (rows: PeopleFileRow[]) => void | Promise<void>,
 ): Promise<void> {
   try {
-    await run(await readPeopleFile());
+    const read = await readPeopleFile();
+    reportSkippedPeopleRows(read);
+    await run(read.rows);
   } catch (error) {
     if (!(error instanceof PeopleFileError)) {
       throw error;

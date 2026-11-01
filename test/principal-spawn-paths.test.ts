@@ -387,6 +387,128 @@ test("REAL OWNER PATH: ACPX_PRINCIPAL_* reaches the agent of a person-created se
   });
 });
 
+// O1 (brick 509d3884): a session created INTO an existing seat from a bare shell, then activated. C8.2 rule 3
+// makes its creator the seat's FIRST HOLDER, so it records that holder's answer — never `none`, which beat
+// rule 3 in every reader and made the seat answer `no-creator`.
+const QX = [
+  "--metadata",
+  "principal_via=started",
+  "--metadata",
+  `principal_id=${Q_ID}`,
+  "--metadata",
+  "principal_name=Daniel Laatz",
+];
+
+async function seatOf(f: Fixture, id: string): Promise<string> {
+  const stored = JSON.parse(await fs.readFile(sessionFilePath(f.home, id), "utf8")) as {
+    seat_id?: string;
+  };
+  assert.ok(stored.seat_id, `${id} holds a seat`);
+  return stored.seat_id;
+}
+
+async function activate(f: Fixture, seat: string, successor: string): Promise<void> {
+  const result = await runCli(
+    ["--cwd", f.cwd, "--format", "json", "sessions", "activate", seat, successor, "--no-notify"],
+    f.home,
+  );
+  assert.equal(result.code, 0, result.stderr);
+}
+
+test("O1: a bare-shell `sessions new --seat` + `sessions activate` answers the FIRST HOLDER's person, not `none`; the handover's create step still answers its predecessor's", async () => {
+  await withMockHome(async (f) => {
+    const first = await createChild(f, QX);
+    const seat = await seatOf(f, first);
+    const successor = await createChild(f, ["--seat", seat]);
+    await activate(f, seat, successor);
+    const stored = JSON.parse(await fs.readFile(sessionFilePath(f.home, successor), "utf8")) as {
+      holder_ordinal?: number;
+    };
+    assert.equal(stored.holder_ordinal, 2, "the control: it really is the seat's second holder");
+    assert.deepEqual(principalKeys(await metadataOf(f.home, successor)), {
+      principal_via: "inherited",
+      principal_id: Q_ID,
+      principal_name: "Daniel Laatz",
+      principal_from: first,
+    });
+    const read = await runCli(
+      ["--format", "json", "people", "principal", "--session", successor],
+      f.home,
+    );
+    assert.equal(read.code, 0, read.stderr);
+    assert.deepEqual(JSON.parse(read.stdout), {
+      principal: { id: Q_ID, name: "Daniel Laatz" },
+      via: "inherited",
+      from: first,
+    });
+    // the control beside it: `--from` (what `sessions handover` does) copies the PREDECESSOR's answer
+    const handedOver = await createChild(f, ["--from", first]);
+    assert.deepEqual(principalKeys(await metadataOf(f.home, handedOver)), {
+      principal_via: "inherited",
+      principal_id: Q_ID,
+      principal_name: "Daniel Laatz",
+      principal_from: first,
+    });
+  });
+});
+
+test("O1: the CALLER is not the creator of a seat successor — a person's session running `sessions new --seat` records the seat's first holder (C8.2 rule 3 outranks rule 4)", async () => {
+  await withMockHome(async (f) => {
+    const first = await createChild(f, QX);
+    const seat = await seatOf(f, first);
+    await seed(f, "caller-p", P);
+    const successor = await createChild(f, ["--seat", seat], {
+      ACPX_SESSION_URL: urlOf("caller-p"),
+    });
+    assert.deepEqual(principalKeys(await metadataOf(f.home, successor)), {
+      principal_via: "inherited",
+      principal_id: Q_ID,
+      principal_name: "Daniel Laatz",
+      principal_from: first,
+    });
+  });
+});
+
+test("O1: a first holder that answers nobody is inherited as nobody; one that predates the keys leaves NO principal_* (the walk answers) — never `none` over rule 3", async () => {
+  await withMockHome(async (f) => {
+    const nobody = await createChild(f); // a bare shell: records principal_via=none
+    const nobodySeat = await seatOf(f, nobody);
+    const onNobody = await createChild(f, ["--seat", nobodySeat]);
+    assert.deepEqual(principalKeys(await metadataOf(f.home, onNobody)), {
+      principal_via: "inherited",
+      principal_from: nobody,
+    });
+
+    // a seat whose first holder records no principal (atrium's `started_by_*` create leaves it to atrium)
+    const legacy = await createChild(f, ["--metadata", "started_by_kind=system"]);
+    assert.deepEqual(
+      principalKeys(await metadataOf(f.home, legacy)),
+      {},
+      "the control: none recorded",
+    );
+    const onLegacy = await createChild(f, ["--seat", await seatOf(f, legacy)]);
+    assert.deepEqual(principalKeys(await metadataOf(f.home, onLegacy)), {});
+  });
+});
+
+test("O1: explicit principal_* metadata on a create into a seat still wins byte for byte (atrium's own create paths)", async () => {
+  await withMockHome(async (f) => {
+    const first = await createChild(f, QX);
+    const seat = await seatOf(f, first);
+    const explicit = await createChild(f, [
+      "--seat",
+      seat,
+      "--metadata",
+      "principal_via=started",
+      "--metadata",
+      `principal_id=${P_ID}`,
+      "--metadata",
+      "principal_name=Daniel Brammertz",
+    ]);
+    assert.deepEqual(principalKeys(await metadataOf(f.home, explicit)), P);
+  });
+});
+
 // A stand-in for this box's acpx-ui message route (the handover POSTs its activation notice there): answers 202.
 async function withAcpxUiStandIn(run: (origin: string) => Promise<void>): Promise<void> {
   const server = http.createServer((req, res) => {

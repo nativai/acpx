@@ -7,6 +7,7 @@ import {
   principalEnvOf,
   recordedPrincipalOf,
   withRecordedPrincipal,
+  withSeatJoinPrincipal,
 } from "../src/session/persistence/principal.js";
 
 // PERSON-CONTRACT v3.1 C8.3 / CONCEPTION §4.2: what a new session records as its principal, and what the
@@ -185,4 +186,28 @@ test("principalContextFields: null (never absent) for no principal, so a leg tha
       principalName: "Daniel Laatz",
     },
   );
+});
+
+// O1 (brick 509d3884): a create INTO an existing seat takes the seat's FIRST HOLDER as its creator (C8.2 rule 3).
+test("a create into a seat copies the first holder's answer — and with no first holder to copy, writes NOTHING, never `none`", () => {
+  const first = {
+    acpxRecordId: "first-holder",
+    principal: { principal_via: "started", principal_id: Q, principal_name: "Daniel Laatz" },
+  };
+  assert.deepEqual(withSeatJoinPrincipal({ brick: "b" }, first), {
+    brick: "b",
+    principal_via: "inherited",
+    principal_id: Q,
+    principal_name: "Daniel Laatz",
+    principal_from: "first-holder",
+  });
+  // the negative that is the bug: no first holder found, or one that predates the keys, is NOT a bare shell
+  assert.equal(withSeatJoinPrincipal(undefined, undefined), undefined);
+  assert.equal(withSeatJoinPrincipal(undefined, { acpxRecordId: "old", principal: {} }), undefined);
+  assert.deepEqual(withSeatJoinPrincipal({ brick: "b" }, undefined), { brick: "b" });
+  // explicit principal_* and atrium's started_by_* still win
+  const explicit = { principal_via: "armer" };
+  assert.equal(withSeatJoinPrincipal(explicit, first), explicit);
+  const byAtrium = { started_by_kind: "human" };
+  assert.equal(withSeatJoinPrincipal(byAtrium, first), byAtrium);
 });
