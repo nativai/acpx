@@ -39,6 +39,7 @@ import type {
   SubscriptionRegistry,
 } from "../config/subscriptions.js";
 import { SubscriptionLockedError } from "../errors.js";
+import { isPersonId } from "../session/persistence/person.js";
 import type { AcpClientOptions } from "../types.js";
 import { commandCarriesAdapterToken } from "./adapter-token.js";
 import { isClaudeFamilyAgent } from "./agent-command.js";
@@ -544,6 +545,14 @@ export type AgentSessionContext = {
    * brick CLI composes its default journal author from it (`<seat> #<ordinal> (session:<id8>)`).
    */
   seatOrdinal?: number | null;
+  /**
+   * Whom this session works for (PERSON-CONTRACT C8.6, brick b0968426): the record's `principal_id` /
+   * `principal_name`, exported as `ACPX_PRINCIPAL_ID` / `ACPX_PRINCIPAL_NAME`. Both are absent for a session
+   * with no principal — the variables are then UNSET, never empty — and `principalEnvOf` is the one place a
+   * record's metadata becomes these two fields.
+   */
+  principalId?: string | null;
+  principalName?: string | null;
 };
 
 /**
@@ -744,6 +753,11 @@ function buildAgentEnvironment(
   // eb8b1fa3 — the holder's own ordinal is session identity like the two above: an inherited value would
   // label a child's journal lines with its PARENT's holder number. Re-set below from THIS spawn's context.
   delete env.ACPX_SEAT_ORDINAL;
+  // brick b0968426 (C8.6) — whom the session works for is session identity like every variable above: a
+  // child of a long-lived owner, or of a person's session when this session has NO principal, must not carry
+  // the caller's person. Re-set below from THIS spawn's record, or stays absent (never empty).
+  delete env.ACPX_PRINCIPAL_ID;
+  delete env.ACPX_PRINCIPAL_NAME;
   // brick c2df657e — the OpenRouter sticky-routing key the seeded pi extension
   // reads (PI_ROUTING_EXTENSION_CODE). Session identity, same reasoning as
   // ACPX_SESSION_URL: a stale value would pin another session's provider cache
@@ -1066,6 +1080,15 @@ function buildAgentEnvironment(
     const trimmedParentSeat = sessionContext.parentSeatId.trim();
     if (trimmedParentSeat.length > 0) {
       env.ACPX_PARENT_SEAT_URL = `${baseUrl}/?seat=${trimmedParentSeat}`;
+    }
+  }
+  // C8.6: only a well-formed person id is exported, and the name only beside it.
+  const principalId = sessionContext?.principalId;
+  if (isPersonId(principalId)) {
+    env.ACPX_PRINCIPAL_ID = principalId;
+    const principalName = sessionContext?.principalName?.trim();
+    if (principalName) {
+      env.ACPX_PRINCIPAL_NAME = principalName;
     }
   }
   if (sessionContext && typeof sessionContext.brick === "string") {

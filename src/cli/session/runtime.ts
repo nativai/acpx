@@ -148,6 +148,7 @@ import {
   writeSessionRecordAtBoundary,
   type PersistedSessionLifecycle,
 } from "../../session/persistence.js";
+import { principalContextFields } from "../../session/persistence/principal.js";
 import { seatDisplayName } from "../../session/seat-display-name.js";
 import {
   SESSION_RECORD_SCHEMA,
@@ -3220,6 +3221,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         seatId: record.seatId ?? null,
         seatOrdinal: record.holderOrdinal ?? null,
         parentSeatId: record.parentSeatId ?? null,
+        ...principalContextFields(record.metadata),
       },
       sessionOptions,
     });
