@@ -258,6 +258,12 @@ Repo: https://github.com/openclaw/acpx
   alone (it used to read `eligibility.reason: "usage-error"`,
   `vendorAvailable: false`); text output shows `5h no limit`. A missing 5-hour
   window without the flag still means unknown. (brick 01f8824e)
+- Subscriptions: `noFiveHourLimit` is now set only when the usage probe carries
+  no `anthropic-ratelimit-unified-5h-*` header at all; an unparseable or partial
+  5-hour header set stays unknown (`usage-error`). A missing or blank `-reset`
+  header now reads as `reset: null` instead of a 1970 reset, which used to sort
+  that account first on "soonest 7-day reset" (and, for the Fable window, made
+  every gated read re-probe). (brick 770f290b)
 
 ## 2026.5.23 (v0.10.0)
 

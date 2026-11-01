@@ -619,3 +619,21 @@ test("getSubscriptionsUsage (no fable): issues NO claude-fable-5 request (cost g
     },
   );
 });
+
+// brick 770f290b R2: a MISSING 7d_oi-reset header is unknown → null. It used to
+// parse as epoch 0 (`Number(null) === 0`), so the snapshot read as "reset passed"
+// and every gated ask re-probed.
+test("200 WITHOUT a 7d_oi-reset header → reset null (not 1970), persisted as null", async () => {
+  const id = uid("noreset");
+  const outcome: ModelOutcome = { status: 200, fableUtil: 0.2, fableStatus: "allowed" };
+  await withProbeRig([{ id, outcomes: new Map([[FABLE, outcome]]) }], async (ctx) => {
+    const state = (await getSubscriptionsFableState(ctx.entries)).get(id);
+    assert.equal(state?.available, true);
+    assert.equal(state?.reset, null);
+    const snapshot = await readFableSnapshot(id);
+    assert.equal(snapshot?.resetsAt ?? null, null);
+    // The reading is fresh, so a second gated ask is served without a probe.
+    await getSubscriptionsFableState(ctx.entries);
+    assert.equal(fableHits(ctx.hits).length, 1);
+  });
+});

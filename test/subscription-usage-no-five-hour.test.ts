@@ -188,6 +188,78 @@ test("probe: a 200 with NO rate-limit headers stays an error and never carries t
   });
 });
 
+// brick 770f290b R1: the flag means NO `…-5h-*` header at all. A garbled or
+// partial 5h set is UNKNOWN, never "no limit".
+test("probe NEGATIVE: an unparseable 5h-utilization header stays usage-error (no flag)", async () => {
+  const id = uid("garbled");
+  const headers = { ...NO_5H_HEADERS, "anthropic-ratelimit-unified-5h-utilization": "n/a" };
+  await withProbeRig([{ id, headers }], async ({ entries }) => {
+    const [reading] = await getSubscriptionsUsage(entries, true);
+    assert.equal(reading?.error, undefined);
+    assert.equal(reading?.fiveHour, null);
+    assert.equal(reading?.sevenDay?.utilization, 0.09);
+    assert.equal(reading?.noFiveHourLimit, undefined);
+    assert.equal(reading?.eligibility?.reason, "usage-error");
+    assert.equal(reading?.eligibility?.vendorAvailable, false);
+  });
+});
+
+test("probe NEGATIVE: a partial 5h set (status/reset, no utilization) stays usage-error", async () => {
+  const id = uid("partial");
+  const headers = {
+    ...NO_5H_HEADERS,
+    "anthropic-ratelimit-unified-5h-status": "allowed",
+    "anthropic-ratelimit-unified-5h-reset": String(RESET_5H),
+  };
+  await withProbeRig([{ id, headers }], async ({ entries }) => {
+    const [reading] = await getSubscriptionsUsage(entries, true);
+    assert.equal(reading?.fiveHour, null);
+    assert.equal(reading?.noFiveHourLimit, undefined);
+    assert.equal(reading?.eligibility?.reason, "usage-error");
+    assert.equal(reading?.eligibility?.vendorAvailable, false);
+  });
+});
+
+// brick 770f290b R2: a missing (or blank) reset header is unknown → null, never
+// epoch 0 — which would sort the account FIRST on "soonest 7d reset".
+test("probe: a missing or blank 7d-reset header parses as reset null, not 1970", async () => {
+  const missing = uid("noreset");
+  const blank = uid("blankreset");
+  const withoutReset = { ...NO_5H_HEADERS };
+  delete withoutReset["anthropic-ratelimit-unified-7d-reset"];
+  const blankReset = { ...NO_5H_HEADERS, "anthropic-ratelimit-unified-7d-reset": "" };
+  await withProbeRig(
+    [
+      { id: missing, headers: withoutReset },
+      { id: blank, headers: blankReset },
+    ],
+    async ({ entries }) => {
+      const readings = await getSubscriptionsUsage(entries, true);
+      for (const reading of readings) {
+        assert.deepEqual(reading.sevenDay, { utilization: 0.09, reset: null }, reading.id);
+        assert.equal(reading.eligibility?.reason, null, reading.id);
+      }
+    },
+  );
+});
+
+test("pick: an account with an unknown 7d reset sorts AFTER one with a known reset", () => {
+  const known = noFiveHour("known", 0.5);
+  const unknownReset = usage({
+    id: "unknown-reset",
+    sevenDay: { utilization: 0.1, reset: null },
+    noFiveHourLimit: true,
+  });
+  const usages = [unknownReset, known];
+  assert.equal(pickFailoverTarget(usages, { exclude: new Set() })?.id, "known");
+  const exhausted = subscriptionEligibilityVerdict(
+    usage({ sevenDay: { utilization: 1, reset: null }, noFiveHourLimit: true }),
+    0.98,
+  );
+  assert.equal(exhausted.reason, "provider-exhausted");
+  assert.equal(exhausted.nextAutomationEligibleAt, undefined);
+});
+
 test("probe: the cached reading keeps the flag it was read with", async () => {
   const id = uid("cache");
   await withProbeRig([{ id, headers: NO_5H_HEADERS }], async ({ entries, hits }) => {

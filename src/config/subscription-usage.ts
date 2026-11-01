@@ -178,11 +178,19 @@ function parseWindow(headers: Headers, key: "5h" | "7d"): SubscriptionUsageWindo
   if (!Number.isFinite(util)) {
     return null;
   }
-  const resetEpochSec = Number(headers.get(`anthropic-ratelimit-unified-${key}-reset`));
-  const reset = Number.isFinite(resetEpochSec)
-    ? new Date(resetEpochSec * 1000).toISOString()
-    : null;
+  const reset = parseResetHeader(headers.get(`anthropic-ratelimit-unified-${key}-reset`));
   return { utilization: clamp01(util), reset };
+}
+
+// Epoch-seconds reset header → ISO-8601. An ABSENT or blank header is unknown →
+// null: `Number(null)` and `Number("")` are both 0, which would read as a 1970
+// reset and sort FIRST on "soonest reset".
+function parseResetHeader(raw: string | null): string | null {
+  if (raw == null || raw.trim() === "") {
+    return null;
+  }
+  const epochSec = Number(raw);
+  return Number.isFinite(epochSec) ? new Date(epochSec * 1000).toISOString() : null;
 }
 
 // The Fable-share ALLOCATION headers ride on every SUCCESSFUL haiku probe — read
@@ -214,10 +222,9 @@ function parseFableWindow(headers: Headers): {
 } {
   const utilRaw = headers.get("anthropic-ratelimit-unified-7d_oi-utilization");
   const util = utilRaw == null ? Number.NaN : Number(utilRaw);
-  const resetEpochSec = Number(headers.get("anthropic-ratelimit-unified-7d_oi-reset"));
   return {
     utilization: Number.isFinite(util) ? clamp01(util) : null,
-    reset: Number.isFinite(resetEpochSec) ? new Date(resetEpochSec * 1000).toISOString() : null,
+    reset: parseResetHeader(headers.get("anthropic-ratelimit-unified-7d_oi-reset")),
     status: headers.get("anthropic-ratelimit-unified-7d_oi-status"),
   };
 }
@@ -225,9 +232,11 @@ function parseFableWindow(headers: Headers): {
 // Did this response carry ANY unified rate-limit header? It is the discriminator
 // between the two 429 classes: a 429 WITH unified headers is real exhaustion
 // (cacheable), a BARE 429 is the request-shape gate — UNKNOWN, never exhaustion.
-function hasUnifiedRateLimitHeaders(headers: Headers): boolean {
+// With the `5h-` scope it is the noFiveHourLimit gate in usageFromResponse.
+function hasUnifiedRateLimitHeaders(headers: Headers, scope = ""): boolean {
+  const prefix = `anthropic-ratelimit-unified-${scope}`;
   for (const [name] of headers) {
-    if (name.toLowerCase().startsWith("anthropic-ratelimit-unified-")) {
+    if (name.toLowerCase().startsWith(prefix)) {
       return true;
     }
   }
@@ -258,7 +267,9 @@ function usageFromResponse(res: Response, base: SubscriptionUsage): Subscription
       sevenDay,
       fallback: parseFallback(res.headers),
     };
-    if (fiveHour === null) {
+    // "No 5h limit" = NO `…-5h-*` header at all. A present-but-unparseable or
+    // partial 5h set leaves fiveHour null WITHOUT the flag — unknown, usage-error.
+    if (fiveHour === null && !hasUnifiedRateLimitHeaders(res.headers, "5h-")) {
       usage.noFiveHourLimit = true; // sevenDay is non-null here
     }
     return usage;
