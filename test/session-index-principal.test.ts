@@ -17,6 +17,7 @@ import {
 import { writeSessionRecord } from "../src/session/persistence/repository.js";
 import type { SessionRecord } from "../src/types.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
+import { withTempHome } from "./temp-home.js";
 
 // P1-2 (TEST-PLAN): `principal_*` is projected onto the session index entry as `principal`, verbatim, on
 // BOTH index legs — the change hazard of `index.ts`: a field missing from the parse leg is stripped from every
@@ -201,48 +202,39 @@ function runReindex(homeDir: string): Promise<{ code: number | null; stderr: str
 }
 
 test("P1-2: S is untouched across three rewrites by the OTHER leg and keeps its principal in the index (the hazard itself)", async () => {
-  const home = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-index-principal-home-"));
-  const savedHome = process.env.HOME;
-  const savedState = process.env.ACPX_STATE_HOME;
-  process.env.HOME = home;
-  process.env.ACPX_STATE_HOME = home;
-  try {
-    const sessionDir = path.join(home, ".acpx", "sessions");
-    await fs.mkdir(sessionDir, { recursive: true });
-    const s = principalRecord("pr-s", PRINCIPAL);
-    const other = principalRecord(
-      "pr-other",
-      { principal_via: "none" },
-      "2026-06-02T00:00:00.000Z",
-    );
-    const fileS = await writeRecordFile(sessionDir, s);
-    await writeRecordFile(sessionDir, other);
-    await writeSessionIndex(sessionDir, await loadOrRebuildSessionIndex(sessionDir));
+  await withTempHome(
+    "acpx-index-principal-home-",
+    async (home) => {
+      const sessionDir = path.join(home, ".acpx", "sessions");
+      await fs.mkdir(sessionDir, { recursive: true });
+      const s = principalRecord("pr-s", PRINCIPAL);
+      const other = principalRecord(
+        "pr-other",
+        { principal_via: "none" },
+        "2026-06-02T00:00:00.000Z",
+      );
+      const fileS = await writeRecordFile(sessionDir, s);
+      await writeRecordFile(sessionDir, other);
+      await writeSessionIndex(sessionDir, await loadOrRebuildSessionIndex(sessionDir));
 
-    const principalOfS = async (): Promise<Record<string, string> | undefined> =>
-      (await readSessionIndex(sessionDir))?.entries.find((entry) => entry.file === fileS)
-        ?.principal;
-    assert.deepEqual(await principalOfS(), PRINCIPAL, "control: S carries it before any rewrite");
+      const principalOfS = async (): Promise<Record<string, string> | undefined> =>
+        (await readSessionIndex(sessionDir))?.entries.find((entry) => entry.file === fileS)
+          ?.principal;
+      assert.deepEqual(await principalOfS(), PRINCIPAL, "control: S carries it before any rewrite");
 
-    // rewrite 1 — the daemon's per-update leg: ANOTHER session's record is written
-    await writeSessionRecord({ ...other, lastUsedAt: "2026-06-03T00:00:00.000Z" });
-    assert.deepEqual(await principalOfS(), PRINCIPAL, "after another session's update");
+      // rewrite 1 — the daemon's per-update leg: ANOTHER session's record is written
+      await writeSessionRecord({ ...other, lastUsedAt: "2026-06-03T00:00:00.000Z" });
+      assert.deepEqual(await principalOfS(), PRINCIPAL, "after another session's update");
 
-    // rewrite 2 — a brand-new session joins and the index reconciles
-    await writeSessionRecord(principalRecord("pr-new", undefined, "2026-06-04T00:00:00.000Z"));
-    assert.deepEqual(await principalOfS(), PRINCIPAL, "after a new session was added");
+      // rewrite 2 — a brand-new session joins and the index reconciles
+      await writeSessionRecord(principalRecord("pr-new", undefined, "2026-06-04T00:00:00.000Z"));
+      assert.deepEqual(await principalOfS(), PRINCIPAL, "after a new session was added");
 
-    // rewrite 3 — `acpx sessions reindex`, the real binary
-    const reindex = await runReindex(home);
-    assert.equal(reindex.code, 0, reindex.stderr);
-    assert.deepEqual(await principalOfS(), PRINCIPAL, "after `sessions reindex`");
-  } finally {
-    process.env.HOME = savedHome;
-    if (savedState === undefined) {
-      delete process.env.ACPX_STATE_HOME;
-    } else {
-      process.env.ACPX_STATE_HOME = savedState;
-    }
-    await fs.rm(home, { recursive: true, force: true });
-  }
+      // rewrite 3 — `acpx sessions reindex`, the real binary
+      const reindex = await runReindex(home);
+      assert.equal(reindex.code, 0, reindex.stderr);
+      assert.deepEqual(await principalOfS(), PRINCIPAL, "after `sessions reindex`");
+    },
+    { pin: ["HOME", "ACPX_STATE_HOME"] },
+  );
 });
