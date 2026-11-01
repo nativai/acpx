@@ -76,6 +76,7 @@ import {
   type StatusFlags,
 } from "./flags.js";
 import { registerModelsCommand } from "./models-command.js";
+import { registerPeopleCommand } from "./people-command.js";
 import { registerProfilesCommand } from "./profiles-command.js";
 import { registerProvidersCommand } from "./providers-command.js";
 import { registerSeatsCommand } from "./seats-command.js";
@@ -1227,6 +1228,8 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
   registerProvidersCommand(program, config);
   // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS` (`"capacity"`, brick afdb5784).
   registerCapacityCommand(program, config);
+  // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS` (`"people"`, brick b0968426).
+  registerPeopleCommand(program, config);
   registerConfigCommand(program, config);
   registerFlowCommand(program, config);
 }

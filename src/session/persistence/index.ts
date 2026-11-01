@@ -13,6 +13,7 @@ import type { SessionRecord } from "../../types.js";
 import { modelSetMethodKnownUnsupported } from "../mode-preference.js";
 import { isIndexLockTimeoutError, withSessionIndexLock } from "./index-lock.js";
 import { parseSessionRecord } from "./parse.js";
+import { PRINCIPAL_METADATA_PREFIX, stringEntriesWithPrefix } from "./principal.js";
 import {
   brickFieldsToIndexEntry,
   parseBrickFieldsFromIndexEntry,
@@ -193,6 +194,16 @@ export type SessionIndexEntry = {
    * check covers index fields — `test/session-index-started-by.test.ts` does.
    */
   startedBy?: Record<string, string>;
+  /**
+   * Whose session this is (PERSON-CONTRACT C8.3): exactly the record's `metadata` entries whose key starts
+   * with {@link PRINCIPAL_METADATA_PREFIX} (`principal_via`, `principal_id`, `principal_name`,
+   * `principal_from`), keys and string values copied VERBATIM. Absent when the record has none.
+   *
+   * ⚠️ BOTH index legs carry it (`toSessionIndexEntry` + `parseIndexEntry`), exactly as `startedBy` does: a
+   * field missing from the parse leg is stripped from EVERY untouched entry on the next rewrite of any other
+   * session, with typecheck and build green. `test/session-index-principal.test.ts` is the guard.
+   */
+  principal?: Record<string, string>;
   /**
    * The DESCRIPTOR's `canSetModelLive`, REFINED by this session's own
    * advertisement (F-12). The UI's live-model control reads this, not the static
@@ -432,17 +443,12 @@ export const STARTED_BY_METADATA_PREFIX = "started_by_";
  * index file is hand-/acpx-ui-writable, so the parse leg cannot assume it).
  */
 function startedByFrom(source: unknown): Record<string, string> | undefined {
-  const entries = asRecord(source);
-  if (!entries) {
-    return undefined;
-  }
-  const picked: Record<string, string> = {};
-  for (const [key, value] of Object.entries(entries)) {
-    if (key.startsWith(STARTED_BY_METADATA_PREFIX) && typeof value === "string") {
-      picked[key] = value;
-    }
-  }
-  return Object.keys(picked).length > 0 ? picked : undefined;
+  return stringEntriesWithPrefix(source, STARTED_BY_METADATA_PREFIX);
+}
+
+/** The `principal_*` entries of `source`, verbatim, strings only — the same rule as {@link startedByFrom}. */
+function principalFrom(source: unknown): Record<string, string> | undefined {
+  return stringEntriesWithPrefix(source, PRINCIPAL_METADATA_PREFIX);
 }
 
 // eslint-disable-next-line complexity -- flat field-by-field projection of the optional hot-path enrichment scalars; linear, not branchy logic
@@ -510,6 +516,8 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     lastTurnNativeFinishReason: optionalString(record.lastTurnNativeFinishReason),
     lastTurnProviderAt: optionalString(record.lastTurnProviderAt),
     startedBy: startedByFrom(record.startedBy),
+    // BOTH index legs: the projection leg is `toSessionIndexEntry`'s `principalFrom(metadata)`.
+    principal: principalFrom(record.principal),
     canSetModelLive:
       typeof record.canSetModelLive === "boolean" ? record.canSetModelLive : undefined,
     // brick ebfe4c3c: BOTH index legs. Miss these and the next rewrite of ANY
@@ -687,6 +695,8 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     lastTurnProviderAt: acpx?.last_turn_provider?.at,
     // BOTH index legs: the parse leg is `parseIndexEntry`'s `startedBy`.
     startedBy: startedByFrom(metadata),
+    // BOTH index legs: the parse leg is `parseIndexEntry`'s `principal`.
+    principal: principalFrom(metadata),
     outputStyleDesired: sessionOptions?.output_style,
     canSetModelLive: canSetModelLiveFromRecord(record),
     resolvedModelLabel: resolvedModelLabelForRecord(record),

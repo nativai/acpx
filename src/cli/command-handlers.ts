@@ -93,6 +93,7 @@ import {
   writeSessionRecordWithLifecycle,
 } from "../session/persistence.js";
 import type { MigrateSlugsResult, TemplateRollbackResult } from "../session/persistence.js";
+import { principalEntriesOf, withRecordedPrincipal } from "../session/persistence/principal.js";
 import { SeatBrickReassignRequiredError, writeBrickLink } from "../session/seat-brick-write.js";
 import { decideSessionBrick } from "../session/seat-brick.js";
 import { seatDisplayName, seatNameFromStore } from "../session/seat-display-name.js";
@@ -845,6 +846,11 @@ type ResolvedParentSession = {
    * the settled truth and the live layer can be mid-flight (design #33).
    */
   outputStyle?: string;
+  /**
+   * The parent's `principal_*` metadata (brick b0968426): `{}` for a local record that predates the keys,
+   * absent for a cross-box parent whose record is not here. Read only by `withRecordedPrincipal`.
+   */
+  principal?: Record<string, string>;
 };
 
 // Snapshot the parent record's inheritable fields. Agent-type + model + effort
@@ -867,6 +873,7 @@ async function parentInheritableFields(parent: SessionRecord): Promise<ResolvedP
     modelSource: sessionOptions?.model_source,
     effort: parent.acpx?.desired_config_options?.effort,
     outputStyle: sessionOptions?.output_style,
+    principal: principalEntriesOf(parent.metadata) ?? {},
   };
 }
 
@@ -1162,10 +1169,15 @@ function buildSessionStartOptions(params: {
     // `createSessionRecordWithClient` (`resolveJoinedSeatBrickMetadata`),
     // which has the seat row in hand — this function has no I/O and cannot
     // read it, so it cannot make that distinction itself.
-    metadata: withInheritedBrick(
-      applyBrickFlag(params.flags.metadata, params.resolvedBrick),
-      params.inherit?.brick,
-      params.resolvedBrick === false,
+    // brick b0968426 (C8.3): the principal is the CREATOR's — the spawning caller, or the old session under
+    // `--from` (a handover successor answers its seat's principal) — resolved as `params.inherit`.
+    metadata: withRecordedPrincipal(
+      withInheritedBrick(
+        applyBrickFlag(params.flags.metadata, params.resolvedBrick),
+        params.inherit?.brick,
+        params.resolvedBrick === false,
+      ),
+      params.inherit,
     ),
     // The RAW flag, never mixed with inheritance — `resolveJoinedSeatBrickMetadata`
     // needs to tell "the operator explicitly said X" apart from "nothing was
@@ -3689,13 +3701,18 @@ async function runSessionCopy(
       // metadata.brick carry: precedence = --brick flag > spawn-parent brick (--parent-id / byway)
       // > none. A plain fork/copy carries NO brick by default (the 07-15 source.metadata.brick
       // fallback was reversed, brick://1113da9d) so it does not impersonate the source's brick.
-      metadata: withInheritedBrick(
-        applyBrickFlag(
-          copyMetadata(flags, source, forkAtMessageIndex, forkAtLogIndex),
-          resolvedBrick,
+      // brick b0968426 (C8.3, G2): the copy's principal is its MAKER's — `caller` — and never the SOURCE's;
+      // `source` is deliberately not an argument of `withRecordedPrincipal`.
+      metadata: withRecordedPrincipal(
+        withInheritedBrick(
+          applyBrickFlag(
+            copyMetadata(flags, source, forkAtMessageIndex, forkAtLogIndex),
+            resolvedBrick,
+          ),
+          caller?.brick, // spawn-parent brick (byway via --parent-id) — KEEP; the CALLER's under --no-parent
+          resolvedBrick === false,
         ),
-        caller?.brick, // spawn-parent brick (byway via --parent-id) — KEEP; the CALLER's under --no-parent
-        resolvedBrick === false,
+        caller,
       ),
       // Brick `9984c510` — this path has no `explicitBrickFlag` (it exists only
       // for the `--seat` JOIN comparison, which fork/copy can never reach —
