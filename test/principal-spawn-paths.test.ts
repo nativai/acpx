@@ -450,3 +450,44 @@ test("sessions handover (the real verb): the successor answers its seat's princi
     });
   });
 });
+
+test("no verb rewrites a recorded principal: sessions set-metadata refuses principal_* and leaves the record unchanged (C8.3, G1)", async () => {
+  await withMockHome(async (f) => {
+    await seed(f, "rec-wo", Q);
+    const before = await fs.readFile(sessionFilePath(f.home, "rec-wo"), "utf8");
+    for (const [key, value] of [
+      ["principal_id", P_ID],
+      ["principal_name", "Daniel Brammertz"],
+      ["principal_via", "none"],
+      ["principal_x", "anything"],
+    ]) {
+      const result = await runCli(
+        ["--cwd", f.cwd, "codex", "sessions", "set-metadata", "--session-id", "rec-wo", key, value],
+        f.home,
+      );
+      assert.equal(result.code, 2, `${key}: ${result.stderr}`);
+      assert.match(result.stderr, /recorded once/u, key);
+    }
+    assert.equal(await fs.readFile(sessionFilePath(f.home, "rec-wo"), "utf8"), before);
+
+    // positive control: the same verb writes an ordinary key, and the principal is untouched
+    const ok = await runCli(
+      [
+        "--cwd",
+        f.cwd,
+        "codex",
+        "sessions",
+        "set-metadata",
+        "--session-id",
+        "rec-wo",
+        "note",
+        "hello",
+      ],
+      f.home,
+    );
+    assert.equal(ok.code, 0, ok.stderr);
+    const metadata = await metadataOf(f.home, "rec-wo");
+    assert.equal(metadata.note, "hello");
+    assert.deepEqual(principalKeys(metadata), Q);
+  });
+});
