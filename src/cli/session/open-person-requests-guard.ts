@@ -4,6 +4,7 @@ import {
 } from "../../acp/acpx-ui-internal-origin.js";
 import type { OutputFormat, SessionRecord } from "../../types.js";
 import { emitJsonResult } from "../output/json-output.js";
+import { callerIsAgent } from "./byway-close-guard.js";
 
 /**
  * `sessions close`'s open-person-request guard (brick 2587d30e, addressing v3 §8.3 / K18 P6).
@@ -30,11 +31,23 @@ import { emitJsonResult } from "../output/json-output.js";
  * `--verbose`; the second is the live store's own answer (nothing open). Keep them apart.
  *
  * `unreachable` (connection refused, timeout, a 5xx, a body that is not the rows shape): acpx
- * cannot know. The close PROCEEDS with a warning on stderr — a close must never be blocked by an
- * atrium that is down (it is what a wrap-up runs against, and on a box with no atrium there is
- * nothing to ask), and atrium's own seat-close hook still closes any rows when it is back.
+ * cannot know. The close PROCEEDS, said on stderr only under `--verbose` — a close must never be
+ * blocked by an atrium that is down (it is what a wrap-up runs against, and on a box with no
+ * atrium there is nothing to ask), and atrium's own seat-close hook still closes any rows, visibly
+ * as `session-closed`, when it is back. ⚠️ NOT a default warning: every agent-run close on a box
+ * or a test rig without a reachable atrium would carry it, and fleet wrap-ups parse the close's
+ * stderr (`2>&1 | tail -1`); `test/background-task-close-gate.test.ts` asserts that stderr exactly.
  *
  * ## Where it does NOT fire
+ *
+ * It guards an AGENT's close only — detected exactly as the byway guard detects it
+ * (`callerIsAgent`: any of the identity variables acpx sets on every agent it runs, which atrium
+ * strips before it spawns acpx). The silent loss this exists for is an agent (an orchestrator
+ * closing its children, a session closing itself) dropping a person's request unseen; a PERSON's
+ * close — atrium's UI close delegation, a human at a terminal — is deliberate, and the seat-close
+ * hook closes the rows visibly as `session-closed`. So a non-agent caller is never asked and
+ * never warned. ⚠️ A self-close by an agent IS guarded (unlike the byway guard's exemption): an
+ * agent that closes itself with a request open must resolve it or say `--force`.
  *
  * It is evaluated by the HANDLER, never inside `closeSession()`, so acpx's own internal closes
  * (template enable, handover) are untouched. And it asks only about a session whose close would
@@ -180,28 +193,16 @@ export function decideOnOpenPersonRequests(
   sessionId: string,
   read: OpenPersonRequestsRead,
 ): OpenPersonRequestsDecision {
-  switch (read.kind) {
-    case "answered":
-      return read.open.length === 0
-        ? { proceed: true }
-        : { proceed: false, message: openRequestsMessage(sessionId, read.open), open: read.open };
-    case "route-absent":
-      return {
-        proceed: true,
-        note: {
-          text: `this atrium has no person-messages route; ${sessionId} closes without an open-request check`,
-          verboseOnly: true,
-        },
-      };
-    case "unreachable":
-      return {
-        proceed: true,
-        note: {
-          text: `could not check ${sessionId} for open requests to people (${read.reason}); closing without that check`,
-          verboseOnly: false,
-        },
-      };
+  if (read.kind === "answered") {
+    return read.open.length === 0
+      ? { proceed: true }
+      : { proceed: false, message: openRequestsMessage(sessionId, read.open), open: read.open };
   }
+  const text =
+    read.kind === "route-absent"
+      ? `this atrium has no person-messages route; ${sessionId} closes without an open-request check`
+      : `could not check ${sessionId} for open requests to people (${read.reason}); closing without that check`;
+  return { proceed: true, note: { text, verboseOnly: true } };
 }
 
 function emitNote(
@@ -251,13 +252,11 @@ export async function refuseCloseOverOpenPersonRequests(params: {
   fetchImpl?: OpenPersonRequestsFetch;
 }): Promise<boolean> {
   const { record, format } = params;
-  if (params.force === true || !closeWouldCloseRows(record)) {
+  const env = params.env ?? process.env;
+  if (params.force === true || !callerIsAgent(env) || !closeWouldCloseRows(record)) {
     return false;
   }
-  const origin = resolveAtriumLocalOrigin(
-    params.env ?? process.env,
-    readAcpxUiInternalOriginSources(),
-  );
+  const origin = resolveAtriumLocalOrigin(env, readAcpxUiInternalOriginSources());
   const read = await readOpenPersonRequests(origin, record.acpxRecordId, params.fetchImpl);
   const decision = decideOnOpenPersonRequests(record.acpxRecordId, read);
   if (decision.proceed) {
