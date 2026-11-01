@@ -7712,8 +7712,9 @@ test("create ops emit the acpx-ui URL on stderr banner + JSON without changing s
 
 // enable marks + closes, the marker SURVIVES a re-read (guards the
 // privileged-writer requirement — a plain write would read-preserve it away),
-// lists under `templates`, and `--disable` clears it while leaving it closed.
-test("sessions template --enable marks + closes and survives a re-read; --disable clears", async () => {
+// lists under `templates`, and `--disable` retracts it SOFTLY (TEMPLATES CONCEPTION K10: the block is
+// kept with enabled:false so `--enable` restores it) while leaving it closed.
+test("sessions template --enable marks + closes and survives a re-read; --disable retracts softly", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     await fs.mkdir(cwd, { recursive: true });
@@ -7767,8 +7768,9 @@ test("sessions template --enable marks + closes and survives a re-read; --disabl
     assert.equal(disabled.code, 0, disabled.stderr);
     const storedAfter = JSON.parse(
       await fs.readFile(sessionFilePath(homeDir, "to-template"), "utf8"),
-    ) as { template?: unknown; closed?: unknown };
-    assert.equal(storedAfter.template, undefined, "marker cleared");
+    ) as { template?: { enabled?: unknown; created_at?: unknown }; closed?: unknown };
+    assert.equal(storedAfter.template?.enabled, false, "marker retracted, not erased");
+    assert.equal(typeof storedAfter.template?.created_at, "string", "the block is kept (K10)");
     assert.equal(storedAfter.closed, true, "disable does not reopen");
 
     const listedAfter = await runCli(

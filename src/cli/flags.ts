@@ -174,6 +174,10 @@ export type SessionsTemplateFlags = {
   // default slug = slugify(name). The refresh skill passes this when the target
   // slug differs from slugify(the candidate's name).
   slug?: string;
+  // Owner of a NEW template: a person reference the people resolver accepts (handle, former handle, id or
+  // full name). Applies on the first mark only; a different owner on a re-mark is an error. Absent ⇒
+  // machine-wide, or the owner the record already has.
+  owner?: string;
   // brick ad6ba1c2 (Contract C3) — mark it even though it has live background tasks; they are killed.
   killBackgroundTasks?: boolean;
 };

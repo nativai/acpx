@@ -94,6 +94,7 @@ import {
 } from "../session/persistence.js";
 import type { MigrateSlugsResult, TemplateRollbackResult } from "../session/persistence.js";
 import { principalEntriesOf, withRecordedPrincipal } from "../session/persistence/principal.js";
+import { templateActorFromEnv } from "../session/persistence/template-actor.js";
 import { SeatBrickReassignRequiredError, writeBrickLink } from "../session/seat-brick-write.js";
 import { decideSessionBrick } from "../session/seat-brick.js";
 import { seatDisplayName, seatNameFromStore } from "../session/seat-display-name.js";
@@ -195,6 +196,14 @@ import {
   skippedFromOptionsNote,
   withFromOptions,
 } from "./session/sessions-new-from.js";
+import {
+  resolveMarkOwner,
+  resolveRollbackKey,
+  softRetract,
+  templateAgentName,
+  templateBlockResultFields,
+  visibleTemplateRecords,
+} from "./template-owner-support.js";
 
 type SessionModule = typeof import("../session/session.js");
 type OutputModule = typeof import("./output/output.js");
@@ -3791,7 +3800,10 @@ export async function handleSessionsTemplates(
     loadOutputRenderModule(),
   ]);
   const sessions = await listSessionsForAgent(agent.agentCommand, agent.agentName);
-  printSessionsByFormat(sessions.filter(isTemplateRecord), globalFlags.format);
+  printSessionsByFormat(
+    visibleTemplateRecords(sessions.filter(isTemplateRecord)),
+    globalFlags.format,
+  );
 }
 
 // Mark a session as a template: terminate any live owner first so the template is a
@@ -3814,6 +3826,29 @@ function resolveMarkAutoPrompt(
   return record.template?.auto_prompt;
 }
 
+// The block a mark writes, rebuilt from named fields: whatever is not listed here is GONE after the
+// first re-mark (the field-by-field leg every new template field must be added to).
+function rebuiltTemplateBlock(
+  record: SessionRecord,
+  flags: SessionsTemplateFlags,
+): NonNullable<SessionRecord["template"]> {
+  const existing = record.template ?? {};
+  return {
+    enabled: true,
+    created_at: existing.created_at ?? isoNow(),
+    source_session_id: existing.source_session_id ?? record.acpSessionId,
+    auto_prompt: resolveMarkAutoPrompt(flags, record),
+    // Carry existing slug/version forward (like created_at/source above) so an
+    // idempotent re-enable is detected by persistTemplateMark and does NOT bump
+    // the version. persistTemplateMark fills/overrides these next.
+    slug: existing.slug,
+    version: existing.version,
+    // The actors travel like slug/version; persistTemplateMark decides who they name.
+    created_actor: existing.created_actor,
+    updated_actor: existing.updated_actor,
+  };
+}
+
 async function markSessionAsTemplate(
   sessionId: string,
   flags: SessionsTemplateFlags,
@@ -3832,17 +3867,7 @@ async function markSessionAsTemplate(
     checkBackgroundTasks: flags.killBackgroundTasks !== true,
   });
   const record = await resolveSessionRecord(sessionId);
-  record.template = {
-    enabled: true,
-    created_at: record.template?.created_at ?? isoNow(),
-    source_session_id: record.template?.source_session_id ?? record.acpSessionId,
-    auto_prompt: resolveMarkAutoPrompt(flags, record),
-    // Carry existing slug/version forward (like created_at/source above) so an
-    // idempotent re-enable is detected by persistTemplateMark and does NOT bump
-    // the version. persistTemplateMark fills/overrides these next.
-    slug: record.template?.slug,
-    version: record.template?.version,
-  };
+  record.template = rebuiltTemplateBlock(record, flags);
   record.closed = true;
   record.closedAt = record.closedAt ?? isoNow();
   return {
@@ -3853,11 +3878,12 @@ async function markSessionAsTemplate(
   };
 }
 
-// Clear the template marker. Disable un-templates only — leave closed/closedAt as-is
+// Retract the template marker SOFTLY (K10): the block keeps its slug, version and actors and only
+// `enabled` turns false, so `--enable` brings the same version back. Leaves closed/closedAt as-is
 // (disabling does not reopen a session). Idempotent on a non-template record.
 async function unmarkSessionTemplate(sessionId: string): Promise<SessionRecord> {
   const record = await resolveSessionRecord(sessionId);
-  record.template = undefined;
+  softRetract(record, templateActorFromEnv());
   return record;
 }
 
@@ -3889,13 +3915,15 @@ export async function handleSessionsTemplate(
     // writeSessionRecord here; it would read-preserve the on-disk template/closed
     // and drop the clear.
     await writeSessionRecordWithLifecycle(record);
-    printTemplateResult(record, enable, globalFlags.format);
+    await printTemplateResult(record, enable, globalFlags.format);
     return;
   }
 
   // brick ad6ba1c2 (Contract C3) — marking a template CLOSES the session: the same gate, before
   // anything is touched.
   const gateRecord = await resolveSessionRecord(sessionId);
+  // --owner and the fixed-owner rule are settled BEFORE the close: a refusal must leave the session open.
+  const ownerId = await resolveMarkOwner(flags, gateRecord.template?.slug);
   const { refusal, gate, answer } = await evaluateBackgroundTaskGate({
     record: gateRecord,
     killBackgroundTasks: flags.killBackgroundTasks,
@@ -3924,8 +3952,12 @@ export async function handleSessionsTemplate(
   const { record, reap, ownerStopped, lateTasks } = marked;
   // Assigns slug (default slugify(name), overridable via --slug) + version =
   // max+1 for the slug group, under the index lock (E6), then PRIVILEGED-writes.
-  await persistTemplateMark(record, { slug: flags.slug });
-  printTemplateResult(
+  await persistTemplateMark(record, {
+    slug: flags.slug,
+    owner: ownerId,
+    actor: templateActorFromEnv(),
+  });
+  await printTemplateResult(
     record,
     enable,
     globalFlags.format,
@@ -3935,37 +3967,38 @@ export async function handleSessionsTemplate(
   warnUncheckedBackgroundTasks(record.acpxRecordId, answer);
 }
 
-function templateResultHumanLine(record: SessionRecord, enable: boolean): string {
+function templateResultHumanLine(
+  record: SessionRecord,
+  enable: boolean,
+  agentName: string | undefined,
+): string {
   if (!enable) {
     return "disabled";
   }
   const autoPromptNote = record.template?.auto_prompt ? " (auto-prompt set)" : "";
-  const slug = record.template?.slug;
-  const slugNote = slug !== undefined ? ` [${slug} v${record.template?.version ?? "?"}]` : "";
+  const slugNote =
+    agentName !== undefined ? ` [${agentName} v${record.template?.version ?? "?"}]` : "";
   return `enabled (closed)${slugNote}${autoPromptNote}`;
 }
 
-function printTemplateResult(
+async function printTemplateResult(
   record: SessionRecord,
   enable: boolean,
   format: OutputFormat,
   backgroundTasks?: BackgroundTasksJson,
-): void {
+): Promise<void> {
+  const agentName = await templateAgentName(record.template?.slug);
   const result = {
     action: enable ? ("template_enabled" as const) : ("template_disabled" as const),
     acpxRecordId: record.acpxRecordId,
     template: enable,
     closed: record.closed === true,
-    created_at: record.template?.created_at,
-    source_session_id: record.template?.source_session_id,
-    auto_prompt: record.template?.auto_prompt,
-    slug: record.template?.slug,
-    version: record.template?.version,
+    ...templateBlockResultFields(record.template, agentName),
     ...backgroundTasksField(backgroundTasks),
   };
   if (!emitJsonResult(format, result)) {
     process.stdout.write(
-      `template ${record.acpxRecordId}: ${templateResultHumanLine(record, enable)}\n`,
+      `template ${record.acpxRecordId}: ${templateResultHumanLine(record, enable, agentName)}\n`,
     );
   }
 }
@@ -4255,7 +4288,7 @@ export async function handleSessionsTemplatesRollback(
   const globalFlags = resolveGlobalFlags(command, config);
   let result: TemplateRollbackResult;
   try {
-    result = await rollbackTemplateSlug(slug, { delete: flags.delete });
+    result = await rollbackTemplateSlug(await resolveRollbackKey(slug), { delete: flags.delete });
   } catch (error) {
     // ⚠️ THIS TYPE ONLY — see the same catch in handleSessionsPrune. Before this
     // there was no try/catch here at all, so a manifest-write failure reached

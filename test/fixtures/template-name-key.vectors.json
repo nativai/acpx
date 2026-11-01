@@ -1,0 +1,96 @@
+{
+  "_comment": "Shared vectors for the template name-key grammar (TEMPLATES CONCEPTION 4608e926 \u00a74.1). acpx: src/session/persistence/template-name-key.ts; acpx-ui mirror: server/templateNameKey.ts. Both repos run THIS file through parseNameKey and pin its sha256 (TEMPLATE_NAME_KEY_FIXTURE_SHA256). Any change is a contract change: edit both copies to the same bytes and update both digests.",
+  "machine": [
+    "reviewer",
+    "intaker",
+    "tmpl-wave-child-relay",
+    "a",
+    "a1-b2",
+    "9",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  ],
+  "person": [
+    {
+      "key": "p-fb566154c0bf245b7538/reviewer",
+      "personId": "p-fb566154c0bf245b7538",
+      "base": "reviewer"
+    },
+    {
+      "key": "p-fb566154c0bf245b7538/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "personId": "p-fb566154c0bf245b7538",
+      "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "key": "p-0123456789abcdef0123/a",
+      "personId": "p-0123456789abcdef0123",
+      "base": "a"
+    }
+  ],
+  "invalid": [
+    "",
+    "/",
+    "/reviewer",
+    "p-fb566154c0bf245b7538/",
+    "p-fb566154c0bf245b7538/reviewer/x",
+    "a/b/c",
+    "!!bad/reviewer",
+    "laatz/reviewer",
+    "P-fb566154c0bf245b7538/reviewer",
+    "p-FB566154C0BF245B7538/reviewer",
+    "p-fb566154c0bf245b75380/reviewer",
+    "p-fb566154c0bf245b753/reviewer",
+    "p-fb566154c0bf245b7538/Reviewer",
+    "p-fb566154c0bf245b7538/re viewer",
+    "p-fb566154c0bf245b7538/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "Reviewer",
+    "-reviewer",
+    "reviewer-",
+    "re--viewer",
+    "re_viewer",
+    " reviewer",
+    "reviewer\n",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  ],
+  "visibility": [
+    {
+      "key": "reviewer",
+      "person": "p-fb566154c0bf245b7538",
+      "visible": true
+    },
+    {
+      "key": "reviewer",
+      "person": null,
+      "visible": true
+    },
+    {
+      "key": null,
+      "person": "p-fb566154c0bf245b7538",
+      "visible": true
+    },
+    {
+      "key": "p-fb566154c0bf245b7538/reviewer",
+      "person": "p-fb566154c0bf245b7538",
+      "visible": true
+    },
+    {
+      "key": "p-fb566154c0bf245b7538/reviewer",
+      "person": null,
+      "visible": false
+    },
+    {
+      "key": "p-0123456789abcdef0123/reviewer",
+      "person": "p-fb566154c0bf245b7538",
+      "visible": false
+    },
+    {
+      "key": "!!bad/reviewer",
+      "person": "p-fb566154c0bf245b7538",
+      "visible": false
+    },
+    {
+      "key": "Weird Name",
+      "person": "p-fb566154c0bf245b7538",
+      "visible": false
+    }
+  ]
+}

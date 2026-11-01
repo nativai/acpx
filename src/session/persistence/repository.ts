@@ -9,7 +9,12 @@ import {
 } from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { SpawnLedger, openSpawnLedgerForRecord, type DiskRecord } from "../../spawn-ledger.js";
-import type { SessionAcpxState, SessionMessage, SessionRecord } from "../../types.js";
+import type {
+  PersistedActor,
+  SessionAcpxState,
+  SessionMessage,
+  SessionRecord,
+} from "../../types.js";
 import {
   isArchivedFileCorrupt,
   readArchivedFileVerified,
@@ -52,7 +57,13 @@ import { withRecordFileLock } from "./record-file-lock.js";
 import { copySeatHolderFields, copySeatLinkageFields } from "./seat-fields.js";
 import { findHolderlessSeats, reapHolderlessSeats } from "./seat-holderless.js";
 import { serializeSessionRecordForDisk } from "./serialize.js";
-import { pickLatestTemplate, slugify, type TemplateOrderKey } from "./template-slug.js";
+import {
+  canonicalMarkBase,
+  isQualifiedTemplateName,
+  planMarkKey,
+  resolveQualifiedTemplateKey,
+} from "./template-owner.js";
+import { pickLatestTemplate, type TemplateOrderKey } from "./template-slug.js";
 
 export const DEFAULT_HISTORY_LIMIT = 20;
 
@@ -1515,6 +1526,9 @@ export type TemplateSelectorResult = {
  * hex+dash UUID suffix can't match, so the clash is theoretical.
  */
 export async function resolveTemplateSelector(arg: string): Promise<TemplateSelectorResult> {
+  if (isQualifiedTemplateName(arg)) {
+    return await resolveQualifiedTemplateSelector(arg);
+  }
   try {
     const record = await resolveSessionRecord(arg);
     return { record, selectorKind: "id" };
@@ -1542,25 +1556,24 @@ export async function resolveTemplateSelector(arg: string): Promise<TemplateSele
   throw new SessionNotFoundError(`no template matches '${arg}' (tried session id, then slug)`);
 }
 
-// Canonicalize the slug to store at mark-time: an explicit `--slug` is run
-// through slugify (idempotent on an already-canonical value) and must be
-// non-empty. Without one ⇒ undefined: the mark leaves slug/version unset and the
-// record groups/resolves by id (graceful — same as a UI-created slug-less
-// template). A session has no name to derive a default from (D-IDENTITY).
-function resolveMarkSlug(
-  record: SessionRecord,
-  explicitSlug: string | undefined,
-): string | undefined {
-  if (explicitSlug !== undefined) {
-    const slug = slugify(explicitSlug);
-    if (slug === undefined) {
-      throw new SessionResolutionError(
-        `--slug '${explicitSlug}' has no [a-z0-9] characters; provide a non-empty slug`,
-      );
-    }
-    return slug;
+/**
+ * `--from-template <ref>/<base>` (TEMPLATES CONCEPTION §6.1): the stored key is `<person-id>/<base>`, found
+ * by exact equality, latest enabled version wins. Ids never contain `/`, so the id leg is SKIPPED, and
+ * ⚠️ NOTHING HERE FALLS BACK — a qualified name that names nobody, or nobody's template, throws; it is
+ * never answered by the plain `<base>` (that would be a hijack in reverse) or by an id. The answer does
+ * not depend on who asks: no principal is read.
+ */
+async function resolveQualifiedTemplateSelector(arg: string): Promise<TemplateSelectorResult> {
+  const key = await resolveQualifiedTemplateKey(arg);
+  const winner = pickLatestTemplate(
+    await enabledTemplateEntriesForSlug(key),
+    indexEntryTemplateOrderKey,
+  );
+  const record = winner ? await loadRecordFromIndexEntry(winner) : undefined;
+  if (!record) {
+    throw new SessionNotFoundError(`no template matches '${arg}'`);
   }
-  return undefined;
+  return { record, selectorKind: "slug" };
 }
 
 // An index entry counts toward a slug's version-max when it IS or WAS a template
@@ -1604,21 +1617,55 @@ function markVersionForSlug(
  * re-entrant, so the privileged write's own immediate index update runs inline.
  * `record.template` must already carry the enabled/created_at/source/auto_prompt
  * block (built by the caller); this only adds slug/version then writes.
+ *
+ * `slug` is a BASE (`--slug`, canonicalized here; a `/` is refused). `owner` is a person id the caller
+ * resolved. The stored key is composed by `planMarkKey`, which also enforces "a template's owner is fixed".
+ * `actor` attributes the write (`template-actor.ts`). A NEW version (a key this record did not carry)
+ * starts with `created_actor` = the actor, or none when the writer is unnamed (the carried one named the
+ * previous version). A re-mark under the same key and version keeps `created_actor`. `updated_actor` is set
+ * only when an actor is given — an unnamed writer never erases a recorded one.
  */
 export async function persistTemplateMark(
   record: SessionRecord,
-  options: { slug?: string } = {},
+  options: { slug?: string; owner?: string; actor?: PersistedActor } = {},
 ): Promise<void> {
   await ensureSessionDir();
   await withSessionIndexLock(sessionBaseDir(), async () => {
-    const slug = resolveMarkSlug(record, options.slug);
-    if (slug !== undefined && record.template) {
-      const version = markVersionForSlug(record, slug, await loadSessionIndexEntries());
-      record.template.slug = slug;
-      record.template.version = version;
+    const base = options.slug === undefined ? undefined : canonicalMarkBase(options.slug);
+    const key = planMarkKey(record.template?.slug, options.owner, base);
+    if (key !== undefined && record.template) {
+      assignMarkKeyAndVersion(record, record.template, key, await loadSessionIndexEntries());
     }
+    stampTemplateActor(record.template, options.actor);
     await writeSessionRecordWithLifecycle(record);
   });
+}
+
+// A key this record did not carry is a NEW version: it starts with no `created_actor` (the carried one
+// named the previous version) and `stampTemplateActor` fills it from the writer.
+function assignMarkKeyAndVersion(
+  record: SessionRecord,
+  template: NonNullable<SessionRecord["template"]>,
+  key: string,
+  entries: SessionIndexEntry[],
+): void {
+  const sameVersion = template.slug === key && typeof template.version === "number";
+  template.version = markVersionForSlug(record, key, entries);
+  template.slug = key;
+  if (!sameVersion) {
+    template.created_actor = undefined;
+  }
+}
+
+function stampTemplateActor(
+  template: SessionRecord["template"],
+  actor: PersistedActor | undefined,
+): void {
+  if (template === undefined || actor === undefined) {
+    return;
+  }
+  template.created_actor ??= actor;
+  template.updated_actor = actor;
 }
 
 export type TemplateRollbackOutcome = "soft-retract" | "delete" | "noop";
