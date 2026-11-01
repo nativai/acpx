@@ -1,0 +1,158 @@
+{
+  "about": "ONE fixture, byte-identical in acpx-ui and acpx (P0, brick 7c69df5c). Sources: PERSON-CONTRACT v3.1 C1.6 (ids) and CONCEPTION section 5.2 (handles). Both repos pin this file by sha256 in their person tests; change it only with the programme lead, in both repos at once.",
+  "recipe_note": "issuer and subject are the exact strings hashed: sha256(issuer + LF + subject), first 20 hex, prefixed p-. N2 is V2 joined by CR LF, so its issuer ends in CR; N3 is V2 with a trailing LF, so its subject ends in LF.",
+  "ids": [
+    {
+      "label": "V1",
+      "how": "positive",
+      "issuer": "C=DE,O=NativAI,CN=nativai.de mTLS CA",
+      "subject": "C=DE,O=NativAI,CN=Daniel Brammertz",
+      "id": "p-9df6e3afab610ff30d1a",
+      "sha256": "9df6e3afab610ff30d1a5e1825d41c76cfec696de1d1acd92265a4eced271ff4"
+    },
+    {
+      "label": "V2",
+      "how": "positive",
+      "issuer": "C=DE,O=NativAI,CN=konsiq-dev-ca",
+      "subject": "C=DE,O=NativAI,CN=Daniel Laatz",
+      "id": "p-fb566154c0bf245b7538",
+      "sha256": "fb566154c0bf245b753852547cbeaa3e5fced9930339e4dcc183fc40ff2d7f83"
+    },
+    {
+      "label": "V3",
+      "how": "positive: literal backslashes, as OpenSSL RFC 2253 writes non-ASCII",
+      "issuer": "C=DE,O=NativAI,CN=nativai.de mTLS CA",
+      "subject": "C=DE,O=NativAI,CN=J\\C3\\BCrgen M\\C3\\BCller-\\C5\\81\\C3\\B3d\\C5\\BA",
+      "id": "p-cb72b9ef849cac8723cb",
+      "sha256": "cb72b9ef849cac8723cb359b7450fe21fff4e3389a0ed8c5e9d0752e50a9e864"
+    },
+    {
+      "label": "N1",
+      "how": "negative: V2 with issuer and subject swapped",
+      "issuer": "C=DE,O=NativAI,CN=Daniel Laatz",
+      "subject": "C=DE,O=NativAI,CN=konsiq-dev-ca",
+      "id": "p-482dc2f510c67eef32f0"
+    },
+    {
+      "label": "N2",
+      "how": "negative: V2 joined by CR LF (the issuer ends in CR)",
+      "issuer": "C=DE,O=NativAI,CN=konsiq-dev-ca\r",
+      "subject": "C=DE,O=NativAI,CN=Daniel Laatz",
+      "id": "p-230813b5190c13d06ea8"
+    },
+    {
+      "label": "N3",
+      "how": "negative: V2 with a trailing LF",
+      "issuer": "C=DE,O=NativAI,CN=konsiq-dev-ca",
+      "subject": "C=DE,O=NativAI,CN=Daniel Laatz\n",
+      "id": "p-cd0f4ad9047f7f9b47a2"
+    },
+    {
+      "label": "N4",
+      "how": "negative: V2 in the legacy /C=DE/O=... form",
+      "issuer": "/C=DE/O=NativAI/CN=konsiq-dev-ca",
+      "subject": "/C=DE/O=NativAI/CN=Daniel Laatz",
+      "id": "p-24a61ebf78cf8f018b46"
+    },
+    {
+      "label": "N5",
+      "how": "negative: V2 in certificate order (Go's form)",
+      "issuer": "CN=konsiq-dev-ca,O=NativAI,C=DE",
+      "subject": "CN=Daniel Laatz,O=NativAI,C=DE",
+      "id": "p-3c316f7eb3710280931e"
+    },
+    {
+      "label": "N6",
+      "how": "negative: V2's subject under V1's issuer (another person)",
+      "issuer": "C=DE,O=NativAI,CN=nativai.de mTLS CA",
+      "subject": "C=DE,O=NativAI,CN=Daniel Laatz",
+      "id": "p-85ab0b45a5ad7e9e06c3"
+    },
+    {
+      "label": "N7",
+      "how": "negative: V2 with a space after each comma",
+      "issuer": "C=DE, O=NativAI, CN=konsiq-dev-ca",
+      "subject": "C=DE, O=NativAI, CN=Daniel Laatz",
+      "id": "p-61a9aa7410516922385d"
+    }
+  ],
+  "not_ids": {
+    "label": "N8",
+    "how": "negative: well-formed lookalikes a reader rejects; it never pads, case-folds or prefix-matches",
+    "values": ["p_fb566154c0bf245b7538", "P-FB566154C0BF245B7538", "p-fb566154c0"]
+  },
+  "handles": [
+    {
+      "name": "Daniel Brammertz",
+      "issuer": "C=DE,O=NativAI,CN=nativai.de mTLS CA",
+      "subject": "C=DE,O=NativAI,CN=Daniel Brammertz",
+      "id": "p-9df6e3afab610ff30d1a",
+      "taken": ["laatz"],
+      "expect": "brammertz"
+    },
+    {
+      "name": "Daniel Laatz",
+      "issuer": "C=DE,O=NativAI,CN=konsiq-dev-ca",
+      "subject": "C=DE,O=NativAI,CN=Daniel Laatz",
+      "id": "p-fb566154c0bf245b7538",
+      "taken": ["brammertz"],
+      "expect": "laatz"
+    },
+    {
+      "name": "Daniel Laatz",
+      "issuer": "C=DE,O=NativAI,CN=konsiq-dev-ca-2",
+      "subject": "C=DE,O=NativAI,CN=Daniel Laatz",
+      "id": "p-ef0c194fea60134d04ad",
+      "taken": ["laatz", "brammertz"],
+      "expect": "daniel-laatz"
+    },
+    {
+      "name": "Prod Smoke",
+      "issuer": "C=DE,O=NativAI,CN=nativai.de mTLS CA",
+      "subject": "C=DE,O=NativAI,CN=Prod Smoke",
+      "id": "p-e1a4546e638ec6265282",
+      "taken": [],
+      "expect": "smoke"
+    },
+    {
+      "name": "dev-client",
+      "issuer": "C=DE,O=Labidio,CN=labidio-dev-ca",
+      "subject": "C=DE,O=Labidio,CN=dev-client",
+      "id": "p-b5389e5d0556c9d1acba",
+      "taken": [],
+      "expect": "dev-client"
+    },
+    {
+      "name": "konsiq-validation@konsiq",
+      "issuer": "C=DE,O=NativAI,CN=konsiq-dev-ca",
+      "subject": "C=DE,O=NativAI,CN=konsiq-validation@konsiq",
+      "id": "p-3e4c20c2b19a8ec10a81",
+      "taken": [],
+      "expect": "konsiq-validation"
+    },
+    {
+      "name": "Jürgen Müller-Łódź",
+      "issuer": "C=DE,O=NativAI,CN=nativai.de mTLS CA",
+      "subject": "C=DE,O=NativAI,CN=J\\C3\\BCrgen M\\C3\\BCller-\\C5\\81\\C3\\B3d\\C5\\BA",
+      "id": "p-cb72b9ef849cac8723cb",
+      "taken": [],
+      "expect": "muller-lodz"
+    },
+    {
+      "name": "Box",
+      "issuer": "C=DE,O=NativAI,CN=nativai.de mTLS CA",
+      "subject": "C=DE,O=NativAI,CN=Box",
+      "id": "p-89418a32bc9c4a3d6f0b",
+      "taken": [],
+      "expect": "box-2"
+    },
+    {
+      "name": "王伟",
+      "issuer": "C=DE,O=NativAI,CN=nativai.de mTLS CA",
+      "subject": "C=DE,O=NativAI,CN=\\E7\\8E\\8B\\E4\\BC\\9F",
+      "id": "p-fea0b5ff142df2c62605",
+      "taken": [],
+      "expect": "person-fea0b5"
+    }
+  ]
+}
