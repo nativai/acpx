@@ -127,6 +127,14 @@ export function inheritedPrincipalEntries(
   return entries;
 }
 
+/** Explicit `principal_*` keys, or `started_by_*` (atrium creating for someone): the principal is not acpx's to write. */
+function carriesPrincipalOrStarter(childMetadata: Record<string, string> | undefined): boolean {
+  return (
+    principalEntriesOf(childMetadata) !== undefined ||
+    stringEntriesWithPrefix(childMetadata, STARTED_BY_PREFIX) !== undefined
+  );
+}
+
 /**
  * The metadata a new session is created with, once its principal is recorded (C8.3, CONCEPTION §4.2).
  * Precedence: explicit `principal_*` keys win (atrium's own create paths pass them); then the creator's
@@ -143,16 +151,38 @@ export function withRecordedPrincipal(
   childMetadata: Record<string, string> | undefined,
   creator: PrincipalCreator | undefined,
 ): Record<string, string> | undefined {
-  if (
-    principalEntriesOf(childMetadata) !== undefined ||
-    stringEntriesWithPrefix(childMetadata, STARTED_BY_PREFIX) !== undefined
-  ) {
+  if (carriesPrincipalOrStarter(childMetadata)) {
     return childMetadata;
   }
   if (creator === undefined) {
     return { ...childMetadata, [VIA_KEY]: "none" };
   }
   const inherited = inheritedPrincipalEntries(creator);
+  return inherited === undefined ? childMetadata : { ...childMetadata, ...inherited };
+}
+
+/**
+ * {@link withRecordedPrincipal} for a session created INTO an existing seat with no `--from`
+ * (`sessions new --seat <seat>`), brick 509d3884 O1. C8.2 rule 3: a seat successor's creator is the
+ * seat's FIRST HOLDER — unless rule 2 applies first: a create that records `spawned_by_session_id`
+ * (`--no-parent` from a caller) answers that caller and never reaches this function (X-1) (`firstHolder`), so the writing rule (C8.3, "evaluate C8.2 for the new session, one
+ * hop") copies that holder's answer, exactly as a handover copies its predecessor's.
+ *
+ * ⚠️ NEVER `principal_via=none` HERE, AND NEVER THE CALLER'S. A bare-shell create used to record `none`
+ * because no creator was found, and the recorded `none` then beat rule 3 in every reader: the seat answered
+ * `no-creator` instead of its first holder's person. The caller is not the creator of a seat successor
+ * either (rule 3 outranks the spawn parent, rule 4). With no first holder to copy from (a seat whose first
+ * holder predates the keys, or is not found) nothing is written and the walk answers, as for any creator
+ * that records no `principal_via`. `test/principal-spawn-paths.test.ts` holds the committed negatives.
+ */
+export function withSeatJoinPrincipal(
+  childMetadata: Record<string, string> | undefined,
+  firstHolder: PrincipalCreator | undefined,
+): Record<string, string> | undefined {
+  if (carriesPrincipalOrStarter(childMetadata) || firstHolder === undefined) {
+    return childMetadata;
+  }
+  const inherited = inheritedPrincipalEntries(firstHolder);
   return inherited === undefined ? childMetadata : { ...childMetadata, ...inherited };
 }
 

@@ -11,10 +11,16 @@
  * ⚠️ A QUALIFIED NAME NEVER FALLS BACK — not to the id leg, not to the plain `<base>`, not to "nobody".
  * Every failure below throws, so `nosuch/reviewer` can never quietly spawn machine-wide `reviewer`, and an
  * unreadable people list can never read as "no such person" (C6.3). The handle form reads `people.json`
- * through `readPeopleFile`, which returns `[]` ONLY for an absent file and throws for any other failure.
+ * through `readPeopleFile`, which returns no rows ONLY for an absent file and throws for any other failure
+ * of the document; a row it cannot use is skipped and named on stderr, not a failure (brick 509d3884, O4).
  */
 import { SessionResolutionError } from "../../errors.js";
-import { type PeopleFileRow, PeopleFileError, readPeopleFile } from "./people-file.js";
+import {
+  type PeopleFileRow,
+  PeopleFileError,
+  readPeopleFile,
+  reportSkippedPeopleRows,
+} from "./people-file.js";
 import { type MatchResult, type PersonHit, isPersonId, matchRef } from "./person.js";
 import { parseNameKey, personNameKey } from "./template-name-key.js";
 import { slugify } from "./template-slug.js";
@@ -41,7 +47,9 @@ function failureMessage(ref: string, where: string, failure: OwnerFailure): stri
 
 async function readPeopleOrThrow(ref: string): Promise<PeopleFileRow[]> {
   try {
-    return await readPeopleFile();
+    const read = await readPeopleFile();
+    reportSkippedPeopleRows(read);
+    return read.rows;
   } catch (error) {
     if (error instanceof PeopleFileError) {
       throw new SessionResolutionError(

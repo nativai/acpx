@@ -252,6 +252,64 @@ test("a people.json truncated by one byte is exit 1 with the parse error — nev
   });
 });
 
+// O4 (brick 509d3884): the people file as atrium leaves it after a same-uid hand edit — one foreign row
+// keyed by a non-id between two valid people. Atrium keeps the row and serves the rest; so does acpx.
+test("a people.json with ONE foreign row lists the valid rows, names the skipped one and exits 0; an unparseable file still exits 1 (O4)", async () => {
+  await withTempHome("acpx-people-cli-", async (home) => {
+    const { brammertz, laatz } = await konsiqPair();
+    const document = JSON.stringify({
+      v: 1,
+      people: {
+        [brammertz.id]: brammertz,
+        "p-zz-not-an-id": { note: "a foreign row, no id" },
+        [laatz.id]: laatz,
+      },
+    });
+    const file = await seedPeople(home, document);
+
+    const text = await runCli(["people", "list"], home);
+    assert.equal(text.code, 0, text.stderr);
+    assert.deepEqual(
+      text.stdout
+        .trimEnd()
+        .split("\n")
+        .map((line) => line.split(/\s+/u)[0]),
+      ["brammertz", "laatz"],
+      "both valid rows are listed, in file order",
+    );
+    assert.ok(text.stderr.includes('"p-zz-not-an-id"'), `the skipped row is named: ${text.stderr}`);
+    assert.ok(text.stderr.includes(file), "the warning names the file");
+    assert.doesNotMatch(text.stdout, /p-zz-not-an-id/u, "the skipped row is not listed");
+
+    const json = await runCli(["--format", "json", "people", "list"], home);
+    assert.equal(json.code, 0, json.stderr);
+    assert.deepEqual(
+      (JSON.parse(json.stdout) as Array<{ id: string }>).map((row) => row.id),
+      [brammertz.id, laatz.id],
+      "stdout stays a clean JSON array of the valid rows",
+    );
+    assert.match(json.stderr, /p-zz-not-an-id/u);
+
+    const resolved = await runCli(["people", "resolve", "laatz"], home);
+    assert.equal(resolved.code, 0, resolved.stderr);
+    assert.match(resolved.stdout, new RegExp(laatz.id, "u"));
+    assert.match(resolved.stderr, /p-zz-not-an-id/u);
+
+    assert.equal(await fs.readFile(file, "utf8"), document, "the verb never repairs the file");
+
+    // the negatives beside it: the same file made unparseable, and a clean file with nothing to name
+    await fs.writeFile(file, document.slice(0, -1), "utf8");
+    const broken = await runCli(["people", "list"], home);
+    assert.equal(broken.code, 1);
+    assert.equal(broken.stdout, "");
+    assert.match(broken.stderr, /not valid JSON/u);
+    await fs.writeFile(file, peopleDocument([brammertz, laatz]), "utf8");
+    const clean = await runCli(["people", "list"], home);
+    assert.equal(clean.code, 0);
+    assert.equal(clean.stderr, "", "a clean file says nothing");
+  });
+});
+
 test("ACPX_PEOPLE_FILE overrides the path (C6.1); the state-root file is then not consulted", async () => {
   await withKonsiq(async (home) => {
     const { laatz } = await konsiqPair();
