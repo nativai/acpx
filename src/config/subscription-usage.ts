@@ -105,6 +105,10 @@ export type SubscriptionUsage = {
   lockedBy?: string;
   fiveHour: SubscriptionUsageWindow | null;
   sevenDay: SubscriptionUsageWindow | null;
+  /** The account has NO 5-hour limit: a successful reading carried the unified 7d
+   *  window but no 5h window (Anthropic's 5h-limit removal). Set ONLY by
+   *  usageFromResponse. `fiveHour: null` WITHOUT this flag still means UNKNOWN. */
+  noFiveHourLimit?: true;
   /** Present only when this subscription's probe failed; windows are null then. */
   error?: string;
   /** Resolved from the registry account policy (or legacy compatibility fallback). */
@@ -248,7 +252,16 @@ function usageFromResponse(res: Response, base: SubscriptionUsage): Subscription
   const fiveHour = parseWindow(res.headers, "5h");
   const sevenDay = parseWindow(res.headers, "7d");
   if (fiveHour || sevenDay) {
-    return { ...base, fiveHour, sevenDay, fallback: parseFallback(res.headers) };
+    const usage: SubscriptionUsage = {
+      ...base,
+      fiveHour,
+      sevenDay,
+      fallback: parseFallback(res.headers),
+    };
+    if (fiveHour === null) {
+      usage.noFiveHourLimit = true; // sevenDay is non-null here
+    }
+    return usage;
   }
   if (!res.ok) {
     return { ...base, error: `HTTP ${res.status}` };
@@ -790,6 +803,7 @@ type AccountUsageProjection = {
   accountLabel: string;
   fiveHour: SubscriptionUsageWindow | null;
   sevenDay: SubscriptionUsageWindow | null;
+  noFiveHourLimit: boolean;
   fetchedAt?: string;
   cacheStatus?: "fresh" | "cached";
   locked: boolean;
@@ -836,12 +850,29 @@ function assignProjectionLock(
   }
 }
 
+// The account has no 5h limit only when NO alias read a 5h window and EVERY
+// successful alias carried the flag — an alias reading `fiveHour: null` without
+// it is UNKNOWN, and aggregation must never promote that to "no limit".
+function accountHasNoFiveHourLimit(
+  usages: readonly SubscriptionUsage[],
+  fiveHour: SubscriptionUsageWindow | null,
+): boolean {
+  const successful = usages.filter((usage) => usage.error === undefined);
+  return (
+    fiveHour === null &&
+    successful.length > 0 &&
+    successful.every((usage) => usage.noFiveHourLimit === true)
+  );
+}
+
 function accountUsageProjection(usages: readonly SubscriptionUsage[]): AccountUsageProjection {
   const lockedUsage = usages.find((usage) => usage.locked === true);
+  const fiveHour = aggregateAccountWindow(usages, "fiveHour");
   const projection: AccountUsageProjection = {
     accountLabel: accountUsageLabel(usages),
-    fiveHour: aggregateAccountWindow(usages, "fiveHour"),
+    fiveHour,
     sevenDay: aggregateAccountWindow(usages, "sevenDay"),
+    noFiveHourLimit: accountHasNoFiveHourLimit(usages, fiveHour),
     locked: false,
   };
   assignProjectionFreshness(projection, usages);
@@ -861,6 +892,10 @@ function applyAccountUsageProjection(
     ...(projection.fetchedAt !== undefined ? { fetchedAt: projection.fetchedAt } : {}),
     ...(projection.cacheStatus !== undefined ? { cacheStatus: projection.cacheStatus } : {}),
   };
+  delete projected.noFiveHourLimit;
+  if (projection.noFiveHourLimit) {
+    projected.noFiveHourLimit = true;
+  }
   delete projected.locked;
   delete projected.lockedAt;
   delete projected.lockedBy;
@@ -1050,8 +1085,13 @@ function providerExhausted(usage: SubscriptionUsage): boolean {
   return (usage.fiveHour?.utilization ?? 0) >= 1 || (usage.sevenDay?.utilization ?? 0) >= 1;
 }
 
+// A null 5h window is usable ONLY with the probe's noFiveHourLimit flag (and a
+// 7d window to judge by); without it, null still means unknown → usage-error.
 function telemetryUsable(usage: SubscriptionUsage): boolean {
-  return usage.error === undefined && usage.fiveHour !== null;
+  if (usage.error !== undefined) {
+    return false;
+  }
+  return usage.fiveHour !== null || (usage.noFiveHourLimit === true && usage.sevenDay !== null);
 }
 
 function weeklyCeilingReached(usage: SubscriptionUsage, ceiling: number): boolean {
@@ -1350,8 +1390,10 @@ export function subscriptionRanksStrictlyBetter(
  *
  * Eligibility gate (all must hold):
  *   - not in `options.exclude`, not user-locked, no probe error
- *   - has 5h headroom: fiveHour !== null && fiveHour.utilization < threshold
- *     (fiveHour === null = header absent on non-errored probe → conservatively ineligible)
+ *   - has 5h headroom: fiveHour !== null && fiveHour.utilization < threshold, or
+ *     `noFiveHourLimit` (the probe saw a 7d window and no 5h window — the account
+ *     has no 5h limit, so the 7d checks alone decide). A fiveHour === null WITHOUT
+ *     the flag = unknown → conservatively ineligible (usage-error).
  *
  * Selection order among eligible (deterministic; picks the first):
  *   1. Soonest sevenDay.reset (null/unparseable → +Infinity, sorted last)

@@ -251,6 +251,13 @@ Repo: https://github.com/openclaw/acpx
   on `process.exit()`), and a self-close makes its second index attempt before
   terminating its own owner. `sessions close` still exits 0; the record stays
   authoritative. (brick 19ee17ab)
+- Subscriptions: a Claude account without a 5-hour limit is no longer treated as
+  unusable telemetry. When a successful usage probe carries the unified 7-day
+  window but no 5-hour window, `SubscriptionUsage` sets `noFiveHourLimit: true`
+  and the account is eligible for failover and auto-selection on its 7-day window
+  alone (it used to read `eligibility.reason: "usage-error"`,
+  `vendorAvailable: false`); text output shows `5h no limit`. A missing 5-hour
+  window without the flag still means unknown. (brick 01f8824e)
 
 ## 2026.5.23 (v0.10.0)
 

@@ -27,6 +27,7 @@ function startMockMessages(
   fableByToken: Map<string, FableOutcome>,
   unifiedByToken: Map<string, number>,
   hits: ProbeHit[],
+  noFiveHourTokens: ReadonlySet<string> = new Set(),
 ): Promise<{ server: Server; url: string }> {
   return new Promise((resolve) => {
     const server = createServer((req, res) => {
@@ -58,10 +59,14 @@ function startMockMessages(
         }
         // Haiku unified usage probe. Default 0.1 (healthy → eligible failover
         // target); a high value models a genuinely 5h-maxed account.
+        // A no-5h token models an account switched off the 5-hour limit: the 7d
+        // window only, no 5h-* headers (brick 01f8824e CONTRACT.md evidence).
         const util = String(unifiedByToken.get(token) ?? 0.1);
         res
           .writeHead(200, {
-            "anthropic-ratelimit-unified-5h-utilization": util,
+            ...(noFiveHourTokens.has(token)
+              ? {}
+              : { "anthropic-ratelimit-unified-5h-utilization": util }),
             "anthropic-ratelimit-unified-7d-utilization": util,
           })
           .end("{}");
@@ -78,7 +83,7 @@ function startMockMessages(
 let rigCounter = 0;
 
 async function withRig(
-  subs: Array<{ id: string; fable: FableOutcome; unified?: number }>,
+  subs: Array<{ id: string; fable: FableOutcome; unified?: number; noFiveHour?: true }>,
   defaultId: string,
   run: (ctx: {
     homeDir: string;
@@ -96,6 +101,7 @@ async function withRig(
   const tokenOf = (id: string) => `tok-${rigCounter}-${id}`;
   const fableByToken = new Map<string, FableOutcome>();
   const unifiedByToken = new Map<string, number>();
+  const noFiveHourTokens = new Set<string>();
   const hits: ProbeHit[] = [];
   try {
     for (const sub of subs) {
@@ -107,6 +113,9 @@ async function withRig(
       fableByToken.set(tokenOf(sub.id), sub.fable);
       if (sub.unified !== undefined) {
         unifiedByToken.set(tokenOf(sub.id), sub.unified);
+      }
+      if (sub.noFiveHour) {
+        noFiveHourTokens.add(tokenOf(sub.id));
       }
     }
     await fs.writeFile(
@@ -124,7 +133,12 @@ async function withRig(
         })),
       }),
     );
-    const { server, url } = await startMockMessages(fableByToken, unifiedByToken, hits);
+    const { server, url } = await startMockMessages(
+      fableByToken,
+      unifiedByToken,
+      hits,
+      noFiveHourTokens,
+    );
     const prevEnv = {
       CLAUDE_MESSAGES_ENDPOINT: process.env.CLAUDE_MESSAGES_ENDPOINT,
       HOME: process.env.HOME,
@@ -368,6 +382,88 @@ test("discrimination (b): all fable-429 + unified ALSO maxed ⇒ generic exhaust
         },
       );
       assert.equal(turns, 0, "nothing eligible → no thrash");
+    },
+  );
+});
+
+// brick 01f8824e: an account with NO 5-hour limit (7d headers only) can still
+// serve non-Fable traffic, so it counts as unified-healthy on its 7d window.
+test("no-5h: all fable-429 + no-5h accounts with 7d headroom ⇒ FableShareExhaustedError", async () => {
+  await withRig(
+    [
+      { id: "a", fable: "exhausted", unified: 0.25, noFiveHour: true },
+      { id: "b", fable: "exhausted", unified: 0.08, noFiveHour: true },
+    ],
+    "a",
+    async ({ homeDir, registryPath }) => {
+      const record = sessionRecord("a", FABLE);
+      await assert.rejects(
+        () =>
+          attemptFailoverAndRetry<string>({
+            record,
+            triggerError: rateLimitError("a"),
+            loadOpts: { homeDir, registryPath },
+            runTurn: async () => "should-not-run",
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof FableShareExhaustedError);
+          assert.match(err.message, /unified 5h no limit\/7d 25% — healthy on a/);
+          return true;
+        },
+      );
+    },
+  );
+});
+
+test("no-5h: a no-5h account at 7d 99% is NOT unified-healthy ⇒ generic exhaustion", async () => {
+  await withRig(
+    [
+      { id: "a", fable: "exhausted", unified: 0.99, noFiveHour: true },
+      { id: "b", fable: "exhausted", unified: 0.99, noFiveHour: true },
+    ],
+    "a",
+    async ({ homeDir, registryPath }) => {
+      const record = sessionRecord("a", FABLE);
+      await assert.rejects(
+        () =>
+          attemptFailoverAndRetry<string>({
+            record,
+            triggerError: rateLimitError("a"),
+            loadOpts: { homeDir, registryPath },
+            runTurn: async () => "should-not-run",
+          }),
+        (err: unknown) => {
+          assert.ok(!(err instanceof FableShareExhaustedError));
+          assert.ok(err instanceof AllSubscriptionsExhaustedError);
+          return true;
+        },
+      );
+    },
+  );
+});
+
+test("no-5h: a non-Fable rate_limit fails over ONTO a no-5h account", async () => {
+  await withRig(
+    [
+      { id: "a", fable: "exhausted", unified: 0.99 },
+      { id: "b", fable: "exhausted", unified: 0.2, noFiveHour: true },
+    ],
+    "a",
+    async ({ homeDir, registryPath }) => {
+      const record = sessionRecord("a", "opus");
+      let turns = 0;
+      const out = await attemptFailoverAndRetry<string>({
+        record,
+        triggerError: rateLimitError("a"),
+        loadOpts: { homeDir, registryPath },
+        runTurn: async () => {
+          turns += 1;
+          return "200-OK";
+        },
+      });
+      assert.equal(out.result, "200-OK");
+      assert.equal(out.switchedTo, "b");
+      assert.equal(turns, 1);
     },
   );
 });
