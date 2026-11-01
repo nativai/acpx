@@ -72,7 +72,8 @@ export function recordedPrincipalOf(metadata: unknown): RecordedPrincipal | null
   }
   return {
     via,
-    id: nonEmpty(entries[ID_KEY]),
+    // The id is NOT trimmed: C1.1 admits no padding and no trailing LF, so `p-…\n` is not a person id.
+    id: entries[ID_KEY] === "" ? null : (entries[ID_KEY] ?? null),
     name: nonEmpty(entries[NAME_KEY]),
     from: nonEmpty(entries[FROM_KEY]),
   };

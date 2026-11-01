@@ -1083,8 +1083,8 @@ function buildAgentEnvironment(
     }
   }
   // C8.6: only a well-formed person id is exported, and the name only beside it.
-  const principalId = sessionContext?.principalId?.trim();
-  if (principalId && isPersonId(principalId)) {
+  const principalId = sessionContext?.principalId;
+  if (isPersonId(principalId)) {
     env.ACPX_PRINCIPAL_ID = principalId;
     const principalName = sessionContext?.principalName?.trim();
     if (principalName) {
