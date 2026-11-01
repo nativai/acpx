@@ -200,7 +200,7 @@ test("a NEW key starts a new version with its own creator, never the previous ve
 function onDisk(template: Record<string, unknown>): unknown {
   const record = serializeSessionRecordForDisk(
     makeSessionRecord({ acpxRecordId: "r", acpSessionId: "r", agentCommand: "a", cwd: "/tmp/x" }),
-  ) as Record<string, unknown>;
+  );
   return { ...record, template };
 }
 
