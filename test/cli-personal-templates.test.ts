@@ -720,6 +720,81 @@ test("--disable keeps the block, slug, version and actors; --enable restores the
   });
 });
 
+// TPL-R5n (§11.5 #5, negative): the actors on disk carry a SENTINEL — a kind this acpx has never heard of, with
+// unknown snake_case fields, nested — and the FULL stored record is compared, not just the two actor keys.
+// Scope: the sentinel sits INSIDE the actors, which parse keeps whole. An unknown key at the record level or
+// directly in the template block is NOT kept by acpx (parseTemplateState and the record parser are whitelists), so
+// it is deliberately not a sentinel here.
+const SENTINEL_ACTOR = {
+  kind: "robot",
+  sentinel_field: { nested_key: [1, "é", null, { deep_key: true }], other_key: "x" },
+};
+
+async function readRecord(homeDir: string, id: string): Promise<Record<string, unknown>> {
+  return JSON.parse(await fs.readFile(sessionFilePath(homeDir, id), "utf8")) as Record<
+    string,
+    unknown
+  >;
+}
+
+test("TPL-R5n: a sentinel actor survives an unnamed re-mark, --disable and --enable, and the FULL record is unchanged but for enabled", async () => {
+  await withTempHome("acpx-t1-r5n-", async (homeDir) => {
+    await writeConfig(homeDir);
+    await seedCandidate(homeDir, "cand-1");
+    await mark(homeDir, "cand-1", ["--enable", "--slug", "reviewer", "--auto-prompt", "review it"]);
+
+    // a record written by a writer with a richer actor: put the sentinel on disk in both actor slots
+    const file = sessionFilePath(homeDir, "cand-1");
+    const seeded = await readRecord(homeDir, "cand-1");
+    seeded.template = {
+      ...(seeded.template as Record<string, unknown>),
+      created_actor: SENTINEL_ACTOR,
+      updated_actor: SENTINEL_ACTOR,
+    };
+    await fs.writeFile(file, `${JSON.stringify(seeded)}\n`, "utf8");
+    const before = await readRecord(homeDir, "cand-1");
+    const actorsText = (record: Record<string, unknown>): string => {
+      const template = record.template as Record<string, unknown>;
+      return JSON.stringify([template.created_actor, template.updated_actor]);
+    };
+    assert.equal(
+      actorsText(before),
+      JSON.stringify([SENTINEL_ACTOR, SENTINEL_ACTOR]),
+      "the seed holds the sentinel",
+    );
+
+    // `closed_at` is the one field a lifecycle write restamps on a closed record; every other key is compared.
+    const stable = (record: Record<string, unknown>): Record<string, unknown> => {
+      const { closed_at: _restamped, ...rest } = record;
+      return rest;
+    };
+    const expected = (enabled: boolean): Record<string, unknown> =>
+      stable({
+        ...before,
+        template: { ...(before.template as Record<string, unknown>), enabled },
+      });
+    const step = async (label: string, args: string[], enabled: boolean): Promise<void> => {
+      const result = await runCli(
+        ["--format", "json", "claude", "sessions", "template", "cand-1", ...args],
+        homeDir,
+      );
+      assert.equal(result.code, 0, `${label}: ${out(result)}`);
+      const after = await readRecord(homeDir, "cand-1");
+      assert.deepEqual(stable(after), expected(enabled), `${label}: the full record is unchanged`);
+      assert.equal(
+        actorsText(after),
+        JSON.stringify([SENTINEL_ACTOR, SENTINEL_ACTOR]),
+        `${label}: the sentinel actors are byte-identical, key order included`,
+      );
+    };
+
+    await step("unnamed re-mark", ["--enable", "--slug", "reviewer"], true);
+    await step("--disable", ["--disable"], false);
+    await step("--enable", ["--enable"], true);
+    await step("unnamed re-mark again", ["--enable", "--slug", "reviewer"], true);
+  });
+});
+
 test("--disable on a session that was never a template changes nothing (no block is invented)", async () => {
   await withTempHome("acpx-t1-soft-none-", async (homeDir) => {
     await writeConfig(homeDir);
