@@ -24,6 +24,7 @@ export {
   isoNow,
   listSessionIndexEntries,
   listSessions,
+  listUnlistedRecordFiles,
   listSessionsForAgent,
   loadSessionRecordBodyFromIndexEntry,
   listSubagentsForSession,

@@ -208,6 +208,57 @@ export async function listSessionIndexEntries(): Promise<SessionIndexEntry[]> {
   return await loadSessionIndexEntries();
 }
 
+/** A session-record file the reader could not turn into a record, and why — see `listUnlistedRecordFiles`. */
+export type UnlistedRecordFile = { file: string; reason: string };
+
+// A record file is `<id>.json`; the dir also holds dotted sidecars (`<id>.delivery.json`) that are NOT records and never
+// get an index entry, so only this positive shape can be called "a record that went missing".
+const RECORD_FILE_SHAPE = /^[^.]+\.json$/;
+
+function describeRejectedRecord(raw: unknown): string {
+  const metadata = (raw as { metadata?: unknown } | null)?.metadata;
+  if (typeof metadata === "object" && metadata !== null && !Array.isArray(metadata)) {
+    for (const [key, value] of Object.entries(metadata)) {
+      if (typeof value !== "string") {
+        return `metadata.${key} is ${value === null ? "null" : typeof value}, not a string (metadata is Record<string,string> only)`;
+      }
+    }
+  }
+  return "the session-record reader rejected it";
+}
+
+/**
+ * The record files the store holds that the listing does NOT show, each with the reason.
+ *
+ * ⚠️ WHY THIS EXISTS (brick 929670fc, REG-2). `parseSessionRecord` returns null for a record with ONE
+ * non-string `metadata` value, `readIndexEntryFromDisk` then gives the file no index entry, and every listing
+ * is built from entries — so the whole record vanished from `sessions list --local` with no trace anywhere. A
+ * reader that drops what it cannot read must at least SAY so. Listing still succeeds (one bad record must not hide
+ * the rest of the store), so the report is the listing's to make, not a thrown error.
+ */
+export async function listUnlistedRecordFiles(): Promise<UnlistedRecordFile[]> {
+  await ensureSessionDir();
+  await flushPendingSessionIndexUpdates(sessionBaseDir());
+  const index = await loadOrRebuildSessionIndex(sessionBaseDir());
+  const indexed = new Set(index.entries.map((entry) => entry.file));
+  const unlisted: UnlistedRecordFile[] = [];
+  for (const file of index.files) {
+    if (!RECORD_FILE_SHAPE.test(file) || indexed.has(file)) {
+      continue;
+    }
+    try {
+      const raw: unknown = JSON.parse(await fs.readFile(path.join(sessionBaseDir(), file), "utf8"));
+      unlisted.push({ file, reason: describeRejectedRecord(raw) });
+    } catch (error) {
+      unlisted.push({
+        file,
+        reason: `unreadable: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  }
+  return unlisted;
+}
+
 function matchesAgentIdentity(
   session: Pick<SessionIndexEntry, "agentCommand" | "agentName">,
   agentCommand: string,

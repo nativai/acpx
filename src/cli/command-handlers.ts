@@ -1620,11 +1620,10 @@ async function printLocalSessionsList(
   filterCwd: string | undefined,
   format: OutputFormat,
   includeByways: boolean,
+  jsonStrict: boolean,
 ): Promise<void> {
-  const [{ listSessionsForAgent }, { printSessionsByFormat }] = await Promise.all([
-    loadSessionModule(),
-    loadOutputRenderModule(),
-  ]);
+  const [{ listSessionsForAgent, listUnlistedRecordFiles }, { printSessionsByFormat }] =
+    await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
   // Brick 6867bbfc §5.9 — a byway is a human's side conversation, not one of the caller's
   // sessions; listed only on request. The adapter-path fallback below inherits this.
   const sessions = (await listSessionsForAgent(agentCommand, agentName)).filter(
@@ -1632,6 +1631,14 @@ async function printLocalSessionsList(
   );
   const filtered = filterCwd ? sessions.filter((session) => session.cwd === filterCwd) : sessions;
   printSessionsByFormat(filtered, format, await seatColumnLabeller());
+  // brick 929670fc (REG-2) — a record the reader cannot load is not listed; it is NAMED here, never silently dropped. The
+  // listing's stdout stays exactly what it was (a bare array in json); `--json-strict` keeps stderr machine-clean, as for
+  // the index-rebuild notice.
+  if (!(jsonStrict && format === "json")) {
+    for (const { file, reason } of await listUnlistedRecordFiles()) {
+      process.stderr.write(`[acpx] WARNING: session record ${file} is not listed: ${reason}\n`);
+    }
+  }
 }
 
 /**
@@ -2910,6 +2917,7 @@ export async function handleSessionsList(
       filterCwd,
       globalFlags.format,
       flags.includeByways === true,
+      globalFlags.jsonStrict === true,
     );
     return;
   }
@@ -2931,6 +2939,7 @@ export async function handleSessionsList(
       undefined,
       globalFlags.format,
       flags.includeByways === true,
+      globalFlags.jsonStrict === true,
     );
     return;
   }

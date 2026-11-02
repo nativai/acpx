@@ -9,6 +9,7 @@ export {
   countPruneCandidates,
   listSessions,
   listSessionsForAgent,
+  listUnlistedRecordFiles,
   pruneSessions,
   resolvePruneSessionIds,
 } from "./persistence.js";
