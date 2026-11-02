@@ -44,6 +44,7 @@ import type { AcpClientOptions } from "../types.js";
 import { commandCarriesAdapterToken } from "./adapter-token.js";
 import { isClaudeFamilyAgent } from "./agent-command.js";
 import { deleteAgentStrippedCredentialEnv } from "./agent-credential-env.js";
+import { appendAgentOsBinToPath } from "./agent-os-bin-path.js";
 import { splitCommandLine } from "./client-process.js";
 import { isCodexAcpCommand } from "./codex-compat.js";
 import { harnessIdForAgentCommand } from "./harness-capabilities.js";
@@ -1161,6 +1162,7 @@ function buildAgentEnvironment(
   // (checked 2026-10-24, key names only); the strip applies to them by decision anyway — agent
   // API access goes through Cardea, never an ambient variable.
   deleteAgentStrippedCredentialEnv(env);
+  appendAgentOsBinToPath(env);
   return env;
 }
 
