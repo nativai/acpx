@@ -1626,16 +1626,24 @@ async function printLocalSessionsList(
     await Promise.all([loadSessionModule(), loadOutputRenderModule()]);
   // Brick 6867bbfc §5.9 — a byway is a human's side conversation, not one of the caller's
   // sessions; listed only on request. The adapter-path fallback below inherits this.
-  const sessions = (await listSessionsForAgent(agentCommand, agentName)).filter(
-    (session) => includeByways || !isBywaySessionRecord(session),
-  );
+  // brick 929670fc (REG-2) — every record that leaves this listing unloadable is NAMED below, whether it never got an index
+  // entry (listUnlistedRecordFiles) or already had one and went bad since (the onUnloadable drop point).
+  const unlisted = new Map<string, string>();
+  const sessions = (
+    await listSessionsForAgent(agentCommand, agentName, ({ file, reason }) =>
+      unlisted.set(file, reason),
+    )
+  ).filter((session) => includeByways || !isBywaySessionRecord(session));
   const filtered = filterCwd ? sessions.filter((session) => session.cwd === filterCwd) : sessions;
   printSessionsByFormat(filtered, format, await seatColumnLabeller());
-  // brick 929670fc (REG-2) — a record the reader cannot load is not listed; it is NAMED here, never silently dropped. The
+  // A record the reader cannot load is not listed; it is NAMED here (once per list run), never silently dropped. The
   // listing's stdout stays exactly what it was (a bare array in json); `--json-strict` keeps stderr machine-clean, as for
   // the index-rebuild notice.
   if (!(jsonStrict && format === "json")) {
     for (const { file, reason } of await listUnlistedRecordFiles()) {
+      unlisted.set(file, reason);
+    }
+    for (const [file, reason] of unlisted) {
       process.stderr.write(`[acpx] WARNING: session record ${file} is not listed: ${reason}\n`);
     }
   }

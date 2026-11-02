@@ -145,6 +145,59 @@ test("sessions list --local · --json-strict keeps stderr machine-clean (the rep
   });
 });
 
+test("sessions list --local · a record that is ALREADY indexed and goes bad afterwards (numeric metadata; invalid JSON) is named exactly once on the next list", async () => {
+  for (const [label, corrupt, reason] of [
+    [
+      "numeric metadata",
+      async (file: string) => {
+        const raw = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+        (raw.metadata as Record<string, unknown>).brick_validation = 42;
+        await fs.writeFile(file, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+      },
+      /metadata\.brick_validation is number, not a string/,
+    ],
+    [
+      "invalid JSON",
+      async (file: string) => {
+        await fs.writeFile(file, "{not json", "utf8");
+      },
+      /unreadable: /,
+    ],
+  ] as const) {
+    await withTempHome("acpx-list-unlisted-indexed-", async (homeDir) => {
+      await plant(homeDir, CLEAN_ID, () => {});
+      await plant(homeDir, BAD_ID, () => {});
+      const before = await listJson(homeDir);
+      assert.deepEqual(
+        listedIds(before).toSorted(),
+        [BAD_ID, CLEAN_ID].toSorted(),
+        `${label}: both listed first (the index entry now exists)`,
+      );
+      assert.ok(!before.stderr.includes("not listed"), `${label}: a healthy store reports nothing`);
+
+      await corrupt(path.join(homeDir, ".acpx", "sessions", `${BAD_ID}.json`));
+      const after = await listJson(homeDir);
+      assert.equal(after.code, 0, after.stderr);
+      assert.deepEqual(
+        listedIds(after),
+        [CLEAN_ID],
+        `${label}: the corrupted record is not listed, the clean one is`,
+      );
+      const lines = after.stderr.split("\n").filter((line) => line.includes("not listed"));
+      assert.equal(lines.length, 1, `${label}: exactly one report, got: ${after.stderr}`);
+      assert.match(
+        lines[0] ?? "",
+        new RegExp(`WARNING: session record ${BAD_ID}\\.json is not listed: `),
+      );
+      assert.match(lines[0] ?? "", reason);
+
+      const strict = await listJson(homeDir, ["--json-strict"]);
+      assert.deepEqual(listedIds(strict), [CLEAN_ID]);
+      assert.ok(!strict.stderr.includes("not listed"), `${label}: --json-strict stays clean`);
+    });
+  }
+});
+
 test("listUnlistedRecordFiles · a record that is not valid JSON is named too (never only the metadata case)", async () => {
   await withTempHome("acpx-list-unlisted-corrupt-", async (homeDir) => {
     await plant(homeDir, CLEAN_ID, () => {});
