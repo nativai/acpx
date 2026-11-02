@@ -208,6 +208,65 @@ export async function listSessionIndexEntries(): Promise<SessionIndexEntry[]> {
   return await loadSessionIndexEntries();
 }
 
+/** A session-record file the reader could not turn into a record, and why — see `listUnlistedRecordFiles`. */
+export type UnlistedRecordFile = { file: string; reason: string };
+
+// A record file is `<id>.json`; the dir also holds dotted sidecars (`<id>.delivery.json`) that are NOT records and never
+// get an index entry, so only this positive shape can be called "a record that went missing".
+const RECORD_FILE_SHAPE = /^[^.]+\.json$/;
+
+function describeRejectedRecord(raw: unknown): string {
+  const metadata = (raw as { metadata?: unknown } | null)?.metadata;
+  if (typeof metadata === "object" && metadata !== null && !Array.isArray(metadata)) {
+    for (const [key, value] of Object.entries(metadata)) {
+      if (typeof value !== "string") {
+        return `metadata.${key} is ${value === null ? "null" : typeof value}, not a string (metadata is Record<string,string> only)`;
+      }
+    }
+  }
+  return "the session-record reader rejected it";
+}
+
+/** Why `<file>` in the session dir cannot be loaded as a record — read again at the moment of reporting (a rare, one-file read). */
+async function explainUnloadableRecordFile(file: string): Promise<string> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(await fs.readFile(path.join(sessionBaseDir(), file), "utf8"));
+  } catch (error) {
+    return `unreadable: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  return parseSessionRecord(raw)
+    ? "its messages log could not be loaded"
+    : describeRejectedRecord(raw);
+}
+
+/**
+ * The record files the store holds that have NO index entry — the half of REG-2 where the file never got one.
+ *
+ * ⚠️ WHY THIS EXISTS (brick 929670fc, REG-2). `parseSessionRecord` returns null for a record with ONE
+ * non-string `metadata` value, `readIndexEntryFromDisk` then gives a NEW file no index entry, and every listing
+ * is built from entries — so the whole record vanished from `sessions list --local` with no trace anywhere. A
+ * reader that drops what it cannot read must at least SAY so. Listing still succeeds (one bad record must not hide
+ * the rest of the store), so the report is the listing's to make, not a thrown error.
+ *
+ * The OTHER half — a record that already HAS an entry and later becomes unloadable (an external writer puts a number
+ * into its metadata) — keeps a stale entry and is dropped when its body is read: `listSessionsForAgent`'s
+ * `onUnloadable` reports that one. Together they cover every way a record leaves the listing unannounced.
+ */
+export async function listUnlistedRecordFiles(): Promise<UnlistedRecordFile[]> {
+  await ensureSessionDir();
+  await flushPendingSessionIndexUpdates(sessionBaseDir());
+  const index = await loadOrRebuildSessionIndex(sessionBaseDir());
+  const indexed = new Set(index.entries.map((entry) => entry.file));
+  const unlisted: UnlistedRecordFile[] = [];
+  for (const file of index.files) {
+    if (RECORD_FILE_SHAPE.test(file) && !indexed.has(file)) {
+      unlisted.push({ file, reason: await explainUnloadableRecordFile(file) });
+    }
+  }
+  return unlisted;
+}
+
 function matchesAgentIdentity(
   session: Pick<SessionIndexEntry, "agentCommand" | "agentName">,
   agentCommand: string,
@@ -1452,12 +1511,22 @@ export async function listSessions(): Promise<SessionRecord[]> {
 export async function listSessionsForAgent(
   agentCommand: string,
   agentName?: string,
+  /** Called once for each indexed entry whose record cannot be loaded and is therefore left out of the result (REG-2). */
+  onUnloadable?: (dropped: UnlistedRecordFile) => void,
 ): Promise<SessionRecord[]> {
   const entries = (await loadSessionIndexEntries()).filter(
     (session) =>
       matchesAgentIdentity(session, agentCommand, agentName) && session.kind !== "subagent",
   );
   const records = await Promise.all(entries.map((entry) => loadRecordFromIndexEntry(entry)));
+  if (onUnloadable) {
+    for (const [at, record] of records.entries()) {
+      const file = entries[at]?.file;
+      if (!record && file) {
+        onUnloadable({ file, reason: await explainUnloadableRecordFile(file) });
+      }
+    }
+  }
   return records
     .filter((entry): entry is SessionRecord => Boolean(entry))
     .toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
