@@ -226,6 +226,10 @@ Repo: https://github.com/openclaw/acpx
 - Control pods ignore project `.acpxrc.json` files (with a warning), retaining
   control-only global configuration and explicit CLI choices.
 
+- Control pods refuse npx/npm-exec adapter launches from shared working directories;
+  check both configured commands and resolved launches. Use an installed
+  control-runtime adapter or a workbench instead.
+
 ### Fixes
 
 - Runtime/reconnect: recover a never-prompted session whose `session/load` is

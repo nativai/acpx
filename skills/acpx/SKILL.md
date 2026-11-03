@@ -71,6 +71,11 @@ repository pre-commit hooks. Run repository formatting and checks explicitly in
 the workbench before committing (for example, `workbench-exec npm run -s precommit`).
 Control pods also ignore the cwd's `.acpxrc.json` entirely and log its presence;
 use the control-only global config or explicit CLI options for agent/MCP settings.
+Control pods refuse npx/npm-exec adapter launches from `/workspace` or `/wisdom`,
+including the Pi fallback. Install the adapter into the control runtime (`/opt`),
+or run it in a workbench. An existing package/cache hit does not bypass this check.
+The configured command and the final resolved launch are both checked; installed
+Claude, Codex, and Pi `/opt` adapters remain allowed from shared directories.
 
 `prompt` is the default verb.
 

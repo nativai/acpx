@@ -134,6 +134,7 @@ import {
   waitForSpawn,
 } from "./client-process.js";
 import { isCodexAcpCommand } from "./codex-compat.js";
+import { assertControlNpxLaunchAllowed } from "./control-npx-guard.js";
 import { extractAcpError, formatAcpErrorMessage } from "./error-shapes.js";
 import {
   HARNESS_FACTS,
@@ -1408,6 +1409,7 @@ export class AcpClient {
 
   private async resolveAgentLaunchPlan(): Promise<AgentLaunchPlan> {
     const configuredCommand = splitCommandLine(this.options.agentCommand);
+    assertControlNpxLaunchAllowed(this.options.cwd, configuredCommand);
     const resolvedBuiltInLaunch = resolveBuiltInAgentLaunch(this.options.agentCommand);
     const spawnCommand = resolvedBuiltInLaunch?.command ?? configuredCommand.command;
     let args = resolvedBuiltInLaunch?.args ?? configuredCommand.args;
@@ -1415,6 +1417,9 @@ export class AcpClient {
     if (isQoderAcpCommand(spawnCommand, args)) {
       args = buildQoderAcpCommandArgs(args, this.options);
     }
+    // A resolver may turn a non-package command into npm exec. Check the final
+    // launch too, before provisioning or spawning any adapter.
+    assertControlNpxLaunchAllowed(this.options.cwd, { command: spawnCommand, args });
     const spawnOptions = buildAgentSpawnOptions(
       this.options.cwd,
       this.options.authCredentials,
