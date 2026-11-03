@@ -66,6 +66,12 @@ For normal session reuse, prefer a global install over `npx`.
 
 ## Command model
 
+Agent Git commits retain platform attribution, disable fsmonitor, and skip
+repository pre-commit hooks. Run repository formatting and checks explicitly in
+the workbench before committing (for example, `workbench-exec npm run -s precommit`).
+Control pods also ignore the cwd's `.acpxrc.json` entirely and log its presence;
+use the control-only global config or explicit CLI options for agent/MCP settings.
+
 `prompt` is the default verb.
 
 ```bash

@@ -220,6 +220,12 @@ Repo: https://github.com/openclaw/acpx
   unchanged. The `sessions new --seat … --brick` mismatch hint now names `--reassign`.
   (brick a91f8d23)
 
+- Agent Git calls disable fsmonitor and no longer chain repository pre-commit
+  hooks. Run project formatters and gates through `workbench-exec` before
+  committing; the platform's commit attribution hook is retained.
+- Control pods ignore project `.acpxrc.json` files (with a warning), retaining
+  control-only global configuration and explicit CLI choices.
+
 ### Fixes
 
 - Runtime/reconnect: recover a never-prompted session whose `session/load` is

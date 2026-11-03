@@ -99,7 +99,9 @@ test("git attribution: activates core.hooksPath via GIT_CONFIG_* with no pre-exi
       acpxRecordId: "child-id",
       sessionName: "runner",
     });
-    assert.equal(options.env.GIT_CONFIG_COUNT, "1");
+    assert.equal(options.env.GIT_CONFIG_COUNT, "2");
+    assert.equal(options.env.GIT_CONFIG_KEY_1, "core.fsmonitor");
+    assert.equal(options.env.GIT_CONFIG_VALUE_1, "false");
     assert.equal(options.env.GIT_CONFIG_KEY_0, "core.hooksPath");
     const value = options.env.GIT_CONFIG_VALUE_0;
     assert.ok(value !== undefined, "GIT_CONFIG_VALUE_0 must be set");
@@ -131,7 +133,9 @@ test("git attribution: appends to a pre-existing GIT_CONFIG_COUNT without clobbe
       // Our hook config lands at index 2, count bumped to 3.
       assert.equal(options.env.GIT_CONFIG_KEY_2, "core.hooksPath");
       assert.ok(isAbsolute(options.env.GIT_CONFIG_VALUE_2 ?? ""));
-      assert.equal(options.env.GIT_CONFIG_COUNT, "3");
+      assert.equal(options.env.GIT_CONFIG_KEY_3, "core.fsmonitor");
+      assert.equal(options.env.GIT_CONFIG_VALUE_3, "false");
+      assert.equal(options.env.GIT_CONFIG_COUNT, "4");
     },
   );
 });
