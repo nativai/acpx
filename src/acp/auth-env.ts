@@ -482,6 +482,7 @@ function applyGitCommitAttribution(
   if (hooksDir) {
     appendGitConfigEnv(env, "core.hooksPath", hooksDir);
   }
+  appendGitConfigEnv(env, "core.fsmonitor", "false");
 }
 
 export type AgentSessionContext = {

@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULT_AGENT_NAME, normalizeAgentName } from "../agent-registry.js";
+import { isControlPod } from "../config/control-pod.js";
 import { loadSubscriptionRegistry, type SubscriptionRegistry } from "../config/subscriptions.js";
 import { parseMcpServers } from "../mcp-servers.js";
 import { DEFAULT_PERMISSION_MODE as ENFORCED_DEFAULT_PERMISSION_MODE } from "../types.js";
@@ -87,6 +88,31 @@ function defaultGlobalConfigPath(): string {
 
 function projectConfigPath(cwd: string): string {
   return path.join(path.resolve(cwd), ".acpxrc.json");
+}
+
+const warnedIgnoredProjectConfigs = new Set<string>();
+
+async function readProjectConfigFile(projectPath: string): Promise<ConfigFileLoadResult> {
+  if (!isControlPod()) {
+    return readConfigFile(projectPath);
+  }
+  // Do not parse (or follow) workbench-writable config. This also makes malformed
+  // JSON and symlinks inert. acpx has no parent-directory project-config lookup.
+  try {
+    await fs.lstat(projectPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { exists: false };
+    }
+    throw error;
+  }
+  if (!warnedIgnoredProjectConfigs.has(projectPath)) {
+    process.stderr.write(
+      `acpx: ignoring project config ${JSON.stringify(projectPath)} on the control pod; use control-only global config or explicit CLI options.\n`,
+    );
+    warnedIgnoredProjectConfigs.add(projectPath);
+  }
+  return { exists: true };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -343,7 +369,7 @@ export async function loadResolvedConfig(cwd: string): Promise<ResolvedAcpxConfi
 
   const [globalResult, projectResult] = await Promise.all([
     readConfigFile(globalPath),
-    readConfigFile(projectPath),
+    readProjectConfigFile(projectPath),
   ]);
 
   const globalConfig = globalResult.config;
