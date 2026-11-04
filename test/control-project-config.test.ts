@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { loadResolvedConfig } from "../src/cli/config.js";
+import { removeTempHome } from "./temp-home.js";
 
 test("control ignores executable project config but keeps global agents and MCP", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "acpx-control-config-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => removeTempHome(root));
   const cwd = join(root, "project");
   await mkdir(cwd);
   await mkdir(join(root, ".acpx"));
