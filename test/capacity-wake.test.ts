@@ -1043,3 +1043,44 @@ test("fall-through: an owner live at the pre-check but gone at submit is gated b
   }
   assert.deepEqual(calls, ["beforePersist", "submit", "beforeSpawn"]);
 });
+
+// ---------------------------------------------------------------------------------------------
+// Probe == gate (G12, C15) and the class never reaching an owner (C7)
+// ---------------------------------------------------------------------------------------------
+
+test("probe and gate agree: `capacity --need 1` met ⇔ admit-wake admits, over a sweep of fixture budgets", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  const id = await makeTarget(f);
+  for (const mib of [2048, 2400, 2600, 2650, 2700, 2750, 3000, 3200, 4000]) {
+    setRequest(f, mib);
+    fs.rmSync(path.join(admission(f), "pending.json"), { force: true });
+    const probe = await runCli(["capacity", "--need", "1"], f.env, os.tmpdir());
+    const gate = await admitWakeCli(f, id);
+    assert.equal(
+      probe.code === 0,
+      gate.code === 0,
+      `${mib} MiB: probe ${probe.code}, gate ${gate.code}`,
+    );
+    assert.equal(gate.json.decision, probe.code === 0 ? "admitted" : "refused", `${mib} MiB`);
+  }
+});
+
+test("class: ACPX_ADMISSION_CLASS never reaches the owner a woken prompt starts, or its adapter", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  const id = await makeTarget(f);
+  const before = fs.existsSync(f.marker) ? fs.readFileSync(f.marker, "utf8") : "";
+  const run = await promptCli(f, id, { ...f.env, ACPX_ADMISSION_CLASS: "delivery" });
+  assert.equal(run.code, 0, run.stderr);
+  const starts = fs
+    .readFileSync(f.marker, "utf8")
+    .slice(before.length)
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as { classPresent: boolean });
+  assert.ok(starts.length >= 1, "the woken owner's adapter started");
+  assert.deepEqual(
+    starts.map((s) => s.classPresent),
+    starts.map(() => false),
+  );
+});
