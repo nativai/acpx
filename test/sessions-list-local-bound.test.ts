@@ -67,6 +67,10 @@ async function writeRecord(seed: Seed, log?: { lines: string; count: number }): 
   }
 }
 
+// A listing that never exits is as much a failure as one that OOMs: kill it and say so, rather than
+// leave the row to hang the file. The bound listing takes ~5 s here.
+const CLI_TIMEOUT_MS = 60_000;
+
 async function runCli(
   homeDir: string,
   args: string[],
@@ -82,10 +86,20 @@ async function runCli(
     });
     let stdout = "";
     let stderr = "";
+    const timer = setTimeout(() => {
+      stderr += `\n[test] CLI did not exit within ${CLI_TIMEOUT_MS} ms; stdout had ${stdout.length} chars; killed\n`;
+      child.kill("SIGKILL");
+    }, CLI_TIMEOUT_MS);
     child.stdout.setEncoding("utf8").on("data", (chunk: string) => (stdout += chunk));
     child.stderr.setEncoding("utf8").on("data", (chunk: string) => (stderr += chunk));
-    child.once("error", reject);
-    child.once("close", (code) => resolve({ code, stdout, stderr }));
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr });
+    });
   });
 }
 
