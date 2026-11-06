@@ -809,3 +809,94 @@ test("A9/N3 negative: a flow's SHELL step keeps the invocation cwd under enforce
     );
   });
 });
+
+test("E1 (warm owner): a folder deleted while the owner is warm is refused at the next turn start", async () => {
+  await withFixture(async (fx) => {
+    const gone = path.join(fx.elsewhere, "gone-warm");
+    await fs.mkdir(gone);
+    const off = { env: { ACPX_SESSION_ROOT: "" } };
+    const legacy = await createSession(fx, ["--cwd", gone], off);
+    const id = String(legacy.acpxRecordId);
+    const warmTurn = await runCli(
+      fx,
+      [...agentArgs(fx), "--ttl", "60", "prompt", "--session-id", id, "echo warm"],
+      off,
+    );
+    assert.equal(warmTurn.code, 0, warmTurn.stdout + warmTurn.stderr);
+    // Planted positive: the owner (and its adapter) is ALIVE — the next turn takes no spawn.
+    const { lockPath } = queuePaths(fx.homeDir, id);
+    const ownerPid = (JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid: number }).pid;
+    process.kill(ownerPid, 0);
+    await fs.rm(gone, { recursive: true, force: true });
+
+    const prompted = await runCli(
+      fx,
+      [...agentArgs(fx), "--format", "json", "prompt", "--session-id", id, "hello"],
+      off,
+    );
+    assert.notEqual(prompted.code, 0, prompted.stdout + prompted.stderr);
+    const output = prompted.stdout + prompted.stderr;
+    assert.match(output, /SESSION_CWD_MISSING/);
+    assert.ok(
+      output.includes(`cannot start: its working directory ${gone} no longer exists`),
+      output,
+    );
+    assert.equal(existsSync(gone), false, "the folder must NOT be re-created");
+    const prompts = (await readOps(fx)).filter(
+      (op) => op.method === "session/prompt" && op.text === "hello",
+    );
+    assert.deepEqual(prompts, [], "the refused turn never reached the agent");
+
+    // E1u: the warm adapter is RELEASED (the owner recycles after the refused task) …
+    const deadline = Date.now() + 20_000;
+    let ownerAlive = true;
+    while (ownerAlive && Date.now() < deadline) {
+      try {
+        process.kill(ownerPid, 0);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      } catch {
+        ownerAlive = false;
+      }
+    }
+    assert.equal(ownerAlive, false, "the warm owner (and its adapter) must be released");
+
+    // … and a DELIVERY (atrium's shape: a message id, no waiter) gets its own terminal with the
+    // code — never the generic QUEUE_TURN_START_FAILED.
+    const messageId = "5e1d0c3a-0000-4000-8000-0000000000e1";
+    const delivered = await runCli(
+      fx,
+      [...agentArgs(fx), "prompt", "--session-id", id, "--no-wait", "--message-id", messageId, "x"],
+      off,
+    );
+    const sessionsDir = path.join(fx.homeDir, ".acpx", "sessions");
+    const carrying = async (needle: string): Promise<string[]> => {
+      const hits: string[] = [];
+      for (const name of await fs.readdir(sessionsDir)) {
+        if (!name.startsWith(id)) {
+          continue;
+        }
+        const body = await fs.readFile(path.join(sessionsDir, name), "utf8").catch(() => "");
+        if (body.includes(needle)) {
+          hits.push(name);
+        }
+      }
+      return hits;
+    };
+    const terminalDeadline = Date.now() + 20_000;
+    let terminal: string | undefined;
+    while (!terminal && Date.now() < terminalDeadline) {
+      for (const name of await carrying(messageId)) {
+        const lines = (await fs.readFile(path.join(sessionsDir, name), "utf8")).split("\n");
+        terminal = lines.find((line) => line.includes(messageId) && line.includes('"failed"'));
+      }
+      if (!terminal) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    }
+    assert.ok(terminal, `no failed delivery terminal: ${delivered.stdout}${delivered.stderr}`);
+    assert.match(terminal, /SESSION_CWD_MISSING/);
+    assert.equal(terminal.includes("QUEUE_TURN_START_FAILED"), false, terminal);
+    assert.ok((await carrying("SESSION_CWD_MISSING")).length >= 1, "the record's turn error");
+    assert.equal(existsSync(gone), false);
+  });
+});

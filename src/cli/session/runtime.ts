@@ -46,6 +46,7 @@ import {
   selectSubscriptionBeforeTurn,
   stampLastTurnSubscription,
 } from "../../runtime/engine/failover.js";
+import { assertSessionCwdExists } from "../../session/session-cwd.js";
 import { SpawnLedgerError } from "../../spawn-ledger.js";
 import {
   registerAbsorbedDeliveries,
@@ -1566,12 +1567,7 @@ function terminalizeTurnThatNeverStarted(
   const terminalError: DeliveryEventError = {
     code: 0,
     message: `${QUEUE_TURN_START_FAILED_MESSAGE}: ${describeTurnStartError(error)}`,
-    // brick 45917618 §5.6: a gone session folder reaches the delivery entry as its OWN code,
-    // unchanged — atrium keys its terminal refusal (and the Fork & send offer) on it.
-    detailCode:
-      error instanceof SessionCwdMissingError
-        ? "SESSION_CWD_MISSING"
-        : QUEUE_TURN_START_FAILED_DETAIL_CODE,
+    detailCode: QUEUE_TURN_START_FAILED_DETAIL_CODE,
   };
   appendDeliveryStreamEventSync(sessionRecordId, task, "failed", terminalError);
   appendRefusedStreamEventSync(sessionRecordId, task, terminalError);
@@ -1699,6 +1695,32 @@ export async function endPreviousLiveTurn(
   await client.close();
 }
 
+// The refusal is a pre-submit terminal (`isPreSubmitTerminalError`): it is persisted as the record's
+// turn error, the delivery gets its own SESSION_CWD_MISSING terminal, and the owner is told so it
+// releases its (possibly warm) adapter and the session goes cold.
+async function refuseTurnWhenSessionCwdMissing(
+  sessionRecordId: string,
+  task: QueueTask,
+  onSessionCwdMissing: (() => void) | undefined,
+): Promise<void> {
+  const record = await resolveSessionRecord(sessionRecordId);
+  try {
+    assertSessionCwdExists({
+      cwd: record.cwd,
+      sessionId: record.acpxRecordId,
+      agentCommand: record.agentCommand,
+    });
+  } catch (error) {
+    await persistPreSubmitTerminalError(record, error);
+    if (task.messageId && !task.terminalWritten) {
+      task.terminalWritten = true;
+      appendDeliveryStreamEventSync(sessionRecordId, task, "failed", deliveryErrorFrom(error));
+    }
+    onSessionCwdMissing?.();
+    throw error;
+  }
+}
+
 export async function runQueuedTask(
   sessionRecordId: string,
   task: QueueTask,
@@ -1723,6 +1745,8 @@ export async function runQueuedTask(
     // subsequent turns cold-spawn on the new transcript anchor.
     onFailoverSwitched?: (newProfileId: string, trigger: AccountSwitchTrigger) => void;
     onLockBlocked?: () => void;
+    // brick 45917618 §5.6: the session's folder is gone — release the adapter after this task.
+    onSessionCwdMissing?: () => void;
     // brick://3356183e: a switch decided BEFORE the turn (lock or selection) asks the
     // owner to replace its shared client with one built from the switched record, and
     // the turn runs on it: no throwaway client closed at turn end, no owner recycle.
@@ -1751,6 +1775,9 @@ export async function runQueuedTask(
 
   try {
     let result: SessionSendResult;
+    // brick 45917618 §5.6 (HoD ruling 2026-11-06): refused at EVERY turn start, not only at a spawn —
+    // a warm owner's adapter would otherwise run the turn in a folder that no longer exists.
+    await refuseTurnWhenSessionCwdMissing(sessionRecordId, task, options.onSessionCwdMissing);
     try {
       const lockPolicy = await applyQueuedTaskSubscriptionLockPolicy(sessionRecordId, options);
       result = await runSessionPrompt({
@@ -1804,7 +1831,8 @@ function isPreSubmitTerminalError(error: unknown): boolean {
     isModelFloorUnmetError(error) ||
     error instanceof AutomationCapacityReservedError ||
     error instanceof CodexSubscriptionCapError ||
-    error instanceof AllSubscriptionsExhaustedError
+    error instanceof AllSubscriptionsExhaustedError ||
+    error instanceof SessionCwdMissingError
   );
 }
 

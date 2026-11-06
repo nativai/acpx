@@ -1,6 +1,5 @@
 import { spawn, type ChildProcess, type ChildProcessByStdio } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { statSync } from "node:fs";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
@@ -41,7 +40,6 @@ import {
 import { resolveBuiltInAgentLaunch } from "../agent-registry.js";
 import { TimeoutError, withTimeout } from "../async-control.js";
 import type { ProvisioningWarningBreadcrumb } from "../config/os-harness-provisioning.js";
-import { resolveSessionRoot } from "../config/session-root.js";
 import {
   resolveExistingTranscriptPath,
   transcriptJsonlPath,
@@ -56,7 +54,6 @@ import {
   GeminiAcpStartupTimeoutError,
   PermissionDeniedError,
   PermissionPromptUnavailableError,
-  SessionCwdMissingError,
   SourceTranscriptMissingError,
   UnsupportedPromptContentError,
 } from "../errors.js";
@@ -73,6 +70,7 @@ import { captureRecordPidIdentity, type RecordPidIdentity } from "../process-ide
 import { getUnsupportedPromptContentMessage, textPrompt } from "../prompt-content.js";
 import { ACTIVITY_NEUTRAL_EVENT_METHOD } from "../session/events.js";
 import { extractRuntimeSessionId } from "../session/runtime-session-id.js";
+import { assertSessionCwdExists } from "../session/session-cwd.js";
 import { buildSpawnCommandOptions } from "../spawn-command-options.js";
 import type {
   AcpClientOptions,
@@ -85,7 +83,6 @@ import type {
 } from "../types.js";
 import { enforcePermissionMode } from "../types.js";
 import {
-  acpAdapterKind,
   buildAgentStartupTimeoutMessage,
   buildClaudeAcpSessionCreateTimeoutMessage,
   buildClaudeCodeOptionsMeta,
@@ -1876,46 +1873,16 @@ export class AcpClient {
     }
   }
 
-  /**
-   * A session whose working directory is gone is REFUSED (`SESSION_CWD_MISSING`), never given a
-   * re-created empty folder and never run somewhere else (brick 45917618 §5.6).
-   *
-   * ⚠️ DO NOT "HEAL" THIS WITH A `mkdirSync(cwd, { recursive: true })`. It looks like a kindness
-   * and it is the bug: it resurrects a reaped worktree path as a plain directory inside a repo tree,
-   * and the agent then works in an empty folder with its conversation intact and no error anywhere.
-   * `test/session-cwd-missing.test.ts` asserts the folder is still absent after the refusal.
-   */
-  private assertSessionCwdExists(): void {
-    const cwd = this.options.cwd;
-    let isDirectory = false;
-    try {
-      isDirectory = statSync(cwd).isDirectory();
-    } catch {
-      isDirectory = false;
-    }
-    if (isDirectory) {
-      return;
-    }
-    let root: string | undefined;
-    try {
-      root = resolveSessionRoot().root ?? undefined;
-    } catch {
-      root = undefined;
-    }
-    throw new SessionCwdMissingError({
-      cwd,
-      sessionId: this.options.sessionContext?.acpxRecordId?.trim() || undefined,
-      piSource: acpAdapterKind(this.options.agentCommand) === "pi",
-      root,
-    });
-  }
-
   private async spawnAgentProcess(
     plan: AgentLaunchPlan,
   ): Promise<ChildProcessByStdio<Writable, Readable, Readable>> {
     // The single adapter spawn site: every spawn for a record — create, prompt, owner turn start,
     // recover, keepwarm, config ops — comes through here (brick 45917618 §5.6).
-    this.assertSessionCwdExists();
+    assertSessionCwdExists({
+      cwd: this.options.cwd,
+      sessionId: this.options.sessionContext?.acpxRecordId,
+      agentCommand: this.options.agentCommand,
+    });
     const spawnedChild = spawn(
       plan.spawnCommand,
       plan.args,

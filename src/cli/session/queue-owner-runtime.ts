@@ -1741,6 +1741,12 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
                   );
                 }
               },
+              onSessionCwdMissing: () => {
+                // brick 45917618 §5.6: the folder is gone — let the warm adapter go, so the
+                // session is cold and any later spawn meets the spawn-site check too.
+                recycleOwnerAfterTask = true;
+                recycleReason = "session-cwd-missing";
+              },
               onLockBlocked: () => {
                 recycleOwnerAfterTask = true;
                 recycleReason = "lock-blocked";
