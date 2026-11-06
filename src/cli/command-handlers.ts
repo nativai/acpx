@@ -5282,19 +5282,22 @@ function printActivationText(
     return;
   }
   process.stdout.write(`\n--- notice for the successor ---\n${result.notice}`);
-  if (noticeOutcome.kind === "failed" && noticeOutcome.capacityMessage !== undefined) {
-    // brick 2b3b259f §9 row 5b: the box had no room to wake the successor. The activation stands;
-    // re-running `activate` does not re-send (`not-resent`), so the activator sends it later.
-    process.stdout.write(
-      `notice NOT delivered — no room to wake the successor now; the activation stands. ` +
-        `Send the notice above to the successor's seat later with send-message.sh, never in a loop:\n` +
-        `${noticeOutcome.capacityMessage}\n`,
-    );
-  } else if (noticeOutcome.kind === "failed") {
-    process.stdout.write(
-      `notice NOT delivered — paste it to the successor (${noticeOutcome.reason})\n`,
-    );
+  if (noticeOutcome.kind === "failed") {
+    process.stdout.write(noticeNotDeliveredText(noticeOutcome));
   }
+}
+
+function noticeNotDeliveredText(outcome: { reason: string; capacityMessage?: string }): string {
+  if (outcome.capacityMessage === undefined) {
+    return `notice NOT delivered — paste it to the successor (${outcome.reason})\n`;
+  }
+  // brick 2b3b259f §9 row 5b: the box had no room to wake the successor. The activation stands;
+  // re-running `activate` does not re-send (`not-resent`), so the activator sends it later.
+  return (
+    `notice NOT delivered — no room to wake the successor now; the activation stands. ` +
+    `Send the notice above to the successor's seat later with send-message.sh, never in a loop:\n` +
+    `${outcome.capacityMessage}\n`
+  );
 }
 
 /** Whether the record is closed — a record that cannot be read counts as open, so the duty line stays. */
