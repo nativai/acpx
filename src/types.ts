@@ -264,7 +264,30 @@ export type CapacityRefusalDetail = {
   /** Automation sessions queued for room at decision time (`queued_ahead=` on the token line). */
   queuedAhead: number;
   capacity?: unknown;
+  /**
+   * A WAKE refusal only (brick 2b3b259f, CONCEPTION §5.2): the refusal's sentences — every line
+   * after the token line, joined by `\n` — as the one product text every surface relays.
+   */
+  message?: string;
+  /** A WAKE refusal only: the released session that was not started. */
+  wake?: { sessionId: string; seatId: string | null };
+  /** A WAKE refusal only: whether the text offers `send-message.sh --final-report`, and why. */
+  finalReport?: { offered: boolean; why: FinalReportWhy };
 };
+
+/**
+ * Why a wake refusal does or does not offer `--final-report` (CONCEPTION §5.1 a–d, contract note
+ * 2026-11-06 17:55Z): `leaf` / `cross-box` offer it; `orchestrator` says "not for you";
+ * `no-capability` (no fresh capability marker), `no-sender` (no sender role — every bare
+ * `acpx prompt`) and `admission-busy` name nothing.
+ */
+export type FinalReportWhy =
+  | "leaf"
+  | "cross-box"
+  | "orchestrator"
+  | "no-capability"
+  | "no-sender"
+  | "admission-busy";
 
 /**
  * Local-box Codex subscription-cap admission result. This intentionally names

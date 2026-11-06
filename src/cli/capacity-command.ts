@@ -1,5 +1,11 @@
 import { type Command, InvalidArgumentError } from "commander";
-import { readPendingReservationsForProbe, readWaitingForProbe } from "../capacity/admission.js";
+import {
+  admitWake,
+  readPendingReservationsForProbe,
+  readWaitingForProbe,
+  type SenderRole,
+  type WakeDecision,
+} from "../capacity/admission.js";
 import { type Harness, HARNESSES, isHarness, MIB } from "../capacity/constants.js";
 import {
   type AdmissionLockState,
@@ -18,6 +24,7 @@ import { EXIT_CODES, type OutputFormat } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import { parseOutputFormat, resolveGlobalFlags } from "./flags.js";
 import { emitJsonResult } from "./output/json-output.js";
+import { ownerMayBeRunning, wakeRequestFor } from "./session/wake-gate.js";
 
 /**
  * `acpx capacity [--agent claude|codex|pi] [--need N] [--class spawn|automation]` — how many more
@@ -133,6 +140,10 @@ function sinceLabel(since: string, now: Date): string {
 const SHOWN_ITEMS = 5;
 
 function itemLabel(item: CapacitySnapshot["waiting"]["items"][number]): string {
+  if (item.kind === "delivery") {
+    // atrium's label: `<sender seat> → <recipient seat>`, or `<N> messages → <recipient seat>`.
+    return item.label || `messages → ${item.ref.slice(0, 8)}`;
+  }
   if (item.kind === "wakeup") {
     return `wakeup ${item.label || item.ref}`;
   }
@@ -143,7 +154,10 @@ function itemLabel(item: CapacitySnapshot["waiting"]["items"][number]): string {
   return `${item.kind} ${item.label || item.ref}`;
 }
 
-/** One line while automation waits for room — agent-facing wording (CONCEPTION e8abe1e8 §12.3). */
+/**
+ * One line while anything waits for room — agent-facing wording (CONCEPTION e8abe1e8 §12.3; A1 §8:
+ * held messages wait too, one item per session that needs waking, so the count is ITEMS).
+ */
 export function waitingLine(s: CapacitySnapshot, now: Date = new Date()): string | undefined {
   const { count, items } = s.waiting;
   if (count === 0) {
@@ -158,7 +172,7 @@ export function waitingLine(s: CapacitySnapshot, now: Date = new Date()): string
       ? "they start before new agent sessions; the slots above already leave room for them"
       : "class automation: the slots above are gross, the queue orders itself";
   return (
-    `waiting: ${plural(count, "automation session")} queued since ` +
+    `waiting: ${count} queued for room since ` +
     `${sinceLabel(items[0]?.since ?? "", now)} (${shown.join(", ")}) — ${effect}`
   );
 }
@@ -301,7 +315,7 @@ async function handleCapacity(
  * AGENT NAME and, in a session-bearing cwd, the rest of the line becomes a prompt delivery.
  */
 export function registerCapacityCommand(parent: Command, config: ResolvedAcpxConfig): void {
-  parent
+  const capacity = parent
     .command("capacity")
     .description(
       "How many more agent sessions fit in this box's control-pod memory (read-only). " +
@@ -329,5 +343,123 @@ export function registerCapacityCommand(parent: Command, config: ResolvedAcpxCon
     })
     .action(async function (this: Command, flags: CapacityFlags) {
       await handleCapacity(flags, this, config);
+    });
+  // A SUBCOMMAND of `capacity`, so `TOP_LEVEL_VERBS` needs no entry; the program's
+  // `enablePositionalOptions()` (inherited) keeps `capacity --class spawn|automation` apart from
+  // `admit-wake --class delivery|automation`. Rows "admit-wake: CLI" in test/capacity-wake.test.ts.
+  registerAdmitWakeCommand(capacity, config);
+}
+
+// ── `acpx capacity admit-wake` (brick 2b3b259f, CONCEPTION §4.1) ─────────────────────────────────
+
+type AdmitWakeFlags = {
+  sessionId: string;
+  class: "delivery" | "automation";
+  sender?: string;
+  senderRole?: SenderRole;
+  crossBox?: boolean;
+  format?: OutputFormat;
+};
+
+function parseWakeClass(value: string): AdmitWakeFlags["class"] {
+  const trimmed = value.trim();
+  if (trimmed !== "delivery" && trimmed !== "automation") {
+    throw new InvalidArgumentError("Expected one of: delivery, automation");
+  }
+  return trimmed;
+}
+
+function parseSenderRole(value: string): SenderRole {
+  const trimmed = value.trim();
+  if (trimmed !== "leaf" && trimmed !== "orchestrator") {
+    throw new InvalidArgumentError("Expected one of: leaf, orchestrator");
+  }
+  return trimmed;
+}
+
+/** The `--format json` answer — the contract atrium's `server/admitWake.ts` parses (IMPL-acpx.md). */
+export function admitWakeJson(sessionId: string, decision: WakeDecision): Record<string, unknown> {
+  return {
+    action: "admit-wake",
+    schema: 1,
+    sessionId,
+    decision: decision.decision,
+    why: decision.decision === "not-gated" ? decision.why : null,
+    key: "key" in decision ? decision.key : null,
+    expiresAt: "expiresAt" in decision ? decision.expiresAt : null,
+    refusal: decision.decision === "refused" ? decision.refusal : null,
+  };
+}
+
+function writeAdmitWakeText(sessionId: string, decision: WakeDecision): void {
+  if (decision.decision === "refused") {
+    process.stderr.write(`${decision.refusal.message}\n`);
+    return;
+  }
+  const why = decision.decision === "not-gated" ? ` (${decision.why})` : "";
+  process.stdout.write(`admit-wake ${sessionId}: ${decision.decision}${why}\n`);
+}
+
+/**
+ * Exit 0 for every non-refusal (`not-needed`, `not-gated`, `admitted`, `already-reserved`), 75 on a
+ * refusal (`admission_busy` included), 2 on usage, the usual non-zero for an unknown session.
+ * A closed record is NOT short-circuited: atrium asks before a `--reopen`, so a refusal reopens
+ * nothing; it answers a closed target without `reopen` with its own 409 before ever calling.
+ */
+async function handleAdmitWake(
+  flags: AdmitWakeFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const { format } = resolveGlobalFlags(command, config);
+  const { resolveSessionRecord } = await import("../session/persistence.js");
+  const record = await resolveSessionRecord(flags.sessionId);
+  const decision: WakeDecision = (await ownerMayBeRunning(record.acpxRecordId))
+    ? { decision: "not-needed" }
+    : await admitWake(
+        wakeRequestFor(record, {
+          verb: "capacity admit-wake",
+          flagClass: flags.class,
+          sender: flags.sender,
+          senderRole: flags.senderRole,
+          crossBox: flags.crossBox === true,
+        }),
+      );
+  if (!emitJsonResult(format, admitWakeJson(record.acpxRecordId, decision))) {
+    writeAdmitWakeText(record.acpxRecordId, decision);
+  } else if (decision.decision === "refused") {
+    process.stderr.write(`${decision.refusal.tokenLine}\n`);
+  }
+  if (decision.decision === "refused") {
+    process.exitCode = EXIT_CODES.CAPACITY;
+  }
+}
+
+function registerAdmitWakeCommand(capacity: Command, config: ResolvedAcpxConfig): void {
+  capacity
+    .command("admit-wake")
+    .description(
+      "atrium's pre-admission before it stores a message for a session with no running agent " +
+        "process: admits (and reserves) the owner start, or exits 75 with the refusal text.",
+    )
+    .requiredOption("--session-id <id>", "The recipient's session record id")
+    .requiredOption(
+      "--class <class>",
+      "delivery (an agent's message) or automation",
+      parseWakeClass,
+    )
+    .option("--sender <id>", "The sending session's record id (decision log)")
+    .option(
+      "--sender-role <role>",
+      "atrium's family verdict on the sender: leaf or orchestrator (omitted: unknown)",
+      parseSenderRole,
+    )
+    .option("--cross-box", "The sender is on another box (recipient-box wording)")
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    .exitOverride((error) => {
+      throw error;
+    })
+    .action(async function (this: Command, flags: AdmitWakeFlags) {
+      await handleAdmitWake(flags, this, config);
     });
 }

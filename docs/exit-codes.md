@@ -5,16 +5,16 @@ description: Stable acpx exit codes for scripting — success, runtime errors, u
 
 `acpx` uses a small, stable set of exit codes so wrapping scripts can branch on them.
 
-| Code  | Meaning                                                             |
-| ----- | ------------------------------------------------------------------- |
-| `0`   | Success                                                             |
-| `1`   | Agent / protocol / runtime error                                    |
-| `2`   | CLI usage error (bad flags, conflicting flags, malformed `--agent`) |
-| `3`   | Timeout (`--timeout` exceeded)                                      |
-| `4`   | No session found (prompt requires an explicit `sessions new`)       |
-| `5`   | Permission denied (every request denied/cancelled, none approved)   |
-| `75`  | No capacity: nothing ran (`capacity --need N`, a gated create)      |
-| `130` | Interrupted (`SIGINT` / `SIGTERM`)                                  |
+| Code  | Meaning                                                                |
+| ----- | ---------------------------------------------------------------------- |
+| `0`   | Success                                                                |
+| `1`   | Agent / protocol / runtime error                                       |
+| `2`   | CLI usage error (bad flags, conflicting flags, malformed `--agent`)    |
+| `3`   | Timeout (`--timeout` exceeded)                                         |
+| `4`   | No session found (prompt requires an explicit `sessions new`)          |
+| `5`   | Permission denied (every request denied/cancelled, none approved)      |
+| `75`  | No capacity: nothing ran (`capacity --need N`, a gated create or wake) |
+| `130` | Interrupted (`SIGINT` / `SIGTERM`)                                     |
 
 ## Notes
 
@@ -28,6 +28,7 @@ description: Stable acpx exit codes for scripting — success, runtime errors, u
   - **Automation.** Atrium creates wakeup and brick-trigger sessions with `ACPX_ADMISSION_CLASS=automation`; they are gated by the same check and get the same exit 75, and atrium then keeps them in its queue until room frees. `automation` is never inferred.
   - **Queued automation goes first.** Atrium publishes what waits in `<admission dir>/waiting/<writer>.json` (schema in the header of `src/capacity/waiting.ts`; a file counts while it is less than 5 minutes old). An agent's slots — in the gate and in `acpx capacity` (class `spawn`, the default) — are net of that count, so `queued_ahead=<n>` on an agent's refusal means n automation sessions start before the agent's next create. `acpx capacity --class automation` reports the gross slots; both classes list what waits (`waiting` in JSON, a `waiting:` line in text).
   - **A held admission lock.** `acpx capacity` JSON always carries `admissionLock: {busy, retryAfterS}`. `busy` means a live process has held the box's admission lock for at least 5 s, so a create starting now is refused `admission_busy`. With `--need N` that is exit 75 for every class, with `needMetReason` starting `admission_busy:`. On an unconfigured box the lock is reported but never refuses. Without `--need`, exit codes are unchanged.
+  - **Waking a released session.** A prompt to a session whose owner was released after idle (or died) must start a new owner, and that is gated by the same check: an agent's own `acpx prompt` on a full box returns 75 before anything is written or started, stderr `acpx: REFUSED reason=… nothing_started=true protocol=1 … queued_ahead=<n> wake=<record id>` and then the sentences; `--format json` carries `message`, `wake: {sessionId, seatId}` and `finalReport: {offered, why}` in `error.data`. A live or starting owner, a fresh handover successor, a closed record with `--message-id`, `ACPX_ADMISSION_CLASS=interactive` (an authenticated human through atrium) and an unconfigured box are never refused. `acpx capacity admit-wake --session-id <id> --class delivery|automation` is atrium's pre-admission for a message: exit 0 with `decision` `not-needed` / `not-gated` / `admitted` / `already-reserved`, or 75 with `decision: "refused"` and the refusal text in `refusal.message`.
   - **Reservations.** An admitted create reserves its harness's memory until its session's owner appears. Once the record exists, the reservation outlives the `sessions new` process: 10 minutes for `automation`, 180 s for every other class. While the owner lives, the owner is charged at least the reservation; once the session has run a turn or is closed, the reservation stops counting as soon as no owner is live. A prompt-less `sessions new` therefore holds its room for up to 180 s; pass `--prompt-file` to start the owner at once.
 - **`130`** matches the conventional shell signal exit code for `Ctrl+C` (`128 + SIGINT`). `acpx` cancels cooperatively before exiting with this code.
 

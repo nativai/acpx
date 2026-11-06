@@ -22,6 +22,7 @@ import {
   censusOwners,
   type LeaseExclusion,
   type OwnerCensus,
+  type OwnerRecordFacts,
   type OwnerTree,
   type ReaderFootprint,
   readReaderFootprint,
@@ -91,6 +92,8 @@ export type OwnerSummary = {
   readonly chargedBytes: number;
   /** This tree holds the reading process: it is the caller's own session. */
   readonly self: boolean;
+  /** The owner's record facts (seat succession, idleness) — the wake gate's inputs (§3.3, §3.4). */
+  readonly facts?: OwnerRecordFacts;
 };
 
 export type CapacitySnapshot = {
@@ -437,6 +440,7 @@ function ownersField(g: Gathered): CapacitySnapshot["owners"] {
       measuredBytes: owner.measuredBytes,
       chargedBytes: ownerCharge(owner, g.constants),
       self: owner.self,
+      facts: owner.facts,
     })),
   };
 }
@@ -515,7 +519,7 @@ export function needMetReason(snapshot: CapacitySnapshot, need: number): string 
   const slots = snapshot.slotsAfterMakeRoom?.[snapshot.agent] ?? 0;
   const queued =
     snapshot.class === "spawn" && snapshot.waiting.count > 0
-      ? ` (after ${snapshot.waiting.count} queued automation session(s), which start first)`
+      ? ` (after ${snapshot.waiting.count} waiting item(s), which start first)`
       : "";
   return `${slots} new ${snapshot.agent} session(s) fit${queued}; ${need} needed`;
 }

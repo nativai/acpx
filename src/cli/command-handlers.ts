@@ -5190,7 +5190,7 @@ function activationHeadline(kind: "activated" | "resumed" | "already-active"): s
  */
 type NoticeOutcome =
   | { kind: "delivered"; deliveryId?: string }
-  | { kind: "failed"; reason: string }
+  | { kind: "failed"; reason: string; capacityMessage?: string }
   | { kind: "suppressed" }
   | { kind: "not-resent" };
 
@@ -5209,9 +5209,10 @@ async function deliverOrSkipNotice(
     successorId: result.successorId,
     notice: result.notice,
   });
-  return delivery.delivered
-    ? { kind: "delivered", deliveryId: delivery.deliveryId }
-    : { kind: "failed", reason: delivery.reason };
+  if (delivery.delivered) {
+    return { kind: "delivered", deliveryId: delivery.deliveryId };
+  }
+  return { kind: "failed", reason: delivery.reason, capacityMessage: delivery.capacityMessage };
 }
 
 function noticeDeliveryJson(outcome: NoticeOutcome): Record<string, unknown> {
@@ -5219,7 +5220,11 @@ function noticeDeliveryJson(outcome: NoticeOutcome): Record<string, unknown> {
     return { delivered: true, ...(outcome.deliveryId ? { deliveryId: outcome.deliveryId } : {}) };
   }
   if (outcome.kind === "failed") {
-    return { delivered: false, reason: outcome.reason };
+    return {
+      delivered: false,
+      reason: outcome.reason,
+      ...(outcome.capacityMessage === undefined ? {} : { refusal: outcome.capacityMessage }),
+    };
   }
   return {
     delivered: false,
@@ -5278,10 +5283,21 @@ function printActivationText(
   }
   process.stdout.write(`\n--- notice for the successor ---\n${result.notice}`);
   if (noticeOutcome.kind === "failed") {
-    process.stdout.write(
-      `notice NOT delivered — paste it to the successor (${noticeOutcome.reason})\n`,
-    );
+    process.stdout.write(noticeNotDeliveredText(noticeOutcome));
   }
+}
+
+function noticeNotDeliveredText(outcome: { reason: string; capacityMessage?: string }): string {
+  if (outcome.capacityMessage === undefined) {
+    return `notice NOT delivered — paste it to the successor (${outcome.reason})\n`;
+  }
+  // brick 2b3b259f §9 row 5b: the box had no room to wake the successor. The activation stands;
+  // re-running `activate` does not re-send (`not-resent`), so the activator sends it later.
+  return (
+    `notice NOT delivered — no room to wake the successor now; the activation stands. ` +
+    `Send the notice above to the successor's seat later with send-message.sh, never in a loop:\n` +
+    `${outcome.capacityMessage}\n`
+  );
 }
 
 /** Whether the record is closed — a record that cannot be read counts as open, so the duty line stays. */

@@ -32,6 +32,21 @@ export type OwnerTree = {
    * instead of dropping to its first-second ~50 MiB (§9).
    */
   readonly reservedBytes?: number;
+  /** From the same record read as the harness (brick 2b3b259f §3.3, §3.4); absent when unreadable. */
+  readonly facts?: OwnerRecordFacts;
+};
+
+/**
+ * The live owner's record fields the wake gate needs: its seat succession (§3.3 — is the target a
+ * fresh successor of this live seat-mate?) and its idleness (§3.4 make-room instrumentation). Read
+ * by the census's one record parse, root-level snake_case on disk.
+ */
+export type OwnerRecordFacts = {
+  readonly seatId?: string;
+  readonly holderOrdinal?: number;
+  readonly holderActive?: boolean;
+  readonly lastUsedAt?: string;
+  readonly lastPromptAt?: string;
 };
 
 export type LeaseExclusion =
@@ -206,16 +221,41 @@ export function parseLeaseBody(raw: string | undefined): LeaseBody | undefined {
   return { pid: parsed.pid, sessionId, ...leaseIdentity(parsed.processIdentity) };
 }
 
-/** The harness from the session record's `agent_command`; unknown ⇒ charged the largest floor. */
-function harnessForSession(sessionsDir: string, sessionId: string): Harness | "unknown" {
+const stringField = (value: unknown): string | undefined =>
+  typeof value === "string" && value.length > 0 ? value : undefined;
+
+function factsOf(record: Record<string, unknown>): OwnerRecordFacts {
+  const ordinal = record.holder_ordinal;
+  return {
+    seatId: stringField(record.seat_id),
+    holderOrdinal: typeof ordinal === "number" && Number.isFinite(ordinal) ? ordinal : undefined,
+    holderActive: typeof record.holder_active === "boolean" ? record.holder_active : undefined,
+    lastUsedAt: stringField(record.last_used_at),
+    lastPromptAt: stringField(record.last_prompt_at),
+  };
+}
+
+/**
+ * The harness from the session record's `agent_command` (unknown ⇒ charged the largest floor), and
+ * the record's seat and idleness facts — one read.
+ */
+function recordOfSession(
+  sessionsDir: string,
+  sessionId: string,
+): { harness: Harness | "unknown"; facts?: OwnerRecordFacts } {
   if (!/^[A-Za-z0-9._-]+$/u.test(sessionId)) {
-    return "unknown";
+    return { harness: "unknown" };
   }
-  const command = parseJsonRecord(
-    readText(path.join(sessionsDir, `${sessionId}.json`)),
-  )?.agent_command;
+  const record = parseJsonRecord(readText(path.join(sessionsDir, `${sessionId}.json`)));
+  if (!record) {
+    return { harness: "unknown" };
+  }
+  const command = record.agent_command;
   const kind = typeof command === "string" ? acpAdapterKind(command) : undefined;
-  return kind !== undefined && isHarness(kind) ? kind : "unknown";
+  return {
+    harness: kind !== undefined && isHarness(kind) ? kind : "unknown",
+    facts: factsOf(record),
+  };
 }
 
 function listLeaseFiles(queueDir: string): string[] {
@@ -376,13 +416,15 @@ export function censusOwners(inputs: CensusInputs): OwnerCensus {
   // Pass 2: each owner measured separately — no order dependence between leases.
   const owners: OwnerTree[] = leases.map((lease) => {
     const tree = measureTree(walk, lease.pid);
+    const { harness, facts } = recordOfSession(inputs.sessionsDir, lease.sessionId);
     return {
       sessionId: lease.sessionId,
       pid: lease.pid,
-      harness: harnessForSession(inputs.sessionsDir, lease.sessionId),
+      harness,
       processes: tree.processes,
       measuredBytes: tree.measuredBytes,
       self: tree.self,
+      facts,
     };
   });
   const warnings =
