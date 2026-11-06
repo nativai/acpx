@@ -53,7 +53,12 @@ async function writeRecord(seed: Seed, log?: { lines: string; count: number }): 
   const body = log
     ? {
         ...serializeSessionRecordForDisk(record),
-        messages_log: { v: 1, count: log.count, base_index: 0, bytes: Buffer.byteLength(log.lines) },
+        messages_log: {
+          v: 1,
+          count: log.count,
+          base_index: 0,
+          bytes: Buffer.byteLength(log.lines),
+        },
       }
     : serializeSessionRecordForDisk(record);
   await fs.writeFile(path.join(dir, `${seed.acpxRecordId}.json`), `${JSON.stringify(body)}\n`);
@@ -172,7 +177,7 @@ test("38465e2c: --format json omits messages; every other field matches the old 
           : ["closed", "seated", "open", "inline"],
       );
       for (const row of listed) {
-        assert.equal(Object.hasOwn(row, "messages"), false, `${String(row.acpxRecordId)}`);
+        assert.equal(Object.hasOwn(row, "messages"), false, String(row.acpxRecordId));
       }
     }
   });
@@ -181,7 +186,13 @@ test("38465e2c: --format json omits messages; every other field matches the old 
 test("38465e2c: text rows are unchanged — id, [closed], cwd, lastUsedAt, seat column", async () => {
   await withTempHome("acpx-list-local-", async (homeDir) => {
     await seedMixedStore();
-    const result = await runCli(homeDir, [AGENT, "sessions", "list", "--local", "--include-byways"]);
+    const result = await runCli(homeDir, [
+      AGENT,
+      "sessions",
+      "list",
+      "--local",
+      "--include-byways",
+    ]);
     assert.equal(result.code, 0, result.stderr);
     const expected = (await oracleListing(true))
       .map((record) => {
