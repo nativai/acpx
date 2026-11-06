@@ -629,6 +629,46 @@ export function rescueStrandedPiTranscriptForResume(params: {
 }
 
 /**
+ * The box store directory pi uses for sessions started in `cwd`
+ * (`<boxAgentDir>/sessions/--<cwd>--/`) — the same placement `resolvePiSessionDir` points a spawn at.
+ */
+export function piBoxSessionDirFor(cwd: string, env: NodeJS.ProcessEnv = process.env): string {
+  return join(resolveBoxPiAgentDir(env), "sessions", jsonlSessionDirectoryName(cwd.trim()));
+}
+
+/**
+ * Where the JSONL of pi session `acpSessionId`, started in `cwd`, is on this box: the box store
+ * first, then the stranded per-session dirs — the same search `rescueStrandedPiTranscriptForResume`
+ * makes (brick 45917618 §5.5 D7: a cross-cwd copy stages it beside the copy). `undefined` = nowhere.
+ */
+export function locatePiSessionTranscript(params: {
+  cwd: string;
+  acpSessionId: string;
+  env?: NodeJS.ProcessEnv;
+  rootDir?: string;
+}): { path: string; name: string } | undefined {
+  const target = resolveRescueTarget(params.cwd, params.acpSessionId);
+  if (!target) {
+    return undefined;
+  }
+  const env = params.env ?? process.env;
+  const boxDir = join(resolveBoxPiAgentDir(env), "sessions", target.slug);
+  const inBox = findFileWithSuffix(boxDir, target.suffix);
+  if (inBox) {
+    return { path: join(boxDir, inBox), name: inBox };
+  }
+  const root = resolveHarnessConfigDirRoot(params.rootDir, env);
+  for (const candidate of piConfigDirsUnder(root)) {
+    const sourceDir = join(root, candidate, "sessions", target.slug);
+    const name = findFileWithSuffix(sourceDir, target.suffix);
+    if (name) {
+      return { path: join(sourceDir, name), name };
+    }
+  }
+  return undefined;
+}
+
+/**
  * Copy one transcript into the box store, REFUSING to overwrite.
  *
  * ⚠️ `COPYFILE_EXCL` IS THE GUARANTEE, NOT AN `existsSync` CHECK. The two Wave 8

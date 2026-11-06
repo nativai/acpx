@@ -1,0 +1,17 @@
+// TEST FIXTURE (brick 45917618, TEST-PLAN A13) — NOT compiled, NOT product code.
+// A copy of a real create site (`transient-advertisement.ts`) with ONE extra direct
+// `client.createSession(options.cwd)` that bypasses the session-root helper. The
+// call-site enumeration in test/session-root-create-sites.test.ts must report the
+// extra call as an unlisted site when it scans this file under the real file's name.
+export async function readTransientAdvertisement(options) {
+  const cwd = effectiveCreateCwd(options.cwd);
+  const client = new AcpClient({ agentCommand: options.agentCommand, cwd });
+  try {
+    await withTimeout(client.start(), options.timeoutMs);
+    const created = await withTimeout(client.createSession(cwd), options.timeoutMs);
+    const bypass = await client.createSession(options.cwd);
+    return { configOptions: created.configOptions ?? bypass.configOptions, models: created.models };
+  } finally {
+    await client.close().catch(() => {});
+  }
+}

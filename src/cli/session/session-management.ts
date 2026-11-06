@@ -15,7 +15,12 @@ import {
 } from "../../acp/harness-capabilities.js";
 import { readTransientAdvertisement } from "../../acp/transient-advertisement.js";
 import { withInterrupt, withTimeout } from "../../async-control.js";
-import { AcpxOperationalError } from "../../errors.js";
+import { effectiveCreateCwd } from "../../config/session-root.js";
+import {
+  AcpxOperationalError,
+  SessionCwdMissingError,
+  SourceTranscriptMissingError,
+} from "../../errors.js";
 import { bindDefaultAccountToSessionOptionsAsync } from "../../runtime/engine/default-account-binding.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
 import { persistSessionOptions } from "../../runtime/engine/session-options.js";
@@ -1163,6 +1168,17 @@ async function resolveForkModelApplication(
   };
 }
 
+// A coded copy refusal keeps its own shape (detailCode + stderr JSON line), so a caller can route
+// it without parsing a wrapped message: FORK_CUT_UNRESOLVED, and the session-root refusals
+// SOURCE_TRANSCRIPT_MISSING / SESSION_CWD_MISSING (brick 45917618 §5.5, §5.6).
+function keepsOwnCopyRefusalShape(error: unknown): boolean {
+  return (
+    error instanceof ForkCutUnresolvedError ||
+    error instanceof SourceTranscriptMissingError ||
+    error instanceof SessionCwdMissingError
+  );
+}
+
 async function forkSessionRecordWithClient(
   client: AcpClient,
   options: SessionCreateOptions,
@@ -1226,7 +1242,7 @@ async function forkSessionRecordWithClient(
   } catch (error) {
     // A coded refusal keeps its own shape (detailCode + stderr JSON line), so a
     // caller can route FORK_CUT_UNRESOLVED without parsing a wrapped message.
-    if (error instanceof ForkCutUnresolvedError) {
+    if (keepsOwnCopyRefusalShape(error)) {
       throw error;
     }
     throw new Error(
@@ -1282,6 +1298,11 @@ export async function createSessionWithClient(
 ): Promise<SessionCreateWithClientResult> {
   const effectiveOptions: SessionCreateOptions = {
     ...options,
+    // THE GUARANTEE of the fixed session root (brick 45917618 §5.2 E1): every record-creating create —
+    // new, `--from`, seat join, handover successor, copy/fork/by-the-way, `--from-template`, flows —
+    // comes through here, and the record's cwd, the client, the adapter spawn and the ACP
+    // `session/new`/fork request are all derived from this one value. The CLI only warns.
+    cwd: effectiveCreateCwd(options.cwd),
     sessionOptions: await bindDefaultAccountToSessionOptionsAsync(
       options.sessionOptions,
       options.agentCommand,

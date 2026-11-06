@@ -422,7 +422,9 @@ export function registerSessionsCommand(
       "--record-id <uuid>",
       "Use this local record UUID (distinct from the adapter session id)",
     )
-    .description("Create a new session for current cwd (optionally from a template)")
+    .description(
+      "Create a new session (optionally from a template); new sessions start in the session root",
+    )
     .option(
       "-s, --name <name>",
       "Name for the new SEAT (a display label — it identifies nothing). Refused with --seat: that seat already has its name (`seats rename`).",
@@ -501,7 +503,7 @@ export function registerSessionsCommand(
         "`laatz/reviewer`; the person id form `p-…/<base>` also works). A plain name never " +
         "matches a person's template, and an unknown person is an error, never a fallback. " +
         "Inherits the template's agent type + context; the new session is a normal open session. " +
-        "Combine with --cwd to place it elsewhere and -s to name its seat.",
+        "Combine with -s to name its seat.",
       (value: string) => parseNonEmptyValue("Template id", value),
     )
     // Brick b40a9a5d — create AND enqueue the first turn in one call, through the same
@@ -516,8 +518,8 @@ export function registerSessionsCommand(
       "--prompt-file <path>",
       "As --prompt, reading the first turn from a file (use - for stdin): with --from-template " +
         "it likewise REPLACES the template's stored auto-prompt. A relative path resolves " +
-        "against the directory you run acpx in, NOT --cwd (which is where the new session " +
-        "lives). A missing, unreadable or empty file is refused and nothing is created.",
+        "against the directory you run acpx in, NOT --cwd. A missing, unreadable or empty file " +
+        "is refused and nothing is created.",
     )
     .option(
       "--no-prompt",
@@ -533,7 +535,7 @@ export function registerSessionsCommand(
 
   const closeCommand = sessionsCommand
     .command("close")
-    .description("Close session for current cwd")
+    .description("Close a session (addressed by --session-id)")
     .argument("[name]", "REFUSED — sessions are addressed by --session-id", parseSessionName)
     // D1 (brick://53437107) — the close-drain barrier's surface. Defaults keep a
     // close of an idle worker indistinguishable from before.
@@ -721,7 +723,7 @@ Closing your OWN session (run from inside it, e.g. --seat "$ACPX_SEAT_URL"):
 
   const showCommand = sessionsCommand
     .command("show")
-    .description("Show session metadata for current cwd")
+    .description("Show session metadata (addressed by --session-id)")
     .argument("[name]", "REFUSED — sessions are addressed by --session-id", parseSessionName);
   addSessionIdentityOptions(showCommand);
   showCommand.action(async function (this: Command, name: string | undefined, flags: StatusFlags) {
@@ -731,7 +733,7 @@ Closing your OWN session (run from inside it, e.g. --seat "$ACPX_SEAT_URL"):
   const setMetadataCommand = sessionsCommand
     .command("set-metadata")
     .description(
-      "Set/update a metadata entry on this cwd's session in place (e.g. brick) — no agent connection. An env-projected key reaches the agent on its next prompt/exec turn, not the in-flight one",
+      "Set/update a metadata entry on a session in place (e.g. brick) — no agent connection. An env-projected key reaches the agent on its next prompt/exec turn, not the in-flight one",
     )
     .argument("<key>", "Metadata key", (value: string) => parseNonEmptyValue("Metadata key", value))
     .argument("<value>", "Metadata value", (value: string) =>
@@ -980,9 +982,11 @@ DISPLAY LABEL and never a key — nothing resolves a holder by it.
       parseNonEmptyValue("Archive path", value),
     )
     .addOption(
-      new LocalAttributeOption("--cwd <cwd>", "Imported session cwd", "destinationCwd").argParser(
-        (value: string) => parseNonEmptyValue("Imported session cwd", value),
-      ),
+      new LocalAttributeOption(
+        "--cwd <cwd>",
+        "Imported session cwd (inert where the session root applies: imports start there)",
+        "destinationCwd",
+      ).argParser((value: string) => parseNonEmptyValue("Imported session cwd", value)),
     )
     .action(async function (this: Command, archivePath: string, flags: SessionsImportFlags) {
       await handleSessionsImport(explicitAgentName, archivePath, flags, this, config);

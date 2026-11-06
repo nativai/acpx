@@ -618,7 +618,12 @@ export function safeCwd(): string {
 export function addGlobalFlags(command: Command): Command {
   return command
     .option("--agent <command>", "Raw ACP agent command (escape hatch)")
-    .option("--cwd <dir>", "Working directory", safeCwd())
+    .option(
+      "--cwd <dir>",
+      "Base directory for relative paths (-f, --permission-policy) and .acpxrc.json. New " +
+        "sessions always start in the session root; existing sessions keep their recorded directory.",
+      safeCwd(),
+    )
     .option(
       "--auth-policy <policy>",
       "Authentication policy: skip or fail when auth is required",

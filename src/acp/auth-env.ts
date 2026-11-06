@@ -598,6 +598,23 @@ function applyAgentTypeEnvironment(env: NodeJS.ProcessEnv, agentCommand: string 
 }
 
 /**
+ * Claude Code's automatic memory is OFF for every agent acpx spawns (brick 7de83919, CONCEPTION
+ * c53cbd97 §7). With every new session at the shared session root, the memory folder is
+ * `projects/-workspace/memory/` for EVERY session of a subscription, so one agent's memory would be
+ * loaded into every other agent's prompt; the Operating System bans harness memory outright.
+ *
+ * ⚠️ AN OVERWRITE, NEVER A DEFAULT: Claude Code reads an inherited defined-falsy value (`"0"`,
+ * `"false"`) as FORCED ON, over any setting — so `??=` would let a parent's `=0` switch it back on.
+ * Unconditional (not gated on the harness): inert for Codex and Pi, and it also reaches a `claude`
+ * CLI an agent runs from its own shell. `test/auto-memory-env.test.ts` pins both.
+ */
+export const AUTO_MEMORY_OFF_ENV = "CLAUDE_CODE_DISABLE_AUTO_MEMORY";
+
+function applyAutoMemoryOff(env: NodeJS.ProcessEnv): void {
+  env[AUTO_MEMORY_OFF_ENV] = "1";
+}
+
+/**
  * The ceiling, in tokens, on how much of one tool call's output a Codex agent can
  * read back (`tool_output_token_limit`). Codex's per-call `max_output_tokens` is
  * clamped to it, and the OS include renders reach ~217 KB (≥ ~60k tokens), so a
@@ -981,6 +998,7 @@ function buildAgentEnvironment(
     delete env.CLAUDE_EFFORT;
   }
   applyAgentTypeEnvironment(env, agentCommand);
+  applyAutoMemoryOff(env);
   applyCodexToolOutputLimit(env, agentCommand);
   const baseUrl = resolveAcpxUiBaseUrl(env);
   // ⚠️ HAND THE RESOLVED VALUE DOWN — this line is why the adapters do not each own

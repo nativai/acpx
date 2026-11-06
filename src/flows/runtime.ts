@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AcpClient } from "../acp/client.js";
 import { InterruptedError, TimeoutError, withInterrupt, withTimeout } from "../async-control.js";
+import { resolveSessionRoot } from "../config/session-root.js";
 import { promptToDisplayText } from "../prompt-content.js";
 import {
   cloneSessionAcpxState,
@@ -159,6 +160,8 @@ export class FlowRunner {
   private readonly services;
   private readonly store;
   private readonly pendingPersistentSessionClients = new Map<string, AcpClient>();
+  /** Runs already told that ACP node `cwd`s are inert under the session root (§5.2 F1). */
+  private readonly nodeCwdWarnedRuns = new Set<string>();
 
   constructor(options: FlowRunnerOptions) {
     this.resolveAgent = options.resolveAgent;
@@ -779,6 +782,7 @@ export class FlowRunner {
       ...resolvedAgent,
       cwd: await resolveNodeCwd(resolvedAgent.cwd, node.cwd, context),
     };
+    this.warnNodeCwdInert(state.runId, node);
     const prompt = normalizePromptInput(await Promise.resolve(node.prompt(context)));
     const promptText = promptToDisplayText(prompt);
     updateStatusDetail(state, summarizePrompt(promptText, node.statusDetail));
@@ -790,6 +794,23 @@ export class FlowRunner {
       attemptId: state.currentAttemptId,
     });
     return { agentInfo, prompt, promptText, promptArtifact, nodeTimeoutMs };
+  }
+
+  // brick 45917618 §5.2 F1: the node `cwd` still keys the session binding (distinct cwds keep
+  // distinct sessions), but the agent session itself starts at the session root. Said once per run.
+  private warnNodeCwdInert(runId: string, node: AcpNodeDefinition): void {
+    if (node.cwd === undefined || this.nodeCwdWarnedRuns.has(runId)) {
+      return;
+    }
+    const sessionRoot = resolveSessionRoot();
+    if (!sessionRoot.enforced) {
+      return;
+    }
+    this.nodeCwdWarnedRuns.add(runId);
+    process.stderr.write(
+      `[acpx] flow ACP node cwd does not apply to its agent session: every new session starts in ` +
+        `${sessionRoot.root} (fixed session root, Daniel 2026-11-06); shell steps keep their cwd.\n`,
+    );
   }
 
   private async writeAcpPromptHeartbeat(runDir: string, state: FlowRunState): Promise<void> {
@@ -1075,7 +1096,8 @@ export class FlowRunner {
       profile: node.profile,
       agentName: agent.agentName,
       agentCommand: agent.agentCommand,
-      cwd: agent.cwd,
+      // EFFECTIVE (the session root when enforced); the binding KEY above keeps the requested cwd.
+      cwd: created.record.cwd,
       acpxRecordId: created.record.acpxRecordId,
       acpSessionId: created.record.acpSessionId,
       agentSessionId: created.record.agentSessionId,

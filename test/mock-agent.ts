@@ -2,7 +2,8 @@
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
@@ -40,6 +41,7 @@ import {
   type SessionInfo,
   type SessionModelState,
 } from "@agentclientprotocol/sdk";
+import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
 
 type ParsedCommand = {
   command: string;
@@ -1090,6 +1092,9 @@ class MockAgent implements Agent {
       sessionId,
       modelId: requestedModel,
       disallowedTools: disallowedToolsFromNewSessionMeta(params),
+      // brick 45917618: the cwd the session was ASKED for, and the one the adapter process stands in.
+      cwd: params.cwd,
+      processCwd: process.cwd(),
     });
 
     const response: NewSessionResponse = { sessionId };
@@ -1206,6 +1211,22 @@ class MockAgent implements Agent {
     const sessionId = randomUUID();
     const forkState = source ?? createSessionState(false);
     this.sessions.set(sessionId, forkState);
+    this.recordOperation({
+      method: "session/fork",
+      sourceSessionId: params.sessionId,
+      sessionId,
+      cwd: params.cwd,
+      processCwd: process.cwd(),
+      // What the real Claude adapter needs: Claude Code resumes the source from
+      // `projects/<slug(request cwd)>/<source id>.jsonl` (brick 45917618 §5.5 D6).
+      claudeTranscriptAtRequestCwd: existsSync(
+        transcriptJsonlPath(
+          process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude"),
+          params.cwd,
+          params.sessionId,
+        ),
+      ),
+    });
 
     return {
       sessionId,

@@ -20,6 +20,7 @@ import { explainTurnError, type RefusalProbeDeps } from "../../acp/openrouter-re
 import { explainPiTurnError } from "../../acp/pi-turn-error.js";
 import { InterruptedError, withInterrupt, withTimeout } from "../../async-control.js";
 import { tailClaudeSubagentJsonl } from "../../claude-jsonl.js";
+import { effectiveCreateCwd } from "../../config/session-root.js";
 import { transcriptCwdHash } from "../../config/subscription-transcript.js";
 import {
   AllSubscriptionsExhaustedError,
@@ -31,6 +32,7 @@ import {
   isSessionResumeRequiredError,
   PermissionPromptUnavailableError,
   SessionClosedError,
+  SessionCwdMissingError,
 } from "../../errors.js";
 import {
   attemptFailoverAndRetry,
@@ -1564,7 +1566,12 @@ function terminalizeTurnThatNeverStarted(
   const terminalError: DeliveryEventError = {
     code: 0,
     message: `${QUEUE_TURN_START_FAILED_MESSAGE}: ${describeTurnStartError(error)}`,
-    detailCode: QUEUE_TURN_START_FAILED_DETAIL_CODE,
+    // brick 45917618 §5.6: a gone session folder reaches the delivery entry as its OWN code,
+    // unchanged — atrium keys its terminal refusal (and the Fork & send offer) on it.
+    detailCode:
+      error instanceof SessionCwdMissingError
+        ? "SESSION_CWD_MISSING"
+        : QUEUE_TURN_START_FAILED_DETAIL_CODE,
   };
   appendDeliveryStreamEventSync(sessionRecordId, task, "failed", terminalError);
   appendRefusedStreamEventSync(sessionRecordId, task, terminalError);
@@ -4398,6 +4405,9 @@ export async function runOnce(runOptions: RunOnceOptions): Promise<RunPromptResu
   // and a literal `auto` reached the profile lookup (brick eeca6037).
   const options: RunOnceOptions = {
     ...runOptions,
+    // brick 45917618 §5.2 E2: a one-shot exec is a new agent session too — it starts at the
+    // session root, so no per-invocation-folder `projects/<slug>/` appears either.
+    cwd: effectiveCreateCwd(runOptions.cwd),
     sessionOptions: await bindDefaultAccountToSessionOptionsAsync(
       runOptions.sessionOptions,
       runOptions.agentCommand,

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { z, ZodError } from "zod";
 import { acpAdapterKind } from "../acp/agent-command.js";
+import { effectiveCreateCwd } from "../config/session-root.js";
 import { AcpxOperationalError } from "../errors.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
 import { defaultSessionEventLog, sessionEventActivePath } from "./event-log.js";
@@ -350,7 +351,9 @@ export async function importSession(
   const sessionsDir = path.join(process.env.ACPX_STATE_HOME || os.homedir(), ".acpx", "sessions");
   await fs.mkdir(sessionsDir, { recursive: true });
 
-  const cwd = resolveImportedCwd(parsed.session.cwd_relative, options.newCwd);
+  // brick 45917618 §5.2 E3: an imported session is a new agent session — it starts at the session
+  // root; `importedFrom.cwdOriginal` keeps where it came from.
+  const cwd = effectiveCreateCwd(resolveImportedCwd(parsed.session.cwd_relative, options.newCwd));
   const newRecordId = await generateRecordId(sessionsDir);
   const newRecord = buildImportedRecord(parsed, sourceRecord, {
     newRecordId,
