@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { isClaudeFamilyAgent } from "../acp/agent-command.js";
 import type { SessionRecord } from "../types.js";
-import { listSessions, sessionBaseDir, writeSessionRecord } from "./persistence.js";
+import { listSessionRecordBodies, sessionBaseDir, writeSessionRecord } from "./persistence.js";
 
 /**
  * THE ONE-SHOT SWEEP for records the account/subscription seam already wedged
@@ -272,7 +272,9 @@ function resolveSweepConfig(options: AccountSeamRepairOptions): SweepConfig {
     dryRun,
     storeDir: (options.storeDir ?? sessionBaseDir)(),
     backupDir: dryRun ? "" : (options.backupDir ?? defaultBackupDir()),
-    loadRecords: options.loadRecords ?? listSessions,
+    // Record BODIES: the sweep used to hydrate and retain every record in the store at once
+    // (brick 38465e2c). `writeSessionRecord` is a checkpoint write, which round-trips a body.
+    loadRecords: options.loadRecords ?? (async () => await listSessionRecordBodies()),
     save: options.saveRecord ?? writeSessionRecord,
     isRecordBusy: options.isRecordBusy ?? defaultIsRecordBusy,
   };

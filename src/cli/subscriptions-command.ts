@@ -35,7 +35,8 @@ import {
   persistSessionOptions,
   sessionOptionsFromRecord,
 } from "../runtime/engine/session-options.js";
-import { listSessions, writeSessionRecord } from "../session/persistence/repository.js";
+import { listSessionRecordBodies, writeSessionRecord } from "../session/persistence/repository.js";
+import type { SessionRecord } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import { parseOutputFormat, resolveGlobalFlags } from "./flags.js";
 
@@ -481,8 +482,9 @@ type SubscriptionRemoveFlags = {
   dryRun?: boolean;
 };
 
-type PinnedSession = {
-  record: Awaited<ReturnType<typeof listSessions>>[number];
+export type PinnedSession = {
+  /** The record BODY (no messages log loaded); a checkpoint write round-trips it. */
+  record: SessionRecord;
   matchesProfile: boolean;
   matchesSubscription: boolean;
 };
@@ -546,25 +548,35 @@ export function resolvePurgeDir(
   return target;
 }
 
-/** Sessions whose persisted selection still names `id`, in either slot. */
-async function findPinnedSessions(id: string): Promise<PinnedSession[]> {
-  const records = await listSessions();
-  const pinned: PinnedSession[] = [];
-  for (const record of records) {
+/**
+ * Sessions whose persisted selection still names `id`, in either slot. Scans record BODIES and
+ * keeps only the pinned ones; it used to hydrate every record in the store (brick 38465e2c).
+ * Exported for tests.
+ */
+export async function findPinnedSessions(id: string): Promise<PinnedSession[]> {
+  const pinnedTo = (record: SessionRecord) => {
     const options = sessionOptionsFromRecord(record);
-    if (!options) {
-      continue;
-    }
-    const matchesProfile = options.profile === id;
-    const matchesSubscription = options.subscription === id;
-    if (matchesProfile || matchesSubscription) {
-      pinned.push({ record, matchesProfile, matchesSubscription });
-    }
-  }
-  return pinned;
+    return { profile: options?.profile === id, subscription: options?.subscription === id };
+  };
+  const records = await listSessionRecordBodies((record) => {
+    const matches = pinnedTo(record);
+    return matches.profile || matches.subscription;
+  });
+  return records.map((record) => {
+    const matches = pinnedTo(record);
+    return {
+      record,
+      matchesProfile: matches.profile,
+      matchesSubscription: matches.subscription,
+    };
+  });
 }
 
-async function reassignPinnedSessions(pinned: PinnedSession[], toId: string): Promise<number> {
+/** Exported for tests. */
+export async function reassignPinnedSessions(
+  pinned: PinnedSession[],
+  toId: string,
+): Promise<number> {
   let count = 0;
   for (const { record, matchesProfile, matchesSubscription } of pinned) {
     const options = sessionOptionsFromRecord(record) ?? {};

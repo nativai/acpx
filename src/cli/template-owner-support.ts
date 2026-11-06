@@ -56,10 +56,10 @@ export function softRetract(record: SessionRecord, actor: PersistedActor | undef
  * `sessions templates`: machine-wide templates plus the caller's principal's own (`ACPX_PRINCIPAL_ID`);
  * machine-wide only in a bare shell. Another person's template, and an invalid key, are never listed.
  */
-export function visibleTemplateRecords(
-  records: readonly SessionRecord[],
+export function visibleTemplateRecords<T extends Pick<SessionRecord, "template">>(
+  records: readonly T[],
   env: NodeJS.ProcessEnv = process.env,
-): SessionRecord[] {
+): T[] {
   const principal = callerPrincipalId(env);
   return records.filter((record) => isVisibleTemplateKey(record.template?.slug, principal));
 }

@@ -9,7 +9,7 @@ import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
 import { defaultSessionEventLog, sessionEventActivePath } from "./event-log.js";
 import { setLoggedMessageCount } from "./messages-log-bookkeeping.js";
 import { messagesLogPath } from "./messages-log.js";
-import { listSessions, parseSessionRecord, writeSessionRecord } from "./persistence.js";
+import { listSessionRecordBodies, parseSessionRecord, writeSessionRecord } from "./persistence.js";
 
 const SUPPORTED_FORMAT_VERSION = 1;
 
@@ -258,10 +258,11 @@ function commandLooksLikeBuiltInAgent(command: string, agentName: string): boole
 }
 
 async function assertProviderSessionAvailable(record: SessionRecord): Promise<void> {
-  const existing = (await listSessions()).find(
+  // Bodies only: the check needs one field, and it used to hydrate every record in the store.
+  const existing = await listSessionRecordBodies(
     (session) => session.acpSessionId === record.acpSessionId,
   );
-  if (!existing) {
+  if (existing.length === 0) {
     return;
   }
   throw importError(

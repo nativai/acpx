@@ -23,6 +23,7 @@ export {
   isTemplateRecord,
   isoNow,
   listSessionIndexEntries,
+  listSessionRecordBodies,
   listSessions,
   listUnlistedRecordFiles,
   listSessionsForAgent,
