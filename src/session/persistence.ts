@@ -19,7 +19,6 @@ export {
   DEFAULT_HISTORY_LIMIT,
   absolutePath,
   countPruneCandidates,
-  hydrateSessionRecordMessages,
   isArchivedRecord,
   isTemplateRecord,
   isoNow,

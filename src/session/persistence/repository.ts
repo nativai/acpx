@@ -161,13 +161,10 @@ async function loadRecordFromIndexEntry(
 
 /**
  * Hydrate, in place, a record loaded as a BODY: its messages become the log's tail plus what the
- * body carries inline, exactly as `loadRecordFromIndexEntry` would have loaded it.
- *
- * ⚠️ A WRITER MUST DO THIS BEFORE IT WRITES A BODY BACK. A body's `messages` hold only the inline
- * tail, and the write path compacts the log from `record.messages`, so writing an unhydrated body
- * can cut the log down to that tail. Throws when the log exists but cannot be read.
+ * body carries inline, exactly as `loadRecordFromIndexEntry` would have loaded it. Throws when the
+ * log exists but cannot be read.
  */
-export async function hydrateSessionRecordMessages(record: SessionRecord): Promise<SessionRecord> {
+async function hydrateSessionRecordMessages(record: SessionRecord): Promise<SessionRecord> {
   return await hydrateSessionMessagesFromLog(
     record,
     messagesLogPath(sessionBaseDir(), record.acpxRecordId),
@@ -1506,8 +1503,11 @@ export async function listSessions(): Promise<SessionRecord[]> {
  * parse is dropped. No messages log is read, and a body `keep` rejects is released at once, so peak
  * heap is the pool width plus what `keep` retains.
  *
- * A body's `messages` are only its inline tail. Hydrate a record
- * (`hydrateSessionRecordMessages`) before you read its conversation or write it back.
+ * A body's `messages` are only its inline (not yet logged) tail. Writing a body back with
+ * `writeSessionRecord` round-trips it: that checkpoint write never touches the log and serializes
+ * exactly that tail. ⚠️ Never write a body with a BOUNDARY write (`writeSessionRecordAtBoundary*`):
+ * a boundary compacts the log from `record.messages`, and from a body that erases the conversation.
+ * test/session-scan-no-hydration.test.ts pins both.
  */
 export async function listSessionRecordBodies(
   keep: (record: SessionRecord) => boolean = () => true,

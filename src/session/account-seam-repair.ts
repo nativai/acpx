@@ -3,12 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { isClaudeFamilyAgent } from "../acp/agent-command.js";
 import type { SessionRecord } from "../types.js";
-import {
-  hydrateSessionRecordMessages,
-  listSessionRecordBodies,
-  sessionBaseDir,
-  writeSessionRecord,
-} from "./persistence.js";
+import { listSessionRecordBodies, sessionBaseDir, writeSessionRecord } from "./persistence.js";
 
 /**
  * THE ONE-SHOT SWEEP for records the account/subscription seam already wedged
@@ -277,14 +272,10 @@ function resolveSweepConfig(options: AccountSeamRepairOptions): SweepConfig {
     dryRun,
     storeDir: (options.storeDir ?? sessionBaseDir)(),
     backupDir: dryRun ? "" : (options.backupDir ?? defaultBackupDir()),
-    // Record BODIES, then hydrate each record just before it is written. The sweep used to
-    // hydrate and retain every record in the store at once (brick 38465e2c). ⚠️ The hydration
-    // in `save` is not optional: a body carries only its inline messages, and writing it as it
-    // is can cut the session's messages log down to that tail.
+    // Record BODIES: the sweep used to hydrate and retain every record in the store at once
+    // (brick 38465e2c). `writeSessionRecord` is a checkpoint write, which round-trips a body.
     loadRecords: options.loadRecords ?? (async () => await listSessionRecordBodies()),
-    save:
-      options.saveRecord ??
-      (async (record) => await writeSessionRecord(await hydrateSessionRecordMessages(record))),
+    save: options.saveRecord ?? writeSessionRecord,
     isRecordBusy: options.isRecordBusy ?? defaultIsRecordBusy,
   };
 }

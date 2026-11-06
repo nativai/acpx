@@ -35,11 +35,7 @@ import {
   persistSessionOptions,
   sessionOptionsFromRecord,
 } from "../runtime/engine/session-options.js";
-import {
-  hydrateSessionRecordMessages,
-  listSessionRecordBodies,
-  writeSessionRecord,
-} from "../session/persistence/repository.js";
+import { listSessionRecordBodies, writeSessionRecord } from "../session/persistence/repository.js";
 import type { SessionRecord } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import { parseOutputFormat, resolveGlobalFlags } from "./flags.js";
@@ -487,7 +483,7 @@ type SubscriptionRemoveFlags = {
 };
 
 export type PinnedSession = {
-  /** The record BODY: its messages are not loaded until a reassignment writes it back. */
+  /** The record BODY (no messages log loaded); a checkpoint write round-trips it. */
   record: SessionRecord;
   matchesProfile: boolean;
   matchesSubscription: boolean;
@@ -582,10 +578,7 @@ export async function reassignPinnedSessions(
   toId: string,
 ): Promise<number> {
   let count = 0;
-  for (const { record: body, matchesProfile, matchesSubscription } of pinned) {
-    // ⚠️ Hydrate before the write: `body` carries only its inline messages, and writing it as it
-    // is can cut the session's messages log down to that tail.
-    const record = await hydrateSessionRecordMessages(body);
+  for (const { record, matchesProfile, matchesSubscription } of pinned) {
     const options = sessionOptionsFromRecord(record) ?? {};
     persistSessionOptions(record, {
       ...options,
