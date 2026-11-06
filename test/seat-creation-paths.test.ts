@@ -1101,6 +1101,8 @@ test("item 8 / path 3 · an UNWRITABLE store still leaves a usable shadow record
   // produces (`SeatStoreUnwritableError`). This is AP15's pair for item 8 on path 3.
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
+    // brick 45917618 §5.6: an owner turn refuses a session whose cwd does not exist — a real session's does.
+    await fs.mkdir(cwd, { recursive: true });
     const sessionDir = path.join(homeDir, ".acpx", "sessions");
     await fs.mkdir(sessionDir, { recursive: true });
     // EXISTS and does not parse — the writer refuses rather than destroying it.
@@ -1235,6 +1237,8 @@ test("item 8 / path 3 · an UNWRITABLE store still leaves a usable shadow record
 test("G2/path 3 · a teammate_spawned notification mints a shadow-record seat, read back from DISK", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
+    // brick 45917618 §5.6: an owner turn refuses a session whose cwd does not exist — a real session's does.
+    await fs.mkdir(cwd, { recursive: true });
     const parentRecord: SessionRecord = makeSessionRecordFixture({
       acpxRecordId: "parent-session",
       acpSessionId: "parent-session-acp",
