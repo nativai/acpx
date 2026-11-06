@@ -7,12 +7,15 @@ import {
   listHarnessCapabilities,
   resolveHarnessCapabilities,
 } from "../acp/harness-capabilities.js";
+import { resolveSessionRoot, type SessionRoot } from "../config/session-root.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import { parseOutputFormat, resolveGlobalFlags } from "./flags.js";
 
 /** The JSON envelope. Keyed `agents` so acpx-ui can assign it to `/api/config.agents` unchanged. */
 export interface AgentsListPayload {
   agents: HarnessCapabilities[];
+  /** Where new sessions start (brick 45917618 §5.9) — atrium's ONLY source for the root. */
+  sessionRoot: SessionRoot;
 }
 
 const COLUMNS = [
@@ -141,9 +144,10 @@ function wantsJson(command: Command, format: string): boolean {
 function handleAgentsList(command: Command, config: ResolvedAcpxConfig): void {
   const { format } = resolveGlobalFlags(command, config);
   const capabilities = listHarnessCapabilities();
+  const sessionRoot = resolveSessionRoot();
 
   if (wantsJson(command, format)) {
-    const payload: AgentsListPayload = { agents: capabilities };
+    const payload: AgentsListPayload = { agents: capabilities, sessionRoot };
     process.stdout.write(`${JSON.stringify(payload)}\n`);
     return;
   }
@@ -152,6 +156,21 @@ function handleAgentsList(command: Command, config: ResolvedAcpxConfig): void {
     return;
   }
   process.stdout.write(renderTable(capabilities));
+  process.stdout.write(`${sessionRootLine(sessionRoot)}\n`);
+}
+
+const SESSION_ROOT_SOURCE_LABELS: Record<SessionRoot["source"], string> = {
+  "control-pod": "control pod",
+  env: "ACPX_SESSION_ROOT",
+  "env-off": "ACPX_SESSION_ROOT empty",
+  "not-control-pod": "not a control pod",
+};
+
+function sessionRootLine(sessionRoot: SessionRoot): string {
+  const label = SESSION_ROOT_SOURCE_LABELS[sessionRoot.source];
+  return sessionRoot.enforced
+    ? `session root: ${sessionRoot.root} (${label})`
+    : `session root: off (${label})`;
 }
 
 function handleAgentShow(command: Command, id: string, config: ResolvedAcpxConfig): void {

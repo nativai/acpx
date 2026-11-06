@@ -69,6 +69,28 @@ test("c2df657e: the scrub removes ACPX_SESSION_RECORD_ID (product-set session id
   ]);
 });
 
+test("45917618: the scrub removes ACPX_SESSION_ROOT (a rig's session-root seam), even when empty", () => {
+  for (const value of ["/workspace", ""]) {
+    const env: NodeJS.ProcessEnv = {
+      ACPX_SESSION_ROOT: value,
+      ACPX_SESSION_URL: "https://acpx.devbox.nativai.de/?session=fixture",
+      HOME: "/home/node",
+    };
+
+    const removed = scrubBoxHarnessEnvOverrides(env);
+
+    // An EMPTY value is a live setting (enforcement off), so presence — not truthiness — is swept.
+    assert.deepEqual(removed, ["ACPX_SESSION_ROOT"], JSON.stringify(value));
+    assert.deepEqual(Object.keys(env).toSorted(), [
+      NO_ENTITLEMENT_FETCH_ENV,
+      RUNTIME_INFO_PATH_ENV,
+      "ACPX_SESSION_URL",
+      "ACPX_UI_INTERNAL_URL",
+      "HOME",
+    ]);
+  }
+});
+
 test("ecfb0461: the bootstrap forbids the authenticated models/user call", () => {
   // 🛑 THE ONLY AUTHENTICATED OUTBOUND CALL acpx MAKES FOR THE MODEL SURFACE, so a
   // row reaching `loadCatalogue` without an isolated `ACPX_STATE_HOME` would resolve

@@ -186,6 +186,7 @@ import {
   withInheritedProfile,
   withInheritedOutputStyle,
   withInheritedReasoningEffort,
+  withInheritedWorktree,
 } from "./session/inherited-metadata.js";
 import { refuseCloseOverOpenPersonRequests } from "./session/open-person-requests-guard.js";
 import { mergeSessionMetadata, validateSessionMetadataValue } from "./session/session-metadata.js";
@@ -1247,7 +1248,13 @@ function buildSessionStartOptions(params: {
     // existing seat with no `--from` the creator is the seat's first holder (C8.2 rule 3; brick 509d3884 O1).
     metadata: recordPrincipal(
       withInheritedBrick(
-        applyBrickFlag(params.flags.metadata, params.resolvedBrick),
+        applyBrickFlag(
+          // §5.8 carry rule: a `--from` / handover successor continues in the old session's worktree.
+          params.from
+            ? withInheritedWorktree(params.flags.metadata, params.from.metadata)
+            : params.flags.metadata,
+          params.resolvedBrick,
+        ),
         params.inherit?.brick,
         params.resolvedBrick === false,
       ),
@@ -1343,8 +1350,13 @@ function copyMetadata(
   source: SessionRecord,
   forkAtMessageIndex: number,
   forkAtLogIndex: number | undefined,
+  requireTemplate: boolean,
 ): Record<string, string> | undefined {
-  const metadata: Record<string, string> = { ...flags.metadata };
+  // §5.8 carry rule: a copy/fork/by-the-way continues the source's work, in the source's worktree;
+  // a `--from-template` child starts new work and never inherits it.
+  const metadata: Record<string, string> = {
+    ...(requireTemplate ? flags.metadata : withInheritedWorktree(flags.metadata, source.metadata)),
+  };
   if (flags.ephemeral === true) {
     metadata.byway = "1";
     metadata.byway_parent = source.acpxRecordId;
@@ -3811,7 +3823,7 @@ async function runSessionCopy(
       metadata: withRecordedPrincipal(
         withInheritedBrick(
           applyBrickFlag(
-            copyMetadata(flags, source, forkAtMessageIndex, forkAtLogIndex),
+            copyMetadata(flags, source, forkAtMessageIndex, forkAtLogIndex, requireTemplate),
             resolvedBrick,
           ),
           caller?.brick, // spawn-parent brick (byway via --parent-id) — KEEP; the CALLER's under --no-parent
