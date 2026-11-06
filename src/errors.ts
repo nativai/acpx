@@ -194,28 +194,25 @@ function sessionCwdMissingMessage(params: {
 }
 
 /**
- * brick 45917618 §5.5 — a Pi copy whose source folder is gone: pi-acp restores the source by
- * spawning pi in that folder, so the copy cannot be made. Refused before anything is created.
+ * brick 45917618 §5.5 — a cross-cwd Pi copy whose source JSONL is in no store acpx knows, or whose
+ * `session` header acpx cannot rewrite to the destination (CONCEPTION v1.5 D7).
  */
-export class SourceCwdMissingError extends AcpxOperationalError {
-  constructor(params: { sessionId: string; cwd: string }) {
-    super(
-      `Session ${params.sessionId} cannot be copied: it is a Pi session and its working directory ` +
-        `${params.cwd} no longer exists. Start a fresh successor: acpx sessions new --from ` +
-        `${params.sessionId}.`,
-      { outputCode: "RUNTIME", detailCode: "SOURCE_CWD_MISSING", origin: "runtime" },
-    );
-  }
-}
-
-/** brick 45917618 §5.5 — a cross-cwd Pi copy whose source JSONL is in no store acpx knows. */
 export class SourceTranscriptMissingError extends AcpxOperationalError {
-  constructor(params: { sessionId?: string; acpSessionId: string; cwd: string }) {
+  constructor(params: {
+    sessionId?: string;
+    acpSessionId: string;
+    cwd: string;
+    unparseableHeaderAt?: string;
+  }) {
     const subject = params.sessionId ? `Session ${params.sessionId}` : "The source session";
+    const what = params.unparseableHeaderAt
+      ? `the Pi transcript ${params.unparseableHeaderAt} has no session header acpx can rewrite ` +
+        `(a first line with type "session" and string id and cwd)`
+      : `the Pi transcript of ACP session ${params.acpSessionId} (from ${params.cwd}) was not ` +
+        `found in the box session store or any stranded session dir`;
     super(
-      `${subject} cannot be copied: the Pi transcript of ACP session ${params.acpSessionId} ` +
-        `(from ${params.cwd}) was not found in the box session store or any stranded session dir. ` +
-        `Start a fresh successor: acpx sessions new --from ${params.sessionId ?? "<id>"}.`,
+      `${subject} cannot be copied: ${what}. Start a fresh successor: acpx sessions new --from ` +
+        `${params.sessionId ?? "<id>"}.`,
       { outputCode: "RUNTIME", detailCode: "SOURCE_TRANSCRIPT_MISSING", origin: "runtime" },
     );
   }

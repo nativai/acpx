@@ -2,7 +2,14 @@
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -1011,6 +1018,25 @@ function selectableConfigValues(option: SessionConfigOption): Set<string> {
   return values;
 }
 
+function piStagedHeaderCwd(sourceSessionId: string): string | null {
+  const dir = process.env.PI_CODING_AGENT_SESSION_DIR;
+  if (!dir) {
+    return null;
+  }
+  try {
+    const name = readdirSync(dir).find((entry) => entry.endsWith(`_${sourceSessionId}.jsonl`));
+    if (!name) {
+      return null;
+    }
+    const header = JSON.parse(readFileSync(path.join(dir, name), "utf8").split("\n")[0] ?? "") as {
+      cwd?: unknown;
+    };
+    return typeof header.cwd === "string" ? header.cwd : null;
+  } catch {
+    return null;
+  }
+}
+
 class MockAgent implements Agent {
   private readonly connection: AgentConnection;
   private readonly sessions = new Map<SessionId, SessionState>();
@@ -1226,6 +1252,9 @@ class MockAgent implements Agent {
           params.sessionId,
         ),
       ),
+      // What pi-acp would read: the source JSONL in the copy's own pi session dir, and the cwd its
+      // `session` header names (brick 45917618 §5.5 D7).
+      piStagedHeaderCwd: piStagedHeaderCwd(params.sessionId),
     });
 
     return {

@@ -4,7 +4,12 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { stageFile, stageLockPath, withStageLock } from "../src/acp/fork-source-staging.js";
+import {
+  rewritePiSessionHeaderCwd,
+  stageFile,
+  stageLockPath,
+  withStageLock,
+} from "../src/acp/fork-source-staging.js";
 import { resetCreateCwdWarnings, resolveCreateCwd } from "../src/cli/create-cwd.js";
 
 // brick 45917618 §5.5 D6/D7 — the stage lock and the staging scope a cross-cwd copy runs in
@@ -137,4 +142,33 @@ test("B4: two inert --cwd creates in one process print the warning once; request
     .filter((line) => line.includes("does not apply"));
   assert.equal(lines.length, 1);
   assert.ok(lines[0]?.startsWith("[acpx] --cwd /tmp/a does not apply to new sessions"));
+});
+
+test("D7 header rewrite: only the session header's cwd changes; every other byte is kept", () => {
+  const header = { type: "session", version: 3, id: "s-1", timestamp: "t", cwd: "/old/legacy" };
+  const rest = '{"type":"message","id":"m1"}\n{"type":"message","id":"m2"}\n';
+  const out = rewritePiSessionHeaderCwd(
+    Buffer.from(`${JSON.stringify(header)}\n${rest}`),
+    "/workspace",
+  );
+  assert.ok(out);
+  const [first, ...others] = out.toString("utf8").split("\n");
+  assert.deepEqual(JSON.parse(first ?? ""), { ...header, cwd: "/workspace" });
+  assert.equal(others.join("\n"), rest);
+});
+
+test("D8c negative: a header pi-acp could not parse is refused, never forked unrewritten", () => {
+  for (const firstLine of [
+    "not json",
+    JSON.stringify({ type: "message", id: "x", cwd: "/old" }),
+    JSON.stringify({ type: "session", cwd: "/old" }),
+    JSON.stringify({ type: "session", id: "x" }),
+    JSON.stringify({ type: "session", id: "x", cwd: 7 }),
+  ]) {
+    assert.equal(
+      rewritePiSessionHeaderCwd(Buffer.from(`${firstLine}\n{"type":"message"}\n`), "/workspace"),
+      undefined,
+      firstLine,
+    );
+  }
 });

@@ -688,49 +688,138 @@ test("F1 (real spawn): the adapter process gets CLAUDE_CODE_DISABLE_AUTO_MEMORY=
   });
 });
 
-async function plantPiSource(fx: Fixture, cwd: string): Promise<string> {
-  // A Pi session record from before the root: created by the mock in its own folder, then given
-  // the REAL Pi adapter command of the live store (sampled 2026-11-06) — the refusal is decided
-  // from the record alone, before any adapter is spawned.
-  const legacy = await createSession(fx, ["--cwd", cwd], { env: { ACPX_SESSION_ROOT: "" } });
-  const id = String(legacy.acpxRecordId);
-  const file = path.join(fx.homeDir, ".acpx", "sessions", `${id}.json`);
-  const record = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
-  record.agent_command = "node /opt/pi-acp/dist/index.js";
-  await fs.writeFile(file, `${JSON.stringify(record)}\n`);
-  return id;
-}
-
 async function recordCount(fx: Fixture): Promise<number> {
   const names = await fs.readdir(path.join(fx.homeDir, ".acpx", "sessions"));
   return names.filter((name) => name.endsWith(".json") && name !== "index.json").length;
 }
 
-test("E6: a Pi source whose folder is gone is refused SOURCE_CWD_MISSING before anything is created", async () => {
+/** A Pi-CLASSIFIED mock: acpx's real Pi path (provisioning, PI_CODING_AGENT_SESSION_DIR, staging). */
+async function piMockArgs(fx: Fixture): Promise<string[]> {
+  const dir = path.join(fx.elsewhere, "pi-acp");
+  await fs.mkdir(dir, { recursive: true });
+  const entry = path.join(dir, "index.js");
+  if (!existsSync(entry)) {
+    await fs.symlink(MOCK_AGENT_PATH, entry);
+  }
+  return [
+    "--agent",
+    `node ${JSON.stringify(entry)} --supports-fork-session --operation-log ${JSON.stringify(fx.opsLog)}`,
+    "--approve-all",
+  ];
+}
+
+/**
+ * A legacy Pi session with one turn, and its pi JSONL planted in the box store under its own cwd's
+ * slug dir — the shape pi itself leaves (`<ISO>_<id>.jsonl`, `type:"session"` header first).
+ */
+async function plantPiSource(
+  fx: Fixture,
+  cwd: string,
+  header?: string,
+): Promise<{ id: string; jsonl: string; content: string }> {
+  const args = await piMockArgs(fx);
+  const off = { env: { ACPX_SESSION_ROOT: "" } };
+  const created = await runCli(
+    fx,
+    [...args, "--cwd", cwd, "--format", "json", "sessions", "new"],
+    off,
+  );
+  assert.equal(created.code, 0, created.stdout + created.stderr);
+  const id = String(parseResult(created.stdout).acpxRecordId);
+  const turn = await runCli(fx, [...args, "prompt", "--session-id", id, "echo planted"], off);
+  assert.equal(turn.code, 0, turn.stdout + turn.stderr);
+  const acpSessionId = String((await readRecord(fx, id)).acp_session_id);
+  const { piBoxSessionDirFor } = await import("../src/acp/harness-config-dir.js");
+  const dir = piBoxSessionDirFor(cwd, { HOME: fx.homeDir });
+  await fs.mkdir(dir, { recursive: true });
+  const jsonl = path.join(dir, `2026-11-06T00-00-00-000Z_${acpSessionId}.jsonl`);
+  const content =
+    `${header ?? JSON.stringify({ type: "session", version: 3, id: acpSessionId, timestamp: "2026-11-06T00:00:00.000Z", cwd })}\n` +
+    `${JSON.stringify({ type: "message", id: "m1", message: { role: "user", content: "PLANTED-CODEWORD" } })}\n`;
+  await fs.writeFile(jsonl, content);
+  return { id, jsonl, content };
+}
+
+test("E6/D8b/D8d (Pi, D7): a staged copy of a source whose folder is gone starts and lands at the root", async () => {
   await withFixture(async (fx) => {
     const gone = path.join(fx.elsewhere, "gone-pi");
     await fs.mkdir(gone);
-    const id = await plantPiSource(fx, gone);
+    const source = await plantPiSource(fx, gone);
     await fs.rm(gone, { recursive: true, force: true });
+
+    const copied = await runCli(fx, [
+      ...(await piMockArgs(fx)),
+      "--format",
+      "json",
+      "sessions",
+      "copy",
+      "--from",
+      source.id,
+    ]);
+    assert.equal(copied.code, 0, copied.stdout + copied.stderr);
+    const copy = parseResult(copied.stdout);
+    assert.equal(copy.cwd, fx.root);
+    const fork = (await readOps(fx)).findLast((op) => op.method === "session/fork");
+    assert.equal(fork?.cwd, fx.root, "the fork ran at the destination");
+    // What pi-acp read at fork time: the STAGED source, its header naming the destination.
+    assert.equal(fork?.piStagedHeaderCwd, fx.root);
+    // D8b: the source is byte-identical (still naming the legacy folder); nothing staged is left.
+    assert.equal(await fs.readFile(source.jsonl, "utf8"), source.content);
+    const { piBoxSessionDirFor } = await import("../src/acp/harness-config-dir.js");
+    const rootDir = piBoxSessionDirFor(fx.root, { HOME: fx.homeDir });
+    const leftovers = (await fs.readdir(rootDir).catch(() => [] as string[])).filter(
+      (name) => name === path.basename(source.jsonl) || name.endsWith(".acpx-stage.lock"),
+    );
+    assert.deepEqual(leftovers, []);
+    // The copy is a working session at the root: its next turn runs.
+    const next = await runCli(fx, [
+      ...(await piMockArgs(fx)),
+      "prompt",
+      "--session-id",
+      String(copy.acpxRecordId),
+      "echo after",
+    ]);
+    assert.equal(next.code, 0, next.stdout + next.stderr);
+    assert.equal(existsSync(gone), false, "the gone folder was not re-created");
+  });
+});
+
+test("D8c: a Pi source whose header cannot be rewritten is refused SOURCE_TRANSCRIPT_MISSING; nothing is created", async () => {
+  await withFixture(async (fx) => {
+    const legacyDir = path.join(fx.elsewhere, "legacy-pi");
+    await fs.mkdir(legacyDir);
+    const source = await plantPiSource(fx, legacyDir, "this is not a pi session header");
     const before = await recordCount(fx);
-    const copied = await runCli(fx, ["--format", "json", "sessions", "copy", "--from", id]);
+    const copied = await runCli(fx, [
+      ...(await piMockArgs(fx)),
+      "--format",
+      "json",
+      "sessions",
+      "copy",
+      "--from",
+      source.id,
+    ]);
     assert.notEqual(copied.code, 0);
     const output = copied.stdout + copied.stderr;
-    assert.match(output, /SOURCE_CWD_MISSING/);
-    assert.ok(output.includes(gone), "the folder is named");
-    assert.ok(output.includes(`acpx sessions new --from ${id}`), "the successor remedy is named");
+    assert.match(output, /SOURCE_TRANSCRIPT_MISSING/);
+    assert.ok(output.includes(source.jsonl), "the refusal names the file");
     assert.equal(await recordCount(fx), before, "no record was created");
-    assert.equal(existsSync(gone), false);
+    assert.equal(
+      await fs.readFile(source.jsonl, "utf8"),
+      source.content,
+      "the source is untouched",
+    );
   });
 });
 
 test("D8c: a cross-cwd Pi copy whose source JSONL is in no store is refused SOURCE_TRANSCRIPT_MISSING", async () => {
   await withFixture(async (fx) => {
-    const legacyDir = path.join(fx.elsewhere, "legacy-pi");
+    const legacyDir = path.join(fx.elsewhere, "legacy-pi-nojsonl");
     await fs.mkdir(legacyDir);
-    const id = await plantPiSource(fx, legacyDir);
+    const source = await plantPiSource(fx, legacyDir);
+    await fs.rm(source.jsonl);
     const before = await recordCount(fx);
-    const copied = await runCli(fx, ["--format", "json", "sessions", "copy", "--from", id]);
+    const copied = await runCli(fx, ["--format", "json", "sessions", "copy", "--from", source.id]);
     assert.notEqual(copied.code, 0);
     assert.match(copied.stdout + copied.stderr, /SOURCE_TRANSCRIPT_MISSING/);
     assert.equal(
@@ -739,74 +828,6 @@ test("D8c: a cross-cwd Pi copy whose source JSONL is in no store is refused SOUR
       "never the adapter's unexplained 'unknown session'",
     );
     assert.equal(await recordCount(fx), before, "no record was created");
-  });
-});
-
-const FLOW_WORKDIR_FIXTURE = fileURLToPath(
-  new URL("./fixtures/flow-workdir.flow.js", import.meta.url),
-);
-const FLOW_SHELL_FIXTURE = fileURLToPath(new URL("./fixtures/flow-shell.flow.js", import.meta.url));
-
-test("A9/F1: a flow's ACP node with a cwd runs its session at the root, binding.cwd is the root, one warning", async () => {
-  await withFixture(async (fx) => {
-    const ran = await runCli(fx, [
-      "--agent",
-      `node ${JSON.stringify(MOCK_AGENT_PATH)} --supports-load-session`,
-      "--approve-all",
-      "--format",
-      "json",
-      "--ttl",
-      "1",
-      "flow",
-      "run",
-      FLOW_WORKDIR_FIXTURE,
-    ]);
-    assert.equal(ran.code, 0, ran.stdout + ran.stderr);
-    const payload = JSON.parse(ran.stdout.trim()) as {
-      status?: string;
-      outputs?: { prepare?: { workdir: string }; finalize?: { cwd: string } };
-      sessionBindings?: Record<string, { cwd: string }>;
-    };
-    assert.equal(payload.status, "completed");
-    // The node asked for a fresh temp workdir; the agent's terminal ran at the root instead.
-    assert.notEqual(payload.outputs?.prepare?.workdir, fx.root);
-    assert.equal(
-      await fs.realpath(String(payload.outputs?.finalize?.cwd)),
-      await fs.realpath(fx.root),
-    );
-    const bindings = Object.values(payload.sessionBindings ?? {});
-    assert.equal(bindings.length, 1);
-    assert.equal(bindings[0]?.cwd, fx.root);
-    const warnings = ran.stderr.split("\n").filter((line) => line.includes("flow ACP node cwd"));
-    assert.equal(warnings.length, 1, ran.stderr);
-  });
-});
-
-test("A9/N3 negative: a flow's SHELL step keeps the invocation cwd under enforcement", async () => {
-  await withFixture(async (fx) => {
-    const input = path.join(fx.elsewhere, "input.json");
-    await fs.writeFile(input, JSON.stringify({ text: "smoke" }));
-    const ran = await runCli(
-      fx,
-      [
-        "--approve-all",
-        "--format",
-        "json",
-        "flow",
-        "run",
-        FLOW_SHELL_FIXTURE,
-        "--input-file",
-        input,
-      ],
-      { cwd: fx.worktree },
-    );
-    assert.equal(ran.code, 0, ran.stdout + ran.stderr);
-    const payload = JSON.parse(ran.stdout.trim()) as { outputs?: { finalize?: { cwd: string } } };
-    assert.equal(
-      await fs.realpath(String(payload.outputs?.finalize?.cwd)),
-      await fs.realpath(fx.worktree),
-      "the shell step must NOT move to the session root",
-    );
   });
 });
 

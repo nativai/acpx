@@ -120,8 +120,9 @@ export async function stageFile(
   sourcePath: string,
   stagedPath: string,
   lock: StageLockHandle,
+  transform: (content: Buffer) => Buffer = (content) => content,
 ): Promise<() => Promise<void>> {
-  const content = await fs.readFile(sourcePath);
+  const content = transform(await fs.readFile(sourcePath));
   const existing = lock.tookOverStale ? undefined : await readOptional(stagedPath);
   await fs.mkdir(path.dirname(stagedPath), { recursive: true });
   await fs.writeFile(stagedPath, content);
@@ -132,6 +133,46 @@ export async function stageFile(
     }
     await fs.writeFile(stagedPath, existing);
   };
+}
+
+/**
+ * A pi session JSONL whose `type:"session"` header (its FIRST line) names `cwd` — rewritten to the
+ * copy's destination, every other byte kept (brick 45917618, CONCEPTION v1.5 §5.5 D7, HoD ruling).
+ * pi-acp's fork copies that header verbatim, and pi refuses to start a session whose stored cwd is
+ * gone ("Stored session working directory does not exist"), so without this a Pi copy at the root
+ * would die as soon as the legacy folder is reaped. Applied ONLY to the staged copy — the source
+ * file is never touched.
+ *
+ * A header pi-acp could not parse (`parseSessionHeader`: `type:"session"`, string `id` and `cwd`)
+ * is refused with `undefined`: the caller never forks from an unrewritten header.
+ */
+export function rewritePiSessionHeaderCwd(content: Buffer, cwd: string): Buffer | undefined {
+  const text = content.toString("utf8");
+  const newline = text.indexOf("\n");
+  const firstLine = newline === -1 ? text : text.slice(0, newline);
+  const header = parsePiSessionHeader(firstLine);
+  if (!header) {
+    return undefined;
+  }
+  const rewritten = JSON.stringify({ ...header, cwd });
+  return Buffer.from(newline === -1 ? rewritten : rewritten + text.slice(newline), "utf8");
+}
+
+/** pi-acp's `parseSessionHeader` shape: `type:"session"` with string `id` and `cwd`. */
+function parsePiSessionHeader(line: string): Record<string, unknown> | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+  if (typeof value !== "object" || value === null) {
+    return undefined;
+  }
+  const header = value as Record<string, unknown>;
+  const valid =
+    header.type === "session" && typeof header.id === "string" && typeof header.cwd === "string";
+  return valid ? header : undefined;
 }
 
 async function readOptional(filePath: string): Promise<Buffer | undefined> {

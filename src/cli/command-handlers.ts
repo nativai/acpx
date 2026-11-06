@@ -1,4 +1,3 @@
-import { statSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
@@ -38,7 +37,6 @@ import {
   ProfileClassMismatchError,
   ProfileUnknownError,
   SessionNotFoundError,
-  SourceCwdMissingError,
   SourceTranscriptMissingError,
   SubscriptionChangeRequiresSwitchError,
   SubscriptionLockedError,
@@ -3905,18 +3903,14 @@ async function runSessionCopy(
 }
 
 /**
- * brick 45917618 §5.5 — the two Pi copies that cannot be made, refused BEFORE anything is created:
- * the source folder is gone (pi-acp restores the source by spawning pi there), or — for a copy into
- * another cwd — the source JSONL is in no store acpx knows, so the staging has nothing to stage.
+ * brick 45917618 §5.5 — the Pi copy that cannot be made, refused BEFORE anything is created: a copy
+ * into another cwd whose source JSONL is in no store acpx knows, so the staging has nothing to stage.
+ * A source whose FOLDER is gone is copyable (CONCEPTION v1.5 D7): the staged copy's header names the
+ * destination, so pi-acp never spawns in the old folder.
  */
 function refuseUncopyablePiSource(source: SessionRecord, destinationCwd: string): void {
-  if (acpAdapterKind(source.agentCommand) !== "pi") {
-    return;
-  }
-  if (!directoryExists(source.cwd)) {
-    throw new SourceCwdMissingError({ sessionId: source.acpxRecordId, cwd: source.cwd });
-  }
   if (
+    acpAdapterKind(source.agentCommand) === "pi" &&
     path.resolve(source.cwd) !== path.resolve(destinationCwd) &&
     !locatePiSessionTranscript({ cwd: source.cwd, acpSessionId: source.acpSessionId })
   ) {
@@ -3925,14 +3919,6 @@ function refuseUncopyablePiSource(source: SessionRecord, destinationCwd: string)
       acpSessionId: source.acpSessionId,
       cwd: source.cwd,
     });
-  }
-}
-
-function directoryExists(dir: string): boolean {
-  try {
-    return statSync(dir).isDirectory();
-  } catch {
-    return false;
   }
 }
 

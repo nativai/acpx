@@ -144,7 +144,14 @@ import {
 import { isCodexAcpCommand } from "./codex-compat.js";
 import { assertControlNpxLaunchAllowed } from "./control-npx-guard.js";
 import { extractAcpError, formatAcpErrorMessage } from "./error-shapes.js";
-import { stageFile, withStageLock } from "./fork-source-staging.js";
+import { rewritePiSessionHeaderCwd, stageFile, withStageLock } from "./fork-source-staging.js";
+
+/** One cross-cwd fork's staging: what is copied where, and how the copy is rewritten on the way. */
+type CrossCwdForkStage = {
+  sourcePath: string;
+  stagedPath: string;
+  transform?: (content: Buffer) => Buffer;
+};
 import {
   HARNESS_FACTS,
   harnessIdForAgentCommand,
@@ -2550,7 +2557,7 @@ export class AcpClient {
       return await run(false);
     }
     return await withStageLock(plan.stagedPath, async (lock) => {
-      const cleanup = await stageFile(plan.sourcePath, plan.stagedPath, lock);
+      const cleanup = await stageFile(plan.sourcePath, plan.stagedPath, lock, plan.transform);
       try {
         return await run(true);
       } finally {
@@ -2563,7 +2570,7 @@ export class AcpClient {
     forkContext: ForkRequestContext,
     sourceAcpSessionId: string,
     sessionCwd: string,
-  ): Promise<{ sourcePath: string; stagedPath: string } | undefined> {
+  ): Promise<CrossCwdForkStage | undefined> {
     const sourceCwd = forkContext.sourceCwd;
     if (path.resolve(sourceCwd) === path.resolve(sessionCwd)) {
       return undefined;
@@ -2597,7 +2604,7 @@ export class AcpClient {
     sourceCwd: string,
     sourceAcpSessionId: string,
     sessionCwd: string,
-  ): { sourcePath: string; stagedPath: string } | undefined {
+  ): CrossCwdForkStage | undefined {
     const env = this.agentSpawnEnv ?? process.env;
     const located = locatePiSessionTranscript({
       cwd: sourceCwd,
@@ -2608,7 +2615,23 @@ export class AcpClient {
       throw new SourceTranscriptMissingError({ acpSessionId: sourceAcpSessionId, cwd: sourceCwd });
     }
     const stagedPath = path.join(piBoxSessionDirFor(sessionCwd, env), located.name);
-    return stagedPath === located.path ? undefined : { sourcePath: located.path, stagedPath };
+    if (stagedPath === located.path) {
+      return undefined;
+    }
+    // CONCEPTION v1.5 §5.5 D7: the staged copy's header names the DESTINATION, so pi-acp restores
+    // the source there and the fork inherits it — the copy never depends on the legacy folder.
+    const transform = (content: Buffer): Buffer => {
+      const rewritten = rewritePiSessionHeaderCwd(content, sessionCwd);
+      if (!rewritten) {
+        throw new SourceTranscriptMissingError({
+          acpSessionId: sourceAcpSessionId,
+          cwd: sourceCwd,
+          unparseableHeaderAt: located.path,
+        });
+      }
+      return rewritten;
+    };
+    return { sourcePath: located.path, stagedPath, transform };
   }
 
   private async buildForkRequestMeta(
