@@ -79,3 +79,26 @@ export async function withInterrupt<T>(
     );
   });
 }
+
+/**
+ * `map` over `items` with at most `limit` calls in flight; results keep input order. A whole-store
+ * scan uses this instead of a `Promise.all` over every record file, so peak memory and open file
+ * handles are bounded by the pool width rather than by the store.
+ */
+export async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  map: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = Array.from({ length: items.length });
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      results[index] = await map(items[index]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}

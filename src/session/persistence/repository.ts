@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { mapWithConcurrency } from "../../async-control.js";
 import {
   SessionArchivedError,
   SessionNotFoundError,
@@ -9,7 +10,12 @@ import {
 } from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { SpawnLedger, openSpawnLedgerForRecord, type DiskRecord } from "../../spawn-ledger.js";
-import type { SessionAcpxState, SessionMessage, SessionRecord } from "../../types.js";
+import type {
+  SessionAcpxState,
+  SessionListing,
+  SessionMessage,
+  SessionRecord,
+} from "../../types.js";
 import {
   isArchivedFileCorrupt,
   readArchivedFileVerified,
@@ -135,21 +141,45 @@ async function ensureSessionDir(): Promise<void> {
   await fs.mkdir(sessionBaseDir(), { recursive: true });
 }
 
+/**
+ * The record an index entry names, WITH its messages log hydrated (up to `MAX_RUNTIME_MESSAGES`
+ * messages). For one record, or a handful. Never map it over the whole store: that is what
+ * OOM-killed labidio's control pod from `sessions list --local` (brick 38465e2c). A scan reads
+ * bodies (`loadSessionRecordBodyFromIndexEntry`, `listSessionRecordBodies`) and hydrates only the
+ * records it goes on to need the conversation of, or to write back.
+ */
 async function loadRecordFromIndexEntry(
   entry: SessionIndexEntry,
 ): Promise<SessionRecord | undefined> {
   const record = await loadSessionRecordBodyFromIndexEntry(entry);
   try {
-    return record
-      ? await hydrateSessionMessagesFromLog(
-          record,
-          messagesLogPath(sessionBaseDir(), record.acpxRecordId),
-        )
-      : undefined;
+    return record ? await hydrateSessionRecordMessages(record) : undefined;
   } catch {
     return undefined;
   }
 }
+
+/**
+ * Hydrate, in place, a record loaded as a BODY: its messages become the log's tail plus what the
+ * body carries inline, exactly as `loadRecordFromIndexEntry` would have loaded it.
+ *
+ * ⚠️ A WRITER MUST DO THIS BEFORE IT WRITES A BODY BACK. A body's `messages` hold only the inline
+ * tail, and the write path compacts the log from `record.messages`, so writing an unhydrated body
+ * can cut the log down to that tail. Throws when the log exists but cannot be read.
+ */
+export async function hydrateSessionRecordMessages(record: SessionRecord): Promise<SessionRecord> {
+  return await hydrateSessionMessagesFromLog(
+    record,
+    messagesLogPath(sessionBaseDir(), record.acpxRecordId),
+  );
+}
+
+/**
+ * The cap on concurrent record-body reads in a whole-store scan. A body is small at the median
+ * (~5 KB on devbox, 2026-11-06) but reaches ~1.7 MB, so a scan reads 16 at a time rather than
+ * opening every file in the store at once.
+ */
+const SESSION_SCAN_CONCURRENCY = 16;
 
 /**
  * The record an index entry names, parsed from `<id>.json` alone. The messages log is NOT
@@ -1347,6 +1377,36 @@ async function appendMessagesLogBoundary(
   }
 }
 
+/**
+ * The one record among `entries` whose body loads, hydrated; `undefined` when no body loads, or
+ * when the single body's messages log cannot be read (the old leg dropped such a record too).
+ * Throws `ambiguous()` when more than one body loads.
+ *
+ * Bodies first, and only the winner is hydrated: a short suffix can match hundreds of entries, and
+ * the old leg hydrated every one of them before it could say "ambiguous" (brick 38465e2c). One
+ * intended difference: two bodies where one log is unreadable is now ambiguous, where the old leg
+ * returned the other record.
+ */
+async function loadUniqueRecordFromIndexEntries(
+  entries: SessionIndexEntry[],
+  ambiguous: () => Error,
+): Promise<SessionRecord | undefined> {
+  const bodies = (
+    await mapWithConcurrency(entries, SESSION_SCAN_CONCURRENCY, loadSessionRecordBodyFromIndexEntry)
+  ).filter((record) => record !== undefined);
+  if (bodies.length > 1) {
+    throw ambiguous();
+  }
+  if (bodies.length === 0) {
+    return undefined;
+  }
+  try {
+    return await hydrateSessionRecordMessages(bodies[0]);
+  } catch {
+    return undefined;
+  }
+}
+
 export async function resolveSessionRecord(sessionId: string): Promise<SessionRecord> {
   await ensureSessionDir();
 
@@ -1370,27 +1430,23 @@ export async function resolveSessionRecord(sessionId: string): Promise<SessionRe
   const exactEntries = entries.filter(
     (entry) => entry.acpxRecordId === sessionId || entry.acpSessionId === sessionId,
   );
-  const exactRecords = (
-    await Promise.all(exactEntries.map((entry) => loadRecordFromIndexEntry(entry)))
-  ).filter((entry): entry is SessionRecord => Boolean(entry));
-  if (exactRecords.length === 1) {
-    return exactRecords[0];
-  }
-  if (exactRecords.length > 1) {
-    throw new SessionResolutionError(`Multiple sessions match id: ${sessionId}`);
+  const exactRecord = await loadUniqueRecordFromIndexEntries(
+    exactEntries,
+    () => new SessionResolutionError(`Multiple sessions match id: ${sessionId}`),
+  );
+  if (exactRecord) {
+    return exactRecord;
   }
 
   const suffixEntries = entries.filter(
     (entry) => entry.acpxRecordId.endsWith(sessionId) || entry.acpSessionId.endsWith(sessionId),
   );
-  const suffixRecords = (
-    await Promise.all(suffixEntries.map((entry) => loadRecordFromIndexEntry(entry)))
-  ).filter((entry): entry is SessionRecord => Boolean(entry));
-  if (suffixRecords.length === 1) {
-    return suffixRecords[0];
-  }
-  if (suffixRecords.length > 1) {
-    throw new SessionResolutionError(`Session id is ambiguous: ${sessionId}`);
+  const suffixRecord = await loadUniqueRecordFromIndexEntries(
+    suffixEntries,
+    () => new SessionResolutionError(`Session id is ambiguous: ${sessionId}`),
+  );
+  if (suffixRecord) {
+    return suffixRecord;
   }
 
   // LAST leg, tried only after every hot-dir leg above has failed. Ordering
@@ -1422,6 +1478,12 @@ export function isoNow(): string {
   return new Date().toISOString();
 }
 
+/**
+ * ⚠️ EVERY record in the store, each HYDRATED, all retained at once. On a production store that is
+ * gigabytes of heap: no CLI path may call this (brick 38465e2c; the same load OOMed `prompt` in
+ * brick d1e12500 and `sessions owner-status --all` in brick ac0be75e). A scan uses
+ * `listSessionRecordBodies` and hydrates only what it writes back.
+ */
 export async function listSessions(): Promise<SessionRecord[]> {
   await ensureSessionDir();
   const entries = await loadSessionIndexEntries();
@@ -1438,17 +1500,57 @@ export async function listSessions(): Promise<SessionRecord[]> {
   return records;
 }
 
+/**
+ * Every record BODY in the store that passes `keep`, newest first. Membership comes from the index
+ * and every field from the record, as in `listSessions`; an entry whose body is missing or does not
+ * parse is dropped. No messages log is read, and a body `keep` rejects is released at once, so peak
+ * heap is the pool width plus what `keep` retains.
+ *
+ * A body's `messages` are only its inline tail. Hydrate a record
+ * (`hydrateSessionRecordMessages`) before you read its conversation or write it back.
+ */
+export async function listSessionRecordBodies(
+  keep: (record: SessionRecord) => boolean = () => true,
+): Promise<SessionRecord[]> {
+  const entries = await loadSessionIndexEntries();
+  const bodies = await mapWithConcurrency(entries, SESSION_SCAN_CONCURRENCY, async (entry) => {
+    const record = await loadSessionRecordBodyFromIndexEntry(entry);
+    return record && keep(record) ? record : undefined;
+  });
+  return bodies
+    .filter((record) => record !== undefined)
+    .toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
+}
+
+function withoutMessages(record: SessionRecord): SessionListing {
+  const { messages: _messages, ...listing } = record;
+  return listing;
+}
+
+/**
+ * The agent's sessions (subagents excluded), newest first, as LISTINGS: every record field except
+ * `messages`. This backs `sessions list --local` and `sessions templates`, whose `--format json`
+ * therefore carries no `messages` key (brick 38465e2c).
+ *
+ * ⚠️ DO NOT LOAD THESE THROUGH `loadRecordFromIndexEntry`. It looks like the same record with more
+ * in it; it hydrates up to 200 messages per record, for every session the agent ever had. That
+ * listing reached 1682 MiB RSS on a 224-record store and OOM-killed labidio's control pod, every
+ * agent on it included. test/sessions-list-local-bound.test.ts (the 128 MB row) goes red.
+ */
 export async function listSessionsForAgent(
   agentCommand: string,
   agentName?: string,
-): Promise<SessionRecord[]> {
+): Promise<SessionListing[]> {
   const entries = (await loadSessionIndexEntries()).filter(
     (session) =>
       matchesAgentIdentity(session, agentCommand, agentName) && session.kind !== "subagent",
   );
-  const records = await Promise.all(entries.map((entry) => loadRecordFromIndexEntry(entry)));
-  return records
-    .filter((entry): entry is SessionRecord => Boolean(entry))
+  const listings = await mapWithConcurrency(entries, SESSION_SCAN_CONCURRENCY, async (entry) => {
+    const record = await loadSessionRecordBodyFromIndexEntry(entry);
+    return record ? withoutMessages(record) : undefined;
+  });
+  return listings
+    .filter((listing) => listing !== undefined)
     .toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
 }
 
@@ -1724,8 +1826,9 @@ async function hardDeleteSessionRecord(entry: SessionIndexEntry): Promise<void> 
   // Loaded BEFORE anything is unlinked, for the manifest. If it cannot be read,
   // fall back to the index entry's own projection — `cwd` is there, and
   // `createdAt`/`closedAt` are then ABSENT from the entry, which per the schema
-  // means "we could not read it", never "it had none".
-  const record = await loadRecordFromIndexEntry(entry).catch(() => undefined);
+  // means "we could not read it", never "it had none". The body is enough: the
+  // manifest takes no messages, and the log is about to be unlinked.
+  const record = await loadSessionRecordBodyFromIndexEntry(entry);
 
   // Write-ahead, exactly as the prune path: a failure here aborts having
   // destroyed nothing.
@@ -1861,6 +1964,7 @@ async function loadEnabledTemplateRecordsSorted(): Promise<SessionRecord[]> {
   const entries = (await loadSessionIndexEntries()).filter(
     (entry) => entry.templateEnabled === true && entry.kind !== "subagent",
   );
+  // Hydrated, because the migration writes each record back; bounded by the templates alone.
   const records = (
     await Promise.all(entries.map((entry) => loadRecordFromIndexEntry(entry)))
   ).filter((record): record is SessionRecord => Boolean(record));
@@ -1941,10 +2045,17 @@ export async function listSubagentsForSession(
   const entries = (await loadSessionIndexEntries()).filter(
     (session) => session.kind === "subagent",
   );
-  const records = await Promise.all(entries.map((entry) => loadRecordFromIndexEntry(entry)));
+  // Bodies to find the children, then hydrate only those: every subagent in the store is
+  // read, but only this parent's have their messages logs loaded (brick 38465e2c).
+  const records = await mapWithConcurrency(entries, SESSION_SCAN_CONCURRENCY, async (entry) => {
+    const record = await loadSessionRecordBodyFromIndexEntry(entry);
+    if (record?.parentSessionId !== parentAcpxRecordId) {
+      return undefined;
+    }
+    return await hydrateSessionRecordMessages(record).catch(() => undefined);
+  });
   return records
-    .filter((entry): entry is SessionRecord => Boolean(entry))
-    .filter((entry) => entry.parentSessionId === parentAcpxRecordId)
+    .filter((entry) => entry !== undefined)
     .toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
 }
 
@@ -2497,7 +2608,9 @@ async function loadPrunableRecords(
   const skippedTemplates: SessionRecord[] = [];
   const cutoffIso = cutoff?.toISOString();
   for (const entry of entries) {
-    const record = await loadRecordFromIndexEntry(entry);
+    // The BODY: prune deletes files and reports ids; it never reads a conversation, and
+    // hydrating each candidate retained up to 200 messages per prunable record (brick 38465e2c).
+    const record = await loadSessionRecordBodyFromIndexEntry(entry);
     if (!record || !isBeforeCutoff(record, cutoffIso)) {
       continue;
     }

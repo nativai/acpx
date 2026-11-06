@@ -1553,7 +1553,7 @@ async function printLocalSessionsList(
  * best-effort — an unreadable store or a malformed row degrades the NAME to `(unnamed)`,
  * never the listing; a record with no seat reads `seat -`.
  */
-async function seatColumnLabeller(): Promise<(session: SessionRecord) => string> {
+async function seatColumnLabeller(): Promise<(session: Pick<SessionRecord, "seatId">) => string> {
   const store = await readSeatStore(sessionBaseDir()).catch(() => undefined);
   return (session) => {
     if (!session.seatId) {

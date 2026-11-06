@@ -2,7 +2,12 @@ import path from "node:path";
 import { resolveAcpxUiBaseUrl } from "../../acp/auth-env.js";
 import { consumeAutoSubscriptionSelection } from "../../runtime/engine/auto-subscription.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
-import type { AgentSessionListResult, OutputFormat, SessionRecord } from "../../types.js";
+import type {
+  AgentSessionListResult,
+  OutputFormat,
+  SessionListing,
+  SessionRecord,
+} from "../../types.js";
 import { backgroundTasksField, type BackgroundTasksJson } from "../background-task-gate.js";
 import { probeQueueOwnerHealth } from "../queue/ipc.js";
 import type {
@@ -66,11 +71,12 @@ async function resolveSessionConnectionStatus(
  * `sessions list` TEXT rows: `<id>[ [closed]]\t<cwd>\t<lastUsedAt>[\tseat <seat8> <name>]`.
  * The seat column (hole #7) is APPENDED so the existing positional columns keep their
  * places for any `cut -f` reader; it appears when the caller supplies `seatLabel`.
+ * JSON prints the listings whole: every record field except `messages` (brick 38465e2c).
  */
 export function printSessionsByFormat(
-  sessions: SessionRecord[],
+  sessions: SessionListing[],
   format: OutputFormat,
-  seatLabel?: (session: SessionRecord) => string,
+  seatLabel?: (session: SessionListing) => string,
 ): void {
   if (format === "json") {
     process.stdout.write(`${JSON.stringify(sessions)}\n`);
@@ -96,7 +102,7 @@ export function printSessionsByFormat(
   }
 }
 
-function printQuietSessions(sessions: SessionRecord[]): void {
+function printQuietSessions(sessions: SessionListing[]): void {
   for (const session of sessions) {
     const closedMarker = session.closed ? " [closed]" : "";
     process.stdout.write(`${session.acpxRecordId}${closedMarker}\n`);
