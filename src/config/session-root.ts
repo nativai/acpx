@@ -71,3 +71,5 @@ export function sessionRootOverrideNotice(
   return (
     `[acpx] ${SESSION_ROOT_ENV}=${value === "" ? "(empty)" : value} overrides the fixed session ` +
     `root on this control pod (test and rig use only)\n`
+  );
+}

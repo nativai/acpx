@@ -1027,4 +1027,5 @@ async function reconcileDriftedEntries(
 }
 
 export async function loadOrRebuildSessionIndex(sessionDir: string): Promise<SessionIndex> {
-  return (await reconcileSessionIndex(sessionDir)).inde
+  return (await reconcileSessionIndex(sessionDir)).index;
+}

@@ -207,4 +207,5 @@ export function withInheritedWorktree(
       inherited[key] = value;
     }
   }
-  return Object.keys(inherited).length > 0 ? { ...childMetadata, ...inherited } : childMet
+  return Object.keys(inherited).length > 0 ? { ...childMetadata, ...inherited } : childMetadata;
+}
