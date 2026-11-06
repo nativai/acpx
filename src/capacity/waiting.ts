@@ -33,9 +33,14 @@ import path from "node:path";
  *               }]
  *             }
  *
- *   Counted   only while `0 ≤ now − mtime < 5 min`: a stale file (its writer died) and one dated in
- *             the FUTURE (a clock step, a fixture) are both ignored — otherwise a dead atrium would
- *             hold every agent back forever.
+ *   Counted   only while `−2 s ≤ now − mtime < 5 min`: a stale file (its writer died) and one dated
+ *             more than 2 s in the FUTURE (a clock step, a fixture) are both ignored — otherwise a dead
+ *             atrium would hold every agent back forever. The 2 s of skew (brick 919a4a80, changed from
+ *             `0 ≤ age`) is what lets a file count in the moment it is written: `now` is a whole
+ *             millisecond while the mtime carries the fraction of the kernel tick that stamped it
+ *             (age −0.5 ms is ordinary — ~1 in 1,000 write→read pairs under load on local disk), and an
+ *             NFS mtime is the server's clock (up to ~5 ms ahead, measured). With `0 ≤ age` such a file
+ *             was ignored and W read 0 for that moment. acpx-ui's `isFreshAge` is the same comparison.
  *   Tolerant  unknown keys (top level or per item) are ignored, never rejected. A file that is not
  *             JSON, has another `schema`, or no `items` array is ignored as a whole; an item without
  *             string `key`, `kind` and `ref` is skipped. Every one of these fails OPEN: W only ever
@@ -45,6 +50,8 @@ import path from "node:path";
  */
 
 export const WAITING_FRESH_MS = 5 * 60_000;
+/** How far an mtime may run ahead of the reader's clock and still count (see "Counted" above). */
+export const WAITING_FUTURE_SKEW_MS = 2_000;
 
 export type WaitingItem = {
   readonly key: string;
@@ -88,8 +95,9 @@ function itemOf(value: unknown): WaitingItem | undefined {
 
 function isFresh(file: string, nowMs: number): boolean {
   try {
+    // ⚠️ Not `age >= 0`: a just-written file reads a fraction of a ms "in the future" (header, "Counted").
     const age = nowMs - fs.statSync(file).mtimeMs;
-    return age >= 0 && age < WAITING_FRESH_MS;
+    return age >= -WAITING_FUTURE_SKEW_MS && age < WAITING_FRESH_MS;
   } catch {
     return false;
   }
