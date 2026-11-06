@@ -4,7 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { readWaiting, WAITING_FRESH_MS, waitingDirOf } from "../src/capacity/waiting.js";
+import {
+  readWaiting,
+  WAITING_FRESH_MS,
+  WAITING_FUTURE_SKEW_MS,
+  waitingDirOf,
+} from "../src/capacity/waiting.js";
 
 // brick e8abe1e8 — the waiting dir's contract (CONCEPTION §3.2.3, §5; schema in the header of
 // src/capacity/waiting.ts). The shared fixture is the ONE body both repos test against: acpx-ui
@@ -82,6 +87,28 @@ test("NEGATIVE waiting: a file dated in the FUTURE is ignored, so a clock step c
   const now = new Date();
   const future = new Date(now.getTime() + 60_000);
   assert.equal(readWaiting(admissionDirWith({ "a.json": fixtureBody() }, future), now).count, 0);
+  const hour = new Date(now.getTime() + 3_600_000);
+  assert.equal(readWaiting(admissionDirWith({ "a.json": fixtureBody() }, hour), now).count, 0);
+  const pastSkew = new Date(now.getTime() + WAITING_FUTURE_SKEW_MS + 1);
+  assert.equal(readWaiting(admissionDirWith({ "a.json": fixtureBody() }, pastSkew), now).count, 0);
+});
+
+test("waiting: a file read in the moment it was written counts — mtime a fraction of a ms, or an NFS clock's ms, past now (brick 919a4a80)", () => {
+  const now = new Date(1_800_000_000_000);
+  const dir = admissionDirWith({ "a.json": fixtureBody() });
+  const file = path.join(waitingDirOf(dir), "a.json");
+  // The red, forced: the kernel stamped the file at T+0.47 ms; the reader's clock reads T.
+  fs.utimesSync(file, (now.getTime() + 0.47) / 1000, (now.getTime() + 0.47) / 1000);
+  assert.ok(
+    fs.statSync(file).mtimeMs > now.getTime(),
+    "the file really is dated after the reader's now",
+  );
+  assert.equal(readWaiting(dir, now).count, 2);
+  fs.utimesSync(file, (now.getTime() + 5) / 1000, (now.getTime() + 5) / 1000);
+  assert.equal(readWaiting(dir, now).count, 2, "5 ms ahead (NFS skew) counts");
+  const edge = new Date(now.getTime() + WAITING_FUTURE_SKEW_MS);
+  fs.utimesSync(file, edge, edge);
+  assert.equal(readWaiting(dir, now).count, 2, "exactly 2 s ahead is inside the skew");
 });
 
 test("NEGATIVE waiting: malformed files are ignored as a whole (fail open)", () => {
