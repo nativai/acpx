@@ -1422,9 +1422,6 @@ export class AcpClient {
   }
 
   private async resolveAgentLaunchPlan(): Promise<AgentLaunchPlan> {
-    // FIRST, before any provisioning: every adapter spawn — create, prompt, owner turn start,
-    // recover, keepwarm, config ops — converges here (brick 45917618 §5.6).
-    this.assertSessionCwdExists();
     const configuredCommand = splitCommandLine(this.options.agentCommand);
     assertControlNpxLaunchAllowed(this.options.cwd, configuredCommand);
     const resolvedBuiltInLaunch = resolveBuiltInAgentLaunch(this.options.agentCommand);
@@ -1916,6 +1913,9 @@ export class AcpClient {
   private async spawnAgentProcess(
     plan: AgentLaunchPlan,
   ): Promise<ChildProcessByStdio<Writable, Readable, Readable>> {
+    // The single adapter spawn site: every spawn for a record — create, prompt, owner turn start,
+    // recover, keepwarm, config ops — comes through here (brick 45917618 §5.6).
+    this.assertSessionCwdExists();
     const spawnedChild = spawn(
       plan.spawnCommand,
       plan.args,

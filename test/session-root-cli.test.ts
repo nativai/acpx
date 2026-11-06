@@ -478,7 +478,7 @@ test("A7: an imported session starts at the root; `sessions import --cwd` is ine
   });
 });
 
-test("G24: a copy and a --from successor carry the source's worktree; the index projects it", async () => {
+test("G23(b)/G24: worktree survives a real turn; a copy and a --from successor carry it", async () => {
   await withFixture(async (fx) => {
     const source = await createSession(fx, [], {}, [
       "--metadata",
@@ -489,6 +489,10 @@ test("G24: a copy and a --from successor carry the source's worktree; the index 
       `worktree_repo=${path.dirname(fx.worktree)}`,
     ]);
     const sourceId = String(source.acpxRecordId);
+    // G23(b): one REAL turn first — the turn path rebuilds the record, and the projection must
+    // survive it (the metadata keys are flat, outside the `record.acpx` allowlist).
+    const turn = await runCli(fx, [...agentArgs(fx), "prompt", "--session-id", sourceId, "echo t"]);
+    assert.equal(turn.code, 0, turn.stdout + turn.stderr);
     const copied = await runCli(fx, [
       ...agentArgs(fx),
       "--format",
@@ -735,5 +739,73 @@ test("D8c: a cross-cwd Pi copy whose source JSONL is in no store is refused SOUR
       "never the adapter's unexplained 'unknown session'",
     );
     assert.equal(await recordCount(fx), before, "no record was created");
+  });
+});
+
+const FLOW_WORKDIR_FIXTURE = fileURLToPath(
+  new URL("./fixtures/flow-workdir.flow.js", import.meta.url),
+);
+const FLOW_SHELL_FIXTURE = fileURLToPath(new URL("./fixtures/flow-shell.flow.js", import.meta.url));
+
+test("A9/F1: a flow's ACP node with a cwd runs its session at the root, binding.cwd is the root, one warning", async () => {
+  await withFixture(async (fx) => {
+    const ran = await runCli(fx, [
+      "--agent",
+      `node ${JSON.stringify(MOCK_AGENT_PATH)} --supports-load-session`,
+      "--approve-all",
+      "--format",
+      "json",
+      "--ttl",
+      "1",
+      "flow",
+      "run",
+      FLOW_WORKDIR_FIXTURE,
+    ]);
+    assert.equal(ran.code, 0, ran.stdout + ran.stderr);
+    const payload = JSON.parse(ran.stdout.trim()) as {
+      status?: string;
+      outputs?: { prepare?: { workdir: string }; finalize?: { cwd: string } };
+      sessionBindings?: Record<string, { cwd: string }>;
+    };
+    assert.equal(payload.status, "completed");
+    // The node asked for a fresh temp workdir; the agent's terminal ran at the root instead.
+    assert.notEqual(payload.outputs?.prepare?.workdir, fx.root);
+    assert.equal(
+      await fs.realpath(String(payload.outputs?.finalize?.cwd)),
+      await fs.realpath(fx.root),
+    );
+    const bindings = Object.values(payload.sessionBindings ?? {});
+    assert.equal(bindings.length, 1);
+    assert.equal(bindings[0]?.cwd, fx.root);
+    const warnings = ran.stderr.split("\n").filter((line) => line.includes("flow ACP node cwd"));
+    assert.equal(warnings.length, 1, ran.stderr);
+  });
+});
+
+test("A9/N3 negative: a flow's SHELL step keeps the invocation cwd under enforcement", async () => {
+  await withFixture(async (fx) => {
+    const input = path.join(fx.elsewhere, "input.json");
+    await fs.writeFile(input, JSON.stringify({ text: "smoke" }));
+    const ran = await runCli(
+      fx,
+      [
+        "--approve-all",
+        "--format",
+        "json",
+        "flow",
+        "run",
+        FLOW_SHELL_FIXTURE,
+        "--input-file",
+        input,
+      ],
+      { cwd: fx.worktree },
+    );
+    assert.equal(ran.code, 0, ran.stdout + ran.stderr);
+    const payload = JSON.parse(ran.stdout.trim()) as { outputs?: { finalize?: { cwd: string } } };
+    assert.equal(
+      await fs.realpath(String(payload.outputs?.finalize?.cwd)),
+      await fs.realpath(fx.worktree),
+      "the shell step must NOT move to the session root",
+    );
   });
 });
