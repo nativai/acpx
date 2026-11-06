@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { mapWithConcurrency } from "../../async-control.js";
 import {
   ConfigOptionQueuedWorkError,
   ConfigOptionTurnInFlightError,
@@ -1393,24 +1394,6 @@ async function ownerStatusesForEntries(
     .filter((row) => row !== undefined)
     .toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt))
     .map((row) => row.status);
-}
-
-async function mapWithConcurrency<T, R>(
-  items: T[],
-  limit: number,
-  map: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const results: R[] = Array.from({ length: items.length });
-  let next = 0;
-  const worker = async (): Promise<void> => {
-    while (next < items.length) {
-      const index = next;
-      next += 1;
-      results[index] = await map(items[index]);
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-  return results;
 }
 
 function ownerStatusBatch(

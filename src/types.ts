@@ -1480,6 +1480,12 @@ export type SessionRecord = {
   parentSeatId?: string;
 };
 
+/**
+ * A session as a listing prints it (`sessions list --local`, `sessions templates`): every record
+ * field except `messages`. A listing never loads a conversation (brick 38465e2c).
+ */
+export type SessionListing = Omit<SessionRecord, "messages">;
+
 export type RunPromptResult = {
   stopReason: StopReason;
   permissionStats: PermissionStats;
