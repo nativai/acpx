@@ -20,7 +20,15 @@ const FALLBACK_FROM = "acpx:sessions-activate";
 
 export type ActivationNoticeDelivery =
   | { delivered: true; deliveryId?: string }
-  | { delivered: false; reason: string };
+  | {
+      delivered: false;
+      reason: string;
+      /**
+       * The capacity refusal's own text (brick 2b3b259f, CONCEPTION §9 row 5b): the box had no room
+       * to wake the successor. The activation stands; the notice is to be re-sent later.
+       */
+      capacityMessage?: string;
+    };
 
 export const resolveNoticeDeliveryOrigin = resolveAcpxUiInternalOrigin;
 
@@ -34,6 +42,21 @@ export function noticeSender(env: NodeJS.ProcessEnv): string {
     return new URL(raw).searchParams.get("session") || FALLBACK_FROM;
   } catch {
     return FALLBACK_FROM;
+  }
+}
+
+/** A 503 `code:"no-capacity"` answer's `message`, verbatim — atrium relays acpx's text (§5.3). */
+function capacityMessageFrom(status: number, body: string): string | undefined {
+  if (status !== 503) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(body) as { code?: unknown; message?: unknown };
+    return parsed.code === "no-capacity" && typeof parsed.message === "string"
+      ? parsed.message
+      : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -82,6 +105,14 @@ async function postNotice(
   );
   const body = await response.text();
   if (!response.ok) {
+    const capacityMessage = capacityMessageFrom(response.status, body);
+    if (capacityMessage !== undefined) {
+      return {
+        delivered: false,
+        reason: "acpx-ui answered HTTP 503 no-capacity: no room to wake the successor",
+        capacityMessage,
+      };
+    }
     return {
       delivered: false,
       reason: `acpx-ui answered HTTP ${response.status}: ${body.slice(0, 200)}`,

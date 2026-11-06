@@ -167,7 +167,7 @@ async function holderActive(homeDir: string, id: string): Promise<unknown> {
   return stored.holder_active;
 }
 
-type Delivery = { delivered?: unknown; deliveryId?: unknown; reason?: unknown };
+type Delivery = { delivered?: unknown; deliveryId?: unknown; reason?: unknown; refusal?: unknown };
 
 function deliveryOf(result: CliResult): Delivery {
   assert.equal(result.code, 0, `${result.stderr}${result.stdout}`);
@@ -372,6 +372,54 @@ test("ND9 · a re-run of an already-completed activation writes nothing and ther
       const again = await activate(homeDir, { ACPX_UI_INTERNAL_URL: stub.url });
       assert.equal(again.code, 0, `${again.stderr}${again.stdout}`);
       assert.equal(stub.requests.length, 1, "the no-op re-run delivered a second notice");
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+test("ND10 · NO ROOM (brick 2b3b259f §9 row 5b): a 503 no-capacity prints the refusal's own text and says the activation stands; JSON carries it as `refusal`", async () => {
+  const refusal =
+    "acpx: REFUSED reason=no_capacity nothing_started=true protocol=1 wake=holder-two\nacpx: no memory to wake session holder-t: PRODUCT TEXT.";
+  await withRig(async (homeDir) => {
+    const stub = await startStub({
+      status: 503,
+      body: JSON.stringify({
+        message: refusal,
+        error: refusal,
+        code: "no-capacity",
+        reason: "no_capacity",
+      }),
+    });
+    try {
+      const text = await activate(homeDir, { ACPX_UI_INTERNAL_URL: stub.url }, [], "text");
+      assert.equal(text.code, 0, `${text.stderr}${text.stdout}`);
+      assert.match(text.stdout, /--- notice for the successor ---\n⟦SEAT-ACTIVATION⟧/);
+      assert.ok(
+        text.stdout.includes(
+          "notice NOT delivered — no room to wake the successor now; the activation stands.",
+        ),
+        text.stdout,
+      );
+      assert.ok(text.stdout.includes(refusal), "the product text, verbatim");
+      assert.equal(await holderActive(homeDir, "holder-two"), true, "the activation itself landed");
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+test("ND11 · NO ROOM (JSON): {delivered:false, reason, refusal} — `refusal` is the 503's message verbatim", async () => {
+  await withRig(async (homeDir) => {
+    const stub = await startStub({
+      status: 503,
+      body: JSON.stringify({ message: "acpx: PRODUCT TEXT.", code: "no-capacity" }),
+    });
+    try {
+      const delivery = deliveryOf(await activate(homeDir, { ACPX_UI_INTERNAL_URL: stub.url }));
+      assert.equal(delivery.delivered, false);
+      assert.match(String(delivery.reason), /503 no-capacity/);
+      assert.equal(delivery.refusal, "acpx: PRODUCT TEXT.");
     } finally {
       await stub.close();
     }
