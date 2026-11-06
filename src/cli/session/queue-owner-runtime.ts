@@ -100,6 +100,7 @@ import {
 } from "./queue-owner-process.js";
 import { runQueuedTask, type AccountSwitchTrigger } from "./runtime.js";
 import { releaseConfigDirOnTerminalClose, writeTerminalCloseRecord } from "./terminal-close.js";
+import { createSendWakeGate, type SendWakeGate } from "./wake-gate.js";
 
 // Wall-clock budget for a cold-respawn owner startup, shared across all re-spawn
 // attempts. It is a TIME bound, not a poll count: once the owner's lease exists a
@@ -1903,6 +1904,8 @@ export type SendSessionRuntimeDeps = {
   startupBudgetMs: number;
   nowMs: () => number;
   maxSpawnAttempts: number;
+  /** The wake gate (brick 2b3b259f) — injectable for tests; default `createSendWakeGate`. */
+  wakeGate?: (record: SessionRecord, options: SessionSendOptions) => SendWakeGate;
 };
 
 export const defaultSendSessionRuntimeDeps: SendSessionRuntimeDeps = {
@@ -2179,6 +2182,11 @@ export async function sendSession(
   // record twice — a refused prompt must not mutate the session it was refused by.
   const record = await resolveSessionRecord(options.sessionId);
   assertRecordOpenForCliPrompt(record, options);
+  // The wake gate (brick 2b3b259f, CONCEPTION §3.1): a send that would cold-start a released owner
+  // on a full box is refused HERE, exit 75, before the record is written — and again right before
+  // the spawn, for an owner that vanished in between (`wake-gate.ts`).
+  const wakeGate = (deps.wakeGate ?? createSendWakeGate)(record, options);
+  await wakeGate.beforePersist();
   const effectiveOptions = await persistSendOwnerOptions(record, options);
 
   const queuedToOwner = await submitToRunningOrStartingOwner(
@@ -2190,6 +2198,7 @@ export async function sendSession(
     return queuedToOwner;
   }
 
+  await wakeGate.beforeSpawn();
   return await spawnAndAwaitQueueOwner(effectiveOptions, deps);
 }
 

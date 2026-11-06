@@ -810,7 +810,7 @@ test("queue first: W = 2 with 2 gross slots — spawn gets 0 and is refused with
   assert.equal(slotsOf(agent.json, "freeSlots"), 0);
   assert.equal(slotsOf(agent.json, "slotsAfterMakeRoom"), 0);
   assert.equal(agent.json.verdict, "tight", "the human reserve is still there");
-  assert.match(String(agent.json.needMetReason), /after 2 queued automation session\(s\)/u);
+  assert.match(String(agent.json.needMetReason), /after 2 waiting item\(s\), which start first/u);
 
   const drainer = await probeJson(f, asAgent(f), ["--class", "automation", "--need", "2"]);
   assert.equal(drainer.code, 0);
@@ -830,7 +830,7 @@ test("queue first: W = 2 with 2 gross slots — spawn gets 0 and is refused with
   );
   assert.match(
     refused.stderr,
-    /Nothing was started or queued\. 2 automation sessions are queued for room ahead of new agent sessions and start first\./u,
+    /Nothing was started or queued\. 2 waiting items are queued for room ahead of new agent sessions and start first\./u,
   );
   assert.deepEqual(createdRecords(f), [], "the agent's refused create left nothing");
 
@@ -891,14 +891,14 @@ test("text: `acpx capacity` names what waits, in order — and says nothing when
   const spawnView = await runCli(["capacity"], asAgent(f), f.root);
   assert.match(
     spawnView.stdout,
-    /^waiting: 2 automation sessions queued since (?:2026-10-31 )?01:00Z \(wakeup re-baker-2026-10-31, brick run 3f2a1c… "Implement X"\) — they start before new agent sessions; the slots above already leave room for them$/mu,
+    /^waiting: 2 queued for room since (?:2026-10-31 )?01:00Z \(wakeup re-baker-2026-10-31, brick run 3f2a1c… "Implement X"\) — they start before new agent sessions; the slots above already leave room for them$/mu,
   );
   assert.match(spawnView.stdout, /^tight: 0 new claude sessions/mu);
   const drainerView = await runCli(["capacity", "--class", "automation"], asAgent(f), f.root);
   assert.match(drainerView.stdout, /^room: 2 new claude sessions/mu);
   assert.match(
     drainerView.stdout,
-    /^waiting: 2 automation sessions .* class automation: the slots above are gross/mu,
+    /^waiting: 2 queued for room .* class automation: the slots above are gross/mu,
   );
 });
 

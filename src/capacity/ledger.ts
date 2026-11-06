@@ -73,8 +73,16 @@ export type PendingEntry = {
   readonly instance: string;
   readonly admitterPid: number;
   readonly admitterIdentity?: Record<string, unknown>;
-  readonly kind: "create";
+  /**
+   * `wake` (brick 2b3b259f, CONCEPTION §3.4): a released session's owner start, key `wake:<recordId>`,
+   * bound from admission on (`boundAt` = `admittedAt`), 180 s whatever its class, and spent ONLY by a
+   * turn — never by `closed` (see {@link sessionSpent}). An older reader's `isEntry` checks no `kind`,
+   * so it counts a wake entry like a bound create until its TTL.
+   */
+  readonly kind: EntryKind;
 };
+
+export type EntryKind = "create" | "wake";
 
 /** Thrown by the lock policy on timeout — the gate turns it into `admission_busy` (§3.3). */
 export class AdmissionLockTimeoutError extends Error {
@@ -261,8 +269,19 @@ export function boundEntry(entry: PendingEntry, sessionId: string, now: Date): P
  * N1 (CONCEPTION e8abe1e8, review re-check): has the bound session already RUN — a turn started at
  * or after `boundAt` (`last_prompt_at`), or the record is closed? A missing or unreadable record is
  * not spent: the reservation keeps counting until its TTL (rounds up, §9).
+ *
+ * ⚠️ A WAKE IS NEVER SPENT BY `closed` (brick 2b3b259f, CONCEPTION §3.4). atrium admits a `--reopen`
+ * send while its target is still closed and reopens it only afterwards: the create rule would prune
+ * that reservation at the very next decision and a second wake could take the same memory. Row
+ * "wake ledger: a wake for a CLOSED record survives a concurrent decision" in
+ * test/capacity-wake.test.ts.
  */
-function sessionSpent(sessionsDir: string, sessionId: string, boundAt: string): boolean {
+function sessionSpent(
+  sessionsDir: string,
+  sessionId: string,
+  boundAt: string,
+  kind: EntryKind | undefined,
+): boolean {
   let record: unknown;
   try {
     record = JSON.parse(readFileSync(path.join(sessionsDir, `${sessionId}.json`), "utf8"));
@@ -272,7 +291,7 @@ function sessionSpent(sessionsDir: string, sessionId: string, boundAt: string): 
   if (!isRecordObject(record)) {
     return false;
   }
-  if (record.closed === true) {
+  if (record.closed === true && kind !== "wake") {
     return true;
   }
   const lastPrompt = typeof record.last_prompt_at === "string" ? record.last_prompt_at : "";
@@ -292,7 +311,7 @@ export function reservationsOf(
       bytes: entry.bytes,
       admitterAlive: admitterAlive(entry),
       bound,
-      spent: bound && sessionSpent(sessionsDir, sessionId, boundAt),
+      spent: bound && sessionSpent(sessionsDir, sessionId, boundAt, entry.kind),
     };
   });
 }
@@ -305,8 +324,12 @@ export function newEntry(params: {
   admissionClass: AdmissionClass;
   origin: string;
   now: Date;
+  /** Default `create`. A `wake` is bound at admission and lives 180 s whatever its class. */
+  kind?: EntryKind;
 }): PendingEntry {
   const identity = getOwnProcessIdentity();
+  const kind = params.kind ?? "create";
+  const ttlMs = kind === "wake" ? ADMISSION_TTL_MS : ttlFor(params.admissionClass);
   return {
     key: params.key,
     ...(params.sessionId ? { sessionId: params.sessionId } : {}),
@@ -315,11 +338,12 @@ export function newEntry(params: {
     class: params.admissionClass,
     origin: params.origin,
     admittedAt: params.now.toISOString(),
-    expiresAt: new Date(params.now.getTime() + ttlFor(params.admissionClass)).toISOString(),
+    expiresAt: new Date(params.now.getTime() + ttlMs).toISOString(),
+    ...(kind === "wake" ? { boundAt: params.now.toISOString() } : {}),
     instance: containerInstance(),
     admitterPid: process.pid,
     ...(identity ? { admitterIdentity: serializeProcessBirthIdentity(identity) } : {}),
-    kind: "create",
+    kind,
   };
 }
 
