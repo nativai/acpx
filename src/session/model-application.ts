@@ -389,7 +389,7 @@ function currentModeIdFrom(
  * names a rung. Groups are FLATTENED rather than skipped — a harness that groups
  * its rungs must not read as advertising an empty ladder.
  */
-function flattenSelectValues(entries: readonly unknown[]): AdvertisedSelectValue[] {
+export function flattenSelectValues(entries: readonly unknown[]): AdvertisedSelectValue[] {
   const flat: AdvertisedSelectValue[] = [];
   for (const entry of entries) {
     const group = entry as { options?: unknown };
