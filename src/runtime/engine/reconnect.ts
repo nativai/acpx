@@ -496,6 +496,8 @@ export async function connectAndLoadSession(
   let pendingAgentSessionId = record.agentSessionId;
   let sessionModels: import("../../acp/client.js").SessionLoadResult["models"];
 
+  // brick e0fc06d8 — see the capture after the replay below.
+  const advertisedMark = client.markAdvertisement();
   const loadState = await loadOrCreateRuntimeSession({
     client,
     record,
@@ -524,6 +526,22 @@ export async function connectAndLoadSession(
     sessionModels,
     timeoutMs: options.timeoutMs,
     verbose: options.verbose,
+  });
+
+  // brick e0fc06d8 (DESIGN-R2 §B, GB1/GB2) — store the LAST list the adapter advertised during THIS
+  // connect, the replay included. The resume/load response above advertises the adapter's own
+  // default model, not the session's pin: measured on claude-agent-acp 356a1ed, `session/resume`
+  // says `model: default` for a sonnet- or opus-pinned session, and only the replayed
+  // `session/set_model <pin>` pushes the served model's list and effort ladder (MEASUREMENT
+  // P1/P1b/P3); P2, the no-replay control, advertises nothing after the resume, so its record keeps
+  // the resume list. pi-acp pushes the same way on set_model/set_mode/set_config_option.
+  //
+  // ⚠️ `advertisedConfigOptionsSince(mark)`, NEVER `getAdvertisedConfigOptions()`: a reused client
+  // can still hold the previous adapter process's last list (GB2). A throwing replay never reaches
+  // this line, so the record keeps the list that honestly describes what the adapter serves.
+  // Rows "NB1"–"NB3" in test/post-replay-advertisement.test.ts.
+  applyConfigOptionsToRecord(record, {
+    configOptions: client.advertisedConfigOptionsSince(advertisedMark),
   });
 
   // brick://874fee67 turn-boundary spec §3, corrected by F6 — the primary stamp
