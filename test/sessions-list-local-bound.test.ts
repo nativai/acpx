@@ -280,7 +280,10 @@ async function seedLaggingStore(): Promise<void> {
 }
 
 const LAG_LISTINGS: Array<{ label: string; args: string[] }> = [
-  { label: "sessions list --local", args: ["--format", "json", AGENT, "sessions", "list", "--local"] },
+  {
+    label: "sessions list --local",
+    args: ["--format", "json", AGENT, "sessions", "list", "--local"],
+  },
   { label: "sessions templates", args: ["--format", "json", AGENT, "sessions", "templates"] },
 ];
 
