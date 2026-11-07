@@ -113,6 +113,7 @@ import type {
   SessionRecord,
   SessionSetDepthResult,
   SessionUserContent,
+  SetValidatedAgainst,
   PermissionPolicy,
 } from "../types.js";
 import {
@@ -1924,9 +1925,21 @@ function printCancelResultByFormat(
   process.stdout.write(result.cancelled ? "cancel requested\n" : "nothing to cancel\n");
 }
 
+/** brick 5c44d8ba: which check vouched for the set — JSON only, and only when the setter said. */
+function validatedAgainstField(validatedAgainst: SetValidatedAgainst | undefined): {
+  validatedAgainst?: SetValidatedAgainst;
+} {
+  return validatedAgainst ? { validatedAgainst } : {};
+}
+
 function printSetModeResultByFormat(
   modeId: string,
-  result: { record: SessionRecord; resumed: boolean; loadError?: string },
+  result: {
+    record: SessionRecord;
+    resumed: boolean;
+    loadError?: string;
+    validatedAgainst?: SetValidatedAgainst;
+  },
   format: OutputFormat,
 ): void {
   if (
@@ -1934,6 +1947,7 @@ function printSetModeResultByFormat(
       action: "mode_set",
       modeId,
       resumed: result.resumed,
+      ...validatedAgainstField(result.validatedAgainst),
       acpxRecordId: result.record.acpxRecordId,
       acpxSessionId: result.record.acpSessionId,
       agentSessionId: result.record.agentSessionId,
@@ -1952,6 +1966,7 @@ function printSetModelResultByFormat(
     ownerRestarted?: boolean;
     ownerRestartSkipped?: string;
     reap?: ReapReport;
+    validatedAgainst?: SetValidatedAgainst;
   },
   format: OutputFormat,
 ): void {
@@ -1960,6 +1975,7 @@ function printSetModelResultByFormat(
       action: "model_set",
       modelId,
       resumed: result.resumed,
+      ...validatedAgainstField(result.validatedAgainst),
       ownerRestarted: result.ownerRestarted ?? false,
       ...(result.ownerRestartSkipped ? { ownerRestartSkipped: result.ownerRestartSkipped } : {}),
       ...reportOwnerRecycleReap(result.record.acpxRecordId, result.reap, format),
@@ -1983,6 +1999,7 @@ function printSetConfigOptionResultByFormat(
     ownerRestarted?: boolean;
     ownerRestartSkipped?: string;
     reap?: ReapReport;
+    validatedAgainst?: SetValidatedAgainst;
   },
   format: OutputFormat,
 ): void {
@@ -1992,6 +2009,7 @@ function printSetConfigOptionResultByFormat(
       configId,
       value,
       resumed: result.resumed,
+      ...validatedAgainstField(result.validatedAgainst),
       ownerRestarted: result.ownerRestarted ?? false,
       ...(result.ownerRestartSkipped ? { ownerRestartSkipped: result.ownerRestartSkipped } : {}),
       ...reportOwnerRecycleReap(result.record.acpxRecordId, result.reap, format),
@@ -2370,6 +2388,7 @@ function depthSetJsonPayload(result: SessionSetDepthResult): Record<string, unkn
     ...(projection.value !== undefined ? { served: projection.value } : {}),
     ...(projection.appliedId !== undefined ? { appliedModeId: projection.appliedId } : {}),
     ...(projection.reason !== undefined ? { reason: projection.reason } : {}),
+    ...validatedAgainstField(result.validatedAgainst),
     acpxRecordId: result.record.acpxRecordId,
     acpSessionId: result.record.acpSessionId,
     agentSessionId: result.record.agentSessionId,
