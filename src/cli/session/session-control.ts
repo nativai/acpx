@@ -146,18 +146,22 @@ export async function setSessionMode(
   }
 
   // G4: a mode is never record-only — its replay is the one that kills a turn.
-  await gateSetConnect(await resolveSessionRecord(options.sessionId), "mode");
-  const direct = await runSessionSetModeDirect({
-    sessionRecordId: options.sessionId,
-    modeId: options.modeId,
-    mcpServers: options.mcpServers,
-    nonInteractivePermissions: options.nonInteractivePermissions,
-    authCredentials: options.authCredentials,
-    authPolicy: options.authPolicy,
-    terminal: options.terminal,
-    timeoutMs: options.timeoutMs,
-    verbose: options.verbose,
-  });
+  const direct = await gateSetConnect(
+    await resolveSessionRecord(options.sessionId),
+    "mode",
+    async () =>
+      await runSessionSetModeDirect({
+        sessionRecordId: options.sessionId,
+        modeId: options.modeId,
+        mcpServers: options.mcpServers,
+        nonInteractivePermissions: options.nonInteractivePermissions,
+        authCredentials: options.authCredentials,
+        authPolicy: options.authPolicy,
+        terminal: options.terminal,
+        timeoutMs: options.timeoutMs,
+        verbose: options.verbose,
+      }),
+  );
   return { ...direct, validatedAgainst: "adapter" };
 }
 
@@ -320,18 +324,22 @@ export async function setSessionModel(
   } else if (recordOnlyModelVerdict(record).kind === "record") {
     result = await setSessionModelOnRecord(options, !ownerToRecycle);
   } else {
-    await gateSetConnect(record, "model");
-    const direct = await runSessionSetModelDirect({
-      sessionRecordId: options.sessionId,
-      modelId: options.modelId,
-      mcpServers: options.mcpServers,
-      nonInteractivePermissions: options.nonInteractivePermissions,
-      authCredentials: options.authCredentials,
-      authPolicy: options.authPolicy,
-      terminal: options.terminal,
-      timeoutMs: options.timeoutMs,
-      verbose: options.verbose,
-    });
+    const direct = await gateSetConnect(
+      record,
+      "model",
+      async () =>
+        await runSessionSetModelDirect({
+          sessionRecordId: options.sessionId,
+          modelId: options.modelId,
+          mcpServers: options.mcpServers,
+          nonInteractivePermissions: options.nonInteractivePermissions,
+          authCredentials: options.authCredentials,
+          authPolicy: options.authPolicy,
+          terminal: options.terminal,
+          timeoutMs: options.timeoutMs,
+          verbose: options.verbose,
+        }),
+    );
     result = { ...direct, validatedAgainst: "adapter" };
   }
 
@@ -472,19 +480,23 @@ async function setSessionConfigOptionWithoutOwner(
   if (recordOnlyConfigOptionVerdict(record, options.configId, options.value).kind === "record") {
     return await setSessionConfigOptionOnRecord(options, record, mayRecycleLateOwner);
   }
-  await gateSetConnect(record, options.configId);
-  const direct = await runSessionSetConfigOptionDirect({
-    sessionRecordId: options.sessionId,
-    configId: options.configId,
-    value: options.value,
-    mcpServers: options.mcpServers,
-    nonInteractivePermissions: options.nonInteractivePermissions,
-    authCredentials: options.authCredentials,
-    authPolicy: options.authPolicy,
-    terminal: options.terminal,
-    timeoutMs: options.timeoutMs,
-    verbose: options.verbose,
-  });
+  const direct = await gateSetConnect(
+    record,
+    options.configId,
+    async () =>
+      await runSessionSetConfigOptionDirect({
+        sessionRecordId: options.sessionId,
+        configId: options.configId,
+        value: options.value,
+        mcpServers: options.mcpServers,
+        nonInteractivePermissions: options.nonInteractivePermissions,
+        authCredentials: options.authCredentials,
+        authPolicy: options.authPolicy,
+        terminal: options.terminal,
+        timeoutMs: options.timeoutMs,
+        verbose: options.verbose,
+      }),
+  );
   return { ...direct, validatedAgainst: "adapter" };
 }
 
@@ -525,18 +537,22 @@ export async function setSessionDepth(
   }
 
   // DESIGN §2: pi depth needs a live ladder projection — gated, never record-only.
-  await gateSetConnect(await resolveSessionRecord(options.sessionId), "effort");
-  const direct = await runSessionSetDepthDirect({
-    sessionRecordId: options.sessionId,
-    requested: options.requested,
-    mcpServers: options.mcpServers,
-    nonInteractivePermissions: options.nonInteractivePermissions,
-    authCredentials: options.authCredentials,
-    authPolicy: options.authPolicy,
-    terminal: options.terminal,
-    timeoutMs: options.timeoutMs,
-    verbose: options.verbose,
-  });
+  const direct = await gateSetConnect(
+    await resolveSessionRecord(options.sessionId),
+    "effort",
+    async () =>
+      await runSessionSetDepthDirect({
+        sessionRecordId: options.sessionId,
+        requested: options.requested,
+        mcpServers: options.mcpServers,
+        nonInteractivePermissions: options.nonInteractivePermissions,
+        authCredentials: options.authCredentials,
+        authPolicy: options.authPolicy,
+        terminal: options.terminal,
+        timeoutMs: options.timeoutMs,
+        verbose: options.verbose,
+      }),
+  );
   return { ...direct, validatedAgainst: "adapter" };
 }
 

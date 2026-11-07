@@ -1123,6 +1123,34 @@ async function admitInteractiveWake(ctx: WakeContext): Promise<WakeDecision> {
 }
 
 /**
+ * brick 5c44d8ba (HoD decision 2026-11-07): an admitted ownerless `set` holds its `wake:` entry only
+ * while its direct connect runs. That adapter is closed before the verb returns, so the entry would
+ * otherwise charge a whole spawn for the wake TTL (180 s) after a few seconds' transient, refusing
+ * other agents' work on a near-full box. Removes exactly the entry this admission wrote (key AND
+ * expiry, so a later re-admission's entry survives); best effort, like a create ticket's release —
+ * a failure only over-reserves until the TTL.
+ */
+export async function releaseAdmittedWake(
+  admitted: { readonly key: string; readonly expiresAt: string },
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  const dir = admissionDir(env);
+  try {
+    await withAdmissionLock(dir, async () => {
+      const entries = await readLedgerFile(dir);
+      await writeLedgerFile(
+        dir,
+        entries.filter(
+          (entry) => entry.key !== admitted.key || entry.expiresAt !== admitted.expiresAt,
+        ),
+      );
+    });
+  } catch {
+    // Best effort: an unreleased entry is dropped at its TTL — over-reserving, never under.
+  }
+}
+
+/**
  * Admit the wake of a session whose owner is not running, or refuse it. Never throws for a
  * decision: a refusal is `{decision: "refused", error, refusal}` — `sendSession` throws the error
  * (exit 75), `admit-wake` prints the refusal. The caller has already found no live or starting owner.

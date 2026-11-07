@@ -120,16 +120,32 @@ export function createSendWakeGate(
  * record untouched and starts nothing (G6). A person — no agent identity, or class `interactive` —
  * is never refused; `admitWake` decides that, exactly as for a wake.
  *
- * ⚠️ DO NOT MOVE THIS BELOW THE DIRECT CALL OR INTO IT. The adapter starts inside the connect; a
- * gate there would run after the memory it guards was taken. Row "N6" in
- * test/record-only-set-gate.test.ts.
+ * An ADMITTED entry is released when `connect` ends, on success or failure (HoD decision
+ * 2026-11-07): the adapter is gone by then, and a held spawn-sized entry would refuse other work for
+ * the wake TTL. It is kept only if an owner may now be running for the session — a prompt that
+ * arrived meanwhile reused this reservation ("already-reserved") and its turn spends it.
+ *
+ * ⚠️ DO NOT MOVE THE GATE BELOW THE CONNECT OR INTO IT. The adapter starts inside the connect; a
+ * gate there would run after the memory it guards was taken. Rows "set gate:" in
+ * test/capacity-wake.test.ts.
  */
-export async function gateSetConnect(record: SessionRecord, setting: string): Promise<void> {
-  const { admitWake } = await import("../../capacity/admission.js");
+export async function gateSetConnect<T>(
+  record: SessionRecord,
+  setting: string,
+  connect: () => Promise<T>,
+): Promise<T> {
+  const { admitWake, releaseAdmittedWake } = await import("../../capacity/admission.js");
   const decision = await admitWake(
     wakeRequestFor(record, { verb: "set", setting, sender: callerSessionId() }),
   );
   if (decision.decision === "refused") {
     throw decision.error;
+  }
+  try {
+    return await connect();
+  } finally {
+    if (decision.decision === "admitted" && !(await ownerMayBeRunning(record.acpxRecordId))) {
+      await releaseAdmittedWake(decision);
+    }
   }
 }
