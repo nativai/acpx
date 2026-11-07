@@ -38,6 +38,7 @@ import {
 import { principalContextFields } from "../../session/persistence/principal.js";
 import { seatDisplayName } from "../../session/seat-display-name.js";
 import {
+  bindTurnOwnWrites,
   settingsBindingFingerprint,
   withoutSettingsFlags,
 } from "../../session/settings-binding.js";
@@ -1879,6 +1880,17 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           );
         }
       });
+      // brick 6e27669f F1 — what this turn wrote from its own options (a per-task `--model`, the
+      // spawn-time flags) is already served by the client: bind it, so the next turn does not
+      // rebind for it. An outside change stays pending (bindTurnOwnWrites).
+      const afterTurn = await resolveSessionRecord(options.sessionId).catch(() => undefined);
+      if (afterTurn) {
+        boundSettings = bindTurnOwnWrites(
+          boundSettings,
+          afterTurn,
+          mergeSessionOptions(task.sessionOptions, ownerSessionOptions),
+        );
+      }
       // Restart idle drain to capture teammate activity until next prompt
       idleDrain = await startIdleStreamDrain();
       // W13-24-14 Phase 2 — the owner just became idle: (re)start the

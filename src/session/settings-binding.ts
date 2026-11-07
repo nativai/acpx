@@ -17,12 +17,7 @@ import type { SessionRecord } from "../types.js";
  * breadcrumbs, `floor_hard`).
  */
 export function settingsBindingFingerprint(record: SessionRecord): string {
-  const options = record.acpx?.session_options ?? {};
-  const desired = record.acpx?.desired_config_options ?? {};
-  return JSON.stringify([
-    ...BOUND_SESSION_OPTIONS.map((field) => options[field] ?? null),
-    ...BOUND_DESIRED_CONFIG_OPTIONS.map((id) => desired[id] ?? null),
-  ]);
+  return JSON.stringify(settingsBindingSlots(record));
 }
 
 const BOUND_SESSION_OPTIONS = [
@@ -37,6 +32,61 @@ const BOUND_SESSION_OPTIONS = [
 ] as const;
 
 const BOUND_DESIRED_CONFIG_OPTIONS = ["effort", "reasoning_effort", "outputStyle"] as const;
+
+type BindingSlots = Array<[slot: string, value: unknown]>;
+
+function settingsBindingSlots(record: SessionRecord): BindingSlots {
+  const options = record.acpx?.session_options ?? {};
+  const desired = record.acpx?.desired_config_options ?? {};
+  return [
+    ...BOUND_SESSION_OPTIONS.map((field): [string, unknown] => [
+      `session_options.${field}`,
+      options[field] ?? null,
+    ]),
+    ...BOUND_DESIRED_CONFIG_OPTIONS.map((id): [string, unknown] => [
+      `desired_config_options.${id}`,
+      desired[id] ?? null,
+    ]),
+  ];
+}
+
+// The slots a turn writes from its OWN options (a per-task `prompt --model X` /
+// `--reasoning-effort`, or the owner's spawn-time flags): `applyPromptModelIfAdvertised` pins the
+// model, the effort application writes both effort slots.
+const TURN_OWN_WRITES: ReadonlyArray<readonly [slot: string, option: "model" | "reasoningEffort"]> =
+  [
+    ["session_options.model", "model"],
+    ["session_options.effort", "reasoningEffort"],
+    ["desired_config_options.effort", "reasoningEffort"],
+  ];
+
+/**
+ * brick 6e27669f F1 — the binding after a turn that wrote settings from its own options. The
+ * client already serves those values (the turn applied them live), so they are bound: without this
+ * the NEXT turn saw "the record moved" and rebound for nothing, killing the session's live
+ * background tasks (9df709f4 VERIFICATION F1: one restart per `--model` switch).
+ *
+ * ⚠️ PER SLOT, AND ONLY WHERE THE RECORD HOLDS EXACTLY THE TURN'S OWN VALUE. A blanket re-baseline
+ * at turn end would swallow an outside set that landed mid-turn (an output style, or a set whose
+ * turn-in-flight check went stale) — GA2 says that set rebinds the next turn. A slot whose record
+ * value differs from the turn's own value is left alone, so that set still rebinds. Rows "F1" in
+ * test/settings-rebind.test.ts.
+ */
+export function bindTurnOwnWrites(
+  bound: string,
+  record: SessionRecord,
+  turnOptions: SessionAgentOptions | undefined,
+): string {
+  const slots = new Map(JSON.parse(bound) as BindingSlots);
+  const now = new Map(settingsBindingSlots(record));
+  for (const [slot, option] of TURN_OWN_WRITES) {
+    const own = turnOptions?.[option];
+    if (own !== undefined && now.get(slot) === own) {
+      slots.set(slot, own);
+    }
+  }
+  return JSON.stringify([...slots]);
+}
 
 const SETTINGS_FLAG_KEYS = [
   "model",

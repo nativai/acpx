@@ -42,7 +42,7 @@ import {
 import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
 import { resolveSessionRecord } from "../src/session/persistence/repository.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence/serialize.js";
-import { settingsBindingFingerprint } from "../src/session/settings-binding.js";
+import { bindTurnOwnWrites, settingsBindingFingerprint } from "../src/session/settings-binding.js";
 import type { SessionAcpxState, SessionRecord } from "../src/types.js";
 import {
   closeServer,
@@ -893,3 +893,106 @@ for (const change of [
     }
   });
 }
+
+// ---------------------------------------------------------------------------------------------
+// F1 (9df709f4 VERIFICATION) — a turn's own per-task `--model` must not make the next turn rebind
+// (which kills the session's live background tasks); an outside set still must.
+// ---------------------------------------------------------------------------------------------
+
+test("F1 unit: a turn's own writes are bound slot by slot; an outside change stays pending", () => {
+  const record = (session_options: Record<string, unknown>, desired?: Record<string, string>) =>
+    makeSessionRecord({
+      acpxRecordId: "f1",
+      acpSessionId: "f1",
+      agentCommand: CLAUDE_CMD,
+      cwd: "/",
+      acpx: {
+        session_options,
+        ...(desired ? { desired_config_options: desired } : {}),
+      } as SessionAcpxState,
+    });
+  const bound = settingsBindingFingerprint(record({ model: "haiku" }));
+  // The turn's own --model sonnet, written by the turn: bound.
+  const own = record({ model: "sonnet" });
+  assert.equal(bindTurnOwnWrites(bound, own, { model: "sonnet" }), settingsBindingFingerprint(own));
+  // The record holds a value the turn did NOT ask for (an outside set): still pending.
+  const outside = record({ model: "opus" });
+  assert.notEqual(
+    bindTurnOwnWrites(bound, outside, { model: "sonnet" }),
+    settingsBindingFingerprint(outside),
+  );
+  assert.equal(bindTurnOwnWrites(bound, outside, undefined), bound, "no own options: unchanged");
+  // Mixed: own model absorbed, an outside effort stays pending (and only that).
+  const mixed = record({ model: "sonnet", effort: "low" }, { effort: "low" });
+  const after = bindTurnOwnWrites(bound, mixed, { model: "sonnet" });
+  assert.notEqual(after, settingsBindingFingerprint(mixed));
+  assert.equal(
+    bindTurnOwnWrites(after, mixed, { reasoningEffort: "low" }),
+    settingsBindingFingerprint(mixed),
+    "the effort slots are bound once the turn's own effort matches",
+  );
+});
+
+test("F1: per-task --model switches cost no rebind; an outside set still rebinds the next turn", async () => {
+  const rig = await makeRig(
+    "--claude-agent-acp --supports-resume-session --advertise-models --advertise-config-options --push-config-on-set-model",
+  );
+  const rebinds = () => (ownerLogOf(rig).match(/\(reason=settings\)/g) ?? []).length;
+  try {
+    const first = await cli(rig, ["prompt", "--session-id", rig.id, "echo plain-one"]);
+    assert.equal(first.code, 0, first.stderr);
+    const owner = ownerPidOf(rig);
+    const adapter = recordOf(rig).pid;
+    for (const [flags, text] of [
+      [["--model", "smart-model"], "echo flagged-smart"],
+      [[], "echo plain-two"],
+      [["--model", "fast-model"], "echo flagged-fast"],
+      [["--model", "smart-model"], "echo flagged-smart-again"],
+      [[], "echo plain-three"],
+    ] as const) {
+      const turn = await cli(rig, [...flags, "prompt", "--session-id", rig.id, text]);
+      assert.equal(turn.code, 0, `${text}: ${turn.stderr}`);
+      assert.equal(rebinds(), 0, `${text}: the turn's own flag made a later turn rebind`);
+      assert.equal(recordOf(rig).pid, adapter, `${text}: the adapter was restarted`);
+    }
+    assert.equal(recordOf(rig).acpx?.session_options?.model, "smart-model", "the pin moved");
+    // GA2 is not swallowed: an outside set rebinds the next turn.
+    const set = await cli(rig, ["set", "effort", "low", "--session-id", rig.id]);
+    assert.equal(set.code, 0, set.stderr);
+    const last = await cli(rig, ["prompt", "--session-id", rig.id, "echo after-set"]);
+    assert.equal(last.code, 0, last.stderr);
+    assert.equal(rebinds(), 1, "the outside set did not rebind");
+    assert.equal(ownerPidOf(rig), owner, "the owner changed");
+  } finally {
+    await runCli(rig, ["--agent", rig.agent, "sessions", "close", "--session-id", rig.id]).catch(
+      () => undefined,
+    );
+    fs.rmSync(rig.root, { recursive: true, force: true });
+  }
+});
+
+test("F6: set auto-failover / auto-subscription / fable-degrade report the owner outcome in JSON", async () => {
+  const rig = await makeRig(
+    "--claude-agent-acp --supports-resume-session --advertise-config-options",
+  );
+  try {
+    const first = await cli(rig, ["prompt", "--session-id", rig.id, "echo warm"]);
+    assert.equal(first.code, 0, first.stderr);
+    for (const args of [
+      ["set", "auto-failover", "off"],
+      ["set", "auto-subscription", "off"],
+      ["set", "fable-degrade", "on"],
+    ]) {
+      const set = await cli(rig, [...args, "--session-id", rig.id]);
+      assert.equal(set.code, 0, `${args.join(" ")}: ${set.stderr}`);
+      const json = lastJson(set);
+      assert.equal(json.ownerRestarted, false, `${args.join(" ")}: ${set.stdout}`);
+      assert.equal(json.ownerRebind, "next-turn", `${args.join(" ")}: ${set.stdout}`);
+    }
+  } finally {
+    await runCli(rig, ["--agent", rig.agent, "sessions", "close", "--session-id", rig.id]).catch(
+      () => undefined,
+    );
+    fs.rmSync(rig.root, { recursive: true, force: true });
+  }
+});

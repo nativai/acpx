@@ -1992,11 +1992,16 @@ function printSetModeResultByFormat(
   process.stdout.write(format === "quiet" ? `${modeId}\n` : `mode set: ${modeId}\n`);
 }
 
-/** The optional owner-recycle fields of a set's JSON result (brick 6e27669f adds `ownerRebind`). */
-function ownerRecycleDetailFields(result: {
+type OwnerRecycleFields = {
+  ownerRestarted?: boolean;
   ownerRestartSkipped?: string;
   ownerRebind?: "next-turn";
-}): { ownerRestartSkipped?: string; ownerRebind?: "next-turn" } {
+};
+
+/** The optional owner-recycle fields of a set's JSON result (brick 6e27669f adds `ownerRebind`). */
+function ownerRecycleDetailFields(
+  result: OwnerRecycleFields,
+): Pick<OwnerRecycleFields, "ownerRestartSkipped" | "ownerRebind"> {
   return {
     ...(result.ownerRestartSkipped ? { ownerRestartSkipped: result.ownerRestartSkipped } : {}),
     ...(result.ownerRebind ? { ownerRebind: result.ownerRebind } : {}),
@@ -2530,7 +2535,7 @@ export async function handleSetAutoFailover(
 }
 
 function printSetAutoFailoverResultByFormat(
-  result: { record: SessionRecord; autoFailover: boolean; reap?: ReapReport },
+  result: { record: SessionRecord; autoFailover: boolean; reap?: ReapReport } & OwnerRecycleFields,
   format: OutputFormat,
 ): void {
   const label = result.autoFailover ? "on" : "off";
@@ -2538,6 +2543,9 @@ function printSetAutoFailoverResultByFormat(
     emitJsonResult(format, {
       action: "auto_failover_set",
       autoFailover: result.autoFailover,
+      // 9df709f4 F6: the same owner outcome every other settings verb reports.
+      ownerRestarted: result.ownerRestarted ?? false,
+      ...ownerRecycleDetailFields(result),
       ...reportOwnerRecycleReap(result.record.acpxRecordId, result.reap, format),
       acpxRecordId: result.record.acpxRecordId,
       acpxSessionId: result.record.acpSessionId,
@@ -2596,6 +2604,7 @@ export async function handleSetAutoSubscription(
       value: result.autoSubscription,
       record: result.record,
       reap: result.reap,
+      owner: result,
     },
     "auto-subscription",
     globalFlags.format,
@@ -2639,6 +2648,7 @@ export async function handleSetFableDegrade(
       value: result.fableDegradeOk,
       record: result.record,
       reap: result.reap,
+      owner: result,
     },
     "fable-degrade",
     globalFlags.format,
@@ -2652,6 +2662,7 @@ function printOnOffResultByFormat(
     value: boolean;
     record: SessionRecord;
     reap?: ReapReport;
+    owner: OwnerRecycleFields;
   },
   label: string,
   format: OutputFormat,
@@ -2661,6 +2672,9 @@ function printOnOffResultByFormat(
     emitJsonResult(format, {
       action: payload.action,
       [payload.key]: payload.value,
+      // 9df709f4 F6: the same owner outcome every other settings verb reports.
+      ownerRestarted: payload.owner.ownerRestarted ?? false,
+      ...ownerRecycleDetailFields(payload.owner),
       ...reportOwnerRecycleReap(payload.record.acpxRecordId, payload.reap, format),
       acpxRecordId: payload.record.acpxRecordId,
       acpxSessionId: payload.record.acpSessionId,
