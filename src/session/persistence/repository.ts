@@ -427,28 +427,6 @@ export async function readRawRecordClosedState(
 }
 
 /**
- * brick 45917618 §5.6 — the two fields the owner's per-turn missing-cwd check needs, read straight
- * from `<id>.json` (snake_case on disk) with nothing hydrated: a full `resolveSessionRecord` per
- * turn also reads the messages log. `undefined` when the file cannot be read or lacks the fields —
- * the caller then proceeds (never refuse on uncertainty).
- */
-export async function readRecordCwdAndAgent(
-  acpxRecordId: string,
-): Promise<{ cwd: string; agentCommand: string } | undefined> {
-  try {
-    const raw = JSON.parse(await fs.readFile(sessionFilePath(acpxRecordId), "utf8")) as Record<
-      string,
-      unknown
-    >;
-    return typeof raw.cwd === "string" && typeof raw.agent_command === "string"
-      ? { cwd: raw.cwd, agentCommand: raw.agent_command }
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
  * Write a session record to `<id>.json` and update the index cache.
  *
  * ## Session-lifecycle-state ownership (see DESIGN.md)

@@ -144,7 +144,6 @@ import {
   isoNow,
   mintSeatRowBestEffort,
   readPersistedLifecycle,
-  readRecordCwdAndAgent,
   resolveSessionRecord,
   seatBrickLinkFromRef,
   sessionBaseDir,
@@ -1699,26 +1698,27 @@ export async function endPreviousLiveTurn(
 // The refusal is a pre-submit terminal (`isPreSubmitTerminalError`): it is persisted as the record's
 // turn error, the delivery gets its own SESSION_CWD_MISSING terminal, and the owner is told so it
 // releases its (possibly warm) adapter and the session goes cold.
+//
+// ⚠️ It runs on the record the turn ALREADY loads (`applyQueuedTaskSubscriptionLockPolicy`): one
+// synchronous `stat`, no extra read and no extra `await` on the success path. A separate read before
+// the turn shifted turn timing enough to raise the overlap rate of the documented outbox race in
+// `test/seat-creation-paths.test.ts` (path 3, bricks 6b1e0038 / 7c339fda) on every gate it ran in.
 async function refuseTurnWhenSessionCwdMissing(
-  sessionRecordId: string,
+  record: SessionRecord,
   task: QueueTask,
   onSessionCwdMissing: (() => void) | undefined,
 ): Promise<void> {
-  const shallow = await readRecordCwdAndAgent(sessionRecordId);
-  if (!shallow) {
-    return;
-  }
   try {
     assertSessionCwdExists({
-      cwd: shallow.cwd,
-      sessionId: sessionRecordId,
-      agentCommand: shallow.agentCommand,
+      cwd: record.cwd,
+      sessionId: record.acpxRecordId,
+      agentCommand: record.agentCommand,
     });
   } catch (error) {
-    await persistPreSubmitTerminalError(await resolveSessionRecord(sessionRecordId), error);
+    await persistPreSubmitTerminalError(record, error);
     if (task.messageId && !task.terminalWritten) {
       task.terminalWritten = true;
-      appendDeliveryStreamEventSync(sessionRecordId, task, "failed", deliveryErrorFrom(error));
+      appendDeliveryStreamEventSync(record.acpxRecordId, task, "failed", deliveryErrorFrom(error));
     }
     onSessionCwdMissing?.();
     throw error;
@@ -1779,11 +1779,12 @@ export async function runQueuedTask(
 
   try {
     let result: SessionSendResult;
-    // brick 45917618 §5.6 (HoD ruling 2026-11-06): refused at EVERY turn start, not only at a spawn —
-    // a warm owner's adapter would otherwise run the turn in a folder that no longer exists.
-    await refuseTurnWhenSessionCwdMissing(sessionRecordId, task, options.onSessionCwdMissing);
     try {
-      const lockPolicy = await applyQueuedTaskSubscriptionLockPolicy(sessionRecordId, options);
+      const lockPolicy = await applyQueuedTaskSubscriptionLockPolicy(
+        sessionRecordId,
+        options,
+        task,
+      );
       result = await runSessionPrompt({
         ...buildQueuedTaskRunOptions(
           sessionRecordId,
@@ -1884,8 +1885,12 @@ function clientForQueuedTurn(
 async function applyQueuedTaskSubscriptionLockPolicy(
   sessionRecordId: string,
   options: QueuedTaskRuntimeOptions,
+  task: QueueTask,
 ): Promise<QueuedTaskClientPolicy> {
   const record = await resolveSessionRecord(sessionRecordId);
+  // brick 45917618 §5.6 (HoD ruling 2026-11-06): refused at EVERY turn start, not only at a spawn —
+  // a warm owner's adapter would otherwise run the turn in a folder that no longer exists.
+  await refuseTurnWhenSessionCwdMissing(record, task, options.onSessionCwdMissing);
   if (bindRecordToDefaultAccount(record)) {
     await writeSessionRecord(record);
   }

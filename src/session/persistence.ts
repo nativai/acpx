@@ -36,7 +36,6 @@ export {
   pruneSessions,
   readPersistedLifecycle,
   readRawRecordClosedState,
-  readRecordCwdAndAgent,
   resolvePruneSessionIds,
   resolveSessionRecord,
   resolveTemplateSelector,
