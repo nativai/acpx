@@ -514,8 +514,15 @@ export type WakeTarget = {
 export type SenderRole = "leaf" | "orchestrator";
 
 export type WakeAdmissionRequest = {
-  readonly verb: "prompt" | "capacity admit-wake";
+  /**
+   * `set` (brick 5c44d8ba, DESIGN §5): an ownerless `acpx <agent> set …` the record could not vouch
+   * for, whose direct connect starts the agent for a few seconds. Same class resolution, sized as a
+   * spawn; only its refusal text differs ({@link wakeRefusal}).
+   */
+  readonly verb: "prompt" | "capacity admit-wake" | "set";
   readonly target: WakeTarget;
+  /** `verb:"set"` only: the setting being changed (`model`, `effort`, `mode`, a config id). */
+  readonly setting?: string;
   /** `admit-wake --class`. Absent ⇒ `ACPX_ADMISSION_CLASS`, else inferred. */
   readonly flagClass?: "delivery" | "automation";
   /** The sending session's record id, for the decision log. */
@@ -612,6 +619,10 @@ function idleFields(snapshot: CapacitySnapshot, nowMs: number): Record<string, n
   return counts;
 }
 
+function settingField(setting: string | undefined): { setting?: string } {
+  return setting === undefined ? {} : { setting };
+}
+
 /** Who asked, and for whom — the fixed part of every wake decision line (C12). */
 function wakeIdentityFields(ctx: WakeContext): Record<string, unknown> {
   const { request } = ctx;
@@ -619,6 +630,7 @@ function wakeIdentityFields(ctx: WakeContext): Record<string, unknown> {
     target: request.target.id,
     targetSeat: request.target.seatId ?? null,
     verb: request.verb,
+    ...settingField(request.setting),
     class: ctx.cls.value,
     classSource: ctx.cls.source,
     ...(explicitClass && !explicitClass.value ? { invalidClass: explicitClass.raw } : {}),
@@ -829,6 +841,8 @@ const WAKE_BUSY_LINE =
 
 type WakeTextInput = {
   readonly reason: CapacityRefusalReason;
+  /** `verb:"set"` only — its own token field and sentence, and never a `--final-report` offer. */
+  readonly setting?: string;
   readonly snapshot: CapacitySnapshot | undefined;
   readonly queuedAhead: number;
   readonly target: WakeTarget;
@@ -927,6 +941,33 @@ function wakeSentences(
 }
 
 /**
+ * A refused ownerless `set` (brick 5c44d8ba, DESIGN §6 T3). Nothing was written: the gate runs
+ * before the record write, as `beforePersist` does for a send.
+ */
+function setSentences(input: WakeTextInput, setting: string, retryAfterS: number): string[] {
+  return [
+    `acpx: Changing ${setting} on ${whoOf(input.target, input.seatName)} needs to start its agent for a few seconds, and this box has no room for that right now. Nothing was changed. Retry in ${retryAfterS} s, or make the change while the session is running — a running session applies it without starting anything.`,
+  ];
+}
+
+/** A wake's text, or a set's (brick 5c44d8ba): its token field, its offer, its sentences. */
+function refusalText(
+  input: WakeTextInput,
+  retryAfterS: number,
+): { setField: string[]; offer: { offered: boolean; why: FinalReportWhy }; sentence: string } {
+  const { setting } = input;
+  if (setting === undefined) {
+    const offer = finalReportOffer(input);
+    return { setField: [], offer, sentence: wakeSentences(input, offer).join("\n") };
+  }
+  return {
+    setField: [`set=${setting}`],
+    offer: { offered: false, why: "set" },
+    sentence: setSentences(input, setting, retryAfterS).join("\n"),
+  };
+}
+
+/**
  * THE wake refusal (CONCEPTION §5.1, §5.2): line 1 = the v1 token line + `wake=<record id>`
  * (additive; `protocol=1`), then the sentences. The error is what `acpx prompt` throws (text mode
  * prints every line; JSON mode carries the sentences as `data.message`); `refusal` is what
@@ -939,9 +980,9 @@ export function wakeRefusal(input: WakeTextInput): {
   const { snapshot, reason, queuedAhead } = input;
   const retryAfterS = retryAfterOf(reason);
   const tokenSnapshot = reason === "admission_busy" ? undefined : snapshot;
-  const tokenLine = `acpx: REFUSED ${[...tokenFields(reason, tokenSnapshot, queuedAhead), `wake=${input.target.id}`].join(" ")}`;
-  const offer = finalReportOffer(input);
-  const sentence = wakeSentences(input, offer).join("\n");
+  const { setField, offer, sentence } = refusalText(input, retryAfterS);
+  // `set=` sits BEFORE `wake=`, which stays: an A1 token parser keyed on `wake=` still matches.
+  const tokenLine = `acpx: REFUSED ${[...tokenFields(reason, tokenSnapshot, queuedAhead), ...setField, `wake=${input.target.id}`].join(" ")}`;
   const hint = input.withHint && offer.offered ? `\n${PRE_S1_HINT}` : "";
   const error = new CapacityRefusedError({
     tokenLine,
@@ -1000,6 +1041,7 @@ async function refusedWake(
   }
   const { error, refusal } = wakeRefusal({
     reason,
+    ...(ctx.request.verb === "set" ? { setting: ctx.request.setting ?? "a setting" } : {}),
     snapshot,
     queuedAhead,
     target: ctx.request.target,
