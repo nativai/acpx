@@ -989,11 +989,12 @@ export function isIdleDrainActivity(direction: AcpMessageDirection, message: unk
   if (typeof msg.method !== "string") {
     return false; // a response to one of the owner's own requests
   }
-  if (msg.method !== "session/update") {
-    return true; // the agent asking for something: work is running
-  }
-  const kind = msg.params?.update?.sessionUpdate;
-  return !(typeof kind === "string" && SETTINGS_ECHO_UPDATES.has(kind));
+  // Any other method is the agent asking for something: work is running.
+  return msg.method !== "session/update" || !isSettingsEcho(msg.params?.update?.sessionUpdate);
+}
+
+function isSettingsEcho(kind: unknown): boolean {
+  return typeof kind === "string" && SETTINGS_ECHO_UPDATES.has(kind);
 }
 
 /** `5m02s` — whole minutes, then zero-padded seconds (floored). */
