@@ -144,6 +144,7 @@ import {
   isoNow,
   mintSeatRowBestEffort,
   readPersistedLifecycle,
+  readRecordCwdAndAgent,
   resolveSessionRecord,
   seatBrickLinkFromRef,
   sessionBaseDir,
@@ -1703,15 +1704,18 @@ async function refuseTurnWhenSessionCwdMissing(
   task: QueueTask,
   onSessionCwdMissing: (() => void) | undefined,
 ): Promise<void> {
-  const record = await resolveSessionRecord(sessionRecordId);
+  const shallow = await readRecordCwdAndAgent(sessionRecordId);
+  if (!shallow) {
+    return;
+  }
   try {
     assertSessionCwdExists({
-      cwd: record.cwd,
-      sessionId: record.acpxRecordId,
-      agentCommand: record.agentCommand,
+      cwd: shallow.cwd,
+      sessionId: sessionRecordId,
+      agentCommand: shallow.agentCommand,
     });
   } catch (error) {
-    await persistPreSubmitTerminalError(record, error);
+    await persistPreSubmitTerminalError(await resolveSessionRecord(sessionRecordId), error);
     if (task.messageId && !task.terminalWritten) {
       task.terminalWritten = true;
       appendDeliveryStreamEventSync(sessionRecordId, task, "failed", deliveryErrorFrom(error));
