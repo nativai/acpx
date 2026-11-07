@@ -17,6 +17,8 @@ import {
 type FakeClient = {
   hasReusableSession: (sessionId: string) => boolean;
   start: () => Promise<void>;
+  markAdvertisement: () => number;
+  advertisedConfigOptionsSince: (mark: number) => undefined;
   getAgentLifecycleSnapshot: () => {
     pid?: number;
     startedAt?: string;
@@ -97,6 +99,8 @@ test("connectAndLoadSession prefers session/resume for resume-capable sessions",
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -160,6 +164,8 @@ test("connectAndLoadSession replays desired config options after cold session/re
       start: async () => {
         started = true;
       },
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -232,6 +238,8 @@ test("connectAndLoadSession replays desired config options after cold session/lo
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -298,6 +306,8 @@ test("connectAndLoadSession resumes an existing load-capable session", async () 
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         pid: 777,
         startedAt: "2026-01-01T00:00:00.000Z",
@@ -367,6 +377,8 @@ test("connectAndLoadSession falls back to createSession when load returns resour
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -446,6 +458,8 @@ test("connectAndLoadSession ports a stranded transcript before retrying resource
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -520,6 +534,8 @@ test("connectAndLoadSession fails loudly for history when resource-not-found has
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -609,6 +625,8 @@ test("cb214e48: a pi record failing session/load never invokes the Claude transc
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({ running: true }),
       supportsLoadSession: () => true,
       supportsResumeSession: () => false,
@@ -680,6 +698,8 @@ test("cb214e48: a claude record still ports it — the gate is not a blanket ski
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({ running: true }),
       supportsLoadSession: () => true,
       supportsResumeSession: () => false,
@@ -736,6 +756,8 @@ test("cb214e48: the pi resume error names the pi sessions dir and carries no sub
       // The production shape: THIS spawn reports the store it handed pi, and
       // `applyLifecycleSnapshotToRecord` lands it on `acpx.pi_session_dir` before
       // the load is attempted.
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({ running: true, piSessionDir }),
       supportsLoadSession: () => true,
       supportsResumeSession: () => false,
@@ -796,6 +818,8 @@ test("cb214e48: a NEW pi-acp's own data.details wins — acpx does not append a 
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
         piSessionDir: path.join(homeDir, ".pi", "agent", "sessions", "--acpx-guess--"),
@@ -877,6 +901,8 @@ test("cb214e48: a stranded pi transcript is rescued on resume and the load RETRI
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({ running: true }),
       supportsLoadSession: () => true,
       supportsResumeSession: () => false,
@@ -941,6 +967,8 @@ test("cb214e48: a pi TIMEOUT is not annotated 'no pi session JSONL'", async () =
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
         piSessionDir: path.join(homeDir, ".pi", "agent", "sessions", "--workspace--"),
@@ -1029,6 +1057,8 @@ test("connectAndLoadSession completes a pending subscription switch by porting t
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -1128,6 +1158,8 @@ test("connectAndLoadSession completes a pending account switch by porting the pr
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -1208,6 +1240,8 @@ test("connectAndLoadSession fails a pending subscription switch loudly when no t
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -1258,6 +1292,8 @@ test("connectAndLoadSession fails instead of creating a fresh session when resum
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -1315,6 +1351,8 @@ test("connectAndLoadSession requires the same provider session for imported reco
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -1366,6 +1404,8 @@ test("connectAndLoadSession falls back to createSession for empty sessions on ad
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -1415,6 +1455,8 @@ test("connectAndLoadSession fails clearly when same-session resume is required b
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -1467,6 +1509,8 @@ test("connectAndLoadSession fails loudly on -32602 Invalid params after real tur
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -1524,6 +1568,8 @@ test("connectAndLoadSession fails loudly on -32601 Method not found after real t
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -1581,6 +1627,8 @@ test("connectAndLoadSession rethrows load failures that should not create a new 
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -1669,6 +1717,8 @@ test("connectAndLoadSession self-heals a guard-forced fresh session via session/
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -1754,6 +1804,8 @@ test("connectAndLoadSession keeps a missing-transcript resume LOUD when a real t
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -1814,6 +1866,8 @@ test("connectAndLoadSession fails when desired mode replay cannot be restored on
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -1880,6 +1934,8 @@ test("connectAndLoadSession replays desired model on a fresh session", async () 
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -1955,6 +2011,8 @@ test("connectAndLoadSession replays a [1m] context-alias model without throwing 
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -2027,6 +2085,8 @@ test("connectAndLoadSession replays desired model after cold session/resume and 
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -2105,6 +2165,8 @@ test("connectAndLoadSession replays desired model after cold session/load", asyn
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -2176,6 +2238,8 @@ test("connectAndLoadSession fails clearly when saved model cannot be replayed ge
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -2243,6 +2307,8 @@ test("connectAndLoadSession surfaces a loud model-floor terminal when the resume
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({ running: true }),
       supportsLoadSession: () => true,
       supportsResumeSession: () => true,
@@ -2303,6 +2369,8 @@ test("connectAndLoadSession restores the original session when desired model rep
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -2372,6 +2440,8 @@ test("connectAndLoadSession replays desired config options on a fresh session", 
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -2436,6 +2506,8 @@ test("connectAndLoadSession restores the original session when desired config re
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -2511,6 +2583,8 @@ test("connectAndLoadSession does not persist normalized effort when later config
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -2592,6 +2666,8 @@ test("connectAndLoadSession reuses an already loaded client session", async () =
       start: async () => {
         started = true;
       },
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         pid: 888,
         startedAt: "2026-01-01T00:00:00.000Z",
@@ -2736,6 +2812,8 @@ test("connectAndLoadSession self-heals a LEGACY pre-tag guard-forced session (un
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -2818,6 +2896,8 @@ test("connectAndLoadSession keeps a terminal_error-only record LOUD — a failed
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({
         running: true,
       }),
@@ -2879,6 +2959,8 @@ for (const [source, expected] of [
       const client: FakeClient = {
         hasReusableSession: () => false,
         start: async () => {},
+        markAdvertisement: () => 0,
+        advertisedConfigOptionsSince: () => undefined,
         getAgentLifecycleSnapshot: () => ({ running: true }),
         supportsLoadSession: () => true,
         supportsResumeSession: () => false,
@@ -2937,6 +3019,8 @@ async function resumeModelVersusReplay(
     const client: FakeClient = {
       hasReusableSession: () => false,
       start: async () => {},
+      markAdvertisement: () => 0,
+      advertisedConfigOptionsSince: () => undefined,
       getAgentLifecycleSnapshot: () => ({ running: true }),
       supportsLoadSession: () => true,
       supportsResumeSession: () => true,
