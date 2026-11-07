@@ -135,6 +135,7 @@ import {
 import type { ResolvedAcpxConfig } from "./config.js";
 import {
   type CreateCwdResolution,
+  cwdFlagIsExplicit,
   resolveCreateCwd,
   resolveCreateCwdFromFlags,
 } from "./create-cwd.js";
@@ -1054,6 +1055,7 @@ function resolveNewSessionAgent(params: {
   inherit: ResolvedParentSession | undefined;
   from: SessionRecord | undefined;
   fromRef: string | undefined;
+  resumeSession: string | undefined;
   command: Command;
   config: ResolvedAcpxConfig;
 }): EffectiveSpawnAgent {
@@ -1064,12 +1066,17 @@ function resolveNewSessionAgent(params: {
     params.inherit,
     params.config,
   );
-  const createCwd = resolveCreateCwdFromFlags({
-    command: params.command,
-    cwdFlag: resolved.cwd,
-    fallback: params.from?.cwd,
-    jsonStrict: params.globalFlags.jsonStrict,
-  });
+  // `--resume-session` continues an EXISTING conversation, which keeps its folder (HoD ruling
+  // 2026-11-06, by D5): an explicit `--cwd` is honoured, silently; without one it starts at the root.
+  const createCwd =
+    params.resumeSession !== undefined && cwdFlagIsExplicit(params.command)
+      ? { cwd: resolved.cwd }
+      : resolveCreateCwdFromFlags({
+          command: params.command,
+          cwdFlag: resolved.cwd,
+          fallback: params.from?.cwd,
+          jsonStrict: params.globalFlags.jsonStrict,
+        });
   const withCwd = { ...resolved, cwd: createCwd.cwd, requestedCwd: createCwd.requestedCwd };
   if (!params.from) {
     return withCwd;
@@ -3524,6 +3531,7 @@ async function createSessionFromNewFlags(
     inherit,
     from,
     fromRef: flags.from,
+    resumeSession: flags.resumeSession,
     command,
     config,
   });

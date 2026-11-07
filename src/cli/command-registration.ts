@@ -430,8 +430,11 @@ export function registerSessionsCommand(
       "Name for the new SEAT (a display label — it identifies nothing). Refused with --seat: that seat already has its name (`seats rename`).",
       parseSessionName,
     )
-    .option("--resume-session <id>", "Resume existing ACP session id", (value: string) =>
-      parseNonEmptyValue("Resume session id", value),
+    .option(
+      "--resume-session <id>",
+      "Resume an existing ACP conversation by id. It keeps the folder it started in: pass --cwd " +
+        "<that folder> (without --cwd it is looked for under the session root)",
+      (value: string) => parseNonEmptyValue("Resume session id", value),
     )
     .option(
       "--parent-seat <seat>",

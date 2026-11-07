@@ -921,3 +921,67 @@ test("E1 (warm owner): a folder deleted while the owner is warm is refused at th
     assert.equal(existsSync(gone), false);
   });
 });
+
+function resumeArgs(fx: Fixture, notFound = false): string[] {
+  const flags = `--supports-resume-session${notFound ? " --resume-session-not-found" : ""}`;
+  return [
+    "--agent",
+    `node ${JSON.stringify(MOCK_AGENT_PATH)} ${flags} --operation-log ${JSON.stringify(fx.opsLog)}`,
+    "--approve-all",
+  ];
+}
+
+test("resume (HoD ruling): --resume-session with an explicit --cwd keeps that folder, silently", async () => {
+  await withFixture(async (fx) => {
+    const resumed = await runCli(fx, [
+      ...resumeArgs(fx),
+      "--cwd",
+      fx.elsewhere,
+      "--format",
+      "json",
+      "sessions",
+      "new",
+      "--resume-session",
+      "legacy-conversation-1",
+    ]);
+    assert.equal(resumed.code, 0, resumed.stdout + resumed.stderr);
+    const result = parseResult(resumed.stdout);
+    assert.equal(result.cwd, fx.elsewhere, "the conversation keeps its folder");
+    assert.equal(Object.hasOwn(result, "requestedCwd"), false, "nothing was overridden");
+    assert.deepEqual(inertLines(resumed.stderr), [], "an honoured --cwd is not announced as inert");
+    assert.equal((await readRecord(fx, String(result.acpxRecordId))).cwd, fx.elsewhere);
+    const resume = (await readOps(fx)).findLast((op) => op.method === "session/resume");
+    assert.equal(resume?.cwd, fx.elsewhere, "the agent was asked to resume it in that folder");
+  });
+});
+
+test("resume (HoD ruling): without --cwd the root is tried, and a miss names it and says to pass --cwd", async () => {
+  await withFixture(async (fx) => {
+    // Control arm of the same row: a resume that IS found, with no --cwd, starts at the root.
+    const found = await runCli(fx, [
+      ...resumeArgs(fx),
+      "--format",
+      "json",
+      "sessions",
+      "new",
+      "--resume-session",
+      "conversation-at-root",
+    ]);
+    assert.equal(found.code, 0, found.stdout + found.stderr);
+    assert.equal(parseResult(found.stdout).cwd, fx.root);
+
+    const missed = await runCli(fx, [
+      ...resumeArgs(fx, true),
+      "--format",
+      "json",
+      "sessions",
+      "new",
+      "--resume-session",
+      "conversation-elsewhere",
+    ]);
+    assert.notEqual(missed.code, 0);
+    const output = missed.stdout + missed.stderr;
+    assert.ok(output.includes(`no such conversation was found for the folder ${fx.root}`), output);
+    assert.ok(output.includes("pass --cwd <the conversation's original folder>"), output);
+  });
+});

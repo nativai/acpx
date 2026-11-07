@@ -1214,6 +1214,12 @@ class MockAgent implements Agent {
       throw new Error("resumeSession is not supported");
     }
 
+    // brick 45917618: the folder a resume was asked for (it keeps the conversation's own folder).
+    this.recordOperation({
+      method: "session/resume",
+      sessionId: params.sessionId,
+      cwd: params.cwd,
+    });
     if (this.options.resumeSessionNotFound) {
       throw RequestError.resourceNotFound(params.sessionId);
     }

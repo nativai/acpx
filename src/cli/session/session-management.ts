@@ -9,6 +9,7 @@ import {
   type SessionLoadResult,
 } from "../../acp/client.js";
 import { formatErrorMessage } from "../../acp/error-normalization.js";
+import { isAcpResourceNotFoundError } from "../../acp/error-shapes.js";
 import {
   assertForkAtIndexHonoured,
   resolveEffectiveForkIndex,
@@ -997,6 +998,18 @@ async function resumeSessionRecordWithClient(
       }),
     };
   } catch (error) {
+    if (isAcpResourceNotFoundError(error)) {
+      // A conversation is found under the folder it started in — say where we looked, and how to
+      // point at the right one (HoD ruling 2026-11-06).
+      throw new AcpxOperationalError(
+        `Failed to resume ACP session ${options.resumeSessionId}: no such conversation was found ` +
+          `for the folder ${cwd}. A conversation keeps the folder it started in — pass ` +
+          `--cwd <the conversation's original folder>. (${formatErrorMessage(error)})`,
+        // No `cause`: the output normalizer would surface the adapter's bare "Resource not found"
+        // from it instead of this message (the original text is quoted above).
+        { outputCode: "NO_SESSION", origin: "runtime" },
+      );
+    }
     throw new Error(
       `Failed to resume ACP session ${options.resumeSessionId}: ${formatErrorMessage(error)}`,
       {
@@ -1302,7 +1315,11 @@ export async function createSessionWithClient(
     // new, `--from`, seat join, handover successor, copy/fork/by-the-way, `--from-template`, flows —
     // comes through here, and the record's cwd, the client, the adapter spawn and the ACP
     // `session/new`/fork request are all derived from this one value. The CLI only warns.
-    cwd: effectiveCreateCwd(options.cwd),
+    //
+    // ⚠️ `--resume-session` is the one exception (HoD ruling 2026-11-06, by D5): it binds a record to
+    // an EXISTING harness conversation, whose transcript is filed under its original folder, so it
+    // keeps the cwd it is given. Re-rooting it makes a legacy Claude resume fail `resourceNotFound`.
+    cwd: options.resumeSessionId ? absolutePath(options.cwd) : effectiveCreateCwd(options.cwd),
     sessionOptions: await bindDefaultAccountToSessionOptionsAsync(
       options.sessionOptions,
       options.agentCommand,
