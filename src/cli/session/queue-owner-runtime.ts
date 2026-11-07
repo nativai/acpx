@@ -997,14 +997,17 @@ function withPersistedSessionOptions(
 }
 
 // What the owner's OWN settings traffic produces on an idle client: the adapter's echo of the
-// changed state. Measured on claude-agent-acp 356a1ed (6e27669f fix round, a warm `set model`):
-// `config_option_update`, `available_commands_update` and a `_claude/backgroundTasks` snapshot; a
-// `set_mode` pushes `current_mode_update`. A snapshot is no work output — a LIVE task already
-// closes the gate through `liveBackgroundTaskCount`, with no time cap.
+// changed state. Measured on claude-agent-acp 356a1ed (6e27669f fix round): a warm `set model`
+// answers with `config_option_update` and then a `usage_update` (the new model's context window);
+// its replay at the next connect adds `available_commands_update` and a `_claude/backgroundTasks`
+// snapshot; a `set_mode` pushes `current_mode_update`. None of them is work output: background
+// work also streams chunks or tool calls, and a LIVE task already closes the gate through
+// `liveBackgroundTaskCount`, with no time cap.
 const SETTINGS_ECHO_UPDATES = new Set([
   "config_option_update",
   "current_mode_update",
   "available_commands_update",
+  "usage_update",
 ]);
 const STATE_SNAPSHOT_METHODS = new Set(["_claude/backgroundTasks"]);
 
