@@ -24,6 +24,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import type { AcpClient } from "../src/acp/client.js";
+import type { QueueTask } from "../src/cli/queue/ipc-server.js";
 import { isProcessAlive, readQueueOwnerProcessIdentity } from "../src/cli/queue/lease-store.js";
 import { applyQueuedTaskSubscriptionLockPolicy } from "../src/cli/session/runtime.js";
 import {
@@ -361,19 +362,25 @@ test("NA3 GA2: the pre-turn policy rebinds exactly when the binding differs, and
       const reasons: unknown[] = [];
       let recycled = 0;
       let seen: SessionRecord | undefined;
-      const policy = await applyQueuedTaskSubscriptionLockPolicy(sessionId, {
-        settingsBindingDiffers: (record) => {
-          seen = record;
-          return row.differs;
+      const policy = await applyQueuedTaskSubscriptionLockPolicy(
+        sessionId,
+        {
+          settingsBindingDiffers: (record) => {
+            seen = record;
+            return row.differs;
+          },
+          replaceSharedClient: async (reason) => {
+            reasons.push(reason);
+            return row.replacement;
+          },
+          onFailoverSwitched: () => {
+            recycled += 1;
+          },
         },
-        replaceSharedClient: async (reason) => {
-          reasons.push(reason);
-          return row.replacement;
-        },
-        onFailoverSwitched: () => {
-          recycled += 1;
-        },
-      });
+        // The turn-start cwd check (brick 45917618) reads the task only to write a failed
+        // terminal for a missing folder; this record's cwd is the temp HOME, which exists.
+        { requestId: "na3-task" } as unknown as QueueTask,
+      );
       const label = JSON.stringify({
         differs: row.differs,
         replaced: row.replacement !== undefined,
