@@ -1083,3 +1083,123 @@ test("resume (Pi): a conversation whose JSONL is not under the chosen folder is 
     assert.equal(parseResult(found.stdout).cwd, legacy);
   });
 });
+
+const FLOW_WORKDIR_FIXTURE = fileURLToPath(
+  new URL("./fixtures/flow-workdir.flow.js", import.meta.url),
+);
+const FLOW_SHELL_FIXTURE = fileURLToPath(new URL("./fixtures/flow-shell.flow.js", import.meta.url));
+
+test("A9/F1: a flow's ACP node with a cwd runs its session at the root, binding.cwd is the root, one warning", async () => {
+  await withFixture(async (fx) => {
+    const ran = await runCli(fx, [
+      "--agent",
+      `node ${JSON.stringify(MOCK_AGENT_PATH)} --supports-load-session`,
+      "--approve-all",
+      "--format",
+      "json",
+      "--ttl",
+      "1",
+      "flow",
+      "run",
+      FLOW_WORKDIR_FIXTURE,
+    ]);
+    assert.equal(ran.code, 0, ran.stdout + ran.stderr);
+    const payload = JSON.parse(ran.stdout.trim()) as {
+      status?: string;
+      outputs?: { prepare?: { workdir: string }; finalize?: { cwd: string } };
+      sessionBindings?: Record<string, { cwd: string }>;
+    };
+    assert.equal(payload.status, "completed");
+    // The node asked for a fresh temp workdir; the agent's terminal ran at the root instead.
+    assert.notEqual(payload.outputs?.prepare?.workdir, fx.root);
+    assert.equal(
+      await fs.realpath(String(payload.outputs?.finalize?.cwd)),
+      await fs.realpath(fx.root),
+    );
+    const bindings = Object.values(payload.sessionBindings ?? {});
+    assert.equal(bindings.length, 1);
+    assert.equal(bindings[0]?.cwd, fx.root);
+    const warnings = ran.stderr.split("\n").filter((line) => line.includes("flow ACP node cwd"));
+    assert.equal(warnings.length, 1, ran.stderr);
+  });
+});
+
+test("A9/N3 negative: a flow's SHELL step keeps the invocation cwd under enforcement", async () => {
+  await withFixture(async (fx) => {
+    const input = path.join(fx.elsewhere, "input.json");
+    await fs.writeFile(input, JSON.stringify({ text: "smoke" }));
+    const ran = await runCli(
+      fx,
+      [
+        "--approve-all",
+        "--format",
+        "json",
+        "flow",
+        "run",
+        FLOW_SHELL_FIXTURE,
+        "--input-file",
+        input,
+      ],
+      { cwd: fx.worktree },
+    );
+    assert.equal(ran.code, 0, ran.stdout + ran.stderr);
+    const payload = JSON.parse(ran.stdout.trim()) as { outputs?: { finalize?: { cwd: string } } };
+    assert.equal(
+      await fs.realpath(String(payload.outputs?.finalize?.cwd)),
+      await fs.realpath(fx.worktree),
+      "the shell step must NOT move to the session root",
+    );
+  });
+});
+
+test("G4/D1: under enforcement, a legacy session's turn still runs in its OWN folder; its record keeps it", async () => {
+  await withFixture(async (fx) => {
+    const legacyDir = path.join(fx.elsewhere, "legacy-keep");
+    await fs.mkdir(legacyDir);
+    const legacy = await createSession(fx, ["--cwd", legacyDir], {
+      env: { ACPX_SESSION_ROOT: "" },
+    });
+    const id = String(legacy.acpxRecordId);
+    // The prompt runs with the root ENFORCED, from a shell standing elsewhere.
+    const prompted = await runCli(
+      fx,
+      [...agentArgs(fx), "prompt", "--session-id", id, "echo kept"],
+      {
+        cwd: fx.worktree,
+      },
+    );
+    assert.equal(prompted.code, 0, prompted.stdout + prompted.stderr);
+    // This mock cannot load, so the turn's adapter opens a session afresh — at the RECORD's cwd.
+    const turnOps = (await readOps(fx)).filter((op) => op.method === "session/new");
+    const last = turnOps.at(-1);
+    assert.equal(last?.cwd, legacyDir, "the adapter was asked for the legacy folder, not the root");
+    assert.equal(last?.processCwd, legacyDir, "the adapter process stands in the legacy folder");
+    assert.equal((await readRecord(fx, id)).cwd, legacyDir, "acpx never rewrites record.cwd");
+  });
+});
+
+test("G6/C1: a non-create --cwd still bases a relative -f — the file under --cwd is the one sent", async () => {
+  await withFixture(async (fx) => {
+    const rooted = await createSession(fx);
+    const id = String(rooted.acpxRecordId);
+    const dirA = path.join(fx.elsewhere, "dirA");
+    await fs.mkdir(dirA);
+    await fs.writeFile(path.join(dirA, "rel.md"), "echo TOKEN-FROM-DIR-A");
+    // Negative: a same-named file where the CLI process stands, and none at the root.
+    await fs.writeFile(path.join(fx.worktree, "rel.md"), "echo TOKEN-FROM-THE-SHELL");
+    const prompted = await runCli(
+      fx,
+      [...agentArgs(fx), "--cwd", dirA, "prompt", "--session-id", id, "-f", "rel.md"],
+      { cwd: fx.worktree },
+    );
+    assert.equal(prompted.code, 0, prompted.stdout + prompted.stderr);
+    const prompts = (await readOps(fx)).filter((op) => op.method === "session/prompt");
+    assert.equal(prompts.at(-1)?.text, "echo TOKEN-FROM-DIR-A");
+    assert.deepEqual(
+      inertLines(prompted.stderr),
+      [],
+      "a non-create --cwd is not announced as inert",
+    );
+    assert.equal((await readRecord(fx, id)).cwd, fx.root, "the session did not move");
+  });
+});

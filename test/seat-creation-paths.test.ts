@@ -1263,10 +1263,23 @@ test("G2/path 3 · a teammate_spawned notification mints a shadow-record seat, r
       close: () => {},
     };
 
-    await runQueuedTask("parent-session", task, {
-      sharedClient: client,
-      suppressSdkConsoleErrors: true,
-    });
+    // N1 (brick 45917618, TEST-PLAN D14): the session root is ENFORCED here, at a folder that is not
+    // the parent's — a subagent shadow record is a view of its parent, so it must keep the PARENT's
+    // cwd, never the root (asserted on the child below).
+    const savedRoot = process.env.ACPX_SESSION_ROOT;
+    process.env.ACPX_SESSION_ROOT = path.join(homeDir, "session-root");
+    try {
+      await runQueuedTask("parent-session", task, {
+        sharedClient: client,
+        suppressSdkConsoleErrors: true,
+      });
+    } finally {
+      if (savedRoot === undefined) {
+        delete process.env.ACPX_SESSION_ROOT;
+      } else {
+        process.env.ACPX_SESSION_ROOT = savedRoot;
+      }
+    }
 
     // The child's id is minted internally (crypto.randomUUID()) — find it by
     // reading the PARENT record's subagents[] back off disk, then read the
@@ -1284,6 +1297,7 @@ test("G2/path 3 · a teammate_spawned notification mints a shadow-record seat, r
     const childRecord = await resolveSessionRecord(childRef.acpxRecordId);
     assert.equal(childRecord.kind, "subagent");
     assert.equal(childRecord.parentSessionId, "parent-session");
+    assert.equal(childRecord.cwd, cwd, "N1: a shadow record keeps its parent's cwd, not the root");
     assert.ok(
       childRecord.seatId,
       "path 3 (subagent shadow record): seat_id absent on the record read back from disk — " +
