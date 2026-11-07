@@ -922,66 +922,164 @@ test("E1 (warm owner): a folder deleted while the owner is warm is refused at th
   });
 });
 
-function resumeArgs(fx: Fixture, notFound = false): string[] {
-  const flags = `--supports-resume-session${notFound ? " --resume-session-not-found" : ""}`;
+// brick 45917618 (HoD ruling 2026-11-06; test-engineer finding B11, brick 8cf859f0). The REAL Claude
+// adapter resumes a conversation by id from any project folder, so a mock that "misses" proves
+// nothing: these rows plant a REAL transcript file under a LEGACY folder's slug in the temp
+// `~/.claude` and drive the real acpx CLI. The refusal is acpx's own, before any adapter is spawned.
+const RESUME_TRANSCRIPT_ID = "59414ee9-0000-4000-8000-00000000b011";
+
+function claudeResumeArgs(fx: Fixture): string[] {
   return [
     "--agent",
-    `node ${JSON.stringify(MOCK_AGENT_PATH)} ${flags} --operation-log ${JSON.stringify(fx.opsLog)}`,
+    `node ${JSON.stringify(MOCK_AGENT_PATH)} --claude-agent-acp --supports-resume-session --operation-log ${JSON.stringify(fx.opsLog)}`,
     "--approve-all",
   ];
 }
 
-test("resume (HoD ruling): --resume-session with an explicit --cwd keeps that folder, silently", async () => {
+async function plantLegacyClaudeTranscript(fx: Fixture, legacy: string): Promise<string> {
+  const { transcriptJsonlPath } = await import("../src/config/subscription-transcript.js");
+  const file = transcriptJsonlPath(path.join(fx.homeDir, ".claude"), legacy, RESUME_TRANSCRIPT_ID);
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(
+    file,
+    `${JSON.stringify({ type: "user", uuid: "u-1", sessionId: RESUME_TRANSCRIPT_ID, cwd: legacy, message: { role: "user", content: "Remember QUILL" } })}\n`,
+  );
+  return file;
+}
+
+const NO_PRIMER = { ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh" };
+
+test("B11 (real transcript): a resume WITHOUT --cwd of a conversation filed under a legacy folder is refused; nothing written", async () => {
   await withFixture(async (fx) => {
-    const resumed = await runCli(fx, [
-      ...resumeArgs(fx),
-      "--cwd",
-      fx.elsewhere,
-      "--format",
-      "json",
-      "sessions",
-      "new",
-      "--resume-session",
-      "legacy-conversation-1",
-    ]);
-    assert.equal(resumed.code, 0, resumed.stdout + resumed.stderr);
-    const result = parseResult(resumed.stdout);
-    assert.equal(result.cwd, fx.elsewhere, "the conversation keeps its folder");
-    assert.equal(Object.hasOwn(result, "requestedCwd"), false, "nothing was overridden");
-    assert.deepEqual(inertLines(resumed.stderr), [], "an honoured --cwd is not announced as inert");
-    assert.equal((await readRecord(fx, String(result.acpxRecordId))).cwd, fx.elsewhere);
-    const resume = (await readOps(fx)).findLast((op) => op.method === "session/resume");
-    assert.equal(resume?.cwd, fx.elsewhere, "the agent was asked to resume it in that folder");
+    const legacy = path.join(fx.elsewhere, "legacy-claude-r");
+    await fs.mkdir(legacy);
+    await plantLegacyClaudeTranscript(fx, legacy);
+    const before = await recordCount(fx).catch(() => 0);
+    const resumed = await runCli(
+      fx,
+      [
+        ...claudeResumeArgs(fx),
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "--resume-session",
+        RESUME_TRANSCRIPT_ID,
+      ],
+      { env: { ...NO_PRIMER, ACPX_SESSION_ROOT: fx.root } },
+    );
+    assert.notEqual(resumed.code, 0, resumed.stdout + resumed.stderr);
+    const output = resumed.stdout + resumed.stderr;
+    assert.ok(output.includes(`no such conversation was found for the folder ${fx.root}`), output);
+    assert.ok(output.includes("pass --cwd <the conversation's original folder>"), output);
+    assert.match(output, /NO_SESSION/);
+    assert.equal(await recordCount(fx).catch(() => 0), before, "no record was created");
+    assert.equal(
+      existsSync(path.join(fx.homeDir, ".acpx", "sessions", `${RESUME_TRANSCRIPT_ID}.json`)),
+      false,
+    );
+    assert.deepEqual(await readOps(fx), [], "no adapter was even spawned");
   });
 });
 
-test("resume (HoD ruling): without --cwd the root is tried, and a miss names it and says to pass --cwd", async () => {
+test("B10 + existing record (real transcript): WITH --cwd <its folder> it resumes there; a record never changes its folder", async () => {
   await withFixture(async (fx) => {
-    // Control arm of the same row: a resume that IS found, with no --cwd, starts at the root.
-    const found = await runCli(fx, [
-      ...resumeArgs(fx),
-      "--format",
-      "json",
-      "sessions",
-      "new",
-      "--resume-session",
-      "conversation-at-root",
-    ]);
-    assert.equal(found.code, 0, found.stdout + found.stderr);
-    assert.equal(parseResult(found.stdout).cwd, fx.root);
+    const legacy = path.join(fx.elsewhere, "legacy-claude-r");
+    await fs.mkdir(legacy);
+    await plantLegacyClaudeTranscript(fx, legacy);
+    const env = { env: { ...NO_PRIMER, ACPX_SESSION_ROOT: fx.root } };
+    const resumeIn = (cwd: string | undefined) =>
+      runCli(
+        fx,
+        [
+          ...claudeResumeArgs(fx),
+          ...(cwd === undefined ? [] : ["--cwd", cwd]),
+          "--format",
+          "json",
+          "sessions",
+          "new",
+          "--resume-session",
+          RESUME_TRANSCRIPT_ID,
+        ],
+        env,
+      );
 
+    const resumed = await resumeIn(legacy);
+    assert.equal(resumed.code, 0, resumed.stdout + resumed.stderr);
+    const result = parseResult(resumed.stdout);
+    assert.equal(result.cwd, legacy, "the conversation keeps its folder");
+    assert.equal(Object.hasOwn(result, "requestedCwd"), false, "nothing was overridden");
+    assert.deepEqual(inertLines(resumed.stderr), [], "an honoured --cwd is not announced as inert");
+    assert.equal((await readRecord(fx, String(result.acpxRecordId))).cwd, legacy);
+    const resume = (await readOps(fx)).findLast((op) => op.method === "session/resume");
+    assert.equal(resume?.cwd, legacy, "the agent was asked to resume it in that folder");
+
+    // The existing record is never re-pointed: neither by --cwd elsewhere …
+    const moved = await resumeIn(fx.worktree);
+    assert.notEqual(moved.code, 0, moved.stdout + moved.stderr);
+    assert.match(moved.stdout + moved.stderr, /RESUME_CWD_MISMATCH/);
+    assert.ok((moved.stdout + moved.stderr).includes(`already exists in the folder ${legacy}`));
+    // … nor by the root default.
+    const rooted = await resumeIn(undefined);
+    assert.notEqual(rooted.code, 0, rooted.stdout + rooted.stderr);
+    assert.equal(
+      (await readRecord(fx, RESUME_TRANSCRIPT_ID)).cwd,
+      legacy,
+      "the record kept its folder",
+    );
+  });
+});
+
+test("resume (Pi): a conversation whose JSONL is not under the chosen folder is refused; under it, it resumes", async () => {
+  await withFixture(async (fx) => {
+    const legacy = path.join(fx.elsewhere, "legacy-pi-r");
+    await fs.mkdir(legacy);
+    const dir = path.join(fx.elsewhere, "pi-acp");
+    await fs.mkdir(dir, { recursive: true });
+    const entry = path.join(dir, "index.js");
+    if (!existsSync(entry)) {
+      await fs.symlink(MOCK_AGENT_PATH, entry);
+    }
+    const args = [
+      "--agent",
+      `node ${JSON.stringify(entry)} --supports-resume-session --operation-log ${JSON.stringify(fx.opsLog)}`,
+      "--approve-all",
+    ];
+    const id = "01a1b33d-0000-7000-8000-00000000b011";
+    const { piBoxSessionDirFor } = await import("../src/acp/harness-config-dir.js");
+    const boxDir = piBoxSessionDirFor(legacy, { HOME: fx.homeDir });
+    await fs.mkdir(boxDir, { recursive: true });
+    await fs.writeFile(
+      path.join(boxDir, `2026-11-06T00-00-00-000Z_${id}.jsonl`),
+      `${JSON.stringify({ type: "session", id, cwd: legacy })}\n`,
+    );
     const missed = await runCli(fx, [
-      ...resumeArgs(fx, true),
+      ...args,
       "--format",
       "json",
       "sessions",
       "new",
       "--resume-session",
-      "conversation-elsewhere",
+      id,
     ]);
     assert.notEqual(missed.code, 0);
-    const output = missed.stdout + missed.stderr;
-    assert.ok(output.includes(`no such conversation was found for the folder ${fx.root}`), output);
-    assert.ok(output.includes("pass --cwd <the conversation's original folder>"), output);
+    assert.ok(
+      (missed.stdout + missed.stderr).includes(
+        `no such conversation was found for the folder ${fx.root}`,
+      ),
+    );
+    const found = await runCli(fx, [
+      ...args,
+      "--cwd",
+      legacy,
+      "--format",
+      "json",
+      "sessions",
+      "new",
+      "--resume-session",
+      id,
+    ]);
+    assert.equal(found.code, 0, found.stdout + found.stderr);
+    assert.equal(parseResult(found.stdout).cwd, legacy);
   });
 });

@@ -73,6 +73,10 @@ import {
   type SeatBrickLink,
   type SeatRecord,
 } from "../../session/persistence.js";
+import {
+  refuseUnresumableConversation,
+  resumeNotFoundMessage,
+} from "../../session/resume-precheck.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import { explainSeatRowMissing } from "../../session/seat-backfill.js";
 import { withBrickCache } from "../../session/seat-brick.js";
@@ -1002,9 +1006,7 @@ async function resumeSessionRecordWithClient(
       // A conversation is found under the folder it started in — say where we looked, and how to
       // point at the right one (HoD ruling 2026-11-06).
       throw new AcpxOperationalError(
-        `Failed to resume ACP session ${options.resumeSessionId}: no such conversation was found ` +
-          `for the folder ${cwd}. A conversation keeps the folder it started in — pass ` +
-          `--cwd <the conversation's original folder>. (${formatErrorMessage(error)})`,
+        `${resumeNotFoundMessage(options.resumeSessionId, cwd)} (${formatErrorMessage(error)})`,
         // No `cause`: the output normalizer would surface the adapter's bare "Resource not found"
         // from it instead of this message (the original text is quoted above).
         { outputCode: "NO_SESSION", origin: "runtime" },
@@ -1325,6 +1327,16 @@ export async function createSessionWithClient(
       options.agentCommand,
     ),
   };
+  if (effectiveOptions.resumeSessionId) {
+    // Before ANY record is created or reused, and before an adapter is spawned (HoD ruling,
+    // 2026-11-06): the conversation must be filed under the chosen folder.
+    await refuseUnresumableConversation({
+      resumeSessionId: effectiveOptions.resumeSessionId,
+      recordId: effectiveOptions.recordId ?? effectiveOptions.resumeSessionId,
+      cwd: absolutePath(effectiveOptions.cwd),
+      agentCommand: effectiveOptions.agentCommand,
+    });
+  }
   const client = new AcpClient({
     agentCommand: effectiveOptions.agentCommand,
     cwd: absolutePath(effectiveOptions.cwd),
