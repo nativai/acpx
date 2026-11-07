@@ -39,6 +39,7 @@ import {
   setSessionProfile,
   setSessionSubscription,
 } from "../src/cli/session/session-control.js";
+import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
 import { resolveSessionRecord } from "../src/session/persistence/repository.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence/serialize.js";
 import { settingsBindingFingerprint } from "../src/session/settings-binding.js";
@@ -813,6 +814,77 @@ for (const change of [
       const lease = queuePaths(rig.root, rig.id).lockPath;
       await waitFor("the idle release", 25_000, () => !fs.existsSync(lease));
       assert.match(ownerLogOf(rig), /releasing session .* \(reason=idle-memory\)/);
+    } finally {
+      await runCli(rig, ["--agent", rig.agent, "sessions", "close", "--session-id", rig.id]).catch(
+        () => undefined,
+      );
+      fs.rmSync(rig.root, { recursive: true, force: true });
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// F3 (9df709f4 VERIFICATION) — a warm `set subscription` / `set profile` must survive to the next
+// turn's pre-turn check. The idle drain wrote back the record it read when the owner went idle,
+// and the durable overlay does not carry the account binding: the pick was erased, nothing rebound.
+// ---------------------------------------------------------------------------------------------
+
+for (const change of [
+  {
+    verb: "subscription",
+    args: ["set", "subscription", "subB"],
+    kept: (acpx: SessionAcpxState | undefined) =>
+      acpx?.session_options?.subscription === "subB" &&
+      acpx?.session_options?.subscription_switch?.to === "subB",
+  },
+  {
+    verb: "profile",
+    args: ["set", "profile", "subB"],
+    kept: (acpx: SessionAcpxState | undefined) => acpx?.session_options?.profile === "subB",
+  },
+]) {
+  test(`F3: a warm set ${change.verb} survives the idle write-back and rebinds the next turn`, async () => {
+    const rig = await makeRig(
+      "--claude-agent-acp --supports-resume-session --advertise-config-options",
+    );
+    const registry = await seedRegistry(rig.root);
+    const raw = JSON.parse(fs.readFileSync(registry.registryPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    fs.writeFileSync(registry.registryPath, `${JSON.stringify({ ...raw, default: "subA" })}\n`);
+    try {
+      const first = await cli(rig, ["prompt", "--session-id", rig.id, "echo turn-one"]);
+      assert.equal(first.code, 0, first.stderr);
+      const owner = ownerPidOf(rig);
+      // The mock writes no Claude transcript; the switch ports one, so plant it in subA.
+      const disk = JSON.parse(
+        fs.readFileSync(path.join(sessionsDir(rig), `${rig.id}.json`), "utf8"),
+      ) as Record<string, unknown>;
+      for (const key of ["acp_session_id", "agent_session_id", "acpSessionId", "agentSessionId"]) {
+        if (typeof disk[key] === "string") {
+          const file = transcriptJsonlPath(
+            path.join(rig.root, ".acpx", "subscriptions", "subA"),
+            path.join(rig.root, "work"),
+            disk[key],
+          );
+          fs.mkdirSync(path.dirname(file), { recursive: true });
+          fs.writeFileSync(file, "{}\n");
+        }
+      }
+      const set = await cli(rig, [...change.args, "--session-id", rig.id]);
+      assert.equal(set.code, 0, `${set.stdout}\n${set.stderr}`);
+      assert.equal(lastJson(set).ownerRebind, "next-turn", set.stdout);
+      assert.ok(change.kept(recordOf(rig).acpx), "the set did not write the record");
+
+      const second = await cli(rig, ["prompt", "--session-id", rig.id, "echo turn-two"]);
+      assert.equal(second.code, 0, second.stderr);
+      assert.ok(
+        change.kept(recordOf(rig).acpx),
+        `the pick was erased before the next turn: ${JSON.stringify(recordOf(rig).acpx?.session_options)}`,
+      );
+      assert.equal(ownerPidOf(rig), owner, "the owner changed");
+      assert.match(ownerLogOf(rig), /queue owner rebound session .* \(reason=settings\)/);
     } finally {
       await runCli(rig, ["--agent", rig.agent, "sessions", "close", "--session-id", rig.id]).catch(
         () => undefined,

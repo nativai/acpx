@@ -44,6 +44,7 @@ import {
 import type {
   AcpJsonRpcMessage,
   AcpMessageDirection,
+  SessionAcpxState,
   SessionRecord,
   SessionSendOutcome,
 } from "../../types.js";
@@ -964,6 +965,36 @@ export async function decideIdleOwnerRelease(
   return { release: false };
 }
 
+/**
+ * brick 6e27669f F3 — the idle drain writes back the record it read when the owner went idle. The
+ * durable overlay carries the preference fields, but NOT the account binding (`profile`,
+ * `subscription`, `subscription_switch`, `account_switch`), so a warm `set subscription` /
+ * `set profile` was erased by this write-back before the next turn's pre-turn check could see it:
+ * no rebind, and the user's pick silently dropped (9df709f4 VERIFICATION F3). Before 6e27669f such
+ * an owner was SIGTERMed by the set and never wrote back.
+ *
+ * Nothing in the owner changes `session_options` while it is idle — owner-arm sets write the disk
+ * themselves, and every account switch the owner makes runs inside a turn, after this drain has
+ * stopped — so the disk's `session_options` are the truth here, whole.
+ * ⚠️ Do not widen this to the TURN's checkpoints: a turn's failover switch is newer than the disk.
+ * Row "F3" in test/settings-rebind.test.ts.
+ */
+function withPersistedSessionOptions(
+  acpx: SessionAcpxState | undefined,
+  persisted: SessionAcpxState | undefined,
+): SessionAcpxState | undefined {
+  if (!persisted) {
+    return acpx;
+  }
+  const next: SessionAcpxState = { ...acpx };
+  if (persisted.session_options) {
+    next.session_options = structuredClone(persisted.session_options);
+  } else {
+    delete next.session_options;
+  }
+  return next;
+}
+
 // What the owner's OWN settings traffic produces on an idle client: the adapter's echo of the
 // changed option (claude-agent-acp pushes `config_option_update` after `set_model`; a `set_mode`
 // pushes `current_mode_update`).
@@ -1540,7 +1571,10 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           // session silently became writable at the next owner restart (brick 54643cac).
           // Overlay the disk's durable preferences first, as the turn's live checkpoint does.
           const persisted = await readPersistedLifecycle(options.sessionId).catch(() => undefined);
-          idleRecord.acpx = mergeLatestDurableAcpxPreferences(idleRecord.acpx, persisted?.acpx);
+          idleRecord.acpx = withPersistedSessionOptions(
+            mergeLatestDurableAcpxPreferences(idleRecord.acpx, persisted?.acpx),
+            persisted?.acpx,
+          );
           await idleWriter.close({ checkpoint: true }).catch(() => {});
           for (const writer of subagentWriters.values()) {
             await writer.close({ checkpoint: true }).catch(() => {});
