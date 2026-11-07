@@ -2282,9 +2282,10 @@ test("integration: a mode and config option set on an idle owner survive the nex
 });
 
 // brick 54643cac — the other half of the same promise: a LATER effort change (which
-// recycles the owner) must not clobber an earlier mode, and a mode set after an effort
-// change must not clobber the effort. Both replay on the respawned owner.
-test("integration: a mode set and an effort change do not clobber each other across an owner recycle", async () => {
+// rebinds the owner's client at its next turn — brick 6e27669f; it used to recycle the
+// owner) must not clobber an earlier mode, and a mode set after an effort change must
+// not clobber the effort. Both replay on the rebound client and on a respawned owner.
+test("integration: a mode set and an effort change do not clobber each other across an owner rebind and respawn", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
     const agentCommand = `${RESUME_CAPABLE_MOCK_AGENT_COMMAND} --advertise-config-options --claude-agent-acp`;
@@ -2297,7 +2298,7 @@ test("integration: a mode set and an effort change do not clobber each other acr
         (await runCli([...agentArgs, "--format", "json", "set-mode", "plan"], homeDir)).code,
         0,
       );
-      // `set effort` recycles the live owner after the apply.
+      // `set effort` leaves the live owner up; it rebinds its client at the next turn.
       const setEffort = await runCli(
         [...agentArgs, "--format", "json", "set", "effort", "low"],
         homeDir,
@@ -2307,7 +2308,7 @@ test("integration: a mode set and an effort change do not clobber each other acr
       assert.equal(afterEffort.acpx?.desired_mode_id, "plan");
       assert.equal(afterEffort.acpx?.desired_config_options?.effort, "low");
 
-      // Re-warm a (cold-respawned) owner, then change the mode again on the idle owner.
+      // The next turn rebinds the same owner, then change the mode again on the idle owner.
       const warm = await runCli(
         [...agentArgs, "--format", "json", "--ttl", "60", "prompt", "echo rewarm"],
         homeDir,
@@ -2451,7 +2452,8 @@ test("integration: set model on a warm idle owner applies through the owner's cl
       assert.equal(stored.acpx?.session_options?.model, "smart-model");
       assert.equal(stored.acpx?.current_model_id, "smart-model");
 
-      // The next turn runs (owner recycled, cold resume after the old adapter is gone).
+      // The next turn runs: the owner rebinds (brick 6e27669f), closing its old client —
+      // and with it the adapter's writer lock — before the new client connects.
       const reprompt = await runCli(
         [...modelAgentArgs, "--format", "json", "--ttl", "5", "prompt", "echo after-switch"],
         homeDir,

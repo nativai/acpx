@@ -41,7 +41,6 @@ function input(overrides: Partial<DecideIdleOwnerReleaseInput> = {}): DecideIdle
     idleReleaseMs: 30_000,
     liveBackgroundTaskCount: 0,
     deployDiffers: () => false,
-    outputStyleDiffers: () => false,
     recordClosed: () => false,
     ...overrides,
   };
@@ -249,58 +248,18 @@ test("P2 #7: normalizeOwnerIdleReleaseMs applies default and edge-case normaliza
   assert.equal(normalizeOwnerIdleReleaseMs(30_000), 30_000);
 });
 
-// brick://874fee67 — the output-style release reason. Path (B): an owner that is
-// idle and never receives another prompt would otherwise hold the stale style
-// forever, and the user's change would appear to have done nothing.
-
-// The INVARIANT again, for the new reason specifically. It must sit BEHIND the
-// same shared gate: recycling mid-turn is the one thing the accept-anytime
-// contract exists to avoid, so an active turn must refuse before the predicate is
-// even consulted.
-test("output-style: hasActiveTurn ⇒ never release, and the predicate is NOT consulted", async () => {
-  let consulted = 0;
-  const decision = await decideIdleOwnerRelease(
-    input({
-      hasActiveTurn: true,
-      outputStyleDiffers: () => {
-        consulted += 1;
-        return true;
-      },
-    }),
-  );
-  assert.equal(decision.release, false);
-  assert.equal(consulted, 0, "the shared gate must refuse before the style check runs");
-});
-
-test("output-style: a pending change releases an idle owner", async () => {
+// brick 6e27669f (GA1) — INVERTED from brick://874fee67's path (B). A settings change never makes
+// an owner exit: there is no "output-style-change" release reason and the decision takes no style
+// input at all. A pending style is bound by the owner's pre-turn rebind, which keeps the queue.
+test("6e27669f: a pending output style is no release reason — the decision has no style input", async () => {
+  // @ts-expect-error -- the input no longer exists; re-adding it brings the exit back (GA1).
   const decision = await decideIdleOwnerRelease(input({ outputStyleDiffers: () => true }));
-  assert.deepEqual(decision, { release: true, reason: "output-style-change" });
-});
-
-// Ordering: the more specific, more user-visible reason wins the label. A human
-// just asked for this and is watching for it; "deploy-staleness" would be a
-// confusing thing to report back.
-test("output-style: outranks deploy-staleness when both hold", async () => {
-  const decision = await decideIdleOwnerRelease(
-    input({ outputStyleDiffers: () => true, deployDiffers: () => true }),
+  assert.deepEqual(decision, { release: false }, "a current, in-window owner stays");
+  assert.deepEqual(
+    await decideIdleOwnerRelease(input({ now: BASE_NOW + 30_000 })),
+    { release: true, reason: "idle-memory" },
+    "it idles out under the normal clock, like any owner",
   );
-  assert.deepEqual(decision, { release: true, reason: "output-style-change" });
-});
-
-// AC-TB4's unit-level mirror: no pending change ⇒ nothing happens. An
-// intent-queue implementation would recycle here; the derived predicate does not.
-test("output-style: no pending change leaves a current, in-window owner alone", async () => {
-  const decision = await decideIdleOwnerRelease(input({ outputStyleDiffers: () => false }));
-  assert.equal(decision.release, false);
-});
-
-// The documented `--ttl 0` limit, pinned so it is a known bound rather than a
-// surprise: path (B) is gated off there and path (A), the turn boundary, covers it.
-test("output-style: ttl 0 gates path (B) off (documented limit — path (A) still fires)", async () => {
-  const decision = await decideIdleOwnerRelease(
-    input({ ttlMs: 0, outputStyleDiffers: () => true }),
-  );
-  assert.equal(decision.release, false);
 });
 
 // ---------------------------------------------------------------------------
@@ -440,31 +399,22 @@ test("a81e16a1 #1: with no background task an idle owner is released at 5 min, n
 // at (30 min) and the T9 self-test checkpoint (35 min) included.
 const BACKGROUND_IDLE_AGES = [5 * MIN, 30 * MIN, 35 * MIN, 24 * 60 * MIN, 7 * 24 * 60 * MIN];
 
-// The three release reasons, each made true on its own. The thunks count their
-// calls: with a live task the gate must refuse BEFORE either is consulted.
+// The two release reasons, each made true on its own. The thunk counts its
+// calls: with a live task the gate must refuse BEFORE it is consulted.
+// (brick 6e27669f removed the third, "output-style-change".)
 function everyReason(): Array<{
-  reason: "idle-memory" | "deploy-staleness" | "output-style-change";
+  reason: "idle-memory" | "deploy-staleness";
   overrides: Partial<DecideIdleOwnerReleaseInput>;
   consulted: () => number;
 }> {
   let deployCalls = 0;
-  let styleCalls = 0;
   const deployDiffers = () => {
     deployCalls += 1;
-    return true;
-  };
-  const outputStyleDiffers = () => {
-    styleCalls += 1;
     return true;
   };
   return [
     { reason: "idle-memory", overrides: {}, consulted: () => 0 },
     { reason: "deploy-staleness", overrides: { deployDiffers }, consulted: () => deployCalls },
-    {
-      reason: "output-style-change",
-      overrides: { outputStyleDiffers },
-      consulted: () => styleCalls,
-    },
   ];
 }
 
