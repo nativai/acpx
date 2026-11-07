@@ -90,6 +90,8 @@ function makeAdapter(options: { honoursCancel: boolean }): AdapterControl {
     supportsLoadSession: () => false,
     supportsResumeSession: () => false,
     start: async () => {},
+    markAdvertisement: () => 0,
+    advertisedConfigOptionsSince: () => undefined,
     getAgentLifecycleSnapshot: () => ({ running: true }),
     getPermissionStats: () => ({ requested: 0, approved: 0, denied: 0, cancelled: 0 }),
     initializeResult: undefined,

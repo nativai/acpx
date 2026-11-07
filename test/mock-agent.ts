@@ -108,6 +108,12 @@ type MockAgentOptions = {
    * assert the exact method list (codex exec in cli.test.ts) must not see a new entry.
    */
   logConfigOptionOps?: boolean;
+  /**
+   * brick e0fc06d8 — `--push-config-on-set-model`: after a successful `session/set_model`, push
+   * `config_option_update` with the full rebuilt list, as claude-agent-acp 356a1ed and pi-acp do.
+   * Opt-in so every existing operation-log row stays byte-identical.
+   */
+  pushConfigOnSetModel?: boolean;
   claudeAgentAcp: boolean;
   expectedForkMeta?: unknown;
   /**
@@ -493,6 +499,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let envDumpExtra: string[] | undefined;
   let operationLogFile: string | undefined;
   let logConfigOptionOps = false;
+  let pushConfigOnSetModel = false;
   let claudeAgentAcp = false;
   let expectedForkMeta: unknown;
   let modelAdvertisement: MockAgentOptions["modelAdvertisement"];
@@ -672,6 +679,11 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--push-config-on-set-model") {
+      pushConfigOnSetModel = true;
+      continue;
+    }
+
     if (token === "--model-advertisement") {
       modelAdvertisement = JSON.parse(
         readFileSync(parseOptionValue(argv, index + 1, token), "utf8"),
@@ -769,6 +781,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     ...(envDumpExtra !== undefined ? { envDumpExtra } : {}),
     operationLogFile,
     logConfigOptionOps,
+    pushConfigOnSetModel,
     claudeAgentAcp,
     expectedForkMeta,
     ...(modelAdvertisement !== undefined ? { modelAdvertisement } : {}),
@@ -1542,6 +1555,16 @@ class MockAgent implements Agent {
     }
     session.modelId = params.modelId;
     session.configValues.effort = defaultClaudeEffort(params.modelId);
+    if (this.options.pushConfigOnSetModel) {
+      // Written ahead of the `{}` response, the order the real adapter uses.
+      await this.connection.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "config_option_update",
+          configOptions: buildConfigOptions(session, this.options),
+        },
+      });
+    }
     return {};
   }
 

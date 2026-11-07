@@ -404,6 +404,8 @@ function makeReconnectClient(
   return {
     hasReusableSession: () => false,
     start: async () => {},
+    markAdvertisement: () => 0,
+    advertisedConfigOptionsSince: () => undefined,
     getAgentLifecycleSnapshot: () => ({ running: true }),
     supportsLoadSession: () => true,
     supportsResumeSession: () => false,
