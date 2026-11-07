@@ -9,15 +9,18 @@
 // - `--format json` emits no `messages` key, and every other field is byte-identical to the old
 //   listing (the old algorithm is kept here as the oracle, over the same store);
 // - the text rows are unchanged.
+// Brick 0bf00929 adds the amended contract: on a record whose log runs past its body watermark,
+// listing JSON reports the BODY watermark and the listing opens no log.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { isBywaySessionRecord } from "../src/session/byway.js";
-import { messagesLogPath } from "../src/session/messages-log.js";
+import { messagesLogFileName, messagesLogPath } from "../src/session/messages-log.js";
 import {
+  isTemplateRecord,
   listSessions,
   rebuildSessionIndex,
   serializeSessionRecordForDisk,
@@ -40,8 +43,14 @@ function logLines(count: number, textBytes: number): string {
   ).join("");
 }
 
-/** Write `<id>.json`; with `log`, point it at a messages log holding those lines. */
-async function writeRecord(seed: Seed, log?: { lines: string; count: number }): Promise<void> {
+/**
+ * Write `<id>.json`; with `log`, point it at a messages log holding those lines. The watermark is
+ * `count` messages and, unless `bytes` says otherwise, all of `lines`.
+ */
+async function writeRecord(
+  seed: Seed,
+  log?: { lines: string; count: number; bytes?: number },
+): Promise<void> {
   const dir = sessionBaseDir();
   await fs.mkdir(dir, { recursive: true });
   const record = makeSessionRecord({
@@ -57,7 +66,7 @@ async function writeRecord(seed: Seed, log?: { lines: string; count: number }): 
           v: 1,
           count: log.count,
           base_index: 0,
-          bytes: Buffer.byteLength(log.lines),
+          bytes: log.bytes ?? Buffer.byteLength(log.lines),
         },
       }
     : serializeSessionRecordForDisk(record);
@@ -75,9 +84,13 @@ async function runCli(
   homeDir: string,
   args: string[],
   heapMb?: number,
+  extraNodeArgs: string[] = [],
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   const env: NodeJS.ProcessEnv = { ...process.env, HOME: homeDir, ACPX_STATE_HOME: homeDir };
-  const nodeArgs = heapMb === undefined ? [] : [`--max-old-space-size=${heapMb}`];
+  const nodeArgs = [
+    ...(heapMb === undefined ? [] : [`--max-old-space-size=${heapMb}`]),
+    ...extraNodeArgs,
+  ];
   return await new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [...nodeArgs, CLI_PATH, ...args], {
       cwd: homeDir,
@@ -218,6 +231,175 @@ test("38465e2c: text rows are unchanged — id, [closed], cwd, lastUsedAt, seat 
     assert.equal(result.stdout, expected);
     assert.match(result.stdout, /^closed \[closed\]\t/);
     assert.match(result.stdout, /\tseat 5eat0000 \(unnamed\)\n/);
+  });
+});
+
+// ── A log ahead of its body watermark (brick 0bf00929) ───────────────────────────────────────
+//
+// The production shape: a record closed after its last body write, whose final message reached the
+// log ~0.5 s later (~0.5% of devbox's records). Its body's `messages_log` says 18 messages / 1,718
+// bytes; the log on disk holds 19 / 1,814. The old listing hydrated every record, and hydration
+// rolls the watermark forward to the log (`hydrateFromLogReader`), so it printed 19 / 1,814. The
+// amended contract (HoD decision (ii) on brick 38465e2c): listing JSON carries the BODY watermark,
+// and the listing never opens the log. The JSON-parity row above cannot see this: its fixture has
+// no lagging record, so there the two watermarks agree.
+//
+// ⚠️ DO NOT "FIX" THE STALE COUNT BY STAT-ING OR READING THE LOG IN THE LISTING. It looks like a
+// cheap correctness win, and it is a filesystem call per record on every listing, the cost brick
+// 38465e2c removed; the no-read row below fails on it. A single-record load (`sessions show`,
+// `history`) still rolls the watermark forward, which is that row's planted positive.
+const LAG_LOG_MESSAGES = 19;
+const LAG_LOG_BYTES = 1_814;
+const LAG_WATERMARK = { v: 1, count: 18, base_index: 0, bytes: 1_718 };
+
+async function seedLaggingStore(): Promise<void> {
+  await writeRecord(
+    {
+      acpxRecordId: "lagging",
+      lastUsedAt: "2026-11-06T02:00:00.000Z",
+      closed: true,
+      closedAt: "2026-11-06T02:00:00.000Z",
+      template: {
+        enabled: true,
+        slug: "lagging-tpl",
+        version: 1,
+        created_at: "2026-11-06T02:00:00.000Z",
+      },
+    },
+    {
+      lines: logLines(LAG_LOG_MESSAGES, 40),
+      count: LAG_WATERMARK.count,
+      bytes: LAG_WATERMARK.bytes,
+    },
+  );
+  await writeRecord(
+    { acpxRecordId: "steady", lastUsedAt: "2026-11-06T01:00:00.000Z" },
+    { lines: logLines(3, 40), count: 3 },
+  );
+  await rebuildSessionIndex(sessionBaseDir(), "test seed");
+}
+
+const LAG_LISTINGS: Array<{ label: string; args: string[] }> = [
+  {
+    label: "sessions list --local",
+    args: ["--format", "json", AGENT, "sessions", "list", "--local"],
+  },
+  { label: "sessions templates", args: ["--format", "json", AGENT, "sessions", "templates"] },
+];
+
+test("0bf00929: a log ahead of its body watermark — listing JSON reports the BODY watermark; every other field matches the old listing", async () => {
+  await withTempHome("acpx-list-local-lag-", async (homeDir) => {
+    await seedLaggingStore();
+    // The fixture provably lags: the log on disk holds more than the body's watermark says.
+    const onDisk = await fs.readFile(messagesLogPath(sessionBaseDir(), "lagging"), "utf8");
+    const diskBytes = Buffer.byteLength(onDisk);
+    const diskCount = onDisk.split("\n").filter(Boolean).length;
+    assert.equal(diskBytes, LAG_LOG_BYTES);
+    assert.equal(diskCount, LAG_LOG_MESSAGES);
+    // The oracle (the old hydrating listing) read the log and rolled the watermark forward to it.
+    const oracle = await oracleListing(false);
+    const oracleLagging = oracle.find((record) => record.acpxRecordId === "lagging");
+    assert.equal(oracleLagging?.messages.length, LAG_LOG_MESSAGES);
+    assert.deepEqual(oracleLagging?.messagesLog, {
+      ...LAG_WATERMARK,
+      count: LAG_LOG_MESSAGES,
+      bytes: LAG_LOG_BYTES,
+    });
+    // Old minus `messages`, with only the lagging record's `messagesLog` put back to its body's.
+    const expected = (records: SessionRecord[]): string =>
+      JSON.stringify(
+        records.map(({ messages: _messages, ...rest }) =>
+          rest.acpxRecordId === "lagging" ? { ...rest, messagesLog: LAG_WATERMARK } : rest,
+        ),
+      );
+    const oracles = [oracle, oracle.filter(isTemplateRecord)];
+    for (const [at, { label, args }] of LAG_LISTINGS.entries()) {
+      const result = await runCli(homeDir, args);
+      assert.equal(result.code, 0, `${label}: ${result.stderr}`);
+      const listed = JSON.parse(result.stdout) as Array<Record<string, unknown>>;
+      const lagging = listed.find((row) => row.acpxRecordId === "lagging");
+      const messagesLog = lagging?.messagesLog as { count?: number; bytes?: number } | undefined;
+      assert.deepEqual(messagesLog, LAG_WATERMARK, label);
+      assert.notEqual(messagesLog?.bytes, diskBytes, label);
+      assert.notEqual(messagesLog?.count, diskCount, label);
+      assert.equal(result.stdout.trim(), expected(oracles[at] ?? []), label);
+    }
+  });
+});
+
+// The `hydratedDuring` spy of test/session-scan-no-hydration.test.ts, moved INTO the CLI child: a
+// preload wraps `fs/promises` stat, open and readFile (named imports too, via
+// `syncBuiltinESMExports`) and records each call on a messages log. Hydration starts by stat-ing
+// the log, so a listing that records nothing opened none.
+async function installLogSpy(
+  homeDir: string,
+): Promise<{ nodeArgs: string[]; take: () => Promise<string[]> }> {
+  const out = path.join(homeDir, "log-spy.out");
+  const preload = path.join(homeDir, "log-spy.mjs");
+  await fs.writeFile(
+    preload,
+    [
+      `import { appendFileSync } from "node:fs";`,
+      `import fs from "node:fs/promises";`,
+      `import { syncBuiltinESMExports } from "node:module";`,
+      `import path from "node:path";`,
+      `for (const name of ["stat", "open", "readFile"]) {`,
+      `  const original = fs[name];`,
+      `  fs[name] = async (target, ...rest) => {`,
+      `    const base = path.basename(String(target));`,
+      `    if (base.endsWith(${JSON.stringify(messagesLogFileName(""))})) {`,
+      `      appendFileSync(${JSON.stringify(out)}, name + " " + base + "\\n");`,
+      `    }`,
+      `    return await original(target, ...rest);`,
+      `  };`,
+      `}`,
+      `syncBuiltinESMExports();`,
+      ``,
+    ].join("\n"),
+  );
+  return {
+    nodeArgs: ["--import", pathToFileURL(preload).href],
+    take: async () => {
+      let recorded = "";
+      try {
+        recorded = await fs.readFile(out, "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw error;
+        }
+      }
+      await fs.rm(out, { force: true });
+      return recorded.split("\n").filter(Boolean);
+    },
+  };
+}
+
+test("0bf00929: the listing and templates JSON come from bodies — no messages log is opened", async () => {
+  await withTempHome("acpx-list-local-lag-", async (homeDir) => {
+    await seedLaggingStore();
+    const spy = await installLogSpy(homeDir);
+    // Planted positive: `sessions show` hydrates its record, and the spy inside the CLI sees it.
+    const shown = await runCli(
+      homeDir,
+      ["--format", "json", AGENT, "sessions", "show", "--session-id", "lagging"],
+      undefined,
+      spy.nodeArgs,
+    );
+    assert.equal(shown.code, 0, shown.stderr);
+    assert.ok(
+      (await spy.take()).includes(`stat ${messagesLogFileName("lagging")}`),
+      "the spy saw the hydration",
+    );
+    for (const { label, args } of LAG_LISTINGS) {
+      const result = await runCli(homeDir, args, undefined, spy.nodeArgs);
+      assert.equal(result.code, 0, `${label}: ${result.stderr}`);
+      const listed = JSON.parse(result.stdout) as Array<Record<string, unknown>>;
+      assert.ok(
+        listed.some((row) => row.acpxRecordId === "lagging"),
+        label,
+      );
+      assert.deepEqual(await spy.take(), [], label);
+    }
   });
 });
 
