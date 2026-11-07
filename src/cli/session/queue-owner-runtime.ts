@@ -997,9 +997,16 @@ function withPersistedSessionOptions(
 }
 
 // What the owner's OWN settings traffic produces on an idle client: the adapter's echo of the
-// changed option (claude-agent-acp pushes `config_option_update` after `set_model`; a `set_mode`
-// pushes `current_mode_update`).
-const SETTINGS_ECHO_UPDATES = new Set(["config_option_update", "current_mode_update"]);
+// changed state. Measured on claude-agent-acp 356a1ed (6e27669f fix round, a warm `set model`):
+// `config_option_update`, `available_commands_update` and a `_claude/backgroundTasks` snapshot; a
+// `set_mode` pushes `current_mode_update`. A snapshot is no work output — a LIVE task already
+// closes the gate through `liveBackgroundTaskCount`, with no time cap.
+const SETTINGS_ECHO_UPDATES = new Set([
+  "config_option_update",
+  "current_mode_update",
+  "available_commands_update",
+]);
+const STATE_SNAPSHOT_METHODS = new Set(["_claude/backgroundTasks"]);
 
 /**
  * brick 6e27669f F4 — whether a message the idle drain sees is BACKGROUND work, the only thing that
@@ -1021,12 +1028,19 @@ export function isIdleDrainActivity(direction: AcpMessageDirection, message: unk
   if (typeof msg.method !== "string") {
     return false; // a response to one of the owner's own requests
   }
-  // Any other method is the agent asking for something: work is running.
-  return msg.method !== "session/update" || !isSettingsEcho(msg.params?.update?.sessionUpdate);
+  // Any other method is the agent asking for something, or working: activity.
+  return !isStateEcho(msg.method, msg.params?.update?.sessionUpdate);
 }
 
-function isSettingsEcho(kind: unknown): boolean {
-  return typeof kind === "string" && SETTINGS_ECHO_UPDATES.has(kind);
+function isStateEcho(method: string, sessionUpdate: unknown): boolean {
+  if (STATE_SNAPSHOT_METHODS.has(method)) {
+    return true;
+  }
+  return (
+    method === "session/update" &&
+    typeof sessionUpdate === "string" &&
+    SETTINGS_ECHO_UPDATES.has(sessionUpdate)
+  );
 }
 
 /** `5m02s` — whole minutes, then zero-padded seconds (floored). */

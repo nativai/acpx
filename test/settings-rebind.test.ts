@@ -781,6 +781,11 @@ test("F4 unit: only background work counts as idle-drain activity", () => {
   assert.equal(isIdleDrainActivity("inbound", response), false, "the response to it");
   assert.equal(isIdleDrainActivity("inbound", update("config_option_update")), false, "set echo");
   assert.equal(isIdleDrainActivity("inbound", update("current_mode_update")), false, "mode echo");
+  // The real adapter's extra echo of a warm `set model` (claude-agent-acp 356a1ed, measured on the
+  // fix-round real path: these two alone held a NEW owner past its idle release).
+  assert.equal(isIdleDrainActivity("inbound", update("available_commands_update")), false);
+  const snapshot = { jsonrpc: "2.0", method: "_claude/backgroundTasks", params: { tasks: [] } };
+  assert.equal(isIdleDrainActivity("inbound", snapshot), false, "a background-task snapshot");
   // Background work keeps the gate closed, as before.
   for (const kind of ["agent_message_chunk", "tool_call", "tool_call_update", "usage_update"]) {
     assert.equal(isIdleDrainActivity("inbound", update(kind)), true, kind);
