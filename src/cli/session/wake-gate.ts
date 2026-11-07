@@ -42,6 +42,7 @@ export function callerSessionId(env: NodeJS.ProcessEnv = process.env): string | 
 
 export type WakeRequestOptions = {
   readonly verb: WakeAdmissionRequest["verb"];
+  readonly setting?: string;
   readonly flagClass?: WakeAdmissionRequest["flagClass"];
   readonly sender?: string;
   readonly senderRole?: SenderRole;
@@ -110,4 +111,25 @@ export function createSendWakeGate(
       }
     },
   };
+}
+
+/**
+ * brick 5c44d8ba (DESIGN §6 T2): the gate in front of every remaining ownerless `set` direct connect
+ * — the settings the record cannot vouch for, which start the agent for a few seconds. Called after
+ * the owner arm found no owner and BEFORE anything is written, so a refusal (exit 75) leaves the
+ * record untouched and starts nothing (G6). A person — no agent identity, or class `interactive` —
+ * is never refused; `admitWake` decides that, exactly as for a wake.
+ *
+ * ⚠️ DO NOT MOVE THIS BELOW THE DIRECT CALL OR INTO IT. The adapter starts inside the connect; a
+ * gate there would run after the memory it guards was taken. Row "N6" in
+ * test/record-only-set-gate.test.ts.
+ */
+export async function gateSetConnect(record: SessionRecord, setting: string): Promise<void> {
+  const { admitWake } = await import("../../capacity/admission.js");
+  const decision = await admitWake(
+    wakeRequestFor(record, { verb: "set", setting, sender: callerSessionId() }),
+  );
+  if (decision.decision === "refused") {
+    throw decision.error;
+  }
 }
