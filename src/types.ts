@@ -1546,6 +1546,7 @@ export type SessionSetConfigOptionResult = {
   /** True when a live queue owner existed and was recycled to bind the change. */
   ownerRestarted?: boolean;
   ownerRestartSkipped?: string;
+  ownerRebind?: "next-turn";
   /** brick ad6ba1c2 — what the owner recycle did to the session's task processes. */
   reap?: ReapReport;
 };
@@ -1575,6 +1576,7 @@ export type SessionSetModelResult = {
   /** True when a live queue owner existed and was recycled to bind the change. */
   ownerRestarted?: boolean;
   ownerRestartSkipped?: string;
+  ownerRebind?: "next-turn";
   /** brick ad6ba1c2 — what the owner recycle did to the session's task processes. */
   reap?: ReapReport;
 };

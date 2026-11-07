@@ -102,6 +102,8 @@ export type QueueOwnerRecord = {
   processIdentity?: QueueOwnerProcessIdentity;
   /** Pod name of the writer. Diagnostics only — no decision reads it. */
   host?: string;
+  /** See {@link ownerRebindsSettings}. */
+  settingsRebind?: 1;
 };
 
 export type QueueOwnerLease = {
@@ -112,6 +114,7 @@ export type QueueOwnerLease = {
   ownerGeneration: number;
   processIdentity?: QueueOwnerProcessIdentity;
   host?: string;
+  settingsRebind?: 1;
 };
 
 export type QueueOwnerStatus = {
@@ -243,7 +246,19 @@ function parseQueueOwnerRecord(raw: unknown): QueueOwnerRecord | null {
     queueDepth: record.queueDepth,
     ...(processIdentity ? { processIdentity } : {}),
     ...(typeof record.host === "string" ? { host: record.host } : {}),
+    ...(record.settingsRebind === 1 ? { settingsRebind: 1 as const } : {}),
   };
+}
+
+/**
+ * brick 6e27669f T-A2 — TRANSITIONAL. The owner behind this lease rebinds its client to a changed
+ * record at its next turn start, so a settings verb must NOT stop it. Every lease this build creates
+ * carries the marker from its first byte. A lease without it is a pre-fix owner still alive after
+ * the deploy: it does not rebind, so the setters recycle it exactly as before.
+ * Removal: brick 1281e50e, once every box has run the fix for at least a day.
+ */
+export function ownerRebindsSettings(owner: QueueOwnerRecord | undefined | null): boolean {
+  return owner?.settingsRebind === 1;
 }
 
 function hasValidQueueOwnerRecordFields(record: Record<string, unknown>): record is Record<
@@ -865,6 +880,7 @@ function leasePayload(lease: QueueOwnerLease, heartbeatAt: string, queueDepth: n
       queueDepth: Math.max(0, Math.round(queueDepth)),
       ...(lease.processIdentity ? { processIdentity: lease.processIdentity } : {}),
       ...(lease.host ? { host: lease.host } : {}),
+      ...(lease.settingsRebind ? { settingsRebind: lease.settingsRebind } : {}),
     },
     null,
     2,
@@ -917,6 +933,7 @@ async function acquireUnderGuard(
     ownerGeneration: createOwnerGeneration(),
     ...ownLeaseIdentity(),
     host: processHostName(),
+    settingsRebind: 1,
   };
   // Exclusive hardlink acquire (port of 92cd5f8d): the lease never exists without its content.
   if (await tryCreateLockFile(lease.lockPath, leasePayload(lease, createdAt, 0))) {

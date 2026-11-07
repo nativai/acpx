@@ -1992,6 +1992,22 @@ function printSetModeResultByFormat(
   process.stdout.write(format === "quiet" ? `${modeId}\n` : `mode set: ${modeId}\n`);
 }
 
+type OwnerRecycleFields = {
+  ownerRestarted?: boolean;
+  ownerRestartSkipped?: string;
+  ownerRebind?: "next-turn";
+};
+
+/** The optional owner-recycle fields of a set's JSON result (brick 6e27669f adds `ownerRebind`). */
+function ownerRecycleDetailFields(
+  result: OwnerRecycleFields,
+): Pick<OwnerRecycleFields, "ownerRestartSkipped" | "ownerRebind"> {
+  return {
+    ...(result.ownerRestartSkipped ? { ownerRestartSkipped: result.ownerRestartSkipped } : {}),
+    ...(result.ownerRebind ? { ownerRebind: result.ownerRebind } : {}),
+  };
+}
+
 function printSetModelResultByFormat(
   modelId: string,
   result: {
@@ -1999,6 +2015,7 @@ function printSetModelResultByFormat(
     resumed: boolean;
     ownerRestarted?: boolean;
     ownerRestartSkipped?: string;
+    ownerRebind?: "next-turn";
     reap?: ReapReport;
     validatedAgainst?: SetValidatedAgainst;
   },
@@ -2011,7 +2028,7 @@ function printSetModelResultByFormat(
       resumed: result.resumed,
       ...validatedAgainstField(result.validatedAgainst),
       ownerRestarted: result.ownerRestarted ?? false,
-      ...(result.ownerRestartSkipped ? { ownerRestartSkipped: result.ownerRestartSkipped } : {}),
+      ...ownerRecycleDetailFields(result),
       ...reportOwnerRecycleReap(result.record.acpxRecordId, result.reap, format),
       acpxRecordId: result.record.acpxRecordId,
       acpxSessionId: result.record.acpSessionId,
@@ -2032,6 +2049,7 @@ function printSetConfigOptionResultByFormat(
     response: { configOptions: unknown[] };
     ownerRestarted?: boolean;
     ownerRestartSkipped?: string;
+    ownerRebind?: "next-turn";
     reap?: ReapReport;
     validatedAgainst?: SetValidatedAgainst;
   },
@@ -2045,7 +2063,7 @@ function printSetConfigOptionResultByFormat(
       resumed: result.resumed,
       ...validatedAgainstField(result.validatedAgainst),
       ownerRestarted: result.ownerRestarted ?? false,
-      ...(result.ownerRestartSkipped ? { ownerRestartSkipped: result.ownerRestartSkipped } : {}),
+      ...ownerRecycleDetailFields(result),
       ...reportOwnerRecycleReap(result.record.acpxRecordId, result.reap, format),
       configOptions: result.response.configOptions,
       acpxRecordId: result.record.acpxRecordId,
@@ -2077,6 +2095,7 @@ function printSetOutputStyleResultByFormat(
     record: SessionRecord;
     ownerRestarted?: boolean;
     ownerRestartSkipped?: string;
+    ownerRebind?: "next-turn";
     reap?: ReapReport;
     pending?: boolean;
   },
@@ -2088,7 +2107,7 @@ function printSetOutputStyleResultByFormat(
       action: "output_style_set",
       outputStyle,
       ownerRestarted: result.ownerRestarted ?? false,
-      ...(result.ownerRestartSkipped ? { ownerRestartSkipped: result.ownerRestartSkipped } : {}),
+      ...ownerRecycleDetailFields(result),
       ...reportOwnerRecycleReap(result.record.acpxRecordId, result.reap, format),
       pending,
       // The style the CURRENT query was built with — what the session is really
@@ -2516,7 +2535,7 @@ export async function handleSetAutoFailover(
 }
 
 function printSetAutoFailoverResultByFormat(
-  result: { record: SessionRecord; autoFailover: boolean; reap?: ReapReport },
+  result: { record: SessionRecord; autoFailover: boolean; reap?: ReapReport } & OwnerRecycleFields,
   format: OutputFormat,
 ): void {
   const label = result.autoFailover ? "on" : "off";
@@ -2524,6 +2543,9 @@ function printSetAutoFailoverResultByFormat(
     emitJsonResult(format, {
       action: "auto_failover_set",
       autoFailover: result.autoFailover,
+      // 9df709f4 F6: the same owner outcome every other settings verb reports.
+      ownerRestarted: result.ownerRestarted ?? false,
+      ...ownerRecycleDetailFields(result),
       ...reportOwnerRecycleReap(result.record.acpxRecordId, result.reap, format),
       acpxRecordId: result.record.acpxRecordId,
       acpxSessionId: result.record.acpSessionId,
@@ -2582,6 +2604,7 @@ export async function handleSetAutoSubscription(
       value: result.autoSubscription,
       record: result.record,
       reap: result.reap,
+      owner: result,
     },
     "auto-subscription",
     globalFlags.format,
@@ -2625,6 +2648,7 @@ export async function handleSetFableDegrade(
       value: result.fableDegradeOk,
       record: result.record,
       reap: result.reap,
+      owner: result,
     },
     "fable-degrade",
     globalFlags.format,
@@ -2638,6 +2662,7 @@ function printOnOffResultByFormat(
     value: boolean;
     record: SessionRecord;
     reap?: ReapReport;
+    owner: OwnerRecycleFields;
   },
   label: string,
   format: OutputFormat,
@@ -2647,6 +2672,9 @@ function printOnOffResultByFormat(
     emitJsonResult(format, {
       action: payload.action,
       [payload.key]: payload.value,
+      // 9df709f4 F6: the same owner outcome every other settings verb reports.
+      ownerRestarted: payload.owner.ownerRestarted ?? false,
+      ...ownerRecycleDetailFields(payload.owner),
       ...reportOwnerRecycleReap(payload.record.acpxRecordId, payload.reap, format),
       acpxRecordId: payload.record.acpxRecordId,
       acpxSessionId: payload.record.acpSessionId,
@@ -2702,6 +2730,7 @@ function printSetSubscriptionResultByFormat(
     transcriptCopied: boolean;
     ownerRestarted: boolean;
     ownerRestartSkipped?: string;
+    ownerRebind?: "next-turn";
     reap?: ReapReport;
   },
   format: OutputFormat,
@@ -2713,7 +2742,7 @@ function printSetSubscriptionResultByFormat(
       from: result.from,
       transcriptCopied: result.transcriptCopied,
       ownerRestarted: result.ownerRestarted,
-      ...(result.ownerRestartSkipped ? { ownerRestartSkipped: result.ownerRestartSkipped } : {}),
+      ...ownerRecycleDetailFields(result),
       ...reportOwnerRecycleReap(result.record.acpxRecordId, result.reap, format),
       acpxRecordId: result.record.acpxRecordId,
       acpxSessionId: result.record.acpSessionId,
@@ -2812,6 +2841,7 @@ function printSetProfileResultByFormat(
     transcriptCopied: boolean;
     ownerRestarted: boolean;
     ownerRestartSkipped?: string;
+    ownerRebind?: "next-turn";
     reap?: ReapReport;
   },
   format: OutputFormat,
@@ -2823,7 +2853,7 @@ function printSetProfileResultByFormat(
       from: result.from,
       transcriptCopied: result.transcriptCopied,
       ownerRestarted: result.ownerRestarted,
-      ...(result.ownerRestartSkipped ? { ownerRestartSkipped: result.ownerRestartSkipped } : {}),
+      ...ownerRecycleDetailFields(result),
       ...reportOwnerRecycleReap(result.record.acpxRecordId, result.reap, format),
       acpxRecordId: result.record.acpxRecordId,
       acpxSessionId: result.record.acpSessionId,
