@@ -1,5 +1,6 @@
 import path from "node:path";
 import { resolveAcpxUiBaseUrl } from "../../acp/auth-env.js";
+import { resolveSessionRoot } from "../../config/session-root.js";
 import { consumeAutoSubscriptionSelection } from "../../runtime/engine/auto-subscription.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import type {
@@ -384,10 +385,23 @@ export type FirstTurnOutcome =
   | { promptQueued: true }
   | { promptQueued: false; promptError: { code: string; message: string } };
 
+/**
+ * brick 45917618 §5.3: every create result carries the EFFECTIVE `cwd`, and `requestedCwd` only
+ * when an explicit `--cwd` was overridden by the session root — the machine signal under
+ * `--json-strict`, whose stderr stays empty.
+ */
+function createdCwdJson(
+  record: SessionRecord,
+  requestedCwd: string | undefined,
+): { cwd: string; requestedCwd?: string } {
+  return { cwd: record.cwd, ...(requestedCwd === undefined ? {} : { requestedCwd }) };
+}
+
 export function printNewSessionByFormat(
   record: SessionRecord,
   format: OutputFormat,
   firstTurn?: FirstTurnOutcome,
+  requestedCwd?: string,
 ): void {
   const subscriptionSelection = consumeAutoSubscriptionSelection();
   const seatUrl = resolveSeatUrl(record.seatId);
@@ -398,6 +412,7 @@ export function printNewSessionByFormat(
       acpxRecordId: record.acpxRecordId,
       acpxSessionId: record.acpSessionId,
       agentSessionId: record.agentSessionId,
+      ...createdCwdJson(record, requestedCwd),
       sessionUrl: composeSessionUrl(record),
       ...newSessionSeatJson(record, seatUrl),
       ...(subscriptionSelection ? { subscriptionSelection } : {}),
@@ -446,6 +461,7 @@ export function printCopiedSessionByFormat(
   source: SessionRecord,
   format: OutputFormat,
   firstTurn?: FirstTurnOutcome,
+  requestedCwd?: string,
 ): void {
   const subscriptionSelection = consumeAutoSubscriptionSelection();
   if (
@@ -457,6 +473,7 @@ export function printCopiedSessionByFormat(
       agentSessionId: record.agentSessionId,
       sourceSessionId: source.acpxRecordId,
       forkedFromSessionId: record.forkedFromSessionId,
+      ...createdCwdJson(record, requestedCwd),
       // EFFECTIVE index. `forkedAtMessageIndexRequested` rides beside it only on
       // a mismatch, so a consumer that reads one field is already correct and a
       // consumer that reads both learns the fork moved.
@@ -549,6 +566,17 @@ export function printQueuedPromptByFormat(
   process.stdout.write(`[queued] ${result.requestId}\n`);
 }
 
+// A banner never fails a prompt: a misconfigured (relative) ACPX_SESSION_ROOT refuses CREATES with a
+// usage error, and here simply means "not at a root".
+function isAtSessionRoot(cwd: string): boolean {
+  try {
+    const sessionRoot = resolveSessionRoot();
+    return sessionRoot.enforced && cwd === sessionRoot.root;
+  } catch {
+    return false;
+  }
+}
+
 export function formatPromptSessionBannerLine(
   record: SessionRecord,
   currentCwd: string,
@@ -556,8 +584,10 @@ export function formatPromptSessionBannerLine(
 ): string {
   const normalizedSessionCwd = path.resolve(record.cwd);
   const normalizedCurrentCwd = path.resolve(currentCwd);
+  // §5.4: a session AT the session root is the normal case, so "routed from" there carries no
+  // information; it stays for legacy sessions, where it says which folder the session lives in.
   const routedFrom =
-    normalizedSessionCwd === normalizedCurrentCwd
+    isAtSessionRoot(normalizedSessionCwd) || normalizedSessionCwd === normalizedCurrentCwd
       ? undefined
       : formatRoutedFrom(normalizedSessionCwd, normalizedCurrentCwd);
 

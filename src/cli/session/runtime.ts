@@ -20,6 +20,7 @@ import { explainTurnError, type RefusalProbeDeps } from "../../acp/openrouter-re
 import { explainPiTurnError } from "../../acp/pi-turn-error.js";
 import { InterruptedError, withInterrupt, withTimeout } from "../../async-control.js";
 import { tailClaudeSubagentJsonl } from "../../claude-jsonl.js";
+import { effectiveCreateCwd } from "../../config/session-root.js";
 import { transcriptCwdHash } from "../../config/subscription-transcript.js";
 import {
   AllSubscriptionsExhaustedError,
@@ -31,6 +32,7 @@ import {
   isSessionResumeRequiredError,
   PermissionPromptUnavailableError,
   SessionClosedError,
+  SessionCwdMissingError,
 } from "../../errors.js";
 import {
   attemptFailoverAndRetry,
@@ -44,6 +46,7 @@ import {
   selectSubscriptionBeforeTurn,
   stampLastTurnSubscription,
 } from "../../runtime/engine/failover.js";
+import { assertSessionCwdExists } from "../../session/session-cwd.js";
 import { SpawnLedgerError } from "../../spawn-ledger.js";
 import {
   registerAbsorbedDeliveries,
@@ -1692,6 +1695,36 @@ export async function endPreviousLiveTurn(
   await client.close();
 }
 
+// The refusal is a pre-submit terminal (`isPreSubmitTerminalError`): it is persisted as the record's
+// turn error, the delivery gets its own SESSION_CWD_MISSING terminal, and the owner is told so it
+// releases its (possibly warm) adapter and the session goes cold.
+//
+// ⚠️ It runs on the record the turn ALREADY loads (`applyQueuedTaskSubscriptionLockPolicy`): one
+// synchronous `stat`, no extra read and no extra `await` on the success path. A separate read before
+// the turn shifted turn timing enough to raise the overlap rate of the documented outbox race in
+// `test/seat-creation-paths.test.ts` (path 3, bricks 6b1e0038 / 7c339fda) on every gate it ran in.
+async function refuseTurnWhenSessionCwdMissing(
+  record: SessionRecord,
+  task: QueueTask,
+  onSessionCwdMissing: (() => void) | undefined,
+): Promise<void> {
+  try {
+    assertSessionCwdExists({
+      cwd: record.cwd,
+      sessionId: record.acpxRecordId,
+      agentCommand: record.agentCommand,
+    });
+  } catch (error) {
+    await persistPreSubmitTerminalError(record, error);
+    if (task.messageId && !task.terminalWritten) {
+      task.terminalWritten = true;
+      appendDeliveryStreamEventSync(record.acpxRecordId, task, "failed", deliveryErrorFrom(error));
+    }
+    onSessionCwdMissing?.();
+    throw error;
+  }
+}
+
 export async function runQueuedTask(
   sessionRecordId: string,
   task: QueueTask,
@@ -1716,6 +1749,8 @@ export async function runQueuedTask(
     // subsequent turns cold-spawn on the new transcript anchor.
     onFailoverSwitched?: (newProfileId: string, trigger: AccountSwitchTrigger) => void;
     onLockBlocked?: () => void;
+    // brick 45917618 §5.6: the session's folder is gone — release the adapter after this task.
+    onSessionCwdMissing?: () => void;
     // brick://3356183e: a switch decided BEFORE the turn (lock or selection) asks the
     // owner to replace its shared client with one built from the switched record, and
     // the turn runs on it: no throwaway client closed at turn end, no owner recycle.
@@ -1745,7 +1780,11 @@ export async function runQueuedTask(
   try {
     let result: SessionSendResult;
     try {
-      const lockPolicy = await applyQueuedTaskSubscriptionLockPolicy(sessionRecordId, options);
+      const lockPolicy = await applyQueuedTaskSubscriptionLockPolicy(
+        sessionRecordId,
+        options,
+        task,
+      );
       result = await runSessionPrompt({
         ...buildQueuedTaskRunOptions(
           sessionRecordId,
@@ -1797,7 +1836,8 @@ function isPreSubmitTerminalError(error: unknown): boolean {
     isModelFloorUnmetError(error) ||
     error instanceof AutomationCapacityReservedError ||
     error instanceof CodexSubscriptionCapError ||
-    error instanceof AllSubscriptionsExhaustedError
+    error instanceof AllSubscriptionsExhaustedError ||
+    error instanceof SessionCwdMissingError
   );
 }
 
@@ -1845,8 +1885,12 @@ function clientForQueuedTurn(
 async function applyQueuedTaskSubscriptionLockPolicy(
   sessionRecordId: string,
   options: QueuedTaskRuntimeOptions,
+  task: QueueTask,
 ): Promise<QueuedTaskClientPolicy> {
   const record = await resolveSessionRecord(sessionRecordId);
+  // brick 45917618 §5.6 (HoD ruling 2026-11-06): refused at EVERY turn start, not only at a spawn —
+  // a warm owner's adapter would otherwise run the turn in a folder that no longer exists.
+  await refuseTurnWhenSessionCwdMissing(record, task, options.onSessionCwdMissing);
   if (bindRecordToDefaultAccount(record)) {
     await writeSessionRecord(record);
   }
@@ -4398,6 +4442,9 @@ export async function runOnce(runOptions: RunOnceOptions): Promise<RunPromptResu
   // and a literal `auto` reached the profile lookup (brick eeca6037).
   const options: RunOnceOptions = {
     ...runOptions,
+    // brick 45917618 §5.2 E2: a one-shot exec is a new agent session too — it starts at the
+    // session root, so no per-invocation-folder `projects/<slug>/` appears either.
+    cwd: effectiveCreateCwd(runOptions.cwd),
     sessionOptions: await bindDefaultAccountToSessionOptionsAsync(
       runOptions.sessionOptions,
       runOptions.agentCommand,

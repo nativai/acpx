@@ -2,7 +2,15 @@
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
@@ -40,6 +48,7 @@ import {
   type SessionInfo,
   type SessionModelState,
 } from "@agentclientprotocol/sdk";
+import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
 
 type ParsedCommand = {
   command: string;
@@ -1021,6 +1030,25 @@ function selectableConfigValues(option: SessionConfigOption): Set<string> {
   return values;
 }
 
+function piStagedHeaderCwd(sourceSessionId: string): string | null {
+  const dir = process.env.PI_CODING_AGENT_SESSION_DIR;
+  if (!dir) {
+    return null;
+  }
+  try {
+    const name = readdirSync(dir).find((entry) => entry.endsWith(`_${sourceSessionId}.jsonl`));
+    if (!name) {
+      return null;
+    }
+    const header = JSON.parse(readFileSync(path.join(dir, name), "utf8").split("\n")[0] ?? "") as {
+      cwd?: unknown;
+    };
+    return typeof header.cwd === "string" ? header.cwd : null;
+  } catch {
+    return null;
+  }
+}
+
 class MockAgent implements Agent {
   private readonly connection: AgentConnection;
   private readonly sessions = new Map<SessionId, SessionState>();
@@ -1102,6 +1130,9 @@ class MockAgent implements Agent {
       sessionId,
       modelId: requestedModel,
       disallowedTools: disallowedToolsFromNewSessionMeta(params),
+      // brick 45917618: the cwd the session was ASKED for, and the one the adapter process stands in.
+      cwd: params.cwd,
+      processCwd: process.cwd(),
     });
 
     const response: NewSessionResponse = { sessionId };
@@ -1195,6 +1226,12 @@ class MockAgent implements Agent {
       throw new Error("resumeSession is not supported");
     }
 
+    // brick 45917618: the folder a resume was asked for (it keeps the conversation's own folder).
+    this.recordOperation({
+      method: "session/resume",
+      sessionId: params.sessionId,
+      cwd: params.cwd,
+    });
     if (this.options.resumeSessionNotFound) {
       throw RequestError.resourceNotFound(params.sessionId);
     }
@@ -1218,6 +1255,25 @@ class MockAgent implements Agent {
     const sessionId = randomUUID();
     const forkState = source ?? createSessionState(false);
     this.sessions.set(sessionId, forkState);
+    this.recordOperation({
+      method: "session/fork",
+      sourceSessionId: params.sessionId,
+      sessionId,
+      cwd: params.cwd,
+      processCwd: process.cwd(),
+      // What the real Claude adapter needs: Claude Code resumes the source from
+      // `projects/<slug(request cwd)>/<source id>.jsonl` (brick 45917618 §5.5 D6).
+      claudeTranscriptAtRequestCwd: existsSync(
+        transcriptJsonlPath(
+          process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude"),
+          params.cwd,
+          params.sessionId,
+        ),
+      ),
+      // What pi-acp would read: the source JSONL in the copy's own pi session dir, and the cwd its
+      // `session` header names (brick 45917618 §5.5 D7).
+      piStagedHeaderCwd: piStagedHeaderCwd(params.sessionId),
+    });
 
     return {
       sessionId,

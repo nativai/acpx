@@ -47,6 +47,14 @@ export const BOX_PI_ENV_PREFIX = "ACPX_PI_";
 export const SESSION_IDENTITY_ENV = ["ACPX_SESSION_RECORD_ID"] as const;
 
 /**
+ * brick 45917618 — the session-root seam (`src/config/session-root.ts`). A rig sets it on its
+ * slot server and it flows into the rig's agents; an agent of that rig running this suite would
+ * re-root every temp-dir create and red rows that assert their own cwd. Every enforcement row sets
+ * it explicitly (or injects the control-pod seam), so the suite starts with it absent.
+ */
+export const SESSION_ROOT_ENV = "ACPX_SESSION_ROOT";
+
+/**
  * brick ecfb0461 — THE SUITE MUST NEVER SEND THE BOX'S OpenRouter KEY OVER THE WIRE.
  *
  * Same family as the two scrubs above (make the starting environment a property of
@@ -106,7 +114,8 @@ export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env
   for (const name of Object.keys(env)) {
     if (
       name.startsWith(BOX_PI_ENV_PREFIX) ||
-      (SESSION_IDENTITY_ENV as readonly string[]).includes(name)
+      (SESSION_IDENTITY_ENV as readonly string[]).includes(name) ||
+      name === SESSION_ROOT_ENV
     ) {
       delete env[name];
       removed.push(name);

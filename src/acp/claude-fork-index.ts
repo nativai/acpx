@@ -105,6 +105,8 @@ export async function materializeClaudeForkSession(args: {
   sourceAcpSessionId: string;
   subscriptionId?: string;
   upToMessageId?: string;
+  /** The caller's staging scope already holds the source under the destination slug (§5.5). */
+  sourceStaged?: boolean;
 }): Promise<string | undefined> {
   const sdk = await loadClaudeForkSessionModule(args.agentCommand);
   if (!sdk) {
@@ -116,12 +118,14 @@ export async function materializeClaudeForkSession(args: {
   process.env.CLAUDE_CONFIG_DIR = configDir;
   let cleanupStagedTranscript: () => Promise<void> = async () => {};
   try {
-    cleanupStagedTranscript = await stageClaudeSourceTranscriptForDestination({
-      configDir,
-      sourceCwd: args.sourceCwd,
-      destinationCwd: args.cwd,
-      sourceAcpSessionId: args.sourceAcpSessionId,
-    });
+    if (!args.sourceStaged) {
+      cleanupStagedTranscript = await stageClaudeSourceTranscriptForDestination({
+        configDir,
+        sourceCwd: args.sourceCwd,
+        destinationCwd: args.cwd,
+        sourceAcpSessionId: args.sourceAcpSessionId,
+      });
+    }
     const result = await sdk.forkSession(args.sourceAcpSessionId, {
       dir: args.cwd,
       ...(args.upToMessageId ? { upToMessageId: args.upToMessageId } : {}),
