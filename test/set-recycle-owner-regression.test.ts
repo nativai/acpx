@@ -181,6 +181,8 @@ test("T5.1 WARM: set effort recycles a live idle owner — terminated, ownerRest
 
       // The live owner was recycled so the next prompt cold-resumes + replays.
       assert.equal(result.ownerRestarted, true);
+      // brick 5c44d8ba N7 (G7): a live owner is the owner arm, unchanged — and says so.
+      assert.equal(result.validatedAgainst, "adapter");
       await waitUntilDead(keeper.pid as number);
       assert.equal(isProcessAlive(keeper.pid), false);
 
@@ -207,6 +209,8 @@ test("T5.2 WARM: set model recycles a live idle owner — terminated, ownerResta
       const result = await setSessionModel({ sessionId, modelId: "sonnet", recycleOwner: true });
 
       assert.equal(result.ownerRestarted, true);
+      // brick 5c44d8ba N7 (G7): a live owner is the owner arm, unchanged — and says so.
+      assert.equal(result.validatedAgainst, "adapter");
       await waitUntilDead(keeper.pid as number);
       assert.equal(isProcessAlive(keeper.pid), false);
 

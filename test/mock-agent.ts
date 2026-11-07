@@ -94,6 +94,11 @@ type MockAgentOptions = {
    */
   envDumpExtra?: string[];
   operationLogFile?: string;
+  /**
+   * brick 5c44d8ba — also log `session/set_config_option` to the operation log. Opt-in: rows that
+   * assert the exact method list (codex exec in cli.test.ts) must not see a new entry.
+   */
+  logConfigOptionOps?: boolean;
   claudeAgentAcp: boolean;
   expectedForkMeta?: unknown;
   /**
@@ -478,6 +483,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let envDumpFile: string | undefined;
   let envDumpExtra: string[] | undefined;
   let operationLogFile: string | undefined;
+  let logConfigOptionOps = false;
   let claudeAgentAcp = false;
   let expectedForkMeta: unknown;
   let modelAdvertisement: MockAgentOptions["modelAdvertisement"];
@@ -647,6 +653,11 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--log-config-option-ops") {
+      logConfigOptionOps = true;
+      continue;
+    }
+
     if (token === "--claude-agent-acp") {
       claudeAgentAcp = true;
       continue;
@@ -748,6 +759,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     envDumpFile,
     ...(envDumpExtra !== undefined ? { envDumpExtra } : {}),
     operationLogFile,
+    logConfigOptionOps,
     claudeAgentAcp,
     expectedForkMeta,
     ...(modelAdvertisement !== undefined ? { modelAdvertisement } : {}),
@@ -1481,6 +1493,14 @@ class MockAgent implements Agent {
     params: SetSessionConfigOptionRequest,
   ): Promise<SetSessionConfigOptionResponse> {
     const session = this.ensureSession(params.sessionId);
+    if (this.options.logConfigOptionOps) {
+      this.recordOperation({
+        method: "session/set_config_option",
+        sessionId: params.sessionId,
+        configId: params.configId,
+        value: params.value,
+      });
+    }
     if (this.options.setSessionConfigInvalidParams) {
       const error = new Error("Invalid params") as Error & {
         code: number;

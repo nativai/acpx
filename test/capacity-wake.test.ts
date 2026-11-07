@@ -1084,3 +1084,111 @@ test("class: ACPX_ADMISSION_CLASS never reaches the owner a woken prompt starts,
     starts.map(() => false),
   );
 });
+
+// ---------------------------------------------------------------------------------------------
+// brick 5c44d8ba — the gate in front of an ownerless `set` direct connect (DESIGN §6 T2/T3, N6)
+// ---------------------------------------------------------------------------------------------
+
+const setModeCli = (f: Fixture, id: string, env: NodeJS.ProcessEnv) =>
+  runCli(["set-mode", "plan", "--session-id", id], env, f.root);
+
+function setToken(id: string, setting: string): RegExp {
+  return new RegExp(
+    `^acpx: REFUSED reason=no_capacity nothing_started=true protocol=1 box=\\S+ basis=request free_slots=0 need_mib=450 releasable_mib=0 retry_after_s=60 queued_ahead=0 set=${setting} wake=${id}$`,
+    "mu",
+  );
+}
+
+const SET_SENTENCE =
+  /^acpx: Changing mode on session [0-9a-f]{8} needs to start its agent for a few seconds, and this box has no room for that right now\. Nothing was changed\. Retry in 60 s, or make the change while the session is running — a running session applies it without starting anything\.$/mu;
+
+test("NEGATIVE set gate: an agent's ownerless `set-mode plan` on a full box exits 75 — set=mode before wake=<id>, nothing started, nothing reserved, record byte-identical (G6)", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  const id = await makeTarget(f);
+  setRequest(f, 2048);
+  writeMarker(f); // a set never offers --final-report, marker or not
+  const before = sha256(recordPath(f, id));
+  const starts = agentStarts(f);
+  const run = await setModeCli(f, id, asAgent(f));
+  assert.equal(run.code, 75, run.stderr);
+  assert.match(run.stderr, setToken(id, "mode"));
+  assert.match(run.stderr, SET_SENTENCE);
+  assert.doesNotMatch(run.stderr, /--final-report/u);
+  assert.equal(sha256(recordPath(f, id)), before, "a refused set does not mutate its target");
+  assert.equal(agentStarts(f), starts, "no adapter started");
+  assert.deepEqual(leaseFiles(f), ["caller.lock"]);
+  assert.deepEqual(await readLedgerFile(admission(f)), []);
+  const [line] = wakeLines(f);
+  assert.equal(line.decision, "refused");
+  assert.equal(line.verb, "set");
+  assert.equal(line.setting, "mode");
+  assert.equal(line.sender, CALLER);
+});
+
+test("set gate: a person is never refused — no identity (atrium's runner) runs ungated and unlogged; class interactive runs and is logged verb set", async () => {
+  const f = makeBox({ requestMib: 4000, inOwnerTree: false });
+  const ids = [await makeTarget(f), await makeTarget(f)];
+  setRequest(f, 2048);
+  const starts = agentStarts(f);
+  const bare = await setModeCli(f, ids[0], f.env);
+  assert.equal(bare.code, 0, bare.stderr);
+  assert.equal(agentStarts(f), starts + 1, "the live path ran");
+  assert.deepEqual(wakeLines(f), [], "no class, no agent: nothing to log");
+  const human = await setModeCli(f, ids[1], { ...f.env, ACPX_ADMISSION_CLASS: "interactive" });
+  assert.equal(human.code, 0, human.stderr);
+  const [line] = wakeLines(f);
+  assert.equal(line.decision, "not-gated");
+  assert.equal(line.why, "interactive");
+  assert.equal(line.verb, "set");
+  assert.equal(line.setting, "mode");
+});
+
+test("set gate: an ADMITTED set's wake entry is released when its connect ends — on success and on failure (HoD 2026-11-07)", async () => {
+  const f = makeBox({ requestMib: 2700 });
+  const ok = await makeTarget(f);
+  const run = await setModeCli(f, ok, asAgent(f));
+  assert.equal(run.code, 0, run.stderr);
+  assert.equal(wakeLines(f).at(-1)?.decision, "admitted", "the set was admitted, so it reserved");
+  assert.deepEqual(
+    await readLedgerFile(admission(f)),
+    [],
+    "the admitted set's entry outlived its connect",
+  );
+
+  // Failure: the adapter dies at start — the connect throws, and the entry still goes.
+  const failing = await makeTarget(f);
+  const dead = path.join(f.root, "dead-agent.mjs");
+  fs.writeFileSync(dead, "process.exit(1);\n");
+  patchRecord(f, failing, { agent_command: `node ${JSON.stringify(dead)}` });
+  const failed = await setModeCli(f, failing, asAgent(f));
+  assert.notEqual(failed.code, 0, "the dead adapter fails the set");
+  assert.notEqual(failed.code, 75, failed.stderr);
+  assert.equal(wakeLines(f).at(-1)?.decision, "admitted");
+  assert.deepEqual(await readLedgerFile(admission(f)), [], "a failed connect kept its entry");
+});
+
+test("set gate: a set the RECORD vouches for is never gated — an agent's `set model` on a full box succeeds, logs nothing, starts nothing (G1 under G6)", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  const id = await makeTarget(f);
+  setRequest(f, 2048);
+  // Real-shaped, classified (the PROJECT.md trap): an unclassified command would route live.
+  const claude = path.join(f.root, "claude-agent-acp", "dist", "index.js");
+  fs.mkdirSync(path.dirname(claude), { recursive: true });
+  fs.writeFileSync(claude, "process.exit(1);\n");
+  const record = JSON.parse(fs.readFileSync(recordPath(f, id), "utf8")) as { acpx?: object };
+  patchRecord(f, id, {
+    agent_command: `node ${claude}`,
+    acpx: { ...record.acpx, available_models: ["default", "sonnet"] },
+  });
+  const starts = agentStarts(f);
+  const run = await runCli(
+    ["--format", "json", "set", "model", "sonnet", "--session-id", id],
+    asAgent(f),
+    f.root,
+  );
+  assert.equal(run.code, 0, run.stderr);
+  const last = run.stdout.trim().split("\n").at(-1) ?? "";
+  assert.equal((JSON.parse(last) as { validatedAgainst?: string }).validatedAgainst, "record");
+  assert.equal(agentStarts(f), starts);
+  assert.deepEqual(wakeLines(f), []);
+});
