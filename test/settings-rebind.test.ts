@@ -26,6 +26,7 @@ import { fileURLToPath } from "node:url";
 import type { AcpClient } from "../src/acp/client.js";
 import type { QueueTask } from "../src/cli/queue/ipc-server.js";
 import { isProcessAlive, readQueueOwnerProcessIdentity } from "../src/cli/queue/lease-store.js";
+import { isIdleDrainActivity } from "../src/cli/session/queue-owner-runtime.js";
 import { applyQueuedTaskSubscriptionLockPolicy } from "../src/cli/session/runtime.js";
 import {
   setRecordOnlyRecheckHookForTests,
@@ -757,5 +758,66 @@ for (const kind of ["capable", "legacy"] as const) {
         }
       }
     });
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// F4 (9df709f4 VERIFICATION) — an owner-arm set on a WARM owner must not hold it past the idle
+// release. The set's own request, response and the adapter's echo stamped the idle drain's
+// activity clock, and the quiescence gate stayed closed for the TTL-derived window.
+// ---------------------------------------------------------------------------------------------
+
+test("F4 unit: only background work counts as idle-drain activity", () => {
+  const update = (sessionUpdate: string) => ({
+    jsonrpc: "2.0",
+    method: "session/update",
+    params: { sessionId: "s", update: { sessionUpdate } },
+  });
+  const request = { jsonrpc: "2.0", id: 7, method: "session/set_config_option", params: {} };
+  const response = { jsonrpc: "2.0", id: 7, result: { configOptions: [] } };
+  // The owner's own settings traffic.
+  assert.equal(isIdleDrainActivity("outbound", request), false, "the owner's own request");
+  assert.equal(isIdleDrainActivity("inbound", response), false, "the response to it");
+  assert.equal(isIdleDrainActivity("inbound", update("config_option_update")), false, "set echo");
+  assert.equal(isIdleDrainActivity("inbound", update("current_mode_update")), false, "mode echo");
+  // Background work keeps the gate closed, as before.
+  for (const kind of ["agent_message_chunk", "tool_call", "tool_call_update", "usage_update"]) {
+    assert.equal(isIdleDrainActivity("inbound", update(kind)), true, kind);
+  }
+  const permission = { jsonrpc: "2.0", id: 9, method: "session/request_permission", params: {} };
+  assert.equal(isIdleDrainActivity("inbound", permission), true, "an agent request");
+});
+
+for (const change of [
+  { verb: "none", args: [] as string[] },
+  { verb: "effort", args: ["set", "effort", "low"] },
+  { verb: "model", args: ["set", "model", "smart-model"] },
+]) {
+  test(`F4: a warm owner idle-releases on time after ${change.verb === "none" ? "no set (control)" : `an owner-arm set ${change.verb}`}`, async () => {
+    const rig = await makeRig(
+      "--claude-agent-acp --supports-resume-session --advertise-models --advertise-config-options --push-config-on-set-model",
+    );
+    // A 2 s idle release under a 60 s TTL (`cli` passes --ttl 60): the quiescence window is 60 s,
+    // so a set whose own traffic counted as relay activity holds the owner for a minute.
+    rig.env.ACPX_OWNER_IDLE_RELEASE_MS = "2000";
+    try {
+      const first = await cli(rig, ["prompt", "--session-id", rig.id, "echo warm"]);
+      assert.equal(first.code, 0, first.stderr);
+      const owner = ownerPidOf(rig);
+      if (change.args.length > 0) {
+        const set = await cli(rig, [...change.args, "--session-id", rig.id]);
+        assert.equal(set.code, 0, set.stderr);
+        assert.equal(lastJson(set).ownerRebind, "next-turn", set.stdout);
+        assert.equal(ownerPidOf(rig), owner, "the set stopped the owner");
+      }
+      const lease = queuePaths(rig.root, rig.id).lockPath;
+      await waitFor("the idle release", 25_000, () => !fs.existsSync(lease));
+      assert.match(ownerLogOf(rig), /releasing session .* \(reason=idle-memory\)/);
+    } finally {
+      await runCli(rig, ["--agent", rig.agent, "sessions", "close", "--session-id", rig.id]).catch(
+        () => undefined,
+      );
+      fs.rmSync(rig.root, { recursive: true, force: true });
+    }
   });
 }

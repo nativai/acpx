@@ -41,7 +41,12 @@ import {
   settingsBindingFingerprint,
   withoutSettingsFlags,
 } from "../../session/settings-binding.js";
-import type { AcpJsonRpcMessage, SessionRecord, SessionSendOutcome } from "../../types.js";
+import type {
+  AcpJsonRpcMessage,
+  AcpMessageDirection,
+  SessionRecord,
+  SessionSendOutcome,
+} from "../../types.js";
 import type { DeferredCloseRequest } from "../queue/ipc-server.js";
 import {
   appendDeliveryStreamEvent,
@@ -959,6 +964,38 @@ export async function decideIdleOwnerRelease(
   return { release: false };
 }
 
+// What the owner's OWN settings traffic produces on an idle client: the adapter's echo of the
+// changed option (claude-agent-acp pushes `config_option_update` after `set_model`; a `set_mode`
+// pushes `current_mode_update`).
+const SETTINGS_ECHO_UPDATES = new Set(["config_option_update", "current_mode_update"]);
+
+/**
+ * brick 6e27669f F4 — whether a message the idle drain sees is BACKGROUND work, the only thing that
+ * may hold the quiescence gate closed.
+ *
+ * ⚠️ DO NOT STAMP EVERY MESSAGE AGAIN. The owner itself talks to its idle client: an owner-arm
+ * `set effort` / `set model` / `set-mode` sends a request, gets its response and the adapter's
+ * echo. Counted as relay activity, that one set held the gate closed for the whole TTL-derived
+ * quiescence window (15 min by default) — an owner plus its adapter tree stayed resident 14m55s
+ * instead of the idle release (9df709f4 VERIFICATION F4; before 6e27669f such an owner was
+ * SIGTERMed by the set, so nothing reached this). Rows "F4" in test/settings-rebind.test.ts.
+ * The messages are still RELAYED to the stream; only the stamp is gated.
+ */
+export function isIdleDrainActivity(direction: AcpMessageDirection, message: unknown): boolean {
+  if (direction !== "inbound" || !message || typeof message !== "object") {
+    return false; // the owner's own request: a set, a close, a task query
+  }
+  const msg = message as { method?: unknown; params?: { update?: { sessionUpdate?: unknown } } };
+  if (typeof msg.method !== "string") {
+    return false; // a response to one of the owner's own requests
+  }
+  if (msg.method !== "session/update") {
+    return true; // the agent asking for something: work is running
+  }
+  const kind = msg.params?.update?.sessionUpdate;
+  return !(typeof kind === "string" && SETTINGS_ECHO_UPDATES.has(kind));
+}
+
 /** `5m02s` — whole minutes, then zero-padded seconds (floored). */
 function formatIdleAge(idleMs: number): string {
   const totalSeconds = Math.max(0, Math.floor(idleMs / 1000));
@@ -1442,13 +1479,16 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
 
       sharedClient.setEventHandlers({
         // eslint-disable-next-line complexity -- fork integration handler; intentionally over budget, refactor would risk verified merge semantics
-        onAcpMessage: (_dir, message) => {
+        onAcpMessage: (direction, message) => {
           if (!active) {
             return;
           }
           // Stamp inter-turn activity so the idle loop's quiescence gate keeps a
-          // quietly-relaying owner warm (never recycles it mid background work).
-          lastIdleDrainActivityAt = Date.now();
+          // quietly-relaying owner warm (never recycles it mid background work) —
+          // background work only: see isIdleDrainActivity.
+          if (isIdleDrainActivity(direction, message)) {
+            lastIdleDrainActivityAt = Date.now();
+          }
           pendingIdle.push(message);
 
           const msg = message as Record<string, unknown>;
