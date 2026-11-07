@@ -77,7 +77,11 @@ import {
   trySetModelOnRunningOwner,
   trySetModeOnRunningOwner,
 } from "../queue/ipc.js";
-import { readQueueOwnerRecord, type CloserTaskContext } from "../queue/lease-store.js";
+import {
+  ownerRebindsSettings,
+  readQueueOwnerRecord,
+  type CloserTaskContext,
+} from "../queue/lease-store.js";
 import type { LiveBackgroundTask } from "./background-task-tracker.js";
 import { DEFAULT_CLOSE_DRAIN_TIMEOUT_MS } from "./contracts.js";
 import type {
@@ -190,7 +194,10 @@ async function handOverToLateOwner<T>(
   submit: () => Promise<T | undefined>,
 ): Promise<T | undefined> {
   await recheckHookForTests?.();
-  if (!(await readQueueOwnerRecord(sessionId))) {
+  const lease = await readQueueOwnerRecord(sessionId);
+  // brick 6e27669f: a capable owner re-reads the record at its next turn start and rebinds, so the
+  // record result stands and nothing is sent (GA1 — no second adapter, no stop).
+  if (!lease || ownerRebindsSettings(lease)) {
     return undefined;
   }
   try {
@@ -212,10 +219,13 @@ async function handOverToLateOwner<T>(
  * never throws: the write has landed, so a turn in flight only skips the restart.
  */
 async function recycleLateOwner(sessionId: string): Promise<OwnerRecycle> {
+  if (ownerRebindsSettings(await readQueueOwnerRecord(sessionId))) {
+    return { ...OWNER_REBINDS_NEXT_TURN };
+  }
   if ((await tryQueryActiveTurnOnRunningOwner(sessionId)) === true) {
     return { ownerRestarted: false, ownerRestartSkipped: "turn-in-flight" };
   }
-  return await recycleLiveOwner(sessionId);
+  return await bindSettingsChange(sessionId);
 }
 
 // CLI-verb recycle pre-check (the warm-revert fix). The deployed warm bug: the
@@ -262,7 +272,30 @@ async function refuseTurnInFlightForLiveOwner(
   return alive;
 }
 
-type OwnerRecycle = { ownerRestarted: boolean; ownerRestartSkipped?: string; reap?: ReapReport };
+type OwnerRecycle = {
+  ownerRestarted: boolean;
+  ownerRestartSkipped?: string;
+  reap?: ReapReport;
+  ownerRebind?: "next-turn";
+};
+
+const OWNER_REBINDS_NEXT_TURN: OwnerRecycle = { ownerRestarted: false, ownerRebind: "next-turn" };
+
+/**
+ * Binds a settings change that a verb has already written to the record.
+ *
+ * ⚠️ A SETTINGS CHANGE NEVER STOPS A CAPABLE OWNER — the owner rebinds itself at the next turn start
+ * (6e27669f). A stop here kills a dequeued or starting prompt that no guard can see: the owner holds
+ * it in a local variable, `queryActiveTurn` says false and the queue depth says 0.
+ * Only a legacy lease (a pre-fix owner, no `settingsRebind`) or no lease at all keeps the recycle,
+ * so those results stay byte-identical to before (GA4). Rows NA1/NA2 in test/settings-rebind.test.ts.
+ */
+async function bindSettingsChange(sessionId: string): Promise<OwnerRecycle> {
+  if (ownerRebindsSettings(await readQueueOwnerRecord(sessionId))) {
+    return { ...OWNER_REBINDS_NEXT_TURN };
+  }
+  return await recycleLiveOwner(sessionId);
+}
 
 /**
  * Recycles a live owner after a setting changed — and reports what happened. `ownerRestarted:true`
@@ -344,8 +377,8 @@ export async function setSessionModel(
   }
 
   if (ownerToRecycle) {
-    Object.assign(result, await recycleLiveOwner(options.sessionId));
-    if (options.verbose) {
+    Object.assign(result, await bindSettingsChange(options.sessionId));
+    if (options.verbose && result.ownerRestarted) {
       process.stderr.write(
         `[acpx] restarted queue owner for session ${options.sessionId} to bind model "${options.modelId}"\n`,
       );
@@ -460,8 +493,8 @@ export async function setSessionConfigOption(
   }
 
   if (ownerToRecycle) {
-    Object.assign(result, await recycleLiveOwner(options.sessionId));
-    if (options.verbose) {
+    Object.assign(result, await bindSettingsChange(options.sessionId));
+    if (options.verbose && result.ownerRestarted) {
       process.stderr.write(
         `[acpx] restarted queue owner for session ${options.sessionId} to bind config option "${options.configId}"\n`,
       );
@@ -561,9 +594,10 @@ export async function setSessionDepth(
 // record on every spawn — so the durable switch is the record edit + transcript
 // copy (switchSessionSubscription). Binding it requires a respawn:
 //   COLD (no live owner) → record edit only; the next spawn resolves the new dir.
-//   LIVE (queue owner holds a client on the old dir) → after the record edit,
-//     terminate the owner so the next prompt cold-spawns a fresh owner on the new
-//     dir (resuming the ported transcript). Refuse if a turn is in flight.
+//   LIVE (queue owner holds a client on the old dir) → after the record edit, a
+//     capable owner rebuilds its client on the new dir at its next turn start
+//     (bindSettingsChange; a legacy owner is terminated instead), resuming the
+//     ported transcript. Refuse if a turn is in flight.
 export async function setSessionSubscription(
   options: SessionSetSubscriptionOptions,
 ): Promise<SessionSetSubscriptionResult> {
@@ -586,12 +620,12 @@ export async function setSessionSubscription(
   });
   await writeSessionRecord(record);
 
-  // Bind on a live session by recycling the owner; the next prompt re-resolves
+  // Bind on a live session (bindSettingsChange); the next turn re-resolves
   // CLAUDE_CONFIG_DIR from the updated record. The ported transcript means the
   // fresh client resumes WITH context.
   let recycled: OwnerRecycle = { ownerRestarted: false };
   if (ownerAlive) {
-    recycled = await recycleLiveOwner(options.sessionId);
+    recycled = await bindSettingsChange(options.sessionId);
     if (options.verbose && recycled.ownerRestarted) {
       process.stderr.write(
         `[acpx] restarted queue owner for session ${options.sessionId} to bind subscription "${to}"\n`,
@@ -609,8 +643,9 @@ export async function setSessionSubscription(
 // transcript port (switchSessionAccount); binding it requires a respawn:
 //   COLD (no live owner) → record edit only; the next spawn resolves the new dir.
 //   LIVE (queue owner holds a client on the old credential) → after the record
-//     edit, terminate the owner so the next prompt cold-spawns on the new
-//     credential (resuming the ported transcript). Refuse if a turn is in flight.
+//     edit, a capable owner rebuilds its client on the new credential at its next
+//     turn start (bindSettingsChange; a legacy owner is terminated instead),
+//     resuming the ported transcript. Refuse if a turn is in flight.
 // The caller (handleSetProfile) guards the credential-class constraint before
 // invoking this; switchSessionAccount with reason "manual" does not assert it.
 export async function setSessionProfile(
@@ -637,7 +672,7 @@ export async function setSessionProfile(
 
   let recycled: OwnerRecycle = { ownerRestarted: false };
   if (ownerAlive) {
-    recycled = await recycleLiveOwner(options.sessionId);
+    recycled = await bindSettingsChange(options.sessionId);
     if (options.verbose && recycled.ownerRestarted) {
       process.stderr.write(
         `[acpx] restarted queue owner for session ${options.sessionId} to bind profile "${toProfile}"\n`,
@@ -675,7 +710,7 @@ export async function setSessionAutoFailover(
 
   const result: SessionSetAutoFailoverResult = { record, autoFailover: options.autoFailover };
   if (ownerAlive) {
-    Object.assign(result, await recycleLiveOwner(options.sessionId));
+    Object.assign(result, await bindSettingsChange(options.sessionId));
   }
   return result;
 }
@@ -726,8 +761,14 @@ export async function setSessionOutputStyle(
   const liveness = await readQueueOwnerLiveness(options.sessionId);
   const ownerAlive = isOwnerPossiblyAlive(liveness);
 
-  // Refuse ONLY for queued-behind work — never for the active turn itself.
-  if (ownerAlive && liveness.queueDepth > 0) {
+  // Refuse ONLY for queued-behind work — never for the active turn itself. And only for a LEGACY
+  // owner (brick 6e27669f): its recycle is what would drop that work. A capable owner rebinds at
+  // its next turn start and keeps its queue.
+  if (
+    ownerAlive &&
+    liveness.queueDepth > 0 &&
+    !ownerRebindsSettings(await readQueueOwnerRecord(options.sessionId))
+  ) {
     throw new ConfigOptionQueuedWorkError(OUTPUT_STYLE_CONFIG_ID);
   }
 
@@ -765,9 +806,10 @@ export async function setSessionOutputStyle(
   }
 
   if (ownerAlive) {
-    // Path (C): idle owner, recycle now so the very next prompt cold-spawns and
-    // resumes with the new style. Which of the three paths runs is an
-    // optimisation; THAT ONE OF THEM RUNS IS NOT.
+    // Path (C): idle owner. A capable owner (brick 6e27669f) rebinds at its next
+    // turn start: it replaces its client, which closes the old adapter, so the
+    // next turn's load hits a fresh adapter — the property below, kept without a
+    // stop. A legacy owner is recycled now, as before.
     //
     // ⚠️ THE RECYCLE IS LOAD-BEARING — do not "optimise" it away on the grounds
     // that the adapter process is already right there (design brick://4d16ab8b;
@@ -784,7 +826,7 @@ export async function setSessionOutputStyle(
     // model's actual behaviour would disagree — the one signal no automated test
     // reads by default. `test/output-style-no-live-apply.test.ts` pins the
     // structural half of this.
-    Object.assign(result, await recycleLiveOwner(options.sessionId));
+    Object.assign(result, await bindSettingsChange(options.sessionId));
   }
   return result;
 }
@@ -813,7 +855,7 @@ export async function setSessionAutoSubscription(
     autoSubscription: options.autoSubscription,
   };
   if (ownerAlive) {
-    Object.assign(result, await recycleLiveOwner(options.sessionId));
+    Object.assign(result, await bindSettingsChange(options.sessionId));
   }
   return result;
 }
@@ -840,7 +882,7 @@ export async function setSessionFableDegrade(
 
   const result: SessionSetFableDegradeResult = { record, fableDegradeOk: options.fableDegradeOk };
   if (ownerAlive) {
-    Object.assign(result, await recycleLiveOwner(options.sessionId));
+    Object.assign(result, await bindSettingsChange(options.sessionId));
   }
   return result;
 }

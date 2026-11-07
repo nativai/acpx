@@ -488,7 +488,10 @@ async function seedInHome(homeDir: string, sessionId: string): Promise<void> {
   fs.writeFileSync(file, `${JSON.stringify(serializeSessionRecordForDisk(record), null, 2)}\n`);
 }
 
-test("N5 G5: an owner that takes the lease between the record write and the re-check gets the set over its socket, and is recycled", async () => {
+// brick 6e27669f: G5 is superseded for capable owners — a lease carrying `settingsRebind` gets
+// nothing over its socket and the record result stands (row NA6, test/settings-rebind.test.ts).
+// The lease planted here is LEGACY (no marker), so this row is GA4: today's hand-over, unchanged.
+test("N5 G5 (legacy lease, GA4): an owner that takes the lease between the record write and the re-check gets the set over its socket, and is recycled", async () => {
   for (const verb of ["effort", "model"] as const) {
     await withTempHome(async (homeDir) => {
       const sessionId = randomUUID();

@@ -16,12 +16,12 @@ import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.j
 import {
   mergeSessionOptions,
   sessionOptionsFromRecord,
+  type SessionAgentOptions,
 } from "../../runtime/engine/session-options.js";
 import { applyDepthAsMode } from "../../session/depth-application.js";
 import { SessionEventWriter } from "../../session/events.js";
 import { mergeLatestDurableAcpxPreferences } from "../../session/mode-preference.js";
 import { advertisedDepthLadderFromConfigOptions } from "../../session/model-application.js";
-import { outputStyleChangePending } from "../../session/output-style.js";
 import {
   ownerOptionsToInput,
   persistSessionOwnerOptions,
@@ -37,6 +37,10 @@ import {
 } from "../../session/persistence.js";
 import { principalContextFields } from "../../session/persistence/principal.js";
 import { seatDisplayName } from "../../session/seat-display-name.js";
+import {
+  settingsBindingFingerprint,
+  withoutSettingsFlags,
+} from "../../session/settings-binding.js";
 import type { AcpJsonRpcMessage, SessionRecord, SessionSendOutcome } from "../../types.js";
 import type { DeferredCloseRequest } from "../queue/ipc-server.js";
 import {
@@ -98,7 +102,7 @@ import {
   readQueueOwnerStartupFailureDetail,
   spawnQueueOwnerProcess,
 } from "./queue-owner-process.js";
-import { runQueuedTask, type AccountSwitchTrigger } from "./runtime.js";
+import { runQueuedTask, type SharedClientRebindReason } from "./runtime.js";
 import { releaseConfigDirOnTerminalClose, writeTerminalCloseRecord } from "./terminal-close.js";
 import { createSendWakeGate, type SendWakeGate } from "./wake-gate.js";
 
@@ -211,6 +215,9 @@ async function sessionContextFromRecord(record: Awaited<ReturnType<typeof resolv
 async function createQueueOwnerSharedClient(
   options: QueueOwnerRuntimeOptions,
   sessionRecord: Awaited<ReturnType<typeof resolveSessionRecord>>,
+  // The owner's CURRENT options: its spawn-time flags, minus the settings ones once a
+  // settings verb has moved the record (brick 6e27669f).
+  sessionOptions: SessionAgentOptions | undefined,
 ): Promise<AcpClient> {
   return new AcpClient({
     agentCommand: sessionRecord.agentCommand,
@@ -224,10 +231,7 @@ async function createQueueOwnerSharedClient(
     suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
     verbose: options.verbose,
     sessionContext: await sessionContextFromRecord(sessionRecord),
-    sessionOptions: mergeSessionOptions(
-      options.sessionOptions,
-      sessionOptionsFromRecord(sessionRecord),
-    ),
+    sessionOptions: mergeSessionOptions(sessionOptions, sessionOptionsFromRecord(sessionRecord)),
   });
 }
 
@@ -810,12 +814,10 @@ function parseEnvMs(raw: string | undefined): number | undefined {
 // OR'd, that share one safety gate (see decideIdleOwnerRelease):
 //   - "deploy-staleness": the owner is running OUTDATED code (W13-24-10 Path 1).
 //   - "idle-memory":      the owner is provably idle past the memory timeout.
-//   - "output-style-change": the record's DESIRED output style no longer matches
-//     the style this owner's live query was BUILT with (brick://874fee67). The
-//     style is only honoured through the adapter's creation settings, so the only
-//     way to adopt a new one is to let this owner go and have the next prompt
-//     cold-spawn a fresh one that resumes with it.
-export type IdleOwnerReleaseReason = "output-style-change" | "deploy-staleness" | "idle-memory";
+// ⚠️ NO "output-style-change" REASON (brick 6e27669f, GA1): a settings change never makes an
+// owner exit. A pending style is bound by the owner's pre-turn rebind instead, which keeps the
+// queue; an idle owner with a pending style simply idles out under "idle-memory".
+export type IdleOwnerReleaseReason = "deploy-staleness" | "idle-memory";
 
 export type IdleOwnerReleaseDecision =
   | { release: false }
@@ -834,18 +836,13 @@ export type DecideIdleOwnerReleaseInput = {
   // unless the session's record is closed (`recordClosed`).
   liveBackgroundTaskCount: number;
   // brick://0c593c10 (ad6ba1c2 design) — whether the session RECORD is closed.
-  // Lazy, like outputStyleDiffers: it re-reads the record, and is consulted only
+  // Lazy, like deployDiffers: it re-reads the record, and is consulted only
   // when everything else in the gate holds AND a task is live, so the common
   // path never pays for it.
   recordClosed: () => boolean | Promise<boolean>;
   // Lazy so the deploy-file read happens ONLY after the safety gate already holds
   // (preserves the W13-24-10 short-circuit cost-ordering). Pure helper otherwise.
   deployDiffers: () => boolean | Promise<boolean>;
-  // brick://874fee67 — lazy for the same reason (it re-reads the session record).
-  // Without this input an owner that is idle and simply never receives another
-  // prompt holds the stale style indefinitely, and the user's change appears to
-  // have done nothing. Path (A), the turn boundary, cannot cover that case.
-  outputStyleDiffers: () => boolean | Promise<boolean>;
 };
 
 // THE LOAD-BEARING DECISION (W13-24-14 Phase 2). Pure (modulo the deployDiffers
@@ -907,7 +904,7 @@ async function ownerIsIdleAndQuiescent(input: DecideIdleOwnerReleaseInput): Prom
   //                      Bash, Monitor and background Agent it holds. A live task
   //                      means the session is still running, exactly like an active
   //                      turn, so it closes the gate for EVERY reason — idle-memory,
-  //                      deploy-staleness, output-style-change — with NO time cap.
+  //                      deploy-staleness — with NO time cap.
   //                      (8f539d53 only floored the idle-memory clock at 30 min and
   //                      then killed the task; the other two reasons ignored it.)
   //                      ⚠️ ACCEPTED TRADE-OFF: a task that never ends — a Monitor
@@ -940,20 +937,7 @@ export async function decideIdleOwnerRelease(
     return { release: false };
   }
 
-  // brick://874fee67: ordered FIRST, ahead of deploy-staleness, by the same
-  // principle the comment below states — the more specific and more user-visible
-  // reason wins the label. A pending style change is something a human just asked
-  // for and is watching for. Evaluated only now, after the gate already holds, so
-  // the record re-read costs nothing on the common busy path.
-  //
-  // ⚠️ Sits BEHIND the shared gate deliberately: this must never release an owner
-  // with an active turn. Recycling mid-turn is the one thing the whole
-  // accept-anytime contract exists to avoid.
-  if (await input.outputStyleDiffers()) {
-    return { release: true, reason: "output-style-change" };
-  }
-
-  // Deploy-staleness checked second: an owner that is BOTH outdated AND long-idle is
+  // Deploy-staleness checked first: an owner that is BOTH outdated AND long-idle is
   // reported under the more specific, more actionable reason. The deploy check (a
   // file read) is evaluated only now — after the gate already holds.
   if (await input.deployDiffers()) {
@@ -1018,38 +1002,34 @@ function logTurnBoundaryRecycle(sessionId: string, reason: string, liveBackgroun
 // client and returns undefined, and the turn falls back to a fresh client + recycle.
 // Closing the old client kills its adapter; proactive selection never gets here with
 // live background tasks (it defers), a lock switch can, and says so.
-async function replaceSharedClientAfterSwitch(params: {
+// brick 6e27669f: the same replacement binds a settings change (`reason.kind ===
+// "settings"`). A failed settings build keeps the old client too, and nothing is
+// recycled: the owner retries at its next turn.
+async function replaceSharedClientInPlace(params: {
   options: QueueOwnerRuntimeOptions;
   current: AcpClient;
-  newProfileId: string;
-  trigger: AccountSwitchTrigger;
+  reason: SharedClientRebindReason;
+  record: SessionRecord;
+  sessionOptions: SessionAgentOptions | undefined;
   liveBackgroundTasks: number;
   taskReaper?: OwnerTaskReaper;
 }): Promise<AcpClient | undefined> {
-  const { options } = params;
+  const { options, reason } = params;
   const startedAt = Date.now();
   let replacement: AcpClient;
   try {
-    replacement = await createQueueOwnerSharedClient(
-      options,
-      await resolveSessionRecord(options.sessionId),
-    );
+    replacement = await createQueueOwnerSharedClient(options, params.record, params.sessionOptions);
   } catch (error) {
-    process.stderr.write(
-      `[acpx] queue owner could not rebuild its client for session ${options.sessionId} after a ` +
-        `switch to ${params.newProfileId}; this turn runs on a fresh client: ${formatErrorMessage(error)}\n`,
-    );
+    process.stderr.write(sharedClientRebuildFailedLine(options.sessionId, reason, error));
     return undefined;
   }
   // brick ad6ba1c2 §5.2 F — the old adapter's tasks, admitted before its client closes.
   const snapshot = params.taskReaper?.snapshot();
   await params.current.close().catch(() => {});
   if (snapshot) {
-    const reaped = await reapAndLogOnOwnerExit(
-      options.sessionId,
-      `a switch to ${params.newProfileId}`,
-      snapshot,
-    );
+    const cause =
+      reason.kind === "settings" ? "a settings rebind" : `a switch to ${reason.profile}`;
+    const reaped = await reapAndLogOnOwnerExit(options.sessionId, cause, snapshot);
     await clearChipIfStillOpen(
       options.sessionId,
       params.liveBackgroundTasks,
@@ -1059,12 +1039,28 @@ async function replaceSharedClientAfterSwitch(params: {
   // The time this adds to the turn: building the client spawns nothing (the adapter
   // starts when the turn connects, as on any cold owner); closing the old one costs
   // nothing on a cold owner and one graceful adapter exit on a warm one.
+  const replaced =
+    `replaced its adapter client in ${Date.now() - startedAt} ms, ` +
+    `killing ${params.liveBackgroundTasks} live background task(s)\n`;
   process.stderr.write(
-    `[acpx] queue owner switched session ${options.sessionId} to ${params.newProfileId} before the turn ` +
-      `(by ${params.trigger}); replaced its adapter client in ${Date.now() - startedAt} ms, ` +
-      `killing ${params.liveBackgroundTasks} live background task(s)\n`,
+    reason.kind === "settings"
+      ? `[acpx] queue owner rebound session ${options.sessionId} before the turn (reason=settings); ${replaced}`
+      : `[acpx] queue owner switched session ${options.sessionId} to ${reason.profile} before the turn ` +
+          `(by ${reason.trigger}); ${replaced}`,
   );
   return replacement;
+}
+
+function sharedClientRebuildFailedLine(
+  sessionId: string,
+  reason: SharedClientRebindReason,
+  error: unknown,
+): string {
+  return reason.kind === "settings"
+    ? `[acpx] queue owner could not rebind session ${sessionId} to its changed settings; ` +
+        `this turn runs on the old client and the next turn retries: ${formatErrorMessage(error)}\n`
+    : `[acpx] queue owner could not rebuild its client for session ${sessionId} after a ` +
+        `switch to ${reason.profile}; this turn runs on a fresh client: ${formatErrorMessage(error)}\n`;
 }
 
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
@@ -1148,7 +1144,16 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   let lastTaskCompletedAt = Date.now();
   // brick://3356183e: `let`, because a switch decided before a turn replaces it
   // (replaceSharedClient below). Every closure here reads the binding, never a copy.
-  let sharedClient = await createQueueOwnerSharedClient(options, sessionRecord);
+  // brick 6e27669f — the owner's CURRENT options and the settings its client is bound to, both
+  // from the record that client is built from. A settings verb no longer stops this owner: the
+  // pre-turn check compares the fresh record with `boundSettings` and rebinds in place.
+  let ownerSessionOptions = options.sessionOptions;
+  let boundSettings = settingsBindingFingerprint(sessionRecord);
+  let sharedClient = await createQueueOwnerSharedClient(
+    options,
+    sessionRecord,
+    ownerSessionOptions,
+  );
   const backgroundTasks = createBackgroundTaskTracker();
   // brick ad6ba1c2 v3 — admission reads the LIVE set at reap time; no remembered state (§5.4).
   const ownerTaskReaper = createOwnerTaskReaper({
@@ -1236,24 +1241,6 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       return await run();
     } finally {
       turnController.endTurn();
-    }
-  };
-
-  // brick://874fee67 — the ONE predicate, evaluated against a FRESHLY READ
-  // record (re-reading inside the owner loop is established practice here; see
-  // closeActiveBackendSession above). Reading `sessionRecord` from the owner's
-  // own memory would defeat the entire design: that snapshot is exactly the
-  // stale view a style change written from outside this process must beat.
-  //
-  // Fail CLOSED on a read error — an unreadable record is not evidence of a
-  // pending change, and releasing the owner on a transient fs error would turn
-  // every such blip into a recycle. The turn boundary and the idle loop both
-  // re-evaluate, so a missed check costs at most one turn of latency.
-  const outputStyleChangeIsPending = async (): Promise<boolean> => {
-    try {
-      return outputStyleChangePending(await resolveSessionRecord(options.sessionId));
-    } catch {
-      return false;
     }
   };
 
@@ -1631,7 +1618,6 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           // Lazy: the deploy-file read happens only after the gate already holds,
           // preserving the W13-24-10 short-circuit cost-ordering.
           deployDiffers: deployedBuildDiffersFromOwner,
-          outputStyleDiffers: outputStyleChangeIsPending,
           recordClosed: sessionRecordIsClosed,
         });
         if (!decision.release) {
@@ -1707,7 +1693,9 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
               authPolicy: options.authPolicy,
               suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
               promptRetries: task.promptRetries ?? 0,
-              sessionOptions: options.sessionOptions,
+              sessionOptions: ownerSessionOptions,
+              settingsBindingDiffers: (record) =>
+                settingsBindingFingerprint(record) !== boundSettings,
               onClientAvailable: setActiveController,
               onClientClosed: clearActiveController,
               onPromptActive: async () => {
@@ -1715,16 +1703,25 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
                 await applyPendingCancel();
               },
               liveBackgroundTaskCount: backgroundTasks.liveCount,
-              replaceSharedClient: async (newProfileId, trigger) => {
-                const replaced = await replaceSharedClientAfterSwitch({
+              replaceSharedClient: async (reason) => {
+                const record = await resolveSessionRecord(options.sessionId);
+                const fingerprint = settingsBindingFingerprint(record);
+                // Before ANY rebuild: a lock or selection switch that coincides with a
+                // pending set must not let a spawn-time `--model` win again.
+                if (fingerprint !== boundSettings) {
+                  ownerSessionOptions = withoutSettingsFlags(ownerSessionOptions);
+                }
+                const replaced = await replaceSharedClientInPlace({
                   options,
                   current: sharedClient,
-                  newProfileId,
-                  trigger,
+                  reason,
+                  record,
+                  sessionOptions: ownerSessionOptions,
                   liveBackgroundTasks: backgroundTasks.liveCount(),
                   taskReaper: ownerTaskReaper,
                 });
                 if (replaced) {
+                  boundSettings = fingerprint;
                   stopObservingBackgroundTasks();
                   sharedClient = replaced;
                   backgroundTasks.reset();
@@ -1812,22 +1809,16 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       // anchor. Exit so the next prompt cold-spawns a fresh owner on the new
       // profile/account.
       //
-      // brick://874fee67 path (A), the PRIMARY one: the same exit, for a style
-      // change that arrived from OUTSIDE this process while the turn was running.
-      // Note the deliberate asymmetry with `recycleOwnerAfterTask` beside it —
-      // that flag is set by callbacks firing INSIDE the turn, in-process, so a
-      // boolean carries it safely. A style change is written by the CLI or
-      // acpx-ui, so a boolean would have to be delivered over IPC, and a lost
-      // message would leave the record holding the new style while this owner
-      // keeps serving the old one: the change silently forgotten, looking exactly
-      // like success. Re-reading the record instead has no such path.
-      if (recycleOwnerAfterTask || (await outputStyleChangeIsPending())) {
+      // ⚠️ DO NOT ADD A SETTINGS CONDITION HERE (brick 6e27669f, GA1). This exit used to
+      // fire for a pending output style too, and it dropped every prompt queued behind
+      // the turn. A settings change made from outside — style included — is caught by
+      // the next turn's pre-turn rebind, which re-reads the record (nothing to lose in
+      // transit) and keeps `pending`. Row NA2/NA5 in test/settings-rebind.test.ts.
+      if (recycleOwnerAfterTask) {
         // brick://3356183e: this exit used to be silent unless --verbose, so an owner
         // that took the session's background tasks with it left two adapter lines and
         // no reason. Non-verbose, like the idle-release line.
-        ownerExitReason = recycleOwnerAfterTask
-          ? (recycleReason ?? "account-switch")
-          : "output-style-change";
+        ownerExitReason = recycleReason ?? "account-switch";
         logTurnBoundaryRecycle(options.sessionId, ownerExitReason, backgroundTasks.liveCount());
         ownerExitKind = "turn-boundary-recycle";
         break;

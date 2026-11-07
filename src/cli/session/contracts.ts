@@ -346,6 +346,7 @@ export type SessionSetSubscriptionResult = {
   /** True when a live queue owner existed and was restarted to bind the switch. */
   ownerRestarted: boolean;
   ownerRestartSkipped?: string;
+  ownerRebind?: "next-turn";
   /** brick ad6ba1c2 — what the owner recycle did to the session's task processes. */
   reap?: ReapReport;
 };
@@ -366,6 +367,7 @@ export type SessionSetProfileResult = {
   /** True when a live queue owner existed and was restarted to bind the move. */
   ownerRestarted: boolean;
   ownerRestartSkipped?: string;
+  ownerRebind?: "next-turn";
   /** brick ad6ba1c2 — what the owner recycle did to the session's task processes. */
   reap?: ReapReport;
 };
@@ -381,6 +383,7 @@ export type SessionSetAutoFailoverResult = {
   /** True when a live queue owner existed and was restarted to bind the change. */
   ownerRestarted?: boolean;
   ownerRestartSkipped?: string;
+  ownerRebind?: "next-turn";
   /** brick ad6ba1c2 — what the owner recycle did to the session's task processes. */
   reap?: ReapReport;
 };
@@ -426,6 +429,7 @@ export type SessionSetOutputStyleResult = {
    *  the change binds on the next prompt. */
   ownerRestarted?: boolean;
   ownerRestartSkipped?: string;
+  ownerRebind?: "next-turn";
   /** brick ad6ba1c2 — what the owner recycle did to the session's task processes. */
   reap?: ReapReport;
   /**
@@ -449,6 +453,7 @@ export type SessionSetAutoSubscriptionResult = {
   /** True when a live queue owner existed and was restarted to bind the change. */
   ownerRestarted?: boolean;
   ownerRestartSkipped?: string;
+  ownerRebind?: "next-turn";
   /** brick ad6ba1c2 — what the owner recycle did to the session's task processes. */
   reap?: ReapReport;
 };
@@ -465,6 +470,7 @@ export type SessionSetFableDegradeResult = {
   /** True when a live queue owner existed and was restarted to bind the change. */
   ownerRestarted?: boolean;
   ownerRestartSkipped?: string;
+  ownerRebind?: "next-turn";
   /** brick ad6ba1c2 — what the owner recycle did to the session's task processes. */
   reap?: ReapReport;
 };

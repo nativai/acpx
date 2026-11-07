@@ -150,6 +150,7 @@ import {
 } from "../../session/persistence.js";
 import { principalContextFields } from "../../session/persistence/principal.js";
 import { seatDisplayName } from "../../session/seat-display-name.js";
+import { withoutSettingsFlags } from "../../session/settings-binding.js";
 import {
   SESSION_RECORD_SCHEMA,
   type AcpJsonRpcMessage,
@@ -1720,10 +1721,12 @@ export async function runQueuedTask(
     // owner to replace its shared client with one built from the switched record, and
     // the turn runs on it: no throwaway client closed at turn end, no owner recycle.
     // `undefined` back (or no hook) falls back to a fresh client + recycle.
-    replaceSharedClient?: (
-      newProfileId: string,
-      trigger: AccountSwitchTrigger,
-    ) => Promise<AcpClient | undefined>;
+    // brick 6e27669f: a settings change (`{kind:"settings"}`) asks for the same
+    // replacement; `undefined` back keeps the old client and recycles nothing.
+    replaceSharedClient?: (reason: SharedClientRebindReason) => Promise<AcpClient | undefined>;
+    // brick 6e27669f: whether a record's settings differ from those the owner's
+    // shared client was built from (settings-binding.ts).
+    settingsBindingDiffers?: (record: SessionRecord) => boolean;
     liveBackgroundTaskCount?: () => number;
   },
 ): Promise<void> {
@@ -1750,7 +1753,7 @@ export async function runQueuedTask(
         ...buildQueuedTaskRunOptions(
           sessionRecordId,
           task,
-          runtimeOptions,
+          turnRuntimeOptions(runtimeOptions, lockPolicy),
           outputFormatter,
           turnStart,
         ),
@@ -1811,7 +1814,30 @@ async function persistPreSubmitTerminalError(record: SessionRecord, error: unkno
 
 export type AccountSwitchTrigger = "lock" | "selection" | "failover";
 
-type QueuedTaskClientPolicy = { useFreshClient: boolean; replacementClient?: AcpClient };
+/** Why the owner is asked to rebuild its shared client before a turn. */
+export type SharedClientRebindReason =
+  | { kind: "account"; profile: string; trigger: AccountSwitchTrigger }
+  | { kind: "settings" };
+
+export type QueuedTaskClientPolicy = {
+  useFreshClient: boolean;
+  replacementClient?: AcpClient;
+  /** The record's settings differ from the owner client's binding (brick 6e27669f). */
+  settingsChanged?: boolean;
+};
+
+// brick 6e27669f: once the record's settings moved, the owner drops its spawn-time
+// settings flags (withoutSettingsFlags) — they are PREFERRED over the record at every
+// merge, and this turn's merge (the warm model re-assert included) must not win the
+// old value back either. Per-task flags still win for their own task.
+function turnRuntimeOptions(
+  options: QueuedTaskRuntimeOptions,
+  policy: QueuedTaskClientPolicy,
+): QueuedTaskRuntimeOptions {
+  return policy.settingsChanged
+    ? { ...options, sessionOptions: withoutSettingsFlags(options.sessionOptions) }
+    : options;
+}
 
 // A switch before the turn means the turn must run on a client built for the new
 // subscription's config dir. brick://3356183e: the owner REPLACES its shared client
@@ -1823,12 +1849,32 @@ async function queuedSwitchResult(
   trigger: AccountSwitchTrigger,
   options: QueuedTaskRuntimeOptions,
 ): Promise<QueuedTaskClientPolicy> {
-  const replacementClient = await options.replaceSharedClient?.(profile, trigger);
+  const replacementClient = await options.replaceSharedClient?.({
+    kind: "account",
+    profile,
+    trigger,
+  });
   if (replacementClient) {
     return { useFreshClient: false, replacementClient };
   }
   options.onFailoverSwitched?.(profile, trigger);
   return { useFreshClient: true };
+}
+
+/**
+ * brick 6e27669f — a settings verb changed the record since the owner's client was built. The
+ * owner rebuilds that client in place and the turn runs on it; its connect cold-resumes WITH
+ * context and replays the record, exactly as a freshly spawned owner's would. No replacement
+ * (a failed build) keeps the old client and recycles NOTHING: no `onFailoverSwitched`, because a
+ * settings change never makes an owner exit (GA1). The owner retries at the next turn.
+ */
+async function queuedSettingsRebindResult(
+  options: QueuedTaskRuntimeOptions,
+): Promise<QueuedTaskClientPolicy> {
+  const replacementClient = await options.replaceSharedClient?.({ kind: "settings" });
+  return replacementClient
+    ? { useFreshClient: false, replacementClient, settingsChanged: true }
+    : { useFreshClient: false, settingsChanged: true };
 }
 
 // The replacement is the owner's NEW shared client; the old one it replaced is
@@ -1842,7 +1888,7 @@ function clientForQueuedTurn(
   return policy.useFreshClient ? { client: undefined } : {};
 }
 
-async function applyQueuedTaskSubscriptionLockPolicy(
+export async function applyQueuedTaskSubscriptionLockPolicy(
   sessionRecordId: string,
   options: QueuedTaskRuntimeOptions,
 ): Promise<QueuedTaskClientPolicy> {
@@ -1850,10 +1896,15 @@ async function applyQueuedTaskSubscriptionLockPolicy(
   if (bindRecordToDefaultAccount(record)) {
     await writeSessionRecord(record);
   }
+  // Read before any switch below moves the account: this is the change made from OUTSIDE.
+  const settingsChanged = options.settingsBindingDiffers?.(record) === true;
   try {
     const outcome = await enforceSubscriptionLockBeforeTurn(record);
     if (outcome.switchedTo) {
-      return await queuedSwitchResult(outcome.switchedTo, "lock", options);
+      return withSettingsChanged(
+        await queuedSwitchResult(outcome.switchedTo, "lock", options),
+        settingsChanged,
+      );
     }
     // brick://4d517be2: proactive selection runs after lock enforcement (skipped
     // above when the lock hook already switched). Best-effort / never-throws; a
@@ -1862,14 +1913,24 @@ async function applyQueuedTaskSubscriptionLockPolicy(
       liveBackgroundTasks: options.liveBackgroundTaskCount?.(),
     });
     if (selection.switchedTo) {
-      return await queuedSwitchResult(selection.switchedTo, "selection", options);
+      return withSettingsChanged(
+        await queuedSwitchResult(selection.switchedTo, "selection", options),
+        settingsChanged,
+      );
     }
     await enforceAutomationWeeklyCeilingBeforeTurn(record);
   } catch (error) {
     await persistPreSubmitTerminalError(record, error);
     throw error;
   }
-  return { useFreshClient: false };
+  return settingsChanged ? await queuedSettingsRebindResult(options) : { useFreshClient: false };
+}
+
+function withSettingsChanged(
+  policy: QueuedTaskClientPolicy,
+  settingsChanged: boolean,
+): QueuedTaskClientPolicy {
+  return settingsChanged ? { ...policy, settingsChanged } : policy;
 }
 
 // Failover eligibility gate: returns the session record when this turn error
