@@ -179,3 +179,33 @@ export function withInheritedOutputStyle(
   }
   return parentOutputStyle?.trim() || childOutputStyle;
 }
+
+/** The three flat keys atrium writes for the git worktree a session was told to work in (§5.8). */
+export const WORKTREE_METADATA_KEYS = [
+  "worktree_path",
+  "worktree_branch",
+  "worktree_repo",
+] as const;
+
+/**
+ * brick 45917618 §5.8 carry rule — pure, no IO. A copy, fork, by-the-way or `--from` successor
+ * continues the SAME work, so it inherits the source's `worktree_*` keys; a caller that names any
+ * of them itself keeps its own and takes none from the source (never a mixed triple). Template
+ * spawns must NOT call this: a template child starts new work.
+ */
+export function withInheritedWorktree(
+  childMetadata: Record<string, string> | undefined,
+  sourceMetadata: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (WORKTREE_METADATA_KEYS.some((key) => childMetadata?.[key] !== undefined)) {
+    return childMetadata;
+  }
+  const inherited: Record<string, string> = {};
+  for (const key of WORKTREE_METADATA_KEYS) {
+    const value = sourceMetadata?.[key];
+    if (typeof value === "string") {
+      inherited[key] = value;
+    }
+  }
+  return Object.keys(inherited).length > 0 ? { ...childMetadata, ...inherited } : childMetadata;
+}

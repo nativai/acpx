@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import {
   closeSync,
+  existsSync,
   mkdirSync,
   openSync,
   readSync,
@@ -10,6 +11,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { resolveSessionRoot } from "../../config/session-root.js";
 import type { SessionAgentOptions } from "../../runtime/engine/session-options.js";
 import type {
   AuthPolicy,
@@ -257,6 +259,18 @@ export function openOwnerLogFile(logPath: string): number {
   return openSync(logPath, "a");
 }
 
+function queueOwnerProcessCwd(): string {
+  try {
+    const sessionRoot = resolveSessionRoot();
+    if (sessionRoot.enforced && existsSync(sessionRoot.root)) {
+      return sessionRoot.root;
+    }
+  } catch {
+    // A relative ACPX_SESSION_ROOT refuses creates elsewhere; the owner keeps its crash guard.
+  }
+  return safeCwd();
+}
+
 export function buildQueueOwnerSpawnOptions(
   payload: string,
   logFd: number | null = null,
@@ -272,8 +286,10 @@ export function buildQueueOwnerSpawnOptions(
     // P1 cwd-hardening (RCA Incident 1): the detached queue owner must NOT
     // inherit the parent's (possibly deleted) working directory — a reaped
     // worktree cwd makes the detached child crash on uv_cwd. Pin to a known-good
-    // dir (real cwd if valid, else os.homedir()).
-    cwd: safeCwd(),
+    // dir (real cwd if valid, else os.homedir()). brick 45917618 §5.2 E7: under the fixed session
+    // root the owner process stands THERE, so no long-lived owner holds a worktree as its process
+    // cwd; the adapter child still gets the SESSION's cwd explicitly.
+    cwd: queueOwnerProcessCwd(),
     // stdin ignored; stdout+stderr → the per-session owner log when available
     // (so an owner/adapter crash is diagnosable), else the prior "ignore".
     stdio: logFd !== null ? ["ignore", logFd, logFd] : "ignore",

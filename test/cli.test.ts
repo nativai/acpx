@@ -1334,7 +1334,13 @@ test("sessions new --resume-session surfaces not-found loadSession errors withou
     );
 
     assert.equal(result.code, 4, result.stderr);
-    assert.match(result.stderr, /Failed to resume ACP session cs_missing: Resource not found/);
+    // brick 45917618 (HoD ruling 2026-11-06): the miss names the folder it looked in and the way to
+    // point at the conversation's own; the adapter's text is still quoted.
+    assert.match(
+      result.stderr,
+      /Failed to resume ACP session cs_missing: no such conversation was found for the folder .*workspace\. .*pass --cwd <the conversation's original folder>/,
+    );
+    assert.match(result.stderr, /Resource not found: cs_missing/);
 
     const sessionsDir = path.join(homeDir, ".acpx", "sessions");
     const entries = await fs.readdir(sessionsDir).catch(() => [] as string[]);

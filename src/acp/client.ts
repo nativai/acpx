@@ -41,6 +41,10 @@ import { resolveBuiltInAgentLaunch } from "../agent-registry.js";
 import { TimeoutError, withTimeout } from "../async-control.js";
 import type { ProvisioningWarningBreadcrumb } from "../config/os-harness-provisioning.js";
 import {
+  resolveExistingTranscriptPath,
+  transcriptJsonlPath,
+} from "../config/subscription-transcript.js";
+import {
   AgentDisconnectedError,
   AgentSpawnError,
   AgentStartupError,
@@ -50,6 +54,7 @@ import {
   GeminiAcpStartupTimeoutError,
   PermissionDeniedError,
   PermissionPromptUnavailableError,
+  SourceTranscriptMissingError,
   UnsupportedPromptContentError,
 } from "../errors.js";
 import { FileSystemHandlers } from "../filesystem.js";
@@ -65,6 +70,7 @@ import { captureRecordPidIdentity, type RecordPidIdentity } from "../process-ide
 import { getUnsupportedPromptContentMessage, textPrompt } from "../prompt-content.js";
 import { ACTIVITY_NEUTRAL_EVENT_METHOD } from "../session/events.js";
 import { extractRuntimeSessionId } from "../session/runtime-session-id.js";
+import { assertSessionCwdExists } from "../session/session-cwd.js";
 import { buildSpawnCommandOptions } from "../spawn-command-options.js";
 import type {
   AcpClientOptions,
@@ -89,6 +95,7 @@ import {
   resolveClaudeDefaultDisallowedTools,
   isCopilotAcpCommand,
   isGeminiAcpCommand,
+  isPiAcpCommand,
   isQoderAcpCommand,
   resolveAgentCloseAfterStdinEndMs,
   resolveAgentStartupTimeoutMs,
@@ -121,6 +128,7 @@ import {
 import {
   materializeClaudeForkSession,
   readClaudeTranscript,
+  resolveClaudeConfigDir,
   resolveClaudeUuidForAcpxIndex,
 } from "./claude-fork-index.js";
 import {
@@ -136,6 +144,14 @@ import {
 import { isCodexAcpCommand } from "./codex-compat.js";
 import { assertControlNpxLaunchAllowed } from "./control-npx-guard.js";
 import { extractAcpError, formatAcpErrorMessage } from "./error-shapes.js";
+import { rewritePiSessionHeaderCwd, stageFile, withStageLock } from "./fork-source-staging.js";
+
+/** One cross-cwd fork's staging: what is copied where, and how the copy is rewritten on the way. */
+type CrossCwdForkStage = {
+  sourcePath: string;
+  stagedPath: string;
+  transform?: (content: Buffer) => Buffer;
+};
 import {
   HARNESS_FACTS,
   harnessIdForAgentCommand,
@@ -144,6 +160,8 @@ import {
 import {
   applyHarnessConfigDir,
   describePiExtensionSeedFailure,
+  locatePiSessionTranscript,
+  piBoxSessionDirFor,
   releaseHarnessConfigDir,
   reportHarnessConfigDir,
   type HarnessConfigDirPlan,
@@ -1871,6 +1889,13 @@ export class AcpClient {
   private async spawnAgentProcess(
     plan: AgentLaunchPlan,
   ): Promise<ChildProcessByStdio<Writable, Readable, Readable>> {
+    // The single adapter spawn site: every spawn for a record — create, prompt, owner turn start,
+    // recover, keepwarm, config ops — comes through here (brick 45917618 §5.6).
+    assertSessionCwdExists({
+      cwd: this.options.cwd,
+      sessionId: this.options.sessionContext?.acpxRecordId,
+      agentCommand: this.options.agentCommand,
+    });
     const spawnedChild = spawn(
       plan.spawnCommand,
       plan.args,
@@ -2461,56 +2486,158 @@ export class AcpClient {
       options.logIndexHistory,
     );
     const requestMeta = await this.buildForkRequestMeta(forkContext);
-    const requestCwd = this.resolveForkRequestCwd(forkContext, sessionCwd);
-    const previousSuppression = this.applySessionUpdateSuppression(
-      Boolean(options.suppressReplayUpdates),
+    // The fork runs AT THE DESTINATION, always (brick 45917618 §5.5): a cross-cwd source is staged
+    // under the destination's key first, so neither the adapter nor the SDK materializer ever needs
+    // the source's folder — a copy of a legacy session works after that folder was deleted.
+    //
+    // ⚠️ DO NOT "RESTORE" THE SOURCE CWD AS THE REQUEST CWD for a Claude cross-cwd copy (what this
+    // did before): the adapter then starts Claude Code IN THE SOURCE FOLDER, which fails once that
+    // folder is gone, and its fork context names the source cwd while the durable copy lives at the
+    // destination (brick 29d27b7c B1). `test/fork-source-staging.test.ts` pins the request cwd.
+    return await this.withCrossCwdForkSource(
+      forkContext,
+      sourceAcpSessionId,
+      sessionCwd,
+      async (sourceStaged) => {
+        const previousSuppression = this.applySessionUpdateSuppression(
+          Boolean(options.suppressReplayUpdates),
+        );
+
+        let response: ForkSessionResponse | undefined;
+
+        try {
+          response = await this.runConnectionRequest(() =>
+            connection.unstable_forkSession({
+              sessionId: sourceAcpSessionId,
+              cwd: sessionCwd,
+              mcpServers: this.options.mcpServers ?? [],
+              ...(requestMeta ? { _meta: requestMeta } : {}),
+            }),
+          );
+
+          await this.waitForSessionUpdateDrain(
+            options.replayIdleMs ?? REPLAY_IDLE_MS,
+            options.replayDrainTimeoutMs ?? REPLAY_DRAIN_TIMEOUT_MS,
+          );
+        } finally {
+          this.restoreSessionUpdateSuppression(previousSuppression);
+        }
+
+        if (!response) {
+          throw new Error("session/fork returned no response");
+        }
+        const result = toForkSessionResult(response);
+        if (forkContext.contextEndLogIndex !== undefined) {
+          result.contextEndLogIndex = forkContext.contextEndLogIndex;
+        }
+        await this.applyDurableClaudeForkSessionId(
+          result,
+          forkContext,
+          sourceAcpSessionId,
+          sessionCwd,
+          sourceStaged,
+        );
+
+        this.loadedSessionId = result.sessionId;
+
+        return result;
+      },
     );
-
-    let response: ForkSessionResponse | undefined;
-
-    try {
-      response = await this.runConnectionRequest(() =>
-        connection.unstable_forkSession({
-          sessionId: sourceAcpSessionId,
-          cwd: requestCwd,
-          mcpServers: this.options.mcpServers ?? [],
-          ...(requestMeta ? { _meta: requestMeta } : {}),
-        }),
-      );
-
-      await this.waitForSessionUpdateDrain(
-        options.replayIdleMs ?? REPLAY_IDLE_MS,
-        options.replayDrainTimeoutMs ?? REPLAY_DRAIN_TIMEOUT_MS,
-      );
-    } finally {
-      this.restoreSessionUpdateSuppression(previousSuppression);
-    }
-
-    if (!response) {
-      throw new Error("session/fork returned no response");
-    }
-    const result = toForkSessionResult(response);
-    if (forkContext.contextEndLogIndex !== undefined) {
-      result.contextEndLogIndex = forkContext.contextEndLogIndex;
-    }
-    await this.applyDurableClaudeForkSessionId(result, forkContext, sourceAcpSessionId, sessionCwd);
-
-    this.loadedSessionId = result.sessionId;
-
-    return result;
   }
 
-  private resolveForkRequestCwd(forkContext: ForkRequestContext, sessionCwd: string): string {
-    // Claude's ACP fork path resolves the source transcript relative to the
-    // request cwd. Cross-cwd copies therefore ask ACP to fork from the source cwd;
-    // the SDK materializer below writes the durable copy into the destination cwd.
-    if (
-      forkContext.claudeFork &&
-      path.resolve(forkContext.sourceCwd) !== path.resolve(sessionCwd)
-    ) {
-      return forkContext.sourceCwd;
+  /**
+   * One staging scope around a cross-cwd fork (brick 45917618 §5.5 D6/D7): the source transcript is
+   * copied under the DESTINATION's key — Claude's `projects/<slug(dest)>/<id>.jsonl`, pi's
+   * `sessions/--<dest>--/<file>` — before the fork, kept until the fork AND the durable
+   * materialization have returned, and removed in `finally`, all under the per-source stage lock.
+   * `run` receives whether a stage is in place (the materializer then skips its own).
+   */
+  private async withCrossCwdForkSource<T>(
+    forkContext: ForkRequestContext,
+    sourceAcpSessionId: string,
+    sessionCwd: string,
+    run: (sourceStaged: boolean) => Promise<T>,
+  ): Promise<T> {
+    const plan = await this.crossCwdForkStage(forkContext, sourceAcpSessionId, sessionCwd);
+    if (!plan) {
+      return await run(false);
     }
-    return sessionCwd;
+    return await withStageLock(plan.stagedPath, async (lock) => {
+      const cleanup = await stageFile(plan.sourcePath, plan.stagedPath, lock, plan.transform);
+      try {
+        return await run(true);
+      } finally {
+        await cleanup();
+      }
+    });
+  }
+
+  private async crossCwdForkStage(
+    forkContext: ForkRequestContext,
+    sourceAcpSessionId: string,
+    sessionCwd: string,
+  ): Promise<CrossCwdForkStage | undefined> {
+    const sourceCwd = forkContext.sourceCwd;
+    if (path.resolve(sourceCwd) === path.resolve(sessionCwd)) {
+      return undefined;
+    }
+    if (forkContext.claudeFork) {
+      return await this.claudeForkStage(sourceCwd, sourceAcpSessionId, sessionCwd);
+    }
+    const { command, args } = splitCommandLine(this.options.agentCommand);
+    if (!isPiAcpCommand(command, args)) {
+      return undefined; // codex: thread/fork resumes the source by id, not by cwd (§5.5)
+    }
+    return this.piForkStage(sourceCwd, sourceAcpSessionId, sessionCwd);
+  }
+
+  private async claudeForkStage(
+    sourceCwd: string,
+    sourceAcpSessionId: string,
+    sessionCwd: string,
+  ): Promise<{ sourcePath: string; stagedPath: string } | undefined> {
+    const configDir = resolveClaudeConfigDir(this.claudeCopySubscriptionSelection());
+    // The source may still sit under the pre-fix slug (brick://ae715773); the STAGED copy is
+    // always at the primary path, the only form Claude Code reads.
+    const resolved = await resolveExistingTranscriptPath(configDir, sourceCwd, sourceAcpSessionId);
+    const sourcePath =
+      resolved?.path ?? transcriptJsonlPath(configDir, sourceCwd, sourceAcpSessionId);
+    const stagedPath = transcriptJsonlPath(configDir, sessionCwd, sourceAcpSessionId);
+    return sourcePath === stagedPath ? undefined : { sourcePath, stagedPath };
+  }
+
+  private piForkStage(
+    sourceCwd: string,
+    sourceAcpSessionId: string,
+    sessionCwd: string,
+  ): CrossCwdForkStage | undefined {
+    const env = this.agentSpawnEnv ?? process.env;
+    const located = locatePiSessionTranscript({
+      cwd: sourceCwd,
+      acpSessionId: sourceAcpSessionId,
+      env,
+    });
+    if (!located) {
+      throw new SourceTranscriptMissingError({ acpSessionId: sourceAcpSessionId, cwd: sourceCwd });
+    }
+    const stagedPath = path.join(piBoxSessionDirFor(sessionCwd, env), located.name);
+    if (stagedPath === located.path) {
+      return undefined;
+    }
+    // CONCEPTION v1.5 §5.5 D7: the staged copy's header names the DESTINATION, so pi-acp restores
+    // the source there and the fork inherits it — the copy never depends on the legacy folder.
+    const transform = (content: Buffer): Buffer => {
+      const rewritten = rewritePiSessionHeaderCwd(content, sessionCwd);
+      if (!rewritten) {
+        throw new SourceTranscriptMissingError({
+          acpSessionId: sourceAcpSessionId,
+          cwd: sourceCwd,
+          unparseableHeaderAt: located.path,
+        });
+      }
+      return rewritten;
+    };
+    return { sourcePath: located.path, stagedPath, transform };
   }
 
   private async buildForkRequestMeta(
@@ -2554,6 +2681,7 @@ export class AcpClient {
     forkContext: ForkRequestContext,
     sourceAcpSessionId: string,
     cwd: string,
+    sourceStaged: boolean,
   ): Promise<void> {
     if (!forkContext.claudeFork) {
       return;
@@ -2566,6 +2694,7 @@ export class AcpClient {
       sourceAcpSessionId,
       subscriptionId: this.claudeCopySubscriptionSelection(),
       upToMessageId: forkContext.claudeResumeSessionAt,
+      sourceStaged,
     });
     if (!durableClaudeSessionId) {
       return;

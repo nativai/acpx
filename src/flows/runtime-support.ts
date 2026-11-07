@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { InterruptedError, TimeoutError } from "../async-control.js";
 import { createOutputFormatter } from "../cli/output/output.js";
+import { effectiveCreateCwd } from "../config/session-root.js";
 import { textPrompt } from "../prompt-content.js";
 import { defaultSessionEventLog } from "../session/event-log.js";
 import { SESSION_RECORD_SCHEMA } from "../types.js";
@@ -289,7 +290,8 @@ export function createIsolatedSessionBinding(
     profile,
     agentName: agent.agentName,
     agentCommand: agent.agentCommand,
-    cwd: agent.cwd,
+    // The isolated prompt runs through `runOnce`, which starts at the session root (§5.2 E2/F1).
+    cwd: effectiveCreateCwd(agent.cwd),
     acpxRecordId: key,
     acpSessionId: key,
   };

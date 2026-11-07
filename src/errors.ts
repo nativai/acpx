@@ -151,6 +151,73 @@ export class AgentSpawnError extends AcpxOperationalError {
   }
 }
 
+/**
+ * brick 45917618 §5.6 — a session's working directory is gone (a reaped worktree, a deleted temp
+ * folder). The turn is REFUSED: the folder is never re-created and the session never continues
+ * somewhere else. `detailCode` `SESSION_CWD_MISSING` is the contract atrium keys on.
+ */
+export class SessionCwdMissingError extends AcpxOperationalError {
+  readonly cwd: string;
+  readonly sessionId?: string;
+
+  constructor(params: { cwd: string; sessionId?: string; piSource?: boolean; root?: string }) {
+    super(sessionCwdMissingMessage(params), {
+      outputCode: "RUNTIME",
+      detailCode: "SESSION_CWD_MISSING",
+      origin: "runtime",
+    });
+    this.cwd = params.cwd;
+    this.sessionId = params.sessionId;
+  }
+}
+
+function sessionCwdMissingMessage(params: {
+  cwd: string;
+  sessionId?: string;
+  piSource?: boolean;
+  root?: string;
+}): string {
+  if (!params.sessionId) {
+    return params.root !== undefined && params.cwd === params.root
+      ? `Cannot start a new session: the session root ${params.cwd} does not exist on this box.`
+      : `Cannot start a new session: its working directory ${params.cwd} does not exist.`;
+  }
+  const id = params.sessionId;
+  const successor = `start a fresh successor: acpx sessions new --from ${id}.`;
+  const head =
+    `Session ${id} cannot start: its working directory ${params.cwd} no longer exists, and ` +
+    `sessions do not move.`;
+  return params.piSource
+    ? `${head} Start a fresh successor: acpx sessions new --from ${id}.`
+    : `${head} Continue it as a copy, which starts in ${params.root ?? "/workspace"} and keeps the ` +
+        `conversation: acpx sessions copy --from ${id} (atrium: Fork or By the way). Or ${successor}`;
+}
+
+/**
+ * brick 45917618 §5.5 — a cross-cwd Pi copy whose source JSONL is in no store acpx knows, or whose
+ * `session` header acpx cannot rewrite to the destination (CONCEPTION v1.5 D7).
+ */
+export class SourceTranscriptMissingError extends AcpxOperationalError {
+  constructor(params: {
+    sessionId?: string;
+    acpSessionId: string;
+    cwd: string;
+    unparseableHeaderAt?: string;
+  }) {
+    const subject = params.sessionId ? `Session ${params.sessionId}` : "The source session";
+    const what = params.unparseableHeaderAt
+      ? `the Pi transcript ${params.unparseableHeaderAt} has no session header acpx can rewrite ` +
+        `(a first line with type "session" and string id and cwd)`
+      : `the Pi transcript of ACP session ${params.acpSessionId} (from ${params.cwd}) was not ` +
+        `found in the box session store or any stranded session dir`;
+    super(
+      `${subject} cannot be copied: ${what}. Start a fresh successor: acpx sessions new --from ` +
+        `${params.sessionId ?? "<id>"}.`,
+      { outputCode: "RUNTIME", detailCode: "SOURCE_TRANSCRIPT_MISSING", origin: "runtime" },
+    );
+  }
+}
+
 export class AgentStartupError extends AcpxOperationalError {
   readonly agentCommand: string;
   readonly exitCode: number | null;

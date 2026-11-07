@@ -15,6 +15,7 @@ import {
   resolveEffectiveForkIndex,
   resolveHarnessCapabilities,
 } from "../acp/harness-capabilities.js";
+import { locatePiSessionTranscript } from "../acp/harness-config-dir.js";
 import { projectAdvertisedComposedModels } from "../acp/model-support.js";
 import { resolveAgentNameFromCommand } from "../agent-registry.js";
 import { type AdmissionTicket, admitCreate } from "../capacity/admission.js";
@@ -36,6 +37,7 @@ import {
   ProfileClassMismatchError,
   ProfileUnknownError,
   SessionNotFoundError,
+  SourceTranscriptMissingError,
   SubscriptionChangeRequiresSwitchError,
   SubscriptionLockedError,
   SubscriptionUnknownError,
@@ -133,6 +135,12 @@ import {
 } from "./background-task-gate.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import {
+  type CreateCwdResolution,
+  cwdFlagIsExplicit,
+  resolveCreateCwd,
+  resolveCreateCwdFromFlags,
+} from "./create-cwd.js";
+import {
   hasExplicitPermissionModeFlag,
   parseHistoryLimit,
   resolveAgentInvocation,
@@ -187,6 +195,7 @@ import {
   withInheritedProfile,
   withInheritedOutputStyle,
   withInheritedReasoningEffort,
+  withInheritedWorktree,
 } from "./session/inherited-metadata.js";
 import { refuseCloseOverOpenPersonRequests } from "./session/open-person-requests-guard.js";
 import { mergeSessionMetadata, validateSessionMetadataValue } from "./session/session-metadata.js";
@@ -971,6 +980,8 @@ type EffectiveSpawnAgent = {
   agentCommand: string;
   cwd: string;
   sameAgentAsParent: boolean;
+  /** An explicit `--cwd` the session root overrode (§5.3) — reported as `requestedCwd`. */
+  requestedCwd?: string;
 };
 
 // `sessions new`'s lineage and inheritance sources. The parent is the flags / env as always,
@@ -1034,9 +1045,10 @@ async function resolveParentForNew(
   }
 }
 
-// The agent `sessions new` spawns. Under `--from` the old session's cwd is the default (an
-// explicit `--cwd` wins), and when the new agent differs from the old one the agent-specific
-// options are skipped and said so on stderr.
+// The agent `sessions new` spawns. Its cwd is the session root whenever that is enforced (§5.2 E5:
+// a `--from` successor never inherits the old session's cwd); otherwise, under `--from` the old
+// session's cwd is the default (an explicit `--cwd` wins). When the new agent differs from the old
+// one the agent-specific options are skipped and said so on stderr.
 function resolveNewSessionAgent(params: {
   agent: ResolvedAgentInvocation;
   explicitAgentName: string | undefined;
@@ -1044,6 +1056,7 @@ function resolveNewSessionAgent(params: {
   inherit: ResolvedParentSession | undefined;
   from: SessionRecord | undefined;
   fromRef: string | undefined;
+  resumeSession: string | undefined;
   command: Command;
   config: ResolvedAcpxConfig;
 }): EffectiveSpawnAgent {
@@ -1054,8 +1067,20 @@ function resolveNewSessionAgent(params: {
     params.inherit,
     params.config,
   );
+  // `--resume-session` continues an EXISTING conversation, which keeps its folder (HoD ruling
+  // 2026-11-06, by D5): an explicit `--cwd` is honoured, silently; without one it starts at the root.
+  const createCwd =
+    params.resumeSession !== undefined && cwdFlagIsExplicit(params.command)
+      ? { cwd: resolved.cwd }
+      : resolveCreateCwdFromFlags({
+          command: params.command,
+          cwdFlag: resolved.cwd,
+          fallback: params.from?.cwd,
+          jsonStrict: params.globalFlags.jsonStrict,
+        });
+  const withCwd = { ...resolved, cwd: createCwd.cwd, requestedCwd: createCwd.requestedCwd };
   if (!params.from) {
-    return resolved;
+    return withCwd;
   }
   const note = resolved.sameAgentAsParent
     ? undefined
@@ -1063,9 +1088,7 @@ function resolveNewSessionAgent(params: {
   if (note) {
     process.stderr.write(note);
   }
-  const cwdSource = optionValueSourceWithGlobals(params.command, "cwd");
-  const cwdIsExplicit = cwdSource !== undefined && cwdSource !== "default";
-  return cwdIsExplicit ? resolved : { ...resolved, cwd: params.from.cwd };
+  return withCwd;
 }
 
 // Resolve the agent a spawn (`sessions new` / `ensure`) actually uses, applying
@@ -1248,7 +1271,13 @@ function buildSessionStartOptions(params: {
     // existing seat with no `--from` the creator is the seat's first holder (C8.2 rule 3; brick 509d3884 O1).
     metadata: recordPrincipal(
       withInheritedBrick(
-        applyBrickFlag(params.flags.metadata, params.resolvedBrick),
+        applyBrickFlag(
+          // §5.8 carry rule: a `--from` / handover successor continues in the old session's worktree.
+          params.from
+            ? withInheritedWorktree(params.flags.metadata, params.from.metadata)
+            : params.flags.metadata,
+          params.resolvedBrick,
+        ),
         params.inherit?.brick,
         params.resolvedBrick === false,
       ),
@@ -1309,25 +1338,19 @@ async function resolveBrickFlagValue(
   return { value: undefined, validated: false };
 }
 
-function optionValueSourceWithGlobals(command: Command, optionName: string): string | undefined {
-  let current: Command | null = command;
-  while (current) {
-    const source = current.getOptionValueSource(optionName);
-    if (source !== undefined) {
-      return source;
-    }
-    current = current.parent;
-  }
-  return undefined;
-}
-
+// A copy's cwd: the session root whenever that is enforced (§5.2 E5 — a copy, fork, by-the-way or
+// template spawn never inherits the source cwd); otherwise the source's cwd unless `--cwd` names one.
 function resolveCopyDestinationCwd(
   command: Command,
   globalFlags: GlobalFlags,
   source: SessionRecord,
-): string {
-  const cwdSource = optionValueSourceWithGlobals(command, "cwd");
-  return cwdSource && cwdSource !== "default" ? path.resolve(globalFlags.cwd) : source.cwd;
+): CreateCwdResolution {
+  return resolveCreateCwdFromFlags({
+    command,
+    cwdFlag: globalFlags.cwd,
+    fallback: source.cwd,
+    jsonStrict: globalFlags.jsonStrict,
+  });
 }
 
 async function sourceDefaultForkName(source: SessionRecord): Promise<string> {
@@ -1344,8 +1367,13 @@ function copyMetadata(
   source: SessionRecord,
   forkAtMessageIndex: number,
   forkAtLogIndex: number | undefined,
+  requireTemplate: boolean,
 ): Record<string, string> | undefined {
-  const metadata: Record<string, string> = { ...flags.metadata };
+  // §5.8 carry rule: a copy/fork/by-the-way continues the source's work, in the source's worktree;
+  // a `--from-template` child starts new work and never inherits it.
+  const metadata: Record<string, string> = {
+    ...(requireTemplate ? flags.metadata : withInheritedWorktree(flags.metadata, source.metadata)),
+  };
   if (flags.ephemeral === true) {
     metadata.byway = "1";
     metadata.byway_parent = source.acpxRecordId;
@@ -1877,11 +1905,17 @@ export async function handleExec(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   warnReasoningEffortNotRoutable(globalFlags, agent.agentName);
   warnOutputStyleNotSupported(globalFlags, agent.agentName);
+  // §5.3: an exec is a new session — `--cwd` still bases `-f`, but the session starts at the root.
+  const execCwd = resolveCreateCwdFromFlags({
+    command,
+    cwdFlag: agent.cwd,
+    jsonStrict: globalFlags.jsonStrict,
+  });
 
   const result = await runOnce({
     agentCommand: agent.agentCommand,
     agentName: agent.agentName,
-    cwd: agent.cwd,
+    cwd: execCwd.cwd,
     prompt,
     mcpServers: config.mcpServers,
     permissionMode,
@@ -3375,7 +3409,7 @@ async function handleSessionsNewFromTemplate(
       `[acpx] --from-template '${fromTemplate}' → ${resolvedSource.acpxRecordId} via ${via}\n`,
     );
   }
-  const { created, source } = await runSessionCopy(
+  const { created, source, requestedCwd } = await runSessionCopy(
     explicitAgentName,
     templateCopyFlags(flags, resolvedSource.acpxRecordId),
     command,
@@ -3388,7 +3422,7 @@ async function handleSessionsNewFromTemplate(
     config,
   );
   const { printCopiedSessionByFormat } = await loadOutputRenderModule();
-  printCopiedSessionByFormat(created, source, globalFlags.format, outcome);
+  printCopiedSessionByFormat(created, source, globalFlags.format, outcome, requestedCwd);
 }
 
 function templateCopyFlags(flags: SessionsNewFlags, templateId: string): SessionsCopyFlags {
@@ -3471,7 +3505,7 @@ export async function handleSessionsNew(
     return;
   }
 
-  const { created, agentName, globalFlags } = await createSessionFromNewFlags(
+  const { created, agentName, globalFlags, requestedCwd } = await createSessionFromNewFlags(
     explicitAgentName,
     flags,
     command,
@@ -3491,7 +3525,7 @@ export async function handleSessionsNew(
   const outcome = firstTurn
     ? await queueFirstTurn(created, firstTurn, "prompt", command, config)
     : undefined;
-  printNewSessionByFormat(created, globalFlags.format, outcome);
+  printNewSessionByFormat(created, globalFlags.format, outcome, requestedCwd);
 }
 
 /**
@@ -3504,7 +3538,12 @@ async function createSessionFromNewFlags(
   flags: SessionsNewFlags,
   command: Command,
   config: ResolvedAcpxConfig,
-): Promise<{ created: SessionRecord; agentName: string; globalFlags: GlobalFlags }> {
+): Promise<{
+  created: SessionRecord;
+  agentName: string;
+  globalFlags: GlobalFlags;
+  requestedCwd?: string;
+}> {
   const globalFlags = resolveGlobalFlags(command, config);
   validateExplicitCredentialFlags(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
@@ -3527,6 +3566,7 @@ async function createSessionFromNewFlags(
     inherit,
     from,
     fromRef: flags.from,
+    resumeSession: flags.resumeSession,
     command,
     config,
   });
@@ -3601,7 +3641,12 @@ async function createSessionFromNewFlags(
     ),
   );
   await maybeStampBrickLink(created);
-  return { created, agentName: effectiveAgent.agentName, globalFlags };
+  return {
+    created,
+    agentName: effectiveAgent.agentName,
+    globalFlags,
+    requestedCwd: effectiveAgent.requestedCwd,
+  };
 }
 
 /**
@@ -3631,7 +3676,7 @@ export async function handleSessionsCopy(
   config: ResolvedAcpxConfig,
 ): Promise<void> {
   const handoffPrompt = (await resolveHandoffPrompt(flags))?.prompt;
-  const { created, source } = await runSessionCopy(
+  const { created, source, requestedCwd } = await runSessionCopy(
     explicitAgentName,
     flags,
     command,
@@ -3639,7 +3684,13 @@ export async function handleSessionsCopy(
     false,
   );
   const { printCopiedSessionByFormat } = await loadOutputRenderModule();
-  printCopiedSessionByFormat(created, source, resolveGlobalFlags(command, config).format);
+  printCopiedSessionByFormat(
+    created,
+    source,
+    resolveGlobalFlags(command, config).format,
+    undefined,
+    requestedCwd,
+  );
 
   // #3 Fork notice: inject a divergence-handoff as turn 1 for every non-ephemeral
   // (plain) fork so the forked agent self-identifies and does not act as the source.
@@ -3795,6 +3846,7 @@ async function runSessionCopy(
 ): Promise<{
   created: Awaited<ReturnType<SessionModule["createSession"]>>;
   source: SessionRecord;
+  requestedCwd?: string;
 }> {
   const globalFlags = resolveGlobalFlags(command, config);
   validateExplicitCredentialFlags(globalFlags);
@@ -3808,6 +3860,8 @@ async function runSessionCopy(
   }
   const { forkAtMessageIndex, forkAtLogIndex } = await resolveCopyCut(source, flags);
   assertCopyAgentLock({ explicitAgentName, globalFlags, pathAgent, source, config });
+  const destination = resolveCopyDestinationCwd(command, globalFlags, source);
+  refuseUncopyablePiSource(source, destination.cwd);
 
   // GAP 1 — resolve the spawn parent the same way plain-`new` does (flag →
   // flag → ACPX_SESSION_URL env fallback). The copy/template/fork child then
@@ -3836,7 +3890,7 @@ async function runSessionCopy(
       agentCommand: source.agentCommand,
       agentName:
         source.agentName ?? resolveAgentNameFromCommand(source.agentCommand, config.agents),
-      cwd: resolveCopyDestinationCwd(command, globalFlags, source),
+      cwd: destination.cwd,
       seatName: flags.name ?? (await sourceDefaultForkName(source)),
       // metadata.brick carry: precedence = --brick flag > spawn-parent brick (--parent-id / byway)
       // > none. A plain fork/copy carries NO brick by default (the 07-15 source.metadata.brick
@@ -3846,7 +3900,7 @@ async function runSessionCopy(
       metadata: withRecordedPrincipal(
         withInheritedBrick(
           applyBrickFlag(
-            copyMetadata(flags, source, forkAtMessageIndex, forkAtLogIndex),
+            copyMetadata(flags, source, forkAtMessageIndex, forkAtLogIndex, requireTemplate),
             resolvedBrick,
           ),
           caller?.brick, // spawn-parent brick (byway via --parent-id) — KEEP; the CALLER's under --no-parent
@@ -3888,7 +3942,27 @@ async function runSessionCopy(
   printCreatedSessionBanner(created, sourceType, globalFlags.format, globalFlags.jsonStrict);
   // The result line is the CALLER's: `sessions new --from-template` prints it only after the
   // first turn is queued, so it can carry `promptQueued`.
-  return { created, source };
+  return { created, source, requestedCwd: destination.requestedCwd };
+}
+
+/**
+ * brick 45917618 §5.5 — the Pi copy that cannot be made, refused BEFORE anything is created: a copy
+ * into another cwd whose source JSONL is in no store acpx knows, so the staging has nothing to stage.
+ * A source whose FOLDER is gone is copyable (CONCEPTION v1.5 D7): the staged copy's header names the
+ * destination, so pi-acp never spawns in the old folder.
+ */
+function refuseUncopyablePiSource(source: SessionRecord, destinationCwd: string): void {
+  if (
+    acpAdapterKind(source.agentCommand) === "pi" &&
+    path.resolve(source.cwd) !== path.resolve(destinationCwd) &&
+    !locatePiSessionTranscript({ cwd: source.cwd, acpSessionId: source.acpSessionId })
+  ) {
+    throw new SourceTranscriptMissingError({
+      sessionId: source.acpxRecordId,
+      acpSessionId: source.acpSessionId,
+      cwd: source.cwd,
+    });
+  }
 }
 
 // `noParent` (`sessions new --from-template --no-parent`, HoD ruling R1) records no parent
@@ -4382,8 +4456,18 @@ export async function handleSessionsImport(
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const newCwd = flags.destinationCwd
+    ? path.resolve(globalFlags.cwd, flags.destinationCwd)
+    : undefined;
+  // §5.3: the import-local `--cwd` is inert under the session root, announced like the global one.
+  const { requestedCwd } = resolveCreateCwd({
+    explicitRequest: newCwd,
+    fallback: globalFlags.cwd,
+    jsonStrict: globalFlags.jsonStrict,
+    flagLabel: "sessions import --cwd",
+  });
   const result = await importSession(archivePath, {
-    newCwd: flags.destinationCwd ? path.resolve(globalFlags.cwd, flags.destinationCwd) : undefined,
+    newCwd,
     expectedAgentName: globalFlags.agent ? undefined : agent.agentName,
     expectedAgentCommand: agent.agentCommand,
   });
@@ -4393,6 +4477,7 @@ export async function handleSessionsImport(
       action: "session_imported",
       record_id: result.record_id,
       cwd: result.cwd,
+      ...(requestedCwd === undefined ? {} : { requestedCwd }),
     })
   ) {
     return;

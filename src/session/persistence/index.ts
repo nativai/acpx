@@ -205,6 +205,15 @@ export type SessionIndexEntry = {
    */
   principal?: Record<string, string>;
   /**
+   * The git worktree this session was told to work in (brick 45917618 §5.8): the record's flat
+   * `worktree_path` / `worktree_branch` / `worktree_repo` metadata, present only when all three are.
+   * The session itself runs at the session root; atrium's list row and chat header read this.
+   *
+   * ⚠️ BOTH index legs carry it (`toSessionIndexEntry` + `parseIndexEntry`), exactly as `startedBy`
+   * does. `test/session-index-worktree.test.ts` is the guard.
+   */
+  worktree?: SessionWorktree;
+  /**
    * The DESCRIPTOR's `canSetModelLive`, REFINED by this session's own
    * advertisement (F-12). The UI's live-model control reads this, not the static
    * table — see {@link canSetModelLiveFromRecord}.
@@ -451,6 +460,31 @@ function principalFrom(source: unknown): Record<string, string> | undefined {
   return stringEntriesWithPrefix(source, PRINCIPAL_METADATA_PREFIX);
 }
 
+export type SessionWorktree = { path: string; branch: string; repo: string };
+
+function worktreeOf(
+  worktreePath: unknown,
+  branch: unknown,
+  repo: unknown,
+): SessionWorktree | undefined {
+  return typeof worktreePath === "string" && typeof branch === "string" && typeof repo === "string"
+    ? { path: worktreePath, branch, repo }
+    : undefined;
+}
+
+/** Projection leg: the record's three flat `worktree_*` metadata strings. */
+function worktreeFromMetadata(
+  metadata: Record<string, string> | undefined,
+): SessionWorktree | undefined {
+  return worktreeOf(metadata?.worktree_path, metadata?.worktree_branch, metadata?.worktree_repo);
+}
+
+/** Parse leg: an index entry's `worktree` object (hand-/acpx-ui-writable, so validated). */
+function worktreeFromIndexEntry(raw: unknown): SessionWorktree | undefined {
+  const value = asRecord(raw);
+  return value ? worktreeOf(value.path, value.branch, value.repo) : undefined;
+}
+
 // eslint-disable-next-line complexity -- flat field-by-field projection of the optional hot-path enrichment scalars; linear, not branchy logic
 function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
   const record = asRecord(raw);
@@ -518,6 +552,8 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     startedBy: startedByFrom(record.startedBy),
     // BOTH index legs: the projection leg is `toSessionIndexEntry`'s `principalFrom(metadata)`.
     principal: principalFrom(record.principal),
+    // BOTH index legs: the projection leg is `toSessionIndexEntry`'s `worktreeFromMetadata`.
+    worktree: worktreeFromIndexEntry(record.worktree),
     canSetModelLive:
       typeof record.canSetModelLive === "boolean" ? record.canSetModelLive : undefined,
     // brick ebfe4c3c: BOTH index legs. Miss these and the next rewrite of ANY
@@ -697,6 +733,8 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     startedBy: startedByFrom(metadata),
     // BOTH index legs: the parse leg is `parseIndexEntry`'s `principal`.
     principal: principalFrom(metadata),
+    // BOTH index legs: the parse leg is `parseIndexEntry`'s `worktreeFromIndexEntry`.
+    worktree: worktreeFromMetadata(metadata),
     outputStyleDesired: sessionOptions?.output_style,
     canSetModelLive: canSetModelLiveFromRecord(record),
     resolvedModelLabel: resolvedModelLabelForRecord(record),

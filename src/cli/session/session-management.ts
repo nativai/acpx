@@ -9,13 +9,19 @@ import {
   type SessionLoadResult,
 } from "../../acp/client.js";
 import { formatErrorMessage } from "../../acp/error-normalization.js";
+import { isAcpResourceNotFoundError } from "../../acp/error-shapes.js";
 import {
   assertForkAtIndexHonoured,
   resolveEffectiveForkIndex,
 } from "../../acp/harness-capabilities.js";
 import { readTransientAdvertisement } from "../../acp/transient-advertisement.js";
 import { withInterrupt, withTimeout } from "../../async-control.js";
-import { AcpxOperationalError } from "../../errors.js";
+import { effectiveCreateCwd } from "../../config/session-root.js";
+import {
+  AcpxOperationalError,
+  SessionCwdMissingError,
+  SourceTranscriptMissingError,
+} from "../../errors.js";
 import { bindDefaultAccountToSessionOptionsAsync } from "../../runtime/engine/default-account-binding.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
 import { persistSessionOptions } from "../../runtime/engine/session-options.js";
@@ -67,6 +73,10 @@ import {
   type SeatBrickLink,
   type SeatRecord,
 } from "../../session/persistence.js";
+import {
+  refuseUnresumableConversation,
+  resumeNotFoundMessage,
+} from "../../session/resume-precheck.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import { explainSeatRowMissing } from "../../session/seat-backfill.js";
 import { withBrickCache } from "../../session/seat-brick.js";
@@ -992,6 +1002,16 @@ async function resumeSessionRecordWithClient(
       }),
     };
   } catch (error) {
+    if (isAcpResourceNotFoundError(error)) {
+      // A conversation is found under the folder it started in — say where we looked, and how to
+      // point at the right one (HoD ruling 2026-11-06).
+      throw new AcpxOperationalError(
+        `${resumeNotFoundMessage(options.resumeSessionId, cwd)} (${formatErrorMessage(error)})`,
+        // No `cause`: the output normalizer would surface the adapter's bare "Resource not found"
+        // from it instead of this message (the original text is quoted above).
+        { outputCode: "NO_SESSION", origin: "runtime" },
+      );
+    }
     throw new Error(
       `Failed to resume ACP session ${options.resumeSessionId}: ${formatErrorMessage(error)}`,
       {
@@ -1163,6 +1183,17 @@ async function resolveForkModelApplication(
   };
 }
 
+// A coded copy refusal keeps its own shape (detailCode + stderr JSON line), so a caller can route
+// it without parsing a wrapped message: FORK_CUT_UNRESOLVED, and the session-root refusals
+// SOURCE_TRANSCRIPT_MISSING / SESSION_CWD_MISSING (brick 45917618 §5.5, §5.6).
+function keepsOwnCopyRefusalShape(error: unknown): boolean {
+  return (
+    error instanceof ForkCutUnresolvedError ||
+    error instanceof SourceTranscriptMissingError ||
+    error instanceof SessionCwdMissingError
+  );
+}
+
 async function forkSessionRecordWithClient(
   client: AcpClient,
   options: SessionCreateOptions,
@@ -1226,7 +1257,7 @@ async function forkSessionRecordWithClient(
   } catch (error) {
     // A coded refusal keeps its own shape (detailCode + stderr JSON line), so a
     // caller can route FORK_CUT_UNRESOLVED without parsing a wrapped message.
-    if (error instanceof ForkCutUnresolvedError) {
+    if (keepsOwnCopyRefusalShape(error)) {
       throw error;
     }
     throw new Error(
@@ -1282,11 +1313,30 @@ export async function createSessionWithClient(
 ): Promise<SessionCreateWithClientResult> {
   const effectiveOptions: SessionCreateOptions = {
     ...options,
+    // THE GUARANTEE of the fixed session root (brick 45917618 §5.2 E1): every record-creating create —
+    // new, `--from`, seat join, handover successor, copy/fork/by-the-way, `--from-template`, flows —
+    // comes through here, and the record's cwd, the client, the adapter spawn and the ACP
+    // `session/new`/fork request are all derived from this one value. The CLI only warns.
+    //
+    // ⚠️ `--resume-session` is the one exception (HoD ruling 2026-11-06, by D5): it binds a record to
+    // an EXISTING harness conversation, whose transcript is filed under its original folder, so it
+    // keeps the cwd it is given. Re-rooting it makes a legacy Claude resume fail `resourceNotFound`.
+    cwd: options.resumeSessionId ? absolutePath(options.cwd) : effectiveCreateCwd(options.cwd),
     sessionOptions: await bindDefaultAccountToSessionOptionsAsync(
       options.sessionOptions,
       options.agentCommand,
     ),
   };
+  if (effectiveOptions.resumeSessionId) {
+    // Before ANY record is created or reused, and before an adapter is spawned (HoD ruling,
+    // 2026-11-06): the conversation must be filed under the chosen folder.
+    await refuseUnresumableConversation({
+      resumeSessionId: effectiveOptions.resumeSessionId,
+      recordId: effectiveOptions.recordId ?? effectiveOptions.resumeSessionId,
+      cwd: absolutePath(effectiveOptions.cwd),
+      agentCommand: effectiveOptions.agentCommand,
+    });
+  }
   const client = new AcpClient({
     agentCommand: effectiveOptions.agentCommand,
     cwd: absolutePath(effectiveOptions.cwd),

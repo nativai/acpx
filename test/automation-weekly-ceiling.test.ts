@@ -164,6 +164,8 @@ async function withCeilingRig(
       }),
       { mode: 0o600 },
     );
+    // brick 45917618 §5.6: an owner turn refuses a session whose cwd does not exist — a real session's does.
+    await fs.mkdir(path.join(homeDir, "work"), { recursive: true });
     const byBaseId = (profile: string) => {
       const found = specs.find((spec) => spec.id === `${profile}${suffix}`);
       assert(found, `profile ${profile} exists`);

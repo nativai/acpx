@@ -4,6 +4,7 @@ import { AcpClient } from "../../acp/client.js";
 import { normalizeOutputError } from "../../acp/error-normalization.js";
 import { extractAcpError, isAcpResourceNotFoundError } from "../../acp/error-shapes.js";
 import { withTimeout } from "../../async-control.js";
+import { effectiveCreateCwd } from "../../config/session-root.js";
 import { textPrompt, type PromptInput } from "../../prompt-content.js";
 import { persistAndApplyRequestedEffort } from "../../session/config-option-application.js";
 import { applyConfigOptionsToRecord } from "../../session/config-options.js";
@@ -506,6 +507,16 @@ async function createOrLoadRuntimeSession(
   };
 }
 
+// brick 45917618 §5.2 E4: a FRESH session starts at the session root; a resume/load keeps the cwd
+// it was given (the agent's own transcript is keyed by it).
+function ensureSessionCwd(
+  input: { cwd?: string; resumeSessionId?: string },
+  defaultCwd: string,
+): string {
+  const requestedCwd = path.resolve(input.cwd?.trim() || defaultCwd);
+  return input.resumeSessionId ? requestedCwd : effectiveCreateCwd(requestedCwd);
+}
+
 function sessionOptionsForCreatedRuntimeSession(
   agentCommand: string,
   sessionOptions: SessionAgentOptions | undefined,
@@ -640,7 +651,7 @@ export class AcpRuntimeManager {
     resumeSessionId?: string;
     sessionOptions?: SessionAgentOptions;
   }): Promise<SessionRecord> {
-    const cwd = path.resolve(input.cwd?.trim() || this.options.cwd);
+    const cwd = ensureSessionCwd(input, this.options.cwd);
     const agentCommand = this.options.agentRegistry.resolve(input.agent);
     const existing = await this.options.sessionStore.load(input.sessionKey);
     if (

@@ -22,8 +22,8 @@
  * the delete — or, better, use the `ACPX_TEST_CLAUDE_ADVERT_JSON` seam.
  */
 
-import path from "node:path";
 import { withTimeout } from "../async-control.js";
+import { effectiveCreateCwd } from "../config/session-root.js";
 import type { AcpClientOptions } from "../types.js";
 import { AcpClient, type SessionCreateResult } from "./client.js";
 
@@ -42,7 +42,9 @@ export type TransientAdvertisementOptions = Pick<
 export async function readTransientAdvertisement(
   options: TransientAdvertisementOptions,
 ): Promise<Pick<SessionCreateResult, "configOptions" | "models">> {
-  const cwd = path.resolve(options.cwd);
+  // brick 45917618 §5.2 E6: the probe opens a session, so it opens it at the session root — silently
+  // (no record, no warning), and without a per-invocation-folder `projects/<slug>/`.
+  const cwd = effectiveCreateCwd(options.cwd);
   const client = new AcpClient({
     agentCommand: options.agentCommand,
     cwd,

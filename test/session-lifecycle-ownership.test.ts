@@ -336,6 +336,8 @@ function makeQueueTask(requestId: string, onSend: (message: QueueOwnerMessage) =
 test("runQueuedTask rejects a closed session with SESSION_CLOSED (queued-prompt fail-loud)", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "repo");
+    // brick 45917618 §5.6: an owner turn refuses a session whose cwd does not exist — a real session's does.
+    await fs.mkdir(cwd, { recursive: true });
     await seedSessionJson(
       homeDir,
       makeSessionRecord({
