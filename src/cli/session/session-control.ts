@@ -5,6 +5,7 @@ import {
   ConfigOptionTurnInFlightError,
   ModelTurnInFlightError,
   ProfileTurnInFlightError,
+  QueueConnectionError,
   SubscriptionTurnInFlightError,
 } from "../../errors.js";
 import {
@@ -44,6 +45,11 @@ import {
   isoNow,
 } from "../../session/persistence.js";
 import type { SessionIndexEntry } from "../../session/persistence/index.js";
+import {
+  recordOnlyConfigOptionVerdict,
+  recordOnlyModelVerdict,
+  writeModelPin,
+} from "../../session/record-only-set.js";
 import type {
   SessionRecord,
   SessionSetConfigOptionResult,
@@ -107,6 +113,7 @@ import {
   type SessionCloseRecordState,
   writeTerminalCloseRecord,
 } from "./terminal-close.js";
+import { gateSetConnect } from "./wake-gate.js";
 
 export async function cancelSessionPrompt(
   options: SessionCancelOptions,
@@ -134,20 +141,81 @@ export async function setSessionMode(
     return {
       record,
       resumed: false,
+      validatedAgainst: "adapter",
     };
   }
 
-  return await runSessionSetModeDirect({
-    sessionRecordId: options.sessionId,
-    modeId: options.modeId,
-    mcpServers: options.mcpServers,
-    nonInteractivePermissions: options.nonInteractivePermissions,
-    authCredentials: options.authCredentials,
-    authPolicy: options.authPolicy,
-    terminal: options.terminal,
-    timeoutMs: options.timeoutMs,
-    verbose: options.verbose,
-  });
+  // G4: a mode is never record-only — its replay is the one that kills a turn.
+  const direct = await gateSetConnect(
+    await resolveSessionRecord(options.sessionId),
+    "mode",
+    async () =>
+      await runSessionSetModeDirect({
+        sessionRecordId: options.sessionId,
+        modeId: options.modeId,
+        mcpServers: options.mcpServers,
+        nonInteractivePermissions: options.nonInteractivePermissions,
+        authCredentials: options.authCredentials,
+        authPolicy: options.authPolicy,
+        terminal: options.terminal,
+        timeoutMs: options.timeoutMs,
+        verbose: options.verbose,
+      }),
+  );
+  return { ...direct, validatedAgainst: "adapter" };
+}
+
+let recheckHookForTests: (() => Promise<void>) | undefined;
+
+/** Runs between a record-only write and its lease re-check — the owner-start window (row N5). */
+export function setRecordOnlyRecheckHookForTests(hook: (() => Promise<void>) | undefined): void {
+  recheckHookForTests = hook;
+}
+
+/**
+ * The re-check after a record-only write (DESIGN §3). Owner startup takes the lease BEFORE it reads
+ * the record, and a lease never exists without its content — so no lease now means any later owner
+ * reads this write. A lease now means an owner started in the window: it gets the same set through
+ * the existing owner arm (`submit`), as if it had been there at the first look. An owner still
+ * starting (not accepting, or foreign and unreachable) has not begun a turn and its first turn
+ * re-reads the record, so that answer leaves the record-only result standing; any other owner error
+ * propagates, with the value already in the record.
+ *
+ * ⚠️ DO NOT DROP THIS AS "THE FIRST LOOK ALREADY FOUND NO OWNER". An owner that took the lease and
+ * read the record between the first look and the write serves the OLD value until it is told —
+ * the warm re-assert reverts it every turn. Row "N5" in test/record-only-set.test.ts.
+ */
+async function handOverToLateOwner<T>(
+  sessionId: string,
+  submit: () => Promise<T | undefined>,
+): Promise<T | undefined> {
+  await recheckHookForTests?.();
+  if (!(await readQueueOwnerRecord(sessionId))) {
+    return undefined;
+  }
+  try {
+    return await submit();
+  } catch (error) {
+    if (
+      error instanceof QueueConnectionError &&
+      (error.detailCode === "QUEUE_NOT_ACCEPTING_REQUESTS" ||
+        error.detailCode === "QUEUE_OWNER_UNREACHABLE")
+    ) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+/**
+ * The recycle tail for an owner that appeared during a record-only set. Unlike the pre-check it
+ * never throws: the write has landed, so a turn in flight only skips the restart.
+ */
+async function recycleLateOwner(sessionId: string): Promise<OwnerRecycle> {
+  if ((await tryQueryActiveTurnOnRunningOwner(sessionId)) === true) {
+    return { ownerRestarted: false, ownerRestartSkipped: "turn-in-flight" };
+  }
+  return await recycleLiveOwner(sessionId);
 }
 
 // CLI-verb recycle pre-check (the warm-revert fix). The deployed warm bug: the
@@ -252,19 +320,27 @@ export async function setSessionModel(
     // and a later flagless re-ensure won't clobber this pin).
     setDesiredModelSource(record, "explicit");
     await writeSessionRecord(record);
-    result = { record, resumed: false };
+    result = { record, resumed: false, validatedAgainst: "adapter" };
+  } else if (recordOnlyModelVerdict(record).kind === "record") {
+    result = await setSessionModelOnRecord(options, !ownerToRecycle);
   } else {
-    result = await runSessionSetModelDirect({
-      sessionRecordId: options.sessionId,
-      modelId: options.modelId,
-      mcpServers: options.mcpServers,
-      nonInteractivePermissions: options.nonInteractivePermissions,
-      authCredentials: options.authCredentials,
-      authPolicy: options.authPolicy,
-      terminal: options.terminal,
-      timeoutMs: options.timeoutMs,
-      verbose: options.verbose,
-    });
+    const direct = await gateSetConnect(
+      record,
+      "model",
+      async () =>
+        await runSessionSetModelDirect({
+          sessionRecordId: options.sessionId,
+          modelId: options.modelId,
+          mcpServers: options.mcpServers,
+          nonInteractivePermissions: options.nonInteractivePermissions,
+          authCredentials: options.authCredentials,
+          authPolicy: options.authPolicy,
+          terminal: options.terminal,
+          timeoutMs: options.timeoutMs,
+          verbose: options.verbose,
+        }),
+    );
+    result = { ...direct, validatedAgainst: "adapter" };
   }
 
   if (ownerToRecycle) {
@@ -277,6 +353,75 @@ export async function setSessionModel(
   }
 
   return result;
+}
+
+/**
+ * G1: an ownerless `set model` the record vouches for — the pre-checks above already ran
+ * (`assertLiveModelChangeRoutable`, `assertRecordModelSupported`). Writes the owner arm's triple and
+ * starts nothing; the next connect's replay applies it, loudly if the adapter refuses.
+ */
+async function setSessionModelOnRecord(
+  options: SessionSetModelOptions,
+  mayRecycleLateOwner: boolean,
+): Promise<SessionSetModelResult> {
+  const record = await resolveSessionRecord(options.sessionId);
+  writeModelPin(record, options.modelId);
+  await writeSessionRecord(record);
+  const late = await handOverToLateOwner(options.sessionId, () =>
+    trySetModelOnRunningOwner(
+      options.sessionId,
+      options.modelId,
+      options.timeoutMs,
+      options.verbose,
+    ),
+  );
+  if (!late) {
+    return { record, resumed: false, validatedAgainst: "record" };
+  }
+  return {
+    record,
+    resumed: false,
+    validatedAgainst: "adapter",
+    ...(options.recycleOwner && mayRecycleLateOwner
+      ? await recycleLateOwner(options.sessionId)
+      : {}),
+  };
+}
+
+/** G1 for a config option the record's own advertisement lists — see {@link setSessionModelOnRecord}. */
+async function setSessionConfigOptionOnRecord(
+  options: SessionSetConfigOptionOptions,
+  record: SessionRecord,
+  mayRecycleLateOwner: boolean,
+): Promise<SessionSetConfigOptionResult> {
+  setDesiredConfigOption(record, options.configId, options.value);
+  await writeSessionRecord(record);
+  const late = await handOverToLateOwner(options.sessionId, () =>
+    trySetConfigOptionOnRunningOwner(
+      options.sessionId,
+      options.configId,
+      options.value,
+      options.timeoutMs,
+      options.verbose,
+    ),
+  );
+  if (!late) {
+    return {
+      record,
+      response: { configOptions: record.acpx?.config_options ?? [] },
+      resumed: false,
+      validatedAgainst: "record",
+    };
+  }
+  return {
+    record,
+    response: late,
+    resumed: false,
+    validatedAgainst: "adapter",
+    ...(options.recycleOwner && mayRecycleLateOwner
+      ? await recycleLateOwner(options.sessionId)
+      : {}),
+  };
 }
 
 export async function setSessionConfigOption(
@@ -309,20 +454,9 @@ export async function setSessionConfigOption(
       setDesiredConfigOption(record, options.configId, options.value);
     }
     await writeSessionRecord(record);
-    result = { record, response: ownerResponse, resumed: false };
+    result = { record, response: ownerResponse, resumed: false, validatedAgainst: "adapter" };
   } else {
-    result = await runSessionSetConfigOptionDirect({
-      sessionRecordId: options.sessionId,
-      configId: options.configId,
-      value: options.value,
-      mcpServers: options.mcpServers,
-      nonInteractivePermissions: options.nonInteractivePermissions,
-      authCredentials: options.authCredentials,
-      authPolicy: options.authPolicy,
-      terminal: options.terminal,
-      timeoutMs: options.timeoutMs,
-      verbose: options.verbose,
-    });
+    result = await setSessionConfigOptionWithoutOwner(options, !ownerToRecycle);
   }
 
   if (ownerToRecycle) {
@@ -335,6 +469,35 @@ export async function setSessionConfigOption(
   }
 
   return result;
+}
+
+/** No owner answered: record-only where the record can say YES (DESIGN §2), else the gated connect. */
+async function setSessionConfigOptionWithoutOwner(
+  options: SessionSetConfigOptionOptions,
+  mayRecycleLateOwner: boolean,
+): Promise<SessionSetConfigOptionResult> {
+  const record = await resolveSessionRecord(options.sessionId);
+  if (recordOnlyConfigOptionVerdict(record, options.configId, options.value).kind === "record") {
+    return await setSessionConfigOptionOnRecord(options, record, mayRecycleLateOwner);
+  }
+  const direct = await gateSetConnect(
+    record,
+    options.configId,
+    async () =>
+      await runSessionSetConfigOptionDirect({
+        sessionRecordId: options.sessionId,
+        configId: options.configId,
+        value: options.value,
+        mcpServers: options.mcpServers,
+        nonInteractivePermissions: options.nonInteractivePermissions,
+        authCredentials: options.authCredentials,
+        authPolicy: options.authPolicy,
+        terminal: options.terminal,
+        timeoutMs: options.timeoutMs,
+        verbose: options.verbose,
+      }),
+  );
+  return { ...direct, validatedAgainst: "adapter" };
 }
 
 /**
@@ -369,20 +532,28 @@ export async function setSessionDepth(
       record,
       projection: ownerProjection,
       resumed: false,
+      validatedAgainst: "adapter",
     };
   }
 
-  return await runSessionSetDepthDirect({
-    sessionRecordId: options.sessionId,
-    requested: options.requested,
-    mcpServers: options.mcpServers,
-    nonInteractivePermissions: options.nonInteractivePermissions,
-    authCredentials: options.authCredentials,
-    authPolicy: options.authPolicy,
-    terminal: options.terminal,
-    timeoutMs: options.timeoutMs,
-    verbose: options.verbose,
-  });
+  // DESIGN §2: pi depth needs a live ladder projection — gated, never record-only.
+  const direct = await gateSetConnect(
+    await resolveSessionRecord(options.sessionId),
+    "effort",
+    async () =>
+      await runSessionSetDepthDirect({
+        sessionRecordId: options.sessionId,
+        requested: options.requested,
+        mcpServers: options.mcpServers,
+        nonInteractivePermissions: options.nonInteractivePermissions,
+        authCredentials: options.authCredentials,
+        authPolicy: options.authPolicy,
+        terminal: options.terminal,
+        timeoutMs: options.timeoutMs,
+        verbose: options.verbose,
+      }),
+  );
+  return { ...direct, validatedAgainst: "adapter" };
 }
 
 // Change a session's active Claude subscription in place. Unlike set-mode/model

@@ -279,7 +279,7 @@ export type CapacityRefusalDetail = {
  * Why a wake refusal does or does not offer `--final-report` (CONCEPTION §5.1 a–d, contract note
  * 2026-11-06 17:55Z): `leaf` / `cross-box` offer it; `orchestrator` says "not for you";
  * `no-capability` (no fresh capability marker), `no-sender` (no sender role — every bare
- * `acpx prompt`) and `admission-busy` name nothing.
+ * `acpx prompt`), `admission-busy` and `set` name nothing.
  */
 export type FinalReportWhy =
   | "leaf"
@@ -287,7 +287,9 @@ export type FinalReportWhy =
   | "orchestrator"
   | "no-capability"
   | "no-sender"
-  | "admission-busy";
+  | "admission-busy"
+  /** brick 5c44d8ba: a refused ownerless `set` — a settings change, never a message to hold. */
+  | "set";
 
 /**
  * Local-box Codex subscription-cap admission result. This intentionally names
@@ -1521,10 +1523,18 @@ export type SessionSendResult = RunPromptResult & {
   loadError?: string;
 };
 
+/**
+ * brick 5c44d8ba: which check vouched for an ownerless `set` — the record's own stored advertisement
+ * (`record`, nothing started) or a live adapter (`adapter`: the owner arm or the gated direct
+ * connect). CLI JSON output only; never persisted.
+ */
+export type SetValidatedAgainst = "record" | "adapter";
+
 export type SessionSetModeResult = {
   record: SessionRecord;
   resumed: boolean;
   loadError?: string;
+  validatedAgainst?: SetValidatedAgainst;
 };
 
 export type SessionSetConfigOptionResult = {
@@ -1532,6 +1542,7 @@ export type SessionSetConfigOptionResult = {
   response: SetSessionConfigOptionResponse;
   resumed: boolean;
   loadError?: string;
+  validatedAgainst?: SetValidatedAgainst;
   /** True when a live queue owner existed and was recycled to bind the change. */
   ownerRestarted?: boolean;
   ownerRestartSkipped?: string;
@@ -1553,12 +1564,14 @@ export type SessionSetDepthResult = {
   projection: DepthProjection;
   resumed: boolean;
   loadError?: string;
+  validatedAgainst?: SetValidatedAgainst;
 };
 
 export type SessionSetModelResult = {
   record: SessionRecord;
   resumed: boolean;
   loadError?: string;
+  validatedAgainst?: SetValidatedAgainst;
   /** True when a live queue owner existed and was recycled to bind the change. */
   ownerRestarted?: boolean;
   ownerRestartSkipped?: string;
