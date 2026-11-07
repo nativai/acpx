@@ -78,6 +78,8 @@ function unresumableClient(counter: { prompts: number }): AcpClient {
   return {
     hasReusableSession: () => false,
     start: async () => {},
+    markAdvertisement: () => 0,
+    advertisedConfigOptionsSince: () => undefined,
     getAgentLifecycleSnapshot: () => ({ running: true }),
     supportsResumeSession: () => false,
     supportsLoadSession: () => false,

@@ -60,6 +60,8 @@ function freshCreateManager(store: InMemorySessionStore): AcpRuntimeManager {
         supportsLoadSession: () => true,
         supportsResumeSession: () => false,
         loadSessionWithOptions: async () => ({ agentSessionId: "unused" }),
+        markAdvertisement: () => 0,
+        advertisedConfigOptionsSince: () => undefined,
         getAgentLifecycleSnapshot: () => ({ running: true }),
         prompt: async () => ({ stopReason: "end_turn" }),
         requestCancelActivePrompt: async () => false,

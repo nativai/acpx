@@ -1104,6 +1104,12 @@ export class AcpClient {
    */
   private configOptionUpdateCount = 0;
   /**
+   * How many advertisements {@link rememberConfigOptions} has STORED — every source, pushes and
+   * responses alike. Read only through {@link markAdvertisement} /
+   * {@link advertisedConfigOptionsSince} (brick e0fc06d8).
+   */
+  private advertisementSeq = 0;
+  /**
    * Set when this adapter answered `-32601 Method not found` for
    * `session/set_model` — a durable capability fact, not a transient failure.
    */
@@ -2894,6 +2900,24 @@ export class AcpClient {
     return this.latestConfigOptions;
   }
 
+  /** A position in this client's advertisement history, for {@link advertisedConfigOptionsSince}. */
+  markAdvertisement(): number {
+    return this.advertisementSeq;
+  }
+
+  /**
+   * The latest advertisement iff one was stored after `mark`, else `undefined` (brick e0fc06d8).
+   *
+   * ⚠️ NEVER PERSIST `latestConfigOptions` UNGUARDED — persist THIS. A reused client (the queue
+   * owner's) outlives its adapter process, so `latestConfigOptions` can still hold the PREVIOUS
+   * process's last list; written to the record, it would describe a model this connect never served.
+   * Same reasoning as `configOptionUpdateCount` above. Rows "NB2" in
+   * test/post-replay-advertisement.test.ts.
+   */
+  advertisedConfigOptionsSince(mark: number): SessionConfigOption[] | undefined {
+    return this.advertisementSeq > mark ? this.latestConfigOptions : undefined;
+  }
+
   async setSessionConfigOption(
     sessionId: string,
     configId: string,
@@ -2995,6 +3019,7 @@ export class AcpClient {
   private rememberConfigOptions(options: SessionConfigOption[] | undefined): void {
     if (options && options.length > 0) {
       this.latestConfigOptions = options;
+      this.advertisementSeq += 1;
     }
   }
 

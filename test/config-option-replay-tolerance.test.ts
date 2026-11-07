@@ -65,6 +65,8 @@ function fakeClient(options: FakeClientOptions, calls: string[]) {
     supportsResumeSession: () => true,
     resumeSession: async () => ({ agentSessionId: "replay-agent", models: undefined }),
     loadSessionWithOptions: async () => ({ agentSessionId: "replay-agent", models: undefined }),
+    markAdvertisement: () => 0,
+    advertisedConfigOptionsSince: () => undefined,
     getAgentLifecycleSnapshot: () => ({ running: true }),
     setSessionMode: async () => {},
     setSessionModel: async () => {},
