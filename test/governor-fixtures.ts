@@ -264,7 +264,12 @@ export class FakeBox {
       ...CAPACITY_CONSTANTS,
       // Explicit, not inherited: a row that needs enforce or governed terminals must still prove its
       // case if the shipped values are ever re-tuned.
-      governor: { ...CAPACITY_CONSTANTS.governor, mode: "enforce", governTerminals: true, ...constants },
+      governor: {
+        ...CAPACITY_CONSTANTS.governor,
+        mode: "enforce",
+        governTerminals: true,
+        ...constants,
+      },
     };
     const log = (line: string) => {
       this.logs.push(line);

@@ -222,7 +222,10 @@ test("args: --test-rig and --limit-bytes are REFUSED without ACPX_GOVERNOR_TEST=
     testRig: true,
     limitBytes: 4096,
   });
-  assert.deepEqual(parseGovernorArgs(["--limit-bytes=8192"], env), { testRig: false, limitBytes: 8192 });
+  assert.deepEqual(parseGovernorArgs(["--limit-bytes=8192"], env), {
+    testRig: false,
+    limitBytes: 8192,
+  });
   assert.ok("error" in parseGovernorArgs(["--limit-bytes", "x"], env));
   assert.ok("error" in parseGovernorArgs(["run"], env), "never a verb");
   // The mode is the constant and nothing else (D1 decided; §13.1): no flag can switch it.
