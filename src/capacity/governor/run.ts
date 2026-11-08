@@ -4,7 +4,7 @@ import path from "node:path";
 import { scanProcTable } from "../../process-tree-reap.js";
 import { readCgroup } from "../cgroup.js";
 import { type CapacityConstants, type GovernorConstants } from "../constants.js";
-import { censusOwners } from "../owners.js";
+import { verifiedLeaseOwners } from "../leases.js";
 import {
   cachedTokenState,
   classifySessions,
@@ -536,7 +536,7 @@ export class Governor {
       // No queue dir yet = no owner can hold a lease: the census is complete. Anything else is blind.
       this.queueReadable = (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
     }
-    const census = censusOwners({
+    const owners = verifiedLeaseOwners({
       queueDir: this.deps.queueDir,
       sessionsDir: this.deps.sessionsDir,
       procRoot: this.deps.procRoot,
@@ -544,10 +544,7 @@ export class Governor {
       freshMs: this.settings.constants.leaseFreshMs,
     });
     this.leaseOwners = new Map(
-      census.owners.map((owner) => [
-        owner.pid,
-        { sessionId: owner.sessionId, seatId: owner.facts?.seatId },
-      ]),
+      owners.map((owner) => [owner.pid, { sessionId: owner.sessionId, seatId: owner.seatId }]),
     );
   }
 

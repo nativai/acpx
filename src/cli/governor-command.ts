@@ -21,7 +21,7 @@ import {
   readGovernorLiveness,
   readHeartbeat,
 } from "../capacity/governor/status.js";
-import { censusOwners } from "../capacity/owners.js";
+import { verifiedLeaseOwners } from "../capacity/leases.js";
 import { capacitySourcesFromEnv } from "../capacity/reading.js";
 import { scanProcTable } from "../process-tree-reap.js";
 import type { ResolvedAcpxConfig } from "./config.js";
@@ -181,7 +181,7 @@ export function governorScanJson(dir: string, nowMs: number): Record<string, unk
   const sources = capacitySourcesFromEnv();
   const scan = scanProcTable(sources.procRoot, parseGovProcStat);
   const system = systemSidFor(scan.byPid, dir);
-  const census = censusOwners({
+  const owners = verifiedLeaseOwners({
     queueDir: sources.queueDir,
     sessionsDir: sources.sessionsDir,
     procRoot: sources.procRoot,
@@ -194,7 +194,7 @@ export function governorScanJson(dir: string, nowMs: number): Record<string, unk
     {
       systemSid: system.sid ?? -1,
       leaseOwners: new Map(
-        census.owners.map((o) => [o.pid, { sessionId: o.sessionId, seatId: o.facts?.seatId }]),
+        owners.map((o) => [o.pid, { sessionId: o.sessionId, seatId: o.seatId }]),
       ),
       tokenState: cachedTokenState(sources.procRoot, () => scan.byPid),
     },

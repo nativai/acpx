@@ -3,7 +3,7 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { queueBaseDir } from "../../cli/queue/paths.js";
 import { queueOwnerTokenState } from "../../process-tree-reap.js";
-import { sessionBaseDir } from "../../session/persistence/repository.js";
+import { sessionBaseDir } from "../../session/persistence/session-base-dir.js";
 import { CAPACITY_CONSTANTS } from "../constants.js";
 import { DEFAULT_ATRIUM_URL, Notifier, type NotifyFetch } from "./notify.js";
 import {

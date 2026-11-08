@@ -1,5 +1,5 @@
 import { type CapacityConstants, type GovernorConstants } from "../constants.js";
-import { parseStatusMemory } from "../owners.js";
+import { parseStatusMemory } from "../leases.js";
 import type { SessionView } from "./classify.js";
 import { type GuardContext, protectedReason } from "./sweep.js";
 
