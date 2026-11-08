@@ -380,6 +380,74 @@ test("a STOP left in flight by a dead governor is finished (SIGKILL) on restart 
   assert.deepEqual(state.stopsInFlight, []);
 });
 
+test("F5 committed negative: a recorded stop whose pid now belongs to an owner or the system session is never killed — SIGCONT + event", (t) => {
+  const cases: Array<{ label: string; plant: (box: FakeBox) => number; leaseSession?: string }> = [
+    {
+      label: "queue owner (argv token)",
+      plant: (box) =>
+        box.add({ pid: 700, ppid: 1, comm: "node", owner: true, state: "T" }).ticks as number,
+    },
+    {
+      label: "queue owner (lease only)",
+      plant: (box) => box.add({ pid: 700, ppid: 1, comm: "node", state: "T" }).ticks as number,
+      leaseSession: "sess-lease-700",
+    },
+    {
+      label: "adapter inside an owner session",
+      plant: (box) => {
+        box.add({ pid: 690, ppid: 1, comm: "node", owner: true });
+        return box.add({ pid: 700, ppid: 690, pgid: 690, sid: 690, comm: "node", state: "T" })
+          .ticks as number;
+      },
+    },
+    {
+      label: "system-session member",
+      plant: (box) =>
+        box.add({ pid: 700, ppid: 6, pgid: 6, sid: 6, comm: "node", state: "T" }).ticks as number,
+    },
+  ];
+  for (const c of cases) {
+    const box = new FakeBox();
+    t.after(() => box.cleanup());
+    box.standardSystem();
+    const ticks = c.plant(box);
+    if (c.leaseSession) {
+      box.lease(c.leaseSession, 700);
+    }
+    fs.mkdirSync(box.dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(box.dir, "state.json"),
+      JSON.stringify({ stopsInFlight: [{ pid: 700, startTicks: String(ticks) }] }),
+    );
+    startedGovernor(box);
+    assert.ok(box.procs.has(700), `${c.label}: still alive`);
+    assert.deepEqual(
+      box.signals,
+      [{ target: 700, signal: "SIGCONT" }],
+      `${c.label}: SIGCONT only, never SIGKILL`,
+    );
+    assert.equal(box.procs.get(700)?.state, "S", `${c.label}: no longer frozen`);
+    const released = box.events().filter((e) => e.action === "stop_released");
+    assert.equal(released.length, 1, c.label);
+    assert.match(String(released[0].notify_status), /^owner-|^system$/u, c.label);
+  }
+});
+
+test("F5: in observe mode a recorded stop is released (SIGCONT), never killed", (t) => {
+  const box = new FakeBox();
+  t.after(() => box.cleanup());
+  box.standardSystem();
+  const frozen = box.add({ pid: 700, ppid: 1, comm: "bash", state: "T" });
+  fs.mkdirSync(box.dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(box.dir, "state.json"),
+    JSON.stringify({ stopsInFlight: [{ pid: 700, startTicks: String(frozen.ticks) }] }),
+  );
+  startedGovernor(box, {}, { mode: "observe" });
+  assert.deepEqual(box.signals, [{ target: 700, signal: "SIGCONT" }]);
+  assert.equal(box.events().find((e) => e.action === "stop_released")?.notify_status, "observe");
+});
+
 test("dedupe: one message per (session, rule) per 10 min; repeats are summarised when the window closes", async (t) => {
   const box = stormBox(t, 130);
   const governor = startedGovernor(box);

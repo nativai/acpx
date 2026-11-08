@@ -30,6 +30,7 @@ export type GovernorAction =
   | "r2_blind"
   | "ungoverned_burst"
   | "notify_dropped"
+  | "stop_released"
   | "peaks";
 
 export type GovernorRule = "fork-storm" | "memory-emergency" | "";

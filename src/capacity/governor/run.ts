@@ -379,10 +379,7 @@ export class Governor {
     this.applyNice();
     this.bootTimeMs = readBootTimeMs(this.deps.procRoot);
     if (this.state.stopsInFlight.length > 0) {
-      const killed = finishStops(this.sweepDeps(), this.state.stopsInFlight);
-      this.deps.log(
-        `process-governor: finished ${killed} stop(s) left in flight by a previous run`,
-      );
+      this.finishStopsInFlight();
     }
     this.entrySignature = fileSignature(this.deps.entryFile);
     this.recordPendingPeaks(this.deps.now());
@@ -447,6 +444,30 @@ export class Governor {
     } catch {
       // not ours or gone
     }
+  }
+
+  /**
+   * Stops a previous run left in flight: the owner census runs FIRST (lease-named owners are part of
+   * the guard), then every stop is re-judged by `finishStops`; a released one becomes an event.
+   */
+  private finishStopsInFlight(): void {
+    const nowMs = this.deps.now();
+    this.latestByPid = scanProcTable(this.deps.procRoot, parseGovProcStat).byPid;
+    this.refreshCensus(nowMs);
+    const outcomes = finishStops(this.sweepDeps(), this.state.stopsInFlight, {
+      kill: this.mode === "enforce",
+    });
+    for (const o of outcomes.filter((x) => x.outcome === "released")) {
+      this.record({
+        ...this.baseEvent("stop_released", nowMs),
+        processes: 1,
+        notify_status: o.reason ?? "",
+      });
+    }
+    const killed = outcomes.filter((x) => x.outcome === "killed").length;
+    this.deps.log(
+      `process-governor: ${outcomes.length} stop(s) left in flight by a previous run: ${killed} killed, ${outcomes.length - killed} released or gone`,
+    );
   }
 
   private applyNice(): void {

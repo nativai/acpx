@@ -199,16 +199,43 @@ function stopPass(
 }
 
 /** On start-up: SIGKILL every recorded stop that is still the same live process. */
-export function finishStops(deps: SweepDeps, stops: readonly StopRecord[]): number {
-  let killed = 0;
+export type StopOutcome = {
+  readonly pid: number;
+  /** `killed` — finished; `released` — SIGCONT, never killed; `gone` — no longer the recorded process. */
+  readonly outcome: "killed" | "released" | "gone";
+  readonly reason?: string;
+};
+
+/**
+ * On start-up, the stops a dead governor left in flight (§5.1 step 5). Each one is judged AGAIN, on a
+ * fresh scan: the start ticks must still match, and the FULL §3.3 guard must still hold — the pid can
+ * have been recycled into an owner or the system session, or an owner can have been recognised since.
+ * A stop that fails the guard (or any stop when `kill` is false, i.e. observe mode) gets SIGCONT and is
+ * reported, never SIGKILL. Committed negative: "a recorded stop whose pid now belongs to an owner or the
+ * system session is never killed" (test/governor-daemon.test.ts).
+ */
+export function finishStops(
+  deps: SweepDeps,
+  stops: readonly StopRecord[],
+  options: { readonly kill: boolean },
+): StopOutcome[] {
+  const outcomes: StopOutcome[] = [];
   for (const record of stops) {
-    if (sameLive(deps, record)) {
-      send(deps, record.pid, "SIGKILL");
-      killed += 1;
+    const live = sameLive(deps, record);
+    if (!live) {
+      outcomes.push({ pid: record.pid, outcome: "gone" });
+      continue;
     }
+    const reason = protectedReason(live, deps.guard) ?? (options.kill ? undefined : "observe");
+    send(deps, record.pid, reason === undefined ? "SIGKILL" : "SIGCONT");
+    outcomes.push({
+      pid: record.pid,
+      outcome: reason === undefined ? "killed" : "released",
+      reason,
+    });
   }
   deps.recordStops([]);
-  return killed;
+  return outcomes;
 }
 
 /**

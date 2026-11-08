@@ -187,8 +187,8 @@ export class FakeBox {
     }
     const allowed = hit.filter((p) => !p.immortal);
     for (const p of allowed) {
-      if (sig === "SIGSTOP") {
-        p.state = "T";
+      if (sig === "SIGSTOP" || sig === "SIGCONT") {
+        p.state = sig === "SIGSTOP" ? "T" : "S";
         this.write(p);
       } else if (sig === "SIGKILL") {
         this.removedStderr.set(p.pid, this.stderrOf(p.pid));
