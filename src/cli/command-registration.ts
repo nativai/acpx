@@ -76,7 +76,6 @@ import {
   type StatusFlags,
 } from "./flags.js";
 import { registerModelsCommand } from "./models-command.js";
-import { registerPeopleCommand } from "./people-command.js";
 import { registerProfilesCommand } from "./profiles-command.js";
 import { registerProvidersCommand } from "./providers-command.js";
 import { registerSeatsCommand } from "./seats-command.js";
@@ -153,10 +152,7 @@ export function registerSessionsCommand(
 
   const templatesCommand = sessionsCommand
     .command("templates")
-    .description(
-      "List saved templates for this agent: machine-wide ones plus your own (ACPX_PRINCIPAL_ID) " +
-        "(subcommands: rollback, migrate-slugs)",
-    )
+    .description("List saved templates for this agent (subcommands: rollback, migrate-slugs)")
     .action(async function (this: Command, flags: SessionsListFlags) {
       await handleSessionsTemplates(explicitAgentName, flags, this, config);
     });
@@ -164,7 +160,7 @@ export function registerSessionsCommand(
   templatesCommand
     .command("rollback")
     .description(
-      "Retract a template name's latest version (default: soft-retract, reversible; --delete hard-removes). The name is `reviewer` or `<handle>/<base>`",
+      "Retract a template slug's latest version (default: soft-retract, reversible; --delete hard-removes)",
     )
     .argument("<slug>", "Template slug to roll back", (value: string) =>
       parseNonEmptyValue("Template slug", value),
@@ -384,10 +380,7 @@ export function registerSessionsCommand(
       (value: string) => parseNonEmptyValue("Session id", value),
     )
     .option("--enable", "Mark the session as a template (also closes it); the default action")
-    .option(
-      "--disable",
-      "Retract the template (soft: the record, slug and version are kept; --enable restores it)",
-    )
+    .option("--disable", "Clear the template marker (leaves the session closed as-is)")
     .option(
       "--auto-prompt <text>",
       "Prompt auto-sent on every spawn from this template (empty string clears it). " +
@@ -395,17 +388,9 @@ export function registerSessionsCommand(
     )
     .option(
       "--slug <slug>",
-      "Template BASE name for --enable (canonicalized; '/' is refused). Required for a new " +
-        "template: a session has no name to derive one from, so without it the template is " +
-        "slug-less and resolves by id only.",
-    )
-    .option(
-      "--owner <person>",
-      "Make the template one person's (private: listed only to them, still startable by name " +
-        "with --from-template <handle>/<base>). A handle, former handle, person id or full name " +
-        "from `acpx people list`. Needs --slug, applies on the first mark only, and a different " +
-        "owner on a re-mark is an error. Absent ⇒ machine-wide.",
-      (value: string) => parseNonEmptyValue("Owner", value),
+      "Template slug for --enable (canonicalized). Required for a new template: a " +
+        "session has no name to derive one from, so without it the template is slug-less " +
+        "and resolves by id only.",
     )
     .option(
       "--kill-background-tasks",
@@ -501,10 +486,7 @@ export function registerSessionsCommand(
     .option("--no-brick", "Do not link, and do not inherit the spawning session's brick.")
     .option(
       "--from-template <id>",
-      "Instantiate from a saved template: an acpx record id, ACP session id or unique suffix; a " +
-        "machine-wide template name (`reviewer`); or a person's template (`<handle>/<base>`, e.g. " +
-        "`laatz/reviewer`; the person id form `p-…/<base>` also works). A plain name never " +
-        "matches a person's template, and an unknown person is an error, never a fallback. " +
+      "Instantiate from a saved template (acpx record id, ACP session id, or unique suffix). " +
         "Inherits the template's agent type + context; the new session is a normal open session. " +
         "Combine with -s to name its seat.",
       (value: string) => parseNonEmptyValue("Template id", value),
@@ -560,12 +542,6 @@ export function registerSessionsCommand(
       "--kill-background-tasks",
       "Close even though the session has live background tasks (Monitor, background Bash, " +
         "background Agent). Those tasks are killed.",
-    )
-    // brick 2587d30e — shown in --help on purpose: an agent must read it before it reaches for it.
-    .option(
-      "--force",
-      "Agent callers: close even though the session has open requests to people (a flagged " +
-        "message still awaiting a person's answer). Those requests are closed as session-closed.",
     )
     // brick 9d34a178 — shown in --help on purpose: an agent closing ITSELF must read these two.
     .option(
@@ -1258,8 +1234,6 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
   registerProvidersCommand(program, config);
   // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS` (`"capacity"`, brick afdb5784).
   registerCapacityCommand(program, config);
-  // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS` (`"people"`, brick b0968426).
-  registerPeopleCommand(program, config);
   registerConfigCommand(program, config);
   registerFlowCommand(program, config);
 }

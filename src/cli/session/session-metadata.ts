@@ -1,5 +1,4 @@
 import { InvalidArgumentError } from "commander";
-import { PRINCIPAL_METADATA_PREFIX } from "../../session/persistence/principal.js";
 import type { SessionRecord } from "../../types.js";
 import { isBrickUuid } from "./brick-link.js";
 
@@ -10,13 +9,6 @@ import { isBrickUuid } from "./brick-link.js";
  * semantics, `brick`, must additionally be a full uuid.
  */
 export function validateSessionMetadataValue(key: string, value: string): string {
-  // brick b0968426 (PERSON-CONTRACT C8.3, G1): the recorded principal is written ONCE, at creation, and no verb
-  // rewrites it — this is the only verb that writes a free-form key, so it is refused here, before any write.
-  if (key.startsWith(PRINCIPAL_METADATA_PREFIX)) {
-    throw new InvalidArgumentError(
-      `${key} is recorded once, when the session is created, and cannot be changed afterwards`,
-    );
-  }
   const trimmed = value.trim();
   if (trimmed.length === 0) {
     throw new InvalidArgumentError("Metadata value must not be empty");

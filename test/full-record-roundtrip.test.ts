@@ -145,8 +145,6 @@ function fullRecordSentinel(): SessionRecord {
       auto_prompt: "sentinel-auto-prompt",
       slug: "sentinel-template-slug",
       version: 2,
-      created_actor: { kind: "agent", session_id: "sentinel-created-actor-session" },
-      updated_actor: { kind: "human", verified: false, name: "sentinel-updated-actor" },
     },
     seatId: "sentinel-seat-id",
     holderOrdinal: 1,

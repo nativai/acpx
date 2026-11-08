@@ -9,7 +9,6 @@ import {
   ownerOptionsToInput,
 } from "../../session/owner-options.js";
 import { absolutePath, isoNow } from "../../session/persistence.js";
-import { principalContextFields } from "../../session/persistence/principal.js";
 import { seatDisplayName } from "../../session/seat-display-name.js";
 import { DEFAULT_PERMISSION_MODE } from "../../types.js";
 import type {
@@ -144,7 +143,6 @@ export async function withConnectedSession<T>(
         seatId: record.seatId ?? null,
         seatOrdinal: record.holderOrdinal ?? null,
         parentSeatId: record.parentSeatId ?? null,
-        ...principalContextFields(record.metadata),
       },
       sessionOptions: sessionOptionsFromRecord(record),
     }) ??
@@ -173,7 +171,6 @@ export async function withConnectedSession<T>(
         seatId: record.seatId ?? null,
         seatOrdinal: record.holderOrdinal ?? null,
         parentSeatId: record.parentSeatId ?? null,
-        ...principalContextFields(record.metadata),
       },
       sessionOptions: sessionOptionsFromRecord(record),
     });

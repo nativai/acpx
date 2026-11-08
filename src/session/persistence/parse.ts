@@ -14,7 +14,6 @@ import { normalizeRuntimeSessionId } from "../runtime-session-id.js";
 import { rememberSessionMetadataBaseline } from "./metadata-merge.js";
 import { rememberSessionModelBaseline } from "./model-merge.js";
 import { parseSeatFieldsFromPersistedRecord } from "./seat-fields.js";
-import { parsePersistedActor } from "./template-actor.js";
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -1352,15 +1351,6 @@ function parseTemplateState(raw: unknown): SessionRecord["template"] {
   }
   if (isNonNegativeInteger(record.version)) {
     template.version = record.version;
-  }
-  // Attribution (TEMPLATES CONCEPTION §4.2). A malformed actor is dropped on its own: the block stays.
-  const createdActor = parsePersistedActor(record.created_actor);
-  if (createdActor !== undefined) {
-    template.created_actor = createdActor;
-  }
-  const updatedActor = parsePersistedActor(record.updated_actor);
-  if (updatedActor !== undefined) {
-    template.updated_actor = updatedActor;
   }
   return Object.keys(template).length > 0 ? template : undefined;
 }

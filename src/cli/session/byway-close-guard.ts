@@ -30,7 +30,7 @@ export type BywayCloseRefusal = {
   sourceSessionId: string | null;
 };
 
-export function callerIsAgent(env: NodeJS.ProcessEnv): boolean {
+function callerIsAgent(env: NodeJS.ProcessEnv): boolean {
   return AGENT_IDENTITY_VARS.some((name) => (env[name]?.trim() ?? "") !== "");
 }
 

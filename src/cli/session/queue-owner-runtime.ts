@@ -35,7 +35,6 @@ import {
   writeSessionRecord,
   writeSessionRecordAtBoundary,
 } from "../../session/persistence.js";
-import { principalContextFields } from "../../session/persistence/principal.js";
 import { seatDisplayName } from "../../session/seat-display-name.js";
 import {
   bindTurnOwnWrites,
@@ -215,7 +214,6 @@ async function sessionContextFromRecord(record: Awaited<ReturnType<typeof resolv
     seatId: record.seatId ?? null,
     seatOrdinal: record.holderOrdinal ?? null,
     parentSeatId: record.parentSeatId ?? null,
-    ...principalContextFields(record.metadata),
   };
 }
 

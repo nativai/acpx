@@ -77,7 +77,6 @@ import {
 import {
   isoNow,
   isTemplateRecord,
-  listSessionIndexEntries,
   migrateTemplateSlugs,
   persistTemplateMark,
   matchesPruneSessionId,
@@ -96,13 +95,6 @@ import {
   writeSessionRecordWithLifecycle,
 } from "../session/persistence.js";
 import type { MigrateSlugsResult, TemplateRollbackResult } from "../session/persistence.js";
-import {
-  type PrincipalCreator,
-  principalEntriesOf,
-  withRecordedPrincipal,
-  withSeatJoinPrincipal,
-} from "../session/persistence/principal.js";
-import { templateActorFromEnv } from "../session/persistence/template-actor.js";
 import { SeatBrickReassignRequiredError, writeBrickLink } from "../session/seat-brick-write.js";
 import { decideSessionBrick } from "../session/seat-brick.js";
 import { seatDisplayName, seatNameFromStore } from "../session/seat-display-name.js";
@@ -197,7 +189,6 @@ import {
   withInheritedReasoningEffort,
   withInheritedWorktree,
 } from "./session/inherited-metadata.js";
-import { refuseCloseOverOpenPersonRequests } from "./session/open-person-requests-guard.js";
 import { mergeSessionMetadata, validateSessionMetadataValue } from "./session/session-metadata.js";
 import type {
   SetParentRefusalCode,
@@ -213,14 +204,6 @@ import {
   skippedFromOptionsNote,
   withFromOptions,
 } from "./session/sessions-new-from.js";
-import {
-  resolveMarkOwner,
-  resolveRollbackKey,
-  softRetract,
-  templateAgentName,
-  templateBlockResultFields,
-  visibleTemplateRecords,
-} from "./template-owner-support.js";
 
 type SessionModule = typeof import("../session/session.js");
 type OutputModule = typeof import("./output/output.js");
@@ -872,11 +855,6 @@ type ResolvedParentSession = {
    * the settled truth and the live layer can be mid-flight (design #33).
    */
   outputStyle?: string;
-  /**
-   * The parent's `principal_*` metadata (brick b0968426): `{}` for a local record that predates the keys,
-   * absent for a cross-box parent whose record is not here. Read only by `withRecordedPrincipal`.
-   */
-  principal?: Record<string, string>;
 };
 
 // Snapshot the parent record's inheritable fields. Agent-type + model + effort
@@ -899,49 +877,7 @@ async function parentInheritableFields(parent: SessionRecord): Promise<ResolvedP
     modelSource: sessionOptions?.model_source,
     effort: parent.acpx?.desired_config_options?.effort,
     outputStyle: sessionOptions?.output_style,
-    principal: principalEntriesOf(parent.metadata) ?? {},
   };
-}
-
-/**
- * The first holder of `seatId` as a principal creator (brick 509d3884 O1): its record id and the
- * `principal_*` entries its index entry projects. Lowest ordinal wins; a holder that has none yet (a
- * prepared successor) is not a candidate. `undefined` when the seat has no numbered holder. A scan over the
- * index, run only when a session is created INTO a seat — a rare, operator-or-handover path.
- */
-async function firstHolderOfSeat(seatId: string): Promise<PrincipalCreator | undefined> {
-  let first: { ordinal: number; creator: PrincipalCreator } | undefined;
-  for (const entry of await listSessionIndexEntries()) {
-    if (entry.seatId !== seatId || entry.holderOrdinal === undefined) {
-      continue;
-    }
-    if (first === undefined || entry.holderOrdinal < first.ordinal) {
-      first = {
-        ordinal: entry.holderOrdinal,
-        creator: { acpxRecordId: entry.acpxRecordId, principal: entry.principal ?? {} },
-      };
-    }
-  }
-  return first?.creator;
-}
-
-/**
- * Who may answer for a create INTO a seat (brick 509d3884 O1, X-1). C8.2 rule order: rule 2
- * (`spawned_by_session_id`, written by `--no-parent` when there is a caller) outranks rule 3 (a seat
- * successor answers its seat's first holder). So rule 3 answers only for a create with no `--from` and no
- * recorded spawned-by session; otherwise `undefined`, and the caller / `--from` session stays the creator.
- * Create shapes: fresh no `--seat` -> rule 4 (parent) or 5 (none); `--no-parent` with a caller -> rule 2;
- * `--seat`, no `--no-parent` or no caller -> rule 3; `--from` -> the predecessor's answer (unchanged).
- */
-async function seatJoinFor(
-  joining: string | undefined,
-  from: SessionRecord | undefined,
-  spawnedBySessionId: string | undefined,
-): Promise<{ firstHolder: PrincipalCreator | undefined } | undefined> {
-  if (joining === undefined || from !== undefined || spawnedBySessionId !== undefined) {
-    return undefined;
-  }
-  return { firstHolder: await firstHolderOfSeat(joining) };
 }
 
 async function resolveAndValidateParentSessionId(
@@ -1197,18 +1133,6 @@ function inheritedSpawnSessionOptions(
   };
 }
 
-function recordPrincipal(
-  metadata: Record<string, string> | undefined,
-  params: {
-    inherit: ResolvedParentSession | undefined;
-    seatJoin?: { firstHolder?: PrincipalCreator };
-  },
-): Record<string, string> | undefined {
-  return params.seatJoin === undefined
-    ? withRecordedPrincipal(metadata, params.inherit)
-    : withSeatJoinPrincipal(metadata, params.seatJoin.firstHolder);
-}
-
 function buildSessionStartOptions(params: {
   agent: EffectiveSpawnAgent;
   flags: SessionsNewFlags;
@@ -1229,10 +1153,6 @@ function buildSessionStartOptions(params: {
   /** Brick `9984c510` — the leg `resolveBrickFlagValue` took for `resolvedBrick`,
    * when it is a string. See `SessionCreateOptions.explicitBrickFlagValidated`. */
   resolvedBrickValidated?: boolean;
-  /** Present only for a create INTO an existing seat with no `--from` and no recorded spawned-by session
-   * (brick 509d3884 O1, X-1): the seat's first holder, whose answer the new holder copies (C8.2 rule 3)
-   * instead of the caller's or a bare shell's `none`. Absent when rule 2 (`--no-parent`) applies. */
-  seatJoin?: { firstHolder: PrincipalCreator | undefined };
 }): Parameters<SessionModule["createSession"]>[0] {
   return {
     agentCommand: params.agent.agentCommand,
@@ -1266,22 +1186,16 @@ function buildSessionStartOptions(params: {
     // `createSessionRecordWithClient` (`resolveJoinedSeatBrickMetadata`),
     // which has the seat row in hand — this function has no I/O and cannot
     // read it, so it cannot make that distinction itself.
-    // brick b0968426 (C8.3): the principal is the CREATOR's — the spawning caller, or the old session under
-    // `--from` (a handover successor answers its seat's principal) — resolved as `params.inherit`. Into an
-    // existing seat with no `--from` the creator is the seat's first holder (C8.2 rule 3; brick 509d3884 O1).
-    metadata: recordPrincipal(
-      withInheritedBrick(
-        applyBrickFlag(
-          // §5.8 carry rule: a `--from` / handover successor continues in the old session's worktree.
-          params.from
-            ? withInheritedWorktree(params.flags.metadata, params.from.metadata)
-            : params.flags.metadata,
-          params.resolvedBrick,
-        ),
-        params.inherit?.brick,
-        params.resolvedBrick === false,
+    metadata: withInheritedBrick(
+      applyBrickFlag(
+        // §5.8 carry rule: a `--from` / handover successor continues in the old session's worktree.
+        params.from
+          ? withInheritedWorktree(params.flags.metadata, params.from.metadata)
+          : params.flags.metadata,
+        params.resolvedBrick,
       ),
-      params,
+      params.inherit?.brick,
+      params.resolvedBrick === false,
     ),
     // The RAW flag, never mixed with inheritance — `resolveJoinedSeatBrickMetadata`
     // needs to tell "the operator explicitly said X" apart from "nothing was
@@ -3080,18 +2994,6 @@ export async function handleSessionsClose(
     return;
   }
 
-  // brick 2587d30e (addressing v3 §8.3) — same rule: decided before anything is touched.
-  if (
-    await refuseCloseOverOpenPersonRequests({
-      record,
-      force: flags.force,
-      format: globalFlags.format,
-      verbose: globalFlags.verbose,
-    })
-  ) {
-    return;
-  }
-
   // brick ad6ba1c2 (Contract C2) — same rule as the byway guard: decided BEFORE anything is
   // touched. A refusal drains nothing, sends no close_session, signals nothing, writes no record.
   const { refusal, gate, answer } = await evaluateBackgroundTaskGate({
@@ -3568,7 +3470,6 @@ async function createSessionFromNewFlags(
   if (flags.favorite === true && joining !== undefined) {
     throw new InvalidArgumentError(favoriteOnJoinMessage(joining));
   }
-  const seatJoin = await seatJoinFor(joining, from, spawnedBySessionId);
   const { value: resolvedBrick, validated: resolvedBrickValidated } = await resolveBrickFlagValue(
     flags.brick,
   );
@@ -3650,7 +3551,6 @@ async function createSessionFromNewFlags(
         from,
         resolvedBrick,
         resolvedBrickValidated,
-        seatJoin,
       }),
     ),
   );
@@ -3909,18 +3809,13 @@ async function runSessionCopy(
       // metadata.brick carry: precedence = --brick flag > spawn-parent brick (--parent-id / byway)
       // > none. A plain fork/copy carries NO brick by default (the 07-15 source.metadata.brick
       // fallback was reversed, brick://1113da9d) so it does not impersonate the source's brick.
-      // brick b0968426 (C8.3, G2): the copy's principal is its MAKER's — `caller` — and never the SOURCE's;
-      // `source` is deliberately not an argument of `withRecordedPrincipal`.
-      metadata: withRecordedPrincipal(
-        withInheritedBrick(
-          applyBrickFlag(
-            copyMetadata(flags, source, forkAtMessageIndex, forkAtLogIndex, requireTemplate),
-            resolvedBrick,
-          ),
-          caller?.brick, // spawn-parent brick (byway via --parent-id) — KEEP; the CALLER's under --no-parent
-          resolvedBrick === false,
+      metadata: withInheritedBrick(
+        applyBrickFlag(
+          copyMetadata(flags, source, forkAtMessageIndex, forkAtLogIndex, requireTemplate),
+          resolvedBrick,
         ),
-        caller,
+        caller?.brick, // spawn-parent brick (byway via --parent-id) — KEEP; the CALLER's under --no-parent
+        resolvedBrick === false,
       ),
       // Brick `9984c510` — this path has no `explicitBrickFlag` (it exists only
       // for the `--seat` JOIN comparison, which fork/copy can never reach —
@@ -4019,10 +3914,7 @@ export async function handleSessionsTemplates(
     loadOutputRenderModule(),
   ]);
   const sessions = await listSessionsForAgent(agent.agentCommand, agent.agentName);
-  printSessionsByFormat(
-    visibleTemplateRecords(sessions.filter(isTemplateRecord)),
-    globalFlags.format,
-  );
+  printSessionsByFormat(sessions.filter(isTemplateRecord), globalFlags.format);
 }
 
 // Mark a session as a template: terminate any live owner first so the template is a
@@ -4045,29 +3937,6 @@ function resolveMarkAutoPrompt(
   return record.template?.auto_prompt;
 }
 
-// The block a mark writes, rebuilt from named fields: whatever is not listed here is GONE after the
-// first re-mark (the field-by-field leg every new template field must be added to).
-function rebuiltTemplateBlock(
-  record: SessionRecord,
-  flags: SessionsTemplateFlags,
-): NonNullable<SessionRecord["template"]> {
-  const existing = record.template ?? {};
-  return {
-    enabled: true,
-    created_at: existing.created_at ?? isoNow(),
-    source_session_id: existing.source_session_id ?? record.acpSessionId,
-    auto_prompt: resolveMarkAutoPrompt(flags, record),
-    // Carry existing slug/version forward (like created_at/source above) so an
-    // idempotent re-enable is detected by persistTemplateMark and does NOT bump
-    // the version. persistTemplateMark fills/overrides these next.
-    slug: existing.slug,
-    version: existing.version,
-    // The actors travel like slug/version; persistTemplateMark decides who they name.
-    created_actor: existing.created_actor,
-    updated_actor: existing.updated_actor,
-  };
-}
-
 async function markSessionAsTemplate(
   sessionId: string,
   flags: SessionsTemplateFlags,
@@ -4086,7 +3955,17 @@ async function markSessionAsTemplate(
     checkBackgroundTasks: flags.killBackgroundTasks !== true,
   });
   const record = await resolveSessionRecord(sessionId);
-  record.template = rebuiltTemplateBlock(record, flags);
+  record.template = {
+    enabled: true,
+    created_at: record.template?.created_at ?? isoNow(),
+    source_session_id: record.template?.source_session_id ?? record.acpSessionId,
+    auto_prompt: resolveMarkAutoPrompt(flags, record),
+    // Carry existing slug/version forward (like created_at/source above) so an
+    // idempotent re-enable is detected by persistTemplateMark and does NOT bump
+    // the version. persistTemplateMark fills/overrides these next.
+    slug: record.template?.slug,
+    version: record.template?.version,
+  };
   record.closed = true;
   record.closedAt = record.closedAt ?? isoNow();
   return {
@@ -4097,12 +3976,11 @@ async function markSessionAsTemplate(
   };
 }
 
-// Retract the template marker SOFTLY (K10): the block keeps its slug, version and actors and only
-// `enabled` turns false, so `--enable` brings the same version back. Leaves closed/closedAt as-is
+// Clear the template marker. Disable un-templates only — leave closed/closedAt as-is
 // (disabling does not reopen a session). Idempotent on a non-template record.
 async function unmarkSessionTemplate(sessionId: string): Promise<SessionRecord> {
   const record = await resolveSessionRecord(sessionId);
-  softRetract(record, templateActorFromEnv());
+  record.template = undefined;
   return record;
 }
 
@@ -4134,15 +4012,13 @@ export async function handleSessionsTemplate(
     // writeSessionRecord here; it would read-preserve the on-disk template/closed
     // and drop the clear.
     await writeSessionRecordWithLifecycle(record);
-    await printTemplateResult(record, enable, globalFlags.format);
+    printTemplateResult(record, enable, globalFlags.format);
     return;
   }
 
   // brick ad6ba1c2 (Contract C3) — marking a template CLOSES the session: the same gate, before
   // anything is touched.
   const gateRecord = await resolveSessionRecord(sessionId);
-  // --owner and the fixed-owner rule are settled BEFORE the close: a refusal must leave the session open.
-  const ownerId = await resolveMarkOwner(flags, gateRecord.template?.slug);
   const { refusal, gate, answer } = await evaluateBackgroundTaskGate({
     record: gateRecord,
     killBackgroundTasks: flags.killBackgroundTasks,
@@ -4171,12 +4047,8 @@ export async function handleSessionsTemplate(
   const { record, reap, ownerStopped, lateTasks } = marked;
   // Assigns slug (default slugify(name), overridable via --slug) + version =
   // max+1 for the slug group, under the index lock (E6), then PRIVILEGED-writes.
-  await persistTemplateMark(record, {
-    slug: flags.slug,
-    owner: ownerId,
-    actor: templateActorFromEnv(),
-  });
-  await printTemplateResult(
+  await persistTemplateMark(record, { slug: flags.slug });
+  printTemplateResult(
     record,
     enable,
     globalFlags.format,
@@ -4186,38 +4058,37 @@ export async function handleSessionsTemplate(
   warnUncheckedBackgroundTasks(record.acpxRecordId, answer);
 }
 
-function templateResultHumanLine(
-  record: SessionRecord,
-  enable: boolean,
-  agentName: string | undefined,
-): string {
+function templateResultHumanLine(record: SessionRecord, enable: boolean): string {
   if (!enable) {
     return "disabled";
   }
   const autoPromptNote = record.template?.auto_prompt ? " (auto-prompt set)" : "";
-  const slugNote =
-    agentName !== undefined ? ` [${agentName} v${record.template?.version ?? "?"}]` : "";
+  const slug = record.template?.slug;
+  const slugNote = slug !== undefined ? ` [${slug} v${record.template?.version ?? "?"}]` : "";
   return `enabled (closed)${slugNote}${autoPromptNote}`;
 }
 
-async function printTemplateResult(
+function printTemplateResult(
   record: SessionRecord,
   enable: boolean,
   format: OutputFormat,
   backgroundTasks?: BackgroundTasksJson,
-): Promise<void> {
-  const agentName = await templateAgentName(record.template?.slug);
+): void {
   const result = {
     action: enable ? ("template_enabled" as const) : ("template_disabled" as const),
     acpxRecordId: record.acpxRecordId,
     template: enable,
     closed: record.closed === true,
-    ...templateBlockResultFields(record.template, agentName),
+    created_at: record.template?.created_at,
+    source_session_id: record.template?.source_session_id,
+    auto_prompt: record.template?.auto_prompt,
+    slug: record.template?.slug,
+    version: record.template?.version,
     ...backgroundTasksField(backgroundTasks),
   };
   if (!emitJsonResult(format, result)) {
     process.stdout.write(
-      `template ${record.acpxRecordId}: ${templateResultHumanLine(record, enable, agentName)}\n`,
+      `template ${record.acpxRecordId}: ${templateResultHumanLine(record, enable)}\n`,
     );
   }
 }
@@ -4518,7 +4389,7 @@ export async function handleSessionsTemplatesRollback(
   const globalFlags = resolveGlobalFlags(command, config);
   let result: TemplateRollbackResult;
   try {
-    result = await rollbackTemplateSlug(await resolveRollbackKey(slug), { delete: flags.delete });
+    result = await rollbackTemplateSlug(slug, { delete: flags.delete });
   } catch (error) {
     // ⚠️ THIS TYPE ONLY — see the same catch in handleSessionsPrune. Before this
     // there was no try/catch here at all, so a manifest-write failure reached
