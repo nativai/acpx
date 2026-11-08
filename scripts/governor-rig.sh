@@ -20,6 +20,7 @@
 #   sampler --config … start | report          the harness's own 50 ms /proc sampler (AC1 a/f, AC2) — 900 s max
 #   orphan  --config … <sid>                    AC2: cut every parent link of a storm (TaskStop's remainder)
 #   spawn-system --config … [N]                 AC5(iii): N children INSIDE the governor's own (system) session
+#   scan    --config … [--format json]          `acpx governor scan` of the rig (find a storm's sid)
 #   status  --config …                          heartbeat, last events, atrium
 #   down    --config …                          governor, sampler, then the stack (ensure-down.sh)
 #
@@ -257,6 +258,10 @@ cmd_sampler() { on_control; load
 cmd_orphan() { on_control; load; [[ "${1:-}" =~ ^[0-9]+$ ]] || die "orphan <sid>"
   workbench-exec -- python3 -I "$HERE/scripts/governor-rig-sampler.py" --orphan "$1"; }
 
+# `acpx governor scan` of the RIG's workbench, with the rig's HOME (its leases, records and governor memory).
+cmd_scan() { on_control; load
+  workbench-exec -- env HOME="$SLOT_HOME" ACPX_STATE_HOME="$SLOT_HOME" node "$ACPX_WT/dist/cli.js" governor scan "$@"; }
+
 cmd_status() { on_control; load
   echo "== governor heartbeat"; cat "$GOV_HOME/heartbeat.json" 2>/dev/null || echo "(none)"
   echo "== last events"; tail -n 8 "$GOV_HOME/events.ndjson" 2>/dev/null | cut -c1-400 || true
@@ -289,6 +294,7 @@ case "$sub" in
   create) cmd_create "$@" ;; all) cmd_all "$@" ;; build) cmd_build ;; seed) cmd_seed ;; up) cmd_up "${1:-}" ;;
   governor) cmd_governor "${1:-}" ;; spawn-system) cmd_spawn_system "${1:-200}" ;; agent) cmd_agent "$@" ;;
   sampler) cmd_sampler "${1:-}" ;; orphan) cmd_orphan "${1:-}" ;; status) cmd_status ;; down) cmd_down ;;
+  scan) cmd_scan "$@" ;;
   _wb-governor) wb_governor "${1:-}" ;; _wb-launcher) wb_launcher "${1:-}" ;; _wb-governor-stop) wb_governor_stop ;;
   _wb-agent) wb_agent "$@" ;;
   *) sed -n '2,32p' "$SELF"; exit 2 ;;
