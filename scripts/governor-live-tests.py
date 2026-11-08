@@ -304,7 +304,14 @@ def n4(gov):
 
 
 def n5(gov):
-    """200 double-forked `setsid sleep &` children of a job-control shell: ungoverned_burst, NOT killed."""
+    """200 double-forked `setsid sleep &` children of a job-control shell: ungoverned_burst, NOT killed.
+
+    The alarm is rate-limited to one per `alarmRepeatMs` (60 s) by design, so each trial first waits until the
+    previous burst event is more than 61 s old — otherwise a later trial would wrongly read "no alarm"."""
+    last = [e for e in gov.events() if e.get("action") == "ungoverned_burst"]
+    if last:
+        at = time.mktime(time.strptime(last[-1]["captured_at"][:19], "%Y-%m-%d %H:%M:%S")) - time.timezone
+        time.sleep(max(0, at + 61 - time.time()))
     before = len(gov.events())
     mark = "37.123"
     sh = as_tool_command(["bash", "-c", f"set -m; for i in $(seq 200); do setsid sleep {mark} & done; wait"])
