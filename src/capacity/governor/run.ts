@@ -1263,4 +1263,12 @@ function applyArg(
     return undefined;
   }
   if (value !== undefined || (name !== "--enforce" && name !== "--test-rig")) {
-    r
+    return `unknown argument ${name}`;
+  }
+  if (name === "--enforce") {
+    args.enforce = true;
+  } else {
+    args.testRig = true;
+  }
+  return undefined;
+}
