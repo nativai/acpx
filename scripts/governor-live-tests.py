@@ -168,16 +168,37 @@ class Governor:
         self.log.close()
 
 
-def storm(step, leader_wrapper=None):
-    script = STORM % (DMAX, LEAF_S, step)
-    argv = ["bash", "-c", script] if leader_wrapper is None else leader_wrapper(script)
-    return subprocess.Popen(argv, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+# The production shape: Claude Code runs each Bash tool command as a NEW SESSION whose leader's parent is
+# the `claude` process (F1). A command whose session is born OUTSIDE any governed session is, by design,
+# never governed (§3.2) — and under `workbench-exec --detach` this harness's own session is parented by
+# PID 1, so storms spawned directly by it were classified `outside` and only raised ungoverned_burst.
+# So every command here is started by a stand-in harness: python under the comm name `claude`.
+FAKE_CLAUDE_DIR = tempfile.mkdtemp(prefix="govlive-claude-")
+FAKE_CLAUDE = os.path.join(FAKE_CLAUDE_DIR, "claude")
+os.symlink(sys.executable, FAKE_CLAUDE)
+LAUNCH = ("import subprocess,sys\n"
+          "p=subprocess.Popen(sys.argv[1:],start_new_session=True,stdout=subprocess.DEVNULL)\n"
+          "print(p.pid,flush=True)\n"
+          "sys.exit(p.wait())\n")
+
+
+def as_tool_command(argv, stderr=None):
+    """Run `argv` as a tool command: a new session whose leader's parent is a process named `claude`."""
+    harness = subprocess.Popen([FAKE_CLAUDE, "-I", "-c", LAUNCH] + argv, stdout=subprocess.PIPE,
+                               stderr=stderr if stderr is not None else subprocess.DEVNULL)
+    sid = int(harness.stdout.readline().decode().strip())
+    harness.sid = sid
+    return harness
+
+
+def storm(step):
+    return as_tool_command(["bash", "-c", STORM % (DMAX, LEAF_S, step)], stderr=subprocess.PIPE)
 
 
 def n1(gov):
     """A storm (~50 levels/s) is killed within 5 s of crossing 128; zero survivors at +1/+3/+30 s."""
     p = storm(STEP)
-    sid = p.pid
+    sid = p.sid
     s = Sampler(sid)
     s.start()
     deadline = time.monotonic() + 60
@@ -209,12 +230,11 @@ def n1(gov):
 def n2(gov):
     """100 parallel processes for 20 s, and one 1.2 GiB process, are NOT killed (below R2's line)."""
     before = len(gov.events())
-    par = subprocess.Popen(["bash", "-c", "seq 100 | xargs -P 100 -I{} sleep 20"], start_new_session=True)
-    mem = subprocess.Popen([sys.executable, "-I", "-c",
-                            "import time\nb=bytearray(1288490188)\nfor i in range(0,len(b),4096): b[i]=1\ntime.sleep(25)"],
-                           start_new_session=True)
+    par = as_tool_command(["bash", "-c", "seq 100 | xargs -P 100 -I{} sleep 20"])
+    mem = as_tool_command([sys.executable, "-I", "-c",
+                           "import time\nb=bytearray(1288490188)\nfor i in range(0,len(b),4096): b[i]=1\ntime.sleep(25)"])
     time.sleep(3)
-    par_peak = len(members(par.pid))
+    par_peak = len(members(par.sid))
     rc_par = par.wait(timeout=60)
     rc_mem = mem.wait(timeout=60)
     new = [e for e in gov.events()[before:] if e.get("action") in ("killed", "would_kill")]
@@ -225,7 +245,7 @@ def n2(gov):
 def n3(_gov):
     """Control (no governor): the claude-style snapshot kill leaves a regrowing remainder in some trials."""
     p = storm(STEP)
-    sid = p.pid
+    sid = p.sid
     time.sleep(1.5)
     snap = descendants(sid)
     kill(-sid)
@@ -248,9 +268,9 @@ def n4(gov):
     """`setsid ./job.sh` inside a command: a DERIVED session, counted on its own, killed at 128."""
     before = len(gov.events())
     job = STORM % (DMAX, LEAF_S, STEP)
-    outer = subprocess.Popen(["bash", "-c", 'setsid bash -c "$1" & echo $!; wait', "outer", job],
-                             start_new_session=True, stdout=subprocess.PIPE)
-    inner_sid = int(outer.stdout.readline().decode().strip())
+    outer = as_tool_command(["bash", "-c", 'setsid bash -c "$1" >&2 & echo $! >&2; wait', "outer", job],
+                            stderr=subprocess.PIPE)
+    inner_sid = int(outer.stderr.readline().decode().strip())
     s = Sampler(inner_sid)
     s.start()
     deadline = time.monotonic() + 60
@@ -262,10 +282,10 @@ def n4(gov):
         outer.wait(timeout=5)
     except subprocess.TimeoutExpired:
         pass
-    outer_killed = outer.returncode == -signal.SIGKILL
+    outer_killed = outer.returncode == 256 - signal.SIGKILL  # the stand-in exits with its child's -9 & 0xff
     killed = [e for e in gov.events()[before:] if e.get("action") == "killed"]
     end_session(inner_sid)
-    end_session(outer.pid)
+    end_session(outer.sid)
     kinds = [e.get("session_kind") for e in killed]
     return dict(test="N4", pass_=(s.empty_at is not None and "derived" in kinds and len(killed) == 1 and not outer_killed),
                 peak=s.peak, kinds=kinds, outer_command_killed=outer_killed,
@@ -276,8 +296,7 @@ def n5(gov):
     """200 double-forked `setsid sleep &` children of a job-control shell: ungoverned_burst, NOT killed."""
     before = len(gov.events())
     mark = "37.123"
-    sh = subprocess.Popen(["bash", "-c", f"set -m; for i in $(seq 200); do setsid sleep {mark} & done; wait"],
-                          start_new_session=True)
+    sh = as_tool_command(["bash", "-c", f"set -m; for i in $(seq 200); do setsid sleep {mark} & done; wait"])
     sh.wait(timeout=30)
     time.sleep(3)
 
