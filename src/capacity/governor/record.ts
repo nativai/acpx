@@ -206,8 +206,22 @@ type InsertOutcome =
   | "clickhouse_connection";
 
 export type ClickHouseConfig =
-  | { enabled: true; endpoint: string; password: string; fetchImpl: FetchLike }
+  | { enabled: true; endpoint: string; password: string; fetchImpl: FetchLike; capture?: boolean }
   | { enabled: false; reason: string };
+
+/**
+ * TEST MODE ONLY, and only where the credential is absent (a workbench has no
+ * `/run/secrets/acpx-clickhouse`): instead of POSTing, append each exact JSONEachRow body — the same
+ * bytes the writer would send — to a local file. A tester then parses those rows against the live
+ * server's read-only `format()` from a control pod. The real INSERT is first exercised on staging.
+ */
+export function captureFetch(file: string): FetchLike {
+  return async (_url, init) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, init.body);
+    return { status: 200 };
+  };
+}
 
 type WriterOptions = {
   env: NodeJS.ProcessEnv;
@@ -216,6 +230,8 @@ type WriterOptions = {
   allowed: boolean;
   box: BoxIdentity;
   fetchImpl: FetchLike;
+  /** Test mode without the credential: where to capture the rows ({@link captureFetch}). */
+  captureFile?: string;
 };
 
 /**
@@ -232,7 +248,15 @@ export function clickHouseConfig(options: WriterOptions): ClickHouseConfig {
     env.ACPX_GOVERNOR_CLICKHOUSE_PASSWORD_FILE || CLICKHOUSE_PASSWORD_FILE,
   );
   if (!password) {
-    return { enabled: false, reason: "clickhouse_password_unreadable" };
+    return options.testMode && options.captureFile
+      ? {
+          enabled: true,
+          endpoint: "capture",
+          password: "",
+          fetchImpl: captureFetch(options.captureFile),
+          capture: true,
+        }
+      : { enabled: false, reason: "clickhouse_password_unreadable" };
   }
   const endpoint = env.ACPX_GOVERNOR_CLICKHOUSE_URL || CLICKHOUSE_ENDPOINT;
   return { enabled: true, endpoint, password, fetchImpl: options.fetchImpl };
@@ -331,6 +355,16 @@ export class ClickHouseWriter {
     }
   }
 
+  private get capturing(): boolean {
+    return this.config.enabled && this.config.capture === true;
+  }
+
+  /** One retry on timeout, 5xx or a connection failure; HTTP 4xx is never retried (the recorder's rule). */
+  private async attemptWithRetry(body: string): Promise<InsertOutcome> {
+    const first = await this.attempt(body);
+    return first === "ok" || first === "clickhouse_4xx" ? first : this.attempt(body);
+  }
+
   /** Send everything queued, one POST. Returns the outcome (`ok` when nothing was queued). */
   async flush(): Promise<string> {
     if (this.sending || this.queue.length === 0) {
@@ -341,11 +375,8 @@ export class ClickHouseWriter {
     this.queue = [];
     const body = `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`;
     try {
-      let outcome = await this.attempt(body);
-      if (outcome !== "ok" && outcome !== "clickhouse_4xx") {
-        outcome = await this.attempt(body);
-      }
-      this.lastStatus = outcome;
+      const outcome = await this.attemptWithRetry(body);
+      this.lastStatus = outcome === "ok" && this.capturing ? "captured" : outcome;
       if (outcome !== "ok") {
         this.log(`process-governor clickhouse writer ${outcome}: ${rows.length} row(s) dropped`);
       }

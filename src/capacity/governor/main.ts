@@ -57,6 +57,7 @@ async function main(): Promise<number> {
       allowed: true,
       box: identity,
       fetchImpl: fetch as unknown as FetchLike,
+      captureFile: `${dir}/clickhouse-rows.ndjson`,
     }),
     log,
   );

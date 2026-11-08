@@ -112,6 +112,8 @@ class Sampler(threading.Thread):
         super().__init__(daemon=True)
         self.sid, self.stop_at = sid, None
         self.crossed_at = self.empty_at = None
+        self.crossed_bound = False
+        self.last_below_at = None
         self.peak = 0
         self.running = True
 
@@ -122,8 +124,16 @@ class Sampler(threading.Thread):
             self.peak = max(self.peak, n)
             if self.crossed_at is None and n >= 128:
                 self.crossed_at = now
-            if self.crossed_at is not None and self.empty_at is None and n == 0:
-                self.empty_at = now
+            elif self.crossed_at is None and n > 0:
+                self.last_below_at = now
+            if self.empty_at is None and n == 0 and self.peak >= 64:
+                if self.crossed_at is None and self.last_below_at is not None:
+                    # The governor killed the storm at 128 BETWEEN two of our samples (measured: 1 trial in
+                    # 20). The crossing then lies after our last sample below 128: bound it by that sample.
+                    # N1 checks the governor's own event says >= 128.
+                    self.crossed_at, self.crossed_bound = self.last_below_at, True
+                if self.crossed_at is not None:
+                    self.empty_at = now
             time.sleep(0.05)
 
 
@@ -219,8 +229,9 @@ def n1(gov):
     last = ev[-1] if ev else {}
     leftover = end_session(sid)
     ok = (s.crossed_at is not None and s.empty_at is not None and s.empty_at - s.crossed_at <= 5
-          and all(v == 0 for v in after.values()))
-    return dict(test="N1", pass_=ok, peak=s.peak,
+          and all(v == 0 for v in after.values())
+          and (not s.crossed_bound or (last.get("processes") or 0) >= 128))
+    return dict(test="N1", pass_=ok, peak=s.peak, crossing_bounded_by_last_sample_below=s.crossed_bound,
                 cross_to_empty_s=None if s.empty_at is None or s.crossed_at is None else round(s.empty_at - s.crossed_at, 3),
                 **after, inband_line="process-governor: KILLED" in stderr,
                 event_processes=last.get("processes"), event_rounds=last.get("rounds"), event_kill_ms=last.get("kill_ms"),

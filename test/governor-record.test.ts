@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { inBandLine, messageUrl, seatMessageText } from "../src/capacity/governor/notify.js";
 import {
+  ClickHouseWriter,
   clickHouseConfig,
   clickhouseRow,
   clickhouseTime,
@@ -177,6 +178,37 @@ test("record: the ClickHouse writer is refused for a non-supervised governor, a 
     },
   });
   assert.equal(ok.enabled && ok.password, "s3cret");
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("record: test mode WITHOUT the credential captures the exact JSONEachRow bodies to a file; production never does", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-gov-cap-"));
+  const captureFile = path.join(dir, "clickhouse-rows.ndjson");
+  const missing = path.join(dir, "no-such-password");
+  const fetchImpl = async () => {
+    throw new Error("must not POST in capture mode");
+  };
+  const env = { ACPX_GOVERNOR_CLICKHOUSE_PASSWORD_FILE: missing };
+  const base = { allowed: true, box: { box: FIXTURE_BOX }, fetchImpl, captureFile };
+  const production = clickHouseConfig({
+    ...base,
+    env: {},
+    testMode: false,
+    box: { box: "devbox.nativai.de" },
+  });
+  assert.equal(production.enabled, false, "no capture outside test mode");
+  const config = clickHouseConfig({ ...base, env, testMode: true });
+  assert.ok(config.enabled && config.capture);
+  const writer = new ClickHouseWriter(config, () => {});
+  const row = clickhouseRow({ ...sample(), box: FIXTURE_BOX, test: true });
+  writer.enqueue(row);
+  assert.equal(await writer.flush(), "ok");
+  assert.equal(writer.lastStatus, "captured");
+  assert.equal(
+    fs.readFileSync(captureFile, "utf8"),
+    `${JSON.stringify(row)}\n`,
+    "the same bytes the POST carries",
+  );
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
