@@ -25,6 +25,7 @@ import {
 } from "../spawn-command-options.js";
 import type { ClientOperation, NonInteractivePermissionPolicy, PermissionMode } from "../types.js";
 import { deleteAgentStrippedCredentialEnv } from "./agent-credential-env.js";
+import { applyFuncnestLimit } from "./shell-recursion-limit.js";
 
 const DEFAULT_TERMINAL_OUTPUT_LIMIT_BYTES = 64 * 1024;
 const DEFAULT_KILL_GRACE_MS = 1_500;
@@ -88,6 +89,9 @@ function toEnvObject(env: CreateTerminalRequest["env"]): NodeJS.ProcessEnv {
   const merged: NodeJS.ProcessEnv = { ...process.env };
   delete merged.PORT;
   deleteAgentStrippedCredentialEnv(merged);
+  // A terminal command is an agent shell too: the queue owner's own env normally carries no FUNCNEST (acpx
+  // sets it per adapter spawn), so the adapter-env default does not reach here. Before the request env, so a request-named value wins.
+  applyFuncnestLimit(merged);
   for (const entry of env ?? []) {
     merged[entry.name] = entry.value;
   }

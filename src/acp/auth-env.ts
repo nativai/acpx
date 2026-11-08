@@ -54,6 +54,7 @@ import type { ShimHandle } from "./openrouter-shim.js";
 import { spawnOpenRouterShim } from "./openrouter-shim.js";
 import { ensureSessionSharedTmpDir } from "./session-shared-tmp-dir.js";
 import { ensureSessionTmpDir } from "./session-tmp-dir.js";
+import { applyFuncnestLimit } from "./shell-recursion-limit.js";
 
 const AUTH_ENV_PREFIX = "ACPX_AUTH_";
 export const ACPX_EFFECTIVE_PROFILE_ENV = "ACPX_EFFECTIVE_PROFILE";
@@ -985,6 +986,7 @@ function buildAgentEnvironment(
   }
   applyAgentTypeEnvironment(env, agentCommand);
   applyAutoMemoryOff(env);
+  applyFuncnestLimit(env);
   applyCodexToolOutputLimit(env, agentCommand);
   const baseUrl = resolveAcpxUiBaseUrl(env);
   // ⚠️ HAND THE RESOLVED VALUE DOWN — this line is why the adapters do not each own
