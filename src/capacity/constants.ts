@@ -97,7 +97,7 @@ export const CAPACITY_CONSTANTS: CapacityConstants = {
   budgetMinBytes: 256 * MIB,
   leaseFreshMs: 5 * 60_000,
   governor: {
-    mode: "observe",
+    mode: "enforce",
     governTerminals: true,
     maxGroupProcesses: 128,
     scanIntervalMs: 1000,
