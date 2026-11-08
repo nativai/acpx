@@ -113,6 +113,11 @@ export const TOP_LEVEL_VERBS = new Set([
   // by `registerCapacityCommand`. Agents call `acpx capacity --need N` before a fan-out; without this
   // entry that line is a prompt delivery to the cwd's session.
   "capacity",
+  // `governor` — the runaway process-tree governor's READ-ONLY views, `status` and `scan` (brick
+  // 5d7a23b6), registered by `registerGovernorCommand`. The daemon never starts through this parser
+  // (it runs `dist/capacity/governor/main.js`); without this entry `acpx governor status` would be a
+  // prompt delivery to the cwd's session.
+  "governor",
   // `output-styles` is registered top-level by `registerSharedAgentSubcommands`
   // (command-registration.ts, called with `program` from `registerDefaultCommands`)
   // and was MISSING here — brick https://acpx.devbox.nativai.de/?brick=eb9c1d1e.
