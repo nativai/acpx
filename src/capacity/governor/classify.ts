@@ -191,13 +191,19 @@ function terminalAttribution(parent: GovProc): Attribution {
 
 const OUTSIDE: Placement = { governed: false, reason: "outside" };
 
-/** A leaderless session (§3.2): governed unless a member is a harness, an owner or lease-named. */
+/**
+ * A leaderless session (§3.2, as ruled in §19 D1): governed unless a live member is a VERIFIED owner —
+ * it carries the `__queue-owner` argv token, or a lease names it.
+ *
+ * ⚠️ DO NOT ADD A COMM-NAME TEST BACK ("a member named `claude` means owner remains"). It looks like
+ * protection for a dead owner's adapter and harness, and it is the bug: any binary renamed `claude`, or a
+ * backgrounded nested `claude`, made a 403-process storm unkillable and silent (TE X6, finding F1). A name
+ * never exempts (§12). Real owner remains are governed; R1 never reaches a handful of processes, and at
+ * R2's line a dead owner's leftovers are the right victim. Row: "classify: LEADERLESS …".
+ */
 function placeLeaderless(c: Classifier, members: readonly GovProc[]): Placement {
   const ownerRemains = members.some(
-    (m) =>
-      HARNESS_COMMS.has(m.comm) ||
-      c.ctx.leaseOwners.has(m.pid) ||
-      c.ctx.tokenState(m.pid) === "owner",
+    (m) => c.ctx.leaseOwners.has(m.pid) || c.ctx.tokenState(m.pid) === "owner",
   );
   return ownerRemains
     ? { governed: false, reason: "owner" }

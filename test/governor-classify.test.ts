@@ -139,19 +139,52 @@ test("classify: a DERIVED session (setsid inside a command) inherits the parent'
   assert.equal(terminalChild.governed && terminalChild.root, "terminal");
 });
 
-test("classify: LEADERLESS — no live leader and no harness/owner member is governed; a claude member keeps it ungoverned", (t) => {
+test("classify: LEADERLESS — governed unless a live member is a VERIFIED owner (token or lease); a member merely NAMED claude is governed (§19 D1, TE X6)", (t) => {
   const box = new FakeBox();
   t.after(() => box.cleanup());
   box.standardSystem();
   box.addMany(5, { ppid: 1, pgid: 701, sid: 700, comm: "bash" }, 701); // leader 700 is gone
-  box.add({ pid: 801, ppid: 1, pgid: 801, sid: 800, comm: "claude" }); // a dead owner's remains
-  assert.deepEqual(placementOf(box, 700), {
+  box.addMany(3, { ppid: 1, pgid: 801, sid: 800, comm: "claude" }, 801); // renamed binary / nested claude
+  box.add({ pid: 901, ppid: 1, pgid: 901, sid: 900, comm: "node", owner: true }); // a real owner, token
+  box.add({ pid: 951, ppid: 1, pgid: 951, sid: 950, comm: "node" }); // a real owner, lease only
+  const leases = new Map([[951, { sessionId: "sess-951" }]]);
+  const leaderless = {
     governed: true,
     kind: "leaderless",
     root: "unknown",
     attribution: { label: "unknown" },
-  });
-  assert.deepEqual(placementOf(box, 800), { governed: false, reason: "owner" });
+  };
+  assert.deepEqual(placementOf(box, 700, leases), leaderless);
+  assert.deepEqual(placementOf(box, 800, leases), leaderless, "a comm name never exempts");
+  assert.deepEqual(placementOf(box, 900, leases), { governed: false, reason: "owner" });
+  assert.deepEqual(placementOf(box, 950, leases), { governed: false, reason: "owner" });
+});
+
+test("classify: a REMEMBERED kind wins over every first-sight test (§19 D1a)", (t) => {
+  const box = new FakeBox();
+  t.after(() => box.cleanup());
+  box.standardSystem();
+  const { claudePid } = box.owner(100, "sess-r", "seat-r");
+  box.toolSession(200, claudePid, 3);
+  const leases = new Map([[100, { sessionId: "sess-r", seatId: "seat-r" }]]);
+  const first = classify(box, leases);
+  // The leader dies and a member becomes a token-carrying process: a first-sight test would now say
+  // "owner remains"; the memory of a tool session must win (the guard still never signals the owner).
+  box.remove(200);
+  box.add({ ...(box.procs.get(201) as FakeProcess), owner: true });
+  const byPid = scanProcTable(box.proc, parseGovProcStat).byPid;
+  const ctx: ClassifyContext = {
+    systemSid: 6,
+    leaseOwners: leases,
+    tokenState: (pid) => queueOwnerTokenState(pid, box.proc),
+  };
+  const view = classifySessions(byPid, ctx, first.memory, box.nowMs).sessions.get(200);
+  assert.equal(view?.record.placement.governed && view.record.placement.kind, "tool");
+  assert.equal(
+    classifySessions(byPid, ctx, new Map(), box.nowMs).sessions.get(200)?.record.placement.governed,
+    false,
+    "control: without memory it reads owner",
+  );
 });
 
 test("classify: born OUTSIDE a governed session — parent PID 1, or started by an owner session — is never governed", (t) => {

@@ -287,6 +287,21 @@ test("ungoverned_burst: > 64 ungoverned processes in 60 s raises the alarm and k
   assert.equal(burst[0].processes, 200);
 });
 
+test("ungoverned_burst counts OWNER sessions too (§19 D1c): an owner session gaining > 64 raises it, kills nothing", async (t) => {
+  const box = new FakeBox();
+  t.after(() => box.cleanup());
+  box.standardSystem();
+  box.owner(100, "sess-burst");
+  const governor = startedGovernor(box);
+  governor.tick();
+  box.addMany(100, { ppid: 102, pgid: 100, sid: 100, comm: "bash" }, 3000); // commands inside the owner's session
+  box.nowMs += 1000;
+  governor.tick();
+  await governor.settle();
+  assert.deepEqual(box.signals, []);
+  assert.equal(box.events().filter((e) => e.action === "ungoverned_burst").length, 1);
+});
+
 test("leaderless remainder after a governor restart with groups.json deleted: killed, attribution unknown (AC2 variant)", async (t) => {
   const box = new FakeBox();
   t.after(() => box.cleanup());

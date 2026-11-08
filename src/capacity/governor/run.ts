@@ -1017,15 +1017,20 @@ export class Governor {
   // the ungoverned-burst alarm (§3.4) and fast mode (§4.2 cadence)
   // -------------------------------------------------------------------------
 
+  /**
+   * §3.4 as ruled in §19 D1(c): growth in every non-system session that is NOT governed — `outside` AND
+   * owner sessions (which also makes Codex/Pi commands run inside an owner's own session visible, E1).
+   * The "box notice" is this event + its ClickHouse row + the log line (§19 D4); no human channel in v1.
+   */
   private burstAlarm(sessions: ReadonlyMap<number, SessionView>, nowMs: number): void {
-    let outside = 0;
+    let ungoverned = 0;
     for (const view of sessions.values()) {
       const p = view.record.placement;
-      if (!p.governed && p.reason === "outside") {
-        outside += view.members.length;
+      if (!p.governed && p.reason !== "system") {
+        ungoverned += view.members.length;
       }
     }
-    const gain = this.burst.observe(nowMs, outside);
+    const gain = this.burst.observe(nowMs, ungoverned);
     if (gain !== undefined) {
       this.alarm("ungoverned_burst", nowMs, () => ({
         ...this.baseEvent("ungoverned_burst", nowMs),
