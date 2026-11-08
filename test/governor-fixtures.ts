@@ -135,8 +135,10 @@ export class FakeBox {
       p.owner ? `node\0/opt/acpx/dist/cli.js\0__queue-owner\0` : `${p.comm}\0-c\0${SECRET}\0`,
     );
     fs.writeFileSync(path.join(dir, "environ"), `ANTHROPIC_API_KEY=${SECRET}\0`);
-    if (!fs.existsSync(path.join(dir, "fd", "2"))) {
-      fs.writeFileSync(path.join(dir, "fd", "2"), "");
+    for (const fd of ["1", "2"]) {
+      if (!fs.existsSync(path.join(dir, "fd", fd))) {
+        fs.writeFileSync(path.join(dir, "fd", fd), "");
+      }
     }
   }
 
@@ -145,16 +147,16 @@ export class FakeBox {
     fs.rmSync(path.join(this.proc, String(pid)), { recursive: true, force: true });
   }
 
-  /** What the killed command's stderr received. */
-  stderrOf(pid: number): string {
+  /** What the killed command's stderr (fd 2) or stdout (fd 1) received — kept after the kill. */
+  stderrOf(pid: number, fd: "1" | "2" = "2"): string {
     try {
-      return fs.readFileSync(path.join(this.proc, String(pid), "fd", "2"), "utf8");
+      return fs.readFileSync(path.join(this.proc, String(pid), "fd", fd), "utf8");
     } catch {
-      return this.removedStderr.get(pid) ?? "";
+      return this.removedFds.get(`${pid}:${fd}`) ?? "";
     }
   }
 
-  private readonly removedStderr = new Map<number, string>();
+  private readonly removedFds = new Map<string, string>();
 
   lease(sessionId: string, pid: number, seatId?: string): void {
     const p = this.procs.get(pid) as FakeProcess;
@@ -191,7 +193,9 @@ export class FakeBox {
         p.state = sig === "SIGSTOP" ? "T" : "S";
         this.write(p);
       } else if (sig === "SIGKILL") {
-        this.removedStderr.set(p.pid, this.stderrOf(p.pid));
+        for (const fd of ["1", "2"] as const) {
+          this.removedFds.set(`${p.pid}:${fd}`, this.stderrOf(p.pid, fd));
+        }
         this.remove(p.pid);
       }
     }

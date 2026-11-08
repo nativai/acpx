@@ -9,7 +9,10 @@ import { writeFileAtomic } from "./classify.js";
  * CONCEPTION 5d7a23b6 §6.2–6.3 — telling. Nothing silent:
  *   - IN-BAND: before the sweep, one line appended to the session leader's own stderr
  *     (`/proc/<leader>/fd/2`, write-only, append, non-blocking), so the reason lands in the same tool
- *     result as the `Killed` — without it the natural next move is to retry the same command;
+ *     result as the `Killed` — without it the natural next move is to retry the same command. When the
+ *     leader is dead (a storm backgrounded by an ordinary tool call), to the OLDEST surviving member's
+ *     fd 2, else its fd 1 (§19 D2): a background task's capture file, or the tool's pipe while Claude
+ *     still reads it; /dev/null swallows it, which is accepted;
  *   - OUT OF BAND: a message to the owner's seat through atrium (the worktree reaper's mechanism,
  *     F12), deduped per (session, rule) per 10 min, with an outbox while atrium is down.
  * Comm names and numbers only: never argv, environment, cwd or paths.
@@ -28,8 +31,13 @@ export type KillFacts = {
   readonly limitBytes?: number;
   readonly commTop: ReadonlyArray<readonly [string, number]>;
   readonly eventId: string;
+  /** The command's start (the remembered leader's start ticks), when known. */
   readonly startedAt?: string;
+  /** When the start is unknown (first seen without a leader): when the governor first saw it. */
+  readonly firstSeenAt?: string;
   readonly orphaned: boolean;
+  /** A terminal's second sweep within 60 s: the interactive shell was ended too (§5.1). */
+  readonly shellEnded?: boolean;
 };
 
 const gib = (bytes: number): string => `${(bytes / 1024 ** 3).toFixed(2)} GiB`;
@@ -37,8 +45,9 @@ const classes = (commTop: KillFacts["commTop"]): string =>
   commTop.map(([comm, n]) => `${comm}×${n}`).join(" ");
 
 const REMEDY_STORM =
-  "A shell function that calls a command of its own name — tr(){ … | tr …; } — recurses forever; " +
-  "heavy or parallel work belongs in workbench-exec.";
+  "A command that forks without bound — a recursive function, a `&` loop, a fork bomb (for example " +
+  "tr(){ … | tr …; }, a function that calls the command it shadows) — never stops by itself; heavy or " +
+  "parallel work belongs in workbench-exec.";
 const REMEDY_MEMORY = "Heavy work belongs in workbench-exec, not on the control pod.";
 
 function ruleSummary(facts: KillFacts): string {
@@ -55,37 +64,24 @@ function ruleSummary(facts: KillFacts): string {
 /** §6.2: the one line appended to the killed command's own stderr. */
 export function inBandLine(facts: KillFacts): string {
   const remedy = facts.rule === "fork-storm" ? REMEDY_STORM : REMEDY_MEMORY;
+  const untouched = facts.shellEnded
+    ? "Your shell was ended too: this terminal ran away twice within 60 s."
+    : "Nothing else in your session was touched.";
   return (
     `process-governor: KILLED this command (${ruleSummary(facts)}; ${classes(facts.commTop)}). ` +
-    `Nothing else in your session was touched. ${remedy} ` +
+    `${untouched} ${remedy} ` +
     `Event ${facts.eventId} in ~/.acpx/governor/events.ndjson.\n`
   );
 }
 
-/**
- * Append the line to the leader's fd 2. Same uid and `bash` is dumpable, so the open is permitted.
- * Best effort, never retried. The leader is re-checked by start ticks first: a recycled pid must
- * never receive it.
- */
-export function writeInBand(
-  procRoot: string,
-  leader: GovProc,
-  line: string,
-  stillAlive: (proc: GovProc) => boolean,
-): "written" | "failed" | "no-leader" {
-  if (!stillAlive(leader)) {
-    return "no-leader";
-  }
+function appendTo(file: string, line: string): boolean {
   let fd: number | undefined;
   try {
-    fd = fs.openSync(
-      `${procRoot}/${leader.pid}/fd/2`,
-      fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NONBLOCK,
-    );
+    fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NONBLOCK);
     fs.writeSync(fd, line);
-    return "written";
+    return true;
   } catch {
-    return "failed";
+    return false;
   } finally {
     if (fd !== undefined) {
       try {
@@ -97,6 +93,27 @@ export function writeInBand(
   }
 }
 
+/**
+ * Append the line to `target`'s fd 2, else its fd 1 — `target` is the leader, or, with the leader
+ * dead, the oldest surviving member (§19 D2). Same uid and `bash` is dumpable, so the open is
+ * permitted. Best effort, never retried, written once. The target is re-checked by start ticks first:
+ * a recycled pid must never receive it.
+ */
+export function writeInBand(
+  procRoot: string,
+  target: GovProc,
+  line: string,
+  stillAlive: (proc: GovProc) => boolean,
+): "fd2" | "fd1" | "failed" | "gone" {
+  if (!stillAlive(target)) {
+    return "gone";
+  }
+  if (appendTo(`${procRoot}/${target.pid}/fd/2`, line)) {
+    return "fd2";
+  }
+  return appendTo(`${procRoot}/${target.pid}/fd/1`, line) ? "fd1" : "failed";
+}
+
 /** §6.3: the seat message. */
 export function seatMessageText(facts: KillFacts, repeats = 0): string {
   const lines = [
@@ -104,6 +121,10 @@ export function seatMessageText(facts: KillFacts, repeats = 0): string {
   ];
   if (facts.startedAt) {
     lines.push(`The command started at ${facts.startedAt} UTC — match it to your own tool call.`);
+  } else if (facts.firstSeenAt) {
+    lines.push(
+      `It was first seen at ${facts.firstSeenAt} UTC (its own start is unknown) — match it to your own tool call.`,
+    );
   }
   if (facts.orphaned) {
     lines.push(

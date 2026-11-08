@@ -168,6 +168,14 @@ test("terminal session: the interactive shell keeps its own group on the first s
   governor.tick();
   await governor.settle();
   assert.deepEqual(box.members(500), [], "a loop typed at the prompt: the leader goes too");
+  const lines = box.stderrOf(500).split("\n").filter(Boolean);
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /Nothing else in your session was touched/u);
+  assert.match(
+    lines[1],
+    /Your shell was ended too/u,
+    "F9: the second sweep says the shell went too",
+  );
 });
 
 test("R2 line: L − M_oom on both branches of M_oom (512 MiB floor, 5 % of L)", () => {
@@ -316,6 +324,51 @@ test("leaderless remainder after a governor restart with groups.json deleted: ki
   assert.equal(killed?.attribution, "unknown");
   assert.equal(killed?.orphaned, true);
   assert.equal(killed?.notify_status, "no_target");
+  assert.equal(killed?.started_at, null, "F8: first seen leaderless, its start is unknown");
+  // §19 D2: with the leader dead, the in-band line goes to the OLDEST surviving member's fd 2, once.
+  assert.match(box.stderrOf(2001), /^process-governor: KILLED this command/u);
+  assert.equal(box.stderrOf(2002), "");
+});
+
+test("§19 D2: a dead leader's in-band line falls back to the oldest member's fd 1 when fd 2 is not writable", async (t) => {
+  const box = new FakeBox();
+  t.after(() => box.cleanup());
+  box.standardSystem();
+  box.addMany(140, { ppid: 1, pgid: 2001, sid: 2000, comm: "bash" }, 2001);
+  const fd2 = path.join(box.proc, "2001", "fd", "2");
+  fs.rmSync(fd2);
+  fs.mkdirSync(fd2); // an fd 2 that cannot be opened for writing
+  const governor = startedGovernor(box);
+  governor.tick();
+  await governor.settle();
+  assert.deepEqual(box.members(2000), []);
+  assert.match(box.stderrOf(2001, "1"), /^process-governor: KILLED this command/u);
+});
+
+test("F8: an orphaned remainder's started_at is the REMEMBERED leader's start, not its oldest survivor's", async (t) => {
+  const box = stormBox(t, 20);
+  const leaderTicks = box.procs.get(2000)?.ticks as number;
+  const governor = startedGovernor(box);
+  governor.tick(); // first sight: a tool session, leader alive — remembered
+  box.remove(2000); // the tool call is stopped: the shell dies, the remainder is reparented and regrows
+  for (const p of box.members(2000)) {
+    box.add({ ...p, ppid: 1 });
+  }
+  box.addMany(120, { ppid: 1, pgid: 2001, sid: 2000, comm: "bash" }, 5000);
+  box.nowMs += 1000;
+  governor.tick();
+  await governor.settle();
+  const killed = box.events().find((e) => e.action === "killed");
+  const expected = new Date(1762560000 * 1000 + leaderTicks * 10)
+    .toISOString()
+    .replace("T", " ")
+    .replace("Z", "");
+  assert.equal(killed?.orphaned, true);
+  assert.equal(killed?.started_at, expected);
+  assert.match(
+    JSON.parse(box.atriumCalls[0].body).text as string,
+    new RegExp(`started at ${expected.replaceAll(".", "\\.")} UTC`, "u"),
+  );
 });
 
 test("verification: survivors at +1 s give kill_incomplete and another sweep; after three sweeps a LOUD event", async (t) => {

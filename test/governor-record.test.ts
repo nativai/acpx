@@ -250,10 +250,26 @@ test("notify: the in-band line and the seat message carry rule, counts, comm cla
   assert.equal(
     inBandLine(facts),
     "process-governor: KILLED this command (rule=fork-storm processes=412 limit=128; bash×409 git×2 grep×1). " +
-      "Nothing else in your session was touched. A shell function that calls a command of its own name — " +
-      "tr(){ … | tr …; } — recurses forever; heavy or parallel work belongs in workbench-exec. " +
+      "Nothing else in your session was touched. A command that forks without bound — a recursive function, " +
+      "a `&` loop, a fork bomb (for example tr(){ … | tr …; }, a function that calls the command it shadows) " +
+      "— never stops by itself; heavy or parallel work belongs in workbench-exec. " +
       "Event 7f3c0000-0000-4000-8000-000000000000 in ~/.acpx/governor/events.ndjson.\n",
   );
+  // A terminal's second sweep ended the shell: the line must not claim nothing else was touched (F9).
+  const second = inBandLine({ ...facts, shellEnded: true });
+  assert.match(second, /Your shell was ended too: this terminal ran away twice within 60 s\./u);
+  assert.doesNotMatch(second, /Nothing else in your session was touched/u);
+  // F8: without a known start the message says when it was FIRST SEEN, never "started at".
+  const unknownStart = seatMessageText({
+    ...facts,
+    startedAt: undefined,
+    firstSeenAt: "2026-11-08 17:49:00.000",
+  });
+  assert.match(
+    unknownStart,
+    /first seen at 2026-11-08 17:49:00\.000 UTC \(its own start is unknown\)/u,
+  );
+  assert.doesNotMatch(unknownStart, /started at/u);
   const text = seatMessageText(facts);
   assert.match(text, /started at 2026-11-08 17:48:01\.000 UTC/u);
   assert.match(text, /ORPHANED: its tool call had already ended or been stopped/u);

@@ -182,6 +182,27 @@ function messageTarget(view: SessionView): MessageTarget | undefined {
   return a?.sessionId ? { kind: "session", id: a.sessionId } : undefined;
 }
 
+/** A terminal session whose live leader is an interactive shell (it has a controlling tty). */
+function isInteractiveTerminal(view: SessionView): boolean {
+  const placement = view.record.placement;
+  return (
+    placement.governed &&
+    placement.kind === "terminal" &&
+    view.leader !== undefined &&
+    view.leader.ttyNr !== 0
+  );
+}
+
+/** F8: the remembered start when known, else when the governor first saw the session. */
+function startFacts(
+  event: GovernorEvent,
+  view: SessionView,
+): Pick<KillFacts, "startedAt" | "firstSeenAt"> {
+  return event.started_at
+    ? { startedAt: event.started_at }
+    : { firstSeenAt: clickhouseTime(view.record.firstSeenMs) };
+}
+
 /** Fast-mode trigger (§4.2): `start` on a jump of ≥ 16 or a first crossing of 32; `grew` on any rise. */
 function growthOf(prev: number, count: number, g: GovernorConstants): "none" | "grew" | "start" {
   if (count <= prev) {
@@ -646,16 +667,27 @@ export class Governor {
     );
   }
 
+  /**
+   * The command's start = the leader's start ticks REMEMBERED at first sight (§19 D2 / TE F8): an
+   * orphaned remainder's oldest survivor is not the command's start. Unknown (null) when the session was
+   * first seen without a leader — the seat message then says when it was first seen instead.
+   */
   private startedAt(view: SessionView): string | null {
-    const ticks = view.leader
-      ? view.leader.startTicks
-      : view.members
-          .map((m) => m.startTicks)
-          .toSorted((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1))[0];
+    const ticks = view.record.leaderStartTicks;
     if (ticks === undefined || this.bootTimeMs === undefined) {
       return null;
     }
     return clickhouseTime(this.bootTimeMs + Number(ticks) * (1000 / USER_HZ));
+  }
+
+  /** Where the in-band line goes: the live leader, else the oldest surviving member (§19 D2). */
+  private inBandTarget(view: SessionView): GovProc | undefined {
+    if (view.leader) {
+      return view.leader;
+    }
+    return view.members.toSorted((a, b) =>
+      BigInt(a.startTicks) < BigInt(b.startTicks) ? -1 : 1,
+    )[0];
   }
 
   private sessionEvent(
@@ -796,11 +828,12 @@ export class Governor {
     anonBytes?: number,
   ): void {
     const event = this.sessionEvent(view, rule, "killed", nowMs, box, anonBytes);
-    const facts = this.killFacts(view, event, box);
-    if (view.leader) {
-      writeInBand(this.deps.procRoot, view.leader, inBandLine(facts), this.stillAlive);
-    }
     const sparePgid = this.terminalSpare(view, nowMs);
+    const facts = this.killFacts(view, event, box, sparePgid);
+    const inBand = this.inBandTarget(view);
+    if (inBand) {
+      writeInBand(this.deps.procRoot, inBand, inBandLine(facts), this.stillAlive);
+    }
     this.sweep(view, event, sparePgid);
     this.state.kills.push({
       atMs: nowMs,
@@ -834,7 +867,12 @@ export class Governor {
     );
   }
 
-  private killFacts(view: SessionView, event: GovernorEvent, box: BoxReading): KillFacts {
+  private killFacts(
+    view: SessionView,
+    event: GovernorEvent,
+    box: BoxReading,
+    sparePgid: number | undefined,
+  ): KillFacts {
     return {
       rule: event.rule === "memory-emergency" ? "memory-emergency" : "fork-storm",
       processes: view.members.length,
@@ -844,8 +882,9 @@ export class Governor {
       limitBytes: box.limit,
       commTop: event.comm_top,
       eventId: event.event_id,
-      startedAt: event.started_at ?? undefined,
+      ...startFacts(event, view),
       orphaned: view.orphaned,
+      shellEnded: isInteractiveTerminal(view) && sparePgid === undefined,
     };
   }
 
