@@ -328,6 +328,8 @@ const LINE3 =
   "acpx: retry later — after one of your own sessions finishes, or after you close one you are done with — and never in a loop; 'acpx capacity --need 1' says when there is room.";
 const LINE4_LEAF =
   "acpx: only if you have finished your work, will do no further work, and will close yourself right after this send: send it with 'send-message.sh --final-report' instead — it is held and delivered when room frees. Orchestrators, and any agent that will keep working, must not use it.";
+const LINE_BLOCKED_LEAF =
+  "acpx: blocked on the recipient's answer? Do not arm a wakeup to retry — it would take the slot the recipient needs to wake; end your turn with your question as its last output.";
 const LINE4_ORCHESTRATOR =
   "acpx: (--final-report is only for a finished agent's last message before it closes itself; you have open sub-sessions, so it is not for you.)";
 
@@ -484,12 +486,13 @@ test("text (a): a LEAF sender, marker fresh → lines 1–4 + the pre-S1 hint, o
   const run = await admitWakeCli(f, id, ["--sender", CALLER, "--sender-role", "leaf"]);
   assert.equal(run.code, 75);
   const lines = run.json.refusal?.message.split("\n") ?? [];
-  assert.equal(lines.length, 5, lines.join("\n"));
+  assert.equal(lines.length, 6, lines.join("\n"));
   assert.match(lines[0], tokenFor(id));
   assert.match(lines[1], LINE2);
   assert.equal(lines[2], LINE3);
-  assert.equal(lines[3], LINE4_LEAF);
-  assert.equal(lines[4], PRE_S1_HINT);
+  assert.equal(lines[3], LINE_BLOCKED_LEAF);
+  assert.equal(lines[4], LINE4_LEAF);
+  assert.equal(lines[5], PRE_S1_HINT);
   assert.equal(PRE_S1_HINT, "(If your send-message.sh does not know --final-report, retry later.)");
   assert.deepEqual(run.json.refusal?.finalReport, { offered: true, why: "leaf" });
 });
@@ -502,6 +505,10 @@ test("text (b): an ORCHESTRATOR sender → line 4 is 'not for you', no hint, off
   assert.equal(lines.length, 4, lines.join("\n"));
   assert.equal(lines[3], LINE4_ORCHESTRATOR);
   assert.ok(!lines.includes(PRE_S1_HINT));
+  assert.ok(
+    !lines.includes(LINE_BLOCKED_LEAF),
+    "an orchestrator is never told not to arm a wakeup",
+  );
 });
 
 test("NEGATIVE text (c): marker absent, stale (6 min), future (+60 s) or not finalReport → --final-report is NEVER named", async () => {
@@ -563,8 +570,28 @@ test("text (d): --cross-box → line 3 names the recipient's box and never local
     `acpx: the recipient's box (${box}) has no room right now; retry later, never in a loop — your own box's 'acpx capacity' cannot see it.`,
   );
   assert.doesNotMatch(lines.join("\n"), /acpx capacity --need 1/u);
-  assert.equal(lines[3], LINE4_LEAF);
+  assert.equal(lines[3], LINE_BLOCKED_LEAF);
+  assert.equal(lines[4], LINE4_LEAF);
   assert.deepEqual(run.json.refusal?.finalReport, { offered: true, why: "cross-box" });
+});
+
+test("text (§5.7): the blocked-leaf line sits between the retry line and the --final-report line, local and cross-box; an orchestrator never gets it, in either box shape", async () => {
+  const f = makeBox({ requestMib: 2048 });
+  const id = await makeTarget(f);
+  writeMarker(f);
+  for (const crossBox of [false, true]) {
+    const cross = crossBox ? ["--cross-box"] : [];
+    const leaf = await refusedText(f, id, [...cross, "--sender-role", "leaf"]);
+    const at = leaf.indexOf(LINE_BLOCKED_LEAF);
+    assert.ok(at > 0, `leaf crossBox=${crossBox}: ${leaf.join("\n")}`);
+    assert.ok(leaf[at - 1].includes("retry later"), `crossBox=${crossBox}: retry line precedes it`);
+    assert.equal(leaf[at + 1], LINE4_LEAF, `crossBox=${crossBox}: final-report line follows it`);
+    const orchestrator = await refusedText(f, id, [...cross, "--sender-role", "orchestrator"]);
+    assert.ok(
+      !orchestrator.join("\n").includes("Do not arm a wakeup"),
+      `orchestrator crossBox=${crossBox}: ${orchestrator.join("\n")}`,
+    );
+  }
 });
 
 test("text: the seat name leads <who> when the target's seat has one", async () => {

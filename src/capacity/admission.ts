@@ -834,6 +834,13 @@ const NOT_FOR_YOU_LINE =
   "acpx: (--final-report is only for a finished agent's last message before it closes itself; you have open sub-sessions, so it is not for you.)";
 const RETRY_LINE =
   "acpx: retry later — after one of your own sessions finishes, or after you close one you are done with — and never in a loop; 'acpx capacity --need 1' says when there is room.";
+/**
+ * A leaf blocked on the recipient's answer must not arm a wakeup to retry: its self-wakeup would
+ * take the slot the recipient needs to wake, ahead of the parent it waits on (A1 §5.7). Leaf
+ * senders only — an orchestrator's heartbeat wakeups are its own protocol and are never told this.
+ */
+const BLOCKED_LEAF_LINE =
+  "acpx: blocked on the recipient's answer? Do not arm a wakeup to retry — it would take the slot the recipient needs to wake; end your turn with your question as its last output.";
 /** The pre-S1 hint (CONCEPTION §5.3; contract note 17:55Z): admit-wake's answer only, only when offered. */
 export const PRE_S1_HINT = "(If your send-message.sh does not know --final-report, retry later.)";
 const WAKE_BUSY_LINE =
@@ -936,6 +943,7 @@ function wakeSentences(
   return [
     wakeNoRoomLine(input, snapshot),
     wakeRetryLine(input, snapshot),
+    ...(offer.offered ? [BLOCKED_LEAF_LINE] : []),
     ...finalReportLine(offer.why, offer.offered),
   ];
 }
