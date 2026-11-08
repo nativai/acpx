@@ -191,13 +191,30 @@ function growthOf(prev: number, count: number, g: GovernorConstants): "none" | "
   return count - prev >= g.fastGrowthProcesses || crossed ? "start" : "grew";
 }
 
-const EMPTY_STATE: GovernorState = {
-  r2LastKillMs: 0,
-  r2Skip: [],
-  terminalSweeps: [],
-  stopsInFlight: [],
-  kills: [],
-};
+function growthSummary(
+  sessions: ReadonlyMap<number, SessionView>,
+  prevCounts: ReadonlyMap<string, number>,
+  g: GovernorConstants,
+): { counts: Map<string, number>; started: boolean; grew: boolean } {
+  const counts = new Map<string, number>();
+  let started = false;
+  let grew = false;
+  for (const view of sessions.values()) {
+    if (view.record.placement.governed) {
+      const key = sessionKey(view);
+      counts.set(key, view.members.length);
+      const growth = growthOf(prevCounts.get(key) ?? 0, view.members.length, g);
+      started ||= growth === "start";
+      grew ||= growth !== "none";
+    }
+  }
+  return { counts, started, grew };
+}
+
+/** A fresh state — fresh arrays every time: a shared constant's arrays would leak between runs. */
+function emptyState(): GovernorState {
+  return { r2LastKillMs: 0, r2Skip: [], terminalSweeps: [], stopsInFlight: [], kills: [] };
+}
 
 function loadState(file: string): GovernorState {
   try {
@@ -210,7 +227,7 @@ function loadState(file: string): GovernorState {
       kills: Array.isArray(parsed.kills) ? parsed.kills : [],
     };
   } catch {
-    return { ...EMPTY_STATE };
+    return emptyState();
   }
 }
 
@@ -895,22 +912,14 @@ export class Governor {
     nowMs: number,
     box: BoxReading,
   ): void {
-    if (box.committed === undefined || box.limit === undefined) {
-      return;
-    }
-    if (box.committed < emergencyLineBytes(box.limit, this.settings.constants)) {
-      return;
-    }
-    if (this.r2Blind(measured, nowMs, box)) {
-      return;
-    }
-    if (nowMs - this.state.r2LastKillMs < this.g.emergencyKillSpacingMs) {
+    const limit = box.limit;
+    if (limit === undefined || !this.r2Armed(measured, nowMs, box)) {
       return;
     }
     this.state.r2Skip = this.state.r2Skip.filter((s) => nowMs - s.atMs < this.g.r2SkipWindowMs);
     const choice = chooseR2Victim(
       this.r2Candidates(sessions),
-      victimFloorBytes(box.limit, this.g),
+      victimFloorBytes(limit, this.g),
       this.state.r2Skip,
       nowMs,
       this.g,
@@ -940,6 +949,20 @@ export class Governor {
       this.state.r2Skip.push({ sid: victim.view.sid, atMs: nowMs, freeable: victim.freeable });
     }
     this.act(victim.view, "memory-emergency", nowMs, box, victim.freeable);
+  }
+
+  /** `C` is at or past `L − M_oom`, R2 can see, and the 2 s kill spacing has elapsed. */
+  private r2Armed(measured: boolean, nowMs: number, box: BoxReading): boolean {
+    if (box.committed === undefined || box.limit === undefined) {
+      return false;
+    }
+    if (box.committed < emergencyLineBytes(box.limit, this.settings.constants)) {
+      return false;
+    }
+    if (this.r2Blind(measured, nowMs, box)) {
+      return false;
+    }
+    return nowMs - this.state.r2LastKillMs >= this.g.emergencyKillSpacingMs;
   }
 
   /**
@@ -995,18 +1018,7 @@ export class Governor {
   }
 
   private cadence(sessions: ReadonlyMap<number, SessionView>, nowMs: number): number {
-    const counts = new Map<string, number>();
-    let started = false;
-    let grew = false;
-    for (const view of sessions.values()) {
-      if (view.record.placement.governed) {
-        const key = sessionKey(view);
-        counts.set(key, view.members.length);
-        const growth = growthOf(this.prevCounts.get(key) ?? 0, view.members.length, this.g);
-        started ||= growth === "start";
-        grew ||= growth !== "none";
-      }
-    }
+    const { counts, started, grew } = growthSummary(sessions, this.prevCounts, this.g);
     this.prevCounts = counts;
     if (started || (grew && nowMs < this.fastUntilMs)) {
       this.fastUntilMs = nowMs + this.g.fastHoldMs;
@@ -1184,17 +1196,10 @@ export class Governor {
    * flight (no verification due, no stop recorded), exit 0 so the supervisor starts the new build.
    */
   private selfRestartDue(nowMs: number): boolean {
-    const signature = fileSignature(this.deps.entryFile);
-    const changed =
-      signature !== undefined && signature !== "missing" && signature !== this.entrySignature;
-    if (!changed || this.lastSeenSignature !== signature) {
-      this.lastSeenSignature = changed ? signature : undefined;
-      this.entryChangedAtMs = changed ? nowMs : undefined;
+    if (!this.newBuildStable(nowMs)) {
       return false;
     }
-    const stable = nowMs - (this.entryChangedAtMs ?? nowMs) >= SELF_RESTART_STABLE_MS;
-    const idle = this.verifications.length === 0 && this.state.stopsInFlight.length === 0;
-    if (!stable || !idle) {
+    if (this.verifications.length > 0 || this.state.stopsInFlight.length > 0) {
       return false;
     }
     this.deps.log(
@@ -1204,6 +1209,19 @@ export class Governor {
   }
 
   private lastSeenSignature: string | undefined;
+
+  /** The entry file differs from the one this process started from, unchanged for 10 s. */
+  private newBuildStable(nowMs: number): boolean {
+    const signature = fileSignature(this.deps.entryFile);
+    const changed =
+      signature !== undefined && signature !== "missing" && signature !== this.entrySignature;
+    if (!changed || this.lastSeenSignature !== signature) {
+      this.lastSeenSignature = changed ? signature : undefined;
+      this.entryChangedAtMs = changed ? nowMs : undefined;
+      return false;
+    }
+    return nowMs - (this.entryChangedAtMs ?? nowMs) >= SELF_RESTART_STABLE_MS;
+  }
 
   /** Persist everything and release the lock (clean exit). */
   shutdown(): void {

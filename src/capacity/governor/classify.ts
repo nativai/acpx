@@ -390,17 +390,16 @@ function isPlacement(value: unknown): value is Placement {
   );
 }
 
+const isSid = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value > 1;
+
 function parseGroupRecord(item: unknown): GroupRecord | undefined {
   const r = (item && typeof item === "object" ? item : {}) as Record<string, unknown>;
-  const sid = r.sid;
-  if (typeof sid !== "number" || !Number.isSafeInteger(sid) || sid <= 1) {
-    return undefined;
-  }
-  if (typeof r.firstSeenMs !== "number" || !isPlacement(r.placement)) {
+  if (!isSid(r.sid) || typeof r.firstSeenMs !== "number" || !isPlacement(r.placement)) {
     return undefined;
   }
   return {
-    sid,
+    sid: r.sid,
     leaderStartTicks: typeof r.leaderStartTicks === "string" ? r.leaderStartTicks : undefined,
     leaderPpid: typeof r.leaderPpid === "number" ? r.leaderPpid : undefined,
     firstSeenMs: r.firstSeenMs,

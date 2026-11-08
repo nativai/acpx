@@ -44,7 +44,9 @@ function ownerReason(proc: GovProc, guard: GuardContext): string | undefined {
     return "owner-lease";
   }
   const token = guard.tokenState(proc.pid);
-  if (token === "owner") {
+  // An owner leads its own session, so its adapter and harness are protected through the leader:
+  // "queue-owner sessions are never touched" (§3.3), not just the owner process itself.
+  if (token === "owner" || (proc.sid !== proc.pid && guard.tokenState(proc.sid) === "owner")) {
     return "owner-token";
   }
   // Uncertainty means no group kill: a LIVE process whose argv cannot be read is not proven a
@@ -217,18 +219,21 @@ export function finishStops(deps: SweepDeps, stops: readonly StopRecord[]): numb
 export function sweepSession(deps: SweepDeps, options: SweepOptions): SweepResult {
   const started = deps.now();
   const guarded = new Set<number>();
+  /** Groups whose kill was refused (EPERM): retrying them every round changes nothing. */
+  const refused = new Set<number>();
   let rounds = 0;
   let groupsSignalled = 0;
-  let eperm = false;
   for (let round = 0; round < options.rounds; round += 1) {
     const members = sessionMembers(deps.scan(), options.sid, options.sparePgid);
-    const targets = roundTargets(members, deps.guard, guarded);
+    const targets = roundTargets(members, deps.guard, guarded).filter((pgid) => !refused.has(pgid));
     if (targets.length === 0) {
       break;
     }
     rounds += 1;
     for (const pgid of targets) {
-      eperm = send(deps, -pgid, "SIGKILL") || eperm;
+      if (send(deps, -pgid, "SIGKILL")) {
+        refused.add(pgid);
+      }
     }
     groupsSignalled += targets.length;
     deps.sleepSync(options.roundIntervalMs);
@@ -241,7 +246,7 @@ export function sweepSession(deps: SweepDeps, options: SweepOptions): SweepResul
     killMs: Math.max(0, deps.now() - started),
     survivors,
     groupsSignalled,
-    eperm: eperm || fallback.eperm,
+    eperm: refused.size > 0 || fallback.eperm,
     guardedPgids: [...guarded],
     fallbackStops: fallback.stops,
   };

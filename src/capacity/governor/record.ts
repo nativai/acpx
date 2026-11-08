@@ -153,7 +153,7 @@ export const FIXTURE_BOX = "fixture.invalid";
 
 const BOX_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/u;
 
-export type BoxIdentity = { box: string } | { box: undefined; reason: string };
+export type BoxIdentity = { box: string; reason?: undefined } | { box: undefined; reason: string };
 
 /**
  * `OOM_CLICKHOUSE_BOX`, else `NATIVAI_BOX_FQDN`, validated. A wrong label is unrepairable (all five
@@ -209,39 +209,47 @@ export type ClickHouseConfig =
   | { enabled: true; endpoint: string; password: string; fetchImpl: FetchLike }
   | { enabled: false; reason: string };
 
-/**
- * The writer's configuration. The endpoint is FIXED; a test may point it at `http://127.0.0.1:<port>`
- * only with `ACPX_GOVERNOR_TEST=1`. The password is read once into memory — never argv, env or disk.
- */
-export function clickHouseConfig(options: {
+type WriterOptions = {
   env: NodeJS.ProcessEnv;
   testMode: boolean;
   /** False for a governor that is not the supervised production instance: local events only. */
   allowed: boolean;
   box: BoxIdentity;
   fetchImpl: FetchLike;
-}): ClickHouseConfig {
-  if (!options.allowed) {
-    return { enabled: false, reason: "clickhouse_not_supervised" };
+};
+
+/**
+ * The writer's configuration. The endpoint is FIXED; a test may point it at `http://127.0.0.1:<port>`
+ * only with `ACPX_GOVERNOR_TEST=1`. The password is read once into memory — never argv, env or disk.
+ */
+export function clickHouseConfig(options: WriterOptions): ClickHouseConfig {
+  const refusal = writerRefusal(options);
+  if (refusal !== undefined) {
+    return { enabled: false, reason: refusal };
   }
-  if (options.box.box === undefined) {
-    return { enabled: false, reason: options.box.reason };
-  }
-  const endpoint = options.env.ACPX_GOVERNOR_CLICKHOUSE_URL || undefined;
-  const passwordFile = options.env.ACPX_GOVERNOR_CLICKHOUSE_PASSWORD_FILE || undefined;
-  if (!overridesAllowed(endpoint, passwordFile, options.testMode)) {
-    return { enabled: false, reason: "clickhouse_config_invalid" };
-  }
-  const password = readPassword(passwordFile ?? CLICKHOUSE_PASSWORD_FILE);
+  const env = options.env;
+  const password = readPassword(
+    env.ACPX_GOVERNOR_CLICKHOUSE_PASSWORD_FILE || CLICKHOUSE_PASSWORD_FILE,
+  );
   if (!password) {
     return { enabled: false, reason: "clickhouse_password_unreadable" };
   }
-  return {
-    enabled: true,
-    endpoint: endpoint ?? CLICKHOUSE_ENDPOINT,
-    password,
-    fetchImpl: options.fetchImpl,
-  };
+  const endpoint = env.ACPX_GOVERNOR_CLICKHOUSE_URL || CLICKHOUSE_ENDPOINT;
+  return { enabled: true, endpoint, password, fetchImpl: options.fetchImpl };
+}
+
+function writerRefusal(options: WriterOptions): string | undefined {
+  if (!options.allowed) {
+    return "clickhouse_not_supervised";
+  }
+  if (options.box.reason !== undefined) {
+    return options.box.reason;
+  }
+  const endpoint = options.env.ACPX_GOVERNOR_CLICKHOUSE_URL || undefined;
+  const passwordFile = options.env.ACPX_GOVERNOR_CLICKHOUSE_PASSWORD_FILE || undefined;
+  return overridesAllowed(endpoint, passwordFile, options.testMode)
+    ? undefined
+    : "clickhouse_config_invalid";
 }
 
 /** Overrides only in test mode, and the endpoint only a loopback port (the recorder's rule). */
