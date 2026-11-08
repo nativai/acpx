@@ -727,9 +727,9 @@ function isOldEnough(
  * Anchor resolution for a companion — `metadata.byway_parent` FIRST, then
  * `forked_from_session_id`.
  *
- * ⚠️ THE ORDER IS THE CONTRACT, not a preference. It matches acpx-ui's
- * `server/byway.ts` `isOrphanByway`, which is the source of truth for the
- * hard-delete this whole mechanism exists to prevent. In every live specimen the
+ * The order matched acpx-ui's former `isOrphanByway` (removed with its sweep in
+ * brick 16732ad6); a byway is no longer a companion, so for byways this is now
+ * provenance only, and companions (subagents) resolve via `parentSessionId`. In every live specimen the
  * two fields AGREE, so production cannot discriminate the order at all — the rig's
  * `BYWAY-DISAGREE-byway` cohort points them at different parents on purpose, and
  * it is the only thing that can catch a reversed order.
@@ -817,11 +817,28 @@ function considerCandidate(
   }
 }
 
+/**
+ * A retention COMPANION moves with its anchor: a SUBAGENT, and only a subagent.
+ *
+ * ⚠️ A by-the-way thread is NOT a companion any more (brick 16732ad6, Daniel
+ * 2026-11-08). It used to ride along so that acpx-ui's 5-minute orphan sweep never saw
+ * a thread whose source session had left the hot dir — that sweep hard-deleted it.
+ * The sweep is removed, and a thread now belongs to its parent SEAT: it is listed
+ * under the seat whatever became of the holder it was copied from. Pulling it into
+ * the archive with a retired holder would drop a live seat's thread out of that list.
+ * A thread therefore ages out on its OWN record (the closed / stale tiers), and a
+ * holder with an un-archivable thread is no longer held back by the reverse guard.
+ * Skew-safe: an older acpx-ui's sweep spares a thread whose anchor sits in the archive.
+ */
+export function isRetentionCompanion(record: ArchiveRecordView): boolean {
+  return record.kind === "subagent" && !record.isByway;
+}
+
 function buildCompanionGraph(all: readonly ArchiveCandidate[]): Map<string, string[]> {
   const companionsOf = new Map<string, string[]>();
   for (const candidate of all) {
     const record = candidate.record;
-    if (!record || (!record.isByway && record.kind !== "subagent")) {
+    if (!record || !isRetentionCompanion(record)) {
       continue;
     }
     const anchor = anchorIdFor(record);
@@ -842,9 +859,8 @@ function buildCompanionGraph(all: readonly ArchiveCandidate[]): Map<string, stri
  * Pull a selected id's companions into the same run, to a FIXED POINT — a
  * companion may itself have companions.
  *
- * acpx-ui's `sweepOrphanByways` HARD-DELETES a byway record (record + JSONL) whose
- * anchor no longer resolves on disk, on a 5-minute cadence with NO watermark. So a
- * byway left behind by a moved parent is destroyed, not merely orphaned.
+ * Subagents only (`isRetentionCompanion`): by-the-way threads stopped being
+ * companions when acpx-ui dropped its orphan sweep (brick 16732ad6).
  */
 function closeCompanions(state: PlanState, input: PlanInput): void {
   for (let changed = true; changed; ) {
@@ -885,11 +901,10 @@ function pullCompanion(
     block(state, companion, staticBlocker.blocker, staticBlocker.detail);
     return false;
   }
-  const kind = companion.record?.kind === "subagent" ? "subagent" : "byway";
   state.selected.set(companionId, {
     candidate: companion,
     tier: "companion",
-    reason: `${kind}-of-${anchorId.slice(0, 8)}`,
+    reason: `subagent-of-${anchorId.slice(0, 8)}`,
   });
   return true;
 }
@@ -1003,11 +1018,11 @@ function aggregateOrphans(selected: readonly PlannedArchive[]): {
  * ⚠️ COMPANIONS MOVE BEFORE THEIR ANCHORS, AND THIS ORDERING IS THE PRIMARY
  * DEFENCE, NOT `--repair`.
  *
- * The anchor's DEPARTURE is what arms acpx-ui's 5-minute `sweepOrphanByways`
- * hard-delete, so it must be the last event in the group. A crash between a
- * companion and its anchor then leaves the companion already in the archive beside
- * nothing — inert and restorable. The reverse order leaves a byway hot with a
- * vanished anchor, and it is destroyed within five minutes. `--repair` widens the
+ * The anchor leaves last, so a crash between a companion and its anchor leaves the
+ * companion already in the archive beside nothing — inert and restorable. (This
+ * once defended byways against acpx-ui's orphan sweep; byways are no longer
+ * companions and that sweep is gone — brick 16732ad6. The ordering still keeps a
+ * subagent from sitting hot beside an archived parent.) `--repair` widens the
  * window; only the ordering closes it.
  */
 export function orderForApply(
