@@ -530,7 +530,14 @@ test("NEGATIVE text (c): marker absent, stale (6 min), future (+60 s) or not fin
       const run = await admitWakeCli(f, id, ["--sender-role", role]);
       assert.equal(run.code, 75, `${label}/${role}`);
       const message = run.json.refusal?.message ?? "";
-      assert.equal(message.split("\n").length, 3, `${label}/${role}: ${message}`);
+      // The blocked-leaf line is about the sender's position, not atrium's capability: a leaf gets
+      // it here too (4 lines); an orchestrator never does (3).
+      assert.equal(
+        message.split("\n").length,
+        role === "leaf" ? 4 : 3,
+        `${label}/${role}: ${message}`,
+      );
+      assert.equal(message.includes(LINE_BLOCKED_LEAF), role === "leaf", `${label}/${role}`);
       assert.doesNotMatch(message, /--final-report/u, `${label}/${role}`);
       assert.deepEqual(run.json.refusal?.finalReport, { offered: false, why: "no-capability" });
     }

@@ -943,7 +943,7 @@ function wakeSentences(
   return [
     wakeNoRoomLine(input, snapshot),
     wakeRetryLine(input, snapshot),
-    ...(offer.offered ? [BLOCKED_LEAF_LINE] : []),
+    ...(input.senderRole === "leaf" ? [BLOCKED_LEAF_LINE] : []),
     ...finalReportLine(offer.why, offer.offered),
   ];
 }
