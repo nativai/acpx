@@ -30,10 +30,27 @@ export function victimFloorBytes(limitBytes: number, g: GovernorConstants): numb
   return Math.max(g.victimFloorBytes, g.victimFloorFraction * limitBytes);
 }
 
-/** R1: governed sessions at or above the process limit. Zombies are not members. */
-export function r1Matches(sessions: Iterable<SessionView>, g: GovernorConstants): SessionView[] {
+/**
+ * §19 D4: R1 (count) applies to every NON-EXEMPT session, governed or not. `outside` sessions are
+ * included — in production every `setsid` from a job-control tool shell double-forks out of sight, so
+ * the escape is the default — but only while owner identification works (the R2-blind rule). Exempt:
+ * PID 1 and the system session (`reason: system`), verified owners (`reason: owner`), and, with
+ * `governTerminals:false`, terminal-placed sessions (handled where R1 acts). Count is evidence; memory
+ * is not — R2's victims stay positive-origin only.
+ */
+export function isR1Eligible(view: SessionView, ownerIdOk: boolean): boolean {
+  const placement = view.record.placement;
+  return placement.governed || (placement.reason === "outside" && ownerIdOk);
+}
+
+/** R1: eligible sessions at or above the process limit. Zombies are not members. */
+export function r1Matches(
+  sessions: Iterable<SessionView>,
+  g: GovernorConstants,
+  ownerIdOk: boolean,
+): SessionView[] {
   return [...sessions].filter(
-    (view) => view.record.placement.governed && view.members.length >= g.maxGroupProcesses,
+    (view) => isR1Eligible(view, ownerIdOk) && view.members.length >= g.maxGroupProcesses,
   );
 }
 

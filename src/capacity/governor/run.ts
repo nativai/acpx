@@ -162,7 +162,10 @@ function boxFields(box: BoxReading): Partial<GovernorEvent> {
 function attributionFields(view: SessionView): Partial<GovernorEvent> {
   const placement = view.record.placement;
   if (!placement.governed) {
-    return { session_kind: "" };
+    // An `outside` session R1 acted on (§19 D4): unplaceable, so unattributed — event only, no seat.
+    return placement.reason === "outside"
+      ? { session_kind: "outside", attribution: "unknown" }
+      : { session_kind: "" };
   }
   const a = placement.attribution;
   return {
@@ -242,7 +245,8 @@ function growthSummary(
   let started = false;
   let grew = false;
   for (const view of sessions.values()) {
-    if (view.record.placement.governed) {
+    const placement = view.record.placement;
+    if (placement.governed || placement.reason === "outside") {
       const key = sessionKey(view);
       counts.set(key, view.members.length);
       const growth = growthOf(prevCounts.get(key) ?? 0, view.members.length, g);
@@ -636,7 +640,7 @@ export class Governor {
       limit: this.settings.limitBytes ?? cgroup.limitBytes,
       psi: cgroup.memoryPressure.fullAvg10,
     };
-    for (const view of r1Matches(sessions.values(), this.g)) {
+    for (const view of r1Matches(sessions.values(), this.g, this.ownerIdentificationWorks())) {
       this.act(view, "fork-storm", nowMs, box);
     }
     this.memoryRule(scan.measured, sessions, nowMs, box);
@@ -828,7 +832,9 @@ export class Governor {
     anonBytes?: number,
   ): void {
     const placement = view.record.placement;
-    if (!placement.governed) {
+    // Governed sessions, and — for R1 only, chosen by r1Matches — `outside` ones (§19 D4). Never an
+    // owner or the system session; the guard re-checks every member before every signal anyway.
+    if (!placement.governed && placement.reason !== "outside") {
       return;
     }
     if (isExemptTerminal(placement, this.g.governTerminals)) {
@@ -1070,10 +1076,13 @@ export class Governor {
    * R2 acts only on a measured scan and only while owner identification works (the argv token is
    * readable, or the lease census is complete); otherwise `r2_blind` and nothing (§4.2).
    */
+  /** The argv token is readable, or the lease census is complete (§4.2; R1 on `outside`, §19 D4). */
+  private ownerIdentificationWorks(): boolean {
+    return this.queueReadable || this.deps.tokenState(this.deps.selfPid) !== "unreadable";
+  }
+
   private r2Blind(measured: boolean, nowMs: number, box: BoxReading): boolean {
-    const ownerIdOk =
-      this.queueReadable || this.deps.tokenState(this.deps.selfPid) !== "unreadable";
-    if (measured && ownerIdOk) {
+    if (measured && this.ownerIdentificationWorks()) {
       return false;
     }
     this.alarm("r2_blind", nowMs, () => ({

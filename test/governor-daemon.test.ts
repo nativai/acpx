@@ -184,6 +184,70 @@ test("terminal session: the interactive shell keeps its own group on the first s
   );
 });
 
+test("§19 D4 committed positive: an OUTSIDE session (setsid -f escape) at ≥ 128 is killed — in-band line, event, no seat message", async (t) => {
+  const box = new FakeBox();
+  t.after(() => box.cleanup());
+  box.standardSystem();
+  box.add({ pid: 4000, ppid: 1, comm: "bash" }); // double-forked out of a tool command: parent PID 1
+  box.addMany(140, { ppid: 4000, pgid: 4001, sid: 4000, comm: "bash" }, 4001);
+  // ...under governTerminals:false too: an escape is unplaceable, so the terminal exemption cannot cover it.
+  const governor = startedGovernor(box, {}, { governTerminals: false });
+  governor.tick();
+  await governor.settle();
+  assert.deepEqual(box.members(4000), []);
+  const killed = box.events().find((e) => e.action === "killed");
+  assert.equal(killed?.session_kind, "outside");
+  assert.equal(killed?.attribution, "unknown");
+  assert.equal(killed?.notify_status, "no_target");
+  assert.deepEqual(box.atriumCalls, []);
+  assert.match(box.stderrOf(4000), /^process-governor: KILLED this command/u);
+});
+
+test("§19 D4 committed negatives: a verified-owner session and the system session at ≥ 128 are NEVER signalled; R1 on outside needs owner identification", async (t) => {
+  const box = new FakeBox();
+  t.after(() => box.cleanup());
+  box.standardSystem();
+  box.owner(100, "sess-big"); // token owner: grows to 143 inside its own session
+  box.addMany(140, { ppid: 102, pgid: 100, sid: 100, comm: "bash" }, 3000);
+  box.add({ pid: 200, ppid: 1, comm: "node" }); // lease-only owner
+  box.lease("sess-lease-200", 200);
+  box.addMany(140, { ppid: 200, pgid: 200, sid: 200, comm: "bash" }, 5000);
+  box.addMany(140, { ppid: 40, pgid: 6, sid: 6, comm: "node" }, 7000); // the system session (atrium's children)
+  const governor = startedGovernor(box);
+  governor.tick();
+  await governor.settle();
+  assert.deepEqual(box.signals, []);
+  assert.equal(
+    box.events().filter((e) => e.action === "killed" || e.action === "would_kill").length,
+    0,
+  );
+
+  // Owner identification broken (queue dir unreadable AND argv unreadable): an outside storm is NOT killed.
+  const blind = new FakeBox();
+  t.after(() => blind.cleanup());
+  blind.standardSystem();
+  blind.add({ pid: 4000, ppid: 1, comm: "bash" });
+  blind.addMany(140, { ppid: 4000, pgid: 4001, sid: 4000, comm: "bash" }, 4001);
+  fs.chmodSync(blind.queue, 0o000);
+  let readable = true;
+  try {
+    fs.readdirSync(blind.queue);
+  } catch {
+    readable = false;
+  }
+  const g2 = startedGovernor(blind, {}, {}, { tokenState: () => "unreadable" });
+  g2.tick();
+  await g2.settle();
+  fs.chmodSync(blind.queue, 0o755);
+  if (readable) {
+    t.diagnostic(
+      "running as a user that bypasses directory permissions: the blind arm is not exercised",
+    );
+    return;
+  }
+  assert.deepEqual(blind.signals, []);
+});
+
 test("R2 line: L − M_oom on both branches of M_oom (512 MiB floor, 5 % of L)", () => {
   const C = CAPACITY_CONSTANTS;
   assert.equal(oomMarginBytes(4 * GiB, C), 512 * MIB);

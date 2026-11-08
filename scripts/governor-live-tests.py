@@ -379,7 +379,57 @@ def n6(gov):
                 sampler_peak=s.peak, survivors_after_1s=survivors, survivors_after_4s=after3, kills=len(killed))
 
 
-TESTS = {"N1": n1, "N2": n2, "N3": n3, "N4": n4, "N5": n5, "N6": n6}
+def sid_counts():
+    out = {}
+    for v in scan().values():
+        if v[3] != "Z":
+            out[v[2]] = out.get(v[2], 0) + 1
+    return out
+
+
+def escape(gov, detach):
+    """TE X3/X3b from a JOB-CONTROL tool shell (`set -m`, production): `setsid` forks because its caller
+    leads a process group, so the storm's session is born under PID 1 => `outside`. §19 D4: R1 still
+    kills it at 128, with an in-band line to its live leader, an event, and no seat message."""
+    before_sids = set(sid_counts())
+    before = len(gov.events())
+    inner = STORM % (DMAX, LEAF_S, STEP)
+    cmd = 'set -m; setsid -f bash -c "$1"; sleep 25' if detach else 'set -m; setsid bash -c "$1" & sleep 25'
+    p = as_tool_command(["bash", "-c", cmd, "x", inner])
+    peaks = {}
+    deadline = time.monotonic() + 40
+    while time.monotonic() < deadline:
+        for sid, n in sid_counts().items():
+            if sid not in before_sids and sid != p.sid:
+                peaks[sid] = max(peaks.get(sid, 0), n)
+        if [e for e in gov.events()[before:] if e.get("action") == "killed"]:
+            break
+        time.sleep(0.05)
+    time.sleep(1.0)
+    storm_sid = max(peaks, key=peaks.get) if peaks else None
+    survivors = len(members(storm_sid)) if storm_sid else None
+    killed = [e for e in gov.events()[before:] if e.get("action") == "killed"]
+    first = killed[0] if killed else {}
+    tool_alive = len(members(p.sid))
+    if storm_sid:
+        end_session(storm_sid)
+    end_session(p.sid)
+    return dict(test="N8" if detach else "N7", pass_=bool(killed) and first.get("session_kind") == "outside"
+                and (first.get("processes") or 10**6) <= 200 and survivors == 0 and tool_alive > 0,
+                kind=first.get("session_kind"), killed_at_processes=first.get("processes"),
+                notify=first.get("notify_status"), harness_peak=peaks.get(storm_sid), survivors_after_1s=survivors,
+                tool_command_untouched=tool_alive > 0)
+
+
+def n7(gov):
+    return escape(gov, detach=False)
+
+
+def n8(gov):
+    return escape(gov, detach=True)
+
+
+TESTS = {"N1": n1, "N2": n2, "N3": n3, "N4": n4, "N5": n5, "N6": n6, "N7": n7, "N8": n8}
 
 
 def main():

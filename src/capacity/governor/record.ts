@@ -42,7 +42,8 @@ export type GovernorEvent = {
   mode: "enforce" | "observe";
   rule: GovernorRule;
   action: GovernorAction;
-  session_kind: SessionKind | "";
+  /** `outside` only for an R1 kill of an unplaceable session (§19 D4). */
+  session_kind: SessionKind | "outside" | "";
   orphaned: boolean | null;
   session_id: string;
   seat_id: string;
