@@ -162,7 +162,7 @@ cmd_seed() { on_control; load; cd "$STACK_ROOT"
 limit_arg() { # limit_arg auto|N|"" -> the --limit-bytes value (auto = the workbench's C now + 1.5 GiB, §10 AC4)
   case "${1:-}" in
     "") echo "" ;;
-    auto) awk -v add=$((GIB * 3 / 2)) '$1=="anon"{a=$2} $1=="kernel"{k=$2} END{printf "%d\n", a+k+add}' /sys/fs/cgroup/memory.stat ;;
+    auto) awk -v add=$((GIB * 3 / 2)) '$1=="anon"{a=$2} $1=="kernel"{k=$2} END{printf "%.0f\n", a+k+add}' /sys/fs/cgroup/memory.stat ;;
     *) [[ "$1" =~ ^[1-9][0-9]*$ ]] || die "--limit-bytes is auto or a byte count"; echo "$1" ;;
   esac; }
 
