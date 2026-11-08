@@ -28,7 +28,11 @@ STEP = os.environ.get("STEP", "0.02")
 LEAF_S = os.environ.get("LEAF_S", "120")
 SLOW_STEP = os.environ.get("SLOW_STEP", "0.2")
 
+# `unset FUNCNEST` INSIDE the storm: acpx exports FUNCNEST=64 into every agent environment (c2af7c83) and
+# workbench-exec forwards it, so without this bash stops the recursion at depth 64 — below R1's 128 — and N1
+# false-FAILs from any agent seat (TE finding F7). The AC1 prompt does the same. The depth cap is DMAX.
 STORM = r'''
+unset FUNCNEST
 set -m
 f(){ local d=$1; if [ "$d" -ge %d ]; then sleep %s; return; fi; sleep %s; echo x | cat | f $((d+1)); }
 f 0
