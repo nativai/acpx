@@ -10,7 +10,12 @@ import {
 } from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { SpawnLedger, openSpawnLedgerForRecord, type DiskRecord } from "../../spawn-ledger.js";
-import type { SessionAcpxState, SessionListing, SessionMessage, SessionRecord } from "../../types.js";
+import type {
+  SessionAcpxState,
+  SessionListing,
+  SessionMessage,
+  SessionRecord,
+} from "../../types.js";
 import {
   isArchivedFileCorrupt,
   readArchivedFileVerified,
