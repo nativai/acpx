@@ -262,7 +262,9 @@ export class FakeBox {
   ): Governor {
     const merged: CapacityConstants = {
       ...CAPACITY_CONSTANTS,
-      governor: { ...CAPACITY_CONSTANTS.governor, ...constants },
+      // Explicit, not inherited: a row that needs enforce or governed terminals must still prove its
+      // case if the shipped values are ever re-tuned.
+      governor: { ...CAPACITY_CONSTANTS.governor, mode: "enforce", governTerminals: true, ...constants },
     };
     const log = (line: string) => {
       this.logs.push(line);
@@ -303,7 +305,6 @@ export class FakeBox {
       },
       {
         constants: merged,
-        configuredMode: "enforce",
         testMode: false,
         testRig: false,
         box: "devbox.test.invalid",

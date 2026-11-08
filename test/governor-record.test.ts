@@ -212,25 +212,22 @@ test("record: test mode WITHOUT the credential captures the exact JSONEachRow bo
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("args: --enforce, --test-rig and --limit-bytes are REFUSED without ACPX_GOVERNOR_TEST=1; the production start takes none", () => {
-  assert.deepEqual(parseGovernorArgs([], {}), { enforce: false, testRig: false });
-  for (const argv of [["--enforce"], ["--test-rig"], ["--limit-bytes", "100"]]) {
+test("args: --test-rig and --limit-bytes are REFUSED without ACPX_GOVERNOR_TEST=1; the production start takes none; there is no --enforce", () => {
+  assert.deepEqual(parseGovernorArgs([], {}), { testRig: false });
+  for (const argv of [["--test-rig"], ["--limit-bytes", "100"]]) {
     assert.ok("error" in parseGovernorArgs(argv, {}), argv.join(" "));
   }
   const env = { ACPX_GOVERNOR_TEST: "1" };
-  assert.deepEqual(parseGovernorArgs(["--enforce", "--test-rig", "--limit-bytes", "4096"], env), {
-    enforce: true,
+  assert.deepEqual(parseGovernorArgs(["--test-rig", "--limit-bytes", "4096"], env), {
     testRig: true,
     limitBytes: 4096,
   });
-  assert.deepEqual(parseGovernorArgs(["--limit-bytes=8192"], env), {
-    enforce: false,
-    testRig: false,
-    limitBytes: 8192,
-  });
+  assert.deepEqual(parseGovernorArgs(["--limit-bytes=8192"], env), { testRig: false, limitBytes: 8192 });
   assert.ok("error" in parseGovernorArgs(["--limit-bytes", "x"], env));
   assert.ok("error" in parseGovernorArgs(["run"], env), "never a verb");
-  assert.ok("error" in parseGovernorArgs(["--enforce=yes"], env));
+  // The mode is the constant and nothing else (D1 decided; §13.1): no flag can switch it.
+  assert.ok("error" in parseGovernorArgs(["--enforce"], env));
+  assert.ok("error" in parseGovernorArgs(["--observe"], env));
 });
 
 test("notify: the in-band line and the seat message carry rule, counts, comm classes and the remedy — never argv", () => {

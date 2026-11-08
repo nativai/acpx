@@ -38,9 +38,11 @@ export type CapacityConstants = {
 };
 
 /**
- * Daniel's open decision D1 (CONCEPTION 5d7a23b6 §14) is CONFIGURATION, in git: flipping `mode` or
- * `governTerminals` is a one-line commit that ships by box refresh, and the governor restarts itself
- * on the new build (§7.2).
+ * D1 (CONCEPTION 5d7a23b6 §14) is CONFIGURATION, in git. Daniel decided "(a)" on 2026-11-08: enforce
+ * both rules from the first deploy on each box, terminals and ssh logins governed (`decision/
+ * DECISION.md` in the brick). Changing `mode` or `governTerminals` is a one-line commit that ships by
+ * box refresh; the governor restarts itself on the new build (§7.2). `observe` survives only as a
+ * re-tuning value of `mode` (§13.1) — there is no runtime switch.
  */
 export type GovernorConstants = {
   /**

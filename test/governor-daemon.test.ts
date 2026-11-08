@@ -99,7 +99,8 @@ test("U2 — observe mode emits ZERO signals, ZERO in-band lines, ZERO messages 
   // Also an R2 victim: the box is past its emergency line and a governed session holds 2 GiB.
   box.add({ pid: 3000, ppid: 102, comm: "bash", rssKb: 2 * 1024 * 1024 });
   box.memory({ anon: 11.8 * GiB, kernel: 0.1 * GiB, max: 12 * GiB });
-  const governor = startedGovernor(box, { configuredMode: "observe" });
+  // The constant's OTHER value, set explicitly: the shipped value is "enforce" (D1 "(a)").
+  const governor = startedGovernor(box, {}, { mode: "observe" });
   for (let i = 0; i < 5; i += 1) {
     governor.tick();
     box.nowMs += 3000;
@@ -118,8 +119,8 @@ test("U2 — observe mode emits ZERO signals, ZERO in-band lines, ZERO messages 
   assert.equal(would.find((e) => e.rule === "memory-emergency")?.processes, 1);
 });
 
-test("the shipped default is OBSERVE, terminals governed (D1 as configuration)", () => {
-  assert.equal(K.mode, "observe");
+test("the shipped configuration is D1 = (a): ENFORCE, terminals governed (decision/DECISION.md)", () => {
+  assert.equal(K.mode, "enforce");
   assert.equal(K.governTerminals, true);
 });
 

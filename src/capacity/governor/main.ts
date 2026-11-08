@@ -88,7 +88,6 @@ async function main(): Promise<number> {
     },
     {
       constants: CAPACITY_CONSTANTS,
-      configuredMode: args.enforce ? "enforce" : CAPACITY_CONSTANTS.governor.mode,
       testMode,
       testRig: args.testRig,
       limitBytes: args.limitBytes,

@@ -2,7 +2,7 @@
 # governor-rig.sh — the §10 test rig of the runaway process-tree governor (brick 5d7a23b6, CONCEPTION v1.2 §10):
 # a full, isolated acpx + atrium stack (the devn-slot FULL-STACK recipe, /wisdom/Projects/acpx-ui/skills/devn-slot/
 # reference/full-stack.md) running THIS branch's acpx with its own HOME, plus the governor in test mode
-# (ACPX_GOVERNOR_TEST=1 --enforce --test-rig, ACPX_GOVERNOR_ATRIUM_URL = the rig's atrium) — ALL IN THE CALLER'S OWN
+# (ACPX_GOVERNOR_TEST=1 --test-rig, ACPX_GOVERNOR_ATRIUM_URL = the rig's atrium) — ALL IN THE CALLER'S OWN
 # WORKBENCH, so the storms, the governor and the harness's /proc sampler share one pod.
 #
 # Run every command from your OWN agent session's shell on the control plane (never through ssh-remote: the
@@ -192,7 +192,7 @@ wb_governor() { on_workbench; load
   tail -3 "$R/logs/governor.log" || true; }
 
 wb_launcher() { # runs as its own session leader: the rig's SYSTEM session (never governed)
-  load; local limit=${1:-} args=(--enforce --test-rig)
+  load; local limit=${1:-} args=(--test-rig)
   [ -n "$limit" ] && args+=(--limit-bytes "$limit")
   echo $$ > "$RUN/governor-launcher.pid"
   cd /

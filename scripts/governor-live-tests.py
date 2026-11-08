@@ -143,7 +143,7 @@ class Governor:
         env = dict(os.environ, ACPX_GOVERNOR_TEST="1", ACPX_STATE_HOME=home,
                    ACPX_GOVERNOR_ATRIUM_URL="http://127.0.0.1:9")
         self.log = open(os.path.join(home, "governor.log"), "w")
-        self.proc = subprocess.Popen(["node", "--max-old-space-size=64", DIST_MAIN, "--enforce", "--test-rig"],
+        self.proc = subprocess.Popen(["node", "--max-old-space-size=64", DIST_MAIN, "--test-rig"],
                                      cwd="/", env=env, stdout=self.log, stderr=subprocess.STDOUT,
                                      start_new_session=True)
         hb = os.path.join(home, ".acpx", "governor", "heartbeat.json")

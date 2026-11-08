@@ -108,8 +108,8 @@ export type GovernorDeps = {
 };
 
 export type GovernorSettings = {
+  /** `constants.governor.mode` is the ONLY source of the mode: no flag, no runtime switch (§13.1). */
   readonly constants: CapacityConstants;
-  readonly configuredMode: GovernorMode;
   /** `ACPX_GOVERNOR_TEST=1`: every event is stamped `test`, every ClickHouse row a fixture box. */
   readonly testMode: boolean;
   /** `--test-rig`: the governor's own session is the system session, whatever PID 1's is. */
@@ -325,7 +325,7 @@ export class Governor {
   }
 
   get mode(): GovernorMode {
-    return this.observeReason ? "observe" : this.settings.configuredMode;
+    return this.observeReason ? "observe" : this.g.mode;
   }
 
   // -------------------------------------------------------------------------
@@ -388,7 +388,7 @@ export class Governor {
     this.recordPendingPeaks(this.deps.now());
     const flags = `${this.settings.testMode ? " test=true" : ""}${this.settings.testRig ? " test-rig" : ""}`;
     this.deps.log(
-      `process-governor: started pid=${this.deps.selfPid} mode=${this.mode} configured=${this.settings.configuredMode} governTerminals=${this.g.governTerminals} systemSid=${this.systemSid}${flags}`,
+      `process-governor: started pid=${this.deps.selfPid} mode=${this.mode} configured=${this.g.mode} governTerminals=${this.g.governTerminals} systemSid=${this.systemSid}${flags}`,
     );
   }
 
@@ -1175,7 +1175,7 @@ export class Governor {
       scanMs: this.lastScanMs,
       intervalMs: this.lastIntervalMs,
       mode: this.mode,
-      configuredMode: this.settings.configuredMode,
+      configuredMode: this.g.mode,
       observeReason: this.observeReason,
       governTerminals: this.g.governTerminals,
       test: this.settings.testMode,
@@ -1237,14 +1237,14 @@ export class Governor {
 // ---------------------------------------------------------------------------
 
 export type GovernorArgs = {
-  readonly enforce: boolean;
   readonly testRig: boolean;
   readonly limitBytes?: number;
 };
 
 /**
- * The production entry takes NO argv. `--enforce`, `--test-rig` and `--limit-bytes <n>` exist for the
- * rig (§10) and are refused unless `ACPX_GOVERNOR_TEST=1`; with it, every event is stamped `test`.
+ * The production entry takes NO argv. `--test-rig` and `--limit-bytes <n>` exist for the rig (§10) and
+ * are refused unless `ACPX_GOVERNOR_TEST=1`; with it, every event is stamped `test`. There is no
+ * `--enforce`: the mode is `CAPACITY_CONSTANTS.governor.mode`, nothing else (D1 decided "(a)").
  */
 export function parseGovernorArgs(
   argv: readonly string[],
@@ -1253,10 +1253,7 @@ export function parseGovernorArgs(
   if (argv.length > 0 && env.ACPX_GOVERNOR_TEST !== "1") {
     return { error: `${argv[0]} is a test-only flag: refused without ACPX_GOVERNOR_TEST=1` };
   }
-  const args: { enforce: boolean; testRig: boolean; limitBytes?: number } = {
-    enforce: false,
-    testRig: false,
-  };
+  const args: { testRig: boolean; limitBytes?: number } = { testRig: false };
   for (let i = 0; i < argv.length; i += 1) {
     const [name, inline] = argv[i].split("=", 2);
     const value = name === "--limit-bytes" && inline === undefined ? argv[(i += 1)] : inline;
@@ -1269,7 +1266,7 @@ export function parseGovernorArgs(
 }
 
 function applyArg(
-  args: { enforce: boolean; testRig: boolean; limitBytes?: number },
+  args: { testRig: boolean; limitBytes?: number },
   name: string,
   value: string | undefined,
 ): string | undefined {
@@ -1280,13 +1277,9 @@ function applyArg(
     args.limitBytes = Number(value);
     return undefined;
   }
-  if (value !== undefined || (name !== "--enforce" && name !== "--test-rig")) {
+  if (value !== undefined || name !== "--test-rig") {
     return `unknown argument ${name}`;
   }
-  if (name === "--enforce") {
-    args.enforce = true;
-  } else {
-    args.testRig = true;
-  }
+  args.testRig = true;
   return undefined;
 }
