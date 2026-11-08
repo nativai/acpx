@@ -3,6 +3,8 @@ import test from "node:test";
 import { projectArchiveRecord } from "../src/session/archive/record-view.js";
 import {
   anchorIdFor,
+  buildArchivePlan,
+  isRetentionCompanion,
   EMPTY_MANIFEST_VIEW,
   orderForApply,
   resolveBoundaries,
@@ -473,4 +475,86 @@ test("companion ordering terminates on a cycle rather than recursing forever", (
   );
   assert.equal(ordered.length, 2);
   assert.deepEqual(ordered.map((entry) => entry.candidate.id).toSorted(), ["a", "b"]);
+});
+
+// ── brick 16732ad6: a by-the-way thread is NOT a retention companion ─────────────
+//
+// It belongs to its parent SEAT and is listed there whatever became of the holder it was
+// copied from; acpx-ui no longer deletes a thread whose source is gone. So archiving a
+// retired holder must leave its threads hot, and a thread that cannot move must not hold
+// the holder back. Subagents keep both rules — the controls below prove the machinery runs.
+
+const HOLDER = "11111111-0000-4000-8000-000000000001";
+const THREAD = "11111111-0000-4000-8000-000000000002";
+const SUBAGENT = "11111111-0000-4000-8000-000000000003";
+const OLD = { ".json": 60 * DAY, ".messages.ndjson": 60 * DAY };
+
+function retiredHolder() {
+  return candidate({ id: HOLDER, record: { closed: true, closed_at: iso(30 * DAY) }, files: OLD });
+}
+function thread(files: Record<string, number>) {
+  return candidate({
+    id: THREAD,
+    record: {
+      kind: "session",
+      closed: false,
+      last_used_at: iso(1 * DAY),
+      metadata: { byway: "1", byway_parent: HOLDER },
+      forked_from_session_id: HOLDER,
+      parent_session_id: HOLDER,
+    },
+    files,
+  });
+}
+function subagent(files: Record<string, number>) {
+  return candidate({
+    id: SUBAGENT,
+    record: { kind: "subagent", closed: true, closed_at: iso(1 * DAY), parent_session_id: HOLDER },
+    files,
+  });
+}
+async function plan(candidates: ArchiveCandidate[]) {
+  return await buildArchivePlan({
+    candidates,
+    orphans: [],
+    ignoredFiles: [],
+    boundaries: BOUNDARIES,
+    includeOrphans: false,
+    liveness: { primary: undefined, wakeups: { status: "absent" } },
+  });
+}
+const ids = (p: Awaited<ReturnType<typeof plan>>) =>
+  p.selected.map((x) => x.candidate.id).toSorted();
+
+test("16732ad6: only a subagent is a retention companion — a by-the-way thread is not", () => {
+  assert.equal(isRetentionCompanion(thread(OLD).record!), false);
+  assert.equal(isRetentionCompanion(subagent(OLD).record!), true);
+});
+
+test("16732ad6: archiving a retired holder leaves its by-the-way thread hot; its subagent still moves with it", async () => {
+  const p = await plan([retiredHolder(), thread(OLD), subagent(OLD)]);
+  assert.deepEqual(
+    ids(p),
+    [HOLDER, SUBAGENT].toSorted(),
+    "the thread was pulled into the archive with its holder",
+  );
+  assert.equal(
+    p.selected.find((x) => x.candidate.id === SUBAGENT)?.tier,
+    "companion",
+    "control: the subagent rides as a companion",
+  );
+});
+
+test("16732ad6: a thread that cannot move no longer holds its holder back", async () => {
+  // touched within the quiet window ⇒ `touched-recently`; before, the reverse guard dropped the holder for it.
+  const p = await plan([retiredHolder(), thread({ ".json": 0, ".messages.ndjson": 0 })]);
+  assert.deepEqual(ids(p), [HOLDER]);
+  assert.deepEqual(p.droppedAnchors, []);
+});
+
+test("16732ad6 control: a SUBAGENT that cannot move still drops its anchor (the reverse guard is intact)", async () => {
+  const p = await plan([retiredHolder(), subagent({ ".json": 0 })]);
+  assert.deepEqual(ids(p), []);
+  assert.equal(p.droppedAnchors.length, 1);
+  assert.equal(p.droppedAnchors[0].companionId, SUBAGENT);
 });
