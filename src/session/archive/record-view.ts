@@ -63,8 +63,9 @@ export type ArchiveRecordView = {
   pidIdentity: RecordPidIdentity | undefined;
   parentSessionId: string | undefined;
   /**
-   * `$.metadata.byway_parent` — checked FIRST when resolving a byway's anchor,
-   * per acpx-ui's `server/byway.ts` `isOrphanByway`, which is the source of truth.
+   * `$.metadata.byway_parent` — checked FIRST when resolving a byway's anchor
+   * (`anchorIdFor`). Provenance only since brick 16732ad6: a byway is no longer a
+   * retention companion, and acpx-ui no longer deletes one whose anchor is gone.
    */
   bywayParent: string | undefined;
   forkedFromSessionId: string | undefined;
@@ -111,11 +112,10 @@ function metadataString(
 }
 
 /**
- * ⚠️ A SUPERSET ON THE FLAG IS SAFE; A SUBSET IS NOT. acpx-ui's `isOrphanByway`
- * is what hard-deletes a byway whose anchor vanished, so failing to recognise a
- * record AS a byway is the direction that loses data — it drops out of companion
- * closure and is destroyed within five minutes of its anchor leaving. Recognising
- * a non-byway as one merely moves it with its parent, which is harmless.
+ * A superset on the flag (kind OR metadata). Until brick 16732ad6 a missed byway
+ * lost data (acpx-ui's orphan sweep deleted it once its anchor left); that sweep is
+ * gone and byways are no longer retention companions (`isRetentionCompanion`), so
+ * the flag now only keeps a byway-shaped record out of the subagent companion rule.
  */
 function isBywayRecord(
   record: Record<string, unknown>,
