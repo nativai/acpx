@@ -203,6 +203,27 @@ function startFacts(
     : { firstSeenAt: clickhouseTime(view.record.firstSeenMs) };
 }
 
+/** Linux `RESERVED_PIDS`: after a wrap the kernel allocates from 300 again (`kernel/pid.c`). */
+const RESERVED_PIDS = 300;
+const DEFAULT_PID_MAX = 4_194_304;
+
+/** `/proc/loadavg`'s last field: the last pid allocated in the READER's pid namespace. */
+export function parseLastPid(loadavg: string): number | undefined {
+  const last = loadavg.trim().split(/\s+/u).at(-1);
+  return last !== undefined && /^\d+$/u.test(last) ? Number(last) : undefined;
+}
+
+/**
+ * Pids allocated between two reads of the last pid. Allocation is cyclic: after `pidMax − 1` the kernel
+ * wraps to `RESERVED_PIDS`, so a smaller current value means a wrap (§19 D3).
+ */
+export function pidsAllocated(previous: number, current: number, pidMax: number): number {
+  if (current >= previous) {
+    return current - previous;
+  }
+  return pidMax - 1 - previous + Math.max(1, current - RESERVED_PIDS + 1);
+}
+
 /** Fast-mode trigger (§4.2): `start` on a jump of ≥ 16 or a first crossing of 32; `grew` on any rise. */
 function growthOf(prev: number, count: number, g: GovernorConstants): "none" | "grew" | "start" {
   if (count <= prev) {
@@ -256,6 +277,15 @@ function readBootTimeMs(procRoot: string): number | undefined {
   try {
     const match = /^btime\s+(\d+)$/mu.exec(fs.readFileSync(path.join(procRoot, "stat"), "utf8"));
     return match ? Number(match[1]) * 1000 : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readPidMax(procRoot: string): number | undefined {
+  try {
+    const raw = fs.readFileSync(path.join(procRoot, "sys", "kernel", "pid_max"), "utf8").trim();
+    return /^\d+$/u.test(raw) ? Number(raw) : undefined;
   } catch {
     return undefined;
   }
@@ -399,6 +429,8 @@ export class Governor {
   private resume(): void {
     this.applyNice();
     this.bootTimeMs = readBootTimeMs(this.deps.procRoot);
+    this.pidMax = readPidMax(this.deps.procRoot) ?? DEFAULT_PID_MAX;
+    this.lastPid = this.readLastPid();
     if (this.state.stopsInFlight.length > 0) {
       this.finishStopsInFlight();
     }
@@ -680,6 +712,18 @@ export class Governor {
     return clickhouseTime(this.bootTimeMs + Number(ticks) * (1000 / USER_HZ));
   }
 
+  /**
+   * ⚠️ An R1 KILL measures no memory before the sweep: Σ status over a 1,500-member storm is ~1,500 file
+   * reads between detection and the first signal (measured: 176 ms from trigger to sweep in a workbench),
+   * and a storm grows meanwhile. Count is the evidence for R1; its event carries `anon_bytes: null` (not
+   * measured). Every other event still measures it.
+   */
+  private anonBefore(view: SessionView, rule: GovernorRule, action: GovernorAction): number | null {
+    return rule === "fork-storm" && action === "killed"
+      ? null
+      : sessionAnonBytes(view, this.deps.readStatus);
+  }
+
   /** Where the in-band line goes: the live leader, else the oldest surviving member (§19 D2). */
   private inBandTarget(view: SessionView): GovProc | undefined {
     if (view.leader) {
@@ -706,7 +750,7 @@ export class Governor {
       orphaned: view.orphaned,
       processes: view.members.length,
       threads: view.threads,
-      anon_bytes: anonBytes ?? sessionAnonBytes(view, this.deps.readStatus),
+      anon_bytes: anonBytes ?? this.anonBefore(view, rule, action),
       comm_top: commTop(view.members),
       started_at: this.startedAt(view),
     };
@@ -1271,6 +1315,35 @@ export class Governor {
   }
 
   private lastSeenSignature: string | undefined;
+  private lastPid: number | undefined;
+  private pidMax = DEFAULT_PID_MAX;
+
+  private readLastPid(): number | undefined {
+    try {
+      return parseLastPid(fs.readFileSync(path.join(this.deps.procRoot, "loadavg"), "utf8"));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * §19 D3, called every `pidWatchIntervalMs` between scans (~31 µs a read): true when at least
+   * `pidWatchTrigger` pids were allocated since the previous call — the caller then scans AT ONCE, and
+   * fast mode starts. A doubling bomb no longer gets a whole idle interval.
+   */
+  pidWatch(): boolean {
+    const current = this.readLastPid();
+    const previous = this.lastPid;
+    this.lastPid = current;
+    if (current === undefined || previous === undefined) {
+      return false;
+    }
+    if (pidsAllocated(previous, current, this.pidMax) < this.g.pidWatchTrigger) {
+      return false;
+    }
+    this.fastUntilMs = this.deps.now() + this.g.fastHoldMs;
+    return true;
+  }
 
   /** The entry file differs from the one this process started from, unchanged for 10 s. */
   private newBuildStable(nowMs: number): boolean {

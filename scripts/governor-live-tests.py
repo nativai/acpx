@@ -346,7 +346,40 @@ def n5(gov):
                 kill_events=len(killed))
 
 
-TESTS = {"N1": n1, "N2": n2, "N3": n3, "N4": n4, "N5": n5}
+# TE's X2: the classic `&` binary fork bomb, depth-capped at 9 (<= 1,023 shells + 512 leaf sleeps). A
+# doubling bomb used to finish inside one idle 1 s interval (killed at 1,535 = the whole capped tree);
+# with the §19 D3 pid watcher it must die at <= 256.
+BOMB = 'unset FUNCNEST; b(){ if [ "$1" -ge 9 ]; then sleep 30; return; fi; b $(($1+1)) & b $(($1+1)) & wait; }; b 0'
+
+
+def n6(gov):
+    """X2: a depth-capped `&` doubling bomb is killed at <= 256 processes (§19 D3), none left."""
+    before = len(gov.events())
+    # NICE_STORM=19 emulates production's priority gap in a workbench (no CAP_SYS_NICE there, so the
+    # governor runs at nice 0): CFS weight nice 0 / nice 19 = 1024/15 ≈ 68×, production nice −20 / 0 =
+    # 88761/1024 ≈ 87×. Reported in every row; 0 = no emulation.
+    nice = int(os.environ.get("NICE_STORM", "0"))
+    p = as_tool_command(["nice", "-n", str(nice), "bash", "-c", BOMB])
+    sid = p.sid
+    s = Sampler(sid)
+    s.start()
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and not [e for e in gov.events()[before:] if e.get("action") == "killed"]:
+        time.sleep(0.05)
+    time.sleep(1.0)
+    s.running = False
+    killed = [e for e in gov.events()[before:] if e.get("action") == "killed"]
+    survivors = len(members(sid))
+    time.sleep(3)
+    after3 = len(members(sid))
+    end_session(sid)
+    first = killed[0] if killed else {}
+    return dict(test="N6", nice_storm=nice, pass_=bool(killed) and (first.get("processes") or 10**6) <= 256 and survivors == 0 and after3 == 0,
+                killed_at_processes=first.get("processes"), rounds=first.get("rounds"), kill_ms=first.get("kill_ms"),
+                sampler_peak=s.peak, survivors_after_1s=survivors, survivors_after_4s=after3, kills=len(killed))
+
+
+TESTS = {"N1": n1, "N2": n2, "N3": n3, "N4": n4, "N5": n5, "N6": n6}
 
 
 def main():

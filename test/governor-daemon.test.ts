@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { CAPACITY_CONSTANTS, MIB } from "../src/capacity/constants.js";
 import { emergencyLineBytes, oomMarginBytes } from "../src/capacity/governor/rules.js";
+import { parseLastPid, pidsAllocated } from "../src/capacity/governor/run.js";
 import { FakeBox, GiB, SECRET } from "./governor-fixtures.js";
 
 // brick 5d7a23b6 — the governor daemon end to end on fixture boxes: R1, R2, the D1 configuration
@@ -85,6 +86,11 @@ test("R1 kill: in-band line on the leader's fd 2 only, seat message, events.ndjs
   assert.equal(killed[0].seat_id, "seat-storm-1");
   assert.equal(killed[0].processes, 200);
   assert.equal(killed[0].survivors, 0);
+  assert.equal(
+    killed[0].anon_bytes,
+    null,
+    "an R1 kill reads no status before the sweep (§19 D3 latency)",
+  );
   assert.equal(killed[0].notify_status, "sent");
   assert.equal(killed[0].notified, true);
   assert.equal(killed[0].mode, "enforce");
@@ -655,6 +661,38 @@ test("fast mode: a governed session growing by ≥ 16 between scans switches to 
   assert.deepEqual(governor.tick(), { nextMs: K.fastScanIntervalMs });
   box.nowMs += 1100;
   assert.deepEqual(governor.tick(), { nextMs: K.scanIntervalMs });
+});
+
+test("§19 D3 trigger arithmetic: last pid from /proc/loadavg, pids allocated incl. the wrap at pid_max", () => {
+  assert.equal(parseLastPid("0.08 0.12 0.10 1/617 777300\n"), 777300);
+  assert.equal(parseLastPid("garbage"), undefined);
+  assert.equal(pidsAllocated(777300, 777300, 4_194_304), 0);
+  assert.equal(pidsAllocated(777300, 777316, 4_194_304), 16);
+  // Wrap: the kernel allocates up to pid_max − 1, then from RESERVED_PIDS (300) again.
+  assert.equal(pidsAllocated(4_194_300, 4_194_303, 4_194_304), 3);
+  assert.equal(pidsAllocated(4_194_300, 300, 4_194_304), 4, "…4194301, 4194302, 4194303, 300");
+  assert.equal(pidsAllocated(4_194_300, 311, 4_194_304), 15);
+  assert.equal(pidsAllocated(4_194_300, 312, 4_194_304), 16);
+  assert.equal(pidsAllocated(32_760, 310, 32_768), 18, "a small pid_max wraps the same way");
+});
+
+test("§19 D3 pid watcher: < 16 new pids per tick is quiet; ≥ 16 asks for a scan NOW and starts fast mode", (t) => {
+  const box = stormBox(t, 2);
+  const loadavg = path.join(box.proc, "loadavg");
+  fs.mkdirSync(path.join(box.proc, "sys", "kernel"), { recursive: true });
+  fs.writeFileSync(path.join(box.proc, "sys", "kernel", "pid_max"), "32768\n");
+  fs.writeFileSync(loadavg, "0.1 0.1 0.1 1/100 32700\n");
+  const governor = startedGovernor(box);
+  assert.deepEqual(governor.tick(), { nextMs: K.scanIntervalMs });
+  fs.writeFileSync(loadavg, "0.1 0.1 0.1 1/100 32715\n");
+  assert.equal(governor.pidWatch(), false, "15 pids: idle noise");
+  fs.writeFileSync(loadavg, "0.1 0.1 0.1 1/100 32731\n");
+  assert.equal(governor.pidWatch(), true, "16 pids: scan now");
+  assert.deepEqual(governor.tick(), { nextMs: K.fastScanIntervalMs }, "and fast mode");
+  fs.writeFileSync(loadavg, "0.1 0.1 0.1 1/100 320\n"); // 32731 → wrap → 320: 36 + 21 = 57 pids
+  assert.equal(governor.pidWatch(), true, "a wrap is counted, not read as a negative");
+  fs.writeFileSync(loadavg, "0.1 0.1 0.1 1/100 321\n");
+  assert.equal(governor.pidWatch(), false);
 });
 
 test("self-restart: a changed entry file, stable for 10 s, makes the governor exit 0 between sweeps", (t) => {

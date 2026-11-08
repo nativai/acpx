@@ -65,6 +65,13 @@ export type GovernorConstants = {
   /** …or first crosses this size, and lasts until no session has grown for `fastHoldMs`. */
   readonly fastSizeProcesses: number;
   readonly fastHoldMs: number;
+  /**
+   * §19 D3 — between scans, every `pidWatchIntervalMs` the governor reads the last pid allocated in its
+   * own pid namespace (`/proc/loadavg`, last field); `pidWatchTrigger` or more pids since the previous
+   * read force a scan at once and fast mode. An idle devbox allocates ~1 pid per 50 ms tick.
+   */
+  readonly pidWatchIntervalMs: number;
+  readonly pidWatchTrigger: number;
   /** R2's victim must free at least `max(victimFloorBytes, victimFloorFraction × L)`. */
   readonly victimFloorBytes: number;
   readonly victimFloorFraction: number;
@@ -107,6 +114,8 @@ export const CAPACITY_CONSTANTS: CapacityConstants = {
     fastGrowthProcesses: 16,
     fastSizeProcesses: 32,
     fastHoldMs: 5000,
+    pidWatchIntervalMs: 50,
+    pidWatchTrigger: 16,
     victimFloorBytes: 256 * MIB,
     victimFloorFraction: 0.025,
     emergencyKillSpacingMs: 2000,

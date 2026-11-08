@@ -111,16 +111,30 @@ async function main(): Promise<number> {
     return code;
   };
   return new Promise((resolve) => {
+    let timer: NodeJS.Timeout | undefined;
+    let done = false;
+    const end = (code: number): void => {
+      done = true;
+      clearTimeout(timer);
+      clearInterval(watcher);
+      void finish(code).then(resolve);
+    };
+    // One scan; the next is scheduled by the cadence — or brought forward by the pid watcher below.
+    // Both run on this one thread, so a scan never overlaps another.
     const loop = (): void => {
+      clearTimeout(timer);
+      if (done) {
+        return;
+      }
       if (stopping) {
-        void finish(0).then(resolve);
+        end(0);
         return;
       }
       let next = CAPACITY_CONSTANTS.governor.scanIntervalMs;
       try {
         const outcome = governor.tick();
         if ("exitCode" in outcome) {
-          void finish(outcome.exitCode).then(resolve);
+          end(outcome.exitCode);
           return;
         }
         next = outcome.nextMs;
@@ -129,8 +143,14 @@ async function main(): Promise<number> {
           `process-governor: scan failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
-      setTimeout(loop, next);
+      timer = setTimeout(loop, next);
     };
+    // §19 D3: ≥ pidWatchTrigger pids allocated since the last 50 ms tick ⇒ scan NOW (and fast mode).
+    const watcher = setInterval(() => {
+      if (!done && governor.pidWatch()) {
+        loop();
+      }
+    }, CAPACITY_CONSTANTS.governor.pidWatchIntervalMs);
     loop();
   });
 }
