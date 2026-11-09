@@ -102,6 +102,8 @@ export type QueueOwnerRecord = {
   processIdentity?: QueueOwnerProcessIdentity;
   /** Pod name of the writer. Diagnostics only — no decision reads it. */
   host?: string;
+  /** Rollback guard, written never read: see {@link SETTINGS_REBIND_MARKER}. */
+  settingsRebind?: 1;
 };
 
 export type QueueOwnerLease = {
@@ -112,6 +114,7 @@ export type QueueOwnerLease = {
   ownerGeneration: number;
   processIdentity?: QueueOwnerProcessIdentity;
   host?: string;
+  settingsRebind?: 1;
 };
 
 export type QueueOwnerStatus = {
@@ -243,8 +246,21 @@ function parseQueueOwnerRecord(raw: unknown): QueueOwnerRecord | null {
     queueDepth: record.queueDepth,
     ...(processIdentity ? { processIdentity } : {}),
     ...(typeof record.host === "string" ? { host: record.host } : {}),
+    ...(record.settingsRebind === 1 ? { settingsRebind: 1 as const } : {}),
   };
 }
+
+/**
+ * ROLLBACK GUARD — WRITTEN, NEVER READ. Nothing in this build branches on it (the settings verbs
+ * never stop a live owner any more, so no build-time distinction is left to make). It stays on every
+ * new lease for one more release because production `main` 5c21f164 still READS it: that build's
+ * `set` recycles any owner whose lease lacks the marker, and a recycle kills a dequeued or starting
+ * prompt (the 6e27669f bug). A rollback, or a mixed-build window, would bring that back for owners
+ * this build spawned. Removal: https://atrium.devbox.nativai.de/?brick=c36e09c3
+ * ⚠️ DO NOT "CLEAN UP" THIS UNUSED-LOOKING CONSTANT — test/settings-rebind.test.ts (NA7) fails if a
+ * lease this build writes lacks it.
+ */
+export const SETTINGS_REBIND_MARKER = 1 as const;
 
 function hasValidQueueOwnerRecordFields(record: Record<string, unknown>): record is Record<
   string,
@@ -865,6 +881,7 @@ function leasePayload(lease: QueueOwnerLease, heartbeatAt: string, queueDepth: n
       queueDepth: Math.max(0, Math.round(queueDepth)),
       ...(lease.processIdentity ? { processIdentity: lease.processIdentity } : {}),
       ...(lease.host ? { host: lease.host } : {}),
+      ...(lease.settingsRebind ? { settingsRebind: lease.settingsRebind } : {}),
     },
     null,
     2,
@@ -917,6 +934,7 @@ async function acquireUnderGuard(
     ownerGeneration: createOwnerGeneration(),
     ...ownLeaseIdentity(),
     host: processHostName(),
+    settingsRebind: SETTINGS_REBIND_MARKER,
   };
   // Exclusive hardlink acquire (port of 92cd5f8d): the lease never exists without its content.
   if (await tryCreateLockFile(lease.lockPath, leasePayload(lease, createdAt, 0))) {

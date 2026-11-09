@@ -225,7 +225,8 @@ const OWNER_REBINDS_NEXT_TURN: OwnerRecycle = { ownerRestarted: false, ownerRebi
  * Only the NO-LEASE case (the owner has already gone) goes through `recycleLiveOwner`, so that
  * result keeps its JSON (`no-owner` → `ownerRestarted:true`). Any lease means a live owner of this
  * build or later: the pre-fix owners that did not rebind are gone from the fleet (brick 1281e50e
- * removed the capability marker that told them apart). Rows NA1/NA2 in test/settings-rebind.test.ts.
+ * removed the branch that told them apart; the lease marker is still written, never read).
+ * Rows NA1/NA2 in test/settings-rebind.test.ts.
  */
 export async function bindSettingsChange(sessionId: string): Promise<OwnerRecycle> {
   if (await readQueueOwnerRecord(sessionId)) {
@@ -617,11 +618,11 @@ export async function setSessionAutoFailover(
  * ⚠️ THIS SETTER DELIBERATELY BREAKS THE FAMILY PATTERN, in one direction only:
  * **it does not refuse while a turn is in flight.** Every sibling above throws
  * `ConfigOptionTurnInFlightError` there. Here the write is ACCEPTED at any time
- * and only the RECYCLE is deferred:
+ * and only the BINDING is deferred:
  *
- *   validate → persist → idle?          → recycle now
- *                      → turn in flight → PENDING; the owner recycles itself at
- *                                         the turn boundary (or on its idle check)
+ *   validate → persist → owner alive?   → PENDING; the owner rebinds its client
+ *                                         at its next turn start (6e27669f)
+ *                      → no owner       → nothing to bind; the next spawn reads it
  *
  * Why accepting mid-turn is safe here when it would not be for a live-applied
  * option: the forbidden state this feature is designed around is *the live
@@ -633,21 +634,16 @@ export async function setSessionAutoFailover(
  * `pending` bounded by the current turn. Turns routinely run for minutes; the
  * style is consumed only when the next query is built.
  *
- * ⚠️ THE QUEUED-BEHIND REFUSAL STAYS. It is a DIFFERENT hazard: an owner recycle
- * discards the owner's IN-MEMORY prompt queue (acpx has no persisted prompt
- * queue — the owner's whole on-disk footprint is a `.lock` and a `.sock`), so a
- * prompt already handed to the owner and waiting behind the active turn can be
- * dropped. The active turn is protected by deferring the recycle; work queued
- * behind it is not. Refusing converts a silent prompt-drop into a visible
- * "try again when idle". This exposure is pre-existing and shared with `set
- * effort` / `subscription` / `profile` / `auto-failover` — tracked as
- * https://acpx.devbox.nativai.de/?brick=47efa4ee; fixing it for the whole family
- * is out of scope here.
+ * ⚠️ THERE IS NO QUEUED-BEHIND REFUSAL ANY MORE, and none should come back. The owner
+ * is never stopped by this setter (the next turn rebinds it in place), so a prompt
+ * waiting behind the active turn cannot be dropped by it. The refusal existed only
+ * for a pre-fix owner's recycle and was removed with it (brick 1281e50e); the
+ * committed row is NA5 in test/settings-rebind.test.ts.
  *
  * A second change while one is pending is LAST-WRITE-WINS, with no conflict
  * logic, because `pending` is a comparison of two values and not a queue of
- * intents: set B then C → the recycle builds with C. And setting the style back
- * to what is already applied makes `pending` false again, so no recycle fires at
+ * intents: set B then C → the rebind builds with C. And setting the style back
+ * to what is already applied makes `pending` false again, so no rebind fires at
  * all — which is correct, and is the behaviour an intent-queue implementation
  * gets wrong.
  */

@@ -14,6 +14,7 @@
 //   NA4 GA1+GA2  real owner + mock adapter: `set effort` / `set model` → the SAME owner rebinds
 //   NA5 GA1      a pending output style keeps a prompt queued behind the turn alive
 //   NA6 GA1      a record-only set talks to no owner at all
+//   NA7 guard    every lease this build writes carries `settingsRebind:1` (rollback guard, never read)
 import "./install-owner-reaper.js";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -26,7 +27,14 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import type { AcpClient } from "../src/acp/client.js";
 import type { QueueTask } from "../src/cli/queue/ipc-server.js";
-import { isProcessAlive, readQueueOwnerProcessIdentity } from "../src/cli/queue/lease-store.js";
+import {
+  isProcessAlive,
+  readQueueOwnerProcessIdentity,
+  readQueueOwnerRecord,
+  refreshQueueOwnerLease,
+  releaseQueueOwnerLease,
+  tryAcquireQueueOwnerLease,
+} from "../src/cli/queue/lease-store.js";
 import { isIdleDrainActivity } from "../src/cli/session/queue-owner-runtime.js";
 import { applyQueuedTaskSubscriptionLockPolicy } from "../src/cli/session/runtime.js";
 import {
@@ -92,15 +100,15 @@ async function plantOwner(
   homeDir: string,
   sessionId: string,
   server: ReturnType<typeof createSingleRequestServer>,
-  retiredMarker = false,
+  withMarker = false,
 ): Promise<Keeper> {
   const keeper = await startKeeperProcess();
   const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
   await listenServer(server, socketPath);
   const processIdentity = keeper.pid ? await readQueueOwnerProcessIdentity(keeper.pid) : undefined;
   await writeQueueOwnerLock({ lockPath, pid: keeper.pid, sessionId, socketPath, processIdentity });
-  if (retiredMarker) {
-    // A lease written by the fixed build before brick 1281e50e retired the marker.
+  if (withMarker) {
+    // The marker this build writes on every lease (NA7).
     const lease = JSON.parse(await fsp.readFile(lockPath, "utf8")) as Record<string, unknown>;
     await fsp.writeFile(lockPath, `${JSON.stringify({ ...lease, settingsRebind: 1 })}\n`, "utf8");
   }
@@ -229,20 +237,20 @@ const VERBS: Verb[] = [
 // NA1 — every verb, both lease kinds
 // ---------------------------------------------------------------------------------------------
 
-// A lease without any marker is the shape every lease has now; one still carrying the retired
-// `settingsRebind` key (written by the fixed build before brick 1281e50e) must behave the same —
-// the parser drops the key, so neither shape can fall into a third behaviour.
-for (const retiredMarker of [false, true]) {
-  test(`NA1 GA1: all 8 settings verbs on a live idle owner (lease ${retiredMarker ? "still carrying the retired marker" : "without a marker"})`, async () => {
+// This build never READS the lease marker, so a lease without it (a plain planted lease) and one
+// carrying `settingsRebind:1` (what this build writes, NA7) must behave the same — neither shape
+// can fall into a third behaviour.
+for (const withMarker of [false, true]) {
+  test(`NA1 GA1: all 8 settings verbs on a live idle owner (lease ${withMarker ? "carrying the marker" : "without a marker"})`, async () => {
     assert.equal(VERBS.length, 8, "the verb table names every settings verb");
     for (const row of VERBS) {
       await withTempHome(async (homeDir) => {
-        const sessionId = `na1-${retiredMarker ? "marked" : "plain"}-${row.verb.replace(/\W+/g, "-")}`;
+        const sessionId = `na1-${withMarker ? "marked" : "plain"}-${row.verb.replace(/\W+/g, "-")}`;
         const loadOpts = await seedRegistry(homeDir);
         await seedSession(homeDir, sessionId, row.acpx);
         const requests: OwnerRequest[] = [];
         const server = recordingOwner(requests);
-        const keeper = await plantOwner(homeDir, sessionId, server, retiredMarker);
+        const keeper = await plantOwner(homeDir, sessionId, server, withMarker);
         const { lockPath } = queuePaths(homeDir, sessionId);
         const generation = () =>
           (JSON.parse(fs.readFileSync(lockPath, "utf8")) as { ownerGeneration: number })
@@ -699,6 +707,28 @@ test("NA6 GA1: the record-only arms never talk to an owner; the instrument flags
     ownerCalls(planted, "setSessionModelOnRecord"),
     "the guard did not flag a planted call",
   );
+});
+
+// ---------------------------------------------------------------------------------------------
+// NA7 — the rollback guard is still WRITTEN (brick c36e09c3 removes it)
+// ---------------------------------------------------------------------------------------------
+
+test("NA7 rollback guard: a lease written by this build carries settingsRebind:1, through acquire and refresh", async () => {
+  await withTempHome(async () => {
+    const lease = await tryAcquireQueueOwnerLease("na7-marker");
+    assert(lease);
+    try {
+      const onDisk = () =>
+        JSON.parse(fs.readFileSync(lease.lockPath, "utf8")) as { settingsRebind?: unknown };
+      // The raw bytes, not the parsed record: production main 5c21f164 reads exactly this key.
+      assert.equal(onDisk().settingsRebind, 1, "a fresh lease lacks the marker");
+      await refreshQueueOwnerLease(lease, { queueDepth: 1 }, () => "2026-03-26T00:00:00.000Z");
+      assert.equal(onDisk().settingsRebind, 1, "a heartbeat rewrite dropped the marker");
+      assert.equal((await readQueueOwnerRecord("na7-marker"))?.settingsRebind, 1);
+    } finally {
+      await releaseQueueOwnerLease(lease);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------------------------
