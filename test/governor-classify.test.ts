@@ -500,6 +500,80 @@ test("sweep: a terminal's spared leader group stays; the fallback STOPs top-down
   assert.ok(box.procs.has(522) && !box.procs.has(520) && !box.procs.has(521));
 });
 
+test("sweep (a): round 1 signals from the DECISION scan — no /proc re-scan before the first signal", (t) => {
+  const box = new FakeBox();
+  t.after(() => box.cleanup());
+  box.standardSystem();
+  const { claudePid } = box.owner(100, "sess-a");
+  box.toolSession(200, claudePid, 130);
+  const decision = scanProcTable(box.proc, parseGovProcStat).byPid;
+  const events: string[] = [];
+  const deps = {
+    ...sweepDeps(box, guardFor(box)),
+    scan: () => {
+      events.push("scan");
+      return scanProcTable(box.proc, parseGovProcStat).byPid;
+    },
+    signal: (target: number, sig: NodeJS.Signals) => {
+      events.push(`signal ${target}`);
+      box.signal(target, sig);
+    },
+  };
+  const result = sweepSession(deps, {
+    sid: 200,
+    rounds: 10,
+    roundIntervalMs: 10,
+    decisionScan: decision,
+  });
+  assert.equal(events[0].startsWith("signal"), true, `first action was ${events[0]}`);
+  assert.equal(result.survivors, 0);
+});
+
+test("sweep: each argv is read at most ONCE per guard pass (the session leader's negative is not re-read per member)", (t) => {
+  const box = new FakeBox();
+  t.after(() => box.cleanup());
+  box.standardSystem();
+  const { claudePid } = box.owner(100, "sess-memo");
+  box.toolSession(200, claudePid, 130);
+  const reads = new Map<number, number>();
+  const guard = {
+    ...guardFor(box),
+    tokenState: (pid: number) => {
+      reads.set(pid, (reads.get(pid) ?? 0) + 1);
+      return queueOwnerTokenState(pid, box.proc);
+    },
+  };
+  const decision = scanProcTable(box.proc, parseGovProcStat).byPid;
+  sweepSession(sweepDeps(box, guard), {
+    sid: 200,
+    rounds: 1,
+    roundIntervalMs: 10,
+    decisionScan: decision,
+  });
+  assert.equal(reads.get(200), 1, "the leader's token: once in the pass, not once per member");
+  assert.ok([...reads.values()].every((n) => n === 1));
+});
+
+test("sweep accounting: `signalled` counts every member of the signalled groups across rounds — not the decision count", (t) => {
+  const box = new FakeBox();
+  t.after(() => box.cleanup());
+  box.standardSystem();
+  const { claudePid } = box.owner(100, "sess-acct");
+  box.toolSession(200, claudePid, 130);
+  const decision = scanProcTable(box.proc, parseGovProcStat).byPid; // 130 members seen
+  // The storm keeps forking after the decision: 70 more in a new job's group of the same session.
+  box.addMany(70, { ppid: 201, pgid: 900, sid: 200, comm: "bash" }, 900);
+  const result = sweepSession(sweepDeps(box, guardFor(box)), {
+    sid: 200,
+    rounds: 10,
+    roundIntervalMs: 10,
+    decisionScan: decision,
+  });
+  assert.equal(result.survivors, 0);
+  assert.equal(result.signalled, 200);
+  assert.ok(result.rounds >= 2);
+});
+
 test("sweep: EPERM on a root-owned member is reported, and the members the governor may kill still die", (t) => {
   const box = new FakeBox();
   t.after(() => box.cleanup());

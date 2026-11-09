@@ -80,6 +80,14 @@ export type SweepOptions = {
   readonly sparePgid?: number;
   readonly rounds: number;
   readonly roundIntervalMs: number;
+  /**
+   * The scan the kill DECISION was taken on. Round 1 signals from it — its guard is evaluated on it,
+   * right before the signal — instead of re-scanning /proc first; later rounds re-scan. Any process
+   * born since is a fork of a member: it inherits the member's pgid (so the group kill reaches it) and
+   * cannot become an owner without exec'ing acpx (round 2 re-guards it). Measured on a ~8,000/s bomb:
+   * the round-1 re-scan cost 30–214 ms before the first signal (CONCEPTION §19, TE re-verify of D3a).
+   */
+  readonly decisionScan?: ReadonlyMap<number, GovProc>;
 };
 
 export type SweepResult = {
@@ -94,6 +102,8 @@ export type SweepResult = {
   /** Pgids that failed the guard — should never happen for a governed session. */
   readonly guardedPgids: readonly number[];
   readonly fallbackStops: number;
+  /** Distinct members of the signalled groups, across all rounds — what the sweep actually killed. */
+  readonly signalled: number;
 };
 
 function sessionMembers(
@@ -245,38 +255,70 @@ export function finishStops(
  */
 export function sweepSession(deps: SweepDeps, options: SweepOptions): SweepResult {
   const started = deps.now();
-  const guarded = new Set<number>();
-  /** Groups whose kill was refused (EPERM): retrying them every round changes nothing. */
-  const refused = new Set<number>();
-  let rounds = 0;
-  let groupsSignalled = 0;
+  const run: SweepRun = {
+    guarded: new Set(),
+    refused: new Set(),
+    signalled: new Set(),
+    rounds: 0,
+    groups: 0,
+  };
   for (let round = 0; round < options.rounds; round += 1) {
-    const members = sessionMembers(deps.scan(), options.sid, options.sparePgid);
-    const targets = roundTargets(members, deps.guard, guarded).filter((pgid) => !refused.has(pgid));
-    if (targets.length === 0) {
+    if (!sweepRound(deps, options, round, run)) {
       break;
     }
-    rounds += 1;
-    for (const pgid of targets) {
-      if (send(deps, -pgid, "SIGKILL")) {
-        refused.add(pgid);
-      }
-    }
-    groupsSignalled += targets.length;
     deps.sleepSync(options.roundIntervalMs);
   }
   const fallback =
-    guarded.size > 0 ? stopThenKill(deps, options.sid, guarded) : { stops: 0, eperm: false };
+    run.guarded.size > 0
+      ? stopThenKill(deps, options.sid, run.guarded)
+      : { stops: 0, eperm: false };
   const survivors = sessionMembers(deps.scan(), options.sid, options.sparePgid).length;
   return {
-    rounds,
+    rounds: run.rounds,
     killMs: Math.max(0, deps.now() - started),
     survivors,
-    groupsSignalled,
-    eperm: refused.size > 0 || fallback.eperm,
-    guardedPgids: [...guarded],
+    groupsSignalled: run.groups,
+    eperm: run.refused.size > 0 || fallback.eperm,
+    guardedPgids: [...run.guarded],
     fallbackStops: fallback.stops,
+    signalled: run.signalled.size + fallback.stops,
   };
+}
+
+type SweepRun = {
+  /** Pgids that failed the guard: never group-signalled. */
+  readonly guarded: Set<number>;
+  /** Groups whose kill was refused (EPERM): retrying them every round changes nothing. */
+  readonly refused: Set<number>;
+  readonly signalled: Set<number>;
+  rounds: number;
+  groups: number;
+};
+
+/** One round; false when there was nothing left to signal. */
+function sweepRound(deps: SweepDeps, options: SweepOptions, round: number, run: SweepRun): boolean {
+  const scan = round === 0 && options.decisionScan ? options.decisionScan : deps.scan();
+  const members = sessionMembers(scan, options.sid, options.sparePgid);
+  const targets = roundTargets(members, deps.guard, run.guarded).filter(
+    (pgid) => !run.refused.has(pgid),
+  );
+  if (targets.length === 0) {
+    return false;
+  }
+  const targeted = new Set(targets);
+  for (const m of members) {
+    if (targeted.has(m.pgid)) {
+      run.signalled.add(m.pid);
+    }
+  }
+  run.rounds += 1;
+  for (const pgid of targets) {
+    if (send(deps, -pgid, "SIGKILL")) {
+      run.refused.add(pgid);
+    }
+  }
+  run.groups += targets.length;
+  return true;
 }
 
 /** The pgids this round may group-signal; a pgid failing the guard joins `guarded` for good. */
@@ -294,9 +336,24 @@ function roundTargets(
       byPgid.set(m.pgid, [m]);
     }
   }
+  // Each pid's argv is read at most ONCE per guard pass (still right before this round's signals):
+  // without it the session leader's negative was re-read for every one of ~1,000 members.
+  const memo = new Map<number, TokenState>();
+  const once: GuardContext = {
+    ...guard,
+    tokenState: (pid) => {
+      const known = memo.get(pid);
+      if (known !== undefined) {
+        return known;
+      }
+      const state = guard.tokenState(pid);
+      memo.set(pid, state);
+      return state;
+    },
+  };
   const targets: number[] = [];
   for (const [pgid, group] of byPgid) {
-    if (pgid <= 1 || group.some((m) => protectedReason(m, guard) !== undefined)) {
+    if (pgid <= 1 || group.some((m) => protectedReason(m, once) !== undefined)) {
       guarded.add(pgid);
     } else if (!guarded.has(pgid)) {
       targets.push(pgid);

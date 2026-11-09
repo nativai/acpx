@@ -84,7 +84,7 @@ test("R1 kill: in-band line on the leader's fd 2 only, seat message, events.ndjs
   assert.equal(killed[0].session_kind, "tool");
   assert.equal(killed[0].session_id, "sess-storm-0001");
   assert.equal(killed[0].seat_id, "seat-storm-1");
-  assert.equal(killed[0].processes, 200);
+  assert.equal(killed[0].processes, 200, "max(decision count, members signalled)");
   assert.equal(killed[0].survivors, 0);
   assert.equal(
     killed[0].anon_bytes,

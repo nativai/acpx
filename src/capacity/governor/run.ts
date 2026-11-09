@@ -950,7 +950,11 @@ export class Governor {
       sparePgid,
       rounds: this.g.sweepRounds,
       roundIntervalMs: this.g.sweepRoundIntervalMs,
+      decisionScan: this.latestByPid,
     });
+    // What the sweep KILLED, not what the decision scan counted: a storm keeps forking until the first
+    // signal (TE: the event under-reported 3–6×). max(): the decision count is also a floor.
+    event.processes = Math.max(view.members.length, result.signalled);
     event.rounds = result.rounds;
     event.kill_ms = Math.round(result.killMs);
     event.survivors = result.survivors;

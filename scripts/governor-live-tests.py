@@ -378,7 +378,9 @@ def n6(gov):
     first = killed[0] if killed else {}
     bound = 400 if nice > 0 else 10**6
     return dict(test="N6", nice_storm=nice, bound=bound if nice > 0 else None,
-                pass_=bool(killed) and (first.get("processes") or 10**6) <= bound and survivors == 0 and after3 == 0,
+                # Timed by the HARNESS's own 50 ms sampler, never by the event (AC1's rule; TE re-verify of D3a):
+                # the event counted the decision scan while the bomb kept forking until the first signal.
+                pass_=bool(killed) and s.peak <= bound and survivors == 0 and after3 == 0,
                 killed_at_processes=first.get("processes"), rounds=first.get("rounds"), kill_ms=first.get("kill_ms"),
                 sampler_peak=s.peak, survivors_after_1s=survivors, survivors_after_4s=after3, kills=len(killed))
 
