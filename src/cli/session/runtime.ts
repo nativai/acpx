@@ -2489,6 +2489,20 @@ async function runDeferredInjectedTurn(
   }
 }
 
+// brick 570d2570 — the `done` a close sweep writes for a main turn that had already answered on its own.
+function mainTurnOwnEnd(
+  answer: { stopReason: RunPromptResult["stopReason"]; turnError?: string; steered?: boolean },
+  reconciliation: TurnWatchdogReconciliation,
+): NonNullable<OpenMainTurnDelivery["ownEnd"]> {
+  const recovered = reconciliation.kind === "recovered";
+  return {
+    stopReason: recovered ? reconciliation.stopReason : toDeliveryStopReason(answer.stopReason),
+    ...(answer.steered ? { steered: true } : {}),
+    ...(recovered ? { recoveredBy: "turn-watchdog" as const } : {}),
+    ...(answer.turnError ? { error: { code: 0, message: answer.turnError, detailCode: "" } } : {}),
+  };
+}
+
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
 async function runSessionPrompt(options: RunSessionPromptOptions): Promise<SessionSendResult> {
   const stopTotalTimer = startPerfTimer("runtime.prompt.total");
@@ -2623,32 +2637,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     );
     const delivered = members.filter((member) => !deduplicated.includes(member));
     if (delivered.length > 0) {
-      const promptStartedAt = isoNow();
-      for (const member of delivered) {
-        member.userMessageId =
-          member.messageId !== undefined && hasUserMessageId(conversation, member.messageId)
-            ? member.messageId
-            : recordPromptSubmission(
-                conversation,
-                member.prompt,
-                promptStartedAt,
-                member.messageId,
-              );
-      }
-      record.lastPromptAt = promptStartedAt;
-      record.lastUsedAt = promptStartedAt;
-      applyConversation(record, conversation);
-      record.acpx = acpxState;
-      const lastRowId = delivered.findLast(
-        (member) => member.userMessageId !== undefined,
-      )?.userMessageId;
-      await writeSessionRecordAtBoundary(record, {
-        logThrough:
-          lastRowId === undefined
-            ? undefined
-            : lastUserMessageWithId(conversation.messages, lastRowId),
-      });
-      copyLoggedMessageCount(record, conversation);
+      await writeMemberRows(delivered);
     }
     for (const member of deduplicated) {
       if (member.task) {
@@ -2658,21 +2647,50 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     return { delivered, deduplicated, record: settled.record };
   };
 
+  // One User row per member (kept by id when it already exists — F2), then ONE boundary write that
+  // logs through the last of them.
+  const writeMemberRows = async (members: TurnMember[]): Promise<void> => {
+    const promptStartedAt = isoNow();
+    for (const member of members) {
+      member.userMessageId =
+        member.messageId !== undefined && hasUserMessageId(conversation, member.messageId)
+          ? member.messageId
+          : recordPromptSubmission(conversation, member.prompt, promptStartedAt, member.messageId);
+    }
+    record.lastPromptAt = promptStartedAt;
+    record.lastUsedAt = promptStartedAt;
+    applyConversation(record, conversation);
+    record.acpx = acpxState;
+    const lastRowId = members.findLast(
+      (member) => member.userMessageId !== undefined,
+    )?.userMessageId;
+    await writeSessionRecordAtBoundary(record, {
+      logThrough:
+        lastRowId === undefined
+          ? undefined
+          : lastUserMessageWithId(conversation.messages, lastRowId),
+    });
+    copyLoggedMessageCount(record, conversation);
+  };
+
+  const startOnlyMember = async (only: TurnMember): Promise<SessionRecord | undefined> => {
+    const promptStart = await recordPromptStart(only.prompt, only.messageId);
+    only.userMessageId = promptStart.messageId;
+    output.setContext({
+      sessionId: record.acpxRecordId,
+    });
+    if (!promptStart.deduplicated) {
+      return undefined;
+    }
+    const deduplicatedRecord = promptStart.record ?? record;
+    await appendDeduplicatedDeliveryTerminal(deduplicatedRecord, only.context);
+    return deduplicatedRecord;
+  };
+
   // The members' User rows. A turn of ONE (not a split part) takes today's path, unchanged.
   const startMainMembers = async (): Promise<SessionRecord | undefined> => {
     if (mainMembers.length === 1 && !options.split) {
-      const only = mainMembers[0];
-      const promptStart = await recordPromptStart(only.prompt, only.messageId);
-      only.userMessageId = promptStart.messageId;
-      output.setContext({
-        sessionId: record.acpxRecordId,
-      });
-      if (!promptStart.deduplicated) {
-        return undefined;
-      }
-      const deduplicatedRecord = promptStart.record ?? record;
-      await appendDeduplicatedDeliveryTerminal(deduplicatedRecord, only.context);
-      return deduplicatedRecord;
+      return await startOnlyMember(mainMembers[0]);
     }
     const started = await recordBatchStart(mainMembers);
     output.setContext({
@@ -3501,57 +3519,77 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     const absorbed = new Map<TurnMember, AbsorbedInjectedDelivery>();
     let deferred = false;
     try {
-      const started = await recordBatchStart(unsettled);
-      for (const member of started.deduplicated) {
-        await appendDeliveryTerminal(member.context, "done", { stopReason: "deduplicated" });
-        if (member.task) {
-          sendInjectedDeduplicatedResultIfWaiting(member.task, started.record ?? record);
-        }
-      }
-      unsettled = started.delivered;
-      if (unsettled.length === 0) {
-        return;
-      }
-      const composed = composeTurnPrompt(unsettled, undefined);
-      for (const member of unsettled) {
-        await appendDeliveryEvent(member.context, "accepted");
-        // brick e09628a1 — count from BEFORE the prompt is sent, so no completion it causes is missed.
-        registerSteerConsumption(member.context);
-      }
-      const responsePromise = client.prompt(sessionId, composed.prompt, {
-        ...injectedPromptOptions(composed.messageId),
-        ...(composed.batchMeta ? { batchMeta: composed.batchMeta } : {}),
-      });
-      for (const member of unsettled) {
-        const delivery = member.task
-          ? createAbsorbedInjectedDelivery(member.task, member.context)
-          : undefined;
-        if (delivery) {
-          absorbed.set(member, delivery);
-        }
-      }
-      const response = await responsePromise;
-      for (const member of unsettled) {
-        if (member.task) {
-          await handleInjectedPromptResponse(
-            member.task,
-            member.context,
-            member.userMessageId,
-            response,
-            absorbed.get(member),
-          );
-        }
+      unsettled = await startInjectedBatchMembers(unsettled);
+      if (unsettled.length > 0) {
+        await sendInjectedBatch(sessionId, unsettled, absorbed);
       }
     } catch (injectedError) {
       deferred = await handleInjectedBatchError(unsettled, absorbed, injectedError, arrival);
     } finally {
       // A deferred batch stays open: its failover retry answers, then closes it.
       if (!deferred) {
-        for (const task of injected) {
-          const member = unsettled.find((candidate) => candidate.task === task);
-          closeInjectedTask(task, member ? absorbed.get(member) : undefined);
-        }
+        closeInjectedBatch(injected, unsettled, absorbed);
       }
+    }
+  };
+
+  // The batch's User rows; a member already delivered ends `done / deduplicated` here. The rest return.
+  const startInjectedBatchMembers = async (members: TurnMember[]): Promise<TurnMember[]> => {
+    const started = await recordBatchStart(members);
+    for (const member of started.deduplicated) {
+      await appendDeliveryTerminal(member.context, "done", { stopReason: "deduplicated" });
+      if (member.task) {
+        sendInjectedDeduplicatedResultIfWaiting(member.task, started.record ?? record);
+      }
+    }
+    return started.delivered;
+  };
+
+  const sendInjectedBatch = async (
+    sessionId: string,
+    members: TurnMember[],
+    absorbed: Map<TurnMember, AbsorbedInjectedDelivery>,
+  ): Promise<void> => {
+    const composed = composeTurnPrompt(members, undefined);
+    for (const member of members) {
+      await appendDeliveryEvent(member.context, "accepted");
+      // brick e09628a1 — count from BEFORE the prompt is sent, so no completion it causes is missed.
+      registerSteerConsumption(member.context);
+    }
+    const responsePromise = client.prompt(sessionId, composed.prompt, {
+      ...injectedPromptOptions(composed.messageId),
+      ...(composed.batchMeta ? { batchMeta: composed.batchMeta } : {}),
+    });
+    for (const member of members) {
+      const delivery = member.task
+        ? createAbsorbedInjectedDelivery(member.task, member.context)
+        : undefined;
+      if (delivery) {
+        absorbed.set(member, delivery);
+      }
+    }
+    const response = await responsePromise;
+    for (const member of members) {
+      if (member.task) {
+        await handleInjectedPromptResponse(
+          member.task,
+          member.context,
+          member.userMessageId,
+          response,
+          absorbed.get(member),
+        );
+      }
+    }
+  };
+
+  const closeInjectedBatch = (
+    injected: QueueTask[],
+    members: TurnMember[],
+    absorbed: Map<TurnMember, AbsorbedInjectedDelivery>,
+  ): void => {
+    for (const task of injected) {
+      const member = members.find((candidate) => candidate.task === task);
+      closeInjectedTask(task, member ? absorbed.get(member) : undefined);
     }
   };
 
@@ -4495,15 +4533,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       }
       return;
     }
-    const recovered = reconciliation.kind === "recovered";
-    const ownEnd = {
-      stopReason: recovered ? reconciliation.stopReason : toDeliveryStopReason(answer.stopReason),
-      ...(answer.steered ? { steered: true } : {}),
-      ...(recovered ? { recoveredBy: "turn-watchdog" as const } : {}),
-      ...(answer.turnError
-        ? { error: { code: 0, message: answer.turnError, detailCode: "" } }
-        : {}),
-    };
+    const ownEnd = mainTurnOwnEnd(answer, reconciliation);
     for (const open of opens) {
       open.ownEnd = ownEnd;
     }

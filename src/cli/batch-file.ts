@@ -44,26 +44,8 @@ export function assertBatchFileFlags(flags: PromptFlags, promptParts: readonly s
 
 /** Batch file v1: `{"v":1,"messages":[{messageId, prompt, options?}, …]}`, delivery order, ≥ 1. */
 export function parseBatchFile(source: string): BatchFileMember[] {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(source);
-  } catch {
-    throw new BatchFileUsageError("body is not JSON");
-  }
-  const body = parsed as { v?: unknown; messages?: unknown } | null;
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    throw new BatchFileUsageError("body must be an object");
-  }
-  if (body.v !== 1) {
-    throw new BatchFileUsageError(
-      `version ${JSON.stringify(body.v ?? null)} is not supported (v: 1)`,
-    );
-  }
-  if (!Array.isArray(body.messages) || body.messages.length === 0) {
-    throw new BatchFileUsageError("messages must be a non-empty array");
-  }
   const seen = new Set<string>();
-  return body.messages.map((raw: unknown, index) => {
+  return parseBatchBody(source).map((raw: unknown, index) => {
     const member = parseMember(raw, index);
     if (seen.has(member.messageId)) {
       throw new BatchFileUsageError(`messages[${index}]: duplicate messageId ${member.messageId}`);
@@ -73,25 +55,49 @@ export function parseBatchFile(source: string): BatchFileMember[] {
   });
 }
 
+function parseBatchBody(source: string): unknown[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(source);
+  } catch {
+    throw new BatchFileUsageError("body is not JSON");
+  }
+  if (!isObject(parsed)) {
+    throw new BatchFileUsageError("body must be an object");
+  }
+  if (parsed.v !== 1) {
+    throw new BatchFileUsageError(
+      `version ${JSON.stringify(parsed.v ?? null)} is not supported (v: 1)`,
+    );
+  }
+  if (!Array.isArray(parsed.messages) || parsed.messages.length === 0) {
+    throw new BatchFileUsageError("messages must be a non-empty array");
+  }
+  return parsed.messages as unknown[];
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 function parseMember(raw: unknown, index: number): BatchFileMember {
   const at = `messages[${index}]`;
-  const member = raw as { messageId?: unknown; prompt?: unknown; options?: unknown } | null;
-  if (!member || typeof member !== "object" || Array.isArray(member)) {
+  if (!isObject(raw)) {
     throw new BatchFileUsageError(`${at}: must be an object`);
   }
-  if (typeof member.messageId !== "string" || !LOWERCASE_UUID.test(member.messageId)) {
+  if (typeof raw.messageId !== "string" || !LOWERCASE_UUID.test(raw.messageId)) {
     throw new BatchFileUsageError(`${at}: messageId must be a lowercase UUID`);
   }
-  if (!isPromptInput(member.prompt) || member.prompt.length === 0) {
+  if (!isPromptInput(raw.prompt) || raw.prompt.length === 0) {
     throw new BatchFileUsageError(`${at}: prompt must be a non-empty array of ACP content blocks`);
   }
-  const options = parseMemberTaskOptions(member.options);
+  const options = parseMemberTaskOptions(raw.options);
   if (options === null) {
     throw new BatchFileUsageError(`${at}: options are invalid`);
   }
   return {
-    messageId: member.messageId,
-    prompt: member.prompt,
+    messageId: raw.messageId,
+    prompt: raw.prompt,
     ...(options !== undefined ? { options } : {}),
   };
 }

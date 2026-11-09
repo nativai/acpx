@@ -674,11 +674,11 @@ function parseTypedQueueRequest(
   request: Record<string, unknown>,
   context: QueueRequestContext,
 ): QueueRequest | null {
+  const submit = parseSubmitFamilyRequest(request, context);
+  if (submit !== undefined) {
+    return submit;
+  }
   switch (request.type) {
-    case "submit_prompt":
-      return parseSubmitRequest(request, context);
-    case "submit_prompt_batch":
-      return parseSubmitPromptBatchRequest(request, context);
     case "drain_deliveries":
       return parseDrainDeliveriesRequest(request, context);
     case "set_mode":
@@ -694,6 +694,20 @@ function parseTypedQueueRequest(
     default:
       return parsePayloadlessQueueRequest(request.type, context);
   }
+}
+
+// The two submissions; `undefined` = not a submission type.
+function parseSubmitFamilyRequest(
+  request: Record<string, unknown>,
+  context: QueueRequestContext,
+): QueueRequest | null | undefined {
+  if (request.type === "submit_prompt") {
+    return parseSubmitRequest(request, context);
+  }
+  if (request.type === "submit_prompt_batch") {
+    return parseSubmitPromptBatchRequest(request, context);
+  }
+  return undefined;
 }
 
 // Control verbs whose whole payload is the envelope. Split out purely to keep
@@ -825,21 +839,26 @@ function parseSubmitPromptBatchRequest(
     ownerGeneration: context.ownerGeneration,
     members,
     permissionMode: call.permissionMode,
-    ...(call.resumePolicy !== undefined ? { resumePolicy: call.resumePolicy } : {}),
     nonInteractivePermissions: call.nonInteractivePermissions,
-    ...(call.permissionPolicy !== undefined ? { permissionPolicy: call.permissionPolicy } : {}),
     timeoutMs: context.timeoutMs,
-    ...(call.suppressSdkConsoleErrors !== undefined
-      ? { suppressSdkConsoleErrors: call.suppressSdkConsoleErrors }
-      : {}),
-    ...(call.promptRetries !== undefined ? { promptRetries: call.promptRetries } : {}),
-    ...(call.codexSubscriptionCapWeeklyPercent !== undefined
-      ? { codexSubscriptionCapWeeklyPercent: call.codexSubscriptionCapWeeklyPercent }
-      : {}),
-    ...(call.sessionOptions !== undefined ? { sessionOptions: call.sessionOptions } : {}),
-    ...(call.ttlMs !== undefined ? { ttlMs: call.ttlMs } : {}),
+    ...definedFields({
+      resumePolicy: call.resumePolicy,
+      permissionPolicy: call.permissionPolicy,
+      suppressSdkConsoleErrors: call.suppressSdkConsoleErrors,
+      promptRetries: call.promptRetries,
+      codexSubscriptionCapWeeklyPercent: call.codexSubscriptionCapWeeklyPercent,
+      sessionOptions: call.sessionOptions,
+      ttlMs: call.ttlMs,
+    }),
     waitForCompletion: false,
   };
+}
+
+/** The entries whose value is set — an absent option stays absent on the parsed request. */
+function definedFields<T extends Record<string, unknown>>(fields: T): Partial<T> {
+  return Object.fromEntries(
+    Object.entries(fields).filter(([, value]) => value !== undefined),
+  ) as Partial<T>;
 }
 
 function parseBatchMembers(value: unknown): QueueBatchMember[] | null {
@@ -906,13 +925,7 @@ export function parseMemberTaskOptions(value: unknown): MemberTaskOptions | unde
   if (Object.values(parsed).some((field) => field === null)) {
     return null;
   }
-  const options: MemberTaskOptions = {};
-  for (const [key, field] of Object.entries(parsed)) {
-    if (field !== undefined) {
-      (options as Record<string, unknown>)[key] = field;
-    }
-  }
-  return options;
+  return definedFields(parsed) as MemberTaskOptions;
 }
 
 function parseCapWeeklyPercent(value: unknown): number | undefined | null {

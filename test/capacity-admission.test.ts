@@ -1167,3 +1167,17 @@ test("admissionLock: on an UNCONFIGURED box a busy lock is reported but never tu
   assert.equal(probe.code, 0);
   assert.equal(lockOf(probe.json).busy, true);
 });
+
+// UMQ K9 (CONTRACTS §3.1) — atrium learns what this acpx can do from EVERY capacity answer, the
+// refusal included: a field-less answer reads as "no features" and atrium falls back to per-member
+// delivery (S5).
+test("N-A1-14: `capacity --need 99` (exit 75) still carries features ⊇ prompt-batch", async () => {
+  const f = makeBox({ requestMib: 2048 });
+  const refused = await probe(f, 99);
+  assert.equal(refused.code, 75);
+  assert.ok(Array.isArray(refused.json.features), "features is an array");
+  assert.ok((refused.json.features as string[]).includes("prompt-batch"));
+  const met = await probe(makeBox({ requestMib: 4000 }), 1);
+  assert.equal(met.code, 0);
+  assert.ok((met.json.features as string[]).includes("prompt-batch"), "and on a met answer");
+});

@@ -102,9 +102,14 @@ export type ClaimedMainTurnDelivery = {
 export function claimMainTurnOnSessionClose(sessionId: string): ClaimedMainTurnDelivery[] {
   const open = openMainTurnDeliveries.get(sessionId) ?? [];
   openMainTurnDeliveries.delete(sessionId);
-  return open.filter(claimMainTurnDeliveryTerminal).map((delivery) => ({
-    context: delivery.context,
-    ...(delivery.ownEnd ? { ownEnd: delivery.ownEnd } : {}),
-    ...(delivery.consumed ? { consumed: true } : {}),
-  }));
+  return open.filter(claimMainTurnDeliveryTerminal).map((delivery) => {
+    const claimed: ClaimedMainTurnDelivery = { context: delivery.context };
+    if (delivery.ownEnd) {
+      claimed.ownEnd = delivery.ownEnd;
+    }
+    if (delivery.consumed) {
+      claimed.consumed = true;
+    }
+    return claimed;
+  });
 }
