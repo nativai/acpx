@@ -684,14 +684,15 @@ export class Governor {
    */
   private decisionScan(nowMs: number, box: BoxReading): GovScan {
     const counts = new Map<number, number>();
-    const scan = this.scanner((entry, byPid) => {
+    const scan = this.scanner((entry, byPid, dropped) => {
       if (!isLiveState(entry.state)) {
         return false;
       }
       const count = (counts.get(entry.sid) ?? 0) + 1;
       counts.set(entry.sid, count);
       return (
-        count === this.g.maxGroupProcesses && this.killOnCrossing(entry.sid, byPid, nowMs, box)
+        count === this.g.maxGroupProcesses &&
+        this.killOnCrossing(entry.sid, byPid, dropped, nowMs, box)
       );
     });
     return scan.stopped ? this.scanner() : scan;
@@ -713,12 +714,13 @@ export class Governor {
   private killOnCrossing(
     sid: number,
     partial: Map<number, GovProc>,
+    dropped: (pid: number) => boolean,
     nowMs: number,
     box: BoxReading,
   ): boolean {
     const view =
       this.mode === "enforce" && sid !== this.systemSid && sid > 1
-        ? this.crossingView(sid, partial, nowMs)
+        ? this.crossingView(sid, partial, dropped, nowMs)
         : undefined;
     if (
       !view ||
@@ -754,8 +756,12 @@ export class Governor {
   private crossingView(
     sid: number,
     partial: Map<number, GovProc>,
+    dropped: (pid: number) => boolean,
     nowMs: number,
   ): SessionView | undefined {
+    // D7 acts only on a leader read in THIS scan: delivered by it, or — when its reader is merely behind —
+    // read fresh now. A leader whose reader was DROPPED (stuck) is undecidable: no first-sight crossing.
+    const leaderScanned = partial.has(sid) || !dropped(sid);
     if (!partial.has(sid)) {
       // The leader is the session's oldest process, so it is normally already read; after a pid wrap it
       // may lie ahead of the cursor — read it now rather than misread the session as leaderless.
@@ -767,7 +773,7 @@ export class Governor {
     const leader = liveLeader(partial, sid);
     const record =
       rememberedRecord(this.memory, sid, leader) ??
-      this.firstSightRecord(sid, partial, leader, nowMs);
+      (leaderScanned ? this.firstSightRecord(sid, partial, leader, nowMs) : undefined);
     if (!record) {
       return undefined;
     }
@@ -777,7 +783,8 @@ export class Governor {
 
   /**
    * CONCEPTION §19 D7: a session first seen in THIS scan may still be crossed, once the partial view decides
-   * R1 eligibility (D4/D5): its leader is alive and read, is not a verified owner (lease on the pid or sid;
+   * R1 eligibility (D4/D5): its leader is alive and read in THIS scan (not in a dropped reader's share), is
+   * not a verified owner (lease on the pid or sid;
    * the token read answers a plain `absent`), owner identification works, and — under
    * `governTerminals:false` — the leader's parent is read so a terminal placement can be told. The leader's
    * ancestors are read fresh (they are not storm processes: those reads do not block), and the session is

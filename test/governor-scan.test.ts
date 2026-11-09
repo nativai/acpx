@@ -4,7 +4,11 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import type { GovProc } from "../src/capacity/governor/classify.js";
-import { parallelScanner, streamingScanner } from "../src/capacity/governor/scan.js";
+import {
+  parallelScanner,
+  type ProcScanner,
+  streamingScanner,
+} from "../src/capacity/governor/scan.js";
 import { FakeBox } from "./governor-fixtures.js";
 
 // brick 07f4fde2 — CONCEPTION 5d7a23b6 §19 D5 "kill on crossing, mid-scan", and the parallel /proc scan
@@ -201,6 +205,57 @@ test("§19 D7 first sight WAITS when the leader's argv cannot be read; the full 
     !b.groupKills().includes(2000),
     "the guard still refuses the unverified leader's own group",
   );
+});
+
+/** A scanner whose first `incomplete` scans lose `dropped` pids, as a stuck reader's share is lost. */
+function droppingScanner(b: FakeBox, dropped: ReadonlySet<number>, incomplete = 1): ProcScanner {
+  const inner = streamingScanner(b.proc);
+  let calls = 0;
+  return (visit) => {
+    calls += 1;
+    if (calls > incomplete) {
+      return inner(visit);
+    }
+    const isDropped = (pid: number) => dropped.has(pid);
+    const r = inner(
+      visit && ((entry, byPid) => !isDropped(entry.pid) && visit(entry, byPid, isDropped)),
+    );
+    for (const pid of dropped) {
+      r.byPid.delete(pid);
+    }
+    return { ...r, complete: false };
+  };
+}
+
+test("TE F3: an incomplete scan never persists a first-sight placement — the next complete scan places it", (t) => {
+  const b = box(t);
+  const { claudePid } = b.owner(100, "sess-f3-0001");
+  b.toolSession(2000, claudePid, 5);
+  // The first scan loses the harness (`claude`): from that view the command would place as `outside`.
+  const g = b.governor({}, {}, { scanner: droppingScanner(b, new Set([claudePid])) });
+  assert.deepEqual(g.start(), { started: true });
+  g.tick();
+  b.nowMs += 1000;
+  g.tick(); // complete
+  g.shutdown();
+  const groups = JSON.parse(fs.readFileSync(path.join(b.dir, "groups.json"), "utf8")) as Array<{
+    sid: number;
+    placement: { governed: boolean; kind?: string; reason?: string };
+  }>;
+  const placement = groups.find((r) => r.sid === 2000)?.placement;
+  assert.equal(placement?.governed, true, `remembered ${JSON.stringify(placement)}`);
+  assert.equal(placement?.kind, "tool");
+});
+
+test("§19 D7 waits when THIS scan did not deliver the leader (its reader dropped) — no first-sight crossing", async (t) => {
+  const b = box(t);
+  const { claudePid } = b.owner(100, "sess-noleader-1");
+  b.toolSession(2000, claudePid, 300);
+  const g = b.governor({}, {}, { scanner: droppingScanner(b, new Set([2000])) });
+  assert.deepEqual(g.start(), { started: true });
+  g.tick();
+  await g.settle();
+  assert.equal(crossingLine(b), undefined);
 });
 
 // ---------------------------------------------------------------------------

@@ -146,6 +146,8 @@ type Classifier = {
   /** Sessions being placed right now: a parent chain that loops back is unplaceable. */
   readonly inProgress: Set<number>;
   changed: boolean;
+  /** Sids placed (first sight, or re-placed) by THIS classification. */
+  readonly placed: Set<number>;
 };
 
 function isOwnerSession(c: Classifier, sid: number): boolean {
@@ -294,6 +296,7 @@ function placementOf(c: Classifier, sid: number): Placement | undefined {
   c.inProgress.add(sid);
   const placement = place(c, sid, members);
   c.inProgress.delete(sid);
+  c.placed.add(sid);
   c.memory.set(sid, {
     sid,
     leaderStartTicks: leader?.startTicks,
@@ -360,6 +363,7 @@ export function placeSession(
     nowMs,
     inProgress: new Set(),
     changed: false,
+    placed: new Set(),
   };
   return placementOf(c, sid);
 }
@@ -389,7 +393,16 @@ export function classifySessions(
   complete = true,
 ): Classification {
   const bySid = groupBySid(byPid);
-  const c: Classifier = { byPid, bySid, ctx, memory, nowMs, inProgress: new Set(), changed: false };
+  const c: Classifier = {
+    byPid,
+    bySid,
+    ctx,
+    memory,
+    nowMs,
+    inProgress: new Set(),
+    changed: false,
+    placed: new Set(),
+  };
   for (const sid of complete ? memory.keys() : []) {
     if (!bySid.has(sid)) {
       memory.delete(sid);
@@ -401,6 +414,15 @@ export function classifySessions(
     placementOf(c, sid);
     const record = memory.get(sid) as GroupRecord;
     sessions.set(sid, sessionView(sid, record, members, liveLeader(byPid, sid)));
+  }
+  if (!complete) {
+    // TE F3: a view missing a stuck reader's share (~1/4 of the pids) can place a tool command as `outside`
+    // (its harness unread) — this tick may act on that view, but it must not STICK: the next complete scan
+    // places it. Row: "an incomplete scan never persists a first-sight placement".
+    for (const sid of c.placed) {
+      memory.delete(sid);
+    }
+    return { sessions, memoryChanged: false };
   }
   return { sessions, memoryChanged: c.changed };
 }

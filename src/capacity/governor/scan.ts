@@ -23,8 +23,17 @@ import { parseGovProcStat, type GovProc } from "./classify.js";
  * on the main thread.
  */
 
-/** `byPid` is the scan's own (partial) map: the crossing kill may add a leader it reads fresh. */
-export type ScanVisit = (entry: GovProc, byPid: Map<number, GovProc>) => boolean;
+/**
+ * `byPid` is the scan's own (partial) map: the crossing kill may add a leader it reads fresh. `dropped(pid)`
+ * is true when `pid` belongs to a reader left out of THIS scan (stuck): such a pid is undecidable (§19 D7).
+ */
+export type ScanVisit = (
+  entry: GovProc,
+  byPid: Map<number, GovProc>,
+  dropped: (pid: number) => boolean,
+) => boolean;
+
+const NONE_DROPPED = (): boolean => false;
 
 export type GovScan = {
   readonly measured: boolean;
@@ -71,7 +80,7 @@ export function streamingScanner(procRoot: string): ProcScanner {
         const entry = DIGITS.test(d.name) ? readStat(procRoot, Number(d.name)) : undefined;
         if (entry) {
           byPid.set(entry.pid, entry);
-          stopped = visit?.(entry, byPid) === true;
+          stopped = visit?.(entry, byPid, NONE_DROPPED) === true;
         }
       }
     } catch {
@@ -161,7 +170,7 @@ type Collect = {
   readonly visit: ScanVisit | undefined;
   stopped: boolean;
   /** Readers left out of this scan (still blocked in an earlier one, or silent past `stuckMs`). */
-  left: number;
+  readonly left: Set<number>;
 };
 
 /**
@@ -200,7 +209,7 @@ export function parallelScanner(options: ParallelScannerOptions): ParallelScanne
     const entry = parseGovProcStat(text);
     if (entry?.pid === pid) {
       c.byPid.set(pid, entry);
-      c.stopped = c.visit?.(entry, c.byPid) === true;
+      c.stopped = c.visit?.(entry, c.byPid, (p) => c.left.has(p % readers.length)) === true;
     }
   };
 
@@ -240,7 +249,7 @@ export function parallelScanner(options: ParallelScannerOptions): ParallelScanne
       const silent = now() - readers[i].heardAt;
       if (silent >= options.stuckMs) {
         c.pending.delete(i);
-        c.left += 1;
+        c.left.add(i);
         readers[i].stuckLogged = true;
         options.log(
           `process-governor: scan reader ${i} silent > ${options.stuckMs} ms (a blocked /proc read); scan completed without its share`,
@@ -268,7 +277,7 @@ export function parallelScanner(options: ParallelScannerOptions): ParallelScanne
         c.pending.add(i);
         return;
       }
-      c.left += 1;
+      c.left.add(i);
       if (!r.stuckLogged) {
         r.stuckLogged = true;
         options.log(
@@ -299,7 +308,7 @@ export function parallelScanner(options: ParallelScannerOptions): ParallelScanne
       pending: new Set(),
       visit: undefined,
       stopped: false,
-      left: 0,
+      left: new Set(),
     };
     const bootStarted = now();
     while (readers.some((r) => !r.booted) && now() - bootStarted < BOOT_WAIT_MS) {
@@ -326,7 +335,7 @@ export function parallelScanner(options: ParallelScannerOptions): ParallelScanne
       pending: new Set(),
       visit,
       stopped: false,
-      left: 0,
+      left: new Set(),
     };
     enlist(c);
     if (c.pending.size === 0) {
@@ -342,7 +351,7 @@ export function parallelScanner(options: ParallelScannerOptions): ParallelScanne
       measured: isMeasured(procRoot, c.byPid),
       byPid: c.byPid,
       stopped: c.stopped,
-      complete: !c.stopped && c.left === 0,
+      complete: !c.stopped && c.left.size === 0,
     };
   };
 
