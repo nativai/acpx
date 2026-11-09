@@ -1066,6 +1066,13 @@ export function registerSharedAgentSubcommands(
     "External prompt message identity to forward through ACP",
     parseMessageId,
   );
+  // UMQ K3 — atrium's one call for N waiting messages (CONTRACTS §1.1); not taught to agents.
+  promptCommand.addOption(
+    new Option(
+      "--batch-file <path>",
+      "Deliver a batch file v1 as ONE submission (use - for stdin); requires --no-wait",
+    ).hideHelp(),
+  );
   promptCommand.action(async function (this: Command, promptParts: string[], flags: PromptFlags) {
     await handlePrompt(explicitAgentName, promptParts, flags, this, config);
   });

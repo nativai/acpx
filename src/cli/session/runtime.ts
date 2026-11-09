@@ -234,7 +234,7 @@ const INTERRUPT_CANCEL_WAIT_MS = 2_500;
 
 type RunSessionPromptOptions = Omit<
   SessionSendOptions,
-  "errorEmissionPolicy" | "maxQueueDepth" | "sessionId" | "ttlMs" | "waitForCompletion"
+  "batch" | "errorEmissionPolicy" | "maxQueueDepth" | "sessionId" | "ttlMs" | "waitForCompletion"
 > & {
   sessionRecordId: string;
   requestId?: string;

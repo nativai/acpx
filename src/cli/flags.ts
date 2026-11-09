@@ -93,6 +93,8 @@ export type PromptFlags = SessionSelectorFlags & {
   wait?: boolean;
   file?: string;
   messageId?: string;
+  /** UMQ K3 — `--batch-file <path|->`: one submission for N messages (atrium only). */
+  batchFile?: string;
 };
 
 export type ExecFlags = {

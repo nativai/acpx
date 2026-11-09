@@ -57,6 +57,7 @@ import {
   releaseQueueOwnerLease,
   hasLiveProcessGroup,
   tryAcquireQueueOwnerLease,
+  trySubmitBatchToRunningOwner,
   trySubmitToRunningOwner,
   type QueueOwnerLease,
   signalProcessGroup,
@@ -174,6 +175,24 @@ async function submitToRunningOwner(
   options: SessionSendOptions,
   waitForCompletion: boolean,
 ): Promise<SessionSendOutcome | undefined> {
+  if (options.batch) {
+    return await trySubmitBatchToRunningOwner({
+      sessionId: options.sessionId,
+      members: options.batch,
+      permissionMode: options.permissionMode,
+      nonInteractivePermissions: options.nonInteractivePermissions,
+      permissionPolicy: options.permissionPolicy,
+      outputFormatter: options.outputFormatter,
+      errorEmissionPolicy: options.errorEmissionPolicy,
+      timeoutMs: options.timeoutMs,
+      suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
+      promptRetries: options.promptRetries,
+      codexSubscriptionCapWeeklyPercent: options.codexSubscriptionCapWeeklyPercent,
+      verbose: options.verbose,
+      sessionOptions: options.sessionOptions,
+      onSubmitAccepted: options.onSubmitAccepted,
+    });
+  }
   return await trySubmitToRunningOwner({
     sessionId: options.sessionId,
     messageId: options.messageId,
@@ -2251,7 +2270,8 @@ export async function spawnAndAwaitQueueOwner(
 // session reopened since the read costs one loud, retryable error, while
 // accepting one closed since the read falls through to the owner refusal.
 function assertRecordOpenForCliPrompt(record: SessionRecord, options: SessionSendOptions): void {
-  if (options.messageId !== undefined || !record.closed) {
+  // A batch's members all carry message ids (atrium's): the owner-side terminal covers them.
+  if (options.messageId !== undefined || options.batch !== undefined || !record.closed) {
     return;
   }
   throw new SessionClosedError(record.acpxRecordId);
