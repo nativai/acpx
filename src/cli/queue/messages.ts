@@ -31,23 +31,6 @@ import type {
 
 type QueueSessionOptions = NonNullable<AcpClientOptions["sessionOptions"]>;
 
-/**
- * UMQ K5/K6 (CONTRACTS §6.3) — the per-task fields of `submit_prompt`, nothing else: what a routed
- * agent prompt asks of ITS turn, carried opaquely through atrium's queue and handed back per member.
- * acpx owns this schema; {@link parseMemberTaskOptions} is its one validator (the same field parsers
- * `submit_prompt` uses). A member's options win over the call's; a member with none runs with the
- * call's.
- */
-export type MemberTaskOptions = {
-  permissionMode?: PermissionMode;
-  nonInteractivePermissions?: NonInteractivePermissionPolicy;
-  permissionPolicy?: PermissionPolicy;
-  timeoutMs?: number;
-  promptRetries?: number;
-  codexSubscriptionCapWeeklyPercent?: number;
-  sessionOptions?: QueueSessionOptions;
-};
-
 export type QueueSubmitRequest = {
   type: "submit_prompt";
   requestId: string;
@@ -68,6 +51,54 @@ export type QueueSubmitRequest = {
   // Keep-warm-while-engaged: when set, the running owner adopts this as its new
   // idle TTL (ms; 0 = keep alive forever). Absent => leave the owner's TTL as-is.
   ttlMs?: number;
+};
+
+/**
+ * UMQ K3/K6 (CONTRACTS §6.3) — the per-task fields of `submit_prompt`, nothing else: what a batch
+ * member may carry of its own. A member's options win over the call's; members whose options differ
+ * are different turns (`nextBatch`).
+ */
+export type MemberTaskOptions = {
+  permissionMode?: PermissionMode;
+  nonInteractivePermissions?: NonInteractivePermissionPolicy;
+  permissionPolicy?: PermissionPolicy;
+  timeoutMs?: number;
+  promptRetries?: number;
+  codexSubscriptionCapWeeklyPercent?: number;
+  sessionOptions?: QueueSessionOptions;
+};
+
+export type QueueBatchMember = {
+  messageId: string;
+  /** The members' text join, for logs. */
+  message: string;
+  prompt: PromptInput;
+  options?: MemberTaskOptions;
+};
+
+/**
+ * UMQ K3 (CONTRACTS §1.3) — ONE submission for N messages. Sent ONLY to an owner whose lease lists
+ * `submit_prompt_batch` in `protocolFeatures` (`ownerSupportsBatchSubmit`): an older owner answers an
+ * unknown type under requestId "unknown", which the client reads as a stale protocol and kills it.
+ * The call's turn options apply to every member without options of its own.
+ */
+export type QueueSubmitPromptBatchRequest = {
+  type: "submit_prompt_batch";
+  requestId: string;
+  ownerGeneration?: number;
+  members: QueueBatchMember[];
+  permissionMode: PermissionMode;
+  resumePolicy?: SessionResumePolicy;
+  nonInteractivePermissions?: NonInteractivePermissionPolicy;
+  permissionPolicy?: PermissionPolicy;
+  timeoutMs?: number;
+  suppressSdkConsoleErrors?: boolean;
+  promptRetries?: number;
+  codexSubscriptionCapWeeklyPercent?: number;
+  sessionOptions?: QueueSessionOptions;
+  ttlMs?: number;
+  /** Always false: a batch has no caller streaming its turn. */
+  waitForCompletion: false;
 };
 
 export type QueueCancelRequest = {
@@ -184,6 +215,7 @@ export type QueueScheduleCloseRequest = {
 
 export type QueueRequest =
   | QueueSubmitRequest
+  | QueueSubmitPromptBatchRequest
   | QueueCancelRequest
   | QueueSetModeRequest
   | QueueSetModelRequest
@@ -645,6 +677,8 @@ function parseTypedQueueRequest(
   switch (request.type) {
     case "submit_prompt":
       return parseSubmitRequest(request, context);
+    case "submit_prompt_batch":
+      return parseSubmitPromptBatchRequest(request, context);
     case "drain_deliveries":
       return parseDrainDeliveriesRequest(request, context);
     case "set_mode":
@@ -771,58 +805,114 @@ function parseSubmitRequestFields(
   return parsed as ParsedSubmitRequestFields;
 }
 
-/**
- * `undefined` = no options; `null` = invalid (a routed send fails at the CLI, exit 2, before any
- * POST); otherwise the validated options. An unknown key is invalid — the schema is closed.
- */
-export function parseMemberTaskOptions(raw: unknown): MemberTaskOptions | null | undefined {
-  const record = raw == null ? undefined : asRecord(raw);
-  if (raw == null) {
-    return undefined;
-  }
-  if (!record || Object.keys(record).some((key) => !MEMBER_TASK_OPTION_KEYS.has(key))) {
+// UMQ K3 — one parser for the batch, built from the SAME field parsers `submit_prompt` uses; any
+// member failing validation fails the whole request (`QUEUE_REQUEST_INVALID`, nothing enqueued).
+function parseSubmitPromptBatchRequest(
+  request: Record<string, unknown>,
+  context: QueueRequestContext,
+): QueueSubmitPromptBatchRequest | null {
+  if (request.waitForCompletion !== false) {
     return null;
   }
-  const parsed = parseMemberTaskFields(record);
-  if (parsed === null) {
+  const members = parseBatchMembers(request.members);
+  const call = parseSubmitRequestFields({ ...request, message: "", waitForCompletion: false });
+  if (!members || !call) {
     return null;
   }
-  const options: MemberTaskOptions = Object.fromEntries(
-    Object.entries(parsed).filter(([, value]) => value !== undefined),
-  );
-  return Object.keys(options).length > 0 ? options : undefined;
+  return {
+    type: "submit_prompt_batch",
+    requestId: context.requestId,
+    ownerGeneration: context.ownerGeneration,
+    members,
+    permissionMode: call.permissionMode,
+    ...(call.resumePolicy !== undefined ? { resumePolicy: call.resumePolicy } : {}),
+    nonInteractivePermissions: call.nonInteractivePermissions,
+    ...(call.permissionPolicy !== undefined ? { permissionPolicy: call.permissionPolicy } : {}),
+    timeoutMs: context.timeoutMs,
+    ...(call.suppressSdkConsoleErrors !== undefined
+      ? { suppressSdkConsoleErrors: call.suppressSdkConsoleErrors }
+      : {}),
+    ...(call.promptRetries !== undefined ? { promptRetries: call.promptRetries } : {}),
+    ...(call.codexSubscriptionCapWeeklyPercent !== undefined
+      ? { codexSubscriptionCapWeeklyPercent: call.codexSubscriptionCapWeeklyPercent }
+      : {}),
+    ...(call.sessionOptions !== undefined ? { sessionOptions: call.sessionOptions } : {}),
+    ...(call.ttlMs !== undefined ? { ttlMs: call.ttlMs } : {}),
+    waitForCompletion: false,
+  };
 }
 
-const MEMBER_TASK_OPTION_KEYS: ReadonlySet<string> = new Set([
-  "permissionMode",
-  "nonInteractivePermissions",
-  "permissionPolicy",
-  "timeoutMs",
-  "promptRetries",
-  "codexSubscriptionCapWeeklyPercent",
-  "sessionOptions",
-]);
+function parseBatchMembers(value: unknown): QueueBatchMember[] | null {
+  if (!Array.isArray(value) || value.length === 0) {
+    return null;
+  }
+  const members: QueueBatchMember[] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    const member = parseBatchMember(raw);
+    if (!member || seen.has(member.messageId)) {
+      return null;
+    }
+    seen.add(member.messageId);
+    members.push(member);
+  }
+  return members;
+}
 
-function parseMemberTaskFields(record: Record<string, unknown>): MemberTaskOptions | null {
+function parseBatchMember(raw: unknown): QueueBatchMember | null {
+  const member = asRecord(raw);
+  if (
+    !member ||
+    !isNonEmptyString(member.messageId) ||
+    typeof member.message !== "string" ||
+    !isPromptInput(member.prompt) ||
+    member.prompt.length === 0
+  ) {
+    return null;
+  }
+  const options = parseMemberTaskOptions(member.options);
+  if (options === null) {
+    return null;
+  }
+  return {
+    messageId: member.messageId,
+    message: member.message,
+    prompt: member.prompt,
+    ...(options !== undefined ? { options } : {}),
+  };
+}
+
+/** UMQ K6 — `MemberTaskOptions`, validated by `submit_prompt`'s own field parsers. `null` = invalid. */
+export function parseMemberTaskOptions(value: unknown): MemberTaskOptions | undefined | null {
+  if (value == null) {
+    return undefined;
+  }
+  const raw = asRecord(value);
+  if (!raw) {
+    return null;
+  }
   const parsed = {
-    permissionMode: parseOptionalValue(record.permissionMode, isPermissionMode),
+    permissionMode: parseOptionalValue(raw.permissionMode, isPermissionMode),
     nonInteractivePermissions: parseOptionalValue(
-      record.nonInteractivePermissions,
+      raw.nonInteractivePermissions,
       isNonInteractivePermissionPolicy,
     ),
-    permissionPolicy: parseOptionalValue(record.permissionPolicy, isPermissionPolicy),
-    // `parsePositiveTimeout` reads an invalid value as absent; here an invalid one is a refusal.
-    timeoutMs:
-      record.timeoutMs == null ? undefined : (parsePositiveTimeout(record.timeoutMs) ?? null),
-    promptRetries: parseNonNegativeInteger(record.promptRetries),
-    codexSubscriptionCapWeeklyPercent: parseCapWeeklyPercent(
-      record.codexSubscriptionCapWeeklyPercent,
-    ),
-    sessionOptions: parseSessionOptions(record.sessionOptions),
+    permissionPolicy: parseOptionalValue(raw.permissionPolicy, isPermissionPolicy),
+    timeoutMs: raw.timeoutMs == null ? undefined : (parsePositiveTimeout(raw.timeoutMs) ?? null),
+    promptRetries: parseNonNegativeInteger(raw.promptRetries),
+    codexSubscriptionCapWeeklyPercent: parseCapWeeklyPercent(raw.codexSubscriptionCapWeeklyPercent),
+    sessionOptions: parseSessionOptions(raw.sessionOptions),
   };
-  return Object.values(parsed).some((value) => value === null)
-    ? null
-    : (parsed as MemberTaskOptions);
+  if (Object.values(parsed).some((field) => field === null)) {
+    return null;
+  }
+  const options: MemberTaskOptions = {};
+  for (const [key, field] of Object.entries(parsed)) {
+    if (field !== undefined) {
+      (options as Record<string, unknown>)[key] = field;
+    }
+  }
+  return options;
 }
 
 function parseCapWeeklyPercent(value: unknown): number | undefined | null {

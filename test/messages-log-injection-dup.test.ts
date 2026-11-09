@@ -154,9 +154,9 @@ async function runParkedInjectionScenario(scenario: Scenario): Promise<LogEntry[
       },
     });
 
-    let midTurnHandler: ((task: QueueTask) => void) | undefined;
+    let midTurnHandler: ((injected: QueueTask[]) => void) | undefined;
     const handlerRegistered = createDeferred<void>();
-    const run = runQueuedTask(record.acpxRecordId, makeTask("req-main", MAIN_PROMPT_TEXT, MAIN), {
+    const run = runQueuedTask(record.acpxRecordId, [makeTask("req-main", MAIN_PROMPT_TEXT, MAIN)], {
       sharedClient: control.client,
       setMidTurnHandler: (handler) => {
         midTurnHandler = handler;
@@ -178,7 +178,7 @@ async function runParkedInjectionScenario(scenario: Scenario): Promise<LogEntry[
     const lockPath = `${recordFile}.lock`;
     await fs.writeFile(lockPath, "{}");
     for (const [index, messageId] of scenario.injections.entries()) {
-      midTurnHandler?.(makeTask(`req-inj-${index}`, INJECTED_PROMPT_TEXT, messageId));
+      midTurnHandler?.([makeTask(`req-inj-${index}`, INJECTED_PROMPT_TEXT, messageId)]);
       // The injection's boundary append has landed, and its record write is now parked.
       await waitFor(
         async () => (await readLog(logPath)).some((e) => e.kind === "User" && e.key === messageId),
@@ -262,9 +262,9 @@ test("output streamed while an injection's boundary write awaits before its slic
       },
     });
 
-    let midTurnHandler: ((task: QueueTask) => void) | undefined;
+    let midTurnHandler: ((injected: QueueTask[]) => void) | undefined;
     const handlerRegistered = createDeferred<void>();
-    const run = runQueuedTask(record.acpxRecordId, makeTask("req-main", MAIN_PROMPT_TEXT, MAIN), {
+    const run = runQueuedTask(record.acpxRecordId, [makeTask("req-main", MAIN_PROMPT_TEXT, MAIN)], {
       sharedClient: control.client,
       setMidTurnHandler: (handler) => {
         midTurnHandler = handler;
@@ -297,7 +297,7 @@ test("output streamed while an injection's boundary write awaits before its slic
       return await originalStat(...args);
     }) as typeof originalStat;
     try {
-      midTurnHandler?.(makeTask("req-inj", INJECTED_PROMPT_TEXT, INJ_A));
+      midTurnHandler?.([makeTask("req-inj", INJECTED_PROMPT_TEXT, INJ_A)]);
       await parked.promise;
       // The turn streams on inside that await: a NEW Agent entry after U(d).
       control.emitSessionUpdate(agentChunk(record.acpSessionId, "continued answer y"));
@@ -338,9 +338,9 @@ test("a claude-pty steer ack settling mid-stream logs the final Agent entry once
       },
     });
 
-    let midTurnHandler: ((task: QueueTask) => void) | undefined;
+    let midTurnHandler: ((injected: QueueTask[]) => void) | undefined;
     const handlerRegistered = createDeferred<void>();
-    const run = runQueuedTask(record.acpxRecordId, makeTask("req-main", MAIN_PROMPT_TEXT, MAIN), {
+    const run = runQueuedTask(record.acpxRecordId, [makeTask("req-main", MAIN_PROMPT_TEXT, MAIN)], {
       sharedClient: control.client,
       setMidTurnHandler: (handler) => {
         midTurnHandler = handler;
@@ -357,13 +357,13 @@ test("a claude-pty steer ack settling mid-stream logs the final Agent entry once
     await sleep(CHECKPOINT_SETTLE_MS);
 
     const injectedResult = createDeferred<void>();
-    midTurnHandler?.(
+    midTurnHandler?.([
       makeTask("req-steer", INJECTED_PROMPT_TEXT, INJ_A, (message) => {
         if (message.type === "result") {
           injectedResult.resolve();
         }
       }),
-    );
+    ]);
     await injectedInFlight.promise;
     // The turn streams on into a NEW Agent entry after the steer's User entry.
     control.emitSessionUpdate(agentChunk(record.acpSessionId, "continued answer y"));

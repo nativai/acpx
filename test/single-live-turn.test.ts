@@ -273,14 +273,14 @@ async function startTurnWithInjection(
   adapter: AdapterControl,
 ): Promise<{ run: Promise<void> }> {
   let injectedOnce = false;
-  const run = runQueuedTask(sessionId, queueTask("req-main", MAIN_PROMPT_TEXT, MAIN_ID, true), {
+  const run = runQueuedTask(sessionId, [queueTask("req-main", MAIN_PROMPT_TEXT, MAIN_ID, true)], {
     sharedClient: adapter.client,
     suppressSdkConsoleErrors: true,
     setMidTurnHandler: (handler) => {
       if (handler && !injectedOnce) {
         injectedOnce = true;
         queueMicrotask(() =>
-          handler(queueTask("req-injected", INJECTED_PROMPT_TEXT, INJECTED_ID, false)),
+          handler([queueTask("req-injected", INJECTED_PROMPT_TEXT, INJECTED_ID, false)]),
         );
       }
     },
@@ -457,7 +457,7 @@ async function backstoppedTurnThenNextTurn(adapter: AdapterControl): Promise<{
       // The next delivered message, on the SAME shared client.
       await runQueuedTask(
         record.acpxRecordId,
-        queueTask("req-second", SECOND_PROMPT_TEXT, SECOND_ID, true),
+        [queueTask("req-second", SECOND_PROMPT_TEXT, SECOND_ID, true)],
         { sharedClient: adapter.client, suppressSdkConsoleErrors: true },
       );
     });
@@ -553,7 +553,7 @@ test("7531ef5c: a REFUSED delivery (closed session) leaves a live previous turn 
       });
       await runQueuedTask(
         record.acpxRecordId,
-        queueTask("req-refused", SECOND_PROMPT_TEXT, SECOND_ID, false),
+        [queueTask("req-refused", SECOND_PROMPT_TEXT, SECOND_ID, false)],
         { sharedClient: adapter.client, suppressSdkConsoleErrors: true },
       );
     });
@@ -577,7 +577,7 @@ test("7531ef5c CONTROL: with no live previous turn, the next turn neither cancel
     const adapter = makeAdapter({ honoursCancel: true });
     await runQueuedTask(
       record.acpxRecordId,
-      queueTask("req-second", SECOND_PROMPT_TEXT, SECOND_ID, true),
+      [queueTask("req-second", SECOND_PROMPT_TEXT, SECOND_ID, true)],
       { sharedClient: adapter.client, suppressSdkConsoleErrors: true },
     );
     assert.equal(adapter.calls.length, 1);

@@ -497,10 +497,10 @@ async function withMainTurn(
       acpSessionId: record.acpSessionId,
       onInjectedPrompt: async () => await new Promise<PromptResponse>(() => {}),
     });
-    let midTurnHandler: ((task: QueueTask) => void) | undefined;
+    let midTurnHandler: ((injected: QueueTask[]) => void) | undefined;
     const run = runQueuedTask(
       record.acpxRecordId,
-      makeTask(`req-${params.mainMessageId}`, params.mainMessageId, MAIN_PROMPT_TEXT),
+      [makeTask(`req-${params.mainMessageId}`, params.mainMessageId, MAIN_PROMPT_TEXT)],
       {
         sharedClient: control.client,
         suppressSdkConsoleErrors: true,
@@ -522,7 +522,7 @@ async function withMainTurn(
         run,
         inject: (task) => {
           assert.ok(midTurnHandler, "the runtime registered its mid-turn handler");
-          midTurnHandler(task);
+          midTurnHandler([task]);
         },
         step: () => {
           toolIds += 1;

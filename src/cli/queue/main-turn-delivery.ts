@@ -46,20 +46,33 @@ export type OpenMainTurnDelivery = {
   consumed?: boolean;
 };
 
-const openMainTurnDeliveries = new Map<string, OpenMainTurnDelivery>();
+// UMQ §5.3 — a LIST per session: a batch turn's main delivery is one entry per member, and a close that
+// cuts the turn terminalizes every member (each through its own claim).
+const openMainTurnDeliveries = new Map<string, OpenMainTurnDelivery[]>();
 
 export function registerOpenMainTurnDelivery(
   sessionId: string,
   delivery: OpenMainTurnDelivery,
 ): void {
-  openMainTurnDeliveries.set(sessionId, delivery);
+  const open = openMainTurnDeliveries.get(sessionId) ?? [];
+  if (!open.includes(delivery)) {
+    open.push(delivery);
+  }
+  openMainTurnDeliveries.set(sessionId, open);
 }
 
 export function unregisterOpenMainTurnDelivery(
   sessionId: string,
   delivery: OpenMainTurnDelivery,
 ): void {
-  if (openMainTurnDeliveries.get(sessionId) === delivery) {
+  const open = openMainTurnDeliveries.get(sessionId);
+  if (!open) {
+    return;
+  }
+  const remaining = open.filter((entry) => entry !== delivery);
+  if (remaining.length > 0) {
+    openMainTurnDeliveries.set(sessionId, remaining);
+  } else {
     openMainTurnDeliveries.delete(sessionId);
   }
 }
@@ -73,28 +86,25 @@ export function claimMainTurnDeliveryTerminal(delivery: OpenMainTurnDelivery): b
   return true;
 }
 
+export type ClaimedMainTurnDelivery = {
+  context: OpenMainTurnDelivery["context"];
+  ownEnd?: MainTurnOwnEnd;
+  consumed?: boolean;
+};
+
 /**
- * The owner-exit half for a session close: removes the session's open main delivery and, when THIS call won the
- * claim, returns what to write — its context, plus `ownEnd` when the turn had already ended on its own (write that
- * turn's `done`), or no `ownEnd` (the close cut it: write the close's code). `undefined` when no main turn is open
- * (an idle close) or the runtime already claimed it (its terminal is written or being written).
+ * The owner-exit half for a session close: removes the session's open main deliveries and, for each
+ * one THIS call won the claim of, returns what to write — its context, plus `ownEnd` when the turn had
+ * already ended on its own (write that turn's `done`), or no `ownEnd` (the close cut it: write the
+ * close's code). Empty when no main turn is open (an idle close) or the runtime already claimed them
+ * (their terminals are written or being written).
  */
-export function claimMainTurnOnSessionClose(
-  sessionId: string,
-):
-  | { context: OpenMainTurnDelivery["context"]; ownEnd?: MainTurnOwnEnd; consumed?: boolean }
-  | undefined {
-  const delivery = openMainTurnDeliveries.get(sessionId);
-  if (!delivery) {
-    return undefined;
-  }
+export function claimMainTurnOnSessionClose(sessionId: string): ClaimedMainTurnDelivery[] {
+  const open = openMainTurnDeliveries.get(sessionId) ?? [];
   openMainTurnDeliveries.delete(sessionId);
-  if (!claimMainTurnDeliveryTerminal(delivery)) {
-    return undefined;
-  }
-  return {
+  return open.filter(claimMainTurnDeliveryTerminal).map((delivery) => ({
     context: delivery.context,
     ...(delivery.ownEnd ? { ownEnd: delivery.ownEnd } : {}),
     ...(delivery.consumed ? { consumed: true } : {}),
-  };
+  }));
 }

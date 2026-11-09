@@ -1002,6 +1002,32 @@ export function hasAgentReplyAfterPrompt(
   return false;
 }
 
+/**
+ * UMQ §22.1 — the text the agent answered since `promptMessageId`'s User row: how a codex-acp
+ * context overflow shows itself (no error; the turn ends with codex's sentence as its only reply).
+ */
+export function agentTextAfterPrompt(
+  conversation: SessionConversation,
+  promptMessageId: string,
+): string {
+  let sawPrompt = false;
+  const parts: string[] = [];
+  for (const message of conversation.messages) {
+    if (!sawPrompt) {
+      sawPrompt = isUserMessage(message) && message.User.id === promptMessageId;
+      continue;
+    }
+    if (isAgentMessage(message)) {
+      for (const content of message.Agent.content) {
+        if ("Text" in content) {
+          parts.push(content.Text);
+        }
+      }
+    }
+  }
+  return parts.join("");
+}
+
 export type RecordSessionUpdateOptions = {
   /**
    * Whether a prompt has ever been submitted to the adapter on this connection.

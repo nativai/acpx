@@ -1,0 +1,5 @@
+{
+  "source": "captured from a real acpx 5c21f164 queue owner (deployed devbox build) answering a raw submit_prompt_batch; evidence: /wisdom/Bricks/ec35727c-f2cf-4075-bc4a-6174400ea087/verification/A1-old-owner/",
+  "capturedAt": "2026-11-09T16:21:13.944Z",
+  "replyLine": "{\"type\":\"error\",\"requestId\":\"unknown\",\"ownerGeneration\":137911376453039,\"code\":\"RUNTIME\",\"detailCode\":\"QUEUE_REQUEST_INVALID\",\"origin\":\"queue\",\"retryable\":false,\"message\":\"Invalid queue request\"}"
+}

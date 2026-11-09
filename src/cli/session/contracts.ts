@@ -20,6 +20,7 @@ import type {
   SessionResumePolicy,
   SessionRecord,
 } from "../../types.js";
+import type { BatchFileMember } from "../batch-file.js";
 
 type TimedRunOptions = {
   timeoutMs?: number;
@@ -231,6 +232,11 @@ export type SessionSendOptions = {
    * message ledger's accept point (`cli/message-ledger.ts`). Never sent to the owner.
    */
   onSubmitAccepted?: () => void;
+  /**
+   * UMQ K3 — `prompt --batch-file`: ONE submission for these members, in delivery order (`prompt`
+   * is then the head's). Sent as `submit_prompt_batch` only to an owner whose lease lists it.
+   */
+  batch?: BatchFileMember[];
   ttlMs?: number;
   maxQueueDepth?: number;
   client?: AcpClient;

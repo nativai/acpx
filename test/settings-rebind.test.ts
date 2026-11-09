@@ -381,7 +381,7 @@ test("NA3 GA2: the pre-turn policy rebinds exactly when the binding differs, and
         },
         // The turn-start cwd check (brick 45917618) reads the task only to write a failed
         // terminal for a missing folder; this record's cwd is the temp HOME, which exists.
-        { requestId: "na3-task" } as unknown as QueueTask,
+        [{ requestId: "na3-task" } as unknown as QueueTask],
       );
       const label = JSON.stringify({
         differs: row.differs,

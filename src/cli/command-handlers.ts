@@ -130,6 +130,12 @@ import {
   warnUncheckedBackgroundTasks,
   type BackgroundTasksJson,
 } from "./background-task-gate.js";
+import {
+  assertBatchFileFlags,
+  type BatchFileMember,
+  BatchFileUsageError,
+  parseBatchFile,
+} from "./batch-file.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import {
   type CreateCwdResolution,
@@ -1655,6 +1661,7 @@ async function deliverPrompt(params: {
   config: ResolvedAcpxConfig;
   messageId?: string;
   onSubmitAccepted?: () => void;
+  batch?: BatchFileMember[];
 }) {
   const { createOutputFormatter } = await loadOutputModule();
   const { sendSession } = await loadSessionModule();
@@ -1689,6 +1696,7 @@ async function deliverPrompt(params: {
     waitForCompletion: params.waitForCompletion,
     messageId: params.messageId,
     onSubmitAccepted: params.onSubmitAccepted,
+    ...(params.batch ? { batch: params.batch } : {}),
     sessionOptions: sessionOptionsFromGlobalFlags(params.globalFlags),
   });
 }
@@ -1781,7 +1789,13 @@ function routedTaskOptions(
       "the options on this prompt line cannot be carried to atrium's queue",
     );
   }
-  return parsed;
+  return withoutEmptyOptions(parsed);
+}
+
+function withoutEmptyOptions(
+  options: MemberTaskOptions | undefined,
+): MemberTaskOptions | undefined {
+  return options !== undefined && Object.keys(options).length > 0 ? options : undefined;
 }
 
 /** The recipient as a sender names it: the seat's name, else the seat or session id's first 8. */
@@ -1837,6 +1851,68 @@ async function withDirectFallbackRefusal<T>(
   }
 }
 
+/**
+ * UMQ K3 (CONTRACTS §1.1) — `prompt --no-wait --session-id <id> --batch-file <path|->`: atrium's ONE
+ * call for everything waiting for one recipient. A refusal is exit 2 with `acpx: --batch-file <rule>`
+ * on stderr, and nothing is submitted. Exit 0 = the owner accepted every member.
+ */
+async function handleBatchPrompt(
+  explicitAgentName: string | undefined,
+  promptParts: string[],
+  flags: PromptFlags & { batchFile: string },
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const members = await readBatchMembersOrExit(flags, promptParts, globalFlags.cwd);
+  validateExplicitCredentialFlags(globalFlags);
+  const outputPolicy = resolveRequestedOutputPolicy(globalFlags);
+  const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
+  const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const { printPromptSessionBanner, printQueuedPromptByFormat } = await loadOutputRenderModule();
+  const selector = resolveSessionTargetSelector({ flags, command });
+  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  await printPromptSessionBanner(record, agent.cwd, outputPolicy.format, outputPolicy.jsonStrict);
+  const result = await deliverPrompt({
+    sessionId: record.acpxRecordId,
+    prompt: members[0].prompt,
+    waitForCompletion: false,
+    globalFlags,
+    permissionMode,
+    permissionPolicy,
+    outputPolicy,
+    config,
+    batch: members,
+  });
+  if ("queued" in result) {
+    printQueuedPromptByFormat(result, outputPolicy.format);
+  }
+}
+
+async function readBatchMembersOrExit(
+  flags: PromptFlags & { batchFile: string },
+  promptParts: string[],
+  cwd: string,
+): Promise<BatchFileMember[]> {
+  try {
+    assertBatchFileFlags(flags, promptParts);
+    const source =
+      flags.batchFile === "-"
+        ? await readPromptInputFromStdin()
+        : await fs.readFile(path.resolve(cwd, flags.batchFile), "utf8").catch(() => {
+            throw new BatchFileUsageError(`cannot read ${flags.batchFile}`);
+          });
+    return parseBatchFile(source);
+  } catch (error) {
+    if (error instanceof BatchFileUsageError) {
+      process.stderr.write(`acpx: ${error.message}\n`);
+      process.exit(EXIT_CODES.USAGE);
+    }
+    throw error;
+  }
+}
+
 export async function handlePrompt(
   explicitAgentName: string | undefined,
   promptParts: string[],
@@ -1844,6 +1920,16 @@ export async function handlePrompt(
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
+  if (flags.batchFile !== undefined) {
+    await handleBatchPrompt(
+      explicitAgentName,
+      promptParts,
+      { ...flags, batchFile: flags.batchFile },
+      command,
+      config,
+    );
+    return;
+  }
   const globalFlags = resolveGlobalFlags(command, config);
   // ⚠️ THERE USED TO BE AN ORPHAN HARNESS-CONFIG-DIR SWEEP HERE, ON EVERY PROMPT
   // (brick 433f6bf8). REMOVED 2026-09-30 (brick d1e12500) — DO NOT REBUILD IT
@@ -6061,5 +6147,4 @@ export async function handleSessionsRepairAccountSeam(
     process.stdout.write(`${result.repaired.length}\n`);
     return;
   }
-  process.stdout.write(`${formatAccountSeamRepairResult(result)}\n`);
-}
+  process.stdout.write(`${formatAccountSeamRepairResult(result)}\n`

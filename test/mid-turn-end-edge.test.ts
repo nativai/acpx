@@ -118,7 +118,7 @@ test(
           assert.equal(owner.queueDepth(), 1, "the raced steer is in the owner's pending queue");
 
           // The owner loop's next pull returns it as the next sequential turn.
-          const task = await owner.nextTask(0);
+          const task = await owner.nextBatch(0).then((batch) => batch?.[0]);
           assert.ok(task, "nextTask returns the raced steer for a post-turn turn");
         } finally {
           socket.end();

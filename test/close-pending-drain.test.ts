@@ -121,9 +121,12 @@ test("T-RACE-1: a Monitor registering DURING an unforced close's drain ABORTS it
       assert.equal(owner.isDraining(), false, "P1 is not the irreversible drain");
       // A runtime parked in nextTask during P1 gets nothing yet…
       let parkedResult: unknown = "pending";
-      const parked = owner.nextTask(10_000).then((task) => {
-        parkedResult = task;
-      });
+      const parked = owner
+        .nextBatch(10_000)
+        .then((batch) => batch?.[0])
+        .then((task) => {
+          parkedResult = task;
+        });
       const s1 = await submit(socketPath, "s1");
       assert.equal(s1.type, "error");
       assert.equal(s1.detailCode, QUEUE_OWNER_CLOSE_PENDING_DETAIL_CODE);

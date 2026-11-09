@@ -210,7 +210,7 @@ async function withAcceptedNoWaitTask(
       );
       const accepted = (await nextJsonLine(lines[Symbol.asyncIterator]())) as { type: string };
       assert.equal(accepted.type, "accepted", "the owner accepted the task — custody is ours");
-      const task = await owner.nextTask();
+      const task = await owner.nextBatch().then((batch) => batch?.[0]);
       assert(task);
       return task;
     };
@@ -239,7 +239,7 @@ test("b8e251eb: an accepted no-wait task whose turn-start record write throws ge
     try {
       ({ stderr } = await captureStderr(
         async () =>
-          await runQueuedTask(sessionId, task, {
+          await runQueuedTask(sessionId, [task], {
             sharedClient: mock.client,
             suppressSdkConsoleErrors: true,
           }),
@@ -281,7 +281,7 @@ test("b8e251eb: a NON-outbox failure before the turn starts gets the same defini
     await fs.writeFile(sessionFilePath(home, sessionId), "{not json", "utf8");
     const { stderr } = await captureStderr(
       async () =>
-        await runQueuedTask(sessionId, task, {
+        await runQueuedTask(sessionId, [task], {
           sharedClient: mock.client,
           suppressSdkConsoleErrors: true,
         }),
@@ -312,7 +312,7 @@ test("b8e251eb: a turn that started and then failed keeps exactly ONE terminal (
     });
     await captureStderr(
       async () =>
-        await runQueuedTask(sessionId, task, {
+        await runQueuedTask(sessionId, [task], {
           sharedClient: mock.client,
           suppressSdkConsoleErrors: true,
         }),
@@ -345,7 +345,7 @@ test("b8e251eb F2: a re-drive of a message whose first attempt never reached the
     adapterStarts = false;
     await captureStderr(
       async () =>
-        await runQueuedTask(sessionId, task, {
+        await runQueuedTask(sessionId, [task], {
           sharedClient: mock.client,
           suppressSdkConsoleErrors: true,
         }),
@@ -358,7 +358,7 @@ test("b8e251eb F2: a re-drive of a message whose first attempt never reached the
     const redriven = await submit("acpx-b8e251eb-f2-redrive");
     await captureStderr(
       async () =>
-        await runQueuedTask(sessionId, redriven, {
+        await runQueuedTask(sessionId, [redriven], {
           sharedClient: mock.client,
           suppressSdkConsoleErrors: true,
         }),

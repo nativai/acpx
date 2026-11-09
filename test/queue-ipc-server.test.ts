@@ -87,7 +87,7 @@ test("SessionQueueOwner handles control requests and nextTask timeouts", async (
     });
 
     try {
-      assert.equal(await owner.nextTask(10), undefined);
+      assert.equal(await owner.nextBatch(10).then((batch) => batch?.[0]), undefined);
 
       const cancelSocket = await connectSocket(lease.socketPath);
       const cancelLines = readline.createInterface({ input: cancelSocket });
@@ -249,7 +249,7 @@ test("SessionQueueOwner nextTask without ttl waits until a prompt arrives", asyn
     });
 
     try {
-      const pendingTask = owner.nextTask(undefined);
+      const pendingTask = owner.nextBatch(undefined).then((batch) => batch?.[0]);
       const beforePrompt = await Promise.race([
         pendingTask.then(() => "resolved"),
         new Promise<"waiting">((resolve) => {
@@ -353,11 +353,15 @@ test("SessionQueueOwner coalesces concurrent repairs of an externally unlinked s
       };
       assert.equal(accepted.type, "accepted");
       assert.equal(accepted.ownerGeneration, lease.ownerGeneration);
-      const task = await owner.nextTask();
+      const task = await owner.nextBatch().then((batch) => batch?.[0]);
       assert(task);
       assert.equal(task.requestId, "req-after-socket-repair");
       assert.equal(task.messageId, "55555555-5555-4555-8555-555555555555");
-      assert.equal(await owner.nextTask(25), undefined, "repair must not duplicate the task");
+      assert.equal(
+        await owner.nextBatch(25).then((batch) => batch?.[0]),
+        undefined,
+        "repair must not duplicate the task",
+      );
       promptLines.close();
       promptSocket.destroy();
     } finally {
@@ -440,7 +444,7 @@ test("SessionQueueOwner enqueues fire-and-forget prompts and rejects invalid own
       });
       assert.equal(typeof (receivedEvents[0] as { params: { at: unknown } }).params.at, "string");
 
-      const task = await owner.nextTask();
+      const task = await owner.nextBatch().then((batch) => batch?.[0]);
       assert(task);
       assert.equal(task.requestId, "req-submit");
       assert.equal(task.messageId, "11111111-1111-4111-8111-111111111111");
@@ -481,7 +485,7 @@ test("SessionQueueOwner enqueues fire-and-forget prompts and rejects invalid own
       assert.equal(Object.hasOwn(noMessageIdEvent.params, "messageId"), false);
       assert.equal(typeof noMessageIdEvent.params.at, "string");
 
-      const noMessageIdTask = await owner.nextTask();
+      const noMessageIdTask = await owner.nextBatch().then((batch) => batch?.[0]);
       assert(noMessageIdTask);
       assert.equal(noMessageIdTask.requestId, "req-submit-no-message-id");
       assert.equal(noMessageIdTask.messageId, undefined);
@@ -585,7 +589,7 @@ test("SessionQueueOwner rejects stale-generation submit_prompt without enqueuein
       };
       assert.equal(mismatch.type, "error");
       assert.equal(mismatch.detailCode, "QUEUE_OWNER_GENERATION_MISMATCH");
-      assert.equal(await owner.nextTask(25), undefined);
+      assert.equal(await owner.nextBatch(25).then((batch) => batch?.[0]), undefined);
       badLines.close();
       badSocket.destroy();
     } finally {
@@ -650,11 +654,10 @@ test("SessionQueueOwner requeueAll drains buffered tasks in arrival order, not r
       // still jump ahead — arrival time is the single invariant.
       owner.requeueAll([makeDirectTask("older", 500)]);
 
+      // UMQ §5.2: equal turn options ⇒ the whole requeued set is ONE batch, still oldest first.
       const order: string[] = [];
-      for (let i = 0; i < 4; i += 1) {
-        const task = await owner.nextTask(50);
-        assert(task, `expected task ${i}`);
-        order.push(task.requestId);
+      for (let batch = await owner.nextBatch(50); batch; batch = await owner.nextBatch(0)) {
+        order.push(...batch.map((task) => task.requestId));
       }
       assert.deepEqual(order, ["older", "a", "b", "c"]);
     } finally {
@@ -809,7 +812,11 @@ test("P2d: nextTask(0) is a non-blocking peek — returns a pending task at once
     });
     try {
       // Empty queue → the non-blocking peek returns undefined (release proceeds).
-      assert.equal(await owner.nextTask(0), undefined, "empty queue: nextTask(0) is undefined");
+      assert.equal(
+        await owner.nextBatch(0).then((batch) => batch?.[0]),
+        undefined,
+        "empty queue: nextTask(0) is undefined",
+      );
 
       // A task raced into the queue (the TOCTOU window) → nextTask(0) returns it
       // immediately, so the owner processes it instead of releasing.
@@ -829,11 +836,11 @@ test("P2d: nextTask(0) is a non-blocking peek — returns a pending task at once
       const accepted = (await nextJsonLine(promptIterator)) as { type: string };
       assert.equal(accepted.type, "accepted");
 
-      const late = await owner.nextTask(0);
+      const late = await owner.nextBatch(0).then((batch) => batch?.[0]);
       assert(late, "nextTask(0) returns the raced task without blocking");
       assert.equal(late.requestId, "req-p2d-latetask");
       // Consumed → a subsequent peek is empty again.
-      assert.equal(await owner.nextTask(0), undefined);
+      assert.equal(await owner.nextBatch(0).then((batch) => batch?.[0]), undefined);
       promptLines.close();
       promptSocket.destroy();
     } finally {

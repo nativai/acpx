@@ -273,7 +273,7 @@ test("Codex cap denial persists and reaches IPC before client.prompt", async () 
             codexSubscriptionCapWeeklyPercent: 90,
           };
 
-          await runQueuedTask(record.acpxRecordId, task, { sharedClient: client });
+          await runQueuedTask(record.acpxRecordId, [task], { sharedClient: client });
 
           assert.equal(promptCalls, 0, "client.prompt must remain behind Codex cap admission");
           const terminal = sent.find((message) => message.type === "error");

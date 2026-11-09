@@ -104,6 +104,8 @@ export type QueueOwnerRecord = {
   host?: string;
   /** See {@link ownerRebindsSettings}. */
   settingsRebind?: 1;
+  /** See {@link ownerSupportsBatchSubmit}. */
+  protocolFeatures?: readonly string[];
 };
 
 export type QueueOwnerLease = {
@@ -115,6 +117,7 @@ export type QueueOwnerLease = {
   processIdentity?: QueueOwnerProcessIdentity;
   host?: string;
   settingsRebind?: 1;
+  protocolFeatures?: readonly string[];
 };
 
 export type QueueOwnerStatus = {
@@ -247,7 +250,29 @@ function parseQueueOwnerRecord(raw: unknown): QueueOwnerRecord | null {
     ...(processIdentity ? { processIdentity } : {}),
     ...(typeof record.host === "string" ? { host: record.host } : {}),
     ...(record.settingsRebind === 1 ? { settingsRebind: 1 as const } : {}),
+    ...protocolFeaturesField(record.protocolFeatures),
   };
+}
+
+// Kept only as an array; within it, only the string entries (unknown feature names are kept).
+function protocolFeaturesField(value: unknown): { protocolFeatures?: readonly string[] } {
+  if (!Array.isArray(value)) {
+    return {};
+  }
+  return { protocolFeatures: value.filter((entry): entry is string => typeof entry === "string") };
+}
+
+/** The request types this build's owners understand beyond `submit_prompt` (UMQ K3). */
+export const OWNER_PROTOCOL_FEATURES: readonly string[] = ["submit_prompt_batch"];
+
+/**
+ * UMQ K3 — PERMANENT, not scaffolding. An owner started by an older acpx can live indefinitely
+ * (ttl 0, a live background task), and it answers an unknown request type under requestId
+ * "unknown" — which the client reads as a stale protocol and KILLS that owner (`ipc.ts`). So a
+ * `submit_prompt_batch` goes only to an owner whose lease lists it; never sent to find out.
+ */
+export function ownerSupportsBatchSubmit(owner: QueueOwnerRecord | undefined | null): boolean {
+  return owner?.protocolFeatures?.includes("submit_prompt_batch") === true;
 }
 
 /**
@@ -881,6 +906,7 @@ function leasePayload(lease: QueueOwnerLease, heartbeatAt: string, queueDepth: n
       ...(lease.processIdentity ? { processIdentity: lease.processIdentity } : {}),
       ...(lease.host ? { host: lease.host } : {}),
       ...(lease.settingsRebind ? { settingsRebind: lease.settingsRebind } : {}),
+      ...(lease.protocolFeatures ? { protocolFeatures: lease.protocolFeatures } : {}),
     },
     null,
     2,
@@ -934,6 +960,7 @@ async function acquireUnderGuard(
     ...ownLeaseIdentity(),
     host: processHostName(),
     settingsRebind: 1,
+    protocolFeatures: OWNER_PROTOCOL_FEATURES,
   };
   // Exclusive hardlink acquire (port of 92cd5f8d): the lease never exists without its content.
   if (await tryCreateLockFile(lease.lockPath, leasePayload(lease, createdAt, 0))) {
