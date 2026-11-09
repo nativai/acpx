@@ -347,8 +347,10 @@ def n5(gov):
 
 
 # TE's X2: the classic `&` binary fork bomb, depth-capped at 9 (<= 1,023 shells + 512 leaf sleeps). A
-# doubling bomb used to finish inside one idle 1 s interval (killed at 1,535 = the whole capped tree);
-# with the §19 D3 pid watcher it must die at <= 256.
+# doubling bomb used to finish inside one idle 1 s interval (killed at 1,535 = the whole capped tree).
+# CONCEPTION §19 D3a criterion: with the storm at nice 19 (NICE_STORM=19, ≈ production's nice gap), every
+# trial is killed at <= 400 processes; with storm and governor both at nice 0 only 0 survivors is required
+# (scheduling dominates there, not the watcher). 0 survivors at +1 s and +4 s always.
 BOMB = 'unset FUNCNEST; b(){ if [ "$1" -ge 9 ]; then sleep 30; return; fi; b $(($1+1)) & b $(($1+1)) & wait; }; b 0'
 
 
@@ -374,7 +376,9 @@ def n6(gov):
     after3 = len(members(sid))
     end_session(sid)
     first = killed[0] if killed else {}
-    return dict(test="N6", nice_storm=nice, pass_=bool(killed) and (first.get("processes") or 10**6) <= 256 and survivors == 0 and after3 == 0,
+    bound = 400 if nice > 0 else 10**6
+    return dict(test="N6", nice_storm=nice, bound=bound if nice > 0 else None,
+                pass_=bool(killed) and (first.get("processes") or 10**6) <= bound and survivors == 0 and after3 == 0,
                 killed_at_processes=first.get("processes"), rounds=first.get("rounds"), kill_ms=first.get("kill_ms"),
                 sampler_peak=s.peak, survivors_after_1s=survivors, survivors_after_4s=after3, kills=len(killed))
 

@@ -740,23 +740,34 @@ test("§19 D3 trigger arithmetic: last pid from /proc/loadavg, pids allocated in
   assert.equal(pidsAllocated(32_760, 310, 32_768), 18, "a small pid_max wraps the same way");
 });
 
-test("§19 D3 pid watcher: < 16 new pids per tick is quiet; ≥ 16 asks for a scan NOW and starts fast mode", (t) => {
+test("§19 D3a pid watcher: 10 ms; counts pids since the LAST FULL SCAN — 10 new pids per tick trigger on the SECOND tick", (t) => {
+  assert.equal(K.pidWatchIntervalMs, 10);
+  assert.equal(K.pidWatchTrigger, 16);
   const box = stormBox(t, 2);
   const loadavg = path.join(box.proc, "loadavg");
+  const lastPid = (pid: number) => fs.writeFileSync(loadavg, `0.1 0.1 0.1 1/100 ${pid}\n`);
   fs.mkdirSync(path.join(box.proc, "sys", "kernel"), { recursive: true });
   fs.writeFileSync(path.join(box.proc, "sys", "kernel", "pid_max"), "32768\n");
-  fs.writeFileSync(loadavg, "0.1 0.1 0.1 1/100 32700\n");
+  lastPid(32700);
   const governor = startedGovernor(box);
-  assert.deepEqual(governor.tick(), { nextMs: K.scanIntervalMs });
-  fs.writeFileSync(loadavg, "0.1 0.1 0.1 1/100 32715\n");
-  assert.equal(governor.pidWatch(), false, "15 pids: idle noise");
-  fs.writeFileSync(loadavg, "0.1 0.1 0.1 1/100 32731\n");
-  assert.equal(governor.pidWatch(), true, "16 pids: scan now");
-  assert.deepEqual(governor.tick(), { nextMs: K.fastScanIntervalMs }, "and fast mode");
-  fs.writeFileSync(loadavg, "0.1 0.1 0.1 1/100 320\n"); // 32731 → wrap → 320: 36 + 21 = 57 pids
+  assert.deepEqual(
+    governor.tick(),
+    { nextMs: K.scanIntervalMs },
+    "the scan sets the baseline 32700",
+  );
+  lastPid(32710);
+  assert.equal(governor.pidWatch(), false, "tick 1: 10 since the scan");
+  lastPid(32720);
+  assert.equal(governor.pidWatch(), true, "tick 2: 20 since the scan — cumulative, not per tick");
+  assert.deepEqual(
+    governor.tick(),
+    { nextMs: K.fastScanIntervalMs },
+    "the forced scan runs in fast mode",
+  );
+  lastPid(32730);
+  assert.equal(governor.pidWatch(), false, "the scan reset the baseline to 32720");
+  lastPid(310); // 32720 → wrap at 32768 → 310: 47 + 11 = 58
   assert.equal(governor.pidWatch(), true, "a wrap is counted, not read as a negative");
-  fs.writeFileSync(loadavg, "0.1 0.1 0.1 1/100 321\n");
-  assert.equal(governor.pidWatch(), false);
 });
 
 test("self-restart: a changed entry file, stable for 10 s, makes the governor exit 0 between sweeps", (t) => {

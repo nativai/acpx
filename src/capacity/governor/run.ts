@@ -145,6 +145,8 @@ type Verification = {
   sweepNo: number;
   sparePgid: number | undefined;
   rule: GovernorRule;
+  /** `C` when the kill happened: the +1 s check logs its drop (§19 D3a; no schema change). */
+  committedAtKill?: number;
 };
 
 /** The container's memory as R2 and events read it: `C`, `L` (or `--limit-bytes`), PSI full. */
@@ -434,7 +436,7 @@ export class Governor {
     this.applyNice();
     this.bootTimeMs = readBootTimeMs(this.deps.procRoot);
     this.pidMax = readPidMax(this.deps.procRoot) ?? DEFAULT_PID_MAX;
-    this.lastPid = this.readLastPid();
+    this.scanBaselinePid = this.readLastPid();
     if (this.state.stopsInFlight.length > 0) {
       this.finishStopsInFlight();
     }
@@ -619,6 +621,7 @@ export class Governor {
    */
   tick(): { nextMs: number } | { exitCode: number } {
     const nowMs = this.deps.now();
+    this.markScanBaseline();
     const scan = scanProcTable(this.deps.procRoot, parseGovProcStat);
     this.latestByPid = scan.byPid;
     const recheck = this.recheckSystem(nowMs, scan.measured ? scan.byPid : undefined);
@@ -901,6 +904,7 @@ export class Governor {
         sweepNo: 1,
         sparePgid,
         rule,
+        committedAtKill: delay === VERIFY_DELAYS_MS[0] ? box.committed : undefined,
       });
     }
     this.peakKilled(view);
@@ -974,11 +978,23 @@ export class Governor {
     const ctx = this.classifyContext();
     const { sessions } = classifySessions(this.latestByPid, ctx, this.memory, nowMs);
     for (const v of due) {
+      this.logCommittedDrop(v, box);
       const view = sessions.get(v.sid);
       if (view && sessionKey(view) === v.key) {
         this.verifyOne(view, v, nowMs, box);
       }
     }
+  }
+
+  /** The +1 s check after an R1/R2 kill logs the drop in committed memory (one line, no event). */
+  private logCommittedDrop(v: Verification, box: BoxReading): void {
+    if (v.committedAtKill === undefined || box.committed === undefined) {
+      return;
+    }
+    const mib = Math.round((v.committedAtKill - box.committed) / 1048576);
+    this.deps.log(
+      `process-governor +1s after the kill of sid=${v.sid}: committed ${Math.round(v.committedAtKill / 1048576)} -> ${Math.round(box.committed / 1048576)} MiB (dropped ${mib} MiB)`,
+    );
   }
 
   private verifyOne(view: SessionView, v: Verification, nowMs: number, box: BoxReading): void {
@@ -1005,7 +1021,12 @@ export class Governor {
       roundIntervalMs: this.g.sweepRoundIntervalMs,
     });
     for (const delay of VERIFY_DELAYS_MS) {
-      this.verifications.push({ ...v, dueMs: nowMs + delay, sweepNo: v.sweepNo + 1 });
+      this.verifications.push({
+        ...v,
+        dueMs: nowMs + delay,
+        sweepNo: v.sweepNo + 1,
+        committedAtKill: undefined,
+      });
     }
   }
 
@@ -1324,8 +1345,14 @@ export class Governor {
   }
 
   private lastSeenSignature: string | undefined;
-  private lastPid: number | undefined;
+  /** The last pid at the start of the last full scan: the watcher's baseline (§19 D3a). */
+  private scanBaselinePid: number | undefined;
   private pidMax = DEFAULT_PID_MAX;
+
+  /** Read BEFORE the scan: pids allocated while scanning count towards the next trigger. */
+  private markScanBaseline(): void {
+    this.scanBaselinePid = this.readLastPid() ?? this.scanBaselinePid;
+  }
 
   private readLastPid(): number | undefined {
     try {
@@ -1336,18 +1363,21 @@ export class Governor {
   }
 
   /**
-   * §19 D3, called every `pidWatchIntervalMs` between scans (~31 µs a read): true when at least
-   * `pidWatchTrigger` pids were allocated since the previous call — the caller then scans AT ONCE, and
-   * fast mode starts. A doubling bomb no longer gets a whole idle interval.
+   * §19 D3a, called every `pidWatchIntervalMs` between scans (~31 µs a read): true when at least
+   * `pidWatchTrigger` pids were allocated since the start of the LAST FULL SCAN — the caller then scans
+   * AT ONCE (which resets the baseline), and fast mode starts.
+   *
+   * ⚠️ DO NOT MAKE THIS PER-TICK (compare with the previous read). It looks equivalent and it is the bug
+   * D3a fixed: 16 per 10 ms tick is ~1,600 pids/s, so a slower storm never trips it and falls back to the
+   * 1 s base scan. Row: "§19 D3a … 10 new pids per tick trigger on the SECOND tick".
    */
   pidWatch(): boolean {
     const current = this.readLastPid();
-    const previous = this.lastPid;
-    this.lastPid = current;
-    if (current === undefined || previous === undefined) {
+    const baseline = this.scanBaselinePid;
+    if (current === undefined || baseline === undefined) {
       return false;
     }
-    if (pidsAllocated(previous, current, this.pidMax) < this.g.pidWatchTrigger) {
+    if (pidsAllocated(baseline, current, this.pidMax) < this.g.pidWatchTrigger) {
       return false;
     }
     this.fastUntilMs = this.deps.now() + this.g.fastHoldMs;

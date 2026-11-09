@@ -66,9 +66,10 @@ export type GovernorConstants = {
   readonly fastSizeProcesses: number;
   readonly fastHoldMs: number;
   /**
-   * §19 D3 — between scans, every `pidWatchIntervalMs` the governor reads the last pid allocated in its
-   * own pid namespace (`/proc/loadavg`, last field); `pidWatchTrigger` or more pids since the previous
-   * read force a scan at once and fast mode. An idle devbox allocates ~1 pid per 50 ms tick.
+   * §19 D3a — between scans, every `pidWatchIntervalMs` the governor reads the last pid allocated in its
+   * own pid namespace (`/proc/loadavg`, last field); `pidWatchTrigger` or more pids allocated since the
+   * LAST FULL SCAN (cumulative, so a storm trips it at any rate) force a scan at once and fast mode. 10 ms,
+   * not 50: measured on a ~8,000 processes/s doubling bomb (CONCEPTION §19 D3a); ~0.3 % of one CPU.
    */
   readonly pidWatchIntervalMs: number;
   readonly pidWatchTrigger: number;
@@ -114,7 +115,7 @@ export const CAPACITY_CONSTANTS: CapacityConstants = {
     fastGrowthProcesses: 16,
     fastSizeProcesses: 32,
     fastHoldMs: 5000,
-    pidWatchIntervalMs: 50,
+    pidWatchIntervalMs: 10,
     pidWatchTrigger: 16,
     victimFloorBytes: 256 * MIB,
     victimFloorFraction: 0.025,
