@@ -143,6 +143,66 @@ test("§19 D5 crossing: the partial-view kill is followed by the full sweep — 
   assert.ok(Number(killed?.rounds) >= 2);
 });
 
+test("§19 D7 first sight: a non-exempt storm first seen in THIS scan is crossed at its 128th member, placed and remembered", async (t) => {
+  const b = box(t);
+  const { claudePid } = b.owner(100, "sess-first-0001", "seat-first-1");
+  b.toolSession(2000, claudePid, 300);
+  const g = b.governor();
+  assert.deepEqual(g.start(), { started: true });
+  g.tick(); // the session's first sight: no earlier full scan placed it
+  await g.settle();
+  assert.match(crossingLine(b) ?? "", /sid=2000 .* on_crossing=12[89]\b/u);
+  assert.deepEqual(b.members(2000), []);
+  const killed = b.events().filter((e) => e.action === "killed");
+  assert.equal(killed.length, 1);
+  assert.equal(
+    killed[0].session_kind,
+    "tool",
+    "placed by the normal classifier on the partial view",
+  );
+  assert.equal(killed[0].session_id, "sess-first-0001", "attributed through the owner lease");
+  assert.ok(b.atriumCalls.length > 0, "the seat is told, as for any attributed kill");
+});
+
+test("§19 D7 first sight never crosses the system session, a token-owner leader, a lease-named sid, or a terminal under governTerminals:false", async (t) => {
+  const b = box(t);
+  b.addMany(200, { ppid: 40, pgid: 6, sid: 6, comm: "node" }, 7000); // system session
+  b.owner(100, "sess-owner-first");
+  b.addMany(200, { ppid: 102, pgid: 100, sid: 100, comm: "bash" }, 8000); // token-owner leader
+  b.add({ pid: 200, ppid: 1, comm: "node" }); // no argv token: only the lease names it
+  b.lease("sess-lease-first", 200);
+  b.addMany(200, { ppid: 200, pgid: 200, sid: 200, comm: "bash" }, 9000);
+  b.add({ pid: 3000, ppid: 41, comm: "bash", tty: 34816 }); // a ttyd terminal
+  b.addMany(200, { ppid: 3000, pgid: 3001, sid: 3000, comm: "bash" }, 10_000);
+  const g = b.governor({}, { governTerminals: false });
+  assert.deepEqual(g.start(), { started: true });
+  g.tick(); // every one of them is a first sight, each past 128
+  await g.settle();
+  assert.equal(b.signals.length, 0);
+  assert.equal(crossingLine(b), undefined);
+  assert.equal(b.events().filter((e) => e.action === "killed").length, 0);
+});
+
+test("§19 D7 first sight WAITS when the leader's argv cannot be read; the full scan then decides as before", async (t) => {
+  const b = box(t);
+  const { claudePid } = b.owner(100, "sess-unreadable-1");
+  b.toolSession(2000, claudePid, 300);
+  fs.rmSync(path.join(b.proc, "2000", "cmdline")); // the leader's owner token: undecidable
+  const g = b.governor();
+  assert.deepEqual(g.start(), { started: true });
+  g.tick();
+  await g.settle();
+  assert.equal(crossingLine(b), undefined, "no crossing on an undecided first sight");
+  assert.ok(
+    b.logs.some((l) => /process-governor sweep sid=2000 /u.test(l)),
+    "the full-scan R1 still acted",
+  );
+  assert.ok(
+    !b.groupKills().includes(2000),
+    "the guard still refuses the unverified leader's own group",
+  );
+});
+
 // ---------------------------------------------------------------------------
 // the parallel scanner
 // ---------------------------------------------------------------------------

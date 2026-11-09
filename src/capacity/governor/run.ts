@@ -17,6 +17,7 @@ import {
   loadGroupMemory,
   type OwnerFacts,
   parseGovProcStat,
+  placeSession,
   rememberedRecord,
   saveGroupMemory,
   type SessionView,
@@ -698,9 +699,9 @@ export class Governor {
 
   /**
    * §19 D5: act on a session the moment the running scan counts its 128th member — the same rule R1
-   * applies after a full scan, on the members seen so far. Only a session an EARLIER full scan placed
-   * (remembered, still the same leader) qualifies; a first sight waits for the full scan, which places
-   * it. The guard runs as always in the sweep, on the seen members, right before the first signal. Safe
+   * applies after a full scan, on the members seen so far. A session an earlier full scan placed
+   * (remembered, still the same leader) qualifies; a first sight qualifies only when the partial view
+   * decides its eligibility (§19 D7, {@link firstSightRecord}), else it waits for the full scan. The guard runs as always in the sweep, on the seen members, right before the first signal. Safe
    * because a pgid never spans sessions (§3.3): a group kill reaches unscanned members of a signalled pgid,
    * and they are by that invariant in this same, already judged session. Then the sweep re-scans and
    * sweeps as usual (round 2 on).
@@ -717,7 +718,7 @@ export class Governor {
   ): boolean {
     const view =
       this.mode === "enforce" && sid !== this.systemSid && sid > 1
-        ? this.crossingView(sid, partial)
+        ? this.crossingView(sid, partial, nowMs)
         : undefined;
     if (
       !view ||
@@ -750,7 +751,11 @@ export class Governor {
   }
 
   /** The session as the partial view shows it, if an earlier full scan placed it; else undefined. */
-  private crossingView(sid: number, partial: Map<number, GovProc>): SessionView | undefined {
+  private crossingView(
+    sid: number,
+    partial: Map<number, GovProc>,
+    nowMs: number,
+  ): SessionView | undefined {
     if (!partial.has(sid)) {
       // The leader is the session's oldest process, so it is normally already read; after a pid wrap it
       // may lie ahead of the cursor — read it now rather than misread the session as leaderless.
@@ -760,12 +765,67 @@ export class Governor {
       }
     }
     const leader = liveLeader(partial, sid);
-    const record = rememberedRecord(this.memory, sid, leader);
+    const record =
+      rememberedRecord(this.memory, sid, leader) ??
+      this.firstSightRecord(sid, partial, leader, nowMs);
     if (!record) {
       return undefined;
     }
     const members = [...partial.values()].filter((p) => p.sid === sid && isLiveState(p.state));
     return sessionView(sid, record, members, leader);
+  }
+
+  /**
+   * CONCEPTION §19 D7: a session first seen in THIS scan may still be crossed, once the partial view decides
+   * R1 eligibility (D4/D5): its leader is alive and read, is not a verified owner (lease on the pid or sid;
+   * the token read answers a plain `absent`), owner identification works, and — under
+   * `governTerminals:false` — the leader's parent is read so a terminal placement can be told. The leader's
+   * ancestors are read fresh (they are not storm processes: those reads do not block), and the session is
+   * placed by the normal classifier and remembered, like any first sight. Anything undecided ⇒ undefined:
+   * the full scan decides, as before D7.
+   *
+   * ⚠️ A LEADERLESS first sight always waits. D7 speaks of the leader "if alive", but a leaderless session's
+   * owner test (§19 D1) is over ALL its members, and a partial view has not read them all — so it is undecided.
+   * Rows: "§19 D7 …".
+   */
+  private firstSightRecord(
+    sid: number,
+    partial: Map<number, GovProc>,
+    leader: GovProc | undefined,
+    nowMs: number,
+  ): GroupRecord | undefined {
+    if (!leader || !this.firstSightDecidable(sid, partial)) {
+      return undefined;
+    }
+    this.readAncestors(leader, partial);
+    if (!this.g.governTerminals && !partial.has(leader.ppid)) {
+      return undefined; // a terminal placement cannot be told without the parent
+    }
+    placeSession(partial, this.classifyContext(), this.memory, nowMs, sid);
+    this.groupsDirty = true;
+    return rememberedRecord(this.memory, sid, leader);
+  }
+
+  /** D7's owner tests on what has been read: no lease on the sid, identification works, token `absent`. */
+  private firstSightDecidable(sid: number, partial: Map<number, GovProc>): boolean {
+    if (this.leaseOwners.has(sid) || !this.ownerIdentificationWorks()) {
+      return false;
+    }
+    // `owner`, or an argv that cannot be read (undecided): no crossing on first sight.
+    return cachedTokenState(this.deps.procRoot, () => partial, this.tokenCache)(sid) === "absent";
+  }
+
+  /** Parent, grandparent, great-grandparent: what placement looks at (harness, adapter, owner). */
+  private readAncestors(leader: GovProc, partial: Map<number, GovProc>): void {
+    let proc: GovProc = leader;
+    for (let depth = 0; depth < 3 && proc.ppid > 1; depth += 1) {
+      const parent = partial.get(proc.ppid) ?? readOneProc(this.deps.procRoot, proc.ppid);
+      if (!parent) {
+        return;
+      }
+      partial.set(parent.pid, parent);
+      proc = parent;
+    }
   }
 
   /** §18 C6: an observe-only governor re-tries the check each minute. */

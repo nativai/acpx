@@ -340,6 +340,30 @@ function isOrphaned(record: GroupRecord, leader: GovProc | undefined): boolean {
   );
 }
 
+/**
+ * §19 D7: place ONE session from a partial scan (the mid-scan crossing on first sight). The caller has read
+ * the leader and its ancestors fresh, so the placement inputs are present; the result is remembered like any
+ * first-sight placement. Undefined when the session has no member in `byPid`.
+ */
+export function placeSession(
+  byPid: ReadonlyMap<number, GovProc>,
+  ctx: ClassifyContext,
+  memory: Map<number, GroupRecord>,
+  nowMs: number,
+  sid: number,
+): Placement | undefined {
+  const c: Classifier = {
+    byPid,
+    bySid: groupBySid(byPid),
+    ctx,
+    memory,
+    nowMs,
+    inProgress: new Set(),
+    changed: false,
+  };
+  return placementOf(c, sid);
+}
+
 export function sessionView(
   sid: number,
   record: GroupRecord,
