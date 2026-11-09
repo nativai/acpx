@@ -37,6 +37,7 @@ import {
   SeatBrickReassignRequiredError,
   writeBrickLink,
 } from "../session/seat-brick-write.js";
+import { isSleepingRecord, SLEEPING_TEXT } from "../session/sleeping.js";
 import type { OutputFormat } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import { parseOutputFormat, resolveGlobalFlags } from "./flags.js";
@@ -1513,6 +1514,8 @@ type SeatHolderSummary = {
   readonly ordinal: number | undefined;
   /** `undefined` means the record could not be resolved — reported, not inferred. */
   readonly open: boolean | undefined;
+  /** UMQ K7: the holder is a sleeping session — no agent has run yet. */
+  readonly sleeping?: true;
 };
 
 /**
@@ -1529,16 +1532,23 @@ async function listSeatHolders(seatId: string): Promise<SeatHolderSummary[]> {
       continue;
     }
     let open: boolean | undefined;
+    let sleeping: true | undefined;
     try {
       const record = await resolveSessionRecord(entry.acpxRecordId);
       open = record.closed !== true;
+      sleeping = isSleepingRecord(record) ? true : undefined;
     } catch (error) {
       if (!(error instanceof SessionNotFoundError)) {
         throw error;
       }
       open = undefined;
     }
-    holders.push({ id: entry.acpxRecordId, ordinal: entry.holderOrdinal, open });
+    holders.push({
+      id: entry.acpxRecordId,
+      ordinal: entry.holderOrdinal,
+      open,
+      ...(sleeping ? { sleeping } : {}),
+    });
   }
   holders.sort(
     (a, b) => (a.ordinal ?? Number.MAX_SAFE_INTEGER) - (b.ordinal ?? Number.MAX_SAFE_INTEGER),
@@ -1593,6 +1603,7 @@ function seatShowJsonPayload(
       id: holder.id,
       ordinal: holder.ordinal ?? null,
       open: holder.open ?? null,
+      ...(holder.sleeping ? { sleeping: true, state: SLEEPING_TEXT } : {}),
     })),
   };
 }
@@ -1616,12 +1627,17 @@ function renderSeatShowText(
   process.stdout.write(`  next_ordinal:  ${row.nextOrdinal}\n`);
   process.stdout.write(`  brick_id:      ${renderSeatBrickLinkText(row.brickId)}\n`);
   process.stdout.write(`  favorite:      ${row.favorite === true ? "yes" : "no"}\n`);
-  process.stdout.write(`  active holder: ${renderActiveHolderText(holderState)}\n`);
+  const activeIsSleeping =
+    holderState.kind === "active" &&
+    holders.some((holder) => holder.id === holderState.holderId && holder.sleeping);
+  process.stdout.write(
+    `  active holder: ${renderActiveHolderText(holderState)}${activeIsSleeping ? ` (${SLEEPING_TEXT})` : ""}\n`,
+  );
   process.stdout.write(`  holders (${holders.length}):\n`);
   for (const holder of holders) {
     process.stdout.write(
       `    ${holder.ordinal === undefined ? "prepared" : `#${holder.ordinal}`}  ${holder.id}  ` +
-        `${describeHolderOpenState(holder.open)}\n`,
+        `${describeHolderOpenState(holder.open)}${holder.sleeping ? ` — ${SLEEPING_TEXT}` : ""}\n`,
     );
   }
 }

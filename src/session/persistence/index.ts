@@ -787,7 +787,12 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
       metadata?.created_by_label,
       metadata?.created_by_ref,
     ),
-    forkTemplate: forkTemplateOf(metadata?.fork_template_id, metadata?.fork_template_name),
+    // CONTRACTS A-5 + the sub-HoD's refinement: `fork_template_name` is the signal; the id is
+    // `fork_template_id` when atrium writes one, else the `template_source` every copy already carries.
+    forkTemplate: forkTemplateOf(
+      metadata?.fork_template_id ?? metadata?.template_source,
+      metadata?.fork_template_name,
+    ),
     // BOTH index legs: the parse leg is `parseIndexEntry`'s `worktreeFromIndexEntry`.
     worktree: worktreeFromMetadata(metadata),
     outputStyleDesired: sessionOptions?.output_style,

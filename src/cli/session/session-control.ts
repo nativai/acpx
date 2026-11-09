@@ -149,9 +149,16 @@ export async function setSessionMode(
     };
   }
 
+  const modeRecord = await resolveSessionRecord(options.sessionId);
+  if (modeRecord.acpx?.sleeping) {
+    // UMQ K7: a sleeping record has no adapter — write the pin, connect nothing; the first wake replays it.
+    setDesiredModeId(modeRecord, options.modeId);
+    await writeSessionRecord(modeRecord);
+    return { record: modeRecord, resumed: false, validatedAgainst: "record" };
+  }
   // G4: a mode is never record-only — its replay is the one that kills a turn.
   const direct = await gateSetConnect(
-    await resolveSessionRecord(options.sessionId),
+    modeRecord,
     "mode",
     async () =>
       await runSessionSetModeDirect({
@@ -569,9 +576,25 @@ export async function setSessionDepth(
     };
   }
 
+  const depthRecord = await resolveSessionRecord(options.sessionId);
+  if (depthRecord.acpx?.sleeping) {
+    // UMQ K7: nothing to project against until the first wake — carry the pin, connect nothing.
+    setDesiredConfigOption(depthRecord, "effort", options.requested);
+    await writeSessionRecord(depthRecord);
+    return {
+      record: depthRecord,
+      projection: {
+        kind: "unavailable",
+        requested: options.requested,
+        reason: "the session has not run yet: the depth request is carried to its first wake",
+      },
+      resumed: false,
+      validatedAgainst: "record",
+    };
+  }
   // DESIGN §2: pi depth needs a live ladder projection — gated, never record-only.
   const direct = await gateSetConnect(
-    await resolveSessionRecord(options.sessionId),
+    depthRecord,
     "effort",
     async () =>
       await runSessionSetDepthDirect({

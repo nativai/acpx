@@ -3,6 +3,7 @@ import { resolveAcpxUiBaseUrl } from "../../acp/auth-env.js";
 import { resolveSessionRoot } from "../../config/session-root.js";
 import { consumeAutoSubscriptionSelection } from "../../runtime/engine/auto-subscription.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
+import { SLEEPING_SHORT } from "../../session/sleeping.js";
 import type {
   AgentSessionListResult,
   OutputFormat,
@@ -96,9 +97,11 @@ export function printSessionsByFormat(
 
   for (const session of sessions) {
     const closedMarker = session.closed ? " [closed]" : "";
+    // UMQ K7 (CONCEPTION §6.3): a session that never ran says so in its state column.
+    const sleepingMarker = session.acpx?.sleeping ? ` [${SLEEPING_SHORT}]` : "";
     const seatColumn = seatLabel ? `\t${seatLabel(session)}` : "";
     process.stdout.write(
-      `${session.acpxRecordId}${closedMarker}\t${session.cwd}\t${session.lastUsedAt}${seatColumn}\n`,
+      `${session.acpxRecordId}${closedMarker}${sleepingMarker}\t${session.cwd}\t${session.lastUsedAt}${seatColumn}\n`,
     );
   }
 }

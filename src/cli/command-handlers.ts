@@ -3414,7 +3414,7 @@ function noteTemplateAutoPromptReplaced(fromTemplate: string, globalFlags: Globa
 // no `session/new`, no fork, no model apply), so neither verb is gated; that is exactly why it is
 // accepted only from atrium's automated starts, not as a queued fan-out for agents (decision 8).
 const SLEEPING_NEEDS_AUTOMATION_MESSAGE =
-  "--sleeping is for atrium's automated starts (ACPX_ADMISSION_CLASS=automation)";
+  "acpx: --sleeping is for atrium's automated starts (ACPX_ADMISSION_CLASS=automation)";
 
 /** Exit 2, nothing created: the class check, then every flag that would start or feed an agent. */
 function refuseSleepingMisuse(refused: Readonly<Record<string, boolean>>): void {

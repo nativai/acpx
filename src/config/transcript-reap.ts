@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { namesAgentSession } from "../session/sleeping.js";
 import type { SessionRecord } from "../types.js";
 import {
   activeTranscriptConfigDir,
@@ -71,6 +72,11 @@ export async function reapLeftBehindTranscripts(params: {
     keptReasons: {},
     skipped: [],
   };
+  if (!namesAgentSession(record.acpSessionId)) {
+    // UMQ K7: a sleeping record (`acpSessionId: ""`) has no transcript to reap or to keep.
+    summary.skipped.push("not-started");
+    return summary;
+  }
   const selection = await selectFreshestTranscript(record, activeDir, lookup);
   const leftBehind = selection.candidates.filter((candidate) => !candidate.isDest);
   if (!selection.best?.isDest) {
@@ -94,6 +100,9 @@ export async function hasLeftBehindTranscript(
   record: ReapRecord,
   lookup?: SubscriptionLookupOptions & { registry?: SubscriptionRegistry },
 ): Promise<boolean> {
+  if (!namesAgentSession(record.acpSessionId)) {
+    return false; // UMQ K7: never ran — nothing left behind
+  }
   const registry = lookup?.registry ?? loadSubscriptionRegistry(lookup);
   const withRegistry = { ...lookup, registry };
   const activeDir = activeTranscriptConfigDir(record, withRegistry);

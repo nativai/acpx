@@ -41,6 +41,7 @@ import {
   settingsBindingFingerprint,
   withoutSettingsFlags,
 } from "../../session/settings-binding.js";
+import { namesAgentSession } from "../../session/sleeping.js";
 import type {
   AcpJsonRpcMessage,
   AcpMessageDirection,
@@ -1313,8 +1314,8 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
 
   const closeActiveBackendSession = async (timeoutMs?: number): Promise<boolean> => {
     const latestRecord = await resolveSessionRecord(options.sessionId);
-    if (!sharedClient.supportsCloseSession()) {
-      return false;
+    if (!sharedClient.supportsCloseSession() || !namesAgentSession(latestRecord.acpSessionId)) {
+      return false; // UMQ K7: a record that never ran has no backend session to close
     }
     await withTimeout(sharedClient.closeSession(latestRecord.acpSessionId), timeoutMs);
     return true;
