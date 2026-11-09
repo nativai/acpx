@@ -1,11 +1,9 @@
 import fs from "node:fs/promises";
 import { mapWithConcurrency } from "../../async-control.js";
 import {
-  ConfigOptionQueuedWorkError,
   ConfigOptionTurnInFlightError,
   ModelTurnInFlightError,
   ProfileTurnInFlightError,
-  QueueConnectionError,
   SubscriptionTurnInFlightError,
 } from "../../errors.js";
 import {
@@ -77,11 +75,7 @@ import {
   trySetModelOnRunningOwner,
   trySetModeOnRunningOwner,
 } from "../queue/ipc.js";
-import {
-  ownerRebindsSettings,
-  readQueueOwnerRecord,
-  type CloserTaskContext,
-} from "../queue/lease-store.js";
+import { readQueueOwnerRecord, type CloserTaskContext } from "../queue/lease-store.js";
 import type { LiveBackgroundTask } from "./background-task-tracker.js";
 import { DEFAULT_CLOSE_DRAIN_TIMEOUT_MS } from "./contracts.js";
 import type {
@@ -169,65 +163,6 @@ export async function setSessionMode(
   return { ...direct, validatedAgainst: "adapter" };
 }
 
-let recheckHookForTests: (() => Promise<void>) | undefined;
-
-/** Runs between a record-only write and its lease re-check — the owner-start window (row N5). */
-export function setRecordOnlyRecheckHookForTests(hook: (() => Promise<void>) | undefined): void {
-  recheckHookForTests = hook;
-}
-
-/**
- * The re-check after a record-only write (DESIGN §3). Owner startup takes the lease BEFORE it reads
- * the record, and a lease never exists without its content — so no lease now means any later owner
- * reads this write. A lease now means an owner started in the window: it gets the same set through
- * the existing owner arm (`submit`), as if it had been there at the first look. An owner still
- * starting (not accepting, or foreign and unreachable) has not begun a turn and its first turn
- * re-reads the record, so that answer leaves the record-only result standing; any other owner error
- * propagates, with the value already in the record.
- *
- * ⚠️ DO NOT DROP THIS AS "THE FIRST LOOK ALREADY FOUND NO OWNER". An owner that took the lease and
- * read the record between the first look and the write serves the OLD value until it is told —
- * the warm re-assert reverts it every turn. Row "N5" in test/record-only-set.test.ts.
- */
-async function handOverToLateOwner<T>(
-  sessionId: string,
-  submit: () => Promise<T | undefined>,
-): Promise<T | undefined> {
-  await recheckHookForTests?.();
-  const lease = await readQueueOwnerRecord(sessionId);
-  // brick 6e27669f: a capable owner re-reads the record at its next turn start and rebinds, so the
-  // record result stands and nothing is sent (GA1 — no second adapter, no stop).
-  if (!lease || ownerRebindsSettings(lease)) {
-    return undefined;
-  }
-  try {
-    return await submit();
-  } catch (error) {
-    if (
-      error instanceof QueueConnectionError &&
-      (error.detailCode === "QUEUE_NOT_ACCEPTING_REQUESTS" ||
-        error.detailCode === "QUEUE_OWNER_UNREACHABLE")
-    ) {
-      return undefined;
-    }
-    throw error;
-  }
-}
-
-/**
- * The recycle tail for an owner that appeared during a record-only set. Unlike the pre-check it
- * never throws: the write has landed, so a turn in flight only skips the restart.
- */
-async function recycleLateOwner(sessionId: string): Promise<OwnerRecycle> {
-  if (ownerRebindsSettings(await readQueueOwnerRecord(sessionId))) {
-    return { ...OWNER_REBINDS_NEXT_TURN };
-  }
-  if ((await tryQueryActiveTurnOnRunningOwner(sessionId)) === true) {
-    return { ownerRestarted: false, ownerRestartSkipped: "turn-in-flight" };
-  }
-  return await bindSettingsChange(sessionId);
-}
-
 // CLI-verb recycle pre-check (the warm-revert fix). The deployed warm bug: the
 // queue owner binds sessionContext.reasoningEffort / the model at spawn and
 // re-asserts it every turn, reverting a live IPC set on the next warm turn (W12-19
@@ -284,14 +219,16 @@ const OWNER_REBINDS_NEXT_TURN: OwnerRecycle = { ownerRestarted: false, ownerRebi
 /**
  * Binds a settings change that a verb has already written to the record.
  *
- * ⚠️ A SETTINGS CHANGE NEVER STOPS A CAPABLE OWNER — the owner rebinds itself at the next turn start
+ * ⚠️ A SETTINGS CHANGE NEVER STOPS A LIVE OWNER — the owner rebinds itself at the next turn start
  * (6e27669f). A stop here kills a dequeued or starting prompt that no guard can see: the owner holds
  * it in a local variable, `queryActiveTurn` says false and the queue depth says 0.
- * Only a legacy lease (a pre-fix owner, no `settingsRebind`) or no lease at all keeps the recycle,
- * so those results stay byte-identical to before (GA4). Rows NA1/NA2 in test/settings-rebind.test.ts.
+ * Only the NO-LEASE case (the owner has already gone) goes through `recycleLiveOwner`, so that
+ * result keeps its JSON (`no-owner` → `ownerRestarted:true`). Any lease means a live owner of this
+ * build or later: the pre-fix owners that did not rebind are gone from the fleet (brick 1281e50e
+ * removed the capability marker that told them apart). Rows NA1/NA2 in test/settings-rebind.test.ts.
  */
-async function bindSettingsChange(sessionId: string): Promise<OwnerRecycle> {
-  if (ownerRebindsSettings(await readQueueOwnerRecord(sessionId))) {
+export async function bindSettingsChange(sessionId: string): Promise<OwnerRecycle> {
+  if (await readQueueOwnerRecord(sessionId)) {
     return { ...OWNER_REBINDS_NEXT_TURN };
   }
   return await recycleLiveOwner(sessionId);
@@ -355,7 +292,7 @@ export async function setSessionModel(
     await writeSessionRecord(record);
     result = { record, resumed: false, validatedAgainst: "adapter" };
   } else if (recordOnlyModelVerdict(record).kind === "record") {
-    result = await setSessionModelOnRecord(options, !ownerToRecycle);
+    result = await setSessionModelOnRecord(options);
   } else {
     const direct = await gateSetConnect(
       record,
@@ -395,65 +332,25 @@ export async function setSessionModel(
  */
 async function setSessionModelOnRecord(
   options: SessionSetModelOptions,
-  mayRecycleLateOwner: boolean,
 ): Promise<SessionSetModelResult> {
   const record = await resolveSessionRecord(options.sessionId);
   writeModelPin(record, options.modelId);
   await writeSessionRecord(record);
-  const late = await handOverToLateOwner(options.sessionId, () =>
-    trySetModelOnRunningOwner(
-      options.sessionId,
-      options.modelId,
-      options.timeoutMs,
-      options.verbose,
-    ),
-  );
-  if (!late) {
-    return { record, resumed: false, validatedAgainst: "record" };
-  }
-  return {
-    record,
-    resumed: false,
-    validatedAgainst: "adapter",
-    ...(options.recycleOwner && mayRecycleLateOwner
-      ? await recycleLateOwner(options.sessionId)
-      : {}),
-  };
+  return { record, resumed: false, validatedAgainst: "record" };
 }
 
 /** G1 for a config option the record's own advertisement lists — see {@link setSessionModelOnRecord}. */
 async function setSessionConfigOptionOnRecord(
   options: SessionSetConfigOptionOptions,
   record: SessionRecord,
-  mayRecycleLateOwner: boolean,
 ): Promise<SessionSetConfigOptionResult> {
   setDesiredConfigOption(record, options.configId, options.value);
   await writeSessionRecord(record);
-  const late = await handOverToLateOwner(options.sessionId, () =>
-    trySetConfigOptionOnRunningOwner(
-      options.sessionId,
-      options.configId,
-      options.value,
-      options.timeoutMs,
-      options.verbose,
-    ),
-  );
-  if (!late) {
-    return {
-      record,
-      response: { configOptions: record.acpx?.config_options ?? [] },
-      resumed: false,
-      validatedAgainst: "record",
-    };
-  }
   return {
     record,
-    response: late,
+    response: { configOptions: record.acpx?.config_options ?? [] },
     resumed: false,
-    validatedAgainst: "adapter",
-    ...(options.recycleOwner && mayRecycleLateOwner
-      ? await recycleLateOwner(options.sessionId)
-      : {}),
+    validatedAgainst: "record",
   };
 }
 
@@ -489,7 +386,7 @@ export async function setSessionConfigOption(
     await writeSessionRecord(record);
     result = { record, response: ownerResponse, resumed: false, validatedAgainst: "adapter" };
   } else {
-    result = await setSessionConfigOptionWithoutOwner(options, !ownerToRecycle);
+    result = await setSessionConfigOptionWithoutOwner(options);
   }
 
   if (ownerToRecycle) {
@@ -507,11 +404,10 @@ export async function setSessionConfigOption(
 /** No owner answered: record-only where the record can say YES (DESIGN §2), else the gated connect. */
 async function setSessionConfigOptionWithoutOwner(
   options: SessionSetConfigOptionOptions,
-  mayRecycleLateOwner: boolean,
 ): Promise<SessionSetConfigOptionResult> {
   const record = await resolveSessionRecord(options.sessionId);
   if (recordOnlyConfigOptionVerdict(record, options.configId, options.value).kind === "record") {
-    return await setSessionConfigOptionOnRecord(options, record, mayRecycleLateOwner);
+    return await setSessionConfigOptionOnRecord(options, record);
   }
   const direct = await gateSetConnect(
     record,
@@ -594,10 +490,10 @@ export async function setSessionDepth(
 // record on every spawn — so the durable switch is the record edit + transcript
 // copy (switchSessionSubscription). Binding it requires a respawn:
 //   COLD (no live owner) → record edit only; the next spawn resolves the new dir.
-//   LIVE (queue owner holds a client on the old dir) → after the record edit, a
-//     capable owner rebuilds its client on the new dir at its next turn start
-//     (bindSettingsChange; a legacy owner is terminated instead), resuming the
-//     ported transcript. Refuse if a turn is in flight.
+//   LIVE (queue owner holds a client on the old dir) → after the record edit, the
+//     owner rebuilds its client on the new dir at its next turn start
+//     (bindSettingsChange), resuming the ported transcript. Refuse if a turn is
+//     in flight.
 export async function setSessionSubscription(
   options: SessionSetSubscriptionOptions,
 ): Promise<SessionSetSubscriptionResult> {
@@ -643,9 +539,9 @@ export async function setSessionSubscription(
 // transcript port (switchSessionAccount); binding it requires a respawn:
 //   COLD (no live owner) → record edit only; the next spawn resolves the new dir.
 //   LIVE (queue owner holds a client on the old credential) → after the record
-//     edit, a capable owner rebuilds its client on the new credential at its next
-//     turn start (bindSettingsChange; a legacy owner is terminated instead),
-//     resuming the ported transcript. Refuse if a turn is in flight.
+//     edit, the owner rebuilds its client on the new credential at its next
+//     turn start (bindSettingsChange), resuming the ported transcript. Refuse if
+//     a turn is in flight.
 // The caller (handleSetProfile) guards the credential-class constraint before
 // invoking this; switchSessionAccount with reason "manual" does not assert it.
 export async function setSessionProfile(
@@ -761,17 +657,6 @@ export async function setSessionOutputStyle(
   const liveness = await readQueueOwnerLiveness(options.sessionId);
   const ownerAlive = isOwnerPossiblyAlive(liveness);
 
-  // Refuse ONLY for queued-behind work — never for the active turn itself. And only for a LEGACY
-  // owner (brick 6e27669f): its recycle is what would drop that work. A capable owner rebinds at
-  // its next turn start and keeps its queue.
-  if (
-    ownerAlive &&
-    liveness.queueDepth > 0 &&
-    !ownerRebindsSettings(await readQueueOwnerRecord(options.sessionId))
-  ) {
-    throw new ConfigOptionQueuedWorkError(OUTPUT_STYLE_CONFIG_ID);
-  }
-
   const turnActive = ownerAlive
     ? (await tryQueryActiveTurnOnRunningOwner(options.sessionId)) === true
     : false;
@@ -806,20 +691,20 @@ export async function setSessionOutputStyle(
   }
 
   if (ownerAlive) {
-    // Path (C): idle owner. A capable owner (brick 6e27669f) rebinds at its next
+    // Path (C): idle owner. The owner (brick 6e27669f) rebinds at its next
     // turn start: it replaces its client, which closes the old adapter, so the
     // next turn's load hits a fresh adapter — the property below, kept without a
-    // stop. A legacy owner is recycled now, as before.
+    // stop.
     //
-    // ⚠️ THE RECYCLE IS LOAD-BEARING — do not "optimise" it away on the grounds
-    // that the adapter process is already right there (design brick://4d16ab8b;
+    // ⚠️ THE ADAPTER REPLACEMENT IS LOAD-BEARING — do not "optimise" it away on
+    // the grounds that the adapter process is already right there (design brick://4d16ab8b;
     // landmine found by the U1 adapter lane). The adapter's `getOrCreateSession`
     // short-circuits on a session fingerprint and returns an ALREADY-LIVE session
     // UNTOUCHED, so a `session/load` carrying a changed style into a still-running
-    // adapter process DOES NOTHING — silently. Killing the owner first is what
-    // guarantees the load always hits a fresh adapter; the recycle is not merely
-    // the mechanism by which the style takes effect, it is what makes the load
-    // path work at all.
+    // adapter process DOES NOTHING — silently. Replacing the client first (the
+    // owner's rebind at its next turn) is what guarantees the load always hits a
+    // fresh adapter; it is not merely the mechanism by which the style takes
+    // effect, it is what makes the load path work at all.
     //
     // A shortcut here would fail in the worst available way: the record would show
     // the new style AND the harness config readback would agree, and only the

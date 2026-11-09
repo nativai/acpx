@@ -8,13 +8,6 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
-import { readQueueOwnerProcessIdentity } from "../src/cli/queue/lease-store.js";
-import {
-  setRecordOnlyRecheckHookForTests,
-  setSessionConfigOption,
-  setSessionModel,
-} from "../src/cli/session/session-control.js";
-import { resolveSessionRecord } from "../src/session/persistence/repository.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence/serialize.js";
 import {
   advertisementDescribesNextModel,
@@ -22,20 +15,10 @@ import {
   recordOnlyModelVerdict,
 } from "../src/session/record-only-set.js";
 import type { SessionAcpxState, SessionRecord } from "../src/types.js";
-import {
-  closeServer,
-  createSingleRequestServer,
-  listenServer,
-  queuePaths,
-  startKeeperProcess,
-  stopProcess,
-  withTempHome,
-  writeQueueOwnerLock,
-} from "./queue-test-helpers.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
 
 // brick 5c44d8ba — an ownerless `acpx <agent> set …` records what the record can vouch for and
-// starts nothing; everything else goes live through the gate (DESIGN §6, §7 N1–N5). The gate rows
+// starts nothing; everything else goes live through the gate (DESIGN §6, §7 N1–N4; N5 retired with the late-owner hand-over, brick 1281e50e). The gate rows
 // (N6) live in test/capacity-wake.test.ts beside A1's full-box fixture; N7 extends
 // test/set-recycle-owner-regression.test.ts.
 //
@@ -446,145 +429,6 @@ test("N4 G4: set-mode plan, set mode plan (advertised!) and pi set effort high a
       `${label}: a mode reached the record`,
     );
   }
-});
-
-// ---------------------------------------------------------------------------------------------
-// N5 (G5) — an owner that starts during a record-only set gets it through the owner arm
-// ---------------------------------------------------------------------------------------------
-
-type OwnerRequest = { type: string; requestId: string; value?: string; modelId?: string };
-
-function recordingOwner(requests: OwnerRequest[]): ReturnType<typeof createSingleRequestServer> {
-  return createSingleRequestServer((socket, request) => {
-    requests.push(request as OwnerRequest);
-    socket.write(`${JSON.stringify({ type: "accepted", requestId: request.requestId })}\n`);
-    if (request.type === "query_active_turn") {
-      socket.write(
-        `${JSON.stringify({ type: "query_active_turn_result", requestId: request.requestId, active: false })}\n`,
-      );
-    } else if (request.type === "set_config_option") {
-      socket.write(
-        `${JSON.stringify({ type: "set_config_option_result", requestId: request.requestId, response: { configOptions: [] } })}\n`,
-      );
-    } else if (request.type === "set_model") {
-      socket.write(
-        `${JSON.stringify({ type: "set_model_result", requestId: request.requestId, modelId: (request as OwnerRequest).modelId ?? "" })}\n`,
-      );
-    }
-    socket.end();
-  });
-}
-
-async function seedInHome(homeDir: string, sessionId: string): Promise<void> {
-  const file = path.join(homeDir, ".acpx", "sessions", `${sessionId}.json`);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const record = makeSessionRecord({
-    acpxRecordId: sessionId,
-    acpSessionId: `${sessionId}-acp`,
-    agentCommand: `node ${path.join(homeDir, "claude-agent-acp", "dist", "index.js")}`,
-    cwd: homeDir,
-    acpx: claudeAcpx(),
-  });
-  fs.writeFileSync(file, `${JSON.stringify(serializeSessionRecordForDisk(record), null, 2)}\n`);
-}
-
-// brick 6e27669f: G5 is superseded for capable owners — a lease carrying `settingsRebind` gets
-// nothing over its socket and the record result stands (row NA6, test/settings-rebind.test.ts).
-// The lease planted here is LEGACY (no marker), so this row is GA4: today's hand-over, unchanged.
-test("N5 G5 (legacy lease, GA4): an owner that takes the lease between the record write and the re-check gets the set over its socket, and is recycled", async () => {
-  for (const verb of ["effort", "model"] as const) {
-    await withTempHome(async (homeDir) => {
-      const sessionId = randomUUID();
-      await seedInHome(homeDir, sessionId);
-      const requests: OwnerRequest[] = [];
-      const server = recordingOwner(requests);
-      let keeper: Awaited<ReturnType<typeof startKeeperProcess>> | undefined;
-      setRecordOnlyRecheckHookForTests(async () => {
-        keeper = await startKeeperProcess();
-        const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
-        await listenServer(server, socketPath);
-        const processIdentity = keeper.pid
-          ? await readQueueOwnerProcessIdentity(keeper.pid)
-          : undefined;
-        await writeQueueOwnerLock({
-          lockPath,
-          pid: keeper.pid,
-          sessionId,
-          socketPath,
-          processIdentity,
-        });
-      });
-      try {
-        const result =
-          verb === "effort"
-            ? await setSessionConfigOption({
-                sessionId,
-                configId: "effort",
-                value: "low",
-                recycleOwner: true,
-              })
-            : await setSessionModel({ sessionId, modelId: "sonnet", recycleOwner: true });
-        const handed = requests.filter(
-          (r) => r.type === (verb === "effort" ? "set_config_option" : "set_model"),
-        );
-        assert.equal(handed.length, 1, `${verb}: the late owner was not handed the set`);
-        assert.equal(result.validatedAgainst, "adapter", verb);
-        assert.equal(result.ownerRestarted, true, `${verb}: the late owner was not recycled`);
-        const onDisk = await resolveSessionRecord(sessionId);
-        if (verb === "effort") {
-          assert.equal(onDisk.acpx?.desired_config_options?.effort, "low");
-        } else {
-          assert.equal(onDisk.acpx?.session_options?.model, "sonnet");
-        }
-      } finally {
-        setRecordOnlyRecheckHookForTests(undefined);
-        await closeServer(server);
-        if (keeper) {
-          stopProcess(keeper);
-        }
-      }
-    });
-  }
-});
-
-test("N5: a late lease whose owner is still starting (socket not listening) leaves the record-only result standing", async () => {
-  await withTempHome(async (homeDir) => {
-    const sessionId = randomUUID();
-    await seedInHome(homeDir, sessionId);
-    let keeper: Awaited<ReturnType<typeof startKeeperProcess>> | undefined;
-    setRecordOnlyRecheckHookForTests(async () => {
-      keeper = await startKeeperProcess();
-      const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
-      const processIdentity = keeper.pid
-        ? await readQueueOwnerProcessIdentity(keeper.pid)
-        : undefined;
-      await writeQueueOwnerLock({
-        lockPath,
-        pid: keeper.pid,
-        sessionId,
-        socketPath,
-        processIdentity,
-      });
-    });
-    try {
-      const result = await setSessionConfigOption({
-        sessionId,
-        configId: "effort",
-        value: "low",
-        recycleOwner: true,
-      });
-      assert.equal(result.validatedAgainst, "record");
-      assert.equal(
-        (await resolveSessionRecord(sessionId)).acpx?.desired_config_options?.effort,
-        "low",
-      );
-    } finally {
-      setRecordOnlyRecheckHookForTests(undefined);
-      if (keeper) {
-        stopProcess(keeper);
-      }
-    }
-  });
 });
 
 // ---------------------------------------------------------------------------------------------

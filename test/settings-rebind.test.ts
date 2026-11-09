@@ -3,16 +3,17 @@
 // Before the fix every settings verb SIGTERMed a live queue owner after its record write, so the
 // next prompt cold-respawned with the new value. A prompt the owner had already dequeued (held in
 // a local variable, invisible to `queryActiveTurn` and to the queue depth) or whose turn was just
-// starting died with `Queue owner disconnected before prompt completion`. Now a capable owner (its
-// lease carries `settingsRebind`) is never stopped: at its next turn start it sees the record's
-// settings differ from those its client was built from and rebuilds that client in place.
+// starting died with `Queue owner disconnected before prompt completion`. Now a live owner is never
+// stopped: at its next turn start it sees the record's settings differ from those its client was
+// built from and rebuilds that client in place. (Brick 1281e50e removed the transition scaffolding:
+// the lease marker `settingsRebind` and the legacy recycle of pre-fix owners.)
 //
-//   NA1 GA1/GA4  all 8 verbs: a capable idle owner survives; a legacy one is recycled as before
+//   NA1 GA1      all 8 verbs: an idle owner survives; the no-lease case keeps its recycle result
 //   NA2 GA1      structural: no setter stops an owner except through `bindSettingsChange`
 //   NA3 GA2      the pre-turn policy asks for the rebind exactly when the binding differs
 //   NA4 GA1+GA2  real owner + mock adapter: `set effort` / `set model` → the SAME owner rebinds
 //   NA5 GA1      a pending output style keeps a prompt queued behind the turn alive
-//   NA6 GA1      a record-only set hands nothing to a capable late owner
+//   NA6 GA1      a record-only set talks to no owner at all
 import "./install-owner-reaper.js";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -29,7 +30,7 @@ import { isProcessAlive, readQueueOwnerProcessIdentity } from "../src/cli/queue/
 import { isIdleDrainActivity } from "../src/cli/session/queue-owner-runtime.js";
 import { applyQueuedTaskSubscriptionLockPolicy } from "../src/cli/session/runtime.js";
 import {
-  setRecordOnlyRecheckHookForTests,
+  bindSettingsChange,
   setSessionAutoFailover,
   setSessionAutoSubscription,
   setSessionConfigOption,
@@ -64,7 +65,6 @@ const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url
 const CLAUDE_CMD = "node /opt/claude-agent-acp/dist/index.js";
 
 type Keeper = Awaited<ReturnType<typeof startKeeperProcess>>;
-type OwnerKind = "legacy" | "capable";
 type OwnerRequest = { type: string; requestId: string; modelId?: string };
 
 function recordingOwner(requests: OwnerRequest[]): ReturnType<typeof createSingleRequestServer> {
@@ -88,25 +88,21 @@ function recordingOwner(requests: OwnerRequest[]): ReturnType<typeof createSingl
   });
 }
 
-/** The marker every lease of the fixed build carries (T-A2); a legacy lease has none. */
-async function markLeaseCapable(lockPath: string): Promise<void> {
-  const lease = JSON.parse(await fsp.readFile(lockPath, "utf8")) as Record<string, unknown>;
-  await fsp.writeFile(lockPath, `${JSON.stringify({ ...lease, settingsRebind: 1 })}\n`, "utf8");
-}
-
 async function plantOwner(
   homeDir: string,
   sessionId: string,
   server: ReturnType<typeof createSingleRequestServer>,
-  kind: OwnerKind,
+  retiredMarker = false,
 ): Promise<Keeper> {
   const keeper = await startKeeperProcess();
   const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
   await listenServer(server, socketPath);
   const processIdentity = keeper.pid ? await readQueueOwnerProcessIdentity(keeper.pid) : undefined;
   await writeQueueOwnerLock({ lockPath, pid: keeper.pid, sessionId, socketPath, processIdentity });
-  if (kind === "capable") {
-    await markLeaseCapable(lockPath);
+  if (retiredMarker) {
+    // A lease written by the fixed build before brick 1281e50e retired the marker.
+    const lease = JSON.parse(await fsp.readFile(lockPath, "utf8")) as Record<string, unknown>;
+    await fsp.writeFile(lockPath, `${JSON.stringify({ ...lease, settingsRebind: 1 })}\n`, "utf8");
   }
   return keeper;
 }
@@ -143,13 +139,6 @@ async function seedRegistry(homeDir: string): Promise<{ homeDir: string; registr
     mode: 0o600,
   });
   return { homeDir, registryPath };
-}
-
-async function waitUntilDead(pid: number, timeoutMs = 2_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() <= deadline && isProcessAlive(pid)) {
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
 }
 
 type SetterResult = { ownerRestarted?: boolean; ownerRebind?: string };
@@ -240,17 +229,20 @@ const VERBS: Verb[] = [
 // NA1 — every verb, both lease kinds
 // ---------------------------------------------------------------------------------------------
 
-for (const kind of ["capable", "legacy"] as const) {
-  test(`NA1 ${kind === "capable" ? "GA1" : "GA4"}: all 8 settings verbs on a ${kind} idle owner`, async () => {
+// A lease without any marker is the shape every lease has now; one still carrying the retired
+// `settingsRebind` key (written by the fixed build before brick 1281e50e) must behave the same —
+// the parser drops the key, so neither shape can fall into a third behaviour.
+for (const retiredMarker of [false, true]) {
+  test(`NA1 GA1: all 8 settings verbs on a live idle owner (lease ${retiredMarker ? "still carrying the retired marker" : "without a marker"})`, async () => {
     assert.equal(VERBS.length, 8, "the verb table names every settings verb");
     for (const row of VERBS) {
       await withTempHome(async (homeDir) => {
-        const sessionId = `na1-${kind}-${row.verb.replace(/\W+/g, "-")}`;
+        const sessionId = `na1-${retiredMarker ? "marked" : "plain"}-${row.verb.replace(/\W+/g, "-")}`;
         const loadOpts = await seedRegistry(homeDir);
         await seedSession(homeDir, sessionId, row.acpx);
         const requests: OwnerRequest[] = [];
         const server = recordingOwner(requests);
-        const keeper = await plantOwner(homeDir, sessionId, server, kind);
+        const keeper = await plantOwner(homeDir, sessionId, server, retiredMarker);
         const { lockPath } = queuePaths(homeDir, sessionId);
         const generation = () =>
           (JSON.parse(fs.readFileSync(lockPath, "utf8")) as { ownerGeneration: number })
@@ -258,20 +250,12 @@ for (const kind of ["capable", "legacy"] as const) {
         const before = generation();
         try {
           const result = await row.run(sessionId, loadOpts);
-          const label = `${kind} ${row.verb}`;
-          assert.equal(row.written(await resolveSessionRecord(sessionId)), row.expected, label);
-          if (kind === "capable") {
-            assert.equal(result.ownerRestarted, false, `${label}: ${JSON.stringify(result)}`);
-            assert.equal(result.ownerRebind, "next-turn", label);
-            await new Promise((resolve) => setTimeout(resolve, 100));
-            assert.equal(isProcessAlive(keeper.pid), true, `${label}: the owner was stopped`);
-            assert.equal(generation(), before, `${label}: the lease changed hands`);
-          } else {
-            assert.equal(result.ownerRestarted, true, `${label}: ${JSON.stringify(result)}`);
-            assert.equal(result.ownerRebind, undefined, label);
-            await waitUntilDead(keeper.pid as number);
-            assert.equal(isProcessAlive(keeper.pid), false, `${label}: the owner survived`);
-          }
+          assert.equal(row.written(await resolveSessionRecord(sessionId)), row.expected, row.verb);
+          assert.equal(result.ownerRestarted, false, `${row.verb}: ${JSON.stringify(result)}`);
+          assert.equal(result.ownerRebind, "next-turn", row.verb);
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          assert.equal(isProcessAlive(keeper.pid), true, `${row.verb}: the owner was stopped`);
+          assert.equal(generation(), before, `${row.verb}: the lease changed hands`);
         } finally {
           await closeServer(server);
           stopProcess(keeper);
@@ -280,6 +264,14 @@ for (const kind of ["capable", "legacy"] as const) {
     }
   });
 }
+
+test("NA1 GA1: with no lease at all (the owner already gone) bindSettingsChange keeps its recycle result", async () => {
+  await withTempHome(async () => {
+    const result = await bindSettingsChange("na1-no-lease");
+    assert.equal(result.ownerRestarted, true, JSON.stringify(result));
+    assert.equal(result.ownerRebind, undefined, "the no-lease result grew an ownerRebind");
+  });
+});
 
 // ---------------------------------------------------------------------------------------------
 // NA2 — structural: the stop lives in ONE place
@@ -688,79 +680,26 @@ test("NA5 GA1: a mid-turn output-style change keeps the prompt queued behind the
 // NA6 — the record-only set and a late owner (round-1 N5, rewritten)
 // ---------------------------------------------------------------------------------------------
 
-function recordOnlyAcpx(): SessionAcpxState {
-  const select = (id: string, category: string, current: string, values: string[]) => ({
-    id,
-    name: id,
-    category,
-    type: "select" as const,
-    currentValue: current,
-    options: values.map((value) => ({ value, name: value })),
-  });
-  return {
-    config_options: [
-      select("model", "model", "default", ["default", "opus", "sonnet", "haiku"]),
-      select("effort", "thought_level", "default", ["default", "low", "medium", "high"]),
-    ],
-    session_options: { model: "default", effort: "high", model_source: "inherited" },
-    current_model_id: "default",
-    available_models: ["default", "opus", "sonnet", "haiku"],
-    desired_config_options: { effort: "high" },
-  } as SessionAcpxState;
-}
-
-for (const kind of ["capable", "legacy"] as const) {
-  test(`NA6 ${kind === "capable" ? "GA1" : "GA4"}: a ${kind} owner that takes the lease during a record-only set`, async () => {
-    await withTempHome(async (homeDir) => {
-      const sessionId = randomUUID();
-      const file = path.join(homeDir, ".acpx", "sessions", `${sessionId}.json`);
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      const record = makeSessionRecord({
-        acpxRecordId: sessionId,
-        acpSessionId: `${sessionId}-acp`,
-        // Real-shaped and classified (record-only-set.test.ts header), so the verdict says YES.
-        agentCommand: `node ${path.join(homeDir, "claude-agent-acp", "dist", "index.js")}`,
-        cwd: homeDir,
-        acpx: recordOnlyAcpx(),
-      });
-      fs.writeFileSync(file, `${JSON.stringify(serializeSessionRecordForDisk(record), null, 2)}\n`);
-      const requests: OwnerRequest[] = [];
-      const server = recordingOwner(requests);
-      let keeper: Keeper | undefined;
-      setRecordOnlyRecheckHookForTests(async () => {
-        keeper = await plantOwner(homeDir, sessionId, server, kind);
-      });
-      try {
-        const result = await setSessionConfigOption({
-          sessionId,
-          configId: "effort",
-          value: "low",
-          recycleOwner: true,
-        });
-        assert.equal(
-          (await resolveSessionRecord(sessionId)).acpx?.desired_config_options?.effort,
-          "low",
-        );
-        if (kind === "capable") {
-          assert.deepEqual(requests, [], "the capable late owner was sent something");
-          assert.equal(result.validatedAgainst, "record");
-          assert.notEqual(result.ownerRestarted, true);
-          assert.equal(isProcessAlive(keeper?.pid), true);
-        } else {
-          assert.equal(requests.filter((r) => r.type === "set_config_option").length, 1);
-          assert.equal(result.validatedAgainst, "adapter");
-          assert.equal(result.ownerRestarted, true, "the legacy late owner was not recycled");
-        }
-      } finally {
-        setRecordOnlyRecheckHookForTests(undefined);
-        await closeServer(server);
-        if (keeper) {
-          stopProcess(keeper);
-        }
-      }
-    });
-  });
-}
+test("NA6 GA1: the record-only arms never talk to an owner; the instrument flags a planted call", async () => {
+  const source = await fsp.readFile(path.join(SRC_DIR, "cli/session/session-control.ts"), "utf8");
+  const ownerCalls = (text: string, name: string): RegExpMatchArray | null => {
+    const body = functionBody(text, name);
+    return text.slice(body.start, body.end).match(/\btry\w+OnRunningOwner\(/);
+  };
+  for (const name of ["setSessionModelOnRecord", "setSessionConfigOptionOnRecord"]) {
+    assert.equal(ownerCalls(source, name), null, `${name} sends the set to an owner`);
+  }
+  // The instrument bites: the call is flagged without being registered anywhere.
+  const planted = source.replace(
+    "writeModelPin(record, options.modelId);",
+    "writeModelPin(record, options.modelId);\n  await trySetModelOnRunningOwner(options.sessionId, options.modelId);",
+  );
+  assert.notEqual(planted, source, "the planting anchor moved");
+  assert.ok(
+    ownerCalls(planted, "setSessionModelOnRecord"),
+    "the guard did not flag a planted call",
+  );
+});
 
 // ---------------------------------------------------------------------------------------------
 // F4 (9df709f4 VERIFICATION) — an owner-arm set on a WARM owner must not hold it past the idle

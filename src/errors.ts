@@ -860,31 +860,6 @@ export class ConfigOptionTurnInFlightError extends AcpxOperationalError {
 }
 
 /**
- * brick://874fee67 — refuse a config change that would recycle the owner while
- * prompts are QUEUED BEHIND the active turn.
- *
- * Distinct from {@link ConfigOptionTurnInFlightError}: that one guards the turn
- * currently RUNNING. This one guards work already handed to the owner and
- * waiting. acpx has no persisted prompt queue — the owner's entire on-disk
- * footprint is a `.lock` and a `.sock`, so anything the owner holds in memory
- * dies with it. Deferring the recycle protects the active turn but not the
- * queue, so a recycle here would silently drop a prompt the user already sent.
- * Refusing turns that into a visible "try again when idle".
- */
-export class ConfigOptionQueuedWorkError extends AcpxOperationalError {
-  constructor(configId: string) {
-    super(
-      `Cannot change config option "${configId}" while work is queued on this session; the change would restart the agent and drop the queued prompt(s) — try again once the queue has drained (queued-work).`,
-      {
-        outputCode: "USAGE",
-        detailCode: "QUEUED_WORK",
-        origin: "queue",
-      },
-    );
-  }
-}
-
-/**
  * brick://874fee67 — the session's agent advertises no `outputStyle` config
  * option, so a style would be persisted and then silently ignored.
  *
