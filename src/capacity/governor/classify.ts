@@ -132,7 +132,7 @@ export function cachedTokenState(
   };
 }
 
-function liveLeader(byPid: ReadonlyMap<number, GovProc>, sid: number): GovProc | undefined {
+export function liveLeader(byPid: ReadonlyMap<number, GovProc>, sid: number): GovProc | undefined {
   const leader = byPid.get(sid);
   return leader && leader.sid === sid && isLiveState(leader.state) ? leader : undefined;
 }
@@ -264,6 +264,19 @@ function recordStillValid(record: GroupRecord, leader: GovProc | undefined): boo
   return leader === undefined || leader.startTicks === record.leaderStartTicks;
 }
 
+/**
+ * The remembered record of `sid` if it still describes this session (same leader start, or still
+ * leaderless) — the §19 D5 crossing kill acts only on a session placed by an earlier FULL scan.
+ */
+export function rememberedRecord(
+  memory: ReadonlyMap<number, GroupRecord>,
+  sid: number,
+  leader: GovProc | undefined,
+): GroupRecord | undefined {
+  const record = memory.get(sid);
+  return record && recordStillValid(record, leader) ? record : undefined;
+}
+
 /** The session's placement, from memory or decided now (first sight); undefined if it has no member. */
 function placementOf(c: Classifier, sid: number): Placement | undefined {
   const members = c.bySid.get(sid);
@@ -327,15 +340,33 @@ function isOrphaned(record: GroupRecord, leader: GovProc | undefined): boolean {
   );
 }
 
+export function sessionView(
+  sid: number,
+  record: GroupRecord,
+  members: readonly GovProc[],
+  leader: GovProc | undefined,
+): SessionView {
+  return {
+    sid,
+    record,
+    members,
+    leader,
+    orphaned: isOrphaned(record, leader),
+    threads: members.reduce((sum, m) => sum + m.threads, 0),
+  };
+}
+
 export function classifySessions(
   byPid: ReadonlyMap<number, GovProc>,
   ctx: ClassifyContext,
   memory: Map<number, GroupRecord>,
   nowMs: number,
+  /** False when a scan reader's share was left out: then a session not seen is NOT forgotten. */
+  complete = true,
 ): Classification {
   const bySid = groupBySid(byPid);
   const c: Classifier = { byPid, bySid, ctx, memory, nowMs, inProgress: new Set(), changed: false };
-  for (const sid of memory.keys()) {
+  for (const sid of complete ? memory.keys() : []) {
     if (!bySid.has(sid)) {
       memory.delete(sid);
       c.changed = true;
@@ -345,15 +376,7 @@ export function classifySessions(
   for (const [sid, members] of bySid) {
     placementOf(c, sid);
     const record = memory.get(sid) as GroupRecord;
-    const leader = liveLeader(byPid, sid);
-    sessions.set(sid, {
-      sid,
-      record,
-      members,
-      leader,
-      orphaned: isOrphaned(record, leader),
-      threads: members.reduce((sum, m) => sum + m.threads, 0),
-    });
+    sessions.set(sid, sessionView(sid, record, members, liveLeader(byPid, sid)));
   }
   return { sessions, memoryChanged: c.changed };
 }
