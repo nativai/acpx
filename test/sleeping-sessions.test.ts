@@ -1,6 +1,7 @@
 import "./install-owner-reaper.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { readLedgerFile } from "../src/capacity/ledger.js";
@@ -531,4 +532,86 @@ test("status, sessions list and seats show say a sleeping session is sleeping �
   assert.equal(seat.code, 0, seat.stderr);
   assert.ok(seat.stdout.includes(text), seat.stdout);
   assert.equal(fs.existsSync(recordPath(f, created.acpxRecordId)), true);
+});
+
+test("closing a sleeping session starts no adapter and leaves a closed record that reopens as sleeping (AC13: a close ends held mail, the session stays closed)", async () => {
+  const f = makeBox({ requestMib: 2048 });
+  const run = await sleepingNew(f);
+  assert.equal(run.code, 0, run.stderr);
+  const id = jsonOf(run).acpxRecordId;
+  const closed = await runCli(
+    [...baseArgs(f), "sessions", "close", "--session-id", id],
+    f.env,
+    f.root,
+  );
+  assert.equal(closed.code, 0, closed.stderr);
+  assert.equal(agentStarts(f), 0, "closing never spawned an adapter");
+  const record = readRecord(f, id) as {
+    closed?: boolean;
+    acp_session_id: string;
+    acpx: { sleeping?: unknown };
+  };
+  assert.equal(record.closed, true);
+  assert.equal(record.acp_session_id, "");
+  assert.ok(record.acpx.sleeping, "a closed sleeping session is still a session that never ran");
+  const reopened = await runCli([...baseArgs(f), "sessions", "reopen", id], f.env, f.root);
+  assert.equal(reopened.code, 0, reopened.stderr);
+  assert.equal((readRecord(f, id) as { closed?: boolean }).closed, false);
+});
+
+test("the index projection: sleeping, createdBy (kind/label/ref from three metadata strings) and forkTemplate survive the index file; a bad createdBy kind is absent", async () => {
+  const { toSessionIndexEntry, readSessionIndex, writeSessionIndex } =
+    await import("../src/session/persistence/index.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-index-projection-"));
+  try {
+    const base = {
+      acpxRecordId: "projection-1",
+      acpSessionId: "",
+      agentCommand: "agent",
+      cwd: dir,
+    };
+    const record = makeSessionRecord(
+      {
+        ...base,
+        acpx: { sleeping: { since: "2026-11-09T10:00:00.000Z", fork: { from: "tpl-1" } } },
+        metadata: {
+          created_by_kind: "wakeup",
+          created_by_label: "nightly-rebake",
+          created_by_ref: "wk_0f3d9b2c",
+          template_source: "tpl-1",
+          fork_template_name: "Nightly template",
+        },
+      },
+      { defaultAcpx: false },
+    );
+    const entry = toSessionIndexEntry(record, "projection-1.json");
+    assert.equal(entry.sleeping, true);
+    assert.deepEqual(entry.createdBy, {
+      kind: "wakeup",
+      label: "nightly-rebake",
+      ref: "wk_0f3d9b2c",
+    });
+    assert.deepEqual(entry.forkTemplate, { id: "tpl-1", name: "Nightly template" });
+    await writeSessionIndex(dir, { files: ["projection-1.json"], entries: [entry] });
+    const back = (await readSessionIndex(dir))?.entries[0];
+    assert.equal(back?.sleeping, true, "BOTH index legs carry sleeping");
+    assert.deepEqual(back?.createdBy, entry.createdBy, "…and createdBy");
+    assert.deepEqual(back?.forkTemplate, entry.forkTemplate, "…and forkTemplate");
+
+    const bad = toSessionIndexEntry(
+      makeSessionRecord(
+        {
+          ...base,
+          metadata: { created_by_kind: "cron", created_by_label: "x", created_by_ref: "y" },
+        },
+        { defaultAcpx: false },
+      ),
+      "projection-1.json",
+    );
+    assert.equal(bad.createdBy, undefined, "an unknown kind is absent, never guessed");
+    assert.equal(bad.sleeping, undefined, "an ordinary record is not sleeping");
+    assert.equal(bad.forkTemplate, undefined);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
