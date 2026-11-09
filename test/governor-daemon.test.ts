@@ -222,23 +222,39 @@ test("§19 D4 committed negatives: a verified-owner session and the system sessi
     0,
   );
 
+  // The same outside storm, queue dir unreadable in both arms; only the argv token's answer differs.
+  const outsideStorm = async (token: "absent" | "unreadable") => {
+    const b = new FakeBox();
+    t.after(() => b.cleanup());
+    b.standardSystem();
+    b.add({ pid: 4000, ppid: 1, comm: "bash" });
+    b.addMany(140, { ppid: 4000, pgid: 4001, sid: 4000, comm: "bash" }, 4001);
+    fs.chmodSync(b.queue, 0o000);
+    let readable = true;
+    try {
+      fs.readdirSync(b.queue);
+    } catch {
+      readable = false;
+    }
+    const g = startedGovernor(b, {}, {}, { tokenState: () => token });
+    g.tick();
+    await g.settle();
+    fs.chmodSync(b.queue, 0o755);
+    return { box: b, readable };
+  };
+
+  // Positive control (TE G-F4): identification WORKS (the argv token is readable) → the storm IS killed,
+  // so the blind arm below cannot pass on a fixture R1 would never have touched.
+  const seeing = await outsideStorm("absent");
+  assert.deepEqual(
+    seeing.box.members(4000),
+    [],
+    "identification works: the outside storm is killed",
+  );
+  assert.equal(seeing.box.events().find((e) => e.action === "killed")?.session_kind, "outside");
+
   // Owner identification broken (queue dir unreadable AND argv unreadable): an outside storm is NOT killed.
-  const blind = new FakeBox();
-  t.after(() => blind.cleanup());
-  blind.standardSystem();
-  blind.add({ pid: 4000, ppid: 1, comm: "bash" });
-  blind.addMany(140, { ppid: 4000, pgid: 4001, sid: 4000, comm: "bash" }, 4001);
-  fs.chmodSync(blind.queue, 0o000);
-  let readable = true;
-  try {
-    fs.readdirSync(blind.queue);
-  } catch {
-    readable = false;
-  }
-  const g2 = startedGovernor(blind, {}, {}, { tokenState: () => "unreadable" });
-  g2.tick();
-  await g2.settle();
-  fs.chmodSync(blind.queue, 0o755);
+  const { box: blind, readable } = await outsideStorm("unreadable");
   if (readable) {
     t.diagnostic(
       "running as a user that bypasses directory permissions: the blind arm is not exercised",
@@ -246,6 +262,7 @@ test("§19 D4 committed negatives: a verified-owner session and the system sessi
     return;
   }
   assert.deepEqual(blind.signals, []);
+  assert.equal(blind.members(4000).length, 141, "the blind arm left the storm alone");
 });
 
 test("R2 line: L − M_oom on both branches of M_oom (512 MiB floor, 5 % of L)", () => {
