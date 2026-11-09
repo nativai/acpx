@@ -2035,49 +2035,76 @@ async function runSplitHalves(
   members: QueueTask[],
   split: BatchSplitPart | undefined,
 ): Promise<SessionSendResult> {
-  const live = members.filter((task) => !task.terminalWritten);
-  const whole = split ?? { total: live.length, from: 1, to: live.length };
-  const olderCount = Math.ceil(live.length / 2);
-  const older = live.slice(0, olderCount);
-  const newer = live.slice(olderCount);
-  const olderPart = { total: whole.total, from: whole.from, to: whole.from + olderCount - 1 };
-  const newerPart = { total: whole.total, from: olderPart.to + 1, to: whole.to };
-  // NOT verbose-gated: one line per split, in owner.log.
-  process.stderr.write(
-    `[acpx] batch of ${live.length} message(s) for session ${runner.sessionRecordId} did not fit the ` +
-      `recipient's context (${CONTEXT_OVERFLOW}); splitting into ${older.length} + ${newer.length} ` +
-      `(messages ${whole.from}–${whole.to} of ${whole.total}), older half first\n`,
-  );
+  const halves = splitInHalves(runner.sessionRecordId, members, split);
   // While the older half runs, the newer one is in the owner's custody: a close drain or a signal
   // sweep in that window terminalizes it (and it then does not run).
-  const releaseNewer = runner.holdCustody?.(newer) ?? (() => {});
-  let olderResult: SessionSendResult | undefined;
-  let olderError: unknown;
-  try {
-    olderResult = await runSplittingOnContextOverflow(runner, older, olderPart);
-  } catch (partError) {
-    if (partError instanceof InterruptedError) {
-      releaseNewer();
-      terminalizeUnstartedMembers(runner.sessionRecordId, newer, partError);
-      throw partError;
-    }
-    olderError = partError;
-  }
+  const releaseNewer = runner.holdCustody?.(halves.newer) ?? (() => {});
+  const older = await runOlderHalf(runner, halves, releaseNewer);
   releaseNewer();
   // A failure of the older half is its own members' (each already has its terminal); the newer
   // half is still delivered — unless the owner's custody sweep already settled it.
-  const newerLive = newer.filter((task) => !task.terminalWritten);
+  const newerLive = halves.newer.filter((task) => !task.terminalWritten);
   if (newerLive.length === 0) {
-    if (olderResult === undefined) {
-      throw olderError;
+    if (older.result === undefined) {
+      throw older.error;
     }
-    return olderResult;
+    return older.result;
   }
-  const result = await runSplittingOnContextOverflow(runner, newerLive, newerPart);
-  if (olderError !== undefined) {
-    throw olderError;
+  const result = await runSplittingOnContextOverflow(runner, newerLive, halves.newerPart);
+  if (older.error !== undefined) {
+    throw older.error;
   }
   return result;
+}
+
+type SplitHalves = {
+  older: QueueTask[];
+  newer: QueueTask[];
+  olderPart: BatchSplitPart;
+  newerPart: BatchSplitPart;
+};
+
+// The older and newer half (an odd member goes to the older half), positioned in the ORIGINAL
+// batch, and the one owner.log line this split gets (NOT verbose-gated).
+function splitInHalves(
+  sessionRecordId: string,
+  members: QueueTask[],
+  split: BatchSplitPart | undefined,
+): SplitHalves {
+  const live = members.filter((task) => !task.terminalWritten);
+  const whole = split ?? { total: live.length, from: 1, to: live.length };
+  const olderCount = Math.ceil(live.length / 2);
+  const olderPart = { total: whole.total, from: whole.from, to: whole.from + olderCount - 1 };
+  const halves = {
+    older: live.slice(0, olderCount),
+    newer: live.slice(olderCount),
+    olderPart,
+    newerPart: { total: whole.total, from: olderPart.to + 1, to: whole.to },
+  };
+  process.stderr.write(
+    `[acpx] batch of ${live.length} message(s) for session ${sessionRecordId} did not fit the ` +
+      `recipient's context (${CONTEXT_OVERFLOW}); splitting into ${halves.older.length} + ` +
+      `${halves.newer.length} (messages ${whole.from}–${whole.to} of ${whole.total}), older half first\n`,
+  );
+  return halves;
+}
+
+// An interrupt stops the split: the newer half gets the never-reached-the-model terminal.
+async function runOlderHalf(
+  runner: SplitRunner,
+  halves: SplitHalves,
+  releaseNewer: () => void,
+): Promise<{ result?: SessionSendResult; error?: unknown }> {
+  try {
+    return { result: await runSplittingOnContextOverflow(runner, halves.older, halves.olderPart) };
+  } catch (error) {
+    if (error instanceof InterruptedError) {
+      releaseNewer();
+      terminalizeUnstartedMembers(runner.sessionRecordId, halves.newer, error);
+      throw error;
+    }
+    return { error };
+  }
 }
 
 /** The never-reached-the-model terminal for split members an interrupt kept from their turn. */
