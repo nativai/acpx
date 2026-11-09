@@ -105,7 +105,7 @@ const { workerData } = require("node:worker_threads");
 const { ctl, port, index, count, procRoot, nice } = workerData;
 const post = (gen, pid, text) => { port.postMessage([gen, pid, text]); Atomics.add(ctl, ${SEQ}, 1); Atomics.notify(ctl, ${SEQ}); };
 let niceNote;
-try { os.setPriority(0, nice); niceNote = "nice " + os.getPriority(0); } catch (error) { niceNote = "could not set nice " + nice + " (" + ((error && error.code) || String(error)) + ")"; }
+try { os.setPriority(0, nice); niceNote = "nice " + os.getPriority(0); } catch (error) { niceNote = "could not set nice " + nice + " (" + ((error && error.info && error.info.code) || (error && error.code) || String(error)) + ")"; }
 post(0, -2, niceNote);
 let gen = 0;
 for (;;) {
