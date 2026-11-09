@@ -140,6 +140,8 @@ export type SessionsNewFlags = {
   parent?: boolean;
   /** `--favorite`: the new SEAT is minted starred (D-STAR — the star is the seat's). */
   favorite?: boolean;
+  /** Hidden `--sleeping` (UMQ K7): create the record only; the first message wakes it. Automation class only. */
+  sleeping?: boolean;
 };
 
 export type SessionsCopyFlags = {
@@ -164,6 +166,8 @@ export type SessionsCopyFlags = {
   noParent?: boolean;
   /** Internal (no `copy` flag): `sessions new --from-template --favorite`. */
   favorite?: boolean;
+  /** Hidden `--sleeping` (UMQ K7): create the record only; the first wake forks the source. Automation class only. */
+  sleeping?: boolean;
 };
 
 export type SessionsTemplateFlags = {

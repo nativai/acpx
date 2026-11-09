@@ -37,6 +37,7 @@ import {
   SeatBrickReassignRequiredError,
   writeBrickLink,
 } from "../session/seat-brick-write.js";
+import { isSleepingRecord, SLEEPING_TEXT } from "../session/sleeping.js";
 import type { OutputFormat } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import { parseOutputFormat, resolveGlobalFlags } from "./flags.js";
@@ -1513,6 +1514,8 @@ type SeatHolderSummary = {
   readonly ordinal: number | undefined;
   /** `undefined` means the record could not be resolved — reported, not inferred. */
   readonly open: boolean | undefined;
+  /** UMQ K7: the holder is a sleeping session — no agent has run yet. */
+  readonly sleeping?: true;
 };
 
 /**
@@ -1529,16 +1532,23 @@ async function listSeatHolders(seatId: string): Promise<SeatHolderSummary[]> {
       continue;
     }
     let open: boolean | undefined;
+    let sleeping: true | undefined;
     try {
       const record = await resolveSessionRecord(entry.acpxRecordId);
       open = record.closed !== true;
+      sleeping = isSleepingRecord(record) ? true : undefined;
     } catch (error) {
       if (!(error instanceof SessionNotFoundError)) {
         throw error;
       }
       open = undefined;
     }
-    holders.push({ id: entry.acpxRecordId, ordinal: entry.holderOrdinal, open });
+    holders.push({
+      id: entry.acpxRecordId,
+      ordinal: entry.holderOrdinal,
+      open,
+      ...(sleeping ? { sleeping } : {}),
+    });
   }
   holders.sort(
     (a, b) => (a.ordinal ?? Number.MAX_SAFE_INTEGER) - (b.ordinal ?? Number.MAX_SAFE_INTEGER),
@@ -1593,6 +1603,7 @@ function seatShowJsonPayload(
       id: holder.id,
       ordinal: holder.ordinal ?? null,
       open: holder.open ?? null,
+      ...(holder.sleeping ? { sleeping: true, state: SLEEPING_TEXT } : {}),
     })),
   };
 }
@@ -1602,6 +1613,17 @@ function describeHolderOpenState(open: boolean | undefined): string {
     return "record missing";
   }
   return open ? "open" : "closed";
+}
+
+/** The active holder, and (UMQ K7) that it is sleeping when no agent has run in it yet. */
+function activeHolderLine(
+  holderState: ActiveHolderState,
+  holders: readonly SeatHolderSummary[],
+): string {
+  const sleeping =
+    holderState.kind === "active" &&
+    holders.some((holder) => holder.id === holderState.holderId && holder.sleeping);
+  return `${renderActiveHolderText(holderState)}${sleeping ? ` (${SLEEPING_TEXT})` : ""}`;
 }
 
 function renderSeatShowText(
@@ -1616,12 +1638,12 @@ function renderSeatShowText(
   process.stdout.write(`  next_ordinal:  ${row.nextOrdinal}\n`);
   process.stdout.write(`  brick_id:      ${renderSeatBrickLinkText(row.brickId)}\n`);
   process.stdout.write(`  favorite:      ${row.favorite === true ? "yes" : "no"}\n`);
-  process.stdout.write(`  active holder: ${renderActiveHolderText(holderState)}\n`);
+  process.stdout.write(`  active holder: ${activeHolderLine(holderState, holders)}\n`);
   process.stdout.write(`  holders (${holders.length}):\n`);
   for (const holder of holders) {
     process.stdout.write(
       `    ${holder.ordinal === undefined ? "prepared" : `#${holder.ordinal}`}  ${holder.id}  ` +
-        `${describeHolderOpenState(holder.open)}\n`,
+        `${describeHolderOpenState(holder.open)}${holder.sleeping ? ` — ${SLEEPING_TEXT}` : ""}\n`,
     );
   }
 }

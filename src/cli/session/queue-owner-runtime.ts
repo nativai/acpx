@@ -41,6 +41,7 @@ import {
   settingsBindingFingerprint,
   withoutSettingsFlags,
 } from "../../session/settings-binding.js";
+import { namesAgentSession } from "../../session/sleeping.js";
 import type {
   AcpJsonRpcMessage,
   AcpMessageDirection,
@@ -1332,8 +1333,8 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
 
   const closeActiveBackendSession = async (timeoutMs?: number): Promise<boolean> => {
     const latestRecord = await resolveSessionRecord(options.sessionId);
-    if (!sharedClient.supportsCloseSession()) {
-      return false;
+    if (!sharedClient.supportsCloseSession() || !namesAgentSession(latestRecord.acpSessionId)) {
+      return false; // UMQ K7: a record that never ran has no backend session to close
     }
     await withTimeout(sharedClient.closeSession(latestRecord.acpSessionId), timeoutMs);
     return true;
@@ -2368,13 +2369,45 @@ export async function sendSession(
   return await spawnAndAwaitQueueOwner(effectiveOptions, deps);
 }
 
+/** The owner-option inputs of a send — all `persistSendOwnerOptions` reads. */
+export type SendOwnerOptionInputs = Pick<
+  SessionSendOptions,
+  | "sessionId"
+  | "permissionMode"
+  | "permissionModeExplicit"
+  | "nonInteractivePermissions"
+  | "authPolicy"
+  | "terminal"
+>;
+
+/**
+ * UMQ D1 (CONCEPTION §7.2) — a ROUTED agent prompt (atrium's queue, not this process, hands it to
+ * the owner) keeps `sendSession`'s two owner-option steps, split around the POST: the resolution —
+ * which can REFUSE (a mode that cannot be restored) — runs before it, and the write runs only after
+ * a 2xx, so a refused send (closed, archived, template) changes nothing, as `sendSession` gates
+ * first today.
+ */
+export function validateRoutedSendOwnerOptions(
+  record: SessionRecord,
+  options: SendOwnerOptionInputs,
+): void {
+  resolveSessionOwnerOptions(record, options, {
+    permissionModeExplicit: options.permissionModeExplicit,
+  });
+}
+
+export async function persistRoutedSendOwnerOptions(options: SendOwnerOptionInputs): Promise<void> {
+  const record = await resolveSessionRecord(options.sessionId);
+  await persistSendOwnerOptions(record, options);
+}
+
 // Split from its former `resolveAndPersistSendOwnerOptions` shape so `sendSession`
 // can hold the resolved record and run the closed-record refusal above BEFORE any
 // of these writes happen. One read, not two.
-async function persistSendOwnerOptions(
+async function persistSendOwnerOptions<T extends SendOwnerOptionInputs>(
   record: SessionRecord,
-  options: SessionSendOptions,
-): Promise<SessionSendOptions> {
+  options: T,
+): Promise<T> {
   if (bindRecordToDefaultAccount(record)) {
     await writeSessionRecordAtBoundary(record);
   }

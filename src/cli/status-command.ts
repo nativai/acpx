@@ -24,6 +24,7 @@ import {
 } from "../session/model-floor.js";
 import { resolveSessionModelLadder } from "../session/model-ladder.js";
 import { outputStyleChangePending } from "../session/output-style.js";
+import { isSleepingRecord, SLEEPING_TEXT } from "../session/sleeping.js";
 import type { SessionAcpxState, SessionRecord } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import { readSessionContext, sessionContextJson } from "./context-command.js";
@@ -39,7 +40,7 @@ import { agentSessionIdPayload } from "./output/render.js";
 import { probeQueueOwnerHealth } from "./queue/ipc.js";
 import { requireExplicitSessionRecord, resolveSessionTargetSelector } from "./session-selector.js";
 
-type SessionStatusState = "running" | "idle" | "dead";
+type SessionStatusState = "running" | "idle" | "dead" | "sleeping";
 
 function formatUptime(startedAt: string | undefined): string | undefined {
   if (!startedAt) {
@@ -62,11 +63,20 @@ function formatUptime(startedAt: string | undefined): string | undefined {
 }
 
 function resolveStatusState(
-  record: { lastAgentExitCode?: number | null; lastAgentExitSignal?: NodeJS.Signals | null },
+  record: {
+    lastAgentExitCode?: number | null;
+    lastAgentExitSignal?: NodeJS.Signals | null;
+    acpx?: { sleeping?: unknown };
+  },
   health: Awaited<ReturnType<typeof probeQueueOwnerHealth>>,
 ): SessionStatusState {
   if (health.healthy) {
     return "running";
+  }
+
+  // UMQ K7: a record that never ran has no owner to be dead — say so, never "dead"/"idle".
+  if (isSleepingRecord(record)) {
+    return "sleeping";
   }
 
   if (health.hasLease) {
@@ -88,6 +98,8 @@ function statusSummary(state: SessionStatusState): string {
       return "session idle; queue owner will start on next prompt";
     case "dead":
       return "queue owner unavailable";
+    case "sleeping":
+      return SLEEPING_TEXT;
   }
   return "queue owner unavailable";
 }
@@ -718,6 +730,11 @@ function advertisedModelCatalogueText(value: StatusAdvertisedModelCatalogue | nu
   return value ? JSON.stringify(value) : "-";
 }
 
+/** `status:` line — a sleeping session says why it has no owner (UMQ K7, CONCEPTION §6.3). */
+function statusText(status: SessionStatusState): string {
+  return status === "sleeping" ? SLEEPING_TEXT : status;
+}
+
 function printTextStatus(payload: StatusPayload, dead: boolean): void {
   process.stdout.write(`session: ${payload.sessionId}\n`);
   if ("agentSessionId" in payload) {
@@ -725,7 +742,7 @@ function printTextStatus(payload: StatusPayload, dead: boolean): void {
   }
   process.stdout.write(`agent: ${payload.agentCommand}\n`);
   process.stdout.write(`pid: ${orDash(payload.pid)}\n`);
-  process.stdout.write(`status: ${payload.status}\n`);
+  process.stdout.write(`status: ${statusText(payload.status)}\n`);
   process.stdout.write(`model: ${orDash(payload.model)}\n`);
   process.stdout.write(`availableModels: ${listOrDash(payload.availableModels)}\n`);
   process.stdout.write(

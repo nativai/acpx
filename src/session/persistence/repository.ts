@@ -461,6 +461,21 @@ export async function writeSessionRecordAtBoundary(
 }
 
 /**
+ * UMQ K7 — the write that ENDS a sleeping record's sleep (`runtime/engine/sleeping-materialisation.ts`):
+ * a boundary write (a forked record's inherited history must reach the messages sidecar) whose index
+ * entry is written IMMEDIATELY. The general rule throttles scalar index updates for a long-lived
+ * writer, and "sleeping" is a state a person reads off the session list: a row that kept saying so
+ * for seconds after the agent started would be the one stale thing on a live page.
+ */
+export async function writeSessionRecordAtBoundaryNow(record: SessionRecord): Promise<void> {
+  await writeSessionRecordInternal(record, {
+    messagePersistence: "boundary",
+    preserveLifecycle: true,
+    immediateIndexUpdate: true,
+  });
+}
+
+/**
  * Privileged write path — bypasses the read-preserve-lifecycle step so the
  * daemon's authorized closer (`closeSession`) can persist `closed: true` /
  * `closed_at`. All other daemon paths must use plain `writeSessionRecord`.

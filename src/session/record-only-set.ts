@@ -61,6 +61,11 @@ function nextServedModel(record: SessionRecord): string | undefined {
 }
 
 export function recordOnlyModelVerdict(record: SessionRecord): RecordOnlyVerdict {
+  // UMQ K7: a sleeping record has no adapter to ask and nothing to be stale against — the pin is
+  // written and the first wake's preference replay applies (or loudly refuses) it.
+  if (record.acpx?.sleeping) {
+    return RECORD;
+  }
   if (harnessIdForAgentCommand(record.agentCommand) === undefined) {
     return { kind: "live", reason: "unclassified-adapter" };
   }
@@ -90,6 +95,15 @@ function advertisesValue(option: { type?: unknown; options?: unknown }, value: s
  * session, not a degraded one. Row "N4" in test/record-only-set.test.ts.
  */
 export function recordOnlyConfigOptionVerdict(
+  record: SessionRecord,
+  configId: string,
+  value: string,
+): RecordOnlyVerdict {
+  // UMQ K7 — a sleeping record has no adapter to ask (see recordOnlyModelVerdict).
+  return record.acpx?.sleeping ? RECORD : advertisedConfigOptionVerdict(record, configId, value);
+}
+
+function advertisedConfigOptionVerdict(
   record: SessionRecord,
   configId: string,
   value: string,

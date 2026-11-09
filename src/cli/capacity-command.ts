@@ -1,9 +1,8 @@
-import { type Command, InvalidArgumentError } from "commander";
+import { type Command, InvalidArgumentError, Option } from "commander";
 import {
   admitWake,
   readPendingReservationsForProbe,
   readWaitingForProbe,
-  type SenderRole,
   type WakeDecision,
 } from "../capacity/admission.js";
 import { type Harness, HARNESSES, isHarness, MIB } from "../capacity/constants.js";
@@ -170,7 +169,7 @@ export function waitingLine(s: CapacitySnapshot, now: Date = new Date()): string
   }
   const effect =
     s.class === "spawn"
-      ? "they start before new agent sessions; the slots above already leave room for them"
+      ? "atrium wakes them oldest first as room frees, each with everything waiting for it; the slots above already leave room for them"
       : "class automation: the slots above are gross, the queue orders itself";
   return (
     `waiting: ${count} queued for room since ` +
@@ -358,8 +357,6 @@ type AdmitWakeFlags = {
   sessionId: string;
   class: "delivery" | "automation";
   sender?: string;
-  senderRole?: SenderRole;
-  crossBox?: boolean;
   format?: OutputFormat;
 };
 
@@ -367,14 +364,6 @@ function parseWakeClass(value: string): AdmitWakeFlags["class"] {
   const trimmed = value.trim();
   if (trimmed !== "delivery" && trimmed !== "automation") {
     throw new InvalidArgumentError("Expected one of: delivery, automation");
-  }
-  return trimmed;
-}
-
-function parseSenderRole(value: string): SenderRole {
-  const trimmed = value.trim();
-  if (trimmed !== "leaf" && trimmed !== "orchestrator") {
-    throw new InvalidArgumentError("Expected one of: leaf, orchestrator");
   }
   return trimmed;
 }
@@ -423,8 +412,6 @@ async function handleAdmitWake(
           verb: "capacity admit-wake",
           flagClass: flags.class,
           sender: flags.sender,
-          senderRole: flags.senderRole,
-          crossBox: flags.crossBox === true,
         }),
       );
   if (!emitJsonResult(format, admitWakeJson(record.acpxRecordId, decision))) {
@@ -451,12 +438,10 @@ function registerAdmitWakeCommand(capacity: Command, config: ResolvedAcpxConfig)
       parseWakeClass,
     )
     .option("--sender <id>", "The sending session's record id (decision log)")
-    .option(
-      "--sender-role <role>",
-      "atrium's family verdict on the sender: leaf or orchestrator (omitted: unknown)",
-      parseSenderRole,
-    )
-    .option("--cross-box", "The sender is on another box (recipient-box wording)")
+    // S3 (CONCEPTION §15.4): an atrium of the previous build still passes these two. They are
+    // accepted and ignored for one release — the decision is the same with or without them.
+    .addOption(new Option("--sender-role <role>").hideHelp())
+    .addOption(new Option("--cross-box").hideHelp())
     .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
     .exitOverride((error) => {
       throw error;

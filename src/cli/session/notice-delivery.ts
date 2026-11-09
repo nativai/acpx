@@ -19,16 +19,11 @@ export const NOTICE_DELIVERY_TIMEOUT_MS = 10_000;
 const FALLBACK_FROM = "acpx:sessions-activate";
 
 export type ActivationNoticeDelivery =
-  | { delivered: true; deliveryId?: string }
-  | {
-      delivered: false;
-      reason: string;
-      /**
-       * The capacity refusal's own text (brick 2b3b259f, CONCEPTION §9 row 5b): the box had no room
-       * to wake the successor. The activation stands; the notice is to be re-sent later.
-       */
-      capacityMessage?: string;
-    };
+  /**
+   * `held`: atrium stored the notice and delivers it when room frees (UMQ §7.3) — a successor that
+   * is not fresh can be held; the 202 says so with its `held` object. Nothing to resend.
+   */
+  { delivered: true; deliveryId?: string; held?: true } | { delivered: false; reason: string };
 
 export const resolveNoticeDeliveryOrigin = resolveAcpxUiInternalOrigin;
 
@@ -45,18 +40,13 @@ export function noticeSender(env: NodeJS.ProcessEnv): string {
   }
 }
 
-/** A 503 `code:"no-capacity"` answer's `message`, verbatim — atrium relays acpx's text (§5.3). */
-function capacityMessageFrom(status: number, body: string): string | undefined {
-  if (status !== 503) {
-    return undefined;
-  }
+/** Whether the 202 marks the notice as held for room (`held` present, CONTRACTS §5.2). */
+function heldFrom(body: string): boolean {
   try {
-    const parsed = JSON.parse(body) as { code?: unknown; message?: unknown };
-    return parsed.code === "no-capacity" && typeof parsed.message === "string"
-      ? parsed.message
-      : undefined;
+    const parsed = JSON.parse(body) as { held?: unknown };
+    return typeof parsed.held === "object" && parsed.held !== null;
   } catch {
-    return undefined;
+    return false;
   }
 }
 
@@ -105,21 +95,17 @@ async function postNotice(
   );
   const body = await response.text();
   if (!response.ok) {
-    const capacityMessage = capacityMessageFrom(response.status, body);
-    if (capacityMessage !== undefined) {
-      return {
-        delivered: false,
-        reason: "acpx-ui answered HTTP 503 no-capacity: no room to wake the successor",
-        capacityMessage,
-      };
-    }
     return {
       delivered: false,
       reason: `acpx-ui answered HTTP ${response.status}: ${body.slice(0, 200)}`,
     };
   }
   const deliveryId = deliveryIdFrom(body);
-  return deliveryId ? { delivered: true, deliveryId } : { delivered: true };
+  return {
+    delivered: true,
+    ...(deliveryId ? { deliveryId } : {}),
+    ...(heldFrom(body) ? { held: true as const } : {}),
+  };
 }
 
 /** Never throws: every failure is a `{delivered:false, reason}` the caller prints. */

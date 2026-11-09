@@ -11,6 +11,7 @@ import { defaultSessionEventLog, sessionEventActivePath } from "./event-log.js";
 import { setLoggedMessageCount } from "./messages-log-bookkeeping.js";
 import { messagesLogPath } from "./messages-log.js";
 import { listSessionRecordBodies, parseSessionRecord, writeSessionRecord } from "./persistence.js";
+import { namesAgentSession } from "./sleeping.js";
 
 const SUPPORTED_FORMAT_VERSION = 1;
 
@@ -259,6 +260,9 @@ function commandLooksLikeBuiltInAgent(command: string, agentName: string): boole
 }
 
 async function assertProviderSessionAvailable(record: SessionRecord): Promise<void> {
+  if (!namesAgentSession(record.acpSessionId)) {
+    return; // UMQ K7: a sleeping record names no provider session, so it cannot collide with one
+  }
   // Bodies only: the check needs one field, and it used to hydrate every record in the store.
   const existing = await listSessionRecordBodies(
     (session) => session.acpSessionId === record.acpSessionId,

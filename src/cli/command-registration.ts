@@ -510,7 +510,9 @@ export function registerSessionsCommand(
     .option(
       "--no-prompt",
       "With --from-template: do not auto-fire the template's stored auto-prompt (create a pure copy).",
-    );
+    )
+    // UMQ K7 (CONCEPTION §6.1) — hidden: atrium's automated starts only (ACPX_ADMISSION_CLASS=automation).
+    .addOption(new Option("--sleeping").hideHelp());
   // `--prompt <text>` and `--no-prompt` share commander's ONE `prompt` key and the last one
   // wins, so "both given" cannot be read off the parsed flags; these record each occurrence.
   newCommand.on("option:prompt", () => newCommand.setOptionValue("promptTextGiven", true));
@@ -641,6 +643,8 @@ Closing your OWN session (run from inside it, e.g. --seat "$ACPX_SEAT_URL"):
         "(non-blocking). A relative path resolves against the directory you run acpx in, not --cwd",
       (value: string) => parseNonEmptyValue("Prompt file", value),
     )
+    // UMQ K7 (CONCEPTION §6.1) — hidden: atrium's automated starts only (ACPX_ADMISSION_CLASS=automation).
+    .addOption(new Option("--sleeping").hideHelp())
     .action(async function (this: Command, flags: SessionsCopyFlags) {
       await handleSessionsCopy(explicitAgentName, flags, this, config);
     });

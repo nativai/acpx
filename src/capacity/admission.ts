@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { acpAdapterKind } from "../acp/agent-command.js";
 import { CapacityRefusedError } from "../errors.js";
-import type { CapacityRefusalReason, FinalReportWhy } from "../types.js";
+import type { CapacityRefusalReason } from "../types.js";
 import { readPodInfo } from "./budget.js";
 import { type Harness, isHarness, MIB } from "./constants.js";
 import {
@@ -27,7 +27,7 @@ import {
   needMet,
   readCapacity,
 } from "./reading.js";
-import { finalReportSupported, readWaiting, type WaitingQueue } from "./waiting.js";
+import { readWaiting, type WaitingQueue } from "./waiting.js";
 
 /**
  * The create gate (CONCEPTION f7587c86 §6.1 A2, AMENDMENT 2026-10-29): `sessions new`, `sessions
@@ -98,6 +98,15 @@ export function takeAdmissionClassFromEnv(env: NodeJS.ProcessEnv = process.env):
       ? (value as AdmissionClass)
       : undefined,
   };
+}
+
+/**
+ * The class atrium declared for THIS invocation (`ACPX_ADMISSION_CLASS`, consumed at CLI start by
+ * {@link takeAdmissionClassFromEnv}), or `undefined` when none was sent or it was not a known class.
+ * `sessions new|copy --sleeping` is accepted only for `automation` (UMQ K7, CONCEPTION §6.1).
+ */
+export function declaredAdmissionClass(): AdmissionClass | undefined {
+  return explicitClass?.value;
 }
 
 function hasAgentIdentity(env: NodeJS.ProcessEnv): boolean {
@@ -510,9 +519,6 @@ export type WakeTarget = {
   readonly lastPromptAt?: string;
 };
 
-/** atrium's family verdict on the sender (contract note 2026-11-06 17:55Z); acpx computes none. */
-export type SenderRole = "leaf" | "orchestrator";
-
 export type WakeAdmissionRequest = {
   /**
    * `set` (brick 5c44d8ba, DESIGN §5): an ownerless `acpx <agent> set …` the record could not vouch
@@ -527,9 +533,6 @@ export type WakeAdmissionRequest = {
   readonly flagClass?: "delivery" | "automation";
   /** The sending session's record id, for the decision log. */
   readonly sender?: string;
-  readonly senderRole?: SenderRole;
-  /** The sender is on another box: the recipient-box wording (§5.1 d). */
-  readonly crossBox?: boolean;
   /** A closed record prompted with `--message-id`: its owner refuses it (B3) — logged, never gated. */
   readonly closedWithMessageId?: boolean;
   /** The target seat's display name, read only when refusing. */
@@ -549,7 +552,6 @@ export type WakeRefusal = {
   readonly starting: number | null;
   readonly freeSlots: number | null;
   readonly needMib: number | null;
-  readonly finalReport: { readonly offered: boolean; readonly why: FinalReportWhy };
 };
 
 export type WakeDecision =
@@ -637,8 +639,6 @@ function wakeIdentityFields(ctx: WakeContext): Record<string, unknown> {
     caller: ctx.env.ACPX_SESSION_URL ?? ctx.env.ACPX_SESSION_RECORD_ID ?? null,
     callerPid: process.pid,
     sender: request.sender ?? null,
-    senderRole: request.senderRole ?? null,
-    crossBox: request.crossBox === true,
     harness: ctx.harness,
   };
 }
@@ -828,21 +828,6 @@ async function decideWakeUnderLock(
 
 // ── The refusal text: written ONCE, here (CONCEPTION §5.1) ────────────────────────────────────────
 
-const FINAL_REPORT_LINE =
-  "acpx: only if you have finished your work, will do no further work, and will close yourself right after this send: send it with 'send-message.sh --final-report' instead — it is held and delivered when room frees. Orchestrators, and any agent that will keep working, must not use it.";
-const NOT_FOR_YOU_LINE =
-  "acpx: (--final-report is only for a finished agent's last message before it closes itself; you have open sub-sessions, so it is not for you.)";
-const RETRY_LINE =
-  "acpx: retry later — after one of your own sessions finishes, or after you close one you are done with — and never in a loop; 'acpx capacity --need 1' says when there is room.";
-/**
- * A leaf blocked on the recipient's answer must not arm a wakeup to retry: its self-wakeup would
- * take the slot the recipient needs to wake, ahead of the parent it waits on (A1 §5.7). Leaf
- * senders only — an orchestrator's heartbeat wakeups are its own protocol and are never told this.
- */
-const BLOCKED_LEAF_LINE =
-  "acpx: blocked on the recipient's answer? Do not arm a wakeup to retry — it would take the slot the recipient needs to wake; end your turn with your question as its last output.";
-/** The pre-S1 hint (CONCEPTION §5.3; contract note 17:55Z): admit-wake's answer only, only when offered. */
-export const PRE_S1_HINT = "(If your send-message.sh does not know --final-report, retry later.)";
 const WAKE_BUSY_LINE =
   "acpx: other session starts held the box's admission lock for 5 s. Nothing was started or queued. Retry in a few seconds; 'acpx capacity' shows the room left.";
 
@@ -855,38 +840,7 @@ type WakeTextInput = {
   readonly target: WakeTarget;
   readonly seatName: string | undefined;
   readonly harness: Harness;
-  readonly senderRole: SenderRole | undefined;
-  readonly crossBox: boolean;
-  readonly finalReportSupported: boolean;
-  readonly withHint: boolean;
 };
-
-/**
- * Line 4 (§5.1 a–c; contract note 17:55Z), in order: a busy lock offers nothing; no fresh capability
- * marker names nothing (an atrium that cannot hold the send must never be pointed at); no sender
- * role — atrium could not judge, or a bare `acpx prompt`, the orchestrator's verb (R2-1) — names
- * nothing; an orchestrator is told "not for you"; only a leaf is offered the flag.
- */
-export function finalReportOffer(input: {
-  readonly reason: CapacityRefusalReason;
-  readonly finalReportSupported: boolean;
-  readonly senderRole: SenderRole | undefined;
-  readonly crossBox: boolean;
-}): { offered: boolean; why: FinalReportWhy } {
-  if (input.reason === "admission_busy") {
-    return { offered: false, why: "admission-busy" };
-  }
-  if (!input.finalReportSupported) {
-    return { offered: false, why: "no-capability" };
-  }
-  if (input.senderRole === undefined) {
-    return { offered: false, why: "no-sender" };
-  }
-  if (input.senderRole === "orchestrator") {
-    return { offered: false, why: "orchestrator" };
-  }
-  return { offered: true, why: input.crossBox ? "cross-box" : "leaf" };
-}
 
 function whoOf(target: WakeTarget, seatName: string | undefined): string {
   const session = `session ${target.id.slice(0, 8)}`;
@@ -919,33 +873,17 @@ function wakeNoRoomLine(input: WakeTextInput, snapshot: CapacitySnapshot): strin
   );
 }
 
-function wakeRetryLine(input: WakeTextInput, snapshot: CapacitySnapshot): string {
-  return input.crossBox
-    ? `acpx: the recipient's box (${snapshot.box}) has no room right now; retry later, never in a loop — your own box's 'acpx capacity' cannot see it.`
-    : RETRY_LINE;
-}
-
-function finalReportLine(why: FinalReportWhy, offered: boolean): string[] {
-  if (offered) {
-    return [FINAL_REPORT_LINE];
-  }
-  return why === "orchestrator" ? [NOT_FOR_YOU_LINE] : [];
-}
-
-function wakeSentences(
-  input: WakeTextInput,
-  offer: { offered: boolean; why: FinalReportWhy },
-): string[] {
+/**
+ * A wake refusal's sentences (A-10): the reason-specific figures, or the busy-lock line — nothing
+ * else. The atrium-down sentence is `handlePrompt`'s fallback branch's alone (`prompt-routing.ts`):
+ * here it would be false for `admit-wake`, for atrium's own delivery spawns and for D1's back door.
+ */
+function wakeSentences(input: WakeTextInput): string[] {
   const { snapshot } = input;
   if (input.reason === "admission_busy" || !snapshot) {
     return [WAKE_BUSY_LINE];
   }
-  return [
-    wakeNoRoomLine(input, snapshot),
-    wakeRetryLine(input, snapshot),
-    ...(input.senderRole === "leaf" ? [BLOCKED_LEAF_LINE] : []),
-    ...finalReportLine(offer.why, offer.offered),
-  ];
+  return [wakeNoRoomLine(input, snapshot)];
 }
 
 /**
@@ -958,19 +896,17 @@ function setSentences(input: WakeTextInput, setting: string, retryAfterS: number
   ];
 }
 
-/** A wake's text, or a set's (brick 5c44d8ba): its token field, its offer, its sentences. */
+/** A wake's text, or a set's (brick 5c44d8ba): its token field and its sentences. */
 function refusalText(
   input: WakeTextInput,
   retryAfterS: number,
-): { setField: string[]; offer: { offered: boolean; why: FinalReportWhy }; sentence: string } {
+): { setField: string[]; sentence: string } {
   const { setting } = input;
   if (setting === undefined) {
-    const offer = finalReportOffer(input);
-    return { setField: [], offer, sentence: wakeSentences(input, offer).join("\n") };
+    return { setField: [], sentence: wakeSentences(input).join("\n") };
   }
   return {
     setField: [`set=${setting}`],
-    offer: { offered: false, why: "set" },
     sentence: setSentences(input, setting, retryAfterS).join("\n"),
   };
 }
@@ -988,10 +924,9 @@ export function wakeRefusal(input: WakeTextInput): {
   const { snapshot, reason, queuedAhead } = input;
   const retryAfterS = retryAfterOf(reason);
   const tokenSnapshot = reason === "admission_busy" ? undefined : snapshot;
-  const { setField, offer, sentence } = refusalText(input, retryAfterS);
+  const { setField, sentence } = refusalText(input, retryAfterS);
   // `set=` sits BEFORE `wake=`, which stays: an A1 token parser keyed on `wake=` still matches.
   const tokenLine = `acpx: REFUSED ${[...tokenFields(reason, tokenSnapshot, queuedAhead), ...setField, `wake=${input.target.id}`].join(" ")}`;
-  const hint = input.withHint && offer.offered ? `\n${PRE_S1_HINT}` : "";
   const error = new CapacityRefusedError({
     tokenLine,
     sentence,
@@ -1003,19 +938,17 @@ export function wakeRefusal(input: WakeTextInput): {
       ...(tokenSnapshot ? { capacity: tokenSnapshot } : {}),
       message: sentence,
       wake: { sessionId: input.target.id, seatId: input.target.seatId ?? null },
-      finalReport: offer,
     },
   });
   return {
     error,
     refusal: {
-      message: `${tokenLine}\n${sentence}${hint}`,
+      message: `${tokenLine}\n${sentence}`,
       tokenLine,
       reason,
       retryAfterS,
       queuedAhead,
       ...refusalFigures(tokenSnapshot, input.harness),
-      finalReport: offer,
     },
   };
 }
@@ -1055,10 +988,6 @@ async function refusedWake(
     target: ctx.request.target,
     seatName,
     harness: ctx.harness,
-    senderRole: ctx.request.senderRole,
-    crossBox: ctx.request.crossBox === true,
-    finalReportSupported: finalReportSupported(ctx.dir),
-    withHint: ctx.request.verb === "capacity admit-wake",
   });
   return { decision: "refused", error, refusal };
 }

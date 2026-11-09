@@ -483,8 +483,9 @@ function waitingField(queue: WaitingQueue): CapacitySnapshot["waiting"] {
  * UMQ K9 (CONTRACTS §3.1) — advertised on every `acpx --format json capacity` answer. atrium reads
  * a field-less answer as "no features" and then delivers member by member (S5).
  * `prompt-batch`: `prompt --batch-file` + the owner's `submit_prompt_batch`.
+ * `sessions-new-sleeping`: `sessions new|copy --sleeping` (a build without it answers exit 2).
  */
-export const ACPX_FEATURES: readonly string[] = ["prompt-batch"];
+export const ACPX_FEATURES: readonly string[] = ["prompt-batch", "sessions-new-sleeping"];
 
 export function readCapacity(options: ReadCapacityOptions): CapacitySnapshot {
   const g = gather(options);

@@ -7,7 +7,6 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { finalReportOffer, PRE_S1_HINT } from "../src/capacity/admission.js";
 import { MIB } from "../src/capacity/constants.js";
 import {
   ADMISSION_TTL_MS,
@@ -18,7 +17,6 @@ import {
   withAdmissionLock,
 } from "../src/capacity/ledger.js";
 import { partitionPending } from "../src/capacity/pending.js";
-import { finalReportSupported } from "../src/capacity/waiting.js";
 import { sendSession } from "../src/cli/session/queue-owner-runtime.js";
 
 // brick 2b3b259f — A1, the WAKE gate (CONCEPTION §3–§5, TEST-MATRIX B11/B14/B15, C1–C19 acpx
@@ -249,7 +247,6 @@ type AdmitWakeJson = {
     starting: number | null;
     freeSlots: number | null;
     needMib: number | null;
-    finalReport: { offered: boolean; why: string };
   } | null;
 };
 
@@ -324,15 +321,6 @@ function agentStarts(f: Fixture): number {
 
 const LINE2 =
   /^acpx: no memory to wake session [0-9a-f]{8}: it has no running agent process \(released after idle, or stopped\), and starting one needs ~450 MiB the box does not have \(1 live, 0 starting; \d+\.\d\d GiB charged of a \d+\.\d\d GiB budget\)\. Nothing was started or queued\.$/u;
-const LINE3 =
-  "acpx: retry later — after one of your own sessions finishes, or after you close one you are done with — and never in a loop; 'acpx capacity --need 1' says when there is room.";
-const LINE4_LEAF =
-  "acpx: only if you have finished your work, will do no further work, and will close yourself right after this send: send it with 'send-message.sh --final-report' instead — it is held and delivered when room frees. Orchestrators, and any agent that will keep working, must not use it.";
-const LINE_BLOCKED_LEAF =
-  "acpx: blocked on the recipient's answer? Do not arm a wakeup to retry — it would take the slot the recipient needs to wake; end your turn with your question as its last output.";
-const LINE4_ORCHESTRATOR =
-  "acpx: (--final-report is only for a finished agent's last message before it closes itself; you have open sub-sessions, so it is not for you.)";
-
 function tokenFor(id: string): RegExp {
   return new RegExp(
     `^acpx: REFUSED reason=no_capacity nothing_started=true protocol=1 box=\\S+ basis=request free_slots=0 need_mib=450 releasable_mib=0 retry_after_s=60 queued_ahead=0 wake=${id}$`,
@@ -409,7 +397,6 @@ test("NEGATIVE admit-wake: full box → exit 75, the refusal JSON, and NOTHING w
   assert.equal(refusal.freeSlots, 0);
   assert.equal(refusal.needMib, 450);
   assert.equal(typeof refusal.box, "string");
-  assert.deepEqual(refusal.finalReport, { offered: false, why: "no-capability" });
   assert.match(run.stderr, tokenFor(id), "the token line stays on stderr in JSON mode");
   assert.deepEqual(await readLedgerFile(admission(f)), [], "no reservation");
   assert.deepEqual(leaseFiles(f), leasesBefore, "no owner");
@@ -451,12 +438,6 @@ test("admit-wake: CLI — usage errors exit 2; plain `acpx capacity --class` kee
     os.tmpdir(),
   );
   assert.equal(badClass.code, 2, badClass.stderr);
-  const badRole = await runCli(
-    ["capacity", "admit-wake", "--session-id", id, "--class", "delivery", "--sender-role", "x"],
-    f.env,
-    os.tmpdir(),
-  );
-  assert.equal(badRole.code, 2, badRole.stderr);
   const noId = await runCli(["capacity", "admit-wake", "--class", "delivery"], f.env, os.tmpdir());
   assert.equal(noId.code, 2, noId.stderr);
   const plain = await runCli(
@@ -479,126 +460,58 @@ async function refusedText(f: Fixture, id: string, extra: string[]): Promise<str
   return run.json.refusal?.message.split("\n") ?? [];
 }
 
-test("text (a): a LEAF sender, marker fresh → lines 1–4 + the pre-S1 hint, offered:true why leaf", async () => {
+test("text: the wake refusal is the token line plus the reason's figures — nothing else (CONTRACTS A-10)", async () => {
   const f = makeBox({ requestMib: 2048 });
   const id = await makeTarget(f);
-  writeMarker(f);
-  const run = await admitWakeCli(f, id, ["--sender", CALLER, "--sender-role", "leaf"]);
+  const run = await admitWakeCli(f, id, ["--sender", CALLER]);
   assert.equal(run.code, 75);
   const lines = run.json.refusal?.message.split("\n") ?? [];
-  assert.equal(lines.length, 6, lines.join("\n"));
+  assert.equal(lines.length, 2, lines.join("\n"));
   assert.match(lines[0], tokenFor(id));
   assert.match(lines[1], LINE2);
-  assert.equal(lines[2], LINE3);
-  assert.equal(lines[3], LINE_BLOCKED_LEAF);
-  assert.equal(lines[4], LINE4_LEAF);
-  assert.equal(lines[5], PRE_S1_HINT);
-  assert.equal(PRE_S1_HINT, "(If your send-message.sh does not know --final-report, retry later.)");
-  assert.deepEqual(run.json.refusal?.finalReport, { offered: true, why: "leaf" });
+  assert.equal(Object.hasOwn(run.json.refusal ?? {}, "finalReport"), false);
 });
 
-test("text (b): an ORCHESTRATOR sender → line 4 is 'not for you', no hint, offered:false", async () => {
-  const f = makeBox({ requestMib: 2048 });
-  const id = await makeTarget(f);
-  writeMarker(f);
-  const lines = await refusedText(f, id, ["--sender-role", "orchestrator"]);
-  assert.equal(lines.length, 4, lines.join("\n"));
-  assert.equal(lines[3], LINE4_ORCHESTRATOR);
-  assert.ok(!lines.includes(PRE_S1_HINT));
-  assert.ok(
-    !lines.includes(LINE_BLOCKED_LEAF),
-    "an orchestrator is never told not to arm a wakeup",
-  );
-});
-
-test("NEGATIVE text (c): marker absent, stale (6 min), future (+60 s) or not finalReport → --final-report is NEVER named", async () => {
+test("N-A2-9 · G9: a STALE or FRESH A1 capability marker on disk changes nothing — no acpx text mentions --final-report", async () => {
   const f = makeBox({ requestMib: 2048 });
   const id = await makeTarget(f);
   const cases: Array<[string, () => void]> = [
-    [
-      "absent",
-      () => fs.rmSync(path.join(admission(f), "capabilities"), { recursive: true, force: true }),
-    ],
-    ["stale", () => writeMarker(f, 6 * 60_000)],
-    ["future", () => writeMarker(f, -60_000)],
-    ["no finalReport", () => writeMarker(f, 0, { schema: 1, finalReport: false })],
-    ["other schema", () => writeMarker(f, 0, { schema: 2, finalReport: true })],
+    ["fresh", () => writeMarker(f)],
+    ["stale (6 min)", () => writeMarker(f, 6 * 60_000)],
+    ["future (+60 s)", () => writeMarker(f, -60_000)],
+    ["not finalReport", () => writeMarker(f, 0, { schema: 1, finalReport: false })],
   ];
+  const before = await admitWakeCli(f, id, ["--sender", CALLER]);
   for (const [label, arrange] of cases) {
     arrange();
-    for (const role of ["leaf", "orchestrator"]) {
-      const run = await admitWakeCli(f, id, ["--sender-role", role]);
-      assert.equal(run.code, 75, `${label}/${role}`);
-      const message = run.json.refusal?.message ?? "";
-      // The blocked-leaf line is about the sender's position, not atrium's capability: a leaf gets
-      // it here too (4 lines); an orchestrator never does (3).
-      assert.equal(
-        message.split("\n").length,
-        role === "leaf" ? 4 : 3,
-        `${label}/${role}: ${message}`,
-      );
-      assert.equal(message.includes(LINE_BLOCKED_LEAF), role === "leaf", `${label}/${role}`);
-      assert.doesNotMatch(message, /--final-report/u, `${label}/${role}`);
-      assert.deepEqual(run.json.refusal?.finalReport, { offered: false, why: "no-capability" });
+    const prompt = await promptCli(f, id, asAgent(f));
+    const admit = await admitWakeCli(f, id, ["--sender", CALLER]);
+    assert.equal(admit.code, 75, label);
+    assert.equal(admit.json.refusal?.message, before.json.refusal?.message, label);
+    for (const text of [prompt.stderr, prompt.stdout, admit.stderr, admit.json.refusal?.message]) {
+      assert.doesNotMatch(text ?? "", /final.report/iu, label);
     }
   }
 });
 
-test("marker: fresh just-written (−2 s ≤ age < 5 min, the waiting-file rule) counts; 5 min does not", () => {
-  const f = makeBox({ requestMib: 2048 });
-  writeMarker(f, -1_000);
-  assert.equal(finalReportSupported(admission(f)), true, "a fraction ahead (NFS clock) counts");
-  writeMarker(f, 4 * 60_000);
-  assert.equal(finalReportSupported(admission(f)), true);
-  writeMarker(f, 5 * 60_000 + 1_000);
-  assert.equal(finalReportSupported(admission(f)), false);
-  fs.writeFileSync(path.join(admission(f), "capabilities", "atrium-test.json"), "{not json");
-  assert.equal(finalReportSupported(admission(f)), false, "malformed fails closed");
-});
-
-test("text: no --sender-role (atrium could not judge) → line 4 omitted, why no-sender", async () => {
+test("N-A2-11 · S3: `admit-wake --sender-role leaf --cross-box` is accepted as hidden no-ops — the decision is the same as without them", async () => {
   const f = makeBox({ requestMib: 2048 });
   const id = await makeTarget(f);
-  writeMarker(f);
-  const run = await admitWakeCli(f, id, ["--sender", CALLER]);
-  assert.equal(run.json.refusal?.message.split("\n").length, 3);
-  assert.deepEqual(run.json.refusal?.finalReport, { offered: false, why: "no-sender" });
-});
-
-test("text (d): --cross-box → line 3 names the recipient's box and never local-box advice; a leaf is offered, why cross-box", async () => {
-  const f = makeBox({ requestMib: 2048 });
-  const id = await makeTarget(f);
-  writeMarker(f);
-  const run = await admitWakeCli(f, id, ["--cross-box", "--sender-role", "leaf"]);
-  const lines = run.json.refusal?.message.split("\n") ?? [];
-  const box = run.json.refusal?.box ?? "";
-  assert.equal(
-    lines[2],
-    `acpx: the recipient's box (${box}) has no room right now; retry later, never in a loop — your own box's 'acpx capacity' cannot see it.`,
-  );
-  assert.doesNotMatch(lines.join("\n"), /acpx capacity --need 1/u);
-  assert.equal(lines[3], LINE_BLOCKED_LEAF);
-  assert.equal(lines[4], LINE4_LEAF);
-  assert.deepEqual(run.json.refusal?.finalReport, { offered: true, why: "cross-box" });
-});
-
-test("text (§5.7): the blocked-leaf line sits between the retry line and the --final-report line, local and cross-box; an orchestrator never gets it, in either box shape", async () => {
-  const f = makeBox({ requestMib: 2048 });
-  const id = await makeTarget(f);
-  writeMarker(f);
-  for (const crossBox of [false, true]) {
-    const cross = crossBox ? ["--cross-box"] : [];
-    const leaf = await refusedText(f, id, [...cross, "--sender-role", "leaf"]);
-    const at = leaf.indexOf(LINE_BLOCKED_LEAF);
-    assert.ok(at > 0, `leaf crossBox=${crossBox}: ${leaf.join("\n")}`);
-    assert.ok(leaf[at - 1].includes("retry later"), `crossBox=${crossBox}: retry line precedes it`);
-    assert.equal(leaf[at + 1], LINE4_LEAF, `crossBox=${crossBox}: final-report line follows it`);
-    const orchestrator = await refusedText(f, id, [...cross, "--sender-role", "orchestrator"]);
-    assert.ok(
-      !orchestrator.join("\n").includes("Do not arm a wakeup"),
-      `orchestrator crossBox=${crossBox}: ${orchestrator.join("\n")}`,
-    );
-  }
+  const plain = await admitWakeCli(f, id, ["--sender", CALLER]);
+  const legacy = await admitWakeCli(f, id, [
+    "--sender",
+    CALLER,
+    "--sender-role",
+    "leaf",
+    "--cross-box",
+  ]);
+  const odd = await admitWakeCli(f, id, ["--sender-role", "anything-at-all"]);
+  assert.equal(legacy.code, plain.code);
+  assert.equal(legacy.json.decision, "refused");
+  assert.equal(legacy.json.refusal?.message, plain.json.refusal?.message);
+  assert.equal(odd.json.refusal?.message, plain.json.refusal?.message);
+  const help = await runCli(["capacity", "admit-wake", "--help"], f.env, os.tmpdir());
+  assert.doesNotMatch(help.stdout, /sender-role|cross-box/u, "hidden from --help");
 });
 
 test("text: the seat name leads <who> when the target's seat has one", async () => {
@@ -660,38 +573,6 @@ test("text: memory_pressure → its own line 2; queued_ahead > 0 → line 2 ends
   );
 });
 
-test("finalReportOffer: the decision order (busy, capability, sender, role)", () => {
-  const base = { finalReportSupported: true, crossBox: false } as const;
-  assert.deepEqual(finalReportOffer({ ...base, reason: "admission_busy", senderRole: "leaf" }), {
-    offered: false,
-    why: "admission-busy",
-  });
-  assert.deepEqual(
-    finalReportOffer({
-      ...base,
-      reason: "no_capacity",
-      senderRole: "leaf",
-      finalReportSupported: false,
-    }),
-    { offered: false, why: "no-capability" },
-  );
-  assert.deepEqual(finalReportOffer({ ...base, reason: "no_capacity", senderRole: undefined }), {
-    offered: false,
-    why: "no-sender",
-  });
-  assert.deepEqual(
-    finalReportOffer({ ...base, reason: "node_pressure", senderRole: "orchestrator" }),
-    {
-      offered: false,
-      why: "orchestrator",
-    },
-  );
-  assert.deepEqual(finalReportOffer({ ...base, reason: "no_capacity", senderRole: "leaf" }), {
-    offered: true,
-    why: "leaf",
-  });
-});
-
 // ---------------------------------------------------------------------------------------------
 // The acpx-side gate: an agent's own `acpx prompt` (CONCEPTION §4.2; C1, B11)
 // ---------------------------------------------------------------------------------------------
@@ -703,7 +584,6 @@ test("NEGATIVE prompt: an agent's `acpx prompt` to a released session on a full 
   const f = makeBox({ requestMib: 4000 });
   const id = await makeTarget(f);
   setRequest(f, 2048);
-  writeMarker(f); // even with a fresh marker, a bare `acpx prompt` names no --final-report (R2-1)
   const before = sha256(recordPath(f, id));
   const startsBefore = agentStarts(f);
   const run = await promptCli(f, id, asAgent(f));
@@ -713,8 +593,8 @@ test("NEGATIVE prompt: an agent's `acpx prompt` to a released session on a full 
   assert.ok(at >= 0, run.stderr);
   assert.match(lines[at], tokenFor(id));
   assert.match(lines[at + 1] ?? "", LINE2);
-  assert.equal(lines[at + 2], LINE3);
-  assert.doesNotMatch(run.stderr, /--final-report/u);
+  assert.equal(lines[at + 2], undefined, "token line + the figures, nothing after (A-10)");
+  assert.doesNotMatch(run.stderr, /--final-report|retry later|atrium's message queue/u);
   assert.equal(sha256(recordPath(f, id)), before, "a refused prompt does not mutate its target");
   assert.equal(agentStarts(f), startsBefore, "no adapter started");
   assert.deepEqual(leaseFiles(f), ["caller.lock"], "no owner started");
@@ -727,11 +607,10 @@ test("NEGATIVE prompt: an agent's `acpx prompt` to a released session on a full 
   assert.equal(line.sender, CALLER);
 });
 
-test("prompt --format json: the refusal's data carries message (lines 2–3), wake and finalReport; the token stays on stderr", async () => {
+test("prompt --format json: the refusal's data carries message (line 2), wake; no finalReport; the token stays on stderr", async () => {
   const f = makeBox({ requestMib: 4000 });
   const id = await makeTarget(f);
   setRequest(f, 2048);
-  writeMarker(f); // atrium supports it — a bare `acpx prompt` still offers nothing (no sender role)
   const run = await promptCli(f, id, asAgent(f), ["--format", "json"]);
   assert.equal(run.code, 75, run.stderr);
   assert.match(run.stderr, tokenFor(id));
@@ -741,12 +620,11 @@ test("prompt --format json: the refusal's data carries message (lines 2–3), wa
   assert.equal(data.reason, "no_capacity");
   const message = String(data.message).split("\n");
   assert.match(message[0], LINE2);
-  assert.equal(message[1], LINE3);
-  assert.equal(message.length, 2);
+  assert.equal(message.length, 1);
   const seatId = (JSON.parse(fs.readFileSync(recordPath(f, id), "utf8")) as { seat_id?: string })
     .seat_id;
   assert.deepEqual(data.wake, { sessionId: id, seatId: seatId ?? null });
-  assert.deepEqual(data.finalReport, { offered: false, why: "no-sender" });
+  assert.equal(Object.hasOwn(data, "finalReport"), false);
 });
 
 test("NEGATIVE control prompt: the SAME agent prompt with room is admitted — a wake entry, an owner, the turn runs", async () => {
@@ -901,7 +779,7 @@ test("log: every wake line carries kind, target, targetSeat, verb, class, classS
   assert.equal(line.class, "delivery");
   assert.equal(line.classSource, "flag");
   assert.equal(line.sender, "sess-sender");
-  assert.equal(line.senderRole, "leaf");
+  assert.equal(line.senderRole, undefined, "S3: the sender role is a retired no-op, never logged");
   assert.equal(line.decision, "refused");
   assert.equal(line.reason, "no_capacity");
   assert.deepEqual(
@@ -1017,7 +895,6 @@ test("lock: contention past 5 s refuses a wake with reason=admission_busy — it
       `acpx: REFUSED reason=admission_busy nothing_started=true protocol=1 retry_after_s=5 queued_ahead=0 wake=${id}`,
       "acpx: other session starts held the box's admission lock for 5 s. Nothing was started or queued. Retry in a few seconds; 'acpx capacity' shows the room left.",
     ]);
-    assert.deepEqual(run.json.refusal?.finalReport, { offered: false, why: "admission-busy" });
   } finally {
     release();
     await holder;
