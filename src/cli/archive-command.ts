@@ -559,7 +559,7 @@ function appendBlockedLines(lines: string[], result: ArchiveRunResult): void {
 function appendPlanNotes(lines: string[], result: ArchiveRunResult): void {
   const { droppedAnchors, orphanAggregate, livenessDegraded } = result.plan;
   if (droppedAnchors.length > 0) {
-    lines.push(`  dropped anchors (a byway/subagent could not move): ${droppedAnchors.length}`);
+    lines.push(`  dropped anchors (a subagent could not move): ${droppedAnchors.length}`);
     for (const dropped of droppedAnchors.slice(0, 10)) {
       lines.push(`    ${dropped.anchorId} <- ${dropped.companionId} (${dropped.companionBlocker})`);
     }
