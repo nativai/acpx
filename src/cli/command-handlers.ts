@@ -1792,10 +1792,27 @@ function routedTaskOptions(
   return withoutEmptyOptions(parsed);
 }
 
+/**
+ * `parseMemberTaskOptions` keeps only the session options the queue protocol carries, so a command
+ * line whose only session option is one it does not (`--subscription`, `--output-style`, …) parses
+ * to an EMPTY `sessionOptions`. An empty object is still "different options" to the owner's
+ * `nextBatch`: drop it, and the whole value when nothing is left. (Found by the real-agent self-test:
+ * the first POST carried `task_options: {"sessionOptions": {}}`.)
+ */
 function withoutEmptyOptions(
   options: MemberTaskOptions | undefined,
 ): MemberTaskOptions | undefined {
-  return options !== undefined && Object.keys(options).length > 0 ? options : undefined;
+  if (options === undefined) {
+    return undefined;
+  }
+  const { sessionOptions, ...rest } = options;
+  const kept: MemberTaskOptions = {
+    ...rest,
+    ...(sessionOptions !== undefined && Object.keys(sessionOptions).length > 0
+      ? { sessionOptions }
+      : {}),
+  };
+  return Object.keys(kept).length > 0 ? kept : undefined;
 }
 
 /** The recipient as a sender names it: the seat's name, else the seat or session id's first 8. */

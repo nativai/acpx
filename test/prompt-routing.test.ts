@@ -358,6 +358,36 @@ test("routed prompt: task_options carry what THIS command line asked (--model, -
   }
 });
 
+test("routed prompt: a command line whose only session option is one the queue protocol does not carry (--output-style) sends NO task_options — never an empty sessionOptions", async () => {
+  const { f, id, stub } = await routedRig();
+  try {
+    const run = await runCli(
+      [
+        ...baseArgs(f),
+        "--output-style",
+        "concise",
+        "prompt",
+        "--session-id",
+        id,
+        "--no-wait",
+        "hi",
+      ],
+      agentEnv(f),
+      f.root,
+    );
+    assert.equal(run.code, 0, run.stderr);
+    assert.equal(stub.requests.length, 1);
+    const body = stub.requests[0].body as { task_options?: unknown };
+    assert.equal(
+      body.task_options,
+      undefined,
+      `unexpected task_options ${JSON.stringify(body.task_options)}`,
+    );
+  } finally {
+    await stub.close();
+  }
+});
+
 test("routed prompt with image blocks carries `content` (the full ACP blocks) and the text as its preview", async () => {
   const { f, id, stub } = await routedRig();
   try {
