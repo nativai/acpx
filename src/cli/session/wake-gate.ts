@@ -1,4 +1,4 @@
-import type { SenderRole, WakeAdmissionRequest, WakeTarget } from "../../capacity/admission.js";
+import type { WakeAdmissionRequest, WakeTarget } from "../../capacity/admission.js";
 import { seatDisplayName } from "../../session/seat-display-name.js";
 import type { SessionRecord } from "../../types.js";
 import { readQueueOwnerState } from "../queue/lease-store.js";
@@ -45,8 +45,6 @@ export type WakeRequestOptions = {
   readonly setting?: string;
   readonly flagClass?: WakeAdmissionRequest["flagClass"];
   readonly sender?: string;
-  readonly senderRole?: SenderRole;
-  readonly crossBox?: boolean;
   readonly closedWithMessageId?: boolean;
 };
 

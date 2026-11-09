@@ -206,8 +206,8 @@ export type SessionIndexEntry = {
    */
   createdBy?: SessionCreatedBy;
   /**
-   * CONTRACTS A-5 — the template a sleeping COPY will fork, from the metadata strings atrium's
-   * sleeping copy writes (`fork_template_id` / `fork_template_name`). Absent when either is missing.
+   * CONTRACTS A-5 — the template a sleeping COPY will fork: `{id: metadata.template_source, name:
+   * metadata.fork_template_name}` (atrium's sleeping copy writes the name). Absent unless both are set.
    * ⚠️ BOTH index legs, as above.
    */
   forkTemplate?: { id: string; name: string };
@@ -787,40 +787,9 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
       metadata?.created_by_label,
       metadata?.created_by_ref,
     ),
-    // CONTRACTS A-5 + the sub-HoD's refinement: `fork_template_name` is the signal; the id is
-    // `fork_template_id` when atrium writes one, else the `template_source` every copy already carries.
-    forkTemplate: forkTemplateOf(
-      metadata?.fork_template_id ?? metadata?.template_source,
-      metadata?.fork_template_name,
-    ),
-    // BOTH index legs: the parse leg is `parseIndexEntry`'s `worktreeFromIndexEntry`.
-    worktree: worktreeFromMetadata(metadata),
-    outputStyleDesired: sessionOptions?.output_style,
-    canSetModelLive: canSetModelLiveFromRecord(record),
-    resolvedModelLabel: resolvedModelLabelForRecord(record),
-    // `servedModelOf` omits `<synthetic>`: records stamped by an acpx that predates
-    // the producer fix still carry it, and the header would print "served <synthetic>".
-    servedModel: servedModelOf(record),
-    outputStyleSupported: outputStyleSupportedFromRecord(acpx),
-    outputStyleApplied: acpx?.applied_output_style,
-    outputStyleRefused: acpx?.refused_output_style,
-    autoFailover: sessionOptions?.auto_failover,
-    autoSubscription: sessionOptions?.auto_subscription,
-    fableDegradeOk: sessionOptions?.fable_degrade_ok,
-    modelSource: sessionOptions?.model_source,
-    degradedFrom:
-      sessionOptions?.model_source === "explicit-degrade"
-        ? sessionOptions?.fable_degrade?.from
-        : undefined,
-    subscription: sessionOptions?.subscription,
-    profile: sessionOptions?.profile,
-    subscriptionSwitch: sessionOptions?.subscription_switch,
-    accountSwitch: sessionOptions?.account_switch,
-    templateEnabled: record.template?.enabled,
-    templateCreatedAt: record.template?.created_at,
-    templateAutoPrompt: record.template?.auto_prompt,
-    templateSlug: record.template?.slug,
-    templateVersion: record.template?.version,
+    // CONTRACTS A-5 (settled by U2): `template_source` IS the template record id on a copy, so atrium
+    // writes only `fork_template_name`; the clause shows when the name is set.
+    forkTemplate: forkTemplateOf(metadata?.template_source, metadata?.fork_template_name),
     ...seatFieldsToIndexEntry(record),
   };
 }

@@ -5518,8 +5518,8 @@ function activationHeadline(kind: "activated" | "resumed" | "already-active"): s
  * the first (`--no-notify`), and on the second nothing was written, so nothing is lost.
  */
 type NoticeOutcome =
-  | { kind: "delivered"; deliveryId?: string }
-  | { kind: "failed"; reason: string; capacityMessage?: string }
+  | { kind: "delivered"; deliveryId?: string; held?: true }
+  | { kind: "failed"; reason: string }
   | { kind: "suppressed" }
   | { kind: "not-resent" };
 
@@ -5539,21 +5539,25 @@ async function deliverOrSkipNotice(
     notice: result.notice,
   });
   if (delivery.delivered) {
-    return { kind: "delivered", deliveryId: delivery.deliveryId };
+    return {
+      kind: "delivered",
+      deliveryId: delivery.deliveryId,
+      ...(delivery.held ? { held: true as const } : {}),
+    };
   }
-  return { kind: "failed", reason: delivery.reason, capacityMessage: delivery.capacityMessage };
+  return { kind: "failed", reason: delivery.reason };
 }
 
 function noticeDeliveryJson(outcome: NoticeOutcome): Record<string, unknown> {
   if (outcome.kind === "delivered") {
-    return { delivered: true, ...(outcome.deliveryId ? { deliveryId: outcome.deliveryId } : {}) };
+    return {
+      delivered: true,
+      ...(outcome.deliveryId ? { deliveryId: outcome.deliveryId } : {}),
+      ...(outcome.held ? { held: true } : {}),
+    };
   }
   if (outcome.kind === "failed") {
-    return {
-      delivered: false,
-      reason: outcome.reason,
-      ...(outcome.capacityMessage === undefined ? {} : { refusal: outcome.capacityMessage }),
-    };
+    return { delivered: false, reason: outcome.reason };
   }
   return {
     delivered: false,
@@ -5606,8 +5610,7 @@ function printActivationText(
   // the notice carries no work. A failed delivery is never silent: the notice is printed and
   // the line below says to paste it.
   if (noticeOutcome.kind === "delivered") {
-    const delivery = noticeOutcome.deliveryId ? ` (delivery ${noticeOutcome.deliveryId})` : "";
-    process.stdout.write(`\nnotice delivered to ${result.successorId}${delivery}\n`);
+    process.stdout.write(`\n${noticeDeliveredText(result.successorId, noticeOutcome)}\n`);
     return;
   }
   process.stdout.write(`\n--- notice for the successor ---\n${result.notice}`);
@@ -5616,17 +5619,22 @@ function printActivationText(
   }
 }
 
-function noticeNotDeliveredText(outcome: { reason: string; capacityMessage?: string }): string {
-  if (outcome.capacityMessage === undefined) {
-    return `notice NOT delivered — paste it to the successor (${outcome.reason})\n`;
-  }
-  // brick 2b3b259f §9 row 5b: the box had no room to wake the successor. The activation stands;
-  // re-running `activate` does not re-send (`not-resent`), so the activator sends it later.
-  return (
-    `notice NOT delivered — no room to wake the successor now; the activation stands. ` +
-    `Send the notice above to the successor's seat later with send-message.sh, never in a loop:\n` +
-    `${outcome.capacityMessage}\n`
-  );
+/**
+ * The notice reached atrium's queue. Held (UMQ §7.3): atrium stored it and delivers it when the
+ * successor can be woken — the activator has nothing more to do.
+ */
+function noticeDeliveredText(
+  successorId: string,
+  outcome: { deliveryId?: string; held?: true },
+): string {
+  const delivery = outcome.deliveryId ? ` (delivery ${outcome.deliveryId})` : "";
+  return outcome.held
+    ? `notice queued for room for ${successorId}${delivery} — delivered when the successor can be woken`
+    : `notice delivered to ${successorId}${delivery}`;
+}
+
+function noticeNotDeliveredText(outcome: { reason: string }): string {
+  return `notice NOT delivered — paste it to the successor (${outcome.reason})\n`;
 }
 
 /** Whether the record is closed — a record that cannot be read counts as open, so the duty line stays. */

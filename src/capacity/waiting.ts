@@ -24,11 +24,12 @@ import path from "node:path";
  *               "writtenAt": "<ISO>",
  *               "reason": { "code", "live", "box", "at" },            // optional
  *               "items": [{
- *                 "key": "wakeup:<id>" | "trigger-run:<id>" | "delivery:<recipient id>",
- *                 "kind": "wakeup" | "trigger-run" | "delivery",
+ *                 "key": "delivery:<recipient id>"          // an OLD atrium also wrote
+ *                                                           //   "wakeup:<id>" | "trigger-run:<id>" (S4)
+ *                 "kind": "delivery",                       // "wakeup" | "trigger-run" are still READ (S4)
  *                 "ref": "<id>",                                       // delivery: the recipient
  *                 "to": "<recipient record id>",                       // delivery only; optional
- *                 "count": 3, "kinds": [..], "finalReports": 1,        // delivery only; optional
+ *                 "count": 3,                                          // delivery only; optional
  *                 "label": "<name>",
  *                 "harness": "claude" | "codex" | "pi",
  *                 "since": "<ISO>",
@@ -142,43 +143,4 @@ export function readWaiting(admissionDir: string, now: Date = new Date()): Waiti
     .flatMap(itemsOfFile)
     .toSorted(bySinceThenKey);
   return { count: items.length, items };
-}
-
-/**
- * The capability marker (brick 2b3b259f, CONCEPTION §12): atrium's executor writes
- * `<admission dir>/capabilities/<writer>.json` = `{"schema": 1, "finalReport": true, "writtenAt"}`
- * beside its waiting file (mode 0600, temp + rename, rewritten every 60 s, deleted on a clean stop).
- * While one is fresh — the SAME `isFresh` rule as the waiting dir above, `−2 s ≤ age < 5 min` — that
- * atrium honours `send-message.sh --final-report`, so a wake refusal may name it (§5.1 variant c).
- *
- * ⚠️ ABSENT, STALE, FUTURE OR MALFORMED ⇒ NOT SUPPORTED. The refusal text must never point an agent
- * at a send its atrium cannot hold (review #6): an old atrium ignores `final_report` and would
- * deliver — or refuse — it as an ordinary send. Rows: "marker:" in test/capacity-wake.test.ts.
- */
-export function capabilitiesDirOf(admissionDir: string): string {
-  return path.join(admissionDir, "capabilities");
-}
-
-export function finalReportSupported(admissionDir: string, now: Date = new Date()): boolean {
-  const dir = capabilitiesDirOf(admissionDir);
-  let names: string[];
-  try {
-    names = fs.readdirSync(dir);
-  } catch {
-    return false;
-  }
-  return names
-    .filter((name) => name.endsWith(".json"))
-    .map((name) => path.join(dir, name))
-    .some((file) => {
-      if (!isFresh(file, now.getTime())) {
-        return false;
-      }
-      try {
-        const body: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
-        return isObject(body) && body.schema === 1 && body.finalReport === true;
-      } catch {
-        return false;
-      }
-    });
 }
