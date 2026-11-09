@@ -438,6 +438,70 @@ test("sleeping copy: nothing is forked at create; the fork notice is returned; t
   assert.equal(woken.metadata?.template_source, template, "template_source is kept");
 });
 
+test("N-U2-14 · Q9: a template re-baked between the sleeping copy's create and its first wake — the first wake forks the RE-BAKED template (read at wake), template_source kept, template_last_used_at stamped", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  const template = await makeTarget(f);
+  const prompt = async (id: string, text: string) => {
+    const run = await runCli([...baseArgs(f), "prompt", "--session-id", id, text], f.env, f.root);
+    assert.equal(run.code, 0, run.stderr);
+  };
+  await prompt(template, "bake one");
+  const baked = readRecord(f, template) as { last_used_at: string };
+
+  const run = await runCli(
+    [
+      ...baseArgs(f),
+      "--format",
+      "json",
+      "sessions",
+      "copy",
+      "--from",
+      template,
+      "--sleeping",
+      "--metadata",
+      `template_source=${template}`,
+    ],
+    { ...f.env, ...AUTOMATION },
+    f.root,
+  );
+  assert.equal(run.code, 0, run.stderr);
+  const copyId = jsonOf(run).acpxRecordId;
+
+  // The re-bake: the template runs another turn AFTER the sleeping copy exists.
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  await prompt(template, "bake two");
+  const rebaked = readRecord(f, template) as { last_used_at: string; acp_session_id: string };
+  assert.notEqual(
+    rebaked.last_used_at,
+    baked.last_used_at,
+    "control: the re-bake moved the template",
+  );
+  const afterRebake = methods(f).length;
+
+  await prompt(copyId, "hello copy");
+  const woken = readRecord(f, copyId) as {
+    acp_session_id: string;
+    forked_from_session_id?: string;
+    forked_at_message_index?: number;
+    acpx: { sleeping?: unknown };
+    metadata?: Record<string, string>;
+  };
+  assert.ok(methods(f).slice(afterRebake).includes("session/fork"), methods(f).join(","));
+  assert.equal(woken.acpx.sleeping, undefined);
+  assert.equal(woken.forked_from_session_id, template);
+  assert.equal(
+    woken.forked_at_message_index,
+    4,
+    "the copy inherited the RE-BAKED template's four messages — a pin at create time would give two",
+  );
+  assert.equal(
+    woken.metadata?.template_last_used_at,
+    rebaked.last_used_at,
+    "stamped from the template as it is at the first wake, not as it was at the create",
+  );
+  assert.equal(woken.metadata?.template_source, template, "template_source is kept");
+});
+
 test("N-A2-7 · G7 audit: a sleeping SOURCE is refused by copy/fork — 'nothing to copy yet — it has never run'; transcript reap and dedup skip a sleeping record", async () => {
   const f = makeBox({ requestMib: 4000 });
   const run = await sleepingNew(f);

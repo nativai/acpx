@@ -1,6 +1,7 @@
 import type { AcpClient, SessionCreateResult, SessionForkResult } from "../../acp/client.js";
 import { withTimeout } from "../../async-control.js";
 import { readFullSourceHistory } from "../../cli/session/fork-at-log-index.js";
+import { effectiveCreateCwd } from "../../config/session-root.js";
 import { AcpxOperationalError } from "../../errors.js";
 import {
   resolveSessionRecord,
@@ -59,11 +60,16 @@ export async function forkTemplateForSleepingSession(params: {
   }
   const messages = (await readFullSourceHistory(template)).messages;
   const forkAtMessageIndex = messages.length;
+  // The first wake is the moment this session is created, so its cwd goes through the session-root
+  // helper like every other create site. The sleeping create already rooted `record.cwd`, so on an
+  // unchanged box this is the same path (the record is left untouched, so a failed wake stays
+  // byte for byte as the sleeping create wrote it).
+  const cwd = effectiveCreateCwd(params.record.cwd);
   const forked =
     forkAtMessageIndex === 0
-      ? await withTimeout(params.client.createSession(params.record.cwd), params.timeoutMs)
+      ? await withTimeout(params.client.createSession(cwd), params.timeoutMs)
       : await withTimeout(
-          params.client.forkSession(template.acpSessionId, params.record.cwd, {
+          params.client.forkSession(template.acpSessionId, cwd, {
             atIndex: undefined,
             sourceMessages: template.messages,
             sourceCwd: template.cwd,

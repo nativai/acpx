@@ -58,6 +58,11 @@ const KNOWN_SITES: Array<Site & { why: string }> = [
     why: "N2: a load-failure fallback for an EXISTING record keeps the record's cwd (§5.5)",
   },
   {
+    file: "runtime/engine/sleeping-materialisation.ts",
+    text: "? await withTimeout(params.client.createSession(cwd), params.timeoutMs)",
+    why: "E7: the first wake of a sleeping copy with an empty template — `cwd = effectiveCreateCwd(record.cwd)` a few lines above",
+  },
+  {
     file: "flows/runtime.ts",
     text: "const created = await createSessionWithClient({",
     why: "E1/F1: createSessionWithClient forces the root itself",
