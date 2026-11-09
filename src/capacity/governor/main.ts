@@ -122,12 +122,10 @@ async function main(): Promise<number> {
   };
   return new Promise((resolve) => {
     let timer: NodeJS.Timeout | undefined;
-    let immediate: NodeJS.Immediate | undefined;
     let done = false;
     const end = (code: number): void => {
       done = true;
       clearTimeout(timer);
-      clearImmediate(immediate);
       clearInterval(watcher);
       void finish(code).then(resolve);
     };
@@ -135,8 +133,6 @@ async function main(): Promise<number> {
     // Both run on this one thread, so a scan never overlaps another.
     const loop = (): void => {
       clearTimeout(timer);
-      clearImmediate(immediate);
-      immediate = undefined;
       if (done) {
         return;
       }
@@ -157,13 +153,7 @@ async function main(): Promise<number> {
           `process-governor: scan failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
-      // §19 D6: the trigger already met again ⇒ the next tick at once — ONE setImmediate per completed tick,
-      // so the event loop turns between ticks; otherwise the cadence's delay.
-      if (governor.reTickDue()) {
-        immediate = setImmediate(loop);
-      } else {
-        timer = setTimeout(loop, next);
-      }
+      timer = setTimeout(loop, next);
     };
     // §19 D3: ≥ pidWatchTrigger pids allocated since the last 50 ms tick ⇒ scan NOW (and fast mode).
     const watcher = setInterval(() => {

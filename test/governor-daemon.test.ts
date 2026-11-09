@@ -787,53 +787,6 @@ test("§19 D3a pid watcher: 10 ms; counts pids since the LAST FULL SCAN — 10 n
   assert.equal(governor.pidWatch(), true, "a wrap is counted, not read as a negative");
 });
 
-function watchedBox(t: { after: (fn: () => void) => void }) {
-  const box = stormBox(t, 2);
-  const loadavg = path.join(box.proc, "loadavg");
-  const lastPid = (pid: number) => fs.writeFileSync(loadavg, `0.1 0.1 0.1 1/100 ${pid}\n`);
-  fs.mkdirSync(path.join(box.proc, "sys", "kernel"), { recursive: true });
-  fs.writeFileSync(path.join(box.proc, "sys", "kernel", "pid_max"), "32768\n");
-  return { box, lastPid };
-}
-
-test("§19 D6 re-tick at tick end: the cumulative D3a test against THIS tick's baseline, incl. the wrap at pid_max", (t) => {
-  const { box, lastPid } = watchedBox(t);
-  lastPid(32700);
-  const governor = startedGovernor(box);
-  governor.tick(); // baseline 32700
-  lastPid(32715);
-  assert.equal(governor.reTickDue(), false, "15 since the scan");
-  lastPid(32716);
-  assert.equal(governor.reTickDue(), true, "16 since the scan: next tick at once");
-  governor.tick(); // baseline 32716
-  lastPid(32720);
-  assert.equal(governor.reTickDue(), false, "the tick reset the baseline");
-  lastPid(32760);
-  governor.tick(); // baseline 32760
-  lastPid(305); // 32760 → wrap at 32768 → 305: 7 + 6 = 13
-  assert.equal(governor.reTickDue(), false, "a wrap counts 13, not a huge or negative number");
-  lastPid(310); // 7 + 11 = 18
-  assert.equal(governor.reTickDue(), true, "a wrap past the trigger re-ticks");
-});
-
-test("§19 D6: an idle box never re-ticks immediately — ~18 pids/s, 1 s ticks, 60 ticks", (t) => {
-  const { box, lastPid } = watchedBox(t);
-  let pid = 32000;
-  lastPid(pid);
-  const governor = startedGovernor(box);
-  let immediate = 0;
-  for (let i = 0; i < 60; i += 1) {
-    pid += 18; // allocated during the 1 s wait, BEFORE the tick reads its baseline
-    lastPid(pid);
-    box.nowMs += 1000;
-    governor.tick();
-    pid += i % 3 === 0 ? 1 : 0; // at most one pid during a ~3 ms idle tick
-    lastPid(pid);
-    immediate += governor.reTickDue() ? 1 : 0;
-  }
-  assert.equal(immediate, 0);
-});
-
 test("self-restart: a changed entry file, stable for 10 s, makes the governor exit 0 between sweeps", (t) => {
   const box = new FakeBox();
   t.after(() => box.cleanup());
