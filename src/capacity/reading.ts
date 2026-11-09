@@ -18,6 +18,7 @@ import {
   type Verdict,
   verdictFor,
 } from "./formula.js";
+import { governorDir, type GovernorLiveness, readGovernorLiveness } from "./governor/status.js";
 import {
   censusOwners,
   type LeaseExclusion,
@@ -160,6 +161,11 @@ export type CapacitySnapshot = {
   /** The same reading under the basis NOT in force, so request and limit are both visible. */
   readonly alternatives: readonly AlternativeBasis[];
   readonly warnings: readonly string[];
+  /**
+   * The runaway process-tree governor's liveness, from its heartbeat file (CONCEPTION 5d7a23b6
+   * §6.4): a dead governor is visible wherever capacity is shown.
+   */
+  readonly governor: GovernorLiveness;
 };
 
 function boxName(): string {
@@ -186,6 +192,8 @@ export type ReadCapacityOptions = {
   readonly waiting?: WaitingQueue;
   /** Default `spawn`. */
   readonly admissionClass?: CapacityClass;
+  /** The governor's state dir (heartbeat); default `~/.acpx/governor`. */
+  readonly governorDir?: string;
 };
 
 const nul = <T>(value: T | undefined): T | null => (value === undefined ? null : value);
@@ -498,6 +506,11 @@ export function readCapacity(options: ReadCapacityOptions): CapacitySnapshot {
     pressure: pressureField(g),
     alternatives: g.budget.configured && measured ? alternativesFor(g, measured) : [],
     warnings: collectWarnings(g, measured),
+    governor: readGovernorLiveness(
+      options.governorDir ?? governorDir(),
+      g.now.getTime(),
+      options.sources.procRoot,
+    ),
   };
 }
 

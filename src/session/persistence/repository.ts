@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { mapWithConcurrency } from "../../async-control.js";
 import {
@@ -58,6 +57,7 @@ import { withRecordFileLock } from "./record-file-lock.js";
 import { copySeatHolderFields, copySeatLinkageFields } from "./seat-fields.js";
 import { findHolderlessSeats, reapHolderlessSeats } from "./seat-holderless.js";
 import { serializeSessionRecordForDisk } from "./serialize.js";
+import { sessionBaseDir } from "./session-base-dir.js";
 import { pickLatestTemplate, slugify, type TemplateOrderKey } from "./template-slug.js";
 
 export const DEFAULT_HISTORY_LIMIT = 20;
@@ -76,9 +76,7 @@ function sessionFilePath(acpxRecordId: string): string {
   return path.join(sessionBaseDir(), sessionRecordFileName(acpxRecordId));
 }
 
-export function sessionBaseDir(): string {
-  return path.join(process.env.ACPX_STATE_HOME || os.homedir(), ".acpx", "sessions");
-}
+export { sessionBaseDir };
 
 /**
  * Records this process loaded from the COLD ARCHIVE rather than the hot dir.

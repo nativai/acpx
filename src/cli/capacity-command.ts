@@ -7,6 +7,7 @@ import {
   type WakeDecision,
 } from "../capacity/admission.js";
 import { type Harness, HARNESSES, isHarness, MIB } from "../capacity/constants.js";
+import { governorLivenessLine } from "../capacity/governor/status.js";
 import {
   type AdmissionLockState,
   admissionDir,
@@ -206,6 +207,7 @@ export function renderCapacityText(s: CapacitySnapshot): string {
         plural(alt.freeSlots[s.agent], `new ${s.agent} session`),
     ),
     ...s.warnings.map((warning) => `⚠ ${warning}`),
+    governorLivenessLine(s.governor, Date.parse(s.measuredAt)),
   ];
   return `${lines.join("\n")}\n`;
 }

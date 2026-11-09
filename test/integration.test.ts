@@ -15,6 +15,7 @@ import path from "node:path";
 import test from "node:test";
 import { setTimeout as setTimeoutPromise } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { argvCarriesQueueOwnerToken, parseProcStat } from "../src/process-tree-reap.js";
 import { runPromptTurn } from "../src/runtime/engine/prompt-turn.js";
 import {
   createSessionConversation,
@@ -1091,6 +1092,34 @@ function injectedPrimerFromStdout(stdout: string): string {
   assert(createRequest, `expected a session/new request in:\n${stdout}`);
   return createRequest.params?._meta?.systemPrompt?.append ?? "";
 }
+
+test("integration: GOVERNOR PREMISE (§19 D5) — a live queue owner leads its own session, its comm is `node`, and its argv carries the owner token", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("reads /proc");
+    return;
+  }
+  // The governor's guard reads the owner token only for session leaders and `node` processes
+  // (src/capacity/governor/sweep.ts mayBeOwner). That is safe only while acpx spawns every queue owner
+  // DETACHED (so it leads its own session) as a `node` process whose argv keeps `__queue-owner`. This
+  // row fails if the owner is spawned without `detached`, or if anything sets `process.title` (a title
+  // rewrite also overwrites argv and would erase the token for every owner).
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    try {
+      const sessionId = await createSessionAndWarmOwner(baseAgentArgs(cwd), homeDir, cwd);
+      const { lockPath } = queuePaths(homeDir, sessionId);
+      const ownerPid = (JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid: number }).pid;
+      const stat = parseProcStat(await fs.readFile(`/proc/${ownerPid}/stat`, "utf8"));
+      assert.ok(stat, "the owner is alive");
+      assert.equal(stat.sid, ownerPid, "the owner leads its own session (pid = sid)");
+      assert.equal(stat.pgid, ownerPid, "…and its own process group");
+      assert.equal(stat.comm, "node");
+      assert.equal(argvCarriesQueueOwnerToken(ownerPid), true, "its argv carries __queue-owner");
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
 
 test("integration: injected primer renders the CHILD's env — parent+brick fragments reach a child spawned from a spawner that has neither", async () => {
   await withTempHome(async (homeDir) => {
