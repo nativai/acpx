@@ -500,18 +500,7 @@ export function buildPromptRequest(
   options: AcpPromptOptions | undefined,
   turnContext?: string,
 ) {
-  const meta = {
-    ...(options?.promptId !== undefined ? { [CLAUDE_PROMPT_ID_META_KEY]: options.promptId } : {}),
-    // The turn-context block, when prepended, moves every member range by one.
-    ...(options?.batchMeta !== undefined
-      ? {
-          [ACPX_BATCH_META_KEY]: shiftBatchMeta(
-            options.batchMeta,
-            turnContext === undefined ? 0 : 1,
-          ),
-        }
-      : {}),
-  };
+  const meta = promptRequestMeta(options, turnContext);
   return {
     sessionId,
     prompt:
@@ -519,7 +508,29 @@ export function buildPromptRequest(
         ? prompt
         : [{ type: "text" as const, text: turnContext }, ...prompt],
     ...(options?.messageId !== undefined ? { messageId: options.messageId } : {}),
-    ...(Object.keys(meta).length > 0 ? { _meta: meta } : {}),
+    ...(meta ? { _meta: meta } : {}),
+  };
+}
+
+// `_claude/promptId` first (as before), then the batch layout — moved past a prepended turn-context
+// block. `undefined` when neither is set: no `_meta` key at all.
+function promptRequestMeta(
+  options: AcpPromptOptions | undefined,
+  turnContext: string | undefined,
+): Record<string, unknown> | undefined {
+  if (options?.promptId === undefined && options?.batchMeta === undefined) {
+    return undefined;
+  }
+  return {
+    ...(options.promptId !== undefined ? { [CLAUDE_PROMPT_ID_META_KEY]: options.promptId } : {}),
+    ...(options.batchMeta !== undefined
+      ? {
+          [ACPX_BATCH_META_KEY]: shiftBatchMeta(
+            options.batchMeta,
+            turnContext === undefined ? 0 : 1,
+          ),
+        }
+      : {}),
   };
 }
 

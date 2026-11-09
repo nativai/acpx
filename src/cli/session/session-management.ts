@@ -10,10 +10,7 @@ import {
 } from "../../acp/client.js";
 import { formatErrorMessage } from "../../acp/error-normalization.js";
 import { isAcpResourceNotFoundError } from "../../acp/error-shapes.js";
-import {
-  assertForkAtIndexHonoured,
-  resolveEffectiveForkIndex,
-} from "../../acp/harness-capabilities.js";
+import { assertForkAtIndexHonoured } from "../../acp/harness-capabilities.js";
 import { readTransientAdvertisement } from "../../acp/transient-advertisement.js";
 import { withInterrupt, withTimeout } from "../../async-control.js";
 import { effectiveCreateCwd } from "../../config/session-root.js";
@@ -94,6 +91,7 @@ import type {
 import {
   type LogIndexForkWindow,
   readFullSourceHistory,
+  resolveForkCutIndex,
   resolveLogIndexForkWindow,
 } from "./fork-at-log-index.js";
 
@@ -1132,7 +1130,12 @@ async function resolveForkSourceContext(options: SessionCreateOptions): Promise<
   // (`inheritedMessages` below), so the record's own
   // message COUNT agrees with the index it reports — the ground truth
   // `G1-FRK-01` checks the record against.
-  const forkAtMessageIndex = resolveEffectiveForkIndex(options.agentCommand, requested);
+  // UMQ R3: and never inside a batch (`resolveForkCutIndex`).
+  const forkAtMessageIndex = resolveForkCutIndex(
+    options.agentCommand,
+    sourceRecord.messages,
+    requested,
+  );
 
   return {
     sourceRecord,

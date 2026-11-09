@@ -175,7 +175,7 @@ export async function resolveLogIndexForkWindow(params: {
 
   // Codex snaps to its turn granularity; its adapter counts turns from the
   // thread start, so the snap applies to the ABSOLUTE position.
-  const logIndex = Math.max(base, resolveEffectiveForkIndex(params.agentCommand, requested));
+  const logIndex = resolveForkCutIndex(params.agentCommand, history.messages, requested, base);
   const end = logIndex - base;
   return {
     logIndex,
@@ -183,4 +183,55 @@ export async function resolveLogIndexForkWindow(params: {
     messages: history.messages.slice(Math.max(0, end - FORK_WINDOW_MESSAGES), end),
     history: { before: history.messages.slice(0, end), after: history.messages.slice(end) },
   };
+}
+
+/**
+ * The index a fork is ACTUALLY cut at: the harness's own snap (codex: turn-granular, down) and UMQ R3's
+ * batch boundary (`snapForkCutToBatchBoundary`). Both only move DOWN, so alternating them reaches the one
+ * position that satisfies both. `messages[0]` sits at absolute position `base`.
+ */
+export function resolveForkCutIndex(
+  agentCommand: string,
+  messages: readonly SessionMessage[],
+  requested: number,
+  base = 0,
+): number {
+  let cut = requested;
+  for (;;) {
+    const harnessSnapped = Math.max(base, resolveEffectiveForkIndex(agentCommand, cut));
+    const snapped = base + snapForkCutToBatchBoundary(messages, harnessSnapped - base);
+    if (snapped === cut) {
+      return cut;
+    }
+    cut = snapped;
+  }
+}
+
+/**
+ * UMQ R3 — a fork cut never lands INSIDE a run of consecutive User entries: it moves down to before
+ * the run's first entry. A batch turn is such a run (one User entry per member, then one reply),
+ * and the harness transcript holds the whole batch as ONE user message — so a cut at member k would
+ * silently keep or drop k's neighbours. It is the same for any run: every entry of it inherits the
+ * claude_uuid of the entry before the run, so the adapter's cut point is the run's start whichever
+ * entry the record is cut at; moving the record's cut there makes the two agree. A cut AFTER the
+ * run's last entry (before the reply) is outside it and stays.
+ */
+export function snapForkCutToBatchBoundary(
+  messages: readonly SessionMessage[],
+  cutIndex: number,
+): number {
+  let cut = cutIndex;
+  while (
+    cut > 0 &&
+    cut < messages.length &&
+    isUserEntry(messages[cut - 1]) &&
+    isUserEntry(messages[cut])
+  ) {
+    cut -= 1;
+  }
+  return cut;
+}
+
+function isUserEntry(entry: SessionMessage | undefined): boolean {
+  return entry !== undefined && entry !== "Resume" && "User" in entry;
 }

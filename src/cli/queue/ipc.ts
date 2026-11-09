@@ -1103,21 +1103,33 @@ export async function trySubmitBatchToRunningOwner(
   if (!ownerSupportsBatchSubmit(owner)) {
     return await submitBatchMemberByMember(owner, options);
   }
+  const submitted = await submitBatchRecoveringShutdown(owner, options);
+  if (submitted !== "no-owner") {
+    return submitted;
+  }
+  return undefined;
+}
+
+// Only the shutting-down answer is recovered (nothing was accepted); NEVER a protocol mismatch.
+// "no-owner" = no usable owner (cold-start one of our own build).
+async function submitBatchRecoveringShutdown(
+  owner: QueueOwnerRecord,
+  options: SubmitBatchToQueueOwnerOptions,
+): Promise<SessionSendOutcome | "no-owner"> {
   let submitted: SessionSendOutcome | undefined;
   try {
     submitted = await submitBatchToQueueOwner(owner, options);
   } catch (error) {
-    // Only the shutting-down answer is recovered (nothing was accepted); never a protocol mismatch.
-    if (
+    const recovered =
       isOwnerShutdownError(error) &&
       (await recoverOwnerAfterShutdownError({
         sessionId: options.sessionId,
         owner,
         detailCode: error.detailCode,
         verbose: options.verbose,
-      }))
-    ) {
-      return undefined;
+      }));
+    if (recovered) {
+      return "no-owner";
     }
     throw error;
   }
@@ -1126,7 +1138,7 @@ export async function trySubmitBatchToRunningOwner(
   }
   const health = await probeQueueOwnerHealth(options.sessionId);
   if (!health.hasLease) {
-    return undefined;
+    return "no-owner";
   }
   throw notAcceptingRequestsError(health, "queue");
 }
@@ -1139,23 +1151,7 @@ async function submitBatchMemberByMember(
 ): Promise<SessionSendOutcome | undefined> {
   let last: SessionSendOutcome | undefined;
   for (const [index, member] of options.members.entries()) {
-    let outcome: SessionSendOutcome | undefined;
-    try {
-      outcome = await submitToQueueOwner(owner, {
-        ...options,
-        messageId: member.messageId,
-        message: promptToLogText(member.prompt),
-        prompt: member.prompt,
-        ...(member.options ?? {}),
-        waitForCompletion: false,
-        onSubmitAccepted: undefined,
-      });
-    } catch (error) {
-      if (index === 0 && (await maybeRecoverSubmitFailure({ ...options, owner, error }))) {
-        return undefined;
-      }
-      throw error;
-    }
+    const outcome = await submitOneMember(owner, options, member, index);
     if (!outcome) {
       if (index === 0) {
         return undefined;
@@ -1169,6 +1165,32 @@ async function submitBatchMemberByMember(
   }
   options.onSubmitAccepted?.();
   return last;
+}
+
+// One member as a plain `submit_prompt`. Only the FIRST may still fall back to a cold start (nothing
+// accepted yet); the usual recovery applies to it, since `submit_prompt` is a type every owner knows.
+async function submitOneMember(
+  owner: QueueOwnerRecord,
+  options: SubmitBatchToQueueOwnerOptions,
+  member: BatchFileMember,
+  index: number,
+): Promise<SessionSendOutcome | undefined> {
+  try {
+    return await submitToQueueOwner(owner, {
+      ...options,
+      messageId: member.messageId,
+      message: promptToLogText(member.prompt),
+      prompt: member.prompt,
+      ...member.options,
+      waitForCompletion: false,
+      onSubmitAccepted: undefined,
+    });
+  } catch (error) {
+    if (index === 0 && (await maybeRecoverSubmitFailure({ ...options, owner, error }))) {
+      return undefined;
+    }
+    throw error;
+  }
 }
 
 function promptToLogText(prompt: PromptInput): string {

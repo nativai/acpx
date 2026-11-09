@@ -88,7 +88,7 @@ function stableJson(value: unknown): string {
   }
   return JSON.stringify(value, (_key, inner: unknown) =>
     inner && typeof inner === "object" && !Array.isArray(inner)
-      ? Object.fromEntries(Object.entries(inner).sort(([a], [b]) => a.localeCompare(b)))
+      ? Object.fromEntries(Object.entries(inner).toSorted(([a], [b]) => a.localeCompare(b)))
       : inner,
   );
 }
@@ -1421,18 +1421,23 @@ export class SessionQueueOwner {
       requestId: request.requestId,
       ownerGeneration: this.ownerGeneration,
     });
-    for (const task of tasks) {
-      const marker = `${JSON.stringify({
-        jsonrpc: "2.0",
-        method: "acpx/received",
-        params: {
-          requestId: task.requestId,
-          ...(task.messageId != null ? { messageId: task.messageId } : {}),
-          at: new Date().toISOString(),
-        },
-      })}\n`;
-      void appendFile(sessionEventActivePath(this.sessionId), marker, "utf8").catch(() => {});
-    }
+    // ONE append for every member's marker: N concurrent fire-and-forget appends land in any order.
+    const at = new Date().toISOString();
+    const markers = tasks
+      .map(
+        (task) =>
+          `${JSON.stringify({
+            jsonrpc: "2.0",
+            method: "acpx/received",
+            params: {
+              requestId: task.requestId,
+              ...(task.messageId != null ? { messageId: task.messageId } : {}),
+              at,
+            },
+          })}\n`,
+      )
+      .join("");
+    void appendFile(sessionEventActivePath(this.sessionId), markers, "utf8").catch(() => {});
 
     if (!request.waitForCompletion) {
       socket.end();
