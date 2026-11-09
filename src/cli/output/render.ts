@@ -11,6 +11,7 @@ import type {
   SessionRecord,
 } from "../../types.js";
 import { backgroundTasksField, type BackgroundTasksJson } from "../background-task-gate.js";
+import type { MessageRouteAnswer } from "../prompt-routing.js";
 import { probeQueueOwnerHealth } from "../queue/ipc.js";
 import type {
   SessionCloseDrainReport,
@@ -96,14 +97,16 @@ export function printSessionsByFormat(
   }
 
   for (const session of sessions) {
-    const closedMarker = session.closed ? " [closed]" : "";
-    // UMQ K7 (CONCEPTION §6.3): a session that never ran says so in its state column.
-    const sleepingMarker = session.acpx?.sleeping ? ` [${SLEEPING_SHORT}]` : "";
     const seatColumn = seatLabel ? `\t${seatLabel(session)}` : "";
     process.stdout.write(
-      `${session.acpxRecordId}${closedMarker}${sleepingMarker}\t${session.cwd}\t${session.lastUsedAt}${seatColumn}\n`,
+      `${session.acpxRecordId}${stateMarkers(session)}\t${session.cwd}\t${session.lastUsedAt}${seatColumn}\n`,
     );
   }
+}
+
+/** ` [closed]`, and (UMQ K7, CONCEPTION §6.3) ` [sleeping]` for a session that never ran. */
+function stateMarkers(session: SessionListing): string {
+  return `${session.closed ? " [closed]" : ""}${session.acpx?.sleeping ? ` [${SLEEPING_SHORT}]` : ""}`;
 }
 
 function printQuietSessions(sessions: SessionListing[]): void {
@@ -403,6 +406,10 @@ function createdCwdJson(
 /** `sessions new|copy --sleeping` (UMQ K7): the created line's suffix. */
 const SLEEPING_CREATED_SUFFIX = " (sleeping — its first message starts it)";
 
+function sleepingSuffix(record: SessionRecord): string {
+  return record.acpx?.sleeping ? SLEEPING_CREATED_SUFFIX : "";
+}
+
 /** The JSON a sleeping create adds to today's object: nothing was queued by acpx, the session sleeps. */
 function sleepingJson(
   record: SessionRecord,
@@ -568,12 +575,15 @@ export function printQueuedPromptByFormat(
     requestId: string;
   },
   format: OutputFormat,
+  /** UMQ D1: `{ routed: false }` on a direct fallback of an agent prompt — which path ran. */
+  extra: Record<string, unknown> = {},
 ): void {
   if (
     emitJsonResult(format, {
       action: "prompt_queued",
       acpxRecordId: result.sessionId,
       requestId: result.requestId,
+      ...extra,
     })
   ) {
     return;
@@ -584,6 +594,42 @@ export function printQueuedPromptByFormat(
   }
 
   process.stdout.write(`[queued] ${result.requestId}\n`);
+}
+
+/**
+ * UMQ D1 (CONTRACTS §5.5) — a ROUTED agent prompt: today's queued-prompt JSON (`requestId` = the
+ * delivery id the CLI minted) plus the route's fields and `routed: true`. Text: `[sent] delivery …`
+ * when atrium delivers it now, `[queued for room] delivery … (next in line)` with atrium's sentence
+ * on stderr when it is held. The held sentence is atrium's, printed verbatim.
+ */
+export function printRoutedPromptByFormat(
+  routed: {
+    acpxRecordId: string;
+    answer: MessageRouteAnswer;
+    line: string;
+  },
+  format: OutputFormat,
+): void {
+  if (
+    emitJsonResult(format, {
+      action: "prompt_queued",
+      acpxRecordId: routed.acpxRecordId,
+      requestId: routed.answer.delivery_id,
+      routed: true,
+      ...routed.answer,
+    })
+  ) {
+    return;
+  }
+
+  if (format === "quiet") {
+    return;
+  }
+
+  process.stdout.write(`${routed.line}\n`);
+  if (routed.answer.held && routed.answer.message) {
+    process.stderr.write(`${routed.answer.message}\n`);
+  }
 }
 
 // A banner never fails a prompt: a misconfigured (relative) ACPX_SESSION_ROOT refuses CREATES with a
@@ -728,9 +774,7 @@ export function printCreatedSessionBanner(
     }
     process.stderr.write(`[acpx] seat: ${record.seatId}\n`);
   }
-  process.stderr.write(
-    `[acpx] created session ${record.acpxRecordId}${record.acpx?.sleeping ? SLEEPING_CREATED_SUFFIX : ""}\n`,
-  );
+  process.stderr.write(`[acpx] created session ${record.acpxRecordId}${sleepingSuffix(record)}\n`);
   process.stderr.write(`[acpx] agent: ${agentName}\n`);
   process.stderr.write(`[acpx] cwd: ${record.cwd}\n`);
   const url = composeSessionUrl(record);

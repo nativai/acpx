@@ -93,6 +93,8 @@ export type PromptFlags = SessionSelectorFlags & {
   wait?: boolean;
   file?: string;
   messageId?: string;
+  /** `--batch-file` (lane A1's option): atrium's batch spawn — never routed (UMQ D1). */
+  batchFile?: string;
 };
 
 export type ExecFlags = {

@@ -31,6 +31,23 @@ import type {
 
 type QueueSessionOptions = NonNullable<AcpClientOptions["sessionOptions"]>;
 
+/**
+ * UMQ K5/K6 (CONTRACTS §6.3) — the per-task fields of `submit_prompt`, nothing else: what a routed
+ * agent prompt asks of ITS turn, carried opaquely through atrium's queue and handed back per member.
+ * acpx owns this schema; {@link parseMemberTaskOptions} is its one validator (the same field parsers
+ * `submit_prompt` uses). A member's options win over the call's; a member with none runs with the
+ * call's.
+ */
+export type MemberTaskOptions = {
+  permissionMode?: PermissionMode;
+  nonInteractivePermissions?: NonInteractivePermissionPolicy;
+  permissionPolicy?: PermissionPolicy;
+  timeoutMs?: number;
+  promptRetries?: number;
+  codexSubscriptionCapWeeklyPercent?: number;
+  sessionOptions?: QueueSessionOptions;
+};
+
 export type QueueSubmitRequest = {
   type: "submit_prompt";
   requestId: string;
@@ -752,6 +769,60 @@ function parseSubmitRequestFields(
     return null;
   }
   return parsed as ParsedSubmitRequestFields;
+}
+
+/**
+ * `undefined` = no options; `null` = invalid (a routed send fails at the CLI, exit 2, before any
+ * POST); otherwise the validated options. An unknown key is invalid — the schema is closed.
+ */
+export function parseMemberTaskOptions(raw: unknown): MemberTaskOptions | null | undefined {
+  const record = raw == null ? undefined : asRecord(raw);
+  if (raw == null) {
+    return undefined;
+  }
+  if (!record || Object.keys(record).some((key) => !MEMBER_TASK_OPTION_KEYS.has(key))) {
+    return null;
+  }
+  const parsed = parseMemberTaskFields(record);
+  if (parsed === null) {
+    return null;
+  }
+  const options: MemberTaskOptions = Object.fromEntries(
+    Object.entries(parsed).filter(([, value]) => value !== undefined),
+  );
+  return Object.keys(options).length > 0 ? options : undefined;
+}
+
+const MEMBER_TASK_OPTION_KEYS: ReadonlySet<string> = new Set([
+  "permissionMode",
+  "nonInteractivePermissions",
+  "permissionPolicy",
+  "timeoutMs",
+  "promptRetries",
+  "codexSubscriptionCapWeeklyPercent",
+  "sessionOptions",
+]);
+
+function parseMemberTaskFields(record: Record<string, unknown>): MemberTaskOptions | null {
+  const parsed = {
+    permissionMode: parseOptionalValue(record.permissionMode, isPermissionMode),
+    nonInteractivePermissions: parseOptionalValue(
+      record.nonInteractivePermissions,
+      isNonInteractivePermissionPolicy,
+    ),
+    permissionPolicy: parseOptionalValue(record.permissionPolicy, isPermissionPolicy),
+    // `parsePositiveTimeout` reads an invalid value as absent; here an invalid one is a refusal.
+    timeoutMs:
+      record.timeoutMs == null ? undefined : (parsePositiveTimeout(record.timeoutMs) ?? null),
+    promptRetries: parseNonNegativeInteger(record.promptRetries),
+    codexSubscriptionCapWeeklyPercent: parseCapWeeklyPercent(
+      record.codexSubscriptionCapWeeklyPercent,
+    ),
+    sessionOptions: parseSessionOptions(record.sessionOptions),
+  };
+  return Object.values(parsed).some((value) => value === null)
+    ? null
+    : (parsed as MemberTaskOptions);
 }
 
 function parseCapWeeklyPercent(value: unknown): number | undefined | null {

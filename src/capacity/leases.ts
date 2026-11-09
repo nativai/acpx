@@ -294,3 +294,56 @@ export function verifiedLeaseOwners(
     };
   });
 }
+
+/**
+ * UMQ D1 / R12 — is the READING process inside a live queue owner's process tree?
+ *
+ * The census answers this as `OwnerTree.self` (`owners.ts`), but only after reading the whole `/proc`
+ * table and measuring every owner's tree. This answers the same boolean from the reader's own
+ * ANCESTRY: a reader is in an owner's walked tree iff that owner's pid is among its ancestors (the
+ * walk starts at the owner and descends through `ppid` links, never past another owner — and the
+ * nearest owner ancestor is the one that matters). So only the ancestors' `stat` files are read, and
+ * the leases are judged by the SAME `judgeLease` (pid namespace, start ticks) against that partial
+ * table. Row "owner tree: the ancestry check agrees with the census" in test/prompt-routing.test.ts.
+ */
+export function readerIsInsideLiveOwnerTree(inputs: LeaseInputs): boolean {
+  const fresh = freshLeaseFiles(inputs, listLeaseFiles(inputs.queueDir));
+  if (fresh.length === 0) {
+    return false;
+  }
+  const ancestors = readerAncestry(inputs.procRoot);
+  if (ancestors.size === 0) {
+    return false;
+  }
+  const owners = verifiedLeases(inputs, fresh, ancestors, emptyExclusions());
+  return owners.some((owner) => ancestors.has(owner.pid));
+}
+
+/** The reader's ancestors (never the reader itself), by `stat`: pid → entry, nearest first. */
+function readerAncestry(procRoot: string): Map<number, ProcEntry> {
+  const table = new Map<number, ProcEntry>();
+  const reader = readerPid(procRoot);
+  let entry = reader === undefined ? undefined : readStat(procRoot, reader);
+  for (let hops = 0; entry !== undefined && entry.ppid > 0 && hops < 64; hops += 1) {
+    entry = table.has(entry.ppid) ? undefined : readStat(procRoot, entry.ppid);
+    if (entry) {
+      table.set(entry.pid, entry);
+    }
+  }
+  return table;
+}
+
+function readStat(procRoot: string, pid: number): ProcEntry | undefined {
+  const raw = readText(path.join(procRoot, String(pid), "stat"));
+  const entry = raw === undefined ? undefined : parseProcStat(raw);
+  return entry?.pid === pid ? entry : undefined;
+}
+
+function readerPid(procRoot: string): number | undefined {
+  try {
+    const link = fs.readlinkSync(path.join(procRoot, "self"));
+    return /^\d+$/u.test(link) ? Number(link) : undefined;
+  } catch {
+    return process.pid;
+  }
+}

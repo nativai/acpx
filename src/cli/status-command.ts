@@ -730,6 +730,11 @@ function advertisedModelCatalogueText(value: StatusAdvertisedModelCatalogue | nu
   return value ? JSON.stringify(value) : "-";
 }
 
+/** `status:` line — a sleeping session says why it has no owner (UMQ K7, CONCEPTION §6.3). */
+function statusText(status: SessionStatusState): string {
+  return status === "sleeping" ? SLEEPING_TEXT : status;
+}
+
 function printTextStatus(payload: StatusPayload, dead: boolean): void {
   process.stdout.write(`session: ${payload.sessionId}\n`);
   if ("agentSessionId" in payload) {
@@ -737,9 +742,7 @@ function printTextStatus(payload: StatusPayload, dead: boolean): void {
   }
   process.stdout.write(`agent: ${payload.agentCommand}\n`);
   process.stdout.write(`pid: ${orDash(payload.pid)}\n`);
-  process.stdout.write(
-    `status: ${payload.status === "sleeping" ? SLEEPING_TEXT : payload.status}\n`,
-  );
+  process.stdout.write(`status: ${statusText(payload.status)}\n`);
   process.stdout.write(`model: ${orDash(payload.model)}\n`);
   process.stdout.write(`availableModels: ${listOrDash(payload.availableModels)}\n`);
   process.stdout.write(
@@ -781,3 +784,5 @@ export function registerStatusCommand(
   addSeatSelectorOption(statusCommand);
   statusCommand.action(async function (this: Command, flags: StatusFlags) {
     await handleStatus(explicitAgentName, flags, this, config);
+  });
+}

@@ -38,6 +38,7 @@ import {
 import {
   AcpxOperationalError,
   AgentSpawnError,
+  CapacityRefusedError,
   ProfileClassMismatchError,
   ProfileUnknownError,
   SessionNotFoundError,
@@ -158,11 +159,25 @@ import {
   type SessionsCloseFlags,
   type StatusFlags,
 } from "./flags.js";
-import { type MessageLedgerKind, withMessageLedger } from "./message-ledger.js";
+import {
+  type MessageLedgerKind,
+  resolveLedgerCaller,
+  withMessageLedger,
+} from "./message-ledger.js";
 import { emitJsonResult } from "./output/json-output.js";
 // Type-only, so the render module stays lazily imported at runtime.
 import type { FirstTurnOutcome, PruneRefusal, PruneScope } from "./output/render.js";
+import {
+  atriumDownRefusalLine,
+  decideAgentPromptRoute,
+  deliveredDirectlyLine,
+  type MessageRouteAnswer,
+  ROUTED_WAIT_MODE_LINE,
+  routedPromptLine,
+} from "./prompt-routing.js";
 import type { CloserTaskContext, QueueOwnerRecoveryResult } from "./queue/lease-store.js";
+import { type MemberTaskOptions, parseMemberTaskOptions } from "./queue/messages.js";
+import { runRoutedPrompt, type RoutedPromptOutcome } from "./routed-prompt.js";
 import {
   addressedSeatIdFromSelector,
   NoSessionError,
@@ -1678,6 +1693,150 @@ async function deliverPrompt(params: {
   });
 }
 
+/**
+ * UMQ D1 — the routing half of {@link sendPromptToRecipient}: `not-routed` = take the direct path
+ * as always. Cheap conditions first; the owner-tree census last (R12).
+ */
+async function maybeRouteAgentPrompt(
+  context: SendPromptContext,
+): Promise<RoutedPromptOutcome | { kind: "not-routed" }> {
+  const { record, flags, globalFlags } = context;
+  const route = decideAgentPromptRoute({
+    caller: resolveLedgerCaller(),
+    messageId: flags.messageId,
+    batchFile: flags.batchFile !== undefined,
+  });
+  if (!route || (await recipientRunsDirectly(record, flags))) {
+    return { kind: "not-routed" };
+  }
+  return await runRoutedPrompt({
+    route,
+    record,
+    addressedSeat: context.addressedSeat,
+    prompt: context.prompt,
+    taskOptions: routedTaskOptions(context.command, globalFlags, context.permissionMode),
+    ownerInputs: {
+      sessionId: record.acpxRecordId,
+      permissionMode: context.permissionMode,
+      permissionModeExplicit: hasExplicitPermissionModeFlag(globalFlags),
+      nonInteractivePermissions: globalFlags.nonInteractivePermissions,
+      authPolicy: globalFlags.authPolicy,
+      terminal: globalFlags.terminal,
+    },
+  });
+}
+
+/**
+ * Wait mode (CONCEPTION §7.2): a recipient whose agent is running or starting takes today's direct
+ * path — no room question, and the reply streams as today. Anything else is routed, and not waited for.
+ */
+async function recipientRunsDirectly(record: SessionRecord, flags: PromptFlags): Promise<boolean> {
+  if (flags.wait === false) {
+    return false;
+  }
+  const [{ readQueueOwnerLiveness }, { isOwnerPossiblyAlive }] = await Promise.all([
+    import("./queue/lease-store.js"),
+    import("./session/session-control.js"),
+  ]);
+  return isOwnerPossiblyAlive(await readQueueOwnerLiveness(record.acpxRecordId));
+}
+
+/**
+ * What THIS command line asks of its turn — the per-task fields of `submit_prompt`, EXPLICIT ones
+ * only (`MemberTaskOptions`, CONTRACTS §6.3). Defaults ride no member: members with different
+ * options are different turns, so a default stamped on every routed prompt would split a batch that
+ * a person's or atrium's option-less message belongs to.
+ *
+ * ⚠️ `approve-all` is NOT carried: atrium's batch call runs `--approve-all` already (CONTRACTS §1.1),
+ * and agents pass it on nearly every line, so carrying it would make the common member "different".
+ */
+function routedTaskOptions(
+  command: Command,
+  globalFlags: GlobalFlags,
+  permissionMode: ReturnType<typeof resolvePermissionMode>,
+): MemberTaskOptions | undefined {
+  const opts = command.optsWithGlobals<Record<string, unknown>>();
+  const sessionOptions = Object.fromEntries(
+    Object.entries(sessionOptionsFromGlobalFlags(globalFlags)).filter(
+      ([, value]) => value !== undefined,
+    ),
+  );
+  const explicit: Record<string, unknown> = {
+    permissionMode:
+      hasExplicitPermissionModeFlag(globalFlags) && permissionMode !== "approve-all"
+        ? permissionMode
+        : undefined,
+    nonInteractivePermissions:
+      typeof opts.nonInteractivePermissions === "string"
+        ? globalFlags.nonInteractivePermissions
+        : undefined,
+    permissionPolicy: globalFlags.permissionPolicy,
+    timeoutMs: typeof opts.timeout === "number" ? globalFlags.timeout : undefined,
+    promptRetries: globalFlags.promptRetries,
+    sessionOptions: Object.keys(sessionOptions).length > 0 ? sessionOptions : undefined,
+  };
+  const parsed = parseMemberTaskOptions(explicit);
+  if (parsed === null) {
+    throw new InvalidArgumentError(
+      "the options on this prompt line cannot be carried to atrium's queue",
+    );
+  }
+  return parsed;
+}
+
+/** The recipient as a sender names it: the seat's name, else the seat or session id's first 8. */
+async function routedTargetLabel(
+  record: SessionRecord,
+  addressedSeat: string | undefined,
+): Promise<string> {
+  return (
+    (await seatDisplayName(record)) ??
+    (addressedSeat ?? record.seatId ?? record.acpxRecordId).slice(0, 8)
+  );
+}
+
+async function printRoutedSend(
+  context: SendPromptContext,
+  answer: MessageRouteAnswer,
+): Promise<void> {
+  const { record, addressedSeat, flags, outputPolicy } = context;
+  const { printRoutedPromptByFormat } = await loadOutputRenderModule();
+  const label = await routedTargetLabel(record, addressedSeat);
+  printRoutedPromptByFormat(
+    { acpxRecordId: record.acpxRecordId, answer, line: routedPromptLine(answer, label) },
+    outputPolicy.format,
+  );
+  if (flags.wait !== false && outputPolicy.format === "text") {
+    process.stderr.write(`${ROUTED_WAIT_MODE_LINE}\n`);
+  }
+}
+
+/**
+ * The direct path after a routed attempt that could not connect: if its wake gate refuses (exit
+ * 75), the refusal gains the one sentence that says why a sender is seeing it (CONTRACTS §5.5,
+ * A-10) — never in the generic wake text, which is also admit-wake's and atrium's own spawns'.
+ */
+async function withDirectFallbackRefusal<T>(
+  fallback: DirectFallback | undefined,
+  record: SessionRecord,
+  run: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    if (fallback && error instanceof CapacityRefusedError && error.capacityRefusal.wake) {
+      const who = (await seatDisplayName(record)) ?? `session ${record.acpxRecordId.slice(0, 8)}`;
+      const sentence = `${error.message.split("\n").slice(1).join("\n")}\n${atriumDownRefusalLine(who)}`;
+      throw new CapacityRefusedError({
+        tokenLine: error.stderrLine,
+        sentence,
+        detail: { ...error.capacityRefusal, message: sentence },
+      });
+    }
+    throw error;
+  }
+}
+
 export async function handlePrompt(
   explicitAgentName: string | undefined,
   promptParts: string[],
@@ -1725,8 +1884,7 @@ export async function handlePrompt(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   warnReasoningEffortNotRoutable(globalFlags, agent.agentName);
   warnOutputStyleNotSupported(globalFlags, agent.agentName);
-  const { printPromptSessionBanner, printQueuedPromptByFormat, printServedBelowFloorWarning } =
-    await loadOutputRenderModule();
+  const { printPromptSessionBanner } = await loadOutputRenderModule();
   const selector = resolveSessionTargetSelector({ flags, command });
   const record = await requireExplicitSessionRecord(selector, agent.agentName);
   await assertExplicitSubscriptionMatchesExistingSession({
@@ -1737,32 +1895,84 @@ export async function handlePrompt(
   const prompt = await readPrompt(promptParts, flags.file, globalFlags.cwd);
 
   await printPromptSessionBanner(record, agent.cwd, outputPolicy.format, outputPolicy.jsonStrict);
-  const addressedSeat = addressedSeatIdFromSelector(selector);
-  const result = await withMessageLedger(
-    {
-      kind: "prompt",
-      to: { session: record.acpxRecordId, seat: addressedSeat ?? record.seatId ?? null },
-      addressedAs: addressedSeat === undefined ? "session" : "seat",
-      prompt,
-      messageId: flags.messageId,
-    },
-    (onSubmitAccepted) =>
-      deliverPrompt({
-        sessionId: record.acpxRecordId,
-        prompt,
-        waitForCompletion: flags.wait !== false,
-        globalFlags,
-        permissionMode,
-        permissionPolicy,
-        outputPolicy,
-        config,
-        messageId: flags.messageId,
-        onSubmitAccepted,
-      }),
-  );
+  await sendPromptToRecipient({
+    record,
+    addressedSeat: addressedSeatIdFromSelector(selector),
+    prompt,
+    flags,
+    globalFlags,
+    permissionMode,
+    permissionPolicy,
+    outputPolicy,
+    config,
+    command,
+  });
+}
 
+type SendPromptContext = {
+  record: SessionRecord;
+  addressedSeat: string | undefined;
+  prompt: PromptInput;
+  flags: PromptFlags;
+  globalFlags: GlobalFlags;
+  permissionMode: ReturnType<typeof resolvePermissionMode>;
+  permissionPolicy: PermissionPolicy | undefined;
+  outputPolicy: ReturnType<typeof resolveRequestedOutputPolicy>;
+  config: ResolvedAcpxConfig;
+  command: Command;
+};
+
+/**
+ * UMQ D1 (CONCEPTION §7.2): an AGENT's prompt goes through atrium's message queue, which decides
+ * deliver-now vs hold; every other prompt — and an agent's whose atrium cannot be reached — takes the
+ * direct path. `shouldRouteAgentPrompt` (prompt-routing.ts) is the one switch.
+ */
+async function sendPromptToRecipient(context: SendPromptContext): Promise<void> {
+  const routed = await maybeRouteAgentPrompt(context);
+  if (routed.kind === "sent") {
+    await printRoutedSend(context, routed.answer);
+    return;
+  }
+  await sendPromptDirect(context, routed.kind === "direct" ? routed : undefined);
+}
+
+/** Today's path: the wake gate, the owner's queue, the message ledger. */
+async function sendPromptDirect(
+  context: SendPromptContext,
+  fallback: DirectFallback | undefined,
+): Promise<void> {
+  const { record, addressedSeat, prompt, flags, globalFlags, outputPolicy } = context;
+  const { printQueuedPromptByFormat, printServedBelowFloorWarning } =
+    await loadOutputRenderModule();
+  const messageId = fallback?.messageId ?? flags.messageId;
+  const result = await withDirectFallbackRefusal(fallback, record, async () => {
+    return await withMessageLedger(
+      {
+        kind: "prompt",
+        to: { session: record.acpxRecordId, seat: addressedSeat ?? record.seatId ?? null },
+        addressedAs: addressedSeat === undefined ? "session" : "seat",
+        prompt,
+        messageId,
+      },
+      (onSubmitAccepted) =>
+        deliverPrompt({
+          sessionId: record.acpxRecordId,
+          prompt,
+          waitForCompletion: flags.wait !== false,
+          globalFlags,
+          permissionMode: context.permissionMode,
+          permissionPolicy: context.permissionPolicy,
+          outputPolicy,
+          config: context.config,
+          messageId,
+          onSubmitAccepted,
+        }),
+    );
+  });
+
+  noteDeliveredDirectly(fallback, outputPolicy.format);
   if ("queued" in result) {
-    printQueuedPromptByFormat(result, outputPolicy.format);
+    printQueuedPromptByFormat(result, outputPolicy.format, fallback ? { routed: false } : {});
     return;
   }
 
@@ -1781,6 +1991,15 @@ export async function handlePrompt(
     process.stderr.write(
       `[acpx] session reconnect failed, started fresh session: ${result.loadError}\n`,
     );
+  }
+}
+
+/** The direct path ran because a routed attempt could not be completed (UMQ D1, CONTRACTS §5.5). */
+type DirectFallback = Extract<RoutedPromptOutcome, { kind: "direct" }>;
+
+function noteDeliveredDirectly(fallback: DirectFallback | undefined, format: OutputFormat): void {
+  if (fallback && format === "text") {
+    process.stderr.write(`${deliveredDirectlyLine(fallback.deliveryId)}\n`);
   }
 }
 
@@ -3640,6 +3859,15 @@ export async function handleSessionsCopy(
     await handleSleepingSessionsCopy(explicitAgentName, flags, command, config);
     return;
   }
+  await handleLiveSessionsCopy(explicitAgentName, flags, command, config);
+}
+
+async function handleLiveSessionsCopy(
+  explicitAgentName: string | undefined,
+  flags: SessionsCopyFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
   const handoffPrompt = (await resolveHandoffPrompt(flags))?.prompt;
   const { created, source, requestedCwd } = await runSessionCopy(
     explicitAgentName,
