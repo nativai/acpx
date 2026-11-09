@@ -39,11 +39,34 @@ function structuralReason(proc: GovProc, guard: GuardContext): string | undefine
   return proc.pid === guard.selfPid ? "governor" : undefined;
 }
 
+/**
+ * CONCEPTION §19 D5 — the owner-token argv read happens only for a member that COULD be an owner: the
+ * session leader (an owner session protects every member through it) or a process named `node`
+ * (F12's fork → setsid → exec window: the future owner is still the forked node CLI). Every member
+ * still gets the structural guard and the lease check (pid and sid).
+ *
+ * The invariant that makes this safe (§3.3): a process group never spans sessions (`setpgid` into
+ * another session's group fails EPERM; `setsid` makes a new group), and every acpx queue owner is
+ * spawned detached, so it LEADS its own session. Hence no pgid of a governed session holds a running
+ * owner. Premise pinned by "integration: GOVERNOR PREMISE (§19 D5) …".
+ *
+ * ⚠️ DO NOT "restore" the per-member read for every member. It looks like extra safety and it is the
+ * D3a latency bug: ~1,000 argv reads under a storm cost 57–213 ms before the first signal, while the
+ * bomb kept forking (TE re-verify of D3a; profile in impl-evidence/fix-round/d3a-latency-profile).
+ */
+function mayBeOwner(proc: GovProc): boolean {
+  return proc.pid === proc.sid || proc.comm === "node";
+}
+
+function tokenIfMayBeOwner(proc: GovProc, guard: GuardContext): TokenState {
+  return mayBeOwner(proc) ? guard.tokenState(proc.pid) : "absent";
+}
+
 function ownerReason(proc: GovProc, guard: GuardContext): string | undefined {
   if (guard.leaseOwnerPids.has(proc.pid) || guard.leaseOwnerPids.has(proc.sid)) {
     return "owner-lease";
   }
-  const token = guard.tokenState(proc.pid);
+  const token = tokenIfMayBeOwner(proc, guard);
   // An owner leads its own session, so its adapter and harness are protected through the leader:
   // "queue-owner sessions are never touched" (§3.3), not just the owner process itself.
   if (token === "owner" || (proc.sid !== proc.pid && guard.tokenState(proc.sid) === "owner")) {

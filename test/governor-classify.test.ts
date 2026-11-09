@@ -426,7 +426,8 @@ test("F12: the token cache keeps only POSITIVE answers — a process read `absen
   assert.equal(token(201), "absent");
   // node's detached spawn: fork -> setsid -> EXEC into `__queue-owner`. exec keeps pid and start ticks.
   const before = box.procs.get(201) as FakeProcess;
-  box.add({ ...before, owner: true });
+  // exec into `node … __queue-owner`: the argv AND the comm change (comm = the new executable's name).
+  box.add({ ...before, owner: true, comm: "node" });
   assert.equal(box.procs.get(201)?.ticks, before.ticks, "same start ticks");
   assert.equal(token(201), "owner", "a negative is re-read, never served from the cache");
   const guard = { ...guardFor(box), tokenState: token };
@@ -552,6 +553,40 @@ test("sweep: each argv is read at most ONCE per guard pass (the session leader's
   });
   assert.equal(reads.get(200), 1, "the leader's token: once in the pass, not once per member");
   assert.ok([...reads.values()].every((n) => n === 1));
+});
+
+test("§19 D5: the guard reads the owner token only for the session leader and `node` members — other members get structural + lease + leader checks", (t) => {
+  const box = new FakeBox();
+  t.after(() => box.cleanup());
+  box.standardSystem();
+  const { claudePid } = box.owner(100, "sess-d5");
+  box.toolSession(200, claudePid, 130);
+  box.add({ pid: 260, ppid: 201, pgid: 201, sid: 200, comm: "node" }); // a node member: read
+  const reads = new Set<number>();
+  const guard = {
+    ...guardFor(box, [999]),
+    tokenState: (pid: number) => {
+      reads.add(pid);
+      return queueOwnerTokenState(pid, box.proc);
+    },
+  };
+  const byPid = scanProcTable(box.proc, parseGovProcStat).byPid;
+  for (const pid of [200, 201, 202, 260]) {
+    protectedReason(byPid.get(pid)!, guard);
+  }
+  assert.deepEqual(
+    [...reads].toSorted((a, b) => a - b),
+    [200, 260],
+    "leader and node only",
+  );
+  // An owner session still protects EVERY member, through its leader's token.
+  const ownerMember = byPid.get(102)!; // claude inside the owner session (leader 100 carries the token)
+  assert.equal(protectedReason(ownerMember, guard), "owner-token");
+  // A lease still protects whatever the comm.
+  assert.equal(
+    protectedReason(byPid.get(202)!, { ...guard, leaseOwnerPids: new Set([202]) }),
+    "owner-lease",
+  );
 });
 
 test("sweep accounting: `signalled` counts every member of the signalled groups across rounds — not the decision count", (t) => {
