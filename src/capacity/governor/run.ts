@@ -1482,6 +1482,23 @@ export class Governor {
    * 1 s base scan. Row: "§19 D3a … 10 new pids per tick trigger on the SECOND tick".
    */
   pidWatch(): boolean {
+    return this.triggerMet();
+  }
+
+  /**
+   * CONCEPTION §19 D6, called once at the END of every completed tick: true when the D3a trigger is already
+   * met again (≥ `pidWatchTrigger` pids allocated since this tick's scan baseline) — the caller then starts
+   * the next tick at once (`setImmediate`, never a synchronous loop: one immediate re-tick per completed
+   * tick, so timers, the watcher and reader messages always get their turn) instead of waiting for the next
+   * watcher fire. Measured (brick 07f4fde2): those waits were median 9.5 ms, max 88 ms under a storm. An idle
+   * box never meets it after a ~3 ms tick (~18 pids/s). Rows: "§19 D6 …".
+   */
+  reTickDue(): boolean {
+    return this.triggerMet();
+  }
+
+  /** The cumulative D3a test against the last full scan's baseline; a met trigger starts fast mode. */
+  private triggerMet(): boolean {
     const current = this.readLastPid();
     const baseline = this.scanBaselinePid;
     if (current === undefined || baseline === undefined) {
