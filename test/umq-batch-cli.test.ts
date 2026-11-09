@@ -4,12 +4,13 @@
 // TEST-PLAN §4.1 ids.
 
 import assert from "node:assert/strict";
+import "./install-owner-reaper.js";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { withTempHome } from "./temp-home.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -64,12 +65,7 @@ async function runCli(args: string[], homeDir: string, stdin?: string): Promise<
 }
 
 async function withHome(prefix: string, body: (homeDir: string) => Promise<void>): Promise<void> {
-  const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
-  try {
-    await body(homeDir);
-  } finally {
-    await fs.rm(homeDir, { recursive: true, force: true });
-  }
+  await withTempHome(prefix, body);
 }
 
 async function newSession(homeDir: string, agent = MOCK_AGENT): Promise<string> {

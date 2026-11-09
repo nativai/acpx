@@ -806,16 +806,16 @@ test("SessionQueueOwner rejects prompts when queue depth exceeds the configured 
     const secondIterator = secondLines[Symbol.asyncIterator]();
 
     try {
-      const accepted = (await nextJsonLine(secondIterator)) as { type: string; requestId: string };
-      assert.equal(accepted.type, "accepted");
-      assert.equal(accepted.requestId, "req-second");
-
+      // UMQ §1.5 (CONTRACTS K3): the depth check runs BEFORE `accepted` — the refused submit is
+      // never acknowledged first (an acked-then-dropped `--no-wait` task had no terminal at all).
       const error = (await nextJsonLine(secondIterator)) as {
         type: string;
+        requestId: string;
         detailCode?: string;
         retryable?: boolean;
       };
       assert.equal(error.type, "error");
+      assert.equal(error.requestId, "req-second");
       assert.equal(error.detailCode, "QUEUE_OWNER_OVERLOADED");
       assert.equal(error.retryable, true);
     } finally {

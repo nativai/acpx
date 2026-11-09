@@ -1853,6 +1853,10 @@ export async function runQueuedTask(
     setMidTurnHandler?: (handler: ((injected: QueueTask[]) => void) | undefined) => void;
     // UMQ §5.2 — the owner's capture buffer, taken once at the turn's first prompt send.
     takeGatheredTasks?: () => QueueTask[];
+    // UMQ §22.1 — the members a context split holds back while their older half runs, put where the
+    // owner's close drain and signal sweep can terminalize them (custody, corollary C-1). Returns
+    // the release, called before those members run.
+    holdSplitCustody?: (tasks: QueueTask[]) => () => void;
     // Failover: signaled after a turn auto-switched the session to a new
     // profile/account. The owner uses it to recycle its stale shared client so
     // subsequent turns cold-spawn on the new transcript anchor.
@@ -1895,11 +1899,14 @@ export async function runQueuedTask(
 
   try {
     const result = await runSplittingOnContextOverflow(
-      sessionRecordId,
+      {
+        sessionRecordId,
+        runPart: async (part, split) =>
+          await runQueuedTurnPart(sessionRecordId, part, runtimeOptions, outputFormatter, split),
+        holdCustody: options.holdSplitCustody,
+      },
       members,
       undefined,
-      async (part, split) =>
-        await runQueuedTurnPart(sessionRecordId, part, runtimeOptions, outputFormatter, split),
     );
     sendQueuedTaskResult(head, result);
   } catch (error) {
@@ -2002,49 +2009,75 @@ async function runQueuedTurnPart(
  * it into its older and newer half (an odd member goes to the older half) and run them in that
  * order, recursively. Never pre-emptive. A member already settled (deduplicated) is not re-run.
  */
+type SplitRunner = {
+  sessionRecordId: string;
+  runPart: (part: QueueTask[], split: BatchSplitPart | undefined) => Promise<SessionSendResult>;
+  holdCustody?: (tasks: QueueTask[]) => () => void;
+};
+
 async function runSplittingOnContextOverflow(
-  sessionRecordId: string,
+  runner: SplitRunner,
   members: QueueTask[],
   split: BatchSplitPart | undefined,
-  runPart: (part: QueueTask[], split: BatchSplitPart | undefined) => Promise<SessionSendResult>,
 ): Promise<SessionSendResult> {
   try {
-    return await runPart(members, split);
+    return await runner.runPart(members, split);
   } catch (error) {
     if (!(error instanceof BatchContextOverflowError)) {
       throw error;
     }
-    const live = members.filter((task) => !task.terminalWritten);
-    const whole = split ?? { total: live.length, from: 1, to: live.length };
-    const olderCount = Math.ceil(live.length / 2);
-    const older = live.slice(0, olderCount);
-    const newer = live.slice(olderCount);
-    const olderPart = { total: whole.total, from: whole.from, to: whole.from + olderCount - 1 };
-    const newerPart = { total: whole.total, from: olderPart.to + 1, to: whole.to };
-    // NOT verbose-gated: one line per split, in owner.log.
-    process.stderr.write(
-      `[acpx] batch of ${live.length} message(s) for session ${sessionRecordId} did not fit the ` +
-        `recipient's context (${CONTEXT_OVERFLOW}); splitting into ${older.length} + ${newer.length} ` +
-        `(messages ${whole.from}–${whole.to} of ${whole.total}), older half first\n`,
-    );
-    let olderError: unknown;
-    try {
-      await runSplittingOnContextOverflow(sessionRecordId, older, olderPart, runPart);
-    } catch (partError) {
-      if (partError instanceof InterruptedError) {
-        terminalizeUnstartedMembers(sessionRecordId, newer, partError);
-        throw partError;
-      }
-      olderError = partError;
+    return await runSplitHalves(runner, members, split);
+  }
+}
+
+async function runSplitHalves(
+  runner: SplitRunner,
+  members: QueueTask[],
+  split: BatchSplitPart | undefined,
+): Promise<SessionSendResult> {
+  const live = members.filter((task) => !task.terminalWritten);
+  const whole = split ?? { total: live.length, from: 1, to: live.length };
+  const olderCount = Math.ceil(live.length / 2);
+  const older = live.slice(0, olderCount);
+  const newer = live.slice(olderCount);
+  const olderPart = { total: whole.total, from: whole.from, to: whole.from + olderCount - 1 };
+  const newerPart = { total: whole.total, from: olderPart.to + 1, to: whole.to };
+  // NOT verbose-gated: one line per split, in owner.log.
+  process.stderr.write(
+    `[acpx] batch of ${live.length} message(s) for session ${runner.sessionRecordId} did not fit the ` +
+      `recipient's context (${CONTEXT_OVERFLOW}); splitting into ${older.length} + ${newer.length} ` +
+      `(messages ${whole.from}–${whole.to} of ${whole.total}), older half first\n`,
+  );
+  // While the older half runs, the newer one is in the owner's custody: a close drain or a signal
+  // sweep in that window terminalizes it (and it then does not run).
+  const releaseNewer = runner.holdCustody?.(newer) ?? (() => {});
+  let olderResult: SessionSendResult | undefined;
+  let olderError: unknown;
+  try {
+    olderResult = await runSplittingOnContextOverflow(runner, older, olderPart);
+  } catch (partError) {
+    if (partError instanceof InterruptedError) {
+      releaseNewer();
+      terminalizeUnstartedMembers(runner.sessionRecordId, newer, partError);
+      throw partError;
     }
-    // A failure of the older half is its own members' (each already has its terminal); the newer
-    // half is still delivered.
-    const result = await runSplittingOnContextOverflow(sessionRecordId, newer, newerPart, runPart);
-    if (olderError !== undefined) {
+    olderError = partError;
+  }
+  releaseNewer();
+  // A failure of the older half is its own members' (each already has its terminal); the newer
+  // half is still delivered — unless the owner's custody sweep already settled it.
+  const newerLive = newer.filter((task) => !task.terminalWritten);
+  if (newerLive.length === 0) {
+    if (olderResult === undefined) {
       throw olderError;
     }
-    return result;
+    return olderResult;
   }
+  const result = await runSplittingOnContextOverflow(runner, newerLive, newerPart);
+  if (olderError !== undefined) {
+    throw olderError;
+  }
+  return result;
 }
 
 /** The never-reached-the-model terminal for split members an interrupt kept from their turn. */
@@ -3438,6 +3471,14 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     return { ...(messageId !== undefined ? { messageId } : {}), promptId };
   };
 
+  // THE one call site for an injected prompt — single or a batch (UMQ §5.3). Never opted into
+  // per-turn context: a steer inside a running turn must not wear a "new turn" frame.
+  const sendInjectedPrompt = (
+    sessionId: string,
+    prompt: PromptInput,
+    promptOptions: AcpPromptOptions | undefined,
+  ): Promise<PromptResponse> => client.prompt(sessionId, prompt, promptOptions);
+
   const registerSteerConsumption = (context: DeliveryContext | undefined): void => {
     if (context) {
       consumptionTracker?.register(context.messageId, "steer");
@@ -3467,7 +3508,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       await appendDeliveryEvent(injectedDeliveryContext, "accepted");
       // brick e09628a1 — count from BEFORE the prompt is sent, so no completion it causes is missed.
       registerSteerConsumption(injectedDeliveryContext);
-      const injectedResponsePromise = client.prompt(
+      const injectedResponsePromise = sendInjectedPrompt(
         sessionId,
         injectedPrompt,
         injectedPromptOptions(injectedTask.messageId),
@@ -3556,7 +3597,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       // brick e09628a1 — count from BEFORE the prompt is sent, so no completion it causes is missed.
       registerSteerConsumption(member.context);
     }
-    const responsePromise = client.prompt(sessionId, composed.prompt, {
+    const responsePromise = sendInjectedPrompt(sessionId, composed.prompt, {
       ...injectedPromptOptions(composed.messageId),
       ...(composed.batchMeta ? { batchMeta: composed.batchMeta } : {}),
     });

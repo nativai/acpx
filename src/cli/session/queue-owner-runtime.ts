@@ -1640,7 +1640,13 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     // D1 (brick://53437107) — custody lives in TWO places, so the drain and the
     // signal handler must walk both (corollary C-1). The owner holds `pending`;
     // the capture buffer lives here, so hand the owner an accessor that takes it.
-    owner.setMidTurnCustodySource(() => midTurnBuffer.splice(0).flat());
+    // UMQ §22.1 — and a context split's held-back half (`holdSplitCustody`).
+    const splitHeld = new Set<QueueTask>();
+    owner.setMidTurnCustodySource(() => {
+      const held = [...splitHeld];
+      splitHeld.clear();
+      return [...midTurnBuffer.splice(0).flat(), ...held];
+    });
 
     // UMQ §5.2 — gather at prompt send: what arrived while the adapter connected joins the turn's
     // ONE prompt instead of being injected after it. Taken in arrival order up to the first task
@@ -1895,6 +1901,16 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
               takeGatheredTasks: midTurnInjectionSupported
                 ? () => takeGatheredTasks(head)
                 : undefined,
+              holdSplitCustody: (tasks) => {
+                for (const task of tasks) {
+                  splitHeld.add(task);
+                }
+                return () => {
+                  for (const task of tasks) {
+                    splitHeld.delete(task);
+                  }
+                };
+              },
               setMidTurnHandler: midTurnInjectionSupported
                 ? (handler) => {
                     activeMidTurnHandler = handler;

@@ -450,6 +450,72 @@ test("N-A1-7: a stub rejecting any prompt over K members for context size delive
   });
 });
 
+test("N-A1-7 (custody): a close drain while the older half runs terminalizes the held newer half once — and it never runs", async () => {
+  await withRecord("umq-batch-split-close", async (record) => {
+    const olderInFlight = createDeferred<void>();
+    const { client, calls } = makeRecordingClient((call, index) => {
+      if (index === 0) {
+        call.settle.reject(claudePromptTooLong());
+        return;
+      }
+      if (index === 1) {
+        olderInFlight.resolve();
+        return; // the older half's turn: withheld until the close has drained
+      }
+      call.settle.resolve({ stopReason: "end_turn" });
+    });
+    const lease = await tryAcquireQueueOwnerLease(record.acpxRecordId);
+    assert(lease);
+    const owner = await SessionQueueOwner.start(lease, stubControlHandlers(), { maxQueueDepth: 8 });
+    // The owner runtime's wiring (queue-owner-runtime.ts): held split members are custody.
+    const held = new Set<QueueTask>();
+    owner.setMidTurnCustodySource(() => {
+      const taken = [...held];
+      held.clear();
+      return taken;
+    });
+    const members = [1, 2, 3, 4].map((n) => makeTask(n));
+    try {
+      const run = captureStderr(
+        async () =>
+          await runQueuedTask(record.acpxRecordId, members, {
+            sharedClient: client,
+            holdSplitCustody: (tasks) => {
+              for (const task of tasks) {
+                held.add(task);
+              }
+              return () => {
+                for (const task of tasks) {
+                  held.delete(task);
+                }
+              };
+            },
+          }),
+      );
+      await olderInFlight.promise;
+      assert.equal(held.size, 2, "the newer half is in custody while the older half runs");
+      await owner.drainDeliveries("session-close", 0);
+      calls[1].settle.resolve({ stopReason: "end_turn" });
+      await withRaceTimeout(run, "the split never finished");
+      assert.equal(calls.length, 2, "the drained half never ran");
+      for (const n of [3, 4]) {
+        const terminals = (await phasesFor(record, memberId(n))).filter(
+          (phase) => phase !== "accepted",
+        );
+        assert.deepEqual(terminals, ["failed"], `member ${n}: the close's one terminal`);
+      }
+      for (const n of [1, 2]) {
+        const terminals = (await phasesFor(record, memberId(n))).filter(
+          (phase) => phase !== "accepted",
+        );
+        assert.equal(terminals.length, 1, `member ${n}: exactly one terminal`);
+      }
+    } finally {
+      await owner.close();
+    }
+  });
+});
+
 test("N-A1-7 (twin): a NON-context failure never splits — every member gets that failure's terminal", async () => {
   await withRecord("umq-batch-no-split", async (record) => {
     const { client, calls } = makeRecordingClient((call) => {
