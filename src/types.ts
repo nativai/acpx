@@ -707,7 +707,19 @@ export type SessionContextFill = {
   compaction_tokens?: number;
 };
 
+/**
+ * `acpx.sleeping` (UMQ K7, CONCEPTION §6) — the session exists but no agent has ever run: the record
+ * carries `acpSessionId: ""` until the first wake materialises it (`runtime/engine/reconnect.ts`)
+ * and deletes this field. `fork.from` = the template record the first wake forks.
+ */
+export type SessionSleepingState = {
+  since: string;
+  fork?: { from: string };
+};
+
 export type SessionAcpxState = {
+  /** See {@link SessionSleepingState}. Present only until the first wake. */
+  sleeping?: SessionSleepingState;
   reset_on_next_ensure?: boolean;
   current_mode_id?: string;
   desired_mode_id?: string;

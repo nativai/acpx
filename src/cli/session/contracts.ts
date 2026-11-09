@@ -195,6 +195,13 @@ export type SessionCreateOptions = {
   verbose?: boolean;
   sessionOptions?: SessionAgentOptions;
   desiredConfigOptions?: Record<string, string>;
+  /**
+   * `sessions new|copy --sleeping` (UMQ K7): write the record, index entry, seat and links ONLY —
+   * no adapter, no `session/new`, no fork, no model apply. `acpSessionId` is `""` and
+   * `acpx.sleeping` marks the record until the first wake materialises it. With
+   * `forkFromSessionId` the first wake forks that template; without it, a fresh session.
+   */
+  sleeping?: boolean;
 } & TimedRunOptions;
 
 export type SessionSendOptions = {

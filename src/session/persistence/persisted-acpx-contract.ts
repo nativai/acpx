@@ -67,6 +67,8 @@ import type { SessionAcpxState } from "../../types.js";
  * type — a test can read a sentinel back and compare it without widening.
  */
 export const PERSISTED_ACPX_SENTINEL = {
+  // UMQ K7 — nested `fork.from` needs its own sentinel (the compiler only forces top-level keys).
+  sleeping: { since: "2026-09-10T00:00:13.000Z", fork: { from: "sentinel-sleeping-fork-from" } },
   reset_on_next_ensure: true,
   current_mode_id: "sentinel-current-mode",
   desired_mode_id: "sentinel-desired-mode",

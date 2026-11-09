@@ -397,6 +397,19 @@ function createdCwdJson(
   return { cwd: record.cwd, ...(requestedCwd === undefined ? {} : { requestedCwd }) };
 }
 
+/** `sessions new|copy --sleeping` (UMQ K7): the created line's suffix. */
+const SLEEPING_CREATED_SUFFIX = " (sleeping — its first message starts it)";
+
+/** The JSON a sleeping create adds to today's object: nothing was queued by acpx, the session sleeps. */
+function sleepingJson(
+  record: SessionRecord,
+  forkNotice?: string,
+): { promptQueued: false; sleeping: true; forkNotice?: string } | Record<string, never> {
+  return record.acpx?.sleeping
+    ? { promptQueued: false, sleeping: true, ...(forkNotice ? { forkNotice } : {}) }
+    : {};
+}
+
 export function printNewSessionByFormat(
   record: SessionRecord,
   format: OutputFormat,
@@ -417,6 +430,7 @@ export function printNewSessionByFormat(
       ...newSessionSeatJson(record, seatUrl),
       ...(subscriptionSelection ? { subscriptionSelection } : {}),
       ...firstTurn,
+      ...sleepingJson(record),
     })
   ) {
     return;
@@ -462,6 +476,8 @@ export function printCopiedSessionByFormat(
   format: OutputFormat,
   firstTurn?: FirstTurnOutcome,
   requestedCwd?: string,
+  /** A sleeping copy's fork notice, composed at once and returned instead of delivered (K7). */
+  forkNotice?: string,
 ): void {
   const subscriptionSelection = consumeAutoSubscriptionSelection();
   if (
@@ -487,6 +503,7 @@ export function printCopiedSessionByFormat(
       ...newSessionSeatJson(record, resolveSeatUrl(record.seatId)),
       ...(subscriptionSelection ? { subscriptionSelection } : {}),
       ...firstTurn,
+      ...sleepingJson(record, forkNotice),
     })
   ) {
     return;
@@ -708,7 +725,9 @@ export function printCreatedSessionBanner(
     }
     process.stderr.write(`[acpx] seat: ${record.seatId}\n`);
   }
-  process.stderr.write(`[acpx] created session ${record.acpxRecordId}\n`);
+  process.stderr.write(
+    `[acpx] created session ${record.acpxRecordId}${record.acpx?.sleeping ? SLEEPING_CREATED_SUFFIX : ""}\n`,
+  );
   process.stderr.write(`[acpx] agent: ${agentName}\n`);
   process.stderr.write(`[acpx] cwd: ${record.cwd}\n`);
   const url = composeSessionUrl(record);

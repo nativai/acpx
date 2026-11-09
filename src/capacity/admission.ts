@@ -100,6 +100,15 @@ export function takeAdmissionClassFromEnv(env: NodeJS.ProcessEnv = process.env):
   };
 }
 
+/**
+ * The class atrium declared for THIS invocation (`ACPX_ADMISSION_CLASS`, consumed at CLI start by
+ * {@link takeAdmissionClassFromEnv}), or `undefined` when none was sent or it was not a known class.
+ * `sessions new|copy --sleeping` is accepted only for `automation` (UMQ K7, CONCEPTION §6.1).
+ */
+export function declaredAdmissionClass(): AdmissionClass | undefined {
+  return explicitClass?.value;
+}
+
 function hasAgentIdentity(env: NodeJS.ProcessEnv): boolean {
   return Boolean(env.ACPX_SESSION_RECORD_ID?.trim() || env.ACPX_SESSION_URL?.trim());
 }

@@ -194,6 +194,24 @@ export type SessionIndexEntry = {
    */
   startedBy?: Record<string, string>;
   /**
+   * UMQ K7 (CONCEPTION §6.3) — `true` while `record.acpx.sleeping` is set: the session exists but no
+   * agent has run, `acpSessionId` is `""`. Absent = not sleeping. ⚠️ BOTH index legs carry it
+   * (`toSessionIndexEntry` + `parseIndexEntry`), exactly as `startedBy` does.
+   */
+  sleeping?: true;
+  /**
+   * UMQ K7 / P1 — which automated job created the session, from the three metadata keys atrium's
+   * create writes (`created_by_kind|label|ref`). Absent when any is missing or `kind` is unknown.
+   * ⚠️ BOTH index legs, as above.
+   */
+  createdBy?: SessionCreatedBy;
+  /**
+   * CONTRACTS A-5 — the template a sleeping COPY will fork, from the metadata strings atrium's
+   * sleeping copy writes (`fork_template_id` / `fork_template_name`). Absent when either is missing.
+   * ⚠️ BOTH index legs, as above.
+   */
+  forkTemplate?: { id: string; name: string };
+  /**
    * The git worktree this session was told to work in (brick 45917618 §5.8): the record's flat
    * `worktree_path` / `worktree_branch` / `worktree_repo` metadata, present only when all three are.
    * The session itself runs at the session root; atrium's list row and chat header read this.
@@ -432,6 +450,41 @@ function parseIndexAccountSwitch(value: unknown): SessionIndexAccountSwitch | un
   };
 }
 
+export type SessionCreatedBy = {
+  kind: "wakeup" | "trigger-run" | "auto-session";
+  label: string;
+  ref: string;
+};
+
+const CREATED_BY_KINDS: ReadonlySet<string> = new Set(["wakeup", "trigger-run", "auto-session"]);
+
+function createdByOf(kind: unknown, label: unknown, ref: unknown): SessionCreatedBy | undefined {
+  return typeof kind === "string" &&
+    CREATED_BY_KINDS.has(kind) &&
+    typeof label === "string" &&
+    typeof ref === "string"
+    ? { kind: kind as SessionCreatedBy["kind"], label, ref }
+    : undefined;
+}
+
+/** Parse leg: an index entry's `createdBy` object (hand-/acpx-ui-writable, so validated). */
+function createdByFromIndexEntry(raw: unknown): SessionCreatedBy | undefined {
+  const value = asRecord(raw);
+  return value ? createdByOf(value.kind, value.label, value.ref) : undefined;
+}
+
+function forkTemplateOf(id: unknown, name: unknown): { id: string; name: string } | undefined {
+  return typeof id === "string" && id.length > 0 && typeof name === "string"
+    ? { id, name }
+    : undefined;
+}
+
+/** Parse leg: an index entry's `forkTemplate` object (hand-/acpx-ui-writable, so validated). */
+function forkTemplateFromIndexEntry(raw: unknown): { id: string; name: string } | undefined {
+  const value = asRecord(raw);
+  return value ? forkTemplateOf(value.id, value.name) : undefined;
+}
+
 /** Key prefix of the human-identity metadata atrium records on a session it starts. */
 export const STARTED_BY_METADATA_PREFIX = "started_by_";
 
@@ -544,6 +597,10 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     lastTurnNativeFinishReason: optionalString(record.lastTurnNativeFinishReason),
     lastTurnProviderAt: optionalString(record.lastTurnProviderAt),
     startedBy: startedByFrom(record.startedBy),
+    // BOTH index legs (UMQ K7): the projection leg is `toSessionIndexEntry`'s `sleeping` / `createdBy`.
+    sleeping: record.sleeping === true ? true : undefined,
+    createdBy: createdByFromIndexEntry(record.createdBy),
+    forkTemplate: forkTemplateFromIndexEntry(record.forkTemplate),
     // BOTH index legs: the projection leg is `toSessionIndexEntry`'s `worktreeFromMetadata`.
     worktree: worktreeFromIndexEntry(record.worktree),
     canSetModelLive:
@@ -723,6 +780,14 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     lastTurnProviderAt: acpx?.last_turn_provider?.at,
     // BOTH index legs: the parse leg is `parseIndexEntry`'s `startedBy`.
     startedBy: startedByFrom(metadata),
+    // BOTH index legs (UMQ K7): the parse leg is `parseIndexEntry`'s `sleeping` / `createdBy`.
+    sleeping: acpx?.sleeping ? true : undefined,
+    createdBy: createdByOf(
+      metadata?.created_by_kind,
+      metadata?.created_by_label,
+      metadata?.created_by_ref,
+    ),
+    forkTemplate: forkTemplateOf(metadata?.fork_template_id, metadata?.fork_template_name),
     // BOTH index legs: the parse leg is `parseIndexEntry`'s `worktreeFromIndexEntry`.
     worktree: worktreeFromMetadata(metadata),
     outputStyleDesired: sessionOptions?.output_style,

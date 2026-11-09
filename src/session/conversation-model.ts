@@ -705,6 +705,13 @@ export function cloneSessionAcpxState(
   }
 
   return {
+    // UMQ K7 — a sleeping record must stay sleeping through every turn-path re-base.
+    sleeping: state.sleeping
+      ? {
+          since: state.sleeping.since,
+          ...(state.sleeping.fork ? { fork: { from: state.sleeping.fork.from } } : {}),
+        }
+      : undefined,
     current_mode_id: state.current_mode_id,
     desired_mode_id: state.desired_mode_id,
     desired_config_options: state.desired_config_options

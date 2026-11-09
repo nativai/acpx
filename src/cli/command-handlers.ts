@@ -18,7 +18,11 @@ import {
 import { locatePiSessionTranscript } from "../acp/harness-config-dir.js";
 import { projectAdvertisedComposedModels } from "../acp/model-support.js";
 import { resolveAgentNameFromCommand } from "../agent-registry.js";
-import { type AdmissionTicket, admitCreate } from "../capacity/admission.js";
+import {
+  type AdmissionTicket,
+  admitCreate,
+  declaredAdmissionClass,
+} from "../capacity/admission.js";
 import {
   findProfile,
   isSubscriptionProfileLocked,
@@ -1161,6 +1165,7 @@ function buildSessionStartOptions(params: {
     cwd: params.agent.cwd,
     seatName: params.flags.name,
     resumeSessionId: params.flags.resumeSession,
+    ...(params.flags.sleeping === true ? { sleeping: true } : {}),
     parentSessionId: params.parent?.acpxRecordId,
     parentSessionUrl: params.parent?.sessionUrl,
     parentSeatId: params.parent?.seatId,
@@ -1432,9 +1437,15 @@ function copyDesiredConfigOptionsWithOverride(
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
+export const NOTHING_TO_COPY_YET_MESSAGE = "nothing to copy yet — it has never run";
+
 function assertCopyableSource(source: SessionRecord): void {
   if (source.kind === "subagent") {
     throw new Error("Cannot copy a subagent session");
+  }
+  // UMQ K7 (CONCEPTION §6.3): a sleeping session has no conversation and no ACP session to fork.
+  if (source.acpx?.sleeping || source.acpSessionId === "") {
+    throw new Error(`Cannot copy session ${source.acpxRecordId}: ${NOTHING_TO_COPY_YET_MESSAGE}`);
   }
 }
 
@@ -3399,12 +3410,42 @@ function noteTemplateAutoPromptReplaced(fromTemplate: string, globalFlags: Globa
   );
 }
 
+// UMQ K7 (CONCEPTION §6.1) — hidden `sessions new|copy --sleeping`. It allocates nothing (no adapter,
+// no `session/new`, no fork, no model apply), so neither verb is gated; that is exactly why it is
+// accepted only from atrium's automated starts, not as a queued fan-out for agents (decision 8).
+const SLEEPING_NEEDS_AUTOMATION_MESSAGE =
+  "--sleeping is for atrium's automated starts (ACPX_ADMISSION_CLASS=automation)";
+
+/** Exit 2, nothing created: the class check, then every flag that would start or feed an agent. */
+function refuseSleepingMisuse(refused: Readonly<Record<string, boolean>>): void {
+  if (declaredAdmissionClass() !== "automation") {
+    throw new InvalidArgumentError(SLEEPING_NEEDS_AUTOMATION_MESSAGE);
+  }
+  for (const [flag, given] of Object.entries(refused)) {
+    if (given) {
+      throw new InvalidArgumentError(
+        `--sleeping cannot be combined with ${flag}: a sleeping session's opening prompt is atrium's message`,
+      );
+    }
+  }
+}
+
 export async function handleSessionsNew(
   explicitAgentName: string | undefined,
   flags: SessionsNewFlags,
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
+  if (flags.sleeping === true) {
+    refuseSleepingMisuse({
+      "--prompt": flags.promptTextGiven === true,
+      "--prompt-file": flags.promptFile !== undefined,
+      "--from": flags.from !== undefined,
+      "--seat": flags.seat !== undefined,
+      "--from-template": flags.fromTemplate !== undefined,
+      "--resume-session": flags.resumeSession !== undefined,
+    });
+  }
   refuseFromWithTemplate(flags);
   refuseNewSessionFlagCombinations(flags);
   // Brick b40a9a5d decision 1 — the first turn is read and validated HERE, before anything
@@ -3520,12 +3561,16 @@ async function createSessionFromNewFlags(
   // never read as "no capacity" — and BEFORE anything exists, so a refusal (exit 75) leaves no
   // record, no seat and no transient adapter. A live `--from` predecessor is a succession and is
   // never gated; that is also the `sessions handover` successor, which comes through here.
-  const admission = await admitCreate({
-    verb: flags.from === undefined ? "sessions new" : "sessions new --from",
-    agentCommand: effectiveAgent.agentCommand,
-    recordId: flags.recordId,
-    successorOf: from?.acpxRecordId,
-  });
+  // A SLEEPING create allocates nothing, so it takes no ticket (UMQ K7, G6).
+  const admission =
+    flags.sleeping === true
+      ? undefined
+      : await admitCreate({
+          verb: flags.from === undefined ? "sessions new" : "sessions new --from",
+          agentCommand: effectiveAgent.agentCommand,
+          recordId: flags.recordId,
+          successorOf: from?.acpxRecordId,
+        });
   // brick://7a2d5c60 — a cold or stale cache makes the validation above stand
   // aside, which is why it was a production no-op on a box nobody had run
   // `acpx models` on. This kicks a refresh off and RETURNS IMMEDIATELY (detached
@@ -3533,7 +3578,9 @@ async function createSessionFromNewFlags(
   // one validates. It must stay after validation and before the spawn: awaiting
   // it, here or anywhere, would trade a silent no-op for a latency regression on
   // every first create (C4 §7.1).
-  warmCatalogueInBackground();
+  if (flags.sleeping !== true) {
+    warmCatalogueInBackground();
+  }
   const { createSession } = await loadSessionModule();
 
   const created = await createAdmitted(admission, () =>
@@ -3589,6 +3636,10 @@ export async function handleSessionsCopy(
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
+  if (flags.sleeping === true) {
+    await handleSleepingSessionsCopy(explicitAgentName, flags, command, config);
+    return;
+  }
   const handoffPrompt = (await resolveHandoffPrompt(flags))?.prompt;
   const { created, source, requestedCwd } = await runSessionCopy(
     explicitAgentName,
@@ -3630,6 +3681,43 @@ export async function handleSessionsCopy(
   const handoffText = handoffPrompt ? promptToDisplayText(handoffPrompt) : "";
   const deliverText = forkNotice + (handoffText ? handoffText : "");
   await deliverHandoffPrompt(created, textPrompt(deliverText), "fork-notice", command, config);
+}
+
+/**
+ * `sessions copy --from <template> --sleeping` (UMQ K7, CONCEPTION §6.1): the record only. The fork
+ * happens at the first wake, so a template re-baked in between gives the newer content (Q9). The
+ * fork notice a plain copy delivers as turn 1 is composed NOW and returned in the JSON for atrium
+ * to queue as the session's first message.
+ */
+async function handleSleepingSessionsCopy(
+  explicitAgentName: string | undefined,
+  flags: SessionsCopyFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  refuseSleepingMisuse({
+    "--prompt": flags.prompt !== undefined,
+    "--prompt-file": flags.promptFile !== undefined,
+    "--ephemeral": flags.ephemeral === true,
+    "--at-index": flags.atIndex !== undefined,
+    "--at-log-index": flags.atLogIndex !== undefined,
+  });
+  const { created, source, requestedCwd } = await runSessionCopy(
+    explicitAgentName,
+    flags,
+    command,
+    config,
+    false,
+  );
+  const { printCopiedSessionByFormat } = await loadOutputRenderModule();
+  printCopiedSessionByFormat(
+    created,
+    source,
+    resolveGlobalFlags(command, config).format,
+    undefined,
+    requestedCwd,
+    composeForkDivergenceNotice(created, source.acpxRecordId, source.seatId),
+  );
 }
 
 /** A validated first turn, and where it was read from (`--prompt-file`'s resolved path,
@@ -3772,7 +3860,11 @@ async function runSessionCopy(
   if (requireTemplate) {
     assertTemplateSource(source);
   }
-  const { forkAtMessageIndex, forkAtLogIndex } = await resolveCopyCut(source, flags);
+  // A sleeping copy forks at its first wake, always the whole template: no cut to resolve now.
+  const { forkAtMessageIndex, forkAtLogIndex } =
+    flags.sleeping === true
+      ? { forkAtMessageIndex: 0, forkAtLogIndex: undefined }
+      : await resolveCopyCut(source, flags);
   assertCopyAgentLock({ explicitAgentName, globalFlags, pathAgent, source, config });
   const destination = resolveCopyDestinationCwd(command, globalFlags, source);
   refuseUncopyablePiSource(source, destination.cwd);
@@ -3788,11 +3880,14 @@ async function runSessionCopy(
   );
   // The create gate (§6.1 A2) — copy, fork, by-the-way and `--from-template` all come through
   // here; see `createSessionFromNewFlags` for why it sits after validation and before the create.
-  const admission = await admitCreate({
-    verb: requireTemplate ? "sessions new --from-template" : "sessions copy",
-    agentCommand: source.agentCommand,
-    recordId: flags.recordId,
-  });
+  const admission =
+    flags.sleeping === true
+      ? undefined
+      : await admitCreate({
+          verb: requireTemplate ? "sessions new --from-template" : "sessions copy",
+          agentCommand: source.agentCommand,
+          recordId: flags.recordId,
+        });
 
   const [{ createSession }, { printCreatedSessionBanner }] = await Promise.all([
     loadSessionModule(),
@@ -3831,6 +3926,7 @@ async function runSessionCopy(
       forkAtMessageIndex: flags.atIndex,
       forkAtLogIndex: flags.atLogIndex,
       forkExpectEntry: flags.expectEntry,
+      ...(flags.sleeping === true ? { sleeping: true } : {}),
       seatFavorite: flags.favorite,
       mcpServers: config.mcpServers,
       permissionMode,
