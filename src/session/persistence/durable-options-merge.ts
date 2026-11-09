@@ -77,15 +77,31 @@ export function mergeRecordDurableOptionsForPersist(
   }
 
   const acpx = (record.acpx ??= {});
+  adoptDesiredModeId(acpx, baseline, persistedAcpx);
+  adoptDesiredConfigOptions(acpx, baseline, persistedAcpx);
+  adoptSessionOptions(acpx, baseline, persistedAcpx);
+}
 
+function adoptDesiredModeId(
+  acpx: SessionAcpxState,
+  baseline: DurableOptionsBaseline,
+  persistedAcpx: SessionAcpxState,
+): void {
+  const onDisk = persistedAcpx.desired_mode_id;
   if (
-    persistedAcpx.desired_mode_id !== undefined &&
-    persistedAcpx.desired_mode_id !== baseline.modeId &&
+    onDisk !== undefined &&
+    onDisk !== baseline.modeId &&
     acpx.desired_mode_id === baseline.modeId
   ) {
-    acpx.desired_mode_id = persistedAcpx.desired_mode_id;
+    acpx.desired_mode_id = onDisk;
   }
+}
 
+function adoptDesiredConfigOptions(
+  acpx: SessionAcpxState,
+  baseline: DurableOptionsBaseline,
+  persistedAcpx: SessionAcpxState,
+): void {
   for (const [key, onDisk] of Object.entries(persistedAcpx.desired_config_options ?? {})) {
     if (
       onDisk !== baseline.configOptions[key] &&
@@ -94,7 +110,13 @@ export function mergeRecordDurableOptionsForPersist(
       acpx.desired_config_options = { ...acpx.desired_config_options, [key]: onDisk };
     }
   }
+}
 
+function adoptSessionOptions(
+  acpx: SessionAcpxState,
+  baseline: DurableOptionsBaseline,
+  persistedAcpx: SessionAcpxState,
+): void {
   for (const field of FIELDS) {
     const onDisk = persistedAcpx.session_options?.[field];
     if (
@@ -102,8 +124,6 @@ export function mergeRecordDurableOptionsForPersist(
       onDisk !== baseline.sessionOptions[field] &&
       acpx.session_options?.[field] === baseline.sessionOptions[field]
     ) {
-      // The heterogeneous field union defeats a typed assignment; `field` is a known key and
-      // the value came from the same slot on disk (an unknown-valued view, not `any`).
       acpx.session_options = { ...acpx.session_options, [field]: onDisk };
     }
   }
