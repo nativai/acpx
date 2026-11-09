@@ -790,6 +790,34 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     // CONTRACTS A-5 (settled by U2): `template_source` IS the template record id on a copy, so atrium
     // writes only `fork_template_name`; the clause shows when the name is set.
     forkTemplate: forkTemplateOf(metadata?.template_source, metadata?.fork_template_name),
+    // BOTH index legs: the parse leg is `parseIndexEntry`'s `worktreeFromIndexEntry`.
+    worktree: worktreeFromMetadata(metadata),
+    outputStyleDesired: sessionOptions?.output_style,
+    canSetModelLive: canSetModelLiveFromRecord(record),
+    resolvedModelLabel: resolvedModelLabelForRecord(record),
+    // `servedModelOf` omits `<synthetic>`: records stamped by an acpx that predates
+    // the producer fix still carry it, and the header would print "served <synthetic>".
+    servedModel: servedModelOf(record),
+    outputStyleSupported: outputStyleSupportedFromRecord(acpx),
+    outputStyleApplied: acpx?.applied_output_style,
+    outputStyleRefused: acpx?.refused_output_style,
+    autoFailover: sessionOptions?.auto_failover,
+    autoSubscription: sessionOptions?.auto_subscription,
+    fableDegradeOk: sessionOptions?.fable_degrade_ok,
+    modelSource: sessionOptions?.model_source,
+    degradedFrom:
+      sessionOptions?.model_source === "explicit-degrade"
+        ? sessionOptions?.fable_degrade?.from
+        : undefined,
+    subscription: sessionOptions?.subscription,
+    profile: sessionOptions?.profile,
+    subscriptionSwitch: sessionOptions?.subscription_switch,
+    accountSwitch: sessionOptions?.account_switch,
+    templateEnabled: record.template?.enabled,
+    templateCreatedAt: record.template?.created_at,
+    templateAutoPrompt: record.template?.auto_prompt,
+    templateSlug: record.template?.slug,
+    templateVersion: record.template?.version,
     ...seatFieldsToIndexEntry(record),
   };
 }
