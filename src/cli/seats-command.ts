@@ -1615,6 +1615,17 @@ function describeHolderOpenState(open: boolean | undefined): string {
   return open ? "open" : "closed";
 }
 
+/** The active holder, and (UMQ K7) that it is sleeping when no agent has run in it yet. */
+function activeHolderLine(
+  holderState: ActiveHolderState,
+  holders: readonly SeatHolderSummary[],
+): string {
+  const sleeping =
+    holderState.kind === "active" &&
+    holders.some((holder) => holder.id === holderState.holderId && holder.sleeping);
+  return `${renderActiveHolderText(holderState)}${sleeping ? ` (${SLEEPING_TEXT})` : ""}`;
+}
+
 function renderSeatShowText(
   row: SeatRecord,
   holderState: ActiveHolderState,
@@ -1627,12 +1638,7 @@ function renderSeatShowText(
   process.stdout.write(`  next_ordinal:  ${row.nextOrdinal}\n`);
   process.stdout.write(`  brick_id:      ${renderSeatBrickLinkText(row.brickId)}\n`);
   process.stdout.write(`  favorite:      ${row.favorite === true ? "yes" : "no"}\n`);
-  const activeIsSleeping =
-    holderState.kind === "active" &&
-    holders.some((holder) => holder.id === holderState.holderId && holder.sleeping);
-  process.stdout.write(
-    `  active holder: ${renderActiveHolderText(holderState)}${activeIsSleeping ? ` (${SLEEPING_TEXT})` : ""}\n`,
-  );
+  process.stdout.write(`  active holder: ${activeHolderLine(holderState, holders)}\n`);
   process.stdout.write(`  holders (${holders.length}):\n`);
   for (const holder of holders) {
     process.stdout.write(

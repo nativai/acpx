@@ -2,7 +2,10 @@ import type { AcpClient, SessionCreateResult, SessionForkResult } from "../../ac
 import { withTimeout } from "../../async-control.js";
 import { readFullSourceHistory } from "../../cli/session/fork-at-log-index.js";
 import { AcpxOperationalError } from "../../errors.js";
-import { resolveSessionRecord, writeSessionRecordAtBoundary } from "../../session/persistence.js";
+import {
+  resolveSessionRecord,
+  writeSessionRecordAtBoundaryNow,
+} from "../../session/persistence.js";
 import type { SessionMessage, SessionRecord } from "../../types.js";
 
 /**
@@ -85,7 +88,7 @@ async function loadTemplateOrExplain(
   } catch (error) {
     throw new AcpxOperationalError(
       `${SLEEPING_TEMPLATE_GONE}: ${templateId} (session ${record.acpxRecordId}) — ` +
-        `${error instanceof Error ? error.message : String(error)}`,
+        (error instanceof Error ? error.message : String(error)),
       { outputCode: "NO_SESSION", origin: "runtime" },
     );
   }
@@ -101,18 +104,18 @@ export async function finishSleepingMaterialisation(
   record: SessionRecord,
   inherited: SleepingForkInherited | undefined,
 ): Promise<void> {
-  if (record.acpx) {
-    delete record.acpx.sleeping;
+  if (!record.acpx?.sleeping) {
+    return; // an ordinary connect: nothing to end
   }
-  if (!inherited) {
-    return;
+  delete record.acpx.sleeping;
+  if (inherited) {
+    record.messages = structuredClone(inherited.messages);
+    record.forkedAtMessageIndex = inherited.forkAtMessageIndex;
+    record.forkedFromSessionId = inherited.template.acpxRecordId;
+    record.metadata = {
+      ...record.metadata,
+      template_last_used_at: inherited.template.lastUsedAt,
+    };
   }
-  record.messages = structuredClone(inherited.messages);
-  record.forkedAtMessageIndex = inherited.forkAtMessageIndex;
-  record.forkedFromSessionId = inherited.template.acpxRecordId;
-  record.metadata = {
-    ...record.metadata,
-    template_last_used_at: inherited.template.lastUsedAt,
-  };
-  await writeSessionRecordAtBoundary(record);
+  await writeSessionRecordAtBoundaryNow(record);
 }

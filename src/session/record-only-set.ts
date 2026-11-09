@@ -99,9 +99,15 @@ export function recordOnlyConfigOptionVerdict(
   configId: string,
   value: string,
 ): RecordOnlyVerdict {
-  if (record.acpx?.sleeping) {
-    return RECORD; // UMQ K7 — see recordOnlyModelVerdict
-  }
+  // UMQ K7 — a sleeping record has no adapter to ask (see recordOnlyModelVerdict).
+  return record.acpx?.sleeping ? RECORD : advertisedConfigOptionVerdict(record, configId, value);
+}
+
+function advertisedConfigOptionVerdict(
+  record: SessionRecord,
+  configId: string,
+  value: string,
+): RecordOnlyVerdict {
   if (configId === "mode") {
     return { kind: "live", reason: "mode" };
   }

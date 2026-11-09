@@ -81,7 +81,7 @@ import {
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import { explainSeatRowMissing } from "../../session/seat-backfill.js";
 import { withBrickCache } from "../../session/seat-brick.js";
-import type { SessionRecord } from "../../types.js";
+import type { SessionRecord, SessionSleepingState } from "../../types.js";
 import { resolveSessionBrickContext } from "./brick-link.js";
 import { DEFAULT_QUEUE_OWNER_TTL_MS } from "./contracts.js";
 import type {
@@ -976,12 +976,33 @@ export async function createSleepingSession(
   };
   const options = await reconcileSeatAndBrickForCreate(bound);
   assertRecordIdFree(options.recordId);
-  const effectiveSessionOptions = options.forkFromSessionId
+  const sessionOptions = options.forkFromSessionId
     ? options.sessionOptions
     : withDefaultModelForNewSession(options.agentCommand, options.sessionOptions);
-  const recordId = options.recordId ?? crypto.randomUUID();
   const now = isoNow();
   const seatFields = seatFieldsForCreate(options.seatId);
+  const record = sleepingRecordOf(options, seatFields, now);
+  persistSleepingPins(record, options, sessionOptions);
+  const guardForced = spawnGuardForcedInfo(sessionOptions);
+  if (guardForced) {
+    stampModelGuardBreadcrumb(record, { ...guardForced, source: "inherited", at: now });
+  }
+  await writeSessionRecord(record);
+  await mintSeatRowForNewRecord(record, options, seatFields, now);
+  if (guardForced) {
+    await mirrorModelGuardToMessages(record, guardForced).catch(() => {});
+  }
+  return record;
+}
+
+/** The record of a session that has not run: `acpSessionId: ""`, `acpx.sleeping`, links as a live create. */
+function sleepingRecordOf(
+  options: SessionCreateOptions,
+  seatFields: Pick<SessionRecord, "seatId" | "holderOrdinal" | "holderActive">,
+  now: string,
+): SessionRecord {
+  const recordId = options.recordId ?? crypto.randomUUID();
+  const desired = cloneDesiredConfigOptions(options.desiredConfigOptions);
   const record: SessionRecord = {
     schema: "acpx.session.v1",
     acpxRecordId: recordId,
@@ -999,13 +1020,8 @@ export async function createSleepingSession(
     closedAt: undefined,
     ...createSessionConversation(now),
     acpx: {
-      ...(cloneDesiredConfigOptions(options.desiredConfigOptions)
-        ? { desired_config_options: cloneDesiredConfigOptions(options.desiredConfigOptions) }
-        : {}),
-      sleeping: {
-        since: now,
-        ...(options.forkFromSessionId ? { fork: { from: options.forkFromSessionId } } : {}),
-      },
+      ...(desired ? { desired_config_options: desired } : {}),
+      sleeping: sleepingMark(now, options.forkFromSessionId),
     },
     ...seatFields,
     ...(options.forkFromSessionId
@@ -1019,24 +1035,28 @@ export async function createSleepingSession(
   if (record.metadata?.spawn_key) {
     record.metadata.spawn_state = "pending";
   }
-  persistSessionOptions(record, effectiveSessionOptions);
-  persistSessionOwnerOptions(record, options);
-  if (effectiveSessionOptions?.reasoningEffort) {
-    setDesiredConfigOption(record, "effort", effectiveSessionOptions.reasoningEffort);
-  }
-  if (effectiveSessionOptions?.outputStyle) {
-    setDesiredConfigOption(record, "outputStyle", effectiveSessionOptions.outputStyle);
-  }
-  const guardForced = spawnGuardForcedInfo(effectiveSessionOptions);
-  if (guardForced) {
-    stampModelGuardBreadcrumb(record, { ...guardForced, source: "inherited", at: now });
-  }
-  await writeSessionRecord(record);
-  await mintSeatRowForNewRecord(record, options, seatFields, now);
-  if (guardForced) {
-    await mirrorModelGuardToMessages(record, guardForced).catch(() => {});
-  }
   return record;
+}
+
+/** `acpx.sleeping` — and, for a copy, the template its first wake forks. */
+function sleepingMark(since: string, templateId: string | undefined): SessionSleepingState {
+  return { since, ...(templateId ? { fork: { from: templateId } } : {}) };
+}
+
+/** The pins a first wake will replay: durable `session_options`, owner options, desired effort / style. */
+function persistSleepingPins(
+  record: SessionRecord,
+  options: SessionCreateOptions,
+  sessionOptions: SessionCreateOptions["sessionOptions"],
+): void {
+  persistSessionOptions(record, sessionOptions);
+  persistSessionOwnerOptions(record, options);
+  if (sessionOptions?.reasoningEffort) {
+    setDesiredConfigOption(record, "effort", sessionOptions.reasoningEffort);
+  }
+  if (sessionOptions?.outputStyle) {
+    setDesiredConfigOption(record, "outputStyle", sessionOptions.outputStyle);
+  }
 }
 
 function cloneDesiredConfigOptions(

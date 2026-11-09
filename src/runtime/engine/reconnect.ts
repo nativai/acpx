@@ -594,9 +594,7 @@ async function connectAndLoadSessionInner(
     desiredModelId,
   );
 
-  if (record.acpx?.sleeping) {
-    await finishSleepingMaterialisation(record, loadState.sleepingFork);
-  }
+  await finishSleepingMaterialisation(record, loadState.sleepingFork);
 
   options.onSessionIdResolved?.(sessionId);
 

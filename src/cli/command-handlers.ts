@@ -5709,7 +5709,7 @@ function printActivationText(
  * The notice reached atrium's queue. Held (UMQ §7.3): atrium stored it and delivers it when the
  * successor can be woken — the activator has nothing more to do.
  */
-function noticeDeliveredText(
+export function noticeDeliveredText(
   successorId: string,
   outcome: { deliveryId?: string; held?: true },
 ): string {
@@ -5719,7 +5719,7 @@ function noticeDeliveredText(
     : `notice delivered to ${successorId}${delivery}`;
 }
 
-function noticeNotDeliveredText(outcome: { reason: string }): string {
+export function noticeNotDeliveredText(outcome: { reason: string }): string {
   return `notice NOT delivered — paste it to the successor (${outcome.reason})\n`;
 }
 
@@ -6147,4 +6147,5 @@ export async function handleSessionsRepairAccountSeam(
     process.stdout.write(`${result.repaired.length}\n`);
     return;
   }
-  process.stdout.write(`${formatAccountSeamRepairResult(result)}\n`
+  process.stdout.write(`${formatAccountSeamRepairResult(result)}\n`);
+}
