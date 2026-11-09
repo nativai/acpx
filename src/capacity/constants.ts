@@ -73,6 +73,13 @@ export type GovernorConstants = {
    */
   readonly pidWatchIntervalMs: number;
   readonly pidWatchTrigger: number;
+  /**
+   * `/proc/<pid>/stat` reader threads (brick 07f4fde2): a read of a storm process mid-exec blocks in the
+   * kernel for 50–466 ms, so the scan reads with this many threads and a blocked one stalls only itself.
+   * Fixed, created at start-up. A reader silent `scanReaderStuckMs` inside a scan is left out of it.
+   */
+  readonly scanReaders: number;
+  readonly scanReaderStuckMs: number;
   /** R2's victim must free at least `max(victimFloorBytes, victimFloorFraction × L)`. */
   readonly victimFloorBytes: number;
   readonly victimFloorFraction: number;
@@ -117,6 +124,8 @@ export const CAPACITY_CONSTANTS: CapacityConstants = {
     fastHoldMs: 5000,
     pidWatchIntervalMs: 10,
     pidWatchTrigger: 16,
+    scanReaders: 4,
+    scanReaderStuckMs: 250,
     victimFloorBytes: 256 * MIB,
     victimFloorFraction: 0.025,
     emergencyKillSpacingMs: 2000,

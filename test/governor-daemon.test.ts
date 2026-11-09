@@ -59,11 +59,13 @@ test("R1 kill: in-band line on the leader's fd 2 only, seat message, events.ndjs
   const governor = startedGovernor(box);
   governor.tick();
   await governor.settle();
-  // (b) the in-band line, on the LEADER's stderr only
+  // (b) the in-band line, on the LEADER's stderr only. Since §19 D7 a first sight is crossed mid-scan, so the
+  // line and the seat message report the members COUNTED at the decision (128, +1 when the leader was read
+  // fresh); the event below records what the sweep killed (200).
   const line = box.stderrOf(2000);
   assert.match(
     line,
-    /^process-governor: KILLED this command \(rule=fork-storm processes=200 limit=128; bash×200\)/u,
+    /^process-governor: KILLED this command \(rule=fork-storm processes=12[89] limit=128; bash×12[89]\)/u,
   );
   assert.match(line, /workbench-exec/u);
   assert.equal(box.stderrOf(2001), "", "never another member's fd 2");
@@ -74,8 +76,8 @@ test("R1 kill: in-band line on the leader's fd 2 only, seat message, events.ndjs
   assert.equal(call.headers["X-Source-Session"], "process-governor");
   const body = JSON.parse(call.body) as { text: string; from: string };
   assert.equal(body.from, "process-governor");
-  assert.match(body.text, /rule=fork-storm processes=200/u);
-  assert.match(body.text, /bash×200/u);
+  assert.match(body.text, /rule=fork-storm processes=12[89]\b/u);
+  assert.match(body.text, /bash×12[89]\b/u);
   assert.match(body.text, /your session, its other commands and its context are intact/u);
   // (d) the event, locally and as a ClickHouse row
   const killed = box.events().filter((e) => e.action === "killed");
@@ -84,7 +86,12 @@ test("R1 kill: in-band line on the leader's fd 2 only, seat message, events.ndjs
   assert.equal(killed[0].session_kind, "tool");
   assert.equal(killed[0].session_id, "sess-storm-0001");
   assert.equal(killed[0].seat_id, "seat-storm-1");
-  assert.equal(killed[0].processes, 200, "max(decision count, members signalled)");
+  // max(decision count, members signalled) is a LOWER bound (TE G-F1''): the crossing signals the pgids it has
+  // seen, and the group kill takes their unscanned members without the sweep counting them.
+  assert.ok(
+    Number(killed[0].processes) >= 128 && Number(killed[0].processes) <= 200,
+    `processes ${String(killed[0].processes)}`,
+  );
   assert.equal(killed[0].survivors, 0);
   assert.equal(
     killed[0].anon_bytes,
