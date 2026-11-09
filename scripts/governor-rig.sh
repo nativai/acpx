@@ -21,7 +21,7 @@
 #   orphan  --config … <sid>                    AC2: cut every parent link of a storm (TaskStop's remainder)
 #   spawn-system --config … [N]                 AC5(iii): N children INSIDE the governor's own (system) session
 #   scan    --config … [--format json]          `acpx governor scan` of the rig (find a storm's sid)
-#   status  --config …                          heartbeat, last events, atrium
+#   status  --config …                          heartbeat, last events, atrium, job control in tool shells
 #   down    --config …                          governor, sampler, then the stack (ensure-down.sh)
 #
 # Exit: 0 ok · 2 usage/config · 64 wrong pod · else the failing step's rc.
@@ -154,7 +154,19 @@ run_detached() { # run_detached <size> <cmd…>
 cmd_build() { on_control; load; cd "$STACK_ROOT"
   run_detached 6g bash "$FS_DIR/build-all.sh" --config "$STACK_CONFIG" install; }
 
+# Job control in the rig's tool shells (TE I10): Claude Code snapshots the user's shell options from an
+# interactive bash that reads ~/.bashrc; with NO ~/.bashrc in the rig HOME the snapshot lacks
+# `set -o monitor`, so every tool shell ran `hBc` while production runs `hmtBc` — the rig was unfaithful
+# for exactly the setsid / derived / outside shapes. The stock Debian skeleton is production's own
+# ~/.bashrc (byte-identical on devbox, 2026-11-08) and carries no secret.
+ensure_bashrc() {
+  [ -f "$SLOT_HOME/.bashrc" ] && return 0
+  install -m 644 /etc/skel/.bashrc "$SLOT_HOME/.bashrc"
+  echo "$(ts) installed $SLOT_HOME/.bashrc from /etc/skel (job control in the agents' tool shells)"
+}
+
 cmd_seed() { on_control; load; cd "$STACK_ROOT"
+  ensure_bashrc
   if [ ! -s "$SEC/bricks/realm-token" ]; then workbench-exec -- node "$FS_DIR/bricks-seed.mjs" --config "$STACK_CONFIG"; fi
   bash "$FS_DIR/gen-os-runtime.sh" --config "$STACK_CONFIG"
   echo on > "$RUN/os-seams.on"; }
@@ -167,6 +179,7 @@ limit_arg() { # limit_arg auto|N|"" -> the --limit-bytes value (auto = the workb
   esac; }
 
 cmd_up() { on_control; load; cd "$STACK_ROOT"
+  ensure_bashrc
   local limit=${1:-}
   local Q=$SEC/codex-quota.json
   curl -fsS "$STACK_BOX_ATRIUM_URL/api/usage/codex/quota" -o "$Q.new" 2>/dev/null && chmod 600 "$Q.new" && mv "$Q.new" "$Q" || true
@@ -265,7 +278,14 @@ cmd_scan() { on_control; load
 cmd_status() { on_control; load
   echo "== governor heartbeat"; cat "$GOV_HOME/heartbeat.json" 2>/dev/null || echo "(none)"
   echo "== last events"; tail -n 8 "$GOV_HOME/events.ndjson" 2>/dev/null | cut -c1-400 || true
-  echo "== atrium"; workbench-exec -- curl -s -o /dev/null -w '%{http_code}\n' "$MAIN_URL/api/config" || true; }
+  echo "== atrium"; workbench-exec -- curl -s -o /dev/null -w '%{http_code}\n' "$MAIN_URL/api/config" || true
+  echo "== agent tool shells (Claude's newest shell snapshot of $STACK_SUBSCRIPTION)"
+  # Read inside the workbench: the control pod's NFS view of a file the workbench just wrote can lag.
+  workbench-exec -- bash -c 'f=$(ls -t "$1"/snapshot-bash-*.sh 2>/dev/null | head -1)
+    if [ -z "$f" ]; then echo "no snapshot yet — start an agent (agent new …) and re-run status"
+    elif grep -qx "set -o monitor" "$f"; then echo "job control ON (set -o monitor; tool shells run like production hmtBc) — $(basename "$f")"
+    else echo "WARNING: job control OFF in the agents tool shells (no set -o monitor in $(basename "$f")): setsid/derived/outside shapes are NOT production-faithful. Is $2/.bashrc present? Start a NEW agent session after fixing."; fi' \
+    x "$SEC/$STACK_SUBSCRIPTION/shell-snapshots" "$SLOT_HOME"; }
 
 cmd_down() { on_control; load; cd "$STACK_ROOT"
   workbench-exec -- bash "$SELF" _wb-governor-stop --config "$STACK_CONFIG" || true
