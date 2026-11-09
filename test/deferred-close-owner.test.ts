@@ -164,7 +164,7 @@ test("owner: --after-turn on an IDLE owner records nothing (the caller closes no
 test("owner: a self request on an IDLE owner wakes the parked runtime at once, empty-handed", async () => {
   await withOwner("dc-wake", { activeTurn: false }, async (owner) => {
     const startedAt = Date.now();
-    const parked = owner.nextTask(30_000);
+    const parked = owner.nextBatch(30_000).then((batch) => batch?.[0]);
     await new Promise((resolve) => setTimeout(resolve, 20));
     owner.scheduleClose({ killBackgroundTasks: false, onlyIfActiveTurn: false });
     assert.equal(await parked, undefined);
@@ -177,19 +177,23 @@ test("G3: while a deferred close waits, a queued prompt is never handed out — 
     owner.scheduleClose({ killBackgroundTasks: false, onlyIfActiveTurn: false });
     assert.equal((await submit(socketPath, "late")).type, "accepted", "accepted into custody");
     assert.equal(owner.queueDepth(), 1);
-    assert.equal(await owner.nextTask(0), undefined, "nothing starts while the close waits");
+    assert.equal(
+      await owner.nextBatch(0).then((batch) => batch?.[0]),
+      undefined,
+      "nothing starts while the close waits",
+    );
     assert.equal(owner.queueDepth(), 1, "and nothing was taken off the queue");
     // NEGATIVE control: the same queue hands the task out once the request is gone (fail open).
     owner.takeDeferredClose();
-    assert.equal((await owner.nextTask(0))?.messageId, "msg-late");
+    assert.equal((await owner.nextBatch(0).then((batch) => batch?.[0]))?.messageId, "msg-late");
   });
 });
 
 test("G3: while a deferred close waits, an arriving task is NOT injected mid-turn — it queues", async () => {
   await withOwner("dc-noinject", { activeTurn: true }, async (owner, socketPath) => {
     const injected: QueueTask[] = [];
-    owner.setMidTurnHandler((task) => {
-      injected.push(task);
+    owner.setMidTurnHandler((tasks) => {
+      injected.push(...tasks);
       return true;
     });
     // NEGATIVE control first: with no close pending the task IS injected.

@@ -1133,17 +1133,19 @@ test("item 8 / path 3 · an UNWRITABLE store still leaves a usable shadow record
     try {
       await runQueuedTask(
         "parent-session",
-        {
-          requestId: "req-1",
-          message: "spawn a subagent",
-          prompt: textPrompt("spawn a subagent"),
-          permissionMode: "approve-all",
-          timeoutMs: 10_000,
-          waitForCompletion: true,
-          enqueuedAt: Date.now(),
-          send: () => {},
-          close: () => {},
-        },
+        [
+          {
+            requestId: "req-1",
+            message: "spawn a subagent",
+            prompt: textPrompt("spawn a subagent"),
+            permissionMode: "approve-all",
+            timeoutMs: 10_000,
+            waitForCompletion: true,
+            enqueuedAt: Date.now(),
+            send: () => {},
+            close: () => {},
+          },
+        ],
         {
           sharedClient: makeSubagentSpawningClient("parent-session-acp", "subagent-1"),
           suppressSdkConsoleErrors: true,
@@ -1271,7 +1273,7 @@ test("G2/path 3 · a teammate_spawned notification mints a shadow-record seat, r
     const savedRoot = process.env.ACPX_SESSION_ROOT;
     process.env.ACPX_SESSION_ROOT = path.join(homeDir, "session-root");
     try {
-      await runQueuedTask("parent-session", task, {
+      await runQueuedTask("parent-session", [task], {
         sharedClient: client,
         suppressSdkConsoleErrors: true,
       });
@@ -1395,17 +1397,19 @@ test("AP16 (REVERSED) · path 3 writes the RECORD before the ROW, observed in ca
     try {
       await runQueuedTask(
         "order-parent",
-        {
-          requestId: "req-order",
-          message: "spawn a subagent",
-          prompt: textPrompt("spawn a subagent"),
-          permissionMode: "approve-all",
-          timeoutMs: 10_000,
-          waitForCompletion: true,
-          enqueuedAt: Date.now(),
-          send: () => {},
-          close: () => {},
-        },
+        [
+          {
+            requestId: "req-order",
+            message: "spawn a subagent",
+            prompt: textPrompt("spawn a subagent"),
+            permissionMode: "approve-all",
+            timeoutMs: 10_000,
+            waitForCompletion: true,
+            enqueuedAt: Date.now(),
+            send: () => {},
+            close: () => {},
+          },
+        ],
         {
           sharedClient: makeSubagentSpawningClient("order-parent-acp", "subagent-1"),
           suppressSdkConsoleErrors: true,

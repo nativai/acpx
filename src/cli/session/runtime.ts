@@ -2,11 +2,16 @@ import os from "node:os";
 import path from "node:path";
 import type { PromptResponse } from "@agentclientprotocol/sdk";
 import type { EffectiveAccountMetadata } from "../../acp/auth-env.js";
+import type { AcpxBatchMeta, BatchSplitPart } from "../../acp/batch-meta.js";
 import { splitCommandLine } from "../../acp/client-process.js";
 import { AcpClient, type AcpPromptOptions } from "../../acp/client.js";
 import { isCodexAcpCommand } from "../../acp/codex-compat.js";
 import {
+  CONTEXT_OVERFLOW,
   formatErrorMessage,
+  isCodexContextOverflowReply,
+  isContextOverflowError,
+  isContextOverflowText,
   isRetryablePromptError,
   normalizeOutputError,
 } from "../../acp/error-normalization.js";
@@ -84,6 +89,7 @@ import {
   registerContextAlarmDetector,
 } from "../../session/context-alarm-detector.js";
 import {
+  agentTextAfterPrompt,
   cloneSessionAcpxState,
   cloneSessionConversation,
   hasUserMessageId,
@@ -205,6 +211,7 @@ import {
 import { type QueueOwnerActiveSessionController } from "../queue/owner-turn-controller.js";
 import { isSessionCloseDrainActive } from "../queue/session-close-intent.js";
 import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
+import { buildBatchPrompt } from "./batch-envelope.js";
 import { resolveSessionBrickContext } from "./brick-link.js";
 import type { RunOnceOptions, SessionSendOptions } from "./contracts.js";
 import { createSubagentBoundaryWriteEnqueuer } from "./subagent-boundary-write.js";
@@ -242,10 +249,18 @@ type RunSessionPromptOptions = Omit<
   onClientClosed?: () => void;
   onPromptActive?: () => Promise<void> | void;
   // Called with a handler once the ACP prompt is in-flight; the handler
-  // accepts a QueueTask and concurrently calls client.prompt() for it so the
-  // agent sees the new message mid-turn via the Pushable input. Pass undefined
-  // to clear the handler after the turn ends.
-  setMidTurnHandler?: (handler: ((task: QueueTask) => void) | undefined) => void;
+  // accepts ONE submission (a single task or a whole batch — UMQ §5.3: one injected prompt) and
+  // concurrently calls client.prompt() for it so the agent sees the new message mid-turn via the
+  // Pushable input. Pass undefined to clear the handler after the turn ends.
+  setMidTurnHandler?: (handler: ((injected: QueueTask[]) => void) | undefined) => void;
+  // UMQ §5.3 — the queue owner's batch: this turn's members, in delivery order (`prompt`,
+  // `messageId`, `requestId` above are its head's). Mutable: gather appends to it (§5.2).
+  batch?: QueueTask[];
+  // UMQ §22.1 — set on a part of a batch split for context size: its place in the original batch.
+  split?: BatchSplitPart;
+  // UMQ §5.2 — what reached the capture buffer while the adapter connected, taken ONCE, at the
+  // first prompt send of the turn, to join its ONE prompt.
+  takeGatheredTasks?: () => QueueTask[];
   // brick://b8e251eb: set on entering the region whose catch writes this
   // delivery's terminal itself. Still false on failure means NOTHING reached the
   // model and NO terminal was written — the queue owner then writes one.
@@ -270,7 +285,8 @@ type TurnStartProgress = { turnOwnsTerminal: boolean };
 // queue owner re-runs the message on a sibling subscription once the turn has drained
 // (`settleDeferredInjectedPrompts`); only that retry settles the delivery's terminal.
 type DeferredInjectedPrompt = {
-  task: QueueTask;
+  /** One submission: a single injected task, or a batch injected as one prompt (UMQ §5.3). */
+  tasks: QueueTask[];
   error: unknown;
   /** The session's subscription when the prompt failed. A different one at retry time means the session already moved. */
   failedOnSelection: string | undefined;
@@ -281,6 +297,20 @@ type DeferredInjectedPrompt = {
 // `failed` followed by the next sibling's `done` would let acpx-ui re-drive a limit-failed message
 // the retry already delivered. `written` reports whether a turn wrote the terminal after all.
 type HeldDeliveryTerminal = { written: boolean };
+
+/**
+ * UMQ §22.1 — a batch turn of N >= 2 members failed because the recipient's context could not hold
+ * it. No member got a terminal from that attempt: the queue owner splits the batch (older half
+ * first) and each member's one terminal comes from the turn that finally carries it.
+ */
+export class BatchContextOverflowError extends Error {
+  readonly members: number;
+  constructor(cause: unknown, members: number) {
+    super(formatErrorMessage(cause), { cause });
+    this.name = "BatchContextOverflowError";
+    this.members = members;
+  }
+}
 
 function selectedSubscriptionOf(record: SessionRecord): string | undefined {
   const sessionOptions = record.acpx?.session_options;
@@ -392,7 +422,8 @@ type AbsorbedInjectedDelivery = {
 // terminal for one still pending when the backstop fires.
 type TrackedInjectedDelivery = {
   promise: Promise<void>;
-  context: DeliveryContext | undefined;
+  /** One per member of the injected submission (UMQ §5.3: a batch is one injected prompt). */
+  contexts: DeliveryContext[];
   settled: boolean;
 };
 
@@ -401,6 +432,69 @@ type PromptStartResult = {
   deduplicated: boolean;
   record?: SessionRecord;
 };
+
+// UMQ §5.3 — one member of a turn's ONE prompt: a direct prompt is a batch of one. Each keeps its
+// own User row, `accepted`, open main delivery (`main-turn-delivery.ts`) and exactly one terminal.
+type TurnMember = {
+  task?: QueueTask;
+  prompt: PromptInput;
+  messageId?: string;
+  requestId?: string;
+  context: DeliveryContext | undefined;
+  open: OpenMainTurnDelivery | undefined;
+  /** Its User row's id (its messageId, or the one the row was given). */
+  userMessageId?: string;
+};
+
+function turnMemberFor(input: {
+  task?: QueueTask;
+  prompt: PromptInput;
+  messageId?: string;
+  requestId?: string;
+}): TurnMember {
+  const context = deliveryContextFor(input);
+  return {
+    ...input,
+    context,
+    // brick 570d2570 — the main delivery as the owner's exit paths see it: registered once `accepted` is
+    // written, unregistered in the `finally`, and claimed by whichever of `appendDeliveryTerminal` and the
+    // owner's close-cut sweep writes its terminal first (`main-turn-delivery.ts`).
+    open: context
+      ? {
+          context: { messageId: context.messageId, requestId: context.requestId },
+          terminalClaimed: false,
+        }
+      : undefined,
+  };
+}
+
+function turnMemberForTask(task: QueueTask): TurnMember {
+  return turnMemberFor({
+    task,
+    prompt: task.prompt ?? textPrompt(task.message),
+    messageId: task.messageId,
+    requestId: task.requestId,
+  });
+}
+
+// One read of the record and (only when needed) one of the event log for every member: the batch
+// sibling of `resolveRecordIfPromptAlreadyPersisted`, with the same Defect-B rule per id.
+async function resolveAlreadyDeliveredMessageIds(
+  sessionRecordId: string,
+  messageIds: readonly string[],
+): Promise<{ ids: Set<string>; record?: SessionRecord }> {
+  const latestRecord = await resolveSessionRecord(sessionRecordId);
+  const latestConversation = cloneSessionConversation(latestRecord);
+  const persisted = messageIds.filter((id) => hasUserMessageId(latestConversation, id));
+  if (persisted.length === 0) {
+    return { ids: new Set() };
+  }
+  const events = await listSessionEvents(latestRecord.acpxRecordId);
+  return {
+    ids: new Set(persisted.filter((id) => hasCompletedDeliveryFor(events, id))),
+    record: latestRecord,
+  };
+}
 
 function deliveryContextFor(params: {
   messageId?: string;
@@ -1393,12 +1487,18 @@ type QueuedTaskRuntimeOptions = Parameters<typeof runQueuedTask>[2] &
 
 function buildQueuedTaskRunOptions(
   sessionRecordId: string,
-  task: QueueTask,
+  members: QueueTask[],
   options: QueuedTaskRuntimeOptions,
   outputFormatter: OutputFormatter,
   turnStart: TurnStartProgress,
+  split?: BatchSplitPart,
 ): RunSessionPromptOptions {
+  // The head's turn options are every member's: `nextBatch` batches only equal ones (§5.2).
+  const task = members[0];
   return {
+    batch: members,
+    ...(split ? { split } : {}),
+    takeGatheredTasks: options.takeGatheredTasks,
     sessionRecordId,
     turnStart,
     previousTurnClient: options.sharedClient,
@@ -1705,7 +1805,7 @@ export async function endPreviousLiveTurn(
 // `test/seat-creation-paths.test.ts` (path 3, bricks 6b1e0038 / 7c339fda) on every gate it ran in.
 async function refuseTurnWhenSessionCwdMissing(
   record: SessionRecord,
-  task: QueueTask,
+  members: QueueTask[],
   onSessionCwdMissing: (() => void) | undefined,
 ): Promise<void> {
   try {
@@ -1716,9 +1816,16 @@ async function refuseTurnWhenSessionCwdMissing(
     });
   } catch (error) {
     await persistPreSubmitTerminalError(record, error);
-    if (task.messageId && !task.terminalWritten) {
-      task.terminalWritten = true;
-      appendDeliveryStreamEventSync(record.acpxRecordId, task, "failed", deliveryErrorFrom(error));
+    for (const task of members) {
+      if (task.messageId && !task.terminalWritten) {
+        task.terminalWritten = true;
+        appendDeliveryStreamEventSync(
+          record.acpxRecordId,
+          task,
+          "failed",
+          deliveryErrorFrom(error),
+        );
+      }
     }
     onSessionCwdMissing?.();
     throw error;
@@ -1727,7 +1834,7 @@ async function refuseTurnWhenSessionCwdMissing(
 
 export async function runQueuedTask(
   sessionRecordId: string,
-  task: QueueTask,
+  members: QueueTask[],
   options: {
     sharedClient?: AcpClient;
     verbose?: boolean;
@@ -1743,7 +1850,9 @@ export async function runQueuedTask(
     onClientClosed?: () => void;
     onPromptActive?: () => Promise<void> | void;
     onAcpMessage?: (direction: AcpMessageDirection, message: AcpJsonRpcMessage) => void;
-    setMidTurnHandler?: (handler: ((task: QueueTask) => void) | undefined) => void;
+    setMidTurnHandler?: (handler: ((injected: QueueTask[]) => void) | undefined) => void;
+    // UMQ §5.2 — the owner's capture buffer, taken once at the turn's first prompt send.
+    takeGatheredTasks?: () => QueueTask[];
     // Failover: signaled after a turn auto-switched the session to a new
     // profile/account. The owner uses it to recycle its stale shared client so
     // subsequent turns cold-spawn on the new transcript anchor.
@@ -1764,15 +1873,20 @@ export async function runQueuedTask(
     liveBackgroundTaskCount?: () => number;
   },
 ): Promise<void> {
-  const outputFormatter = task.waitForCompletion
-    ? new QueueTaskOutputFormatter(task)
+  // UMQ §5.3 — `members` is the turn's batch (>= 1, delivery order). A waiting caller's task is
+  // always a batch of one (`nextBatch`), so only the head can have a caller to answer.
+  const head = members[0];
+  const outputFormatter = head.waitForCompletion
+    ? new QueueTaskOutputFormatter(head)
     : DISCARD_OUTPUT_FORMATTER;
-  const turnStart: TurnStartProgress = { turnOwnsTerminal: false };
   // brick 901ecf75 — injected prompts a subscription limit rejected during this task's turns. They
   // are re-run once this task's own outcome is settled, before the owner takes its next task.
   const deferredInjected: DeferredInjectedPrompt[] = [];
   const runtimeOptions: QueuedTaskRuntimeOptions = {
     ...options,
+    // §5.2 — gather happens ONCE, at the first turn's first prompt send; a retry, a failover
+    // re-run or a split part folds nothing more in.
+    takeGatheredTasks: oneShot(options.takeGatheredTasks),
     onInjectedFailoverPending: (deferred) => {
       deferredInjected.push(...deferred);
     },
@@ -1780,55 +1894,177 @@ export async function runQueuedTask(
   const deferredState: DeferredInjectedFailoverState = { interrupted: false };
 
   try {
-    let result: SessionSendResult;
-    try {
-      const lockPolicy = await applyQueuedTaskSubscriptionLockPolicy(
-        sessionRecordId,
-        options,
-        task,
-      );
-      result = await runSessionPrompt({
-        ...buildQueuedTaskRunOptions(
-          sessionRecordId,
-          task,
-          turnRuntimeOptions(runtimeOptions, lockPolicy),
-          outputFormatter,
-          turnStart,
-        ),
-        ...clientForQueuedTurn(lockPolicy),
-      });
-    } catch (error) {
-      result = await runQueuedTaskFailover(
-        sessionRecordId,
-        task,
-        runtimeOptions,
-        outputFormatter,
-        error,
-        turnStart,
-      );
-    }
-    sendQueuedTaskResult(task, result);
+    const result = await runSplittingOnContextOverflow(
+      sessionRecordId,
+      members,
+      undefined,
+      async (part, split) =>
+        await runQueuedTurnPart(sessionRecordId, part, runtimeOptions, outputFormatter, split),
+    );
+    sendQueuedTaskResult(head, result);
   } catch (error) {
     if (isSubscriptionLockBlockError(error)) {
       options.onLockBlocked?.();
     }
-    terminalizeDeliveryRefusedByReservedCapacity(sessionRecordId, task, error);
-    terminalizeDeliveryRefusedByClosedRecord(sessionRecordId, task, error);
-    // After the two above, so a task they already terminalized is skipped here.
-    terminalizeTurnThatNeverStarted(sessionRecordId, task, error, turnStart);
-    sendQueuedTaskError(task, error);
+    sendQueuedTaskError(head, error);
     rememberDeferredFailoverOutcome(deferredState, error);
     if (error instanceof InterruptedError) {
       throw error;
     }
   } finally {
-    task.close();
+    for (const task of members) {
+      task.close();
+    }
     await settleDeferredInjectedPrompts(
       sessionRecordId,
       deferredInjected,
       runtimeOptions,
       deferredState,
     );
+  }
+}
+
+function oneShot<T>(take: (() => T[]) | undefined): (() => T[]) | undefined {
+  if (!take) {
+    return undefined;
+  }
+  let open = true;
+  return () => {
+    if (!open) {
+      return [];
+    }
+    open = false;
+    return take();
+  };
+}
+
+/**
+ * ONE turn of the queue owner: `part` is the whole batch, or one part of a batch split for context
+ * size. Every member a failure leaves without a terminal gets one here — except on a context
+ * overflow of N >= 2 members (`BatchContextOverflowError`), where nothing is written: the splitter
+ * re-runs them.
+ */
+async function runQueuedTurnPart(
+  sessionRecordId: string,
+  part: QueueTask[],
+  options: QueuedTaskRuntimeOptions,
+  outputFormatter: OutputFormatter,
+  split: BatchSplitPart | undefined,
+): Promise<SessionSendResult> {
+  const turnStart: TurnStartProgress = { turnOwnsTerminal: false };
+  try {
+    try {
+      const lockPolicy = await applyQueuedTaskSubscriptionLockPolicy(
+        sessionRecordId,
+        options,
+        part,
+      );
+      return await runSessionPrompt({
+        ...buildQueuedTaskRunOptions(
+          sessionRecordId,
+          part,
+          turnRuntimeOptions(options, lockPolicy),
+          outputFormatter,
+          turnStart,
+          split,
+        ),
+        ...clientForQueuedTurn(lockPolicy),
+      });
+    } catch (error) {
+      if (error instanceof BatchContextOverflowError) {
+        throw error;
+      }
+      return await runQueuedTaskFailover(
+        sessionRecordId,
+        part,
+        options,
+        outputFormatter,
+        error,
+        turnStart,
+        split,
+      );
+    }
+  } catch (error) {
+    if (!(error instanceof BatchContextOverflowError)) {
+      for (const task of part) {
+        terminalizeDeliveryRefusedByReservedCapacity(sessionRecordId, task, error);
+        terminalizeDeliveryRefusedByClosedRecord(sessionRecordId, task, error);
+        // After the two above, so a task they already terminalized is skipped here.
+        terminalizeTurnThatNeverStarted(sessionRecordId, task, error, turnStart);
+      }
+    }
+    throw error;
+  }
+}
+
+/**
+ * UMQ §22.1 (HoD Q3) — deliver the batch whole; ONLY when that turn fails for context size, split
+ * it into its older and newer half (an odd member goes to the older half) and run them in that
+ * order, recursively. Never pre-emptive. A member already settled (deduplicated) is not re-run.
+ */
+async function runSplittingOnContextOverflow(
+  sessionRecordId: string,
+  members: QueueTask[],
+  split: BatchSplitPart | undefined,
+  runPart: (part: QueueTask[], split: BatchSplitPart | undefined) => Promise<SessionSendResult>,
+): Promise<SessionSendResult> {
+  try {
+    return await runPart(members, split);
+  } catch (error) {
+    if (!(error instanceof BatchContextOverflowError)) {
+      throw error;
+    }
+    const live = members.filter((task) => !task.terminalWritten);
+    const whole = split ?? { total: live.length, from: 1, to: live.length };
+    const olderCount = Math.ceil(live.length / 2);
+    const older = live.slice(0, olderCount);
+    const newer = live.slice(olderCount);
+    const olderPart = { total: whole.total, from: whole.from, to: whole.from + olderCount - 1 };
+    const newerPart = { total: whole.total, from: olderPart.to + 1, to: whole.to };
+    // NOT verbose-gated: one line per split, in owner.log.
+    process.stderr.write(
+      `[acpx] batch of ${live.length} message(s) for session ${sessionRecordId} did not fit the ` +
+        `recipient's context (${CONTEXT_OVERFLOW}); splitting into ${older.length} + ${newer.length} ` +
+        `(messages ${whole.from}–${whole.to} of ${whole.total}), older half first\n`,
+    );
+    let olderError: unknown;
+    try {
+      await runSplittingOnContextOverflow(sessionRecordId, older, olderPart, runPart);
+    } catch (partError) {
+      if (partError instanceof InterruptedError) {
+        terminalizeUnstartedMembers(sessionRecordId, newer, partError);
+        throw partError;
+      }
+      olderError = partError;
+    }
+    // A failure of the older half is its own members' (each already has its terminal); the newer
+    // half is still delivered.
+    const result = await runSplittingOnContextOverflow(sessionRecordId, newer, newerPart, runPart);
+    if (olderError !== undefined) {
+      throw olderError;
+    }
+    return result;
+  }
+}
+
+/** The never-reached-the-model terminal for split members an interrupt kept from their turn. */
+function terminalizeUnstartedMembers(
+  sessionRecordId: string,
+  members: QueueTask[],
+  error: unknown,
+): void {
+  for (const task of members) {
+    if (task.terminalWritten) {
+      continue;
+    }
+    task.terminalWritten = true;
+    const terminalError: DeliveryEventError = {
+      code: 0,
+      message: `${QUEUE_TURN_START_FAILED_MESSAGE}: ${describeTurnStartError(error)}`,
+      detailCode: QUEUE_TURN_START_FAILED_DETAIL_CODE,
+    };
+    appendDeliveryStreamEventSync(sessionRecordId, task, "failed", terminalError);
+    appendRefusedStreamEventSync(sessionRecordId, task, terminalError);
   }
 }
 
@@ -1930,12 +2166,12 @@ function clientForQueuedTurn(
 export async function applyQueuedTaskSubscriptionLockPolicy(
   sessionRecordId: string,
   options: QueuedTaskRuntimeOptions,
-  task: QueueTask,
+  members: QueueTask[],
 ): Promise<QueuedTaskClientPolicy> {
   const record = await resolveSessionRecord(sessionRecordId);
   // brick 45917618 §5.6 (HoD ruling 2026-11-06): refused at EVERY turn start, not only at a spawn —
   // a warm owner's adapter would otherwise run the turn in a folder that no longer exists.
-  await refuseTurnWhenSessionCwdMissing(record, task, options.onSessionCwdMissing);
+  await refuseTurnWhenSessionCwdMissing(record, members, options.onSessionCwdMissing);
   if (bindRecordToDefaultAccount(record)) {
     await writeSessionRecord(record);
   }
@@ -2084,11 +2320,12 @@ async function surfaceFailoverTerminalError(
 // AllSubscriptionsExhaustedError) for the normal failure path.
 async function runQueuedTaskFailover(
   sessionRecordId: string,
-  task: QueueTask,
+  members: QueueTask[],
   options: QueuedTaskRuntimeOptions,
   outputFormatter: OutputFormatter,
   error: unknown,
   turnStart: TurnStartProgress,
+  split?: BatchSplitPart,
 ): Promise<SessionSendResult> {
   const record = await resolveFailoverRecord(sessionRecordId, error);
   if (!record) {
@@ -2102,9 +2339,17 @@ async function runQueuedTaskFailover(
       triggerError: error,
       verbose: options.verbose,
       runTurn: async () =>
-        // Fresh client (omit sharedClient) so the retry resolves the new dir.
+        // Fresh client (omit sharedClient) so the retry resolves the new dir. UMQ §5.3: the batch
+        // is carried WHOLE — its User rows are kept by id, so the retry adds none.
         await runSessionPrompt({
-          ...buildQueuedTaskRunOptions(sessionRecordId, task, options, outputFormatter, turnStart),
+          ...buildQueuedTaskRunOptions(
+            sessionRecordId,
+            members,
+            options,
+            outputFormatter,
+            turnStart,
+            split,
+          ),
           client: undefined,
           // brick://4d517be2: the failover loop is already selecting reactively —
           // suppress proactive selection on the retry so the two don't fight.
@@ -2158,7 +2403,8 @@ async function retryDeferredInjectedPrompt(
   options: QueuedTaskRuntimeOptions,
   state: DeferredInjectedFailoverState,
 ): Promise<void> {
-  const { task } = entry;
+  const { tasks } = entry;
+  const task = tasks[0];
   const held: HeldDeliveryTerminal = { written: false };
   try {
     if (state.interrupted) {
@@ -2173,7 +2419,7 @@ async function retryDeferredInjectedPrompt(
     });
     process.stderr.write(
       `[acpx] deferred injected prompt for session ${sessionRecordId} ` +
-        `(messageId=${task.messageId ?? "-"}) re-run on ${selectedSubscriptionOf(result.record) ?? "-"} ` +
+        `(messageId=${messageIdsOf(tasks)}) re-run on ${selectedSubscriptionOf(result.record) ?? "-"} ` +
         `after failover; stopReason=${result.stopReason}\n`,
     );
     sendQueuedTaskResult(task, result);
@@ -2182,12 +2428,20 @@ async function retryDeferredInjectedPrompt(
     // The one terminal this delivery gets when no turn wrote it: the retry never started, or every
     // turn it ran failed over (`HeldDeliveryTerminal`) until failover itself gave up.
     if (!held.written) {
-      appendDeliveryStreamEventSync(sessionRecordId, task, "failed", deliveryErrorFrom(error));
+      for (const member of tasks) {
+        appendDeliveryStreamEventSync(sessionRecordId, member, "failed", deliveryErrorFrom(error));
+      }
     }
     sendQueuedTaskError(task, error);
   } finally {
-    task.close();
+    for (const member of tasks) {
+      member.close();
+    }
   }
+}
+
+function messageIdsOf(tasks: readonly QueueTask[]): string {
+  return tasks.map((task) => task.messageId ?? "-").join(",");
 }
 
 async function runDeferredInjectedTurn(
@@ -2195,7 +2449,8 @@ async function runDeferredInjectedTurn(
   entry: DeferredInjectedPrompt,
   options: QueuedTaskRuntimeOptions,
 ): Promise<SessionSendResult> {
-  const { task } = entry;
+  const { tasks } = entry;
+  const task = tasks[0];
   const outputFormatter = task.waitForCompletion
     ? new QueueTaskOutputFormatter(task)
     : DISCARD_OUTPUT_FORMATTER;
@@ -2206,7 +2461,7 @@ async function runDeferredInjectedTurn(
     // the limit again — and a pre-turn selection switch would hide that this was a failover.
     return await runQueuedTaskFailover(
       sessionRecordId,
-      task,
+      tasks,
       options,
       outputFormatter,
       entry.error,
@@ -2218,14 +2473,14 @@ async function runDeferredInjectedTurn(
   // to the old subscription), and fail over again only if that fails over.
   try {
     return await runSessionPrompt({
-      ...buildQueuedTaskRunOptions(sessionRecordId, task, options, outputFormatter, turnStart),
+      ...buildQueuedTaskRunOptions(sessionRecordId, tasks, options, outputFormatter, turnStart),
       client: undefined,
       skipProactiveSelection: true,
     });
   } catch (error) {
     return await runQueuedTaskFailover(
       sessionRecordId,
-      task,
+      tasks,
       options,
       outputFormatter,
       error,
@@ -2288,19 +2543,25 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
 
   const conversation = cloneSessionConversation(record);
   let acpxState = cloneSessionAcpxState(record.acpx);
-  const mainDeliveryContext = deliveryContextFor(options);
-  // brick 570d2570 — the main delivery as the owner's exit paths see it: registered once `accepted` is written,
-  // unregistered in the `finally`, and claimed by whichever of `appendDeliveryTerminal` and the owner's
-  // close-cut sweep writes its terminal first (`main-turn-delivery.ts`).
-  const openMainDelivery: OpenMainTurnDelivery | undefined = mainDeliveryContext
-    ? {
-        context: {
-          messageId: mainDeliveryContext.messageId,
-          requestId: mainDeliveryContext.requestId,
-        },
-        terminalClaimed: false,
-      }
-    : undefined;
+  // UMQ §5.3 — the turn's members: the queue owner's batch, or this direct prompt alone. Gather
+  // (§5.2) appends to it; members already delivered (dedup) leave it before the turn runs.
+  const mainMembers: TurnMember[] = options.batch
+    ? options.batch.map(turnMemberForTask)
+    : [
+        turnMemberFor({
+          prompt: options.prompt,
+          messageId: options.messageId,
+          requestId: options.requestId,
+        }),
+      ];
+  const mainMemberFor = (context: DeliveryContext | undefined): TurnMember | undefined =>
+    context === undefined ? undefined : mainMembers.find((member) => member.context === context);
+  // §22.1 — a context overflow of a batch of N >= 2 leaves every member without a terminal: the
+  // queue owner splits it. A single message (or a part of one) fails exactly as today.
+  const splitsOnOverflow = (error: unknown): boolean =>
+    options.batch !== undefined &&
+    mainMembers.length >= 2 &&
+    (error instanceof BatchContextOverflowError || isContextOverflowError(error));
 
   const recordPromptStart = async (
     prompt: PromptInput | string,
@@ -2348,16 +2609,84 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     return { messageId: promptMessageId, deduplicated: false };
   };
 
-  const promptStart = await recordPromptStart(options.prompt, options.messageId);
-  const promptMessageId = promptStart.messageId;
+  // UMQ §5.3 — N User rows, one per member, written in ONE boundary write; a member whose message
+  // already completed leaves (its `done / deduplicated`), and the rest keep their rows by id.
+  const recordBatchStart = async (
+    members: TurnMember[],
+  ): Promise<{ delivered: TurnMember[]; deduplicated: TurnMember[]; record?: SessionRecord }> => {
+    const settled = await resolveAlreadyDeliveredMessageIds(
+      options.sessionRecordId,
+      members.flatMap((member) => (member.messageId !== undefined ? [member.messageId] : [])),
+    );
+    const deduplicated = members.filter(
+      (member) => member.messageId !== undefined && settled.ids.has(member.messageId),
+    );
+    const delivered = members.filter((member) => !deduplicated.includes(member));
+    if (delivered.length > 0) {
+      const promptStartedAt = isoNow();
+      for (const member of delivered) {
+        member.userMessageId =
+          member.messageId !== undefined && hasUserMessageId(conversation, member.messageId)
+            ? member.messageId
+            : recordPromptSubmission(
+                conversation,
+                member.prompt,
+                promptStartedAt,
+                member.messageId,
+              );
+      }
+      record.lastPromptAt = promptStartedAt;
+      record.lastUsedAt = promptStartedAt;
+      applyConversation(record, conversation);
+      record.acpx = acpxState;
+      const lastRowId = delivered.findLast(
+        (member) => member.userMessageId !== undefined,
+      )?.userMessageId;
+      await writeSessionRecordAtBoundary(record, {
+        logThrough:
+          lastRowId === undefined
+            ? undefined
+            : lastUserMessageWithId(conversation.messages, lastRowId),
+      });
+      copyLoggedMessageCount(record, conversation);
+    }
+    for (const member of deduplicated) {
+      if (member.task) {
+        member.task.terminalWritten = true;
+      }
+    }
+    return { delivered, deduplicated, record: settled.record };
+  };
 
-  output.setContext({
-    sessionId: record.acpxRecordId,
-  });
+  // The members' User rows. A turn of ONE (not a split part) takes today's path, unchanged.
+  const startMainMembers = async (): Promise<SessionRecord | undefined> => {
+    if (mainMembers.length === 1 && !options.split) {
+      const only = mainMembers[0];
+      const promptStart = await recordPromptStart(only.prompt, only.messageId);
+      only.userMessageId = promptStart.messageId;
+      output.setContext({
+        sessionId: record.acpxRecordId,
+      });
+      if (!promptStart.deduplicated) {
+        return undefined;
+      }
+      const deduplicatedRecord = promptStart.record ?? record;
+      await appendDeduplicatedDeliveryTerminal(deduplicatedRecord, only.context);
+      return deduplicatedRecord;
+    }
+    const started = await recordBatchStart(mainMembers);
+    output.setContext({
+      sessionId: record.acpxRecordId,
+    });
+    for (const member of started.deduplicated) {
+      await appendDeduplicatedDeliveryTerminal(started.record ?? record, member.context);
+    }
+    mainMembers.splice(0, mainMembers.length, ...started.delivered);
+    return started.delivered.length === 0 ? (started.record ?? record) : undefined;
+  };
 
-  if (promptStart.deduplicated) {
-    const deduplicatedRecord = promptStart.record ?? record;
-    await appendDeduplicatedDeliveryTerminal(deduplicatedRecord, mainDeliveryContext);
+  const deduplicatedRecord = await startMainMembers();
+  if (deduplicatedRecord) {
     if (options.heldDeliveryTerminal) {
       options.heldDeliveryTerminal.written = true;
     }
@@ -2418,7 +2747,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     async () => await readSeatContextAlarmLevel(sessionBaseDir(), record.seatId),
     contextFillFromState(record.acpx?.context_fill),
   );
-  let contextAlarmInjector: ((task: QueueTask) => void) | undefined;
+  let contextAlarmInjector: ((injected: QueueTask[]) => void) | undefined;
   // Backend is constant per session, so resolve once: whether an injected prompt
   // to this backend returns a terminal response and can therefore be safely
   // awaited (drained) even when waitForCompletion is false. True for Claude;
@@ -2445,8 +2774,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
               delivery.consumed = true;
             }
           }
-          if (openMainDelivery?.context.messageId === messageId) {
-            openMainDelivery.consumed = true;
+          for (const member of mainMembers) {
+            if (member.open?.context.messageId === messageId) {
+              member.open.consumed = true;
+            }
           }
         },
       })
@@ -2653,8 +2984,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // the sweep claimed first, its terminal is the one and this writes nothing — so a late `done`, `cancelled` or
     // watchdog cut can never become a second terminal. A write that throws releases the claim, so a fallback
     // terminal (the catch paths below) can still land, as it could before.
-    const mainClaim =
-      context !== undefined && context === mainDeliveryContext ? openMainDelivery : undefined;
+    const mainClaim = mainMemberFor(context)?.open;
     if (mainClaim && !claimMainTurnDeliveryTerminal(mainClaim)) {
       noteHeldTerminalWritten(context);
       return;
@@ -2673,7 +3003,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   // brick 901ecf75 — tell a deferred injected message's failover driver that this retry turn settled
   // the message's terminal itself, so it writes none of its own.
   const noteHeldTerminalWritten = (context: DeliveryContext | undefined): void => {
-    if (context !== undefined && context === mainDeliveryContext && options.heldDeliveryTerminal) {
+    if (mainMemberFor(context) !== undefined && options.heldDeliveryTerminal) {
       options.heldDeliveryTerminal.written = true;
     }
   };
@@ -2688,9 +3018,25 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     if (options.heldDeliveryTerminal !== undefined && classifyFailover(error) !== null) {
       return;
     }
-    await appendDeliveryTerminal(mainDeliveryContext, "failed", { error: deliveryError }).catch(
-      () => {},
-    );
+    // UMQ §22.1 — the splitter re-runs these members: this attempt terminalizes none of them.
+    if (splitsOnOverflow(error)) {
+      return;
+    }
+    for (const member of mainMembers) {
+      await appendDeliveryTerminal(member.context, "failed", { error: deliveryError }).catch(
+        () => {},
+      );
+    }
+  };
+
+  // Every member of the main turn gets the turn's own terminal (UMQ §5.3).
+  const appendMainTerminals = async (
+    phase: Exclude<DeliveryPhase, "accepted">,
+    params: DeliveryTerminalParams = {},
+  ): Promise<void> => {
+    for (const member of mainMembers) {
+      await appendDeliveryTerminal(member.context, phase, params);
+    }
   };
 
   // brick e09628a1 — the R-CONSUMED verdict for a terminal about to be written (`consumedCutNote`).
@@ -2999,14 +3345,14 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   };
 
   const deferInjectedPrompt = (
-    injectedTask: QueueTask,
+    injectedTasks: QueueTask[],
     injectedError: unknown,
     arrival: number,
   ) => {
     deferredInjected.push({
       arrival,
       deferred: {
-        task: injectedTask,
+        tasks: injectedTasks,
         // The account that physically refused it, so failover marks THAT one dead.
         error: attachEffectiveAccountMetadata(injectedError, client.getEffectiveAccountMetadata()),
         failedOnSelection: selectedSubscriptionOf(record),
@@ -3015,7 +3361,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // NOT verbose-gated: the delivery stays open past this turn, and this line says why.
     process.stderr.write(
       `[acpx] injected prompt for session ${record.acpxRecordId} ` +
-        `(messageId=${injectedTask.messageId ?? "-"}) failed with a ${classifyFailover(injectedError)} ` +
+        `(messageId=${messageIdsOf(injectedTasks)}) failed with a ${classifyFailover(injectedError)} ` +
         `error; deferring it to an in-owner subscription failover once the turn ends\n`,
     );
   };
@@ -3029,7 +3375,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     arrival: number,
   ): Promise<boolean> => {
     if (shouldDeferInjectedError(injectedDeliveryContext, injectedError, absorbedDelivery)) {
-      deferInjectedPrompt(injectedTask, injectedError, arrival);
+      deferInjectedPrompt([injectedTask], injectedError, arrival);
       return true;
     }
     await appendDeliveryTerminal(injectedDeliveryContext, "failed", {
@@ -3080,7 +3426,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     }
   };
 
-  const runInjectedPromptTask = async (
+  const runInjectedSinglePrompt = async (
     sessionId: string,
     injectedTask: QueueTask,
   ): Promise<void> => {
@@ -3131,6 +3477,136 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         closeInjectedTask(injectedTask, absorbedDelivery);
       }
     }
+  };
+
+  // UMQ §5.3 — a batch that arrives during a running turn is ONE injected prompt: one
+  // `client.prompt()` with the envelope, the members' blocks and the same `_meta` as a main batch;
+  // per member its User row, `accepted`, consumption registration, absorbed-delivery entry (absorb
+  // backends) and exactly one terminal. A single submission keeps today's path, unchanged.
+  const runInjectedPromptTask = async (sessionId: string, injected: QueueTask[]): Promise<void> => {
+    if (injected.length === 1) {
+      await runInjectedSinglePrompt(sessionId, injected[0]);
+      return;
+    }
+    await runInjectedBatchPrompt(sessionId, injected);
+  };
+
+  const runInjectedBatchPrompt = async (
+    sessionId: string,
+    injected: QueueTask[],
+  ): Promise<void> => {
+    // Taken synchronously, before any await: the order the messages reached the turn.
+    const arrival = injectedArrivals++;
+    let unsettled = injected.map(turnMemberForTask);
+    const absorbed = new Map<TurnMember, AbsorbedInjectedDelivery>();
+    let deferred = false;
+    try {
+      const started = await recordBatchStart(unsettled);
+      for (const member of started.deduplicated) {
+        await appendDeliveryTerminal(member.context, "done", { stopReason: "deduplicated" });
+        if (member.task) {
+          sendInjectedDeduplicatedResultIfWaiting(member.task, started.record ?? record);
+        }
+      }
+      unsettled = started.delivered;
+      if (unsettled.length === 0) {
+        return;
+      }
+      const composed = composeTurnPrompt(unsettled, undefined);
+      for (const member of unsettled) {
+        await appendDeliveryEvent(member.context, "accepted");
+        // brick e09628a1 — count from BEFORE the prompt is sent, so no completion it causes is missed.
+        registerSteerConsumption(member.context);
+      }
+      const responsePromise = client.prompt(sessionId, composed.prompt, {
+        ...injectedPromptOptions(composed.messageId),
+        ...(composed.batchMeta ? { batchMeta: composed.batchMeta } : {}),
+      });
+      for (const member of unsettled) {
+        const delivery = member.task
+          ? createAbsorbedInjectedDelivery(member.task, member.context)
+          : undefined;
+        if (delivery) {
+          absorbed.set(member, delivery);
+        }
+      }
+      const response = await responsePromise;
+      for (const member of unsettled) {
+        if (member.task) {
+          await handleInjectedPromptResponse(
+            member.task,
+            member.context,
+            member.userMessageId,
+            response,
+            absorbed.get(member),
+          );
+        }
+      }
+    } catch (injectedError) {
+      deferred = await handleInjectedBatchError(unsettled, absorbed, injectedError, arrival);
+    } finally {
+      // A deferred batch stays open: its failover retry answers, then closes it.
+      if (!deferred) {
+        for (const task of injected) {
+          const member = unsettled.find((candidate) => candidate.task === task);
+          closeInjectedTask(task, member ? absorbed.get(member) : undefined);
+        }
+      }
+    }
+  };
+
+  // Resolves true when the whole batch was deferred to the owner's failover (brick 901ecf75).
+  const handleInjectedBatchError = async (
+    unsettled: TurnMember[],
+    absorbed: Map<TurnMember, AbsorbedInjectedDelivery>,
+    injectedError: unknown,
+    arrival: number,
+  ): Promise<boolean> => {
+    const tasks = unsettled.flatMap((member) => (member.task ? [member.task] : []));
+    if (
+      tasks.length > 0 &&
+      unsettled.every((member) =>
+        shouldDeferInjectedError(member.context, injectedError, absorbed.get(member)),
+      )
+    ) {
+      deferInjectedPrompt(tasks, injectedError, arrival);
+      return true;
+    }
+    for (const member of unsettled) {
+      await appendDeliveryTerminal(member.context, "failed", {
+        error: deliveryErrorFrom(injectedError),
+      }).catch(() => {});
+      markAbsorbedDeliveryTerminalWritten(absorbed.get(member));
+      if (member.task) {
+        sendInjectedErrorIfWaiting(member.task, injectedError);
+      }
+    }
+    return false;
+  };
+
+  // UMQ §5.3–§5.5 — the ONE prompt for these members: a batch of N >= 2 (or a split part) is the
+  // envelope + each member's blocks + `_meta["acpx/batch"]`, its `messageId` the head's; a turn of
+  // ONE is exactly that member's own prompt, byte-identical to today.
+  const composeTurnPrompt = (
+    members: TurnMember[],
+    split: BatchSplitPart | undefined,
+  ): {
+    prompt: PromptInput;
+    messageId?: string;
+    batchMeta?: AcpxBatchMeta;
+  } => {
+    const built = buildBatchPrompt(
+      members.map((member) => ({
+        messageId: member.messageId ?? member.userMessageId ?? "",
+        requestId: member.requestId ?? "",
+        prompt: member.prompt,
+      })),
+      split,
+    );
+    if (!built) {
+      return { prompt: members[0].prompt, messageId: members[0].messageId };
+    }
+    return { prompt: built.prompt, messageId: members[0].messageId, batchMeta: built.meta };
   };
 
   // Subagent tracking: map from agent_id (e.g. "poet-a@haiku-demo") to ACPX record id
@@ -3745,7 +4221,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         // without mid-turn steering): the next turn opens with the line instead — a
         // crossing recomputes it from the fill, a cleared notice is held for it.
         if (notice && contextAlarmInjector) {
-          contextAlarmInjector(contextAlarmTask(notice));
+          contextAlarmInjector([contextAlarmTask(notice)]);
         } else if (notice) {
           contextAlarm.holdForTurnStart(notice);
         }
@@ -3778,8 +4254,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       // so the agent sees the new message via its Pushable input mid-turn
       // rather than waiting for the current turn to end. Each injected promise
       // is tracked so the turn can await all of them once it finishes.
-      const injectTask = (injectedTask: QueueTask): void => {
-        const injectedPromise = runInjectedPromptTask(sessionId, injectedTask);
+      const injectTask = (injected: QueueTask[]): void => {
+        const injectedPromise = runInjectedPromptTask(sessionId, injected);
         // Track (await) this injected promise when EITHER the caller is waiting
         // for completion (unchanged), OR the backend returns a terminal for an
         // injected prompt (Claude). This is the root fix for the
@@ -3795,10 +4271,14 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         // awaiting guaranteed a 30-min drain-backstop hit per occurrence. It is
         // tracked as an absorbed delivery instead; the containing turn's end
         // (or the owner-exit sweep) closes its lifecycle and answers the caller.
-        if (awaitInjectedPrompt || (injectedTask.waitForCompletion && !completeAbsorbedInjected)) {
+        const callerWaits = injected.some((task) => task.waitForCompletion);
+        if (awaitInjectedPrompt || (callerWaits && !completeAbsorbedInjected)) {
           const tracked: TrackedInjectedDelivery = {
             promise: injectedPromise,
-            context: deliveryContextFor(injectedTask),
+            contexts: injected.flatMap((task) => {
+              const context = deliveryContextFor(task);
+              return context ? [context] : [];
+            }),
             settled: false,
           };
           // Same detached-rejection class as `newPendingSave` (subagent-boundary-write.ts):
@@ -3965,22 +4445,24 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // at all, breaking exactly-one-terminal.
     if (drainTimedOut) {
       for (const delivery of injectedDeliveries) {
-        if (delivery.settled || !delivery.context) {
+        if (delivery.settled) {
           continue;
         }
-        await appendDeliveryTerminal(delivery.context, "failed", {
-          error: {
-            code: 0,
-            // The outcome-unknown wording is CONTRACTED and shared by the two
-            // codes that mean "may have reached the model" — this one and
-            // ABSORBED_TURN_NEVER_ENDED, which is where the constant takes its
-            // name. Read from the single source so a reword cannot land on one
-            // emitter and silently leave the other behind; the detail code here
-            // is unchanged and stays INJECTED_RESPONSE_TIMEOUT.
-            message: ABSORBED_TURN_NEVER_ENDED_MESSAGE,
-            detailCode: "INJECTED_RESPONSE_TIMEOUT",
-          },
-        });
+        for (const context of delivery.contexts) {
+          await appendDeliveryTerminal(context, "failed", {
+            error: {
+              code: 0,
+              // The outcome-unknown wording is CONTRACTED and shared by the two
+              // codes that mean "may have reached the model" — this one and
+              // ABSORBED_TURN_NEVER_ENDED, which is where the constant takes its
+              // name. Read from the single source so a reword cannot land on one
+              // emitter and silently leave the other behind; the detail code here
+              // is unchanged and stays INJECTED_RESPONSE_TIMEOUT.
+              message: ABSORBED_TURN_NEVER_ENDED_MESSAGE,
+              detailCode: "INJECTED_RESPONSE_TIMEOUT",
+            },
+          });
+        }
       }
     }
     injectedDeliveries.length = 0;
@@ -3995,7 +4477,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     turnError?: string;
     steered?: boolean;
   }): void => {
-    if (!openMainDelivery) {
+    const opens = mainMembers.flatMap((member) => (member.open ? [member.open] : []));
+    if (opens.length === 0) {
       return;
     }
     const reconciliation = reconcileStopReasonWithMarker(
@@ -4007,11 +4490,13 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       },
     );
     if (!mainTurnEndedOnItsOwn(answer.stopReason, reconciliation)) {
-      delete openMainDelivery.ownEnd;
+      for (const open of opens) {
+        delete open.ownEnd;
+      }
       return;
     }
     const recovered = reconciliation.kind === "recovered";
-    openMainDelivery.ownEnd = {
+    const ownEnd = {
       stopReason: recovered ? reconciliation.stopReason : toDeliveryStopReason(answer.stopReason),
       ...(answer.steered ? { steered: true } : {}),
       ...(recovered ? { recoveredBy: "turn-watchdog" as const } : {}),
@@ -4019,6 +4504,24 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         ? { error: { code: 0, message: answer.turnError, detailCode: "" } }
         : {}),
     };
+    for (const open of opens) {
+      open.ownEnd = ownEnd;
+    }
+  };
+
+  // UMQ §5.2 — gather at prompt send: the capture buffer's tasks join THIS prompt (User rows, then
+  // `accepted` and main-delivery registration below) instead of being injected after it.
+  const gatherCapturedMembers = async (): Promise<void> => {
+    const gathered = options.takeGatheredTasks?.() ?? [];
+    if (gathered.length === 0) {
+      return;
+    }
+    options.batch?.push(...gathered);
+    const started = await recordBatchStart(gathered.map(turnMemberForTask));
+    for (const member of started.deduplicated) {
+      await appendDeliveryTerminal(member.context, "done", { stopReason: "deduplicated" });
+    }
+    mainMembers.push(...started.delivered);
   };
 
   const runPromptAttempt = async (sessionId: string, attempt: number) => {
@@ -4034,15 +4537,21 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     guardedPromptIdThisTurn =
       turnWatchdogArmingMode === "claude-prompt-lifecycle" ? crypto.randomUUID() : undefined;
     const promptId = guardedPromptIdThisTurn;
-    await appendDeliveryEvent(mainDeliveryContext, "accepted");
-    if (openMainDelivery) {
-      // brick 570d2570 — from here a session close that cuts this turn can terminalize it from the owner's exit.
-      registerOpenMainTurnDelivery(record.acpxRecordId, openMainDelivery);
+    if (attempt === 0) {
+      await gatherCapturedMembers();
     }
-    // brick e09628a1 — counted from before the prompt is sent; a retry keeps the first registration (E4).
-    if (mainDeliveryContext) {
-      consumptionTracker?.register(mainDeliveryContext.messageId, "main");
+    for (const member of mainMembers) {
+      await appendDeliveryEvent(member.context, "accepted");
+      if (member.open) {
+        // brick 570d2570 — from here a session close that cuts this turn can terminalize it from the owner's exit.
+        registerOpenMainTurnDelivery(record.acpxRecordId, member.open);
+      }
+      // brick e09628a1 — counted from before the prompt is sent; a retry keeps the first registration (E4).
+      if (member.context) {
+        consumptionTracker?.register(member.context.messageId, "main");
+      }
     }
+    const turnPrompt = composeTurnPrompt(mainMembers, options.split);
     // The seat's level as of this turn, and the detector visible to the turn-context
     // channel while this turn's prompt is composed (brick 4f3fa88c).
     await contextAlarm.refreshLevel();
@@ -4051,11 +4560,13 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       const turnPromise = runPromptTurn({
         client,
         sessionId,
-        prompt: options.prompt,
+        prompt: turnPrompt.prompt,
         timeoutMs: options.timeoutMs,
         conversation,
-        promptMessageId,
-        messageId: options.messageId,
+        // The reply follows the LAST member's User row.
+        promptMessageId: mainMembers.at(-1)?.userMessageId,
+        messageId: turnPrompt.messageId,
+        ...(turnPrompt.batchMeta ? { batchMeta: turnPrompt.batchMeta } : {}),
         ...(promptId !== undefined ? { promptId } : {}),
         onPromptStarted: buildPromptStartedHook(sessionId, attempt),
         // brick 570d2570 (C3) — the turn's own end, recorded the moment the response arrives (before the drain).
@@ -4145,6 +4656,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       error: deliveryErrorFrom(error),
     });
     const snapshot = client.getAgentLifecycleSnapshot();
+    if (splitsOnOverflow(error)) {
+      // §22.1 — the same prompt cannot fit on a retry; the owner splits it instead.
+      return await failRuntimePrompt(error, snapshot);
+    }
     if (
       shouldRetryRuntimePrompt(
         error,
@@ -4259,7 +4774,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     reconciliation: TurnWatchdogReconciliation,
   ): Promise<boolean> => {
     if (reconciliation.kind === "cut") {
-      await appendDeliveryTerminal(mainDeliveryContext, "failed", {
+      await appendMainTerminals("failed", {
         error: {
           code: 0,
           message: TURN_WATCHDOG_CANCELLED_MESSAGE,
@@ -4269,11 +4784,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       return true;
     }
     if (reconciliation.kind === "recovered") {
-      await appendDeliveryTerminal(
-        mainDeliveryContext,
-        recoveredDeliveryPhase(reconciliation) ?? "done",
-        { stopReason: reconciliation.stopReason, recoveredBy: "turn-watchdog" },
-      );
+      await appendMainTerminals(recoveredDeliveryPhase(reconciliation) ?? "done", {
+        stopReason: reconciliation.stopReason,
+        recoveredBy: "turn-watchdog",
+      });
       return true;
     }
     return false;
@@ -4335,19 +4849,32 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       record.acpx?.current_model_id,
       process.env,
     );
-    await appendDeliveryTerminal(
-      mainDeliveryContext,
-      deliveryPhaseForStopReason(terminalStopReason),
-      {
-        stopReason: toDeliveryStopReason(terminalStopReason),
-        // brick ddd76838 — forward the adapter's steer-ack flag so the
-        // delivery record says "absorbed steer", not a bare end_turn.
-        ...(response.steered ? { steered: true } : {}),
-        ...(turnErrorForTerminal
-          ? { error: { code: 0, message: turnErrorForTerminal, detailCode: "" } }
-          : {}),
-      },
-    );
+    await appendMainTerminals(deliveryPhaseForStopReason(terminalStopReason), {
+      stopReason: toDeliveryStopReason(terminalStopReason),
+      // brick ddd76838 — forward the adapter's steer-ack flag so the
+      // delivery record says "absorbed steer", not a bare end_turn.
+      ...(response.steered ? { steered: true } : {}),
+      ...(turnErrorForTerminal
+        ? { error: { code: 0, message: turnErrorForTerminal, detailCode: "" } }
+        : {}),
+    });
+  };
+
+  // UMQ §22.1 — codex-acp and pi-acp report a context overflow as a turn that ENDED (`end_turn`): pi
+  // with the provider's message on `_meta.piAcp.turnError`, codex with its own sentence as the turn's
+  // only reply. For a batch of N >= 2 that is the split trigger, not the members' `done`.
+  const contextOverflowOfEndedTurn = (
+    response: Awaited<ReturnType<typeof runPromptTurn>>,
+  ): string | undefined => {
+    if (options.batch === undefined || mainMembers.length < 2) {
+      return undefined;
+    }
+    if (isContextOverflowText(response.turnError)) {
+      return response.turnError;
+    }
+    const lastRow = mainMembers.at(-1)?.userMessageId;
+    const reply = lastRow === undefined ? "" : agentTextAfterPrompt(conversation, lastRow);
+    return isCodexContextOverflowReply(reply) ? reply : undefined;
   };
 
   // brick://b8e251eb: from here on the catch below writes the delivery terminal.
@@ -4378,6 +4905,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         await liveCheckpoint.checkpoint();
 
         const response = await savePromptSuccess(await runPromptWithRetries(activeSessionId));
+        const overflow = contextOverflowOfEndedTurn(response);
+        if (overflow !== undefined) {
+          throw new BatchContextOverflowError(new Error(overflow), mainMembers.length);
+        }
         await appendMainTurnTerminals(response);
         promptTurnActive = false;
 
@@ -4394,7 +4925,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
           stopReason: "cancelled",
         }).catch(() => {});
         if (response?.stopReason === "cancelled") {
-          await appendDeliveryTerminal(mainDeliveryContext, "cancelled", {
+          await appendMainTerminals("cancelled", {
             stopReason: "cancelled",
           }).catch(() => {});
         }
@@ -4421,7 +4952,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       await completeAbsorbedInjectedDeliveries("cancelled", {
         stopReason: "cancelled",
       }).catch(() => {});
-      await appendDeliveryTerminal(mainDeliveryContext, "cancelled", {
+      await appendMainTerminals("cancelled", {
         stopReason: "cancelled",
       }).catch(() => {});
     } else {
@@ -4430,14 +4961,22 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       }).catch(() => {});
       await appendMainFailedTerminal(annotatedError, deliveryErrorFrom(annotatedError));
     }
+    if (
+      splitsOnOverflow(annotatedError) &&
+      !(annotatedError instanceof BatchContextOverflowError)
+    ) {
+      throw new BatchContextOverflowError(annotatedError, mainMembers.length);
+    }
     throw annotatedError;
   } finally {
     // brick 901ecf75 — first, so no throw below can strand a deferred message's open task. Every
     // awaited injected prompt has settled by here (both drain paths run before this point).
     handOverDeferredInjectedPrompts();
     unregisterAbsorbedDeliveries(record.acpxRecordId, absorbedInjectedDeliveries);
-    if (openMainDelivery) {
-      unregisterOpenMainTurnDelivery(record.acpxRecordId, openMainDelivery);
+    for (const member of mainMembers) {
+      if (member.open) {
+        unregisterOpenMainTurnDelivery(record.acpxRecordId, member.open);
+      }
     }
     if (options.verbose) {
       process.stderr.write(`[acpx] ${formatPerfMetric("prompt.total", stopTotalTimer())}\n`);

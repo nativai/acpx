@@ -181,7 +181,7 @@ async function runClaudeTurn(params: {
         sends.push(message),
       );
       const run = withTurnResponseTimeout(params.timeoutMs ?? TIMEOUT_MS, () =>
-        runQueuedTask(record.acpxRecordId, task, {
+        runQueuedTask(record.acpxRecordId, [task], {
           sharedClient: control.client,
           suppressSdkConsoleErrors: true,
         }),

@@ -100,6 +100,8 @@ export type OwnerSummary = {
 export type CapacitySnapshot = {
   readonly action: "capacity";
   readonly schema: 1;
+  /** UMQ K9 — what this acpx build can do for atrium ({@link ACPX_FEATURES}); readers ignore unknowns. */
+  readonly features: readonly string[];
   readonly box: string;
   /** Whose slots these are: `spawn` figures are net of {@link waiting}, `automation` gross. */
   readonly class: CapacityClass;
@@ -477,6 +479,13 @@ function waitingField(queue: WaitingQueue): CapacitySnapshot["waiting"] {
   };
 }
 
+/**
+ * UMQ K9 (CONTRACTS §3.1) — advertised on every `acpx --format json capacity` answer. atrium reads
+ * a field-less answer as "no features" and then delivers member by member (S5).
+ * `prompt-batch`: `prompt --batch-file` + the owner's `submit_prompt_batch`.
+ */
+export const ACPX_FEATURES: readonly string[] = ["prompt-batch"];
+
 export function readCapacity(options: ReadCapacityOptions): CapacitySnapshot {
   const g = gather(options);
   const measured = measuredOf(g);
@@ -484,6 +493,7 @@ export function readCapacity(options: ReadCapacityOptions): CapacitySnapshot {
   return {
     action: "capacity",
     schema: 1,
+    features: ACPX_FEATURES,
     box: options.box ?? boxName(),
     class: options.admissionClass ?? "spawn",
     waiting: waitingField(options.waiting ?? NO_WAITING),

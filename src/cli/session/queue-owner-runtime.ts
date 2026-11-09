@@ -48,7 +48,7 @@ import type {
   SessionRecord,
   SessionSendOutcome,
 } from "../../types.js";
-import type { DeferredCloseRequest } from "../queue/ipc-server.js";
+import { canJoinBatch, type DeferredCloseRequest } from "../queue/ipc-server.js";
 import {
   appendDeliveryStreamEvent,
   QUEUE_CONNECT_RETRY_MS,
@@ -1612,33 +1612,59 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     //   2. "Active" — once activeMidTurnHandler is set, the buffer is
     //      drained into it immediately and subsequent tasks are routed
     //      straight in.
-    let activeMidTurnHandler: ((injectedTask: QueueTask) => void) | undefined;
-    const midTurnBuffer: QueueTask[] = [];
+    // UMQ §5.1 — each entry is ONE submission (a single prompt or a whole batch): a batch that
+    // arrives mid-turn is one injected prompt, so it is buffered and handed over whole.
+    let activeMidTurnHandler: ((injected: QueueTask[]) => void) | undefined;
+    const midTurnBuffer: QueueTask[][] = [];
     let midTurnCaptureActive = false;
 
     // D1 (brick://53437107) — custody lives in TWO places, so the drain and the
     // signal handler must walk both (corollary C-1). The owner holds `pending`;
     // the capture buffer lives here, so hand the owner an accessor that takes it.
-    owner.setMidTurnCustodySource(() => midTurnBuffer.splice(0));
+    owner.setMidTurnCustodySource(() => midTurnBuffer.splice(0).flat());
+
+    // UMQ §5.2 — gather at prompt send: what arrived while the adapter connected joins the turn's
+    // ONE prompt instead of being injected after it. Taken in arrival order up to the first task
+    // that could not share the turn (which keeps its place and is injected as before).
+    const takeGatheredTasks = (head: QueueTask): QueueTask[] => {
+      const taken: QueueTask[] = [];
+      while (midTurnBuffer.length > 0) {
+        const group = midTurnBuffer[0];
+        const joinable = group.findIndex((task) => !canJoinBatch(head, task));
+        if (joinable === -1) {
+          taken.push(...group);
+          midTurnBuffer.shift();
+          continue;
+        }
+        taken.push(...group.splice(0, joinable));
+        break;
+      }
+      return taken;
+    };
 
     if (midTurnInjectionSupported) {
-      owner.setMidTurnHandler((task: QueueTask): boolean => {
-        if (activeMidTurnHandler) {
-          activeMidTurnHandler(task);
-          return true;
-        }
-        if (midTurnCaptureActive) {
-          midTurnBuffer.push(task);
-          // C4 (G3): make the capture-window wait visible. Without this the task
-          // sat between `acpx/received` and acceptance with no delivery event for
-          // up to a full drain cycle (RCA §3). Additive: deployed acpx-ui's
-          // parseDeliveryEvent whitelists phases and ignores unknown ones.
-          appendDeliveryStreamEvent(options.sessionId, task, "queued");
-          return true;
-        }
-        // Not in a turn — let the task land in the normal pending queue.
-        return false;
-      });
+      owner.setMidTurnHandler(
+        (tasks: QueueTask[]): boolean => {
+          if (activeMidTurnHandler) {
+            activeMidTurnHandler(tasks);
+            return true;
+          }
+          if (midTurnCaptureActive) {
+            midTurnBuffer.push(tasks);
+            // C4 (G3): make the capture-window wait visible. Without this the task
+            // sat between `acpx/received` and acceptance with no delivery event for
+            // up to a full drain cycle (RCA §3). Additive: deployed acpx-ui's
+            // parseDeliveryEvent whitelists phases and ignores unknown ones.
+            for (const task of tasks) {
+              appendDeliveryStreamEvent(options.sessionId, task, "queued");
+            }
+            return true;
+          }
+          // Not in a turn — let the task land in the normal pending queue.
+          return false;
+        },
+        () => activeMidTurnHandler !== undefined || midTurnCaptureActive,
+      );
     }
 
     const deferredCloseParams = {
@@ -1669,15 +1695,15 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       // So: poll on a short cadence, hand the gate the ORIGINAL window. Never
       // collapse these back into one variable.
       const { pollTimeoutMs, quiescenceWindowMs: gateWindowMs } = idleCheckTimings(idleWindowMs);
-      let task = await owner.nextTask(pollTimeoutMs);
+      let batch = await owner.nextBatch(pollTimeoutMs);
       // brick 9d34a178 — a deferred close requested while no turn ran (or that waited out a turn
       // the boundary check below never saw) is performed here, before any release decision.
-      if (!task && (await performDeferredClose(deferredCloseParams))) {
+      if (!batch && (await performDeferredClose(deferredCloseParams))) {
         ownerExitKind = "session-close";
         ownerExitReason = "session-close";
         break;
       }
-      if (!task) {
+      if (!batch) {
         // A full idle window elapsed; subsequent waits use the steady cadence.
         isFirstTask = false;
         // No new prompt arrived within the idle-check window. Per the North Star
@@ -1725,8 +1751,8 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         // is owner-internal and NOT lease-gated; the executor's P2b re-drive remains
         // the authoritative wake — this poll just spares the common case a cold
         // respawn (TOCTOU at the process boundary is not perfectly avoidable here).
-        const lateTask = await owner.nextTask(0);
-        if (!lateTask) {
+        const lateBatch = await owner.nextBatch(0);
+        if (!lateBatch) {
           // Diagnosable, NON-verbose-gated → owner.log (the RCA's "make the owner
           // lifecycle diagnosable" recommendation; the TE asserts this line + its
           // reason=). Safe to emit unconditionally: the owner's stderr is its own
@@ -1763,7 +1789,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         process.stderr.write(
           `[acpx] queue owner deferring idle release for session ${options.sessionId}; a task arrived in the release window (P2d final-poll)\n`,
         );
-        task = lateTask;
+        batch = lateBatch;
         // fall through to the task-processing path below (do NOT release/continue).
       }
       isFirstTask = false;
@@ -1771,11 +1797,13 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       // Stop idle drain before the prompt registers its own handlers
       await idleDrain.stop();
 
+      const turnBatch = batch;
+      const head = turnBatch[0];
       midTurnCaptureActive = midTurnInjectionSupported;
       try {
         await runPromptTurn(async () => {
           try {
-            await runQueuedTask(options.sessionId, task, {
+            await runQueuedTask(options.sessionId, turnBatch, {
               sharedClient,
               verbose: options.verbose,
               mcpServers: options.mcpServers,
@@ -1783,7 +1811,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
               authCredentials: options.authCredentials,
               authPolicy: options.authPolicy,
               suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
-              promptRetries: task.promptRetries ?? 0,
+              promptRetries: head.promptRetries ?? 0,
               sessionOptions: ownerSessionOptions,
               settingsBindingDiffers: (record) =>
                 settingsBindingFingerprint(record) !== boundSettings,
@@ -1845,6 +1873,9 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
                   );
                 }
               },
+              takeGatheredTasks: midTurnInjectionSupported
+                ? () => takeGatheredTasks(head)
+                : undefined,
               setMidTurnHandler: midTurnInjectionSupported
                 ? (handler) => {
                     activeMidTurnHandler = handler;
@@ -1869,7 +1900,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         // go back to the normal pending queue — C4 (G3): order-preserving so the
         // oldest is not starved (the old per-item requeue reversed the batch),
         // and each stays visible as `queued` until it is accepted.
-        const leftovers = midTurnBuffer.splice(0);
+        const leftovers = midTurnBuffer.splice(0).flat();
         if (leftovers.length > 0) {
           owner.requeueAll(leftovers);
           for (const leftover of leftovers) {
@@ -1903,7 +1934,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         boundSettings = bindTurnOwnWrites(
           boundSettings,
           afterTurn,
-          mergeSessionOptions(task.sessionOptions, ownerSessionOptions),
+          mergeSessionOptions(head.sessionOptions, ownerSessionOptions),
         );
       }
       // Restart idle drain to capture teammate activity until next prompt

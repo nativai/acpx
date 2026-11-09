@@ -756,16 +756,16 @@ async function runTwoTurns(params: {
       await setSeatContextAlarm(sessionBaseDir(), SEAT, params.seatLevel);
     }
     const rig = alarmRig(params);
-    let handler: ((task: QueueTask) => void) | undefined;
+    let handler: ((injected: QueueTask[]) => void) | undefined;
     const options = {
       sharedClient: rig.client,
-      setMidTurnHandler: (next: ((task: QueueTask) => void) | undefined) => {
+      setMidTurnHandler: (next: ((injected: QueueTask[]) => void) | undefined) => {
         handler = next;
       },
       suppressSdkConsoleErrors: true,
     };
-    await runQueuedTask(record.acpxRecordId, task("turn-1", "work"), options);
-    await runQueuedTask(record.acpxRecordId, task("turn-2", "a parent's message"), options);
+    await runQueuedTask(record.acpxRecordId, [task("turn-1", "work")], options);
+    await runQueuedTask(record.acpxRecordId, [task("turn-2", "a parent's message")], options);
     void handler;
     if (!params.readBack) {
       return { ...rig, storedFill: undefined, contextCli: undefined };

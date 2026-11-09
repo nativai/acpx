@@ -382,7 +382,7 @@ async function runSubagentTurn(
       send: () => {},
       close: () => {},
     };
-    await runQueuedTask("parent-session", task, {
+    await runQueuedTask("parent-session", [task], {
       sharedClient: client,
       suppressSdkConsoleErrors: true,
     });
