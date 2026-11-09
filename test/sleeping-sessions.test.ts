@@ -330,8 +330,16 @@ test("connectAndLoadSession on a sleeping record: session/new → model → (eff
         timeoutMs: 1_000,
         activeController: controller,
       }),
-      /adapter will not start|model unservable/u,
-      failAt,
+      (error: unknown) => {
+        // Every failure inside the materialisation carries ONE code — atrium has a row for it.
+        assert.equal(
+          (error as { detailCode?: string }).detailCode,
+          "SESSION_MATERIALISATION_FAILED",
+          failAt,
+        );
+        assert.match((error as Error).message, /adapter will not start|model unservable/u);
+        return true;
+      },
     );
     assert.deepEqual(
       JSON.stringify({ id: failing.acpSessionId, acpx: failing.acpx }),

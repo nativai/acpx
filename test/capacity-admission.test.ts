@@ -891,7 +891,7 @@ test("text: `acpx capacity` names what waits, in order — and says nothing when
   const spawnView = await runCli(["capacity"], asAgent(f), f.root);
   assert.match(
     spawnView.stdout,
-    /^waiting: 2 queued for room since (?:2026-10-31 )?01:00Z \(wakeup re-baker-2026-10-31, brick run 3f2a1c… "Implement X"\) — they start before new agent sessions; the slots above already leave room for them$/mu,
+    /^waiting: 2 queued for room since (?:2026-10-31 )?01:00Z \(wakeup re-baker-2026-10-31, brick run 3f2a1c… "Implement X"\) — atrium wakes them oldest first as room frees, each with everything waiting for it; the slots above already leave room for them$/mu,
   );
   assert.match(spawnView.stdout, /^tight: 0 new claude sessions/mu);
   const drainerView = await runCli(["capacity", "--class", "automation"], asAgent(f), f.root);

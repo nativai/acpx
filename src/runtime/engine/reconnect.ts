@@ -24,6 +24,7 @@ import {
 import {
   ModelFloorUnmetError,
   SessionConfigOptionReplayError,
+  SessionMaterialisationError,
   SessionModeReplayError,
   SessionModelReplayError,
   SessionResumeRequiredError,
@@ -485,7 +486,10 @@ export async function connectAndLoadSession(
     options.record.acpSessionId = "";
     options.record.agentSessionId = undefined;
     options.record.acpx = before;
-    throw error;
+    // An interrupt is the turn being cancelled, not a failed start; everything else is ONE code.
+    throw error instanceof InterruptedError
+      ? error
+      : new SessionMaterialisationError(options.record.acpxRecordId, error);
   }
 }
 
