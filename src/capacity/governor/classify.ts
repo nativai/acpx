@@ -103,7 +103,15 @@ export type ClassifyContext = {
 export const HARNESS_COMMS: ReadonlySet<string> = new Set(["claude", "codex"]);
 export const SHELL_COMMS: ReadonlySet<string> = new Set(["bash", "sh", "zsh", "fish", "dash"]);
 
-/** A token-check cache keyed by (pid, start ticks): an owner's argv never changes. */
+/**
+ * A token-check cache keyed by (pid, start ticks) that remembers ONLY a positive answer: an owner's argv
+ * never changes once it carries `__queue-owner`.
+ *
+ * ⚠️ DO NOT CACHE `absent` (TE F12, CONCEPTION §19). `exec` keeps the pid AND the start ticks, so a
+ * process read as `absent` in the instant between node's fork and its exec into `__queue-owner` would
+ * keep reading `absent` for life — and the guard would then treat a fresh queue owner as signallable.
+ * A negative is therefore re-read every time, i.e. before every signal. Row: "F12 …".
+ */
 export function cachedTokenState(
   procRoot: string,
   byPid: () => ReadonlyMap<number, GovProc>,
@@ -117,7 +125,7 @@ export function cachedTokenState(
       return hit;
     }
     const state = queueOwnerTokenState(pid, procRoot);
-    if (key && state !== "unreadable") {
+    if (key && state === "owner") {
       cache.set(key, state);
     }
     return state;

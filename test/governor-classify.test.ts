@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import test from "node:test";
 import {
+  cachedTokenState,
   classifySessions,
   type ClassifyContext,
   entrypointSid,
@@ -410,6 +412,28 @@ test("sweep U1: sweeping the SYSTEM session (or an owner session) signals nothin
   }
   assert.deepEqual(box.signals, []);
   assert.ok(box.procs.has(40) && box.procs.has(102));
+});
+
+test("F12: the token cache keeps only POSITIVE answers — a process read `absent` that execs into a queue owner (same pid, same start ticks) is an owner at the next check, so the guard protects it", (t) => {
+  const box = new FakeBox();
+  t.after(() => box.cleanup());
+  box.standardSystem();
+  const { claudePid } = box.owner(100, "sess-f12");
+  box.toolSession(200, claudePid, 3);
+  const byPid = () => scanProcTable(box.proc, parseGovProcStat).byPid;
+  const cache = new Map<string, "owner" | "absent" | "unreadable">();
+  const token = cachedTokenState(box.proc, byPid, cache);
+  assert.equal(token(201), "absent");
+  // node's detached spawn: fork -> setsid -> EXEC into `__queue-owner`. exec keeps pid and start ticks.
+  const before = box.procs.get(201) as FakeProcess;
+  box.add({ ...before, owner: true });
+  assert.equal(box.procs.get(201)?.ticks, before.ticks, "same start ticks");
+  assert.equal(token(201), "owner", "a negative is re-read, never served from the cache");
+  const guard = { ...guardFor(box), tokenState: token };
+  assert.equal(protectedReason(byPid().get(201)!, guard), "owner-token");
+  // A positive IS cached: it survives even if the argv read would now fail.
+  fs.rmSync(`${box.proc}/201/cmdline`);
+  assert.equal(token(201), "owner");
 });
 
 test("sweep: protectedReason refuses pid 1, the system session, the governor, owners; an unreadable LIVE argv is unproven", (t) => {
