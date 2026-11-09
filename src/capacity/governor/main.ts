@@ -13,6 +13,7 @@ import {
   resolveBoxIdentity,
 } from "./record.js";
 import { Governor, parseGovernorArgs } from "./run.js";
+import { parallelScanner } from "./scan.js";
 import { governorDir } from "./status.js";
 import { realSignaller } from "./sweep.js";
 
@@ -61,6 +62,14 @@ async function main(): Promise<number> {
     }),
     log,
   );
+  // The reader threads exist before the first scan and for the governor's life (§16: nothing created or
+  // imported inside the loop). Each sets its own nice: Linux nice is per thread.
+  const readers = parallelScanner({
+    readers: CAPACITY_CONSTANTS.governor.scanReaders,
+    nice: CAPACITY_CONSTANTS.governor.nice,
+    stuckMs: CAPACITY_CONSTANTS.governor.scanReaderStuckMs,
+    log,
+  });
   const governor = new Governor(
     {
       procRoot: "/proc",
@@ -85,6 +94,7 @@ async function main(): Promise<number> {
       selfPid: process.pid,
       uid: os.userInfo().uid,
       entryFile: fileURLToPath(import.meta.url),
+      scanner: readers.scan,
     },
     {
       constants: CAPACITY_CONSTANTS,

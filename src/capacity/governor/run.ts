@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { scanProcTable } from "../../process-tree-reap.js";
+import { isLiveState, scanProcTable } from "../../process-tree-reap.js";
 import { readCgroup } from "../cgroup.js";
 import { type CapacityConstants, type GovernorConstants } from "../constants.js";
 import { verifiedLeaseOwners } from "../leases.js";
@@ -13,11 +13,15 @@ import {
   type GovProc,
   type GroupRecord,
   isExemptTerminal,
+  liveLeader,
   loadGroupMemory,
   type OwnerFacts,
   parseGovProcStat,
+  placeSession,
+  rememberedRecord,
   saveGroupMemory,
   type SessionView,
+  sessionView,
   type TokenState,
   writeFileAtomic,
 } from "./classify.js";
@@ -44,12 +48,14 @@ import {
   chooseR2Victim,
   emergencyLineBytes,
   freeableBytes,
+  isR1Eligible,
   type R2Candidate,
   type R2SkipEntry,
   r1Matches,
   sessionAnonBytes,
   victimFloorBytes,
 } from "./rules.js";
+import { type GovScan, type ProcScanner, readOneProc, streamingScanner } from "./scan.js";
 import type { GovernorHeartbeat, LastKill } from "./status.js";
 import {
   finishStops,
@@ -105,6 +111,8 @@ export type GovernorDeps = {
   /** The entry file watched for a new build (§7.2 self-restart); undefined = never restart. */
   readonly entryFile?: string;
   readonly setPriority?: (nice: number) => void;
+  /** The `/proc` scan; default the synchronous streaming scanner (production: `parallelScanner`). */
+  readonly scanner?: ProcScanner;
 };
 
 export type GovernorSettings = {
@@ -360,9 +368,13 @@ export class Governor {
   private niceApplied: number | null = null;
   private lastScanMs = 0;
   private lastIntervalMs = 0;
+  private readonly scanner: ProcScanner;
+  /** Members the crossing kill acted on (the sweep log's `on_crossing=`); undefined for a full-scan kill. */
+  private crossingSeen: number | undefined;
 
   constructor(deps: GovernorDeps, settings: GovernorSettings) {
     this.deps = deps;
+    this.scanner = deps.scanner ?? streamingScanner(deps.procRoot);
     this.settings = settings;
     this.g = settings.constants.governor;
     this.clickhouseAllowed = settings.clickhouseAllowed;
@@ -569,7 +581,7 @@ export class Governor {
   private sweepDeps(): SweepDeps {
     return {
       scan: () => {
-        this.latestByPid = scanProcTable(this.deps.procRoot, parseGovProcStat).byPid;
+        this.latestByPid = this.scanner().byPid;
         return this.latestByPid;
       },
       signal: this.deps.signal,
@@ -621,31 +633,31 @@ export class Governor {
    */
   tick(): { nextMs: number } | { exitCode: number } {
     const nowMs = this.deps.now();
-    this.markScanBaseline();
-    const scan = scanProcTable(this.deps.procRoot, parseGovProcStat);
-    this.latestByPid = scan.byPid;
-    const recheck = this.recheckSystem(nowMs, scan.measured ? scan.byPid : undefined);
-    if (recheck !== undefined) {
-      return { exitCode: recheck };
-    }
+    this.sweptThisTick = new Set();
+    // Census and memory BEFORE the scan: the crossing kill acts mid-scan with what the tick would use.
     const cgroup = readCgroup(this.deps.cgroupRoot);
     this.refreshCensus(nowMs);
-    const { sessions, memoryChanged } = classifySessions(
-      scan.byPid,
-      this.classifyContext(),
-      this.memory,
-      nowMs,
-    );
-    this.groupsDirty ||= memoryChanged;
-    this.sweptThisTick = new Set();
     const box = {
       committed: cgroup.committed?.committedBytes,
       limit: this.settings.limitBytes ?? cgroup.limitBytes,
       psi: cgroup.memoryPressure.fullAvg10,
     };
-    for (const view of r1Matches(sessions.values(), this.g, this.ownerIdentificationWorks())) {
-      this.act(view, "fork-storm", nowMs, box);
+    this.markScanBaseline();
+    const scan = this.decisionScan(nowMs, box);
+    this.latestByPid = scan.byPid;
+    const recheck = this.recheckSystem(nowMs, scan.measured ? scan.byPid : undefined);
+    if (recheck !== undefined) {
+      return { exitCode: recheck };
     }
+    const { sessions, memoryChanged } = classifySessions(
+      scan.byPid,
+      this.classifyContext(),
+      this.memory,
+      nowMs,
+      scan.complete,
+    );
+    this.groupsDirty ||= memoryChanged;
+    this.forkStormRule(sessions, nowMs, box);
     this.memoryRule(scan.measured, sessions, nowMs, box);
     this.burstAlarm(sessions, nowMs);
     this.runVerifications(nowMs, box);
@@ -661,6 +673,166 @@ export class Governor {
     this.track(this.deps.clickhouse.flush());
     const restart = this.selfRestartDue(nowMs);
     return restart ? { exitCode: 0 } : { nextMs };
+  }
+
+  /**
+   * The tick's scan, with CONCEPTION §19 D5 "kill on crossing, mid-scan": the moment the running scan
+   * counts the `maxGroupProcesses`-th live member of one session, that session is judged and swept at once
+   * ({@link killOnCrossing}); the scan then stops, and a fresh FULL scan serves the rest of the tick (a
+   * partial view never stands in for a full one). Measured (brick 07f4fde2): the full decision scan cost
+   * 86–540 ms under a storm while the storm kept forking.
+   */
+  private decisionScan(nowMs: number, box: BoxReading): GovScan {
+    const counts = new Map<number, number>();
+    const scan = this.scanner((entry, byPid, dropped) => {
+      if (!isLiveState(entry.state)) {
+        return false;
+      }
+      const count = (counts.get(entry.sid) ?? 0) + 1;
+      counts.set(entry.sid, count);
+      return (
+        count === this.g.maxGroupProcesses &&
+        this.killOnCrossing(entry.sid, byPid, dropped, nowMs, box)
+      );
+    });
+    return scan.stopped ? this.scanner() : scan;
+  }
+
+  /**
+   * §19 D5: act on a session the moment the running scan counts its 128th member — the same rule R1
+   * applies after a full scan, on the members seen so far. A session an earlier full scan placed
+   * (remembered, still the same leader) qualifies; a first sight qualifies only when the partial view
+   * decides its eligibility (§19 D7, {@link firstSightRecord}), else it waits for the full scan. The guard runs as always in the sweep, on the seen members, right before the first signal. Safe
+   * because a pgid never spans sessions (§3.3): a group kill reaches unscanned members of a signalled pgid,
+   * and they are by that invariant in this same, already judged session. Then the sweep re-scans and
+   * sweeps as usual (round 2 on).
+   *
+   * Exempt exactly as R1 is: observe mode, the system session and verified owners (`isR1Eligible`: not
+   * governed and not `outside`), `outside` without owner identification, terminals under
+   * `governTerminals:false`. Rows: "§19 D5 crossing …".
+   */
+  private killOnCrossing(
+    sid: number,
+    partial: Map<number, GovProc>,
+    dropped: (pid: number) => boolean,
+    nowMs: number,
+    box: BoxReading,
+  ): boolean {
+    const view =
+      this.mode === "enforce" && sid !== this.systemSid && sid > 1
+        ? this.crossingView(sid, partial, dropped, nowMs)
+        : undefined;
+    if (
+      !view ||
+      !isR1Eligible(view, this.ownerIdentificationWorks()) ||
+      isExemptTerminal(view.record.placement, this.g.governTerminals)
+    ) {
+      return false;
+    }
+    this.latestByPid = partial;
+    this.crossingSeen = view.members.length;
+    try {
+      this.kill(view, "fork-storm", nowMs, box);
+    } finally {
+      this.crossingSeen = undefined;
+    }
+    return true;
+  }
+
+  /** R1 on the full scan. A session the crossing kill swept this tick is not swept again (its +1 s check is). */
+  private forkStormRule(
+    sessions: ReadonlyMap<number, SessionView>,
+    nowMs: number,
+    box: BoxReading,
+  ): void {
+    for (const view of r1Matches(sessions.values(), this.g, this.ownerIdentificationWorks())) {
+      if (!this.sweptThisTick.has(view.sid)) {
+        this.act(view, "fork-storm", nowMs, box);
+      }
+    }
+  }
+
+  /** The session as the partial view shows it, if an earlier full scan placed it; else undefined. */
+  private crossingView(
+    sid: number,
+    partial: Map<number, GovProc>,
+    dropped: (pid: number) => boolean,
+    nowMs: number,
+  ): SessionView | undefined {
+    // D7 acts only on a leader read in THIS scan: delivered by it, or — when its reader is merely behind —
+    // read fresh now. A leader whose reader was DROPPED (stuck) is undecidable: no first-sight crossing.
+    const leaderScanned = partial.has(sid) || !dropped(sid);
+    if (!partial.has(sid)) {
+      // The leader is the session's oldest process, so it is normally already read; after a pid wrap it
+      // may lie ahead of the cursor — read it now rather than misread the session as leaderless.
+      const fresh = readOneProc(this.deps.procRoot, sid);
+      if (fresh?.sid === sid) {
+        partial.set(sid, fresh);
+      }
+    }
+    const leader = liveLeader(partial, sid);
+    const record =
+      rememberedRecord(this.memory, sid, leader) ??
+      (leaderScanned ? this.firstSightRecord(sid, partial, leader, nowMs) : undefined);
+    if (!record) {
+      return undefined;
+    }
+    const members = [...partial.values()].filter((p) => p.sid === sid && isLiveState(p.state));
+    return sessionView(sid, record, members, leader);
+  }
+
+  /**
+   * CONCEPTION §19 D7: a session first seen in THIS scan may still be crossed, once the partial view decides
+   * R1 eligibility (D4/D5): its leader is alive and read in THIS scan (not in a dropped reader's share), is
+   * not a verified owner (lease on the pid or sid;
+   * the token read answers a plain `absent`), owner identification works, and — under
+   * `governTerminals:false` — the leader's parent is read so a terminal placement can be told. The leader's
+   * ancestors are read fresh (they are not storm processes: those reads do not block), and the session is
+   * placed by the normal classifier and remembered, like any first sight. Anything undecided ⇒ undefined:
+   * the full scan decides, as before D7.
+   *
+   * ⚠️ A LEADERLESS first sight always waits. D7 speaks of the leader "if alive", but a leaderless session's
+   * owner test (§19 D1) is over ALL its members, and a partial view has not read them all — so it is undecided.
+   * Rows: "§19 D7 …".
+   */
+  private firstSightRecord(
+    sid: number,
+    partial: Map<number, GovProc>,
+    leader: GovProc | undefined,
+    nowMs: number,
+  ): GroupRecord | undefined {
+    if (!leader || !this.firstSightDecidable(sid, partial)) {
+      return undefined;
+    }
+    this.readAncestors(leader, partial);
+    if (!this.g.governTerminals && !partial.has(leader.ppid)) {
+      return undefined; // a terminal placement cannot be told without the parent
+    }
+    placeSession(partial, this.classifyContext(), this.memory, nowMs, sid);
+    this.groupsDirty = true;
+    return rememberedRecord(this.memory, sid, leader);
+  }
+
+  /** D7's owner tests on what has been read: no lease on the sid, identification works, token `absent`. */
+  private firstSightDecidable(sid: number, partial: Map<number, GovProc>): boolean {
+    if (this.leaseOwners.has(sid) || !this.ownerIdentificationWorks()) {
+      return false;
+    }
+    // `owner`, or an argv that cannot be read (undecided): no crossing on first sight.
+    return cachedTokenState(this.deps.procRoot, () => partial, this.tokenCache)(sid) === "absent";
+  }
+
+  /** Parent, grandparent, great-grandparent: what placement looks at (harness, adapter, owner). */
+  private readAncestors(leader: GovProc, partial: Map<number, GovProc>): void {
+    let proc: GovProc = leader;
+    for (let depth = 0; depth < 3 && proc.ppid > 1; depth += 1) {
+      const parent = partial.get(proc.ppid) ?? readOneProc(this.deps.procRoot, proc.ppid);
+      if (!parent) {
+        return;
+      }
+      partial.set(parent.pid, parent);
+      proc = parent;
+    }
   }
 
   /** §18 C6: an observe-only governor re-tries the check each minute. */
@@ -961,12 +1133,13 @@ export class Governor {
     if (result.eperm && result.survivors > 0) {
       event.action = "kill_failed_eperm";
     }
+    const crossing = this.crossingSeen === undefined ? "" : ` on_crossing=${this.crossingSeen}`;
     const guarded =
       result.guardedPgids.length > 0
         ? ` GUARDED_PGIDS=${result.guardedPgids.length} fallback_stops=${result.fallbackStops}`
         : "";
     this.deps.log(
-      `process-governor sweep sid=${view.sid} rule=${event.rule} rounds=${result.rounds} kill_ms=${event.kill_ms} survivors=${result.survivors} groups=${result.groupsSignalled}${guarded}`,
+      `process-governor sweep sid=${view.sid} rule=${event.rule} rounds=${result.rounds} kill_ms=${event.kill_ms} survivors=${result.survivors} groups=${result.groupsSignalled}${crossing}${guarded}`,
     );
   }
 

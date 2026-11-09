@@ -132,7 +132,7 @@ export function cachedTokenState(
   };
 }
 
-function liveLeader(byPid: ReadonlyMap<number, GovProc>, sid: number): GovProc | undefined {
+export function liveLeader(byPid: ReadonlyMap<number, GovProc>, sid: number): GovProc | undefined {
   const leader = byPid.get(sid);
   return leader && leader.sid === sid && isLiveState(leader.state) ? leader : undefined;
 }
@@ -146,6 +146,8 @@ type Classifier = {
   /** Sessions being placed right now: a parent chain that loops back is unplaceable. */
   readonly inProgress: Set<number>;
   changed: boolean;
+  /** Sids placed (first sight, or re-placed) by THIS classification. */
+  readonly placed: Set<number>;
 };
 
 function isOwnerSession(c: Classifier, sid: number): boolean {
@@ -264,6 +266,19 @@ function recordStillValid(record: GroupRecord, leader: GovProc | undefined): boo
   return leader === undefined || leader.startTicks === record.leaderStartTicks;
 }
 
+/**
+ * The remembered record of `sid` if it still describes this session (same leader start, or still
+ * leaderless) — the §19 D5 crossing kill acts only on a session placed by an earlier FULL scan.
+ */
+export function rememberedRecord(
+  memory: ReadonlyMap<number, GroupRecord>,
+  sid: number,
+  leader: GovProc | undefined,
+): GroupRecord | undefined {
+  const record = memory.get(sid);
+  return record && recordStillValid(record, leader) ? record : undefined;
+}
+
 /** The session's placement, from memory or decided now (first sight); undefined if it has no member. */
 function placementOf(c: Classifier, sid: number): Placement | undefined {
   const members = c.bySid.get(sid);
@@ -281,6 +296,7 @@ function placementOf(c: Classifier, sid: number): Placement | undefined {
   c.inProgress.add(sid);
   const placement = place(c, sid, members);
   c.inProgress.delete(sid);
+  c.placed.add(sid);
   c.memory.set(sid, {
     sid,
     leaderStartTicks: leader?.startTicks,
@@ -327,15 +343,67 @@ function isOrphaned(record: GroupRecord, leader: GovProc | undefined): boolean {
   );
 }
 
+/**
+ * §19 D7: place ONE session from a partial scan (the mid-scan crossing on first sight). The caller has read
+ * the leader and its ancestors fresh, so the placement inputs are present; the result is remembered like any
+ * first-sight placement. Undefined when the session has no member in `byPid`.
+ */
+export function placeSession(
+  byPid: ReadonlyMap<number, GovProc>,
+  ctx: ClassifyContext,
+  memory: Map<number, GroupRecord>,
+  nowMs: number,
+  sid: number,
+): Placement | undefined {
+  const c: Classifier = {
+    byPid,
+    bySid: groupBySid(byPid),
+    ctx,
+    memory,
+    nowMs,
+    inProgress: new Set(),
+    changed: false,
+    placed: new Set(),
+  };
+  return placementOf(c, sid);
+}
+
+export function sessionView(
+  sid: number,
+  record: GroupRecord,
+  members: readonly GovProc[],
+  leader: GovProc | undefined,
+): SessionView {
+  return {
+    sid,
+    record,
+    members,
+    leader,
+    orphaned: isOrphaned(record, leader),
+    threads: members.reduce((sum, m) => sum + m.threads, 0),
+  };
+}
+
 export function classifySessions(
   byPid: ReadonlyMap<number, GovProc>,
   ctx: ClassifyContext,
   memory: Map<number, GroupRecord>,
   nowMs: number,
+  /** False when a scan reader's share was left out: then a session not seen is NOT forgotten. */
+  complete = true,
 ): Classification {
   const bySid = groupBySid(byPid);
-  const c: Classifier = { byPid, bySid, ctx, memory, nowMs, inProgress: new Set(), changed: false };
-  for (const sid of memory.keys()) {
+  const c: Classifier = {
+    byPid,
+    bySid,
+    ctx,
+    memory,
+    nowMs,
+    inProgress: new Set(),
+    changed: false,
+    placed: new Set(),
+  };
+  for (const sid of complete ? memory.keys() : []) {
     if (!bySid.has(sid)) {
       memory.delete(sid);
       c.changed = true;
@@ -345,15 +413,16 @@ export function classifySessions(
   for (const [sid, members] of bySid) {
     placementOf(c, sid);
     const record = memory.get(sid) as GroupRecord;
-    const leader = liveLeader(byPid, sid);
-    sessions.set(sid, {
-      sid,
-      record,
-      members,
-      leader,
-      orphaned: isOrphaned(record, leader),
-      threads: members.reduce((sum, m) => sum + m.threads, 0),
-    });
+    sessions.set(sid, sessionView(sid, record, members, liveLeader(byPid, sid)));
+  }
+  if (!complete) {
+    // TE F3: a view missing a stuck reader's share (~1/4 of the pids) can place a tool command as `outside`
+    // (its harness unread) — this tick may act on that view, but it must not STICK: the next complete scan
+    // places it. Row: "an incomplete scan never persists a first-sight placement".
+    for (const sid of c.placed) {
+      memory.delete(sid);
+    }
+    return { sessions, memoryChanged: false };
   }
   return { sessions, memoryChanged: c.changed };
 }
