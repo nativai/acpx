@@ -6087,4 +6087,5 @@ test("runPromptTurn: existing agent reply still allows post-success drain", asyn
 
   assert.equal(result.source, "rpc");
   assert.equal(result.stopReason, "end_turn");
-  assert.deepEqual(
+  assert.deepEqual(calls, ["prompt", "drain"]);
+});
