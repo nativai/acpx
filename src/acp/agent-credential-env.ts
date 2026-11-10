@@ -13,6 +13,13 @@
 // which keeps them in its own environment (`QDRANT_API_KEY`, `ACPX_EMBED_API_KEY`,
 // `CLICKHOUSE_PASSWORD`).
 //
+// The three `*_PG_PASSWORD` names are wisdom-pg's (brick 51753638, wisdom search moving from
+// Qdrant to Postgres): `TRANSCRIPTS_PG_PASSWORD` sits in the box control container for the
+// acpx-ui SERVER, beside `QDRANT_API_KEY`; `BRICK_NOTES_PG_PASSWORD` and `QMD_PG_PASSWORD`
+// belong to bricks-service and wisdom-services pods and are listed so a box that ever carries
+// one cannot hand it on. The rest of the wiring (`*_PG_HOST`, `*_PG_USER`, …) is not secret
+// and is kept.
+//
 // ⚠️ THIS IS A NAME LIST ON PURPOSE, NOT A `*_KEY` PATTERN. Non-secret environment stays
 // generous, and `GITHUB_TOKEN` / `BROWSERLESS_TOKEN` are kept by decision (read-only PAT; a
 // cluster-internal service token every browser test needs). A pattern would take both.
@@ -22,6 +29,9 @@ export const AGENT_STRIPPED_CREDENTIAL_ENV = [
   "QDRANT_API_KEY",
   "ACPX_EMBED_API_KEY",
   "CLICKHOUSE_PASSWORD",
+  "TRANSCRIPTS_PG_PASSWORD",
+  "BRICK_NOTES_PG_PASSWORD",
+  "QMD_PG_PASSWORD",
 ] as const;
 
 /** acpx's own prefixed form (`promotePrefixedAuthEnvironment`, `assignAuthCredentialEnv`). */
