@@ -70,7 +70,7 @@ import {
   planMarkKey,
   resolveQualifiedTemplateKey,
 } from "./template-owner.js";
-import { pickLatestTemplate, slugify, type TemplateOrderKey } from "./template-slug.js";
+import { pickLatestTemplate, type TemplateOrderKey } from "./template-slug.js";
 
 export const DEFAULT_HISTORY_LIMIT = 20;
 
