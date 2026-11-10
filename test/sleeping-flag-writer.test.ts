@@ -175,3 +175,68 @@ test("real turn: a wake whose turn fails right after the materialisation leaves 
   assert.notEqual(after.acp_session_id, "", `the wake materialised it: ${wake.stderr}`);
   assert.equal(after.acpx.sleeping, undefined, "and it is no longer marked sleeping");
 });
+
+// TE finding (brick 56d160be, Block 8): a `sessions close` landing while the first wake is in flight
+// writes back the record it read BEFORE the wake (`acp_session_id ""`, flag kept). The writer rule
+// used to drop `sleeping` from that write too, leaving `acp ""` WITHOUT `sleeping` — a state no path
+// handles: every later prompt failed SESSION_MODEL_REPLAY_FAILED, permanently. On dev the reopened
+// session simply re-materialises.
+test("a close landing mid-wake (pre-wake record written back): the session stays wakeable — reopen + prompt works", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  const args = ["--agent", f.agent, "--cwd", path.join(f.root, "work"), "--approve-all"];
+  const created = await runCli(
+    [...args, "--format", "json", "sessions", "new", "--sleeping"],
+    { ...f.env, ACPX_ADMISSION_CLASS: "automation" },
+    f.root,
+  );
+  assert.equal(created.code, 0, created.stderr);
+  const id = (
+    JSON.parse(created.stdout.trim().split("\n").at(-1) ?? "{}") as { acpxRecordId: string }
+  ).acpxRecordId;
+
+  const realHome = process.env.HOME;
+  const realState = process.env.ACPX_STATE_HOME;
+  process.env.HOME = f.root;
+  process.env.ACPX_STATE_HOME = f.root;
+  try {
+    const persistence = await loadPersistence();
+    // The closer read the record BEFORE the wake …
+    const closer = await persistence.resolveSessionRecord(id);
+    assert.equal(closer.acpSessionId, "");
+    // … the wake ran to the end in the queue owner (a separate process) …
+    const woke = await runCli([...args, "prompt", "--session-id", id, "hello"], f.env, f.root);
+    assert.equal(woke.code, 0, woke.stderr);
+    const woken = readRecord(f, id) as { acp_session_id: string; acpx: { sleeping?: unknown } };
+    assert.notEqual(woken.acp_session_id, "");
+    assert.equal(woken.acpx.sleeping, undefined);
+    // … and then the closer writes its pre-wake record back, `closed` set (closeSession's write).
+    closer.closed = true;
+    closer.closedAt = new Date().toISOString();
+    await persistence.writeSessionRecordWithLifecycle(closer);
+  } finally {
+    process.env.HOME = realHome;
+    if (realState === undefined) {
+      delete process.env.ACPX_STATE_HOME;
+    } else {
+      process.env.ACPX_STATE_HOME = realState;
+    }
+  }
+  const afterClose = readRecord(f, id) as { acp_session_id: string; acpx: { sleeping?: unknown } };
+  assert.equal(
+    afterClose.acp_session_id,
+    "",
+    "the close's pre-wake write-back (pre-existing, filed apart)",
+  );
+  assert.ok(
+    afterClose.acpx.sleeping,
+    "the flag is KEPT with the empty id: never-ran is consistent",
+  );
+
+  const reopen = await runCli([...args, "sessions", "reopen", id], f.env, f.root);
+  assert.equal(reopen.code, 0, reopen.stderr);
+  const again = await runCli([...args, "prompt", "--session-id", id, "hello again"], f.env, f.root);
+  assert.equal(again.code, 0, `the reopened session works: ${again.stderr}`);
+  const final = readRecord(f, id) as { acp_session_id: string; acpx: { sleeping?: unknown } };
+  assert.notEqual(final.acp_session_id, "", "it re-materialised");
+  assert.equal(final.acpx.sleeping, undefined);
+});
