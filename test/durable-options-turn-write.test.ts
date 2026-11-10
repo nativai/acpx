@@ -274,7 +274,7 @@ test("a set accepted while the turn's prompt-start write is parked is the value 
     const control = makePathologicalClient({ acpSessionId: record.acpSessionId });
     const lockPath = `${file}.lock`;
     await fs.writeFile(lockPath, "{}");
-    const run = runQueuedTask(record.acpxRecordId, makeTask("req-main", MAIN_PROMPT_TEXT, MAIN), {
+    const run = runQueuedTask(record.acpxRecordId, [makeTask("req-main", MAIN_PROMPT_TEXT, MAIN)], {
       sharedClient: control.client,
       suppressSdkConsoleErrors: true,
     });
@@ -312,9 +312,9 @@ test("the same for an injected prompt's own prompt-start write", async () => {
         return await injectedRelease.promise;
       },
     });
-    let midTurnHandler: ((task: QueueTask) => void) | undefined;
+    let midTurnHandler: ((injected: QueueTask[]) => void) | undefined;
     const handlerRegistered = createDeferred<void>();
-    const run = runQueuedTask(record.acpxRecordId, makeTask("req-main", MAIN_PROMPT_TEXT, MAIN), {
+    const run = runQueuedTask(record.acpxRecordId, [makeTask("req-main", MAIN_PROMPT_TEXT, MAIN)], {
       sharedClient: control.client,
       setMidTurnHandler: (handler) => {
         midTurnHandler = handler;
@@ -330,7 +330,7 @@ test("the same for an injected prompt's own prompt-start write", async () => {
 
     const lockPath = `${file}.lock`;
     await fs.writeFile(lockPath, "{}");
-    midTurnHandler?.(makeTask("req-inj", INJECTED_PROMPT_TEXT, INJ));
+    midTurnHandler?.([makeTask("req-inj", INJECTED_PROMPT_TEXT, INJ)]);
     await waitFor(async () => await logHas(logPath, INJ), "the injection's log append");
     await plantSets(file, "New", "low");
     await fs.rm(lockPath, { force: true });
