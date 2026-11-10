@@ -27,6 +27,7 @@ import {
 import { isRecordedPidPossiblyAlive } from "../process-identity.js";
 import { sessionArchiveDirFor } from "../session/archive/paths.js";
 import { parseSessionRecord } from "../session/persistence.js";
+import { namesAgentSession } from "../session/sleeping.js";
 import type { SessionRecord } from "../types.js";
 import { readQueueOwnerLiveness } from "./queue/lease-store.js";
 import { isOwnerPossiblyAlive } from "./session/session-control.js";
@@ -444,6 +445,9 @@ async function readHead(file: string, bytes: number): Promise<string | undefined
 function activePathsFor(records: SessionRecord[], context: DedupContext): Set<string> {
   const active = new Set<string>();
   for (const record of records) {
+    if (!namesAgentSession(record.acpSessionId)) {
+      continue; // UMQ K7: a sleeping record has no transcript file
+    }
     const dir = activeTranscriptConfigDir(record, {
       registry: context.registry,
       homeDir: context.homes.userHome,
@@ -476,6 +480,9 @@ function reachableWitnessPaths(
   }
   const reachable = new Set<string>();
   for (const record of records) {
+    if (!namesAgentSession(record.acpSessionId)) {
+      continue; // UMQ K7: a sleeping record witnesses nothing — it has no transcript
+    }
     const lookup = { registry, homeDir: userHome };
     const activeConfigDir = activeTranscriptConfigDir(record, lookup);
     for (const dir of knownTranscriptConfigDirs({ ...lookup, activeConfigDir })) {

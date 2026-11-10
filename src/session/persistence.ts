@@ -44,6 +44,7 @@ export {
   sessionRecordFileName,
   writeSessionRecord,
   writeSessionRecordAtBoundary,
+  writeSessionRecordAtBoundaryNow,
   writeSessionRecordAtBoundaryWithLifecycle,
   writeSessionRecordAuthorizingParent,
   writeSessionRecordAuthorizingParentWithoutIndex,

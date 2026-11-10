@@ -158,9 +158,16 @@ export function parseProcStat(payload: string): ProcEntry | undefined {
   };
 }
 
-function readEntry(procRoot: string, pid: number): ProcEntry | undefined {
+/** A `/proc/<pid>/stat` parser: {@link parseProcStat}, or one that adds fields to its entry. */
+export type ProcStatParser<T extends ProcEntry> = (payload: string) => T | undefined;
+
+function readEntry<T extends ProcEntry = ProcEntry>(
+  procRoot: string,
+  pid: number,
+  parse: ProcStatParser<T> = parseProcStat as ProcStatParser<T>,
+): T | undefined {
   try {
-    const entry = parseProcStat(fs.readFileSync(`${procRoot}/${pid}/stat`, "utf8"));
+    const entry = parse(fs.readFileSync(`${procRoot}/${pid}/stat`, "utf8"));
     return entry?.pid === pid ? entry : undefined;
   } catch {
     return undefined;
@@ -168,7 +175,7 @@ function readEntry(procRoot: string, pid: number): ProcEntry | undefined {
 }
 
 /** Running, sleeping, stopped… — anything but a zombie or a dead task is a live process. */
-function isLiveState(state: string): boolean {
+export function isLiveState(state: string): boolean {
   return state !== "Z" && state !== "X" && state !== "x";
 }
 
@@ -186,10 +193,13 @@ function listDir(dir: string): string[] {
   }
 }
 
-function readAllEntries(procRoot: string): Map<number, ProcEntry> {
-  const byPid = new Map<number, ProcEntry>();
+function readAllEntries<T extends ProcEntry>(
+  procRoot: string,
+  parse: ProcStatParser<T>,
+): Map<number, T> {
+  const byPid = new Map<number, T>();
   for (const name of listDir(procRoot)) {
-    const entry = DIGITS.test(name) ? readEntry(procRoot, Number(name)) : undefined;
+    const entry = DIGITS.test(name) ? readEntry(procRoot, Number(name), parse) : undefined;
     if (entry) {
       byPid.set(entry.pid, entry);
     }
@@ -202,12 +212,20 @@ function readAllEntries(procRoot: string): Map<number, ProcEntry> {
  * the scan does not contain this process — a /proc that is not our own pid namespace's names nothing
  * we may signal.
  */
-export function scanProcTable(procRoot: string = DEFAULT_PROC_ROOT): ProcScan {
+export function scanProcTable(procRoot?: string): ProcScan;
+export function scanProcTable<T extends ProcEntry>(
+  procRoot: string,
+  parse: ProcStatParser<T>,
+): { measured: boolean; byPid: Map<number, T> };
+export function scanProcTable<T extends ProcEntry>(
+  procRoot: string = DEFAULT_PROC_ROOT,
+  parse: ProcStatParser<T> = parseProcStat as ProcStatParser<T>,
+): { measured: boolean; byPid: Map<number, T> } {
   const realProc = procRoot === DEFAULT_PROC_ROOT;
   if (realProc && process.platform !== "linux") {
     return { measured: false, byPid: new Map() };
   }
-  const byPid = readAllEntries(procRoot);
+  const byPid = readAllEntries(procRoot, parse);
   const selfSeen = !realProc || byPid.has(process.pid);
   return { measured: byPid.size > 0 && selfSeen, byPid };
 }
@@ -228,15 +246,29 @@ function readLink(path: string): string | undefined {
   }
 }
 
-/** Default nested-owner test: the process's argv carries `__queue-owner`. Match only, never print. */
-export function argvCarriesQueueOwnerToken(pid: number, procRoot = DEFAULT_PROC_ROOT): boolean {
+/**
+ * The `__queue-owner` argv check with its third answer kept: `unreadable` (the process is gone, or
+ * its cmdline cannot be opened) is not `absent`. Match only — the result is all that leaves here.
+ */
+export function queueOwnerTokenState(
+  pid: number,
+  procRoot = DEFAULT_PROC_ROOT,
+): "owner" | "absent" | "unreadable" {
   const cmdline = readText(`${procRoot}/${pid}/cmdline`, "latin1");
-  const at = cmdline?.indexOf(QUEUE_OWNER_ARGV_TOKEN) ?? -1;
-  if (cmdline === undefined || at < 0) {
-    return false;
+  if (cmdline === undefined) {
+    return "unreadable";
+  }
+  const at = cmdline.indexOf(QUEUE_OWNER_ARGV_TOKEN);
+  if (at < 0) {
+    return "absent";
   }
   const after = cmdline.charAt(at + QUEUE_OWNER_ARGV_TOKEN.length);
-  return after === "" || after === "\0";
+  return after === "" || after === "\0" ? "owner" : "absent";
+}
+
+/** Default nested-owner test: the process's argv carries `__queue-owner`. Match only, never print. */
+export function argvCarriesQueueOwnerToken(pid: number, procRoot = DEFAULT_PROC_ROOT): boolean {
+  return queueOwnerTokenState(pid, procRoot) === "owner";
 }
 
 // ---------------------------------------------------------------------------

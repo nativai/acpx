@@ -57,6 +57,8 @@ type ParsedCommand = {
 
 type MockAgentOptions = {
   hangOnNewSession: boolean;
+  /** UMQ A1 — hold `initialize` this long: a deterministic "the adapter is still connecting" window. */
+  initializeDelayMs?: number;
   /** brick 074a1bd9 — fail `session/new` the way a pi-acp with a dead pi does.
    *  The string, when set, names the extension file pi dies on — pi loads every
    *  extension and aborts on the unloadable one, which is not necessarily the
@@ -493,6 +495,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let loadReplayText = "replayed load session update";
   let ignoreSigterm = false;
   let hangOnNewSession = false;
+  let initializeDelayMs: number | undefined;
   let failNewSessionOnSeededExtension = false;
   let failNewSessionExtensionName: string | undefined;
   let envDumpFile: string | undefined;
@@ -636,6 +639,12 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--initialize-delay-ms") {
+      initializeDelayMs = Number(parseOptionValue(argv, index + 1, token));
+      index += 1;
+      continue;
+    }
+
     if (token === "--fail-new-session-on-seeded-extension") {
       failNewSessionOnSeededExtension = true;
       // Optional value: names the extension file pi dies on (see the option
@@ -748,6 +757,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
 
   return {
     hangOnNewSession,
+    initializeDelayMs,
     failNewSessionOnSeededExtension,
     failNewSessionExtensionName,
     newSessionMeta: Object.keys(newSessionMeta).length > 0 ? { ...newSessionMeta } : undefined,
@@ -1084,6 +1094,9 @@ class MockAgent implements Agent {
   }
 
   async initialize(): Promise<InitializeResponse> {
+    if (this.options.initializeDelayMs !== undefined) {
+      await new Promise((resolve) => setTimeout(resolve, this.options.initializeDelayMs));
+    }
     const sessionCapabilities = {
       ...(this.options.supportsCloseSession ? { close: {} } : {}),
       ...(this.options.supportsListSessions ? { list: {} } : {}),

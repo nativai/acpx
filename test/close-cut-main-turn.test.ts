@@ -209,7 +209,7 @@ async function withMainTurn(
       acpSessionId: record.acpSessionId,
       ...(params.onInjectedPrompt ? { onInjectedPrompt: params.onInjectedPrompt } : {}),
     });
-    let midTurnHandler: ((task: QueueTask) => void) | undefined;
+    let midTurnHandler: ((injected: QueueTask[]) => void) | undefined;
     const mainTask = makeTask({
       requestId: `req-${params.mainMessageId}`,
       messageId: params.mainMessageId,
@@ -217,7 +217,7 @@ async function withMainTurn(
       waitForCompletion: false,
     });
     const run = withTurnResponseTimeout(params.watchdogTimeoutMs ?? 60_000, () =>
-      runQueuedTask(record.acpxRecordId, mainTask, {
+      runQueuedTask(record.acpxRecordId, [mainTask], {
         sharedClient: control.client,
         suppressSdkConsoleErrors: true,
         setMidTurnHandler: (handler) => {
@@ -238,7 +238,7 @@ async function withMainTurn(
         run,
         inject: (task) => {
           assert.ok(midTurnHandler, "the runtime registered its mid-turn handler");
-          midTurnHandler(task);
+          midTurnHandler([task]);
         },
       });
       await withRaceTimeout(run, MUST_FINISH_MS, "the turn never finished");

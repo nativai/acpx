@@ -626,7 +626,7 @@ test("runQueuedTask emits reserved terminal before the real client prompt seam",
         closes += 1;
       });
 
-      await runQueuedTask(session.acpxRecordId, task, { sharedClient });
+      await runQueuedTask(session.acpxRecordId, [task], { sharedClient });
 
       assert.equal(promptInvocations, 0, "client.prompt must remain behind the hard guard");
       assert.equal(closes, 1);
@@ -701,7 +701,7 @@ test("no-wait reserved refusal terminalizes the correlated delivery exactly once
       task.waitForCompletion = false;
       task.messageId = messageId;
 
-      await runQueuedTask(session.acpxRecordId, task, { sharedClient });
+      await runQueuedTask(session.acpxRecordId, [task], { sharedClient });
 
       assert.equal(promptInvocations, 0, "client.prompt must remain behind the hard guard");
       assert.equal(sent.length, 0, "no-wait tasks have no socket terminal waiter");
@@ -852,7 +852,7 @@ test("exact provider exhaustion records NEW before reactive exhaustion; OLD is n
       });
       const sent: QueueOwnerMessage[] = [];
 
-      await runQueuedTask(session.acpxRecordId, makeQueueTask("NEW", sent), { sharedClient });
+      await runQueuedTask(session.acpxRecordId, [makeQueueTask("NEW", sent)], { sharedClient });
 
       assert.deepEqual(submitted, ["NEW"]);
       const terminal = sent.find((message) => message.type === "error");
@@ -1188,7 +1188,7 @@ test("cache window: a queued turn reads the PREVIOUS turn's anchor, then re-anch
     const sent: QueueOwnerMessage[] = [];
     const turnStart = Date.now();
 
-    await runQueuedTask(session.acpxRecordId, makeQueueTask("move", sent), {
+    await runQueuedTask(session.acpxRecordId, [makeQueueTask("move", sent)], {
       sharedClient,
       replaceSharedClient: async () => sharedClient,
     });
@@ -1216,7 +1216,7 @@ test("cache window: a held queued turn stays put and advances its own anchor at 
     const sent: QueueOwnerMessage[] = [];
     const turnStart = Date.now();
 
-    await runQueuedTask(session.acpxRecordId, makeQueueTask("stay", sent), { sharedClient });
+    await runQueuedTask(session.acpxRecordId, [makeQueueTask("stay", sent)], { sharedClient });
 
     assert.equal(
       sent.find((message) => message.type === "error"),

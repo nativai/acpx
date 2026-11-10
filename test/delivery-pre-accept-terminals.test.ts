@@ -143,7 +143,7 @@ test("NB4 CONTROL: a turn that reaches the model DOES write `accepted` — the i
       hasReusableSession: () => true,
     } as unknown as AcpClient;
     const sent: QueueOwnerMessage[] = [];
-    await runQueuedTask(record.acpxRecordId, task("nb4-control-msg", sent), {
+    await runQueuedTask(record.acpxRecordId, [task("nb4-control-msg", sent)], {
       sharedClient: client,
       suppressSdkConsoleErrors: true,
     });
@@ -171,7 +171,7 @@ test("NB4: SESSION_RESUME_REQUIRED is minted at connect — no `accepted` event,
     const sent: QueueOwnerMessage[] = [];
     await runQueuedTask(
       record.acpxRecordId,
-      task("nb4-resume-msg", sent, { resumePolicy: "same-session-only" }),
+      [task("nb4-resume-msg", sent, { resumePolicy: "same-session-only" })],
       { sharedClient: unresumableClient(counter), suppressSdkConsoleErrors: true },
     ).catch(() => {});
 
@@ -204,7 +204,7 @@ test("NB4: codex-subscription-cap is minted at pre-submit admission — no `acce
     await withQuotaEnv(atCapQuota(), async () => {
       await runQueuedTask(
         record.acpxRecordId,
-        task("nb4-cap-msg", sent, { codexSubscriptionCapWeeklyPercent: 90 }),
+        [task("nb4-cap-msg", sent, { codexSubscriptionCapWeeklyPercent: 90 })],
         {
           sharedClient: {
             ...(unresumableClient(counter) as unknown as Record<string, unknown>),

@@ -118,6 +118,7 @@ import {
   type AgentSessionContext,
   type EffectiveAccountMetadata,
 } from "./auth-env.js";
+import { ACPX_BATCH_META_KEY, type AcpxBatchMeta, shiftBatchMeta } from "./batch-meta.js";
 import { brickContextIdentity, resolveBrickContext } from "./brick-context.js";
 import {
   assertUuidAfterLastCompaction,
@@ -466,6 +467,11 @@ export type AcpPromptOptions = {
    * claude-agent-acp only, a fresh UUID per attempt; absent ⇒ the request carries no `_meta`.
    */
   promptId?: string;
+  /**
+   * UMQ K4 — a batch turn's member layout, sent as `_meta["acpx/batch"]` (CONTRACTS §2.1). Absent for a
+   * single prompt, whose request stays byte-identical. All three adapters tolerate the key (R13).
+   */
+  batchMeta?: AcpxBatchMeta;
 };
 
 export const CLAUDE_PROMPT_ID_META_KEY = "_claude/promptId";
@@ -494,6 +500,7 @@ export function buildPromptRequest(
   options: AcpPromptOptions | undefined,
   turnContext?: string,
 ) {
+  const meta = promptRequestMeta(options, turnContext);
   return {
     sessionId,
     prompt:
@@ -501,8 +508,28 @@ export function buildPromptRequest(
         ? prompt
         : [{ type: "text" as const, text: turnContext }, ...prompt],
     ...(options?.messageId !== undefined ? { messageId: options.messageId } : {}),
-    ...(options?.promptId !== undefined
-      ? { _meta: { [CLAUDE_PROMPT_ID_META_KEY]: options.promptId } }
+    ...(meta ? { _meta: meta } : {}),
+  };
+}
+
+// `_claude/promptId` first (as before), then the batch layout — moved past a prepended turn-context
+// block. `undefined` when neither is set: no `_meta` key at all.
+function promptRequestMeta(
+  options: AcpPromptOptions | undefined,
+  turnContext: string | undefined,
+): Record<string, unknown> | undefined {
+  if (options?.promptId === undefined && options?.batchMeta === undefined) {
+    return undefined;
+  }
+  return {
+    ...(options.promptId !== undefined ? { [CLAUDE_PROMPT_ID_META_KEY]: options.promptId } : {}),
+    ...(options.batchMeta !== undefined
+      ? {
+          [ACPX_BATCH_META_KEY]: shiftBatchMeta(
+            options.batchMeta,
+            turnContext === undefined ? 0 : 1,
+          ),
+        }
       : {}),
   };
 }

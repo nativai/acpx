@@ -15,6 +15,7 @@ import path from "node:path";
 import test from "node:test";
 import { setTimeout as setTimeoutPromise } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { argvCarriesQueueOwnerToken, parseProcStat } from "../src/process-tree-reap.js";
 import { runPromptTurn } from "../src/runtime/engine/prompt-turn.js";
 import {
   createSessionConversation,
@@ -1092,14 +1093,49 @@ function injectedPrimerFromStdout(stdout: string): string {
   return createRequest.params?._meta?.systemPrompt?.append ?? "";
 }
 
+test("integration: GOVERNOR PREMISE (§19 D5) — a live queue owner leads its own session, its comm is `node`, and its argv carries the owner token", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("reads /proc");
+    return;
+  }
+  // The governor's guard reads the owner token only for session leaders and `node` processes
+  // (src/capacity/governor/sweep.ts mayBeOwner). That is safe only while acpx spawns every queue owner
+  // DETACHED (so it leads its own session) as a `node` process whose argv keeps `__queue-owner`. This
+  // row fails if the owner is spawned without `detached`, or if anything sets `process.title` (a title
+  // rewrite also overwrites argv and would erase the token for every owner).
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    try {
+      const sessionId = await createSessionAndWarmOwner(baseAgentArgs(cwd), homeDir, cwd);
+      const { lockPath } = queuePaths(homeDir, sessionId);
+      const ownerPid = (JSON.parse(await fs.readFile(lockPath, "utf8")) as { pid: number }).pid;
+      const stat = parseProcStat(await fs.readFile(`/proc/${ownerPid}/stat`, "utf8"));
+      assert.ok(stat, "the owner is alive");
+      assert.equal(stat.sid, ownerPid, "the owner leads its own session (pid = sid)");
+      assert.equal(stat.pgid, ownerPid, "…and its own process group");
+      assert.equal(stat.comm, "node");
+      assert.equal(argvCarriesQueueOwnerToken(ownerPid), true, "its argv carries __queue-owner");
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: injected primer renders the CHILD's env — parent+brick fragments reach a child spawned from a spawner that has neither", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
     const claudeCompatibleAgentCommand = `${MOCK_AGENT_COMMAND} --claude-agent-acp`;
     const scriptPath = await writeGuardedPrimerScript();
+    // The child's brick must EXIST in the pool acpx resolves it against, or no brick path (and so no
+    // BRICK-BLOCK input) exists. That pool is the test's own — never the box's /wisdom/Bricks, which
+    // holds this very uuid (brick e65acef5).
+    const brickPool = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-brick-pool-"));
+    await fs.mkdir(path.join(brickPool, CHILD_BRICK));
     // runCli already strips ACPX_PARENT_SESSION_URL / ACPX_BRICK from the child
     // CLI's env, so the spawning acpx process here genuinely has neither.
-    const spawnerEnv = { env: { ACPX_SESSION_PRIMER_COMMAND: scriptPath } };
+    const spawnerEnv = {
+      env: { ACPX_SESSION_PRIMER_COMMAND: scriptPath, ACPX_BRICK_POOL_DIR: brickPool },
+    };
 
     try {
       const created = await runCli(
@@ -1142,8 +1178,24 @@ test("integration: injected primer renders the CHILD's env — parent+brick frag
       assert.match(primer, /HOST-BLOCK/);
       assert.match(primer, /PARENT-BLOCK/, "child has a parent — parent-reporting must reach it");
       assert.match(primer, /BRICK-BLOCK/, "child has a brick — brick priming must reach it");
+
+      // The pool guard. The agent folder is made in whichever pool the CLI resolved the brick against;
+      // finding it under THIS temp pool is the proof it was not the live one. It fails if the CLI
+      // child's pool is anything but `brickPool` (nothing would be created here) — the red this
+      // replaced was the live pool's `ENOENT mkdir /wisdom/Bricks/…/agents/…/holders/…`.
+      assert.ok(
+        brickPool.startsWith(os.tmpdir() + path.sep),
+        `the test pool must be a temp dir, got ${brickPool}`,
+      );
+      const seats = await fs.readdir(path.join(brickPool, CHILD_BRICK, "agents"));
+      assert.equal(
+        seats.length,
+        1,
+        "the child's agent folder was created in the TEST's brick pool",
+      );
     } finally {
       await fs.rm(path.dirname(scriptPath), { recursive: true, force: true });
+      await fs.rm(brickPool, { recursive: true, force: true });
       await fs.rm(cwd, { recursive: true, force: true });
     }
   });
@@ -5362,6 +5414,9 @@ async function waitFor<T>(fn: () => Promise<T | null>, timeoutMs: number): Promi
   throw lastError instanceof Error ? lastError : new Error("Timed out waiting for condition");
 }
 
+/** A pool that is never created: `resolveExistingBrickPath` stats it, finds nothing, and no folder is made. */
+const EMPTY_BRICK_POOL_DIR = path.join(os.tmpdir(), "acpx-integration-empty-brick-pool");
+
 async function runCli(
   args: string[],
   homeDir: string,
@@ -5398,6 +5453,16 @@ async function runCliWithEntry(
       if (!Object.prototype.hasOwnProperty.call(options.env ?? {}, key)) {
         delete env[key];
       }
+    }
+    // ⚠️ THE BRICK POOL IS NOT AMBIENT STATE: a box exports ACPX_BRICK_POOL_DIR=/wisdom/Bricks into every
+    // agent shell, and `brick-link.ts brickPoolDir()` honours it by design, so a CLI child that inherited
+    // it resolved `--brick <uuid>` against the LIVE pool and `resolveAndEnsureAgentFolder` then
+    // `mkdir -p`'d `<brick>/agents/<seat8>/holders/<session8>` there (ENOENT on a read-only workbench
+    // /wisdom; litter in the real pool on the control pod — brick e65acef5). A test that needs a pool
+    // passes its own in `options.env` (see PRIMER child-brick test); every other run gets one that
+    // contains no bricks, so nothing resolves and nothing is created.
+    if (!Object.prototype.hasOwnProperty.call(options.env ?? {}, "ACPX_BRICK_POOL_DIR")) {
+      env.ACPX_BRICK_POOL_DIR = EMPTY_BRICK_POOL_DIR;
     }
     const child = spawn(process.execPath, [entryPath, ...args], {
       env,

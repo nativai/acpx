@@ -11,14 +11,13 @@
 // The next prompt cold-resumes (same CLAUDE_CONFIG_DIR → in-place transcript
 // reused, so context is preserved) and replays the desired value, which sticks.
 //
-// brick 6e27669f: that recycle now applies to LEGACY owners only (a lease without
-// `settingsRebind`). A capable owner is never stopped by a set — it rebinds its client
-// at its next turn start (test/settings-rebind.test.ts) — so each WARM row runs twice.
+// brick 6e27669f: a live owner is never stopped by a set any more — it rebinds its client
+// at its next turn start (test/settings-rebind.test.ts). Brick 1281e50e removed the legacy
+// recycle of pre-fix owners, so the WARM rows assert only that outcome.
 //
 // These lock the deterministic seams (same shape/philosophy as the W12-19 suite
 // in spawn-flag-correctness-regression.test.ts):
-//   T5.1/T5.2 WARM: a legacy owner is terminated, ownerRestarted=true; a capable
-//             owner survives with ownerRebind="next-turn"; either way the desired
+//   T5.1/T5.2 WARM: the owner survives with ownerRebind="next-turn", and the desired
 //             value (incl. the session_options.effort sync) is persisted.
 //   T5.3/T5.4 TURN-IN-FLIGHT: a change with a turn in flight is REFUSED (the
 //             TURN_IN_FLIGHT detailCode acpx-ui maps to 409) and the owner survives.
@@ -69,16 +68,6 @@ async function collectSrcTsFiles(root: string): Promise<string[]> {
   return entries
     .filter((entry) => entry.isFile() && entry.name.endsWith(".ts"))
     .map((entry) => path.join(entry.parentPath, entry.name));
-}
-
-async function waitUntilDead(pid: number, timeoutMs = 2_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() <= deadline) {
-    if (!isProcessAlive(pid)) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
 }
 
 function sessionFilePath(homeDir: string, acpxRecordId: string): string {
@@ -141,36 +130,20 @@ async function plantLiveOwner(
   homeDir: string,
   sessionId: string,
   server: ReturnType<typeof createSingleRequestServer>,
-  kind: OwnerKind = "legacy",
 ): Promise<{ keeper: Keeper }> {
   const keeper = await startKeeperProcess();
   const { lockPath, socketPath } = queuePaths(homeDir, sessionId);
   await listenServer(server, socketPath);
   const processIdentity = keeper.pid ? await readQueueOwnerProcessIdentity(keeper.pid) : undefined;
   await writeQueueOwnerLock({ lockPath, pid: keeper.pid, sessionId, socketPath, processIdentity });
-  if (kind === "capable") {
-    // brick 6e27669f T-A2: the marker every lease of the fixed build carries.
-    const lease = JSON.parse(await fs.readFile(lockPath, "utf8")) as Record<string, unknown>;
-    await fs.writeFile(lockPath, `${JSON.stringify({ ...lease, settingsRebind: 1 })}\n`, "utf8");
-  }
   return { keeper };
 }
 
-type OwnerKind = "legacy" | "capable";
-
-/** A legacy owner is recycled (as before 6e27669f); a capable one survives and rebinds. */
-async function assertOwnerOutcome(
-  kind: OwnerKind,
+/** A set never stops a live owner: it survives and rebinds at its next turn start. */
+async function assertOwnerRebinds(
   result: { ownerRestarted?: boolean; ownerRebind?: string },
   keeper: Keeper,
 ): Promise<void> {
-  if (kind === "legacy") {
-    assert.equal(result.ownerRestarted, true);
-    assert.equal(result.ownerRebind, undefined);
-    await waitUntilDead(keeper.pid as number);
-    assert.equal(isProcessAlive(keeper.pid), false);
-    return;
-  }
   assert.equal(result.ownerRestarted, false);
   assert.equal(result.ownerRebind, "next-turn");
   await new Promise((resolve) => setTimeout(resolve, 100));
@@ -195,63 +168,61 @@ function seedRecord(
 // T5.1 / T5.2 — WARM recycle (the headline new behavior)
 // ---------------------------------------------------------------------------
 
-for (const kind of ["legacy", "capable"] as const) {
-  test(`T5.1 WARM (${kind}): set effort on a live idle owner — owner outcome, persisted`, async () => {
-    await withTempHome(async (homeDir) => {
-      const sessionId = `recycle-warm-effort-${kind}`;
-      const server = createMockOwnerServer(false); // turn NOT in flight
-      const { keeper } = await plantLiveOwner(homeDir, sessionId, server, kind);
-      await seedSessionJson(homeDir, seedRecord(homeDir, sessionId, {})); // genuine default
+test("T5.1 WARM: set effort on a live idle owner — owner survives and rebinds, persisted", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "recycle-warm-effort";
+    const server = createMockOwnerServer(false); // turn NOT in flight
+    const { keeper } = await plantLiveOwner(homeDir, sessionId, server);
+    await seedSessionJson(homeDir, seedRecord(homeDir, sessionId, {})); // genuine default
 
-      try {
-        const result = await setSessionConfigOption({
-          sessionId,
-          configId: "effort",
-          value: "low",
-          recycleOwner: true,
-        });
+    try {
+      const result = await setSessionConfigOption({
+        sessionId,
+        configId: "effort",
+        value: "low",
+        recycleOwner: true,
+      });
 
-        // Legacy: recycled so the next prompt cold-resumes + replays. Capable: rebinds.
-        await assertOwnerOutcome(kind, result, keeper);
-        // brick 5c44d8ba N7 (G7): a live owner is the owner arm, unchanged — and says so.
-        assert.equal(result.validatedAgainst, "adapter");
+      // The owner rebinds its client at the next turn, which replays the new value.
+      await assertOwnerRebinds(result, keeper);
+      // brick 5c44d8ba N7 (G7): a live owner is the owner arm, unchanged — and says so.
+      assert.equal(result.validatedAgainst, "adapter");
 
-        // Both fields persisted to DISK: desired_config_options.effort (replayed on
-        // resume) AND session_options.effort (read into the fresh owner's context).
-        const onDisk = await resolveSessionRecord(sessionId);
-        assert.equal(onDisk.acpx?.desired_config_options?.effort, "low");
-        assert.equal(onDisk.acpx?.session_options?.effort, "low");
-      } finally {
-        await closeServer(server);
-        stopProcess(keeper);
-      }
-    });
+      // Both fields persisted to DISK: desired_config_options.effort (replayed on
+      // resume) AND session_options.effort (read into the fresh owner's context).
+      const onDisk = await resolveSessionRecord(sessionId);
+      assert.equal(onDisk.acpx?.desired_config_options?.effort, "low");
+      assert.equal(onDisk.acpx?.session_options?.effort, "low");
+    } finally {
+      await closeServer(server);
+      stopProcess(keeper);
+    }
   });
+});
 
-  test(`T5.2 WARM (${kind}): set model on a live idle owner — owner outcome, persisted`, async () => {
-    await withTempHome(async (homeDir) => {
-      const sessionId = `recycle-warm-model-${kind}`;
-      const server = createMockOwnerServer(false);
-      const { keeper } = await plantLiveOwner(homeDir, sessionId, server, kind);
-      await seedSessionJson(homeDir, seedRecord(homeDir, sessionId, {}));
+test("T5.2 WARM: set model on a live idle owner — owner survives and rebinds, persisted", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "recycle-warm-model";
+    const server = createMockOwnerServer(false);
+    const { keeper } = await plantLiveOwner(homeDir, sessionId, server);
+    await seedSessionJson(homeDir, seedRecord(homeDir, sessionId, {}));
 
-      try {
-        const result = await setSessionModel({ sessionId, modelId: "sonnet", recycleOwner: true });
+    try {
+      const result = await setSessionModel({ sessionId, modelId: "sonnet", recycleOwner: true });
 
-        await assertOwnerOutcome(kind, result, keeper);
-        // brick 5c44d8ba N7 (G7): a live owner is the owner arm, unchanged — and says so.
-        assert.equal(result.validatedAgainst, "adapter");
+      await assertOwnerRebinds(result, keeper);
+      // brick 5c44d8ba N7 (G7): a live owner is the owner arm, unchanged — and says so.
+      assert.equal(result.validatedAgainst, "adapter");
 
-        const onDisk = await resolveSessionRecord(sessionId);
-        assert.equal(onDisk.acpx?.session_options?.model, "sonnet");
-        assert.equal(onDisk.acpx?.current_model_id, "sonnet");
-      } finally {
-        await closeServer(server);
-        stopProcess(keeper);
-      }
-    });
+      const onDisk = await resolveSessionRecord(sessionId);
+      assert.equal(onDisk.acpx?.session_options?.model, "sonnet");
+      assert.equal(onDisk.acpx?.current_model_id, "sonnet");
+    } finally {
+      await closeServer(server);
+      stopProcess(keeper);
+    }
   });
-}
+});
 
 // ---------------------------------------------------------------------------
 // T5.3 / T5.4 — TURN-IN-FLIGHT refusal (the 409 contract; owner must survive)
@@ -373,66 +344,63 @@ test("T5.4b TURN-IN-FLIGHT: set auto-failover with an active turn is refused; ow
 // (structural guard T5.1e below).
 // ---------------------------------------------------------------------------
 
-for (const kind of ["legacy", "capable"] as const) {
-  test(`T5.1c WARM (${kind}): set auto-failover on a live idle owner — owner outcome, persisted`, async () => {
-    await withTempHome(async (homeDir) => {
-      const sessionId = `recycle-warm-auto-failover-${kind}`;
-      const server = createMockOwnerServer(false); // turn NOT in flight
-      const { keeper } = await plantLiveOwner(homeDir, sessionId, server, kind);
-      // PROFILE-based record with the policy currently OFF (the pre-turn state a pin
-      // or an explicit `off` leaves; the `set on` below is the change that must stick).
-      await seedSessionJson(
-        homeDir,
-        seedRecord(homeDir, sessionId, {
-          session_options: { profile: "sub2", auto_failover: false },
-        }),
-      );
+test("T5.1c WARM: set auto-failover on a live idle owner — owner survives and rebinds, persisted", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "recycle-warm-auto-failover";
+    const server = createMockOwnerServer(false); // turn NOT in flight
+    const { keeper } = await plantLiveOwner(homeDir, sessionId, server);
+    // PROFILE-based record with the policy currently OFF (the pre-turn state a pin
+    // or an explicit `off` leaves; the `set on` below is the change that must stick).
+    await seedSessionJson(
+      homeDir,
+      seedRecord(homeDir, sessionId, {
+        session_options: { profile: "sub2", auto_failover: false },
+      }),
+    );
 
-      try {
-        const result = await setSessionAutoFailover({ sessionId, autoFailover: true });
+    try {
+      const result = await setSessionAutoFailover({ sessionId, autoFailover: true });
 
-        // Legacy: recycled so its stale snapshot can't revert the change. Capable: its
-        // pre-turn rebind does that instead.
-        await assertOwnerOutcome(kind, result, keeper);
+      // The owner's pre-turn rebind keeps its stale snapshot from reverting the change.
+      await assertOwnerRebinds(result, keeper);
 
-        const onDisk = await resolveSessionRecord(sessionId);
-        assert.equal(onDisk.acpx?.session_options?.auto_failover, true);
-        // The profile slot is untouched (the setter is a scoped policy edit).
-        assert.equal(onDisk.acpx?.session_options?.profile, "sub2");
-      } finally {
-        await closeServer(server);
-        stopProcess(keeper);
-      }
-    });
+      const onDisk = await resolveSessionRecord(sessionId);
+      assert.equal(onDisk.acpx?.session_options?.auto_failover, true);
+      // The profile slot is untouched (the setter is a scoped policy edit).
+      assert.equal(onDisk.acpx?.session_options?.profile, "sub2");
+    } finally {
+      await closeServer(server);
+      stopProcess(keeper);
+    }
   });
+});
 
-  test(`T5.1d WARM (${kind}): set auto-subscription on a live idle owner — owner outcome, persisted`, async () => {
-    await withTempHome(async (homeDir) => {
-      const sessionId = `recycle-warm-auto-subscription-${kind}`;
-      const server = createMockOwnerServer(false);
-      const { keeper } = await plantLiveOwner(homeDir, sessionId, server, kind);
-      await seedSessionJson(
-        homeDir,
-        seedRecord(homeDir, sessionId, {
-          session_options: { profile: "sub2", auto_subscription: false },
-        }),
-      );
+test("T5.1d WARM: set auto-subscription on a live idle owner — owner survives and rebinds, persisted", async () => {
+  await withTempHome(async (homeDir) => {
+    const sessionId = "recycle-warm-auto-subscription";
+    const server = createMockOwnerServer(false);
+    const { keeper } = await plantLiveOwner(homeDir, sessionId, server);
+    await seedSessionJson(
+      homeDir,
+      seedRecord(homeDir, sessionId, {
+        session_options: { profile: "sub2", auto_subscription: false },
+      }),
+    );
 
-      try {
-        const result = await setSessionAutoSubscription({ sessionId, autoSubscription: true });
+    try {
+      const result = await setSessionAutoSubscription({ sessionId, autoSubscription: true });
 
-        await assertOwnerOutcome(kind, result, keeper);
+      await assertOwnerRebinds(result, keeper);
 
-        const onDisk = await resolveSessionRecord(sessionId);
-        assert.equal(onDisk.acpx?.session_options?.auto_subscription, true);
-        assert.equal(onDisk.acpx?.session_options?.profile, "sub2");
-      } finally {
-        await closeServer(server);
-        stopProcess(keeper);
-      }
-    });
+      const onDisk = await resolveSessionRecord(sessionId);
+      assert.equal(onDisk.acpx?.session_options?.auto_subscription, true);
+      assert.equal(onDisk.acpx?.session_options?.profile, "sub2");
+    } finally {
+      await closeServer(server);
+      stopProcess(keeper);
+    }
   });
-}
+});
 
 // ---------------------------------------------------------------------------
 // T5.1e — MULTI-CALLER GUARD (structural; parity with T5.9). The auto-policy

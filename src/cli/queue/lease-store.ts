@@ -102,8 +102,10 @@ export type QueueOwnerRecord = {
   processIdentity?: QueueOwnerProcessIdentity;
   /** Pod name of the writer. Diagnostics only — no decision reads it. */
   host?: string;
-  /** See {@link ownerRebindsSettings}. */
+  /** Rollback guard, written never read: see {@link SETTINGS_REBIND_MARKER}. */
   settingsRebind?: 1;
+  /** See {@link ownerSupportsBatchSubmit}. */
+  protocolFeatures?: readonly string[];
 };
 
 export type QueueOwnerLease = {
@@ -115,6 +117,7 @@ export type QueueOwnerLease = {
   processIdentity?: QueueOwnerProcessIdentity;
   host?: string;
   settingsRebind?: 1;
+  protocolFeatures?: readonly string[];
 };
 
 export type QueueOwnerStatus = {
@@ -247,19 +250,42 @@ function parseQueueOwnerRecord(raw: unknown): QueueOwnerRecord | null {
     ...(processIdentity ? { processIdentity } : {}),
     ...(typeof record.host === "string" ? { host: record.host } : {}),
     ...(record.settingsRebind === 1 ? { settingsRebind: 1 as const } : {}),
+    ...protocolFeaturesField(record.protocolFeatures),
   };
 }
 
-/**
- * brick 6e27669f T-A2 — TRANSITIONAL. The owner behind this lease rebinds its client to a changed
- * record at its next turn start, so a settings verb must NOT stop it. Every lease this build creates
- * carries the marker from its first byte. A lease without it is a pre-fix owner still alive after
- * the deploy: it does not rebind, so the setters recycle it exactly as before.
- * Removal: brick 1281e50e, once every box has run the fix for at least a day.
- */
-export function ownerRebindsSettings(owner: QueueOwnerRecord | undefined | null): boolean {
-  return owner?.settingsRebind === 1;
+// Kept only as an array; within it, only the string entries (unknown feature names are kept).
+function protocolFeaturesField(value: unknown): { protocolFeatures?: readonly string[] } {
+  if (!Array.isArray(value)) {
+    return {};
+  }
+  return { protocolFeatures: value.filter((entry): entry is string => typeof entry === "string") };
 }
+
+/** The request types this build's owners understand beyond `submit_prompt` (UMQ K3). */
+export const OWNER_PROTOCOL_FEATURES: readonly string[] = ["submit_prompt_batch"];
+
+/**
+ * UMQ K3 — PERMANENT, not scaffolding. An owner started by an older acpx can live indefinitely
+ * (ttl 0, a live background task), and it answers an unknown request type under requestId
+ * "unknown" — which the client reads as a stale protocol and KILLS that owner (`ipc.ts`). So a
+ * `submit_prompt_batch` goes only to an owner whose lease lists it; never sent to find out.
+ */
+export function ownerSupportsBatchSubmit(owner: QueueOwnerRecord | undefined | null): boolean {
+  return owner?.protocolFeatures?.includes("submit_prompt_batch") === true;
+}
+
+/**
+ * ROLLBACK GUARD — WRITTEN, NEVER READ. Nothing in this build branches on it (the settings verbs
+ * never stop a live owner any more, so no build-time distinction is left to make). It stays on every
+ * new lease for one more release because production `main` 5c21f164 still READS it: that build's
+ * `set` recycles any owner whose lease lacks the marker, and a recycle kills a dequeued or starting
+ * prompt (the 6e27669f bug). A rollback, or a mixed-build window, would bring that back for owners
+ * this build spawned. Removal: https://atrium.devbox.nativai.de/?brick=c36e09c3
+ * ⚠️ DO NOT "CLEAN UP" THIS UNUSED-LOOKING CONSTANT — test/settings-rebind.test.ts (NA7) fails if a
+ * lease this build writes lacks it.
+ */
+export const SETTINGS_REBIND_MARKER = 1 as const;
 
 function hasValidQueueOwnerRecordFields(record: Record<string, unknown>): record is Record<
   string,
@@ -881,6 +907,7 @@ function leasePayload(lease: QueueOwnerLease, heartbeatAt: string, queueDepth: n
       ...(lease.processIdentity ? { processIdentity: lease.processIdentity } : {}),
       ...(lease.host ? { host: lease.host } : {}),
       ...(lease.settingsRebind ? { settingsRebind: lease.settingsRebind } : {}),
+      ...(lease.protocolFeatures ? { protocolFeatures: lease.protocolFeatures } : {}),
     },
     null,
     2,
@@ -933,7 +960,8 @@ async function acquireUnderGuard(
     ownerGeneration: createOwnerGeneration(),
     ...ownLeaseIdentity(),
     host: processHostName(),
-    settingsRebind: 1,
+    settingsRebind: SETTINGS_REBIND_MARKER,
+    protocolFeatures: OWNER_PROTOCOL_FEATURES,
   };
   // Exclusive hardlink acquire (port of 92cd5f8d): the lease never exists without its content.
   if (await tryCreateLockFile(lease.lockPath, leasePayload(lease, createdAt, 0))) {

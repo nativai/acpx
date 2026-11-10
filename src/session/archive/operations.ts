@@ -59,6 +59,7 @@ import {
 import { readArchiveRecord, type ArchiveRecordView } from "./record-view.js";
 import {
   anchorIdFor,
+  isRetentionCompanion,
   buildArchivePlan,
   encodeSessionSafeId,
   EMPTY_MANIFEST_VIEW,
@@ -540,11 +541,10 @@ export async function runRestore(
  * ⚠️ ON RESTORE, ANCHORS GO FIRST — THE EXACT REVERSE OF THE ARCHIVE ORDERING, AND
  * FOR THE SAME REASON.
  *
- * On the way out, the anchor's DEPARTURE arms acpx-ui's 5-minute
- * `sweepOrphanByways` hard-delete, so the anchor must leave last. On the way back,
- * the companion's ARRIVAL is what exposes it to that sweep — a byway sitting in the
- * hot dir whose anchor is still in the archive does not resolve, and is
- * hard-deleted within five minutes. So the anchor must arrive first.
+ * Companions are subagents only since brick 16732ad6 (by-the-way threads stopped
+ * being companions when acpx-ui removed its orphan sweep). A subagent restored ahead
+ * of its parent would sit hot beside a parent still in the archive, so the anchor
+ * arrives first.
  *
  * 🛑 SPEC GAP, REPORTED UPSTREAM, NOT SILENTLY REINTERPRETED: conception §6.2 and
  * §9.2 specify companion handling for the ARCHIVE direction only. This ordering
@@ -593,7 +593,8 @@ async function orderRestoreSet(
 }
 
 function companionAnchorOf(view: ArchiveRecordView): string | undefined {
-  if (!view.isByway && view.kind !== "subagent") {
+  // Subagents only — a by-the-way thread is restored on its own (brick 16732ad6).
+  if (!isRetentionCompanion(view)) {
     return undefined;
   }
   return anchorIdFor(view);
@@ -615,7 +616,7 @@ async function warnIfAnchorStaysArchived(
     return;
   }
   warnings.push(
-    `${companionId} is a byway/subagent of ${anchorId}, which is NOT being restored and is not in the hot dir. acpx-ui's sweepOrphanByways HARD-DELETES a byway whose anchor does not resolve, on a 5-minute cadence. Restore ${anchorId} as well, or expect ${companionId} to be destroyed.`,
+    `${companionId} is a subagent of ${anchorId}, which is NOT being restored and is not in the hot dir. Restore ${anchorId} as well, or ${companionId} comes back without its parent.`,
   );
 }
 

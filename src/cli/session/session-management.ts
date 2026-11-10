@@ -10,10 +10,7 @@ import {
 } from "../../acp/client.js";
 import { formatErrorMessage } from "../../acp/error-normalization.js";
 import { isAcpResourceNotFoundError } from "../../acp/error-shapes.js";
-import {
-  assertForkAtIndexHonoured,
-  resolveEffectiveForkIndex,
-} from "../../acp/harness-capabilities.js";
+import { assertForkAtIndexHonoured } from "../../acp/harness-capabilities.js";
 import { readTransientAdvertisement } from "../../acp/transient-advertisement.js";
 import { withInterrupt, withTimeout } from "../../async-control.js";
 import { effectiveCreateCwd } from "../../config/session-root.js";
@@ -35,6 +32,7 @@ import { withDefaultModelForNewSession } from "../../session/default-model.js";
 import { defaultSessionEventLog } from "../../session/event-log.js";
 import {
   setCurrentModelId,
+  setDesiredConfigOption,
   setDesiredModelId,
   syncAdvertisedModelState,
 } from "../../session/mode-preference.js";
@@ -80,7 +78,7 @@ import {
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import { explainSeatRowMissing } from "../../session/seat-backfill.js";
 import { withBrickCache } from "../../session/seat-brick.js";
-import type { SessionRecord } from "../../types.js";
+import type { SessionRecord, SessionSleepingState } from "../../types.js";
 import { resolveSessionBrickContext } from "./brick-link.js";
 import { DEFAULT_QUEUE_OWNER_TTL_MS } from "./contracts.js";
 import type {
@@ -94,6 +92,7 @@ import type {
 import {
   type LogIndexForkWindow,
   readFullSourceHistory,
+  resolveForkCutIndex,
   resolveLogIndexForkWindow,
 } from "./fork-at-log-index.js";
 
@@ -505,12 +504,15 @@ function resolveJoinedSeatBrickMetadata(
   return metadataWithSeatBrickLink(childMetadata, seatBrickId);
 }
 
-// eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
-async function createSessionRecordWithClient(
-  client: AcpClient,
-  options: SessionCreateOptions,
-): Promise<SessionRecord> {
-  const cwd = absolutePath(options.cwd);
+/**
+ * The refusals and the seat / brick reconciliation every create runs BEFORE anything exists —
+ * shared by the live create ({@link createSessionRecordWithClient}) and the sleeping one
+ * ({@link createSleepingSession}), so the two cannot drift apart.
+ */
+async function reconcileSeatAndBrickForCreate(
+  inputOptions: SessionCreateOptions,
+): Promise<SessionCreateOptions> {
+  let options = inputOptions;
   // BEFORE ANY WRITE, AND BEFORE THE AGENT IS EVEN STARTED (D11). A refusal that
   // fired after `client.start()` would leave a spawned adapter behind for a request
   // that was never going to be honoured.
@@ -549,15 +551,119 @@ async function createSessionRecordWithClient(
       ),
     };
   }
-  if (options.recordId) {
+  return options;
+}
+
+function assertRecordIdFree(recordId: string | undefined): void {
+  if (recordId) {
     // A plain existence check — it must not open the spawn ledger (that took the box-wide
     // SQLite write lock on every session creation, brick 750d674d).
-    if (existsSync(path.join(sessionBaseDir(), sessionRecordFileName(options.recordId)))) {
+    if (existsSync(path.join(sessionBaseDir(), sessionRecordFileName(recordId)))) {
       throw new Error(
         "record-id destination already exists; refusing to create another ACP session",
       );
     }
   }
+}
+
+/** The parent edge / provenance fields of a new record — shared by the live and the sleeping create. */
+function parentLinkageFields(
+  options: SessionCreateOptions,
+): Pick<
+  SessionRecord,
+  "kind" | "parentSessionId" | "parentSessionUrl" | "parentSeatId" | "spawnedBySessionId"
+> {
+  return {
+    ...(options.parentSessionId
+      ? {
+          kind: "session" as const,
+          parentSessionId: options.parentSessionId,
+          // Persist the parent's FULL url when we were given one. Without this the
+          // record keeps only the bare uuid, and a CROSS-BOX parent becomes
+          // unidentifiable the moment the spawn ends: the id resolves against
+          // whichever box happens to read it. (brick://c6e3618b)
+          ...(options.parentSessionUrl?.trim()
+            ? { parentSessionUrl: options.parentSessionUrl.trim() }
+            : {}),
+          // Mirrors parentSessionUrl immediately above, for the seat sibling
+          // (C3/D-B1-9): captured once at creation from the parent record then
+          // in hand (same-box only — see ResolvedParentSession.seatId in
+          // command-handlers.ts), used to compose ACPX_PARENT_SEAT_URL on
+          // every subsequent spawn of THIS record.
+          ...(options.parentSeatId?.trim() ? { parentSeatId: options.parentSeatId.trim() } : {}),
+        }
+      : {}),
+    // `--no-parent` (brick 5eaf316c): the creator as provenance only — no `kind`, no edge.
+    // Written here, at construction, where no `<id>.json` exists yet; every later write
+    // keeps it through `preserveParentLinkageForPersist` (disk wins).
+    ...(options.spawnedBySessionId?.trim()
+      ? { spawnedBySessionId: options.spawnedBySessionId.trim() }
+      : {}),
+  };
+}
+
+/** The seat row of a freshly minted record (D13) — shared by the live and the sleeping create. */
+async function mintSeatRowForNewRecord(
+  record: SessionRecord,
+  options: SessionCreateOptions,
+  seatFields: Pick<SessionRecord, "seatId" | "holderOrdinal" | "holderActive">,
+  now: string,
+): Promise<void> {
+  // 🛑 BELOW BOTH LEGS OF THE BRANCH ABOVE, DELIBERATELY. The fork leg writes through
+  // `writeSessionRecordAtBoundary` and the plain leg through `writeSessionRecord`; a mint
+  // placed under only one of them leaves `sessions copy`/fork on the old ordering — and it
+  // would look done, because the row still appears for `sessions new`.
+  // Only the FRESH-MINT path mints: `--seat` joined an existing row, and joining must
+  // never mint one (D13).
+  if (options.seatId === undefined && seatFields.seatId !== undefined) {
+    // 🛑 BEST-EFFORT AND LOUD (ratification item 8) — A STORE FAILURE MUST NOT FAIL THE
+    // SPAWN. Fail-closed here would be a bootstrap trap: every recovery path on these
+    // boxes runs through creating an agent session, so a corrupt store that stops
+    // `sessions new` stops its own repair. The `seat_id` STAYS on the record — it is what
+    // makes the session repairable by the backfill and what keeps its children's
+    // `parent_seat_id` chain from being orphaned.
+    const minted = await mintSeatRowBestEffort(sessionBaseDir(), {
+      seatId: seatFields.seatId,
+      holderId: record.acpxRecordId,
+      name: normalizeName(options.seatName),
+      createdAt: now,
+      // F1 fix (brick 3dff714d, DECISIONS.md) — the SEAT's brick_id is now
+      // written at mint time, from the same resolved value the holder's own
+      // `metadata.brick` already carries (set above by
+      // `withInheritedBrick`/`applyBrickFlag`). The holder's copy stays the
+      // derived projection; this is the canonical write C4 designates the seat
+      // row as needing, which nothing wrote before this fix.
+      //
+      // THE HINGE, brick `9984c510` — `options.explicitBrickFlagValidated` is
+      // the ONE signal that traces back to `resolveBrickFlagRef`'s own leg
+      // (healthy vs degraded): `true` only when an explicit `--brick` was
+      // actually RESOLVED by `brick show`. Every other source of
+      // `metadata.brick` here — no flag at all (ambient parent inheritance)
+      // — never ran a resolution THIS spawn, so it defaults to `false`,
+      // never validated-by-assumption (invariant (ii)'s spirit, carried
+      // forward to the write side).
+      brickId: seatBrickLinkFromRef(
+        options.metadata?.brick,
+        options.explicitBrickFlagValidated === true,
+      ),
+      favorite: options.seatFavorite === true,
+    });
+    if (!minted.minted) {
+      // BOTH LEGS — stderr AND the session stream (the ruling's "never a silent catch"),
+      // through the single writer that also serves path 3 and the divergence line.
+      await reportOperatorDiagnostic(record, minted.diagnostic);
+    }
+  }
+}
+
+// eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
+async function createSessionRecordWithClient(
+  client: AcpClient,
+  inputOptions: SessionCreateOptions,
+): Promise<SessionRecord> {
+  const cwd = absolutePath(inputOptions.cwd);
+  const options = await reconcileSeatAndBrickForCreate(inputOptions);
+  assertRecordIdFree(options.recordId);
   await withTimeout(client.start(), options.timeoutMs);
   let sessionId: string;
   let acpSessionId: string;
@@ -699,31 +805,7 @@ async function createSessionRecordWithClient(
             : { forkedAtMessageIndexRequested: forkContext.requestedForkAtMessageIndex }),
         }
       : {}),
-    ...(options.parentSessionId
-      ? {
-          kind: "session" as const,
-          parentSessionId: options.parentSessionId,
-          // Persist the parent's FULL url when we were given one. Without this the
-          // record keeps only the bare uuid, and a CROSS-BOX parent becomes
-          // unidentifiable the moment the spawn ends: the id resolves against
-          // whichever box happens to read it. (brick://c6e3618b)
-          ...(options.parentSessionUrl?.trim()
-            ? { parentSessionUrl: options.parentSessionUrl.trim() }
-            : {}),
-          // Mirrors parentSessionUrl immediately above, for the seat sibling
-          // (C3/D-B1-9): captured once at creation from the parent record then
-          // in hand (same-box only — see ResolvedParentSession.seatId in
-          // command-handlers.ts), used to compose ACPX_PARENT_SEAT_URL on
-          // every subsequent spawn of THIS record.
-          ...(options.parentSeatId?.trim() ? { parentSeatId: options.parentSeatId.trim() } : {}),
-        }
-      : {}),
-    // `--no-parent` (brick 5eaf316c): the creator as provenance only — no `kind`, no edge.
-    // Written here, at construction, where no `<id>.json` exists yet; every later write
-    // keeps it through `preserveParentLinkageForPersist` (disk wins).
-    ...(options.spawnedBySessionId?.trim()
-      ? { spawnedBySessionId: options.spawnedBySessionId.trim() }
-      : {}),
+    ...parentLinkageFields(options),
     ...(options.metadata && Object.keys(options.metadata).length > 0
       ? { metadata: { ...options.metadata } }
       : {}),
@@ -858,57 +940,121 @@ async function createSessionRecordWithClient(
   } else {
     await writeSessionRecord(record);
   }
-  // 🛑 BELOW BOTH LEGS OF THE BRANCH ABOVE, DELIBERATELY. The fork leg writes through
-  // `writeSessionRecordAtBoundary` and the plain leg through `writeSessionRecord`; a mint
-  // placed under only one of them leaves `sessions copy`/fork on the old ordering — and it
-  // would look done, because the row still appears for `sessions new`.
-  // Only the FRESH-MINT path mints: `--seat` joined an existing row, and joining must
-  // never mint one (D13).
-  if (options.seatId === undefined && seatFields.seatId !== undefined) {
-    // 🛑 BEST-EFFORT AND LOUD (ratification item 8) — A STORE FAILURE MUST NOT FAIL THE
-    // SPAWN. Fail-closed here would be a bootstrap trap: every recovery path on these
-    // boxes runs through creating an agent session, so a corrupt store that stops
-    // `sessions new` stops its own repair. The `seat_id` STAYS on the record — it is what
-    // makes the session repairable by the backfill and what keeps its children's
-    // `parent_seat_id` chain from being orphaned.
-    const minted = await mintSeatRowBestEffort(sessionBaseDir(), {
-      seatId: seatFields.seatId,
-      holderId: record.acpxRecordId,
-      name: normalizeName(options.seatName),
-      createdAt: now,
-      // F1 fix (brick 3dff714d, DECISIONS.md) — the SEAT's brick_id is now
-      // written at mint time, from the same resolved value the holder's own
-      // `metadata.brick` already carries (set above by
-      // `withInheritedBrick`/`applyBrickFlag`). The holder's copy stays the
-      // derived projection; this is the canonical write C4 designates the seat
-      // row as needing, which nothing wrote before this fix.
-      //
-      // THE HINGE, brick `9984c510` — `options.explicitBrickFlagValidated` is
-      // the ONE signal that traces back to `resolveBrickFlagRef`'s own leg
-      // (healthy vs degraded): `true` only when an explicit `--brick` was
-      // actually RESOLVED by `brick show`. Every other source of
-      // `metadata.brick` here — no flag at all (ambient parent inheritance)
-      // — never ran a resolution THIS spawn, so it defaults to `false`,
-      // never validated-by-assumption (invariant (ii)'s spirit, carried
-      // forward to the write side).
-      brickId: seatBrickLinkFromRef(
-        options.metadata?.brick,
-        options.explicitBrickFlagValidated === true,
-      ),
-      favorite: options.seatFavorite === true,
-    });
-    if (!minted.minted) {
-      // BOTH LEGS — stderr AND the session stream (the ruling's "never a silent catch"),
-      // through the single writer that also serves path 3 and the divergence line.
-      await reportOperatorDiagnostic(record, minted.diagnostic);
-    }
-  }
+  await mintSeatRowForNewRecord(record, options, seatFields, now);
   if (guardForced) {
     // Best-effort mirror (pushes the warning message + boundary-writes the sidecar)
     // — a write failure must never fail the spawn.
     await mirrorModelGuardToMessages(record, guardForced).catch(() => {});
   }
   return record;
+}
+
+/**
+ * UMQ K7 (CONCEPTION §6.1) — the record of a session that has not run yet.
+ *
+ * Writes exactly what a normal create writes (record, index entry, seat row, brick link, parent
+ * edge, requested model / effort / subscription / profile) with `acpSessionId: ""` and
+ * `acpx.sleeping`, and starts NOTHING: no `AcpClient`, no adapter spawn, no `session/new`, no
+ * fork, no model apply. The first wake materialises it (`runtime/engine/reconnect.ts`).
+ *
+ * ⚠️ The pins go where a live create puts them — `session_options` (model, effort, output style,
+ * credentials) and `desired_config_options` (effort, output style) — because the first wake
+ * replays exactly those; a pin written anywhere else would never be applied.
+ */
+export async function createSleepingSession(
+  inputOptions: SessionCreateOptions,
+): Promise<SessionRecord> {
+  const bound: SessionCreateOptions = {
+    ...inputOptions,
+    cwd: effectiveCreateCwd(inputOptions.cwd),
+    sessionOptions: await bindDefaultAccountToSessionOptionsAsync(
+      inputOptions.sessionOptions,
+      inputOptions.agentCommand,
+    ),
+  };
+  const options = await reconcileSeatAndBrickForCreate(bound);
+  assertRecordIdFree(options.recordId);
+  const sessionOptions = options.forkFromSessionId
+    ? options.sessionOptions
+    : withDefaultModelForNewSession(options.agentCommand, options.sessionOptions);
+  const now = isoNow();
+  const seatFields = seatFieldsForCreate(options.seatId);
+  const record = sleepingRecordOf(options, seatFields, now);
+  persistSleepingPins(record, options, sessionOptions);
+  const guardForced = spawnGuardForcedInfo(sessionOptions);
+  if (guardForced) {
+    stampModelGuardBreadcrumb(record, { ...guardForced, source: "inherited", at: now });
+  }
+  await writeSessionRecord(record);
+  await mintSeatRowForNewRecord(record, options, seatFields, now);
+  if (guardForced) {
+    await mirrorModelGuardToMessages(record, guardForced).catch(() => {});
+  }
+  return record;
+}
+
+/** The record of a session that has not run: `acpSessionId: ""`, `acpx.sleeping`, links as a live create. */
+function sleepingRecordOf(
+  options: SessionCreateOptions,
+  seatFields: Pick<SessionRecord, "seatId" | "holderOrdinal" | "holderActive">,
+  now: string,
+): SessionRecord {
+  const recordId = options.recordId ?? crypto.randomUUID();
+  const desired = cloneDesiredConfigOptions(options.desiredConfigOptions);
+  const record: SessionRecord = {
+    schema: "acpx.session.v1",
+    acpxRecordId: recordId,
+    acpSessionId: "",
+    agentSessionId: undefined,
+    agentName: options.agentName,
+    agentCommand: options.agentCommand,
+    cwd: absolutePath(options.cwd),
+    createdAt: now,
+    lastUsedAt: now,
+    lastSeq: 0,
+    lastRequestId: undefined,
+    eventLog: defaultSessionEventLog(recordId),
+    closed: false,
+    closedAt: undefined,
+    ...createSessionConversation(now),
+    acpx: {
+      ...(desired ? { desired_config_options: desired } : {}),
+      sleeping: sleepingMark(now, options.forkFromSessionId),
+    },
+    ...seatFields,
+    ...(options.forkFromSessionId
+      ? { kind: "session" as const, forkedFromSessionId: options.forkFromSessionId }
+      : {}),
+    ...parentLinkageFields(options),
+    ...(options.metadata && Object.keys(options.metadata).length > 0
+      ? { metadata: { ...options.metadata } }
+      : {}),
+  };
+  if (record.metadata?.spawn_key) {
+    record.metadata.spawn_state = "pending";
+  }
+  return record;
+}
+
+/** `acpx.sleeping` — and, for a copy, the template its first wake forks. */
+function sleepingMark(since: string, templateId: string | undefined): SessionSleepingState {
+  return { since, ...(templateId ? { fork: { from: templateId } } : {}) };
+}
+
+/** The pins a first wake will replay: durable `session_options`, owner options, desired effort / style. */
+function persistSleepingPins(
+  record: SessionRecord,
+  options: SessionCreateOptions,
+  sessionOptions: SessionCreateOptions["sessionOptions"],
+): void {
+  persistSessionOptions(record, sessionOptions);
+  persistSessionOwnerOptions(record, options);
+  if (sessionOptions?.reasoningEffort) {
+    setDesiredConfigOption(record, "effort", sessionOptions.reasoningEffort);
+  }
+  if (sessionOptions?.outputStyle) {
+    setDesiredConfigOption(record, "outputStyle", sessionOptions.outputStyle);
+  }
 }
 
 function cloneDesiredConfigOptions(
@@ -1132,7 +1278,12 @@ async function resolveForkSourceContext(options: SessionCreateOptions): Promise<
   // (`inheritedMessages` below), so the record's own
   // message COUNT agrees with the index it reports — the ground truth
   // `G1-FRK-01` checks the record against.
-  const forkAtMessageIndex = resolveEffectiveForkIndex(options.agentCommand, requested);
+  // UMQ R3: and never inside a batch (`resolveForkCutIndex`).
+  const forkAtMessageIndex = resolveForkCutIndex(
+    options.agentCommand,
+    sourceRecord.messages,
+    requested,
+  );
 
   return {
     sourceRecord,
@@ -1435,6 +1586,9 @@ function outputStyleListFromAdvertised(
 }
 
 export async function createSession(options: SessionCreateOptions): Promise<SessionRecord> {
+  if (options.sleeping) {
+    return await createSleepingSession(options);
+  }
   const { record, client } = await createSessionWithClient(options);
   try {
     return record;

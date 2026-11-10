@@ -75,6 +75,7 @@ import {
   type SessionsTemplateFlags,
   type StatusFlags,
 } from "./flags.js";
+import { registerGovernorCommand } from "./governor-command.js";
 import { registerModelsCommand } from "./models-command.js";
 import { registerPeopleCommand } from "./people-command.js";
 import { registerProfilesCommand } from "./profiles-command.js";
@@ -527,7 +528,9 @@ export function registerSessionsCommand(
     .option(
       "--no-prompt",
       "With --from-template: do not auto-fire the template's stored auto-prompt (create a pure copy).",
-    );
+    )
+    // UMQ K7 (CONCEPTION §6.1) — hidden: atrium's automated starts only (ACPX_ADMISSION_CLASS=automation).
+    .addOption(new Option("--sleeping").hideHelp());
   // `--prompt <text>` and `--no-prompt` share commander's ONE `prompt` key and the last one
   // wins, so "both given" cannot be read off the parsed flags; these record each occurrence.
   newCommand.on("option:prompt", () => newCommand.setOptionValue("promptTextGiven", true));
@@ -664,6 +667,8 @@ Closing your OWN session (run from inside it, e.g. --seat "$ACPX_SEAT_URL"):
         "(non-blocking). A relative path resolves against the directory you run acpx in, not --cwd",
       (value: string) => parseNonEmptyValue("Prompt file", value),
     )
+    // UMQ K7 (CONCEPTION §6.1) — hidden: atrium's automated starts only (ACPX_ADMISSION_CLASS=automation).
+    .addOption(new Option("--sleeping").hideHelp())
     .action(async function (this: Command, flags: SessionsCopyFlags) {
       await handleSessionsCopy(explicitAgentName, flags, this, config);
     });
@@ -1089,6 +1094,13 @@ export function registerSharedAgentSubcommands(
     "External prompt message identity to forward through ACP",
     parseMessageId,
   );
+  // UMQ K3 — atrium's one call for N waiting messages (CONTRACTS §1.1); not taught to agents.
+  promptCommand.addOption(
+    new Option(
+      "--batch-file <path>",
+      "Deliver a batch file v1 as ONE submission (use - for stdin); requires --no-wait",
+    ).hideHelp(),
+  );
   promptCommand.action(async function (this: Command, promptParts: string[], flags: PromptFlags) {
     await handlePrompt(explicitAgentName, promptParts, flags, this, config);
   });
@@ -1260,6 +1272,8 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
   registerCapacityCommand(program, config);
   // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS` (`"people"`, brick b0968426).
   registerPeopleCommand(program, config);
+  // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS` (`"governor"`, brick 5d7a23b6).
+  registerGovernorCommand(program, config);
   registerConfigCommand(program, config);
   registerFlowCommand(program, config);
 }

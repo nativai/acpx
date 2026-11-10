@@ -11,6 +11,7 @@ import { SESSION_RECORD_SCHEMA } from "../../types.js";
 import { defaultSessionEventLog } from "../event-log.js";
 import { normalizeSessionOwnerOptions } from "../owner-options.js";
 import { normalizeRuntimeSessionId } from "../runtime-session-id.js";
+import { rememberSessionDurableOptionsBaseline } from "./durable-options-merge.js";
 import { rememberSessionMetadataBaseline } from "./metadata-merge.js";
 import { rememberSessionModelBaseline } from "./model-merge.js";
 import { parseSeatFieldsFromPersistedRecord } from "./seat-fields.js";
@@ -318,6 +319,7 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
   const state: SessionAcpxState = {};
 
   assignBooleanTrue(state, "reset_on_next_ensure", record.reset_on_next_ensure);
+  assignSleeping(state, record.sleeping);
   assignStringState(state, "current_mode_id", record.current_mode_id);
   assignStringState(state, "desired_mode_id", record.desired_mode_id);
 
@@ -826,6 +828,22 @@ function assignLastTurnProvider(state: SessionAcpxState, value: unknown): void {
  * Both fields are required: an anchor that names no subscription or no time cannot
  * hold a session anywhere, so a malformed block is dropped (= outside the window).
  */
+// UMQ K7 — `acpx.sleeping`: kept only when well-formed, so a damaged value reads as "not sleeping"
+// (a record that does carry a real `acpSessionId` must never be mistaken for one that never ran).
+function assignSleeping(state: SessionAcpxState, value: unknown): void {
+  const record = asRecord(value);
+  if (!record || typeof record.since !== "string" || record.since.length === 0) {
+    return;
+  }
+  const fork = asRecord(record.fork);
+  state.sleeping = {
+    since: record.since,
+    ...(fork && typeof fork.from === "string" && fork.from.length > 0
+      ? { fork: { from: fork.from } }
+      : {}),
+  };
+}
+
 function assignLastTurnSubscription(state: SessionAcpxState, value: unknown): void {
   const record = asRecord(value);
   if (
@@ -1541,7 +1559,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     return null;
   }
 
-  return rememberSessionModelBaseline(
+  const parsedRecord = rememberSessionModelBaseline(
     rememberSessionMetadataBaseline({
       schema: SESSION_RECORD_SCHEMA,
       acpxRecordId: record.acpx_record_id,
@@ -1594,4 +1612,5 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
       ...seatFields,
     }),
   );
+  return rememberSessionDurableOptionsBaseline(parsedRecord);
 }

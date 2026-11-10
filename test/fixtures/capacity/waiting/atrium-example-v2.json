@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "writer": "atrium-3f9c2a1e",
+  "writtenAt": "2026-11-09T13:10:00.000Z",
+  "reason": {
+    "code": "no_capacity",
+    "live": 22,
+    "box": "devbox",
+    "at": "2026-11-09T13:09:58.000Z"
+  },
+  "items": [
+    {
+      "key": "delivery:5ea7c0de-0000-4000-8000-0000000000a1",
+      "kind": "delivery",
+      "ref": "5ea7c0de-0000-4000-8000-0000000000a1",
+      "to": "5ea7c0de-0000-4000-8000-0000000000a1",
+      "count": 1,
+      "label": "opening prompt → nightly-rebake",
+      "harness": "claude",
+      "since": "2026-11-09T13:02:00.000Z"
+    },
+    {
+      "key": "delivery:5ea7c0de-0000-4000-8000-0000000000a2",
+      "kind": "delivery",
+      "ref": "5ea7c0de-0000-4000-8000-0000000000a2",
+      "to": "5ea7c0de-0000-4000-8000-0000000000a2",
+      "count": 2,
+      "label": "2 messages → hod-wave9",
+      "harness": "claude",
+      "since": "2026-11-09T13:05:00.000Z"
+    },
+    {
+      "key": "delivery:5ea7c0de-0000-4000-8000-0000000000a3",
+      "kind": "delivery",
+      "ref": "5ea7c0de-0000-4000-8000-0000000000a3",
+      "to": "5ea7c0de-0000-4000-8000-0000000000a3",
+      "count": 1,
+      "label": "lane-a → parent-x",
+      "harness": "claude",
+      "since": "2026-11-09T13:09:00.000Z"
+    }
+  ]
+}

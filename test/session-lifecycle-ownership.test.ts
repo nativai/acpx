@@ -355,7 +355,7 @@ test("runQueuedTask rejects a closed session with SESSION_CLOSED (queued-prompt 
       responses.push(response);
     });
 
-    await runQueuedTask("queued-closed", task, {});
+    await runQueuedTask("queued-closed", [task], {});
 
     const errorResponse = responses.find((entry) => entry.type === "error");
     assert.ok(errorResponse, "queued task must produce an error response");

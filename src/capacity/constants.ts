@@ -33,6 +33,71 @@ export type CapacityConstants = {
   readonly budgetMinBytes: number;
   /** Leases older than this are not parsed: a live owner rewrites its lease every 5 s (§5). */
   readonly leaseFreshMs: number;
+  /** The runaway process-tree governor (CONCEPTION 5d7a23b6 §4, §13.2). */
+  readonly governor: GovernorConstants;
+};
+
+/**
+ * D1 (CONCEPTION 5d7a23b6 §14) is CONFIGURATION, in git. Daniel decided "(a)" on 2026-11-08: enforce
+ * both rules from the first deploy on each box, terminals and ssh logins governed (`decision/
+ * DECISION.md` in the brick). Changing `mode` or `governTerminals` is a one-line commit that ships by
+ * box refresh; the governor restarts itself on the new build (§7.2). `observe` survives only as a
+ * re-tuning value of `mode` (§13.1) — there is no runtime switch.
+ */
+export type GovernorConstants = {
+  /**
+   * `observe`: zero signals, zero in-band lines, zero seat messages — only `would_kill` events and
+   * log lines (§6). `enforce`: R1/R2 kill. Committed negative: test/governor-*.test.ts "U2".
+   */
+  readonly mode: "observe" | "enforce";
+  /**
+   * `false`: ttyd and VS Code terminal sessions (and sessions derived from them) are never signalled
+   * and never chosen by R2; they still appear in `scan` and `peaks`. ssh logins stay governed either
+   * way (CONCEPTION §18 C3: they are mostly agents on other boxes using ssh-remote).
+   */
+  readonly governTerminals: boolean;
+  /** R1: a governed session with at least this many live processes is killed at once. */
+  readonly maxGroupProcesses: number;
+  readonly scanIntervalMs: number;
+  readonly fastScanIntervalMs: number;
+  /** Fast mode starts when a governed session grows by this many processes between two scans… */
+  readonly fastGrowthProcesses: number;
+  /** …or first crosses this size, and lasts until no session has grown for `fastHoldMs`. */
+  readonly fastSizeProcesses: number;
+  readonly fastHoldMs: number;
+  /**
+   * §19 D3a — between scans, every `pidWatchIntervalMs` the governor reads the last pid allocated in its
+   * own pid namespace (`/proc/loadavg`, last field); `pidWatchTrigger` or more pids allocated since the
+   * LAST FULL SCAN (cumulative, so a storm trips it at any rate) force a scan at once and fast mode. 10 ms,
+   * not 50: measured on a ~8,000 processes/s doubling bomb (CONCEPTION §19 D3a); ~0.3 % of one CPU.
+   */
+  readonly pidWatchIntervalMs: number;
+  readonly pidWatchTrigger: number;
+  /**
+   * `/proc/<pid>/stat` reader threads (brick 07f4fde2): a read of a storm process mid-exec blocks in the
+   * kernel for 50–466 ms, so the scan reads with this many threads and a blocked one stalls only itself.
+   * Fixed, created at start-up. A reader silent `scanReaderStuckMs` inside a scan is left out of it.
+   */
+  readonly scanReaders: number;
+  readonly scanReaderStuckMs: number;
+  /** R2's victim must free at least `max(victimFloorBytes, victimFloorFraction × L)`. */
+  readonly victimFloorBytes: number;
+  readonly victimFloorFraction: number;
+  readonly emergencyKillSpacingMs: number;
+  readonly r2SkipWindowMs: number;
+  readonly sweepRounds: number;
+  readonly sweepRoundIntervalMs: number;
+  readonly terminalLeaderGraceMs: number;
+  readonly ownerCensusRefreshMs: number;
+  readonly ungovernedBurstProcesses: number;
+  readonly ungovernedBurstWindowMs: number;
+  readonly nice: number;
+  readonly messageDedupeMs: number;
+  readonly outboxTtlMs: number;
+  readonly outboxRetryMs: number;
+  /** A `pressure_no_victim` / `r2_blind` / `ungoverned_burst` event at most this often. */
+  readonly alarmRepeatMs: number;
+  readonly eventsRotateBytes: number;
 };
 
 export const CAPACITY_CONSTANTS: CapacityConstants = {
@@ -48,6 +113,36 @@ export const CAPACITY_CONSTANTS: CapacityConstants = {
   psiHold: 10,
   budgetMinBytes: 256 * MIB,
   leaseFreshMs: 5 * 60_000,
+  governor: {
+    mode: "enforce",
+    governTerminals: true,
+    maxGroupProcesses: 128,
+    scanIntervalMs: 1000,
+    fastScanIntervalMs: 100,
+    fastGrowthProcesses: 16,
+    fastSizeProcesses: 32,
+    fastHoldMs: 5000,
+    pidWatchIntervalMs: 10,
+    pidWatchTrigger: 16,
+    scanReaders: 4,
+    scanReaderStuckMs: 250,
+    victimFloorBytes: 256 * MIB,
+    victimFloorFraction: 0.025,
+    emergencyKillSpacingMs: 2000,
+    r2SkipWindowMs: 30_000,
+    sweepRounds: 10,
+    sweepRoundIntervalMs: 10,
+    terminalLeaderGraceMs: 60_000,
+    ownerCensusRefreshMs: 5000,
+    ungovernedBurstProcesses: 64,
+    ungovernedBurstWindowMs: 60_000,
+    nice: -20,
+    messageDedupeMs: 600_000,
+    outboxTtlMs: 3_600_000,
+    outboxRetryMs: 30_000,
+    alarmRepeatMs: 60_000,
+    eventsRotateBytes: 10 * MIB,
+  },
 };
 
 export function isHarness(value: string): value is Harness {

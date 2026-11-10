@@ -2,6 +2,30 @@ import fs from "node:fs";
 import path from "node:path";
 import { acpAdapterKind } from "../acp/agent-command.js";
 import { type Harness, isHarness } from "./constants.js";
+import {
+  factsOf,
+  freshLeaseFiles,
+  type LeaseExclusion,
+  listLeaseFiles,
+  type OwnerRecordFacts,
+  type ProcEntry,
+  parseStatusMemory,
+  readProcessTable,
+  readSessionRecord,
+  readText,
+  verifiedLeases,
+} from "./leases.js";
+
+// The lease and record pieces live in `leases.ts`, which imports no `node:child_process` path, so the
+// process-tree governor can use them without this module's harness classifier (`acpAdapterKind` →
+// `acp/agent-command`). Re-exported unchanged for every existing caller.
+export {
+  type LeaseExclusion,
+  type OwnerRecordFacts,
+  parseLeaseBody,
+  parseProcStat,
+  parseStatusMemory,
+} from "./leases.js";
 
 /**
  * The live-owner census: lease files → owner pid (verified by start time) → its process tree via
@@ -36,28 +60,6 @@ export type OwnerTree = {
   readonly facts?: OwnerRecordFacts;
 };
 
-/**
- * The live owner's record fields the wake gate needs: its seat succession (§3.3 — is the target a
- * fresh successor of this live seat-mate?) and its idleness (§3.4 make-room instrumentation). Read
- * by the census's one record parse, root-level snake_case on disk.
- */
-export type OwnerRecordFacts = {
-  readonly seatId?: string;
-  readonly holderOrdinal?: number;
-  readonly holderActive?: boolean;
-  readonly lastUsedAt?: string;
-  readonly lastPromptAt?: string;
-};
-
-export type LeaseExclusion =
-  | "unparsable"
-  | "dead"
-  | "identity-mismatch"
-  | "identity-unverified"
-  | "foreign"
-  /** A second fresh lease naming a pid already counted (fresh = live + Σ excluded always holds). */
-  | "duplicate-pid";
-
 export type OwnerCensus = {
   readonly owners: readonly OwnerTree[];
   /** Every `*.lock` in the queue dir — dead owners' leases pile up (372 on devbox, ~10 live). */
@@ -77,69 +79,6 @@ export type CensusInputs = {
   /** Never attributed to any owner: the reading process itself ({@link readReaderFootprint}). */
   readonly readerPid?: number;
 };
-
-type ProcEntry = { pid: number; ppid: number; startTicks: string };
-
-/** `/proc/<pid>/stat`: comm may hold spaces and ')' — fields are parsed after the LAST ')'. */
-export function parseProcStat(payload: string): ProcEntry | undefined {
-  const prefix = /^(\d+) \(/u.exec(payload);
-  const close = payload.lastIndexOf(")");
-  if (!prefix || close < 0) {
-    return undefined;
-  }
-  const fields = payload
-    .slice(close + 2)
-    .trim()
-    .split(/\s+/u);
-  // fields[0] = state (field 3), fields[1] = ppid (field 4), fields[19] = starttime (field 22).
-  const ppid = Number(fields[1]);
-  const startTicks = fields[19];
-  if (!Number.isSafeInteger(ppid) || !startTicks || !/^\d+$/u.test(startTicks)) {
-    return undefined;
-  }
-  return { pid: Number(prefix[1]), ppid, startTicks };
-}
-
-/** `RssAnon` + `VmPTE` in bytes. A kernel thread has neither: 0. */
-export function parseStatusMemory(payload: string): number {
-  let kb = 0;
-  for (const key of ["RssAnon", "VmPTE"]) {
-    const match = new RegExp(`^${key}:\\s+(\\d+)\\s+kB`, "mu").exec(payload);
-    if (match) {
-      kb += Number(match[1]);
-    }
-  }
-  return kb * 1024;
-}
-
-function readText(file: string): string | undefined {
-  try {
-    return fs.readFileSync(file, "utf8");
-  } catch {
-    return undefined;
-  }
-}
-
-function readProcessTable(procRoot: string): Map<number, ProcEntry> {
-  const table = new Map<number, ProcEntry>();
-  let names: string[];
-  try {
-    names = fs.readdirSync(procRoot);
-  } catch {
-    return table;
-  }
-  for (const name of names) {
-    if (!/^\d+$/u.test(name)) {
-      continue;
-    }
-    const raw = readText(path.join(procRoot, name, "stat"));
-    const entry = raw === undefined ? undefined : parseProcStat(raw);
-    if (entry && entry.pid === Number(name)) {
-      table.set(entry.pid, entry);
-    }
-  }
-  return table;
-}
 
 /**
  * The reading process ITSELF — `acpx capacity`, a ~50 MiB node process that sits inside the cgroup
@@ -163,78 +102,6 @@ export function readReaderFootprint(procRoot: string): ReaderFootprint {
   return { pid, bytes: status === undefined ? 0 : parseStatusMemory(status) };
 }
 
-function ownPidNamespace(procRoot: string): string | undefined {
-  try {
-    return fs.readlinkSync(path.join(procRoot, "self", "ns", "pid"));
-  } catch {
-    return undefined;
-  }
-}
-
-type LeaseBody = {
-  pid: number;
-  sessionId: string;
-  startTicks?: string;
-  pidNamespace?: string;
-};
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function parseJsonRecord(raw: string | undefined): Record<string, unknown> | undefined {
-  if (raw === undefined) {
-    return undefined;
-  }
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    return isRecord(parsed) ? parsed : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function isPid(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
-}
-
-/** Both on-disk identity spellings: the fork's `startTimeTicks` and upstream's `startTicks`. */
-function leaseIdentity(raw: unknown): Pick<LeaseBody, "startTicks" | "pidNamespace"> {
-  const identity = isRecord(raw) ? raw : {};
-  const ticks = identity.startTimeTicks ?? identity.startTicks;
-  return {
-    startTicks: typeof ticks === "string" && /^\d+$/u.test(ticks) ? ticks : undefined,
-    pidNamespace: typeof identity.pidNamespace === "string" ? identity.pidNamespace : undefined,
-  };
-}
-
-/** The lease body (`src/cli/queue/lease-store.ts` `leasePayload`). */
-export function parseLeaseBody(raw: string | undefined): LeaseBody | undefined {
-  const parsed = parseJsonRecord(raw);
-  if (!parsed || !isPid(parsed.pid)) {
-    return undefined;
-  }
-  const { sessionId } = parsed;
-  if (typeof sessionId !== "string" || sessionId.length === 0) {
-    return undefined;
-  }
-  return { pid: parsed.pid, sessionId, ...leaseIdentity(parsed.processIdentity) };
-}
-
-const stringField = (value: unknown): string | undefined =>
-  typeof value === "string" && value.length > 0 ? value : undefined;
-
-function factsOf(record: Record<string, unknown>): OwnerRecordFacts {
-  const ordinal = record.holder_ordinal;
-  return {
-    seatId: stringField(record.seat_id),
-    holderOrdinal: typeof ordinal === "number" && Number.isFinite(ordinal) ? ordinal : undefined,
-    holderActive: typeof record.holder_active === "boolean" ? record.holder_active : undefined,
-    lastUsedAt: stringField(record.last_used_at),
-    lastPromptAt: stringField(record.last_prompt_at),
-  };
-}
-
 /**
  * The harness from the session record's `agent_command` (unknown ⇒ charged the largest floor), and
  * the record's seat and idleness facts — one read.
@@ -243,10 +110,7 @@ function recordOfSession(
   sessionsDir: string,
   sessionId: string,
 ): { harness: Harness | "unknown"; facts?: OwnerRecordFacts } {
-  if (!/^[A-Za-z0-9._-]+$/u.test(sessionId)) {
-    return { harness: "unknown" };
-  }
-  const record = parseJsonRecord(readText(path.join(sessionsDir, `${sessionId}.json`)));
+  const record = readSessionRecord(sessionsDir, sessionId);
   if (!record) {
     return { harness: "unknown" };
   }
@@ -258,55 +122,12 @@ function recordOfSession(
   };
 }
 
-function listLeaseFiles(queueDir: string): string[] {
-  try {
-    return fs.readdirSync(queueDir).filter((name) => name.endsWith(".lock"));
-  } catch {
-    return [];
-  }
-}
-
-/**
- * The mtime prefilter: a stat-only pass costs ~6 ms where parsing all 372 leases on devbox cost
- * 122–530 ms (§5). The window is generous (5 min) — a stale heartbeat is not a dead process.
- */
-function freshLeaseFiles(inputs: CensusInputs, names: readonly string[]): string[] {
-  return names.filter((name) => {
-    try {
-      return inputs.nowMs - fs.statSync(path.join(inputs.queueDir, name)).mtimeMs <= inputs.freshMs;
-    } catch {
-      return false; // reaped between readdir and stat
-    }
-  });
-}
-
 function childrenByParent(table: ReadonlyMap<number, ProcEntry>): Map<number, number[]> {
   const children = new Map<number, number[]>();
   for (const entry of table.values()) {
     children.set(entry.ppid, [...(children.get(entry.ppid) ?? []), entry.pid]);
   }
   return children;
-}
-
-/** Why a parsed lease does NOT name a live owner here, or undefined when it does. */
-function judgeLease(
-  lease: LeaseBody,
-  table: ReadonlyMap<number, ProcEntry>,
-  ownNamespace: string | undefined,
-): LeaseExclusion | undefined {
-  // A pid names a process only inside ONE pid namespace (src/process-identity.ts): a lease
-  // written in another pod, or by a previous container, says nothing about the pid here.
-  if (lease.pidNamespace && ownNamespace && lease.pidNamespace !== ownNamespace) {
-    return "foreign";
-  }
-  const entry = table.get(lease.pid);
-  if (!entry) {
-    return "dead";
-  }
-  if (lease.startTicks === undefined) {
-    return "identity-unverified";
-  }
-  return entry.startTicks === lease.startTicks ? undefined : "identity-mismatch";
 }
 
 type TreeWalk = {
@@ -363,29 +184,6 @@ function measureTree(walk: TreeWalk, root: number): TreeMeasure {
     result.self ||= sawReader;
   }
   return result;
-}
-
-/** Pass 1: every fresh lease judged; the verified ones, one per pid, in a stable order. */
-function verifiedLeases(
-  inputs: CensusInputs,
-  fresh: readonly string[],
-  table: ReadonlyMap<number, ProcEntry>,
-  excluded: Record<LeaseExclusion, number>,
-): LeaseBody[] {
-  const ownNamespace = ownPidNamespace(inputs.procRoot);
-  const byPid = new Map<number, LeaseBody>();
-  for (const name of fresh) {
-    const lease = parseLeaseBody(readText(path.join(inputs.queueDir, name)));
-    const exclusion = lease ? judgeLease(lease, table, ownNamespace) : "unparsable";
-    if (exclusion) {
-      excluded[exclusion] += 1;
-    } else if (lease && byPid.has(lease.pid)) {
-      excluded["duplicate-pid"] += 1;
-    } else if (lease) {
-      byPid.set(lease.pid, lease);
-    }
-  }
-  return [...byPid.values()].toSorted((a, b) => a.pid - b.pid);
 }
 
 export function censusOwners(inputs: CensusInputs): OwnerCensus {

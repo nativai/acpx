@@ -18,6 +18,7 @@ import type {
   SessionEnqueueResult,
   SessionSendOutcome,
 } from "../../types.js";
+import type { BatchFileMember } from "../batch-file.js";
 import type { BackgroundTaskAnswer } from "../session/background-task-tracker.js";
 import { clearBackgroundTaskChipAfterReap } from "../session/owner-task-reap.js";
 import { probeQueueOwnerHealth, type QueueOwnerHealth } from "./ipc-health.js";
@@ -25,6 +26,7 @@ import type { QueueOwnerDrainReport } from "./ipc-server.js";
 import { connectToQueueOwner } from "./ipc-transport.js";
 import {
   type CloserTaskContext,
+  ownerSupportsBatchSubmit,
   type QueueOwnerRecord,
   readQueueOwnerRecord,
   readQueueOwnerState,
@@ -56,6 +58,7 @@ import {
   type QueueSetDepthRequest,
   type QueueSetModelRequest,
   type QueueSetModeRequest,
+  type QueueSubmitPromptBatchRequest,
   type QueueSubmitRequest,
 } from "./messages.js";
 
@@ -1070,6 +1073,201 @@ export async function trySubmitToRunningOwner(
   }
 
   throw notAcceptingRequestsError(health, "queue");
+}
+
+export type SubmitBatchToQueueOwnerOptions = Omit<
+  SubmitToQueueOwnerOptions,
+  "messageId" | "message" | "prompt" | "waitForCompletion" | "resumePolicy" | "ttlMs"
+> & {
+  members: BatchFileMember[];
+};
+
+/**
+ * UMQ K3 (CONTRACTS §1.4) — ONE submission for N messages. `submit_prompt_batch` goes ONLY to an
+ * owner whose lease lists it (`ownerSupportsBatchSubmit`); any other live owner gets one
+ * `submit_prompt` per member, in order, each awaiting its `accepted`. Never sent by trial: an older
+ * owner answers an unknown type under requestId "unknown", and the protocol-mismatch recovery in
+ * `trySubmitToRunningOwner` would then KILL it — so this path never runs that recovery for the batch.
+ * `undefined` = no usable owner (the caller cold-starts one of its own build, which supports it).
+ */
+export async function trySubmitBatchToRunningOwner(
+  options: SubmitBatchToQueueOwnerOptions,
+): Promise<SessionSendOutcome | undefined> {
+  const owner = await readQueueOwnerRecord(options.sessionId);
+  if (!owner) {
+    return undefined;
+  }
+  if (await recoverRecoverableOwnerBeforeSubmit(options)) {
+    return undefined;
+  }
+  if (!ownerSupportsBatchSubmit(owner)) {
+    return await submitBatchMemberByMember(owner, options);
+  }
+  const submitted = await submitBatchRecoveringShutdown(owner, options);
+  if (submitted !== "no-owner") {
+    return submitted;
+  }
+  return undefined;
+}
+
+// Only the shutting-down answer is recovered (nothing was accepted); NEVER a protocol mismatch.
+// "no-owner" = no usable owner (cold-start one of our own build).
+async function submitBatchRecoveringShutdown(
+  owner: QueueOwnerRecord,
+  options: SubmitBatchToQueueOwnerOptions,
+): Promise<SessionSendOutcome | "no-owner"> {
+  let submitted: SessionSendOutcome | undefined;
+  try {
+    submitted = await submitBatchToQueueOwner(owner, options);
+  } catch (error) {
+    const recovered =
+      isOwnerShutdownError(error) &&
+      (await recoverOwnerAfterShutdownError({
+        sessionId: options.sessionId,
+        owner,
+        detailCode: error.detailCode,
+        verbose: options.verbose,
+      }));
+    if (recovered) {
+      return "no-owner";
+    }
+    throw error;
+  }
+  if (submitted) {
+    return submitted;
+  }
+  const health = await probeQueueOwnerHealth(options.sessionId);
+  if (!health.hasLease) {
+    return "no-owner";
+  }
+  throw notAcceptingRequestsError(health, "queue");
+}
+
+// An owner of an older build: the members one by one, each its own `submit_prompt`, in order.
+// Once one was accepted the batch cannot be retried whole, so a later failure is the caller's error.
+async function submitBatchMemberByMember(
+  owner: QueueOwnerRecord,
+  options: SubmitBatchToQueueOwnerOptions,
+): Promise<SessionSendOutcome | undefined> {
+  let last: SessionSendOutcome | undefined;
+  for (const [index, member] of options.members.entries()) {
+    const outcome = await submitOneMember(owner, options, member, index);
+    if (!outcome) {
+      if (index === 0) {
+        return undefined;
+      }
+      throw new QueueConnectionError(
+        `Queue owner stopped accepting after ${index} of ${options.members.length} batch members`,
+        { detailCode: "QUEUE_DISCONNECTED_BEFORE_ACK", origin: "queue", retryable: true },
+      );
+    }
+    last = outcome;
+  }
+  options.onSubmitAccepted?.();
+  return last;
+}
+
+// One member as a plain `submit_prompt`. Only the FIRST may still fall back to a cold start (nothing
+// accepted yet); the usual recovery applies to it, since `submit_prompt` is a type every owner knows.
+async function submitOneMember(
+  owner: QueueOwnerRecord,
+  options: SubmitBatchToQueueOwnerOptions,
+  member: BatchFileMember,
+  index: number,
+): Promise<SessionSendOutcome | undefined> {
+  try {
+    return await submitToQueueOwner(owner, {
+      ...options,
+      messageId: member.messageId,
+      message: promptToLogText(member.prompt),
+      prompt: member.prompt,
+      ...member.options,
+      waitForCompletion: false,
+      onSubmitAccepted: undefined,
+    });
+  } catch (error) {
+    if (index === 0 && (await maybeRecoverSubmitFailure({ ...options, owner, error }))) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+function promptToLogText(prompt: PromptInput): string {
+  return prompt
+    .flatMap((block) => (block.type === "text" ? [block.text] : []))
+    .join("\n")
+    .trim();
+}
+
+async function submitBatchToQueueOwner(
+  owner: QueueOwnerRecord,
+  options: SubmitBatchToQueueOwnerOptions,
+): Promise<SessionSendOutcome | undefined> {
+  const requestId = randomUUID();
+  const request: QueueSubmitPromptBatchRequest = {
+    type: "submit_prompt_batch",
+    requestId,
+    ownerGeneration: owner.ownerGeneration,
+    members: options.members.map((member) => ({
+      messageId: member.messageId,
+      message: promptToLogText(member.prompt),
+      prompt: member.prompt,
+      ...(member.options !== undefined ? { options: member.options } : {}),
+    })),
+    permissionMode: options.permissionMode,
+    nonInteractivePermissions: options.nonInteractivePermissions,
+    permissionPolicy: options.permissionPolicy,
+    timeoutMs: options.timeoutMs,
+    suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
+    promptRetries: options.promptRetries ?? 0,
+    ...(options.codexSubscriptionCapWeeklyPercent !== undefined
+      ? { codexSubscriptionCapWeeklyPercent: options.codexSubscriptionCapWeeklyPercent }
+      : {}),
+    sessionOptions: options.sessionOptions,
+    waitForCompletion: false,
+  };
+  options.outputFormatter.setContext({ sessionId: options.sessionId });
+  const queued: SessionEnqueueResult = { queued: true, sessionId: options.sessionId, requestId };
+  return await runQueueOwnerRequest<SessionSendOutcome>({
+    owner,
+    request,
+    onAccepted: ({ resolve }) => {
+      options.onSubmitAccepted?.();
+      resolve(queued);
+    },
+    onMessage: (message, controls) => {
+      if (message.type === "error") {
+        controls.reject(
+          isOwnerShutdownDetailCode(message.detailCode)
+            ? queueConnectionErrorFromOwner(message, false)
+            : emitQueueOwnerError(
+                options.outputFormatter,
+                options.errorEmissionPolicy,
+                options.sessionId,
+                message,
+              ),
+        );
+        return;
+      }
+      controls.reject(
+        controls.state.acknowledged ? unexpectedQueueResponseError() : missingQueueAckError(),
+      );
+    },
+    onClose: ({ state, resolve, reject }) => {
+      if (state.acknowledged) {
+        resolve(queued);
+        return;
+      }
+      reject(
+        new QueueConnectionError("Queue owner disconnected before acknowledging request", {
+          detailCode: "QUEUE_DISCONNECTED_BEFORE_ACK",
+          origin: "queue",
+          retryable: true,
+        }),
+      );
+    },
+  });
 }
 
 export async function tryCloseSessionOnRunningOwner(options: {

@@ -56,6 +56,36 @@ export class AcpxOperationalError extends Error {
   }
 }
 
+/**
+ * UMQ K7 (CONCEPTION §6.2) — the one code for EVERY failure inside a sleeping session's first-wake
+ * materialisation: the adapter would not start, the model was unservable, credentials, the template is
+ * gone, the fork is unsupported. atrium classifies a failed delivery by its detail code, and a code it has
+ * no row for reads "outcome unknown — resending may duplicate it"; this one has a row
+ * (`not_delivered`, `resendSafe`, `never_reached`) because it is minted ONLY before the prompt reaches
+ * the model — before `accepted`, before `session/prompt` (test "N-A2-6 terminal").
+ */
+export const SESSION_MATERIALISATION_FAILED_DETAIL_CODE = "SESSION_MATERIALISATION_FAILED";
+
+export class SessionMaterialisationError extends AcpxOperationalError {
+  readonly sessionId: string;
+
+  // ⚠️ NO `cause` option: the output normalizer would surface the cause's bare message instead of this
+  // one. The cause's own text is quoted below.
+  constructor(sessionId: string, cause: unknown) {
+    super(
+      `Session ${sessionId} could not be started: ${cause instanceof Error ? cause.message : String(cause)}. ` +
+        `Nothing was sent to the agent; the session is still sleeping.`,
+      {
+        outputCode: "RUNTIME",
+        detailCode: SESSION_MATERIALISATION_FAILED_DETAIL_CODE,
+        origin: "runtime",
+        retryable: true,
+      },
+    );
+    this.sessionId = sessionId;
+  }
+}
+
 export class SessionNotFoundError extends AcpxOperationalError {
   readonly sessionId: string;
 
@@ -853,31 +883,6 @@ export class ConfigOptionTurnInFlightError extends AcpxOperationalError {
       {
         outputCode: "USAGE",
         detailCode: "TURN_IN_FLIGHT",
-        origin: "queue",
-      },
-    );
-  }
-}
-
-/**
- * brick://874fee67 — refuse a config change that would recycle the owner while
- * prompts are QUEUED BEHIND the active turn.
- *
- * Distinct from {@link ConfigOptionTurnInFlightError}: that one guards the turn
- * currently RUNNING. This one guards work already handed to the owner and
- * waiting. acpx has no persisted prompt queue — the owner's entire on-disk
- * footprint is a `.lock` and a `.sock`, so anything the owner holds in memory
- * dies with it. Deferring the recycle protects the active turn but not the
- * queue, so a recycle here would silently drop a prompt the user already sent.
- * Refusing turns that into a visible "try again when idle".
- */
-export class ConfigOptionQueuedWorkError extends AcpxOperationalError {
-  constructor(configId: string) {
-    super(
-      `Cannot change config option "${configId}" while work is queued on this session; the change would restart the agent and drop the queued prompt(s) — try again once the queue has drained (queued-work).`,
-      {
-        outputCode: "USAGE",
-        detailCode: "QUEUED_WORK",
         origin: "queue",
       },
     );

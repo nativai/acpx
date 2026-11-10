@@ -39,8 +39,9 @@ import {
   QUEUE_OWNER_CLOSING_MESSAGE,
   SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE,
 } from "./delivery-terminals.js";
-import { claimMainTurnOnSessionClose } from "./main-turn-delivery.js";
+import { type ClaimedMainTurnDelivery, claimMainTurnOnSessionClose } from "./main-turn-delivery.js";
 import {
+  type MemberTaskOptions,
   parseQueueRequest,
   type QueueDrainedDelivery,
   type QueueDrainReason,
@@ -62,6 +63,60 @@ type QueueOwnerSocketLease = {
   socketPath: string;
   ownerGeneration?: number;
 };
+
+// UMQ §5.2 — the options that shape a TURN. Tasks whose values differ cannot share one.
+const TURN_SHAPE_KEYS = [
+  "permissionMode",
+  "resumePolicy",
+  "nonInteractivePermissions",
+  "permissionPolicy",
+  "sessionOptions",
+  "timeoutMs",
+  "promptRetries",
+  "codexSubscriptionCapWeeklyPercent",
+  "suppressSdkConsoleErrors",
+  "waitForCompletion",
+] as const satisfies ReadonlyArray<keyof QueueTask>;
+
+function sameTurnShape(left: QueueTask, right: QueueTask): boolean {
+  return TURN_SHAPE_KEYS.every((key) => stableJson(left[key]) === stableJson(right[key]));
+}
+
+function stableJson(value: unknown): string {
+  if (value === undefined) {
+    return "undefined";
+  }
+  return JSON.stringify(value, (_key, inner: unknown) =>
+    inner && typeof inner === "object" && !Array.isArray(inner)
+      ? Object.fromEntries(Object.entries(inner).toSorted(([a], [b]) => a.localeCompare(b)))
+      : inner,
+  );
+}
+
+/** A slash command is never batched; neither is a task whose caller streams its own turn. */
+export function isSlashCommandPrompt(prompt: PromptInput): boolean {
+  const first = prompt[0];
+  return first?.type === "text" && first.text.trimStart().startsWith("/");
+}
+
+function isBatchable(task: QueueTask): boolean {
+  return !task.waitForCompletion && !isSlashCommandPrompt(task.prompt);
+}
+
+/** Whether `task` may ride the same turn as `head` (the one rule `nextBatch` and gather share). */
+export function canJoinBatch(head: QueueTask, task: QueueTask): boolean {
+  return isBatchable(head) && isBatchable(task) && sameTurnShape(head, task);
+}
+
+/** A member's own task options win over the call's (CONTRACTS §6.3). */
+function memberOptionsOverCall(options: MemberTaskOptions | undefined): Partial<QueueTask> {
+  if (!options) {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(options).filter(([, value]) => value !== undefined),
+  ) as Partial<QueueTask>;
+}
 
 async function isSocketPathMissing(socketPath: string): Promise<boolean> {
   if (process.platform === "win32") {
@@ -300,6 +355,9 @@ function deliveryStreamLine(
 
 export type QueueTask = {
   requestId: string;
+  // UMQ K3 — the submission this task arrived in (its request's requestId). The members of one
+  // `submit_prompt_batch` share it; queue depth counts SUBMISSIONS, so a batch is one entry.
+  submissionId?: string;
   messageId?: string;
   message: string;
   prompt: PromptInput;
@@ -402,8 +460,12 @@ export class SessionQueueOwner {
   private readonly maxQueueDepth: number;
   private readonly onQueueDepthChanged?: (queueDepth: number) => void;
   private readonly pending: QueueTask[] = [];
-  private readonly waiters: Array<(task: QueueTask | undefined) => void> = [];
-  private midTurnHandler?: (task: QueueTask) => boolean;
+  private readonly waiters: Array<(batch: QueueTask[] | undefined) => void> = [];
+  // UMQ §5.1 — a submission that arrives during a running turn is handed over WHOLE: a batch is
+  // ONE injected prompt. `midTurnAccepts` answers, without side effects, whether it would take one
+  // now — the depth check (before `accepted`) must not refuse what would never have queued.
+  private midTurnHandler?: (tasks: QueueTask[]) => boolean;
+  private midTurnAccepts?: () => boolean;
   // D1 — takes (and REMOVES) whatever the runtime is holding in its mid-turn
   // capture buffer. Custody lives in two places, so the drain must walk both
   // (corollary C-1); the runtime owns that array, so it injects the accessor.
@@ -597,17 +659,22 @@ export class SessionQueueOwner {
     }
   }
 
-  /** ABORT: back to normal service. A runtime parked in `nextTask` gets the oldest held item. */
+  /** ABORT: back to normal service. A runtime parked in `nextBatch` gets the batch at the head. */
   private abortClosePending(): void {
     this.closePending = false;
     // A concurrent (forced) close may have committed meanwhile: then nothing is handed out.
-    if (this.pending.length > 0 && !this.closed && !this.draining) {
-      const waiter = this.waiters.shift();
-      if (waiter) {
-        const task = this.pending.shift();
-        this.emitQueueDepth();
-        waiter(task);
-      }
+    this.wakeWaiterWithPendingBatch();
+  }
+
+  // UMQ §5.1 — a parked runtime is woken with the WHOLE batch at the head of `pending`, never its
+  // first task alone.
+  private wakeWaiterWithPendingBatch(): void {
+    if (this.pending.length === 0 || this.closed || this.draining || this.closePending) {
+      return;
+    }
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter(this.takePendingBatch());
     }
   }
 
@@ -714,10 +781,15 @@ export class SessionQueueOwner {
     if (this.drainCause !== "session-close") {
       return 0;
     }
+    // UMQ §5.3 — every member of a batch turn the close cut, each through its own claim.
     const claimed = claimMainTurnOnSessionClose(this.sessionId);
-    if (!claimed) {
-      return 0;
+    for (const delivery of claimed) {
+      this.writeMainTurnCloseTerminal(delivery);
     }
+    return claimed.length;
+  }
+
+  private writeMainTurnCloseTerminal(claimed: ClaimedMainTurnDelivery): void {
     if (claimed.ownEnd) {
       // The turn had already ANSWERED on its own (`ownEnd` is recorded the moment the response arrives); the
       // close only cut the runtime's write. That turn's own `done`, with its stopReason — never the close's code.
@@ -726,7 +798,7 @@ export class SessionQueueOwner {
         ...(claimed.ownEnd.steered ? { steered: true } : {}),
         ...(claimed.ownEnd.recoveredBy ? { recoveredBy: claimed.ownEnd.recoveredBy } : {}),
       });
-      return 1;
+      return;
     }
     if (claimed.consumed) {
       // brick e09628a1 (R-CONSUMED) — the model had consumed the prompt before the close cut its turn: delivered,
@@ -741,7 +813,7 @@ export class SessionQueueOwner {
         ),
         { stopReason: CONSUMED_BEFORE_CUT },
       );
-      return 1;
+      return;
     }
     // brick e50e171d (Daniel, 2026-10-11) — the main was ACCEPTED (it is registered only after its `accepted`
     // event) and a deliberate close ended its turn: delivered by rule. The note keeps the close's code.
@@ -752,7 +824,6 @@ export class SessionQueueOwner {
       deliveredAtCloseNote(SESSION_CLOSED_TURN_CANCELLED_DETAIL_CODE),
       { stopReason: DELIVERED_AT_CLOSE },
     );
-    return 1;
   }
 
   isDraining(): boolean {
@@ -897,7 +968,12 @@ export class SessionQueueOwner {
     return true;
   }
 
-  async nextTask(timeoutMs?: number): Promise<QueueTask | undefined> {
+  /**
+   * UMQ §5.2 — the next turn's batch: the contiguous run of pending tasks from the head whose
+   * turn-shaping options equal the head's (`sameTurnShape`). A slash command or a task whose caller
+   * waits for its own turn is always a batch of one.
+   */
+  async nextBatch(timeoutMs?: number): Promise<QueueTask[] | undefined> {
     // A draining owner never STARTS new work (KD-2 / C-2). Without this a turn
     // that settles during the drain would let the runtime pull the very task the
     // drain is about to terminalize, inject it, and then have it killed by the
@@ -913,18 +989,13 @@ export class SessionQueueOwner {
       return undefined;
     }
     if (!this.draining && !this.closePending && this.pending.length > 0) {
-      const task = this.pending.shift();
-      this.emitQueueDepth();
-      if (task) {
-        recordPerfDuration("queue.owner.wait_ms", Date.now() - task.enqueuedAt);
-      }
-      return task;
+      return this.takePendingBatch();
     }
     if (this.closed) {
       return undefined;
     }
 
-    return await new Promise<QueueTask | undefined>((resolve) => {
+    return await new Promise<QueueTask[] | undefined>((resolve) => {
       const shouldTimeout = timeoutMs != null;
       const timer =
         shouldTimeout &&
@@ -939,27 +1010,50 @@ export class SessionQueueOwner {
           Math.max(0, timeoutMs),
         );
 
-      const waiter = (task: QueueTask | undefined) => {
+      const waiter = (batch: QueueTask[] | undefined) => {
         if (timer) {
           clearTimeout(timer);
         }
-        resolve(task);
+        resolve(batch);
       };
 
       this.waiters.push(waiter);
     });
   }
 
+  private takePendingBatch(): QueueTask[] {
+    const head = this.pending[0];
+    let count = 1;
+    if (head && isBatchable(head)) {
+      while (count < this.pending.length && canJoinBatch(head, this.pending[count])) {
+        count += 1;
+      }
+    }
+    const batch = this.pending.splice(0, count);
+    this.emitQueueDepth();
+    for (const task of batch) {
+      recordPerfDuration("queue.owner.wait_ms", Date.now() - task.enqueuedAt);
+    }
+    return batch;
+  }
+
   queueDepth(): number {
     return this.pending.length;
   }
 
-  setMidTurnHandler(handler: (task: QueueTask) => boolean): void {
+  /** Queued SUBMISSIONS — the unit `maxQueueDepth` counts (a batch is one; CONTRACTS §1.5). */
+  private pendingSubmissions(): number {
+    return new Set(this.pending.map((task) => task.submissionId ?? task.requestId)).size;
+  }
+
+  setMidTurnHandler(handler: (tasks: QueueTask[]) => boolean, accepts?: () => boolean): void {
     this.midTurnHandler = handler;
+    this.midTurnAccepts = accepts;
   }
 
   clearMidTurnHandler(): void {
     this.midTurnHandler = undefined;
+    this.midTurnAccepts = undefined;
   }
 
   requeue(task: QueueTask): void {
@@ -986,25 +1080,39 @@ export class SessionQueueOwner {
     this.onQueueDepthChanged?.(this.pending.length);
   }
 
-  private injectMidTurn(task: QueueTask): boolean {
-    return !this.deferredClose && this.midTurnHandler?.(task) === true;
+  private injectMidTurn(tasks: QueueTask[]): boolean {
+    return !this.deferredClose && this.midTurnHandler?.(tasks) === true;
   }
 
-  private enqueue(task: QueueTask): void {
+  // UMQ §1.5 — would this submission land in `pending`? Not when a running turn takes it as an
+  // injection or a parked runtime takes it at once: those were never refused for depth.
+  private submissionWouldQueue(): boolean {
+    const injects = !this.deferredClose && this.midTurnAccepts?.() === true;
+    return !injects && this.waiters.length === 0;
+  }
+
+  private overDepth(): boolean {
+    return this.submissionWouldQueue() && this.pendingSubmissions() >= this.maxQueueDepth;
+  }
+
+  /** ONE submission — a single prompt or a whole batch — enqueued as a unit (UMQ §5.1). */
+  private enqueueSubmission(tasks: QueueTask[]): void {
     if (this.closed) {
-      if (task.waitForCompletion) {
-        task.send(
-          makeQueueOwnerError(
-            task.requestId,
-            "Queue owner is shutting down",
-            "QUEUE_OWNER_SHUTTING_DOWN",
-            {
-              retryable: true,
-            },
-          ),
-        );
+      for (const task of tasks) {
+        if (task.waitForCompletion) {
+          task.send(
+            makeQueueOwnerError(
+              task.requestId,
+              "Queue owner is shutting down",
+              "QUEUE_OWNER_SHUTTING_DOWN",
+              {
+                retryable: true,
+              },
+            ),
+          );
+        }
+        task.close();
       }
-      task.close();
       return;
     }
 
@@ -1012,36 +1120,13 @@ export class SessionQueueOwner {
     // into the active prompt turn instead of being queued — except while a deferred close waits
     // (brick 9d34a178): the turn is ending, so the task queues and the close's drain terminalizes
     // it SESSION_CLOSED_UNDELIVERED (sender told) — or it starts normally if the close fails open.
-    if (this.injectMidTurn(task)) {
+    if (this.injectMidTurn(tasks)) {
       return;
     }
 
-    const waiter = this.waiters.shift();
-    if (waiter) {
-      waiter(task);
-      return;
-    }
-
-    if (this.pending.length >= this.maxQueueDepth) {
-      if (task.waitForCompletion) {
-        task.send({
-          ...makeQueueOwnerError(
-            task.requestId,
-            `Queue owner is overloaded (${this.pending.length}/${this.maxQueueDepth} queued)`,
-            "QUEUE_OWNER_OVERLOADED",
-            {
-              retryable: true,
-            },
-          ),
-          ownerGeneration: this.ownerGeneration,
-        });
-      }
-      task.close();
-      return;
-    }
-
-    this.pending.push(task);
+    this.pending.push(...tasks);
     this.emitQueueDepth();
+    this.wakeWaiterWithPendingBatch();
   }
 
   private handleControlRequest<TMessage extends QueueOwnerMessage>(options: {
@@ -1285,7 +1370,7 @@ export class SessionQueueOwner {
 
   private enqueuePromptRequest(
     socket: net.Socket,
-    request: Extract<QueueRequest, { type: "submit_prompt" }>,
+    request: Extract<QueueRequest, { type: "submit_prompt" | "submit_prompt_batch" }>,
   ): void {
     // A3 — the quiesce rejection (KD-4). Rejected BEFORE the `accepted` frame,
     // because `accepted` is what resolves a deliver-now submit as `{queued:true}`
@@ -1317,25 +1402,57 @@ export class SessionQueueOwner {
       );
       return;
     }
+    // UMQ §1.5 — the depth check, BEFORE `accepted` for both request types (today an overflowing
+    // `--no-wait` task was accepted and then closed with no terminal). Depth counts submissions.
+    if (this.overDepth()) {
+      this.failRequest(
+        socket,
+        request.requestId,
+        `Queue owner is overloaded (${this.pendingSubmissions()}/${this.maxQueueDepth} queued)`,
+        "QUEUE_OWNER_OVERLOADED",
+        true,
+      );
+      return;
+    }
 
-    const task: QueueTask = {
+    const tasks = this.tasksForRequest(socket, request);
+    writeQueueMessage(socket, {
+      type: "accepted",
       requestId: request.requestId,
-      messageId: request.messageId,
-      message: request.message,
-      prompt: request.prompt ?? textPrompt(request.message),
-      permissionMode: request.permissionMode,
-      resumePolicy: request.resumePolicy,
-      nonInteractivePermissions: request.nonInteractivePermissions,
-      permissionPolicy: request.permissionPolicy,
-      timeoutMs: request.timeoutMs,
-      suppressSdkConsoleErrors: request.suppressSdkConsoleErrors,
-      promptRetries: request.promptRetries,
-      codexSubscriptionCapWeeklyPercent: request.codexSubscriptionCapWeeklyPercent,
-      sessionOptions: request.sessionOptions,
-      waitForCompletion: request.waitForCompletion,
-      ttlMs: request.ttlMs,
-      enqueuedAt: Date.now(),
-      send: (message) => {
+      ownerGeneration: this.ownerGeneration,
+    });
+    // ONE append for every member's marker: N concurrent fire-and-forget appends land in any order.
+    const at = new Date().toISOString();
+    const markers = tasks
+      .map(
+        (task) =>
+          `${JSON.stringify({
+            jsonrpc: "2.0",
+            method: "acpx/received",
+            params: {
+              requestId: task.requestId,
+              ...(task.messageId != null ? { messageId: task.messageId } : {}),
+              at,
+            },
+          })}\n`,
+      )
+      .join("");
+    void appendFile(sessionEventActivePath(this.sessionId), markers, "utf8").catch(() => {});
+
+    if (!request.waitForCompletion) {
+      socket.end();
+    }
+
+    this.enqueueSubmission(tasks);
+  }
+
+  private tasksForRequest(
+    socket: net.Socket,
+    request: Extract<QueueRequest, { type: "submit_prompt" | "submit_prompt_batch" }>,
+  ): QueueTask[] {
+    const enqueuedAt = Date.now();
+    const io = {
+      send: (message: QueueOwnerMessage) => {
         writeQueueMessage(socket, {
           ...message,
           ownerGeneration: this.ownerGeneration,
@@ -1347,28 +1464,43 @@ export class SessionQueueOwner {
         }
       },
     };
-
-    writeQueueMessage(socket, {
-      type: "accepted",
-      requestId: request.requestId,
-      ownerGeneration: this.ownerGeneration,
-    });
-    const marker = `${JSON.stringify({
-      jsonrpc: "2.0",
-      method: "acpx/received",
-      params: {
-        requestId: task.requestId,
-        ...(task.messageId != null ? { messageId: task.messageId } : {}),
-        at: new Date().toISOString(),
-      },
-    })}\n`;
-    void appendFile(sessionEventActivePath(this.sessionId), marker, "utf8").catch(() => {});
-
-    if (!request.waitForCompletion) {
-      task.close();
+    const call = {
+      permissionMode: request.permissionMode,
+      resumePolicy: request.resumePolicy,
+      nonInteractivePermissions: request.nonInteractivePermissions,
+      permissionPolicy: request.permissionPolicy,
+      timeoutMs: request.timeoutMs,
+      suppressSdkConsoleErrors: request.suppressSdkConsoleErrors,
+      promptRetries: request.promptRetries,
+      codexSubscriptionCapWeeklyPercent: request.codexSubscriptionCapWeeklyPercent,
+      sessionOptions: request.sessionOptions,
+      waitForCompletion: request.waitForCompletion,
+      ttlMs: request.ttlMs,
+      enqueuedAt,
+      submissionId: request.requestId,
+      ...io,
+    };
+    if (request.type === "submit_prompt") {
+      return [
+        {
+          ...call,
+          requestId: request.requestId,
+          messageId: request.messageId,
+          message: request.message,
+          prompt: request.prompt ?? textPrompt(request.message),
+        },
+      ];
     }
-
-    this.enqueue(task);
+    // A batch of ONE keeps the plain requestId (byte-identical to a single submit); N >= 2 members
+    // are `<requestId>#<i>`, 0-based (CONTRACTS §1.3).
+    return request.members.map((member, index) => ({
+      ...call,
+      ...memberOptionsOverCall(member.options),
+      requestId: request.members.length === 1 ? request.requestId : `${request.requestId}#${index}`,
+      messageId: member.messageId,
+      message: member.message,
+      prompt: member.prompt,
+    }));
   }
 
   private handleConnection(socket: net.Socket): void {
@@ -1414,7 +1546,7 @@ export class SessionQueueOwner {
       if (this.handleControlQueueRequest(socket, request)) {
         return;
       }
-      if (request.type !== "submit_prompt") {
+      if (request.type !== "submit_prompt" && request.type !== "submit_prompt_batch") {
         this.failRequest(
           socket,
           request.requestId,

@@ -452,7 +452,7 @@ test("ddd76838/7ada04b9: a steered delivery with ZERO frames records steered + t
     const sends: QueueOwnerMessage[] = [];
     const task = makeQueueTask("req-incident", MAIN_PROMPT_TEXT, messageId, (m) => sends.push(m));
 
-    await runQueuedTask(record.acpxRecordId, task, {
+    await runQueuedTask(record.acpxRecordId, [task], {
       sharedClient: control.client,
       suppressSdkConsoleErrors: true,
     });
@@ -508,7 +508,7 @@ test("7ada04b9: a steered delivery WITH two cosmetic frames still warns — the 
       sends.push(m),
     );
 
-    await runQueuedTask(record.acpxRecordId, task, {
+    await runQueuedTask(record.acpxRecordId, [task], {
       sharedClient: control.client,
       suppressSdkConsoleErrors: true,
     });
@@ -546,7 +546,7 @@ test("ddd76838 CONTROL: a normal turn with observed output records neither annot
     const sends: QueueOwnerMessage[] = [];
     const task = makeQueueTask("req-normal", MAIN_PROMPT_TEXT, messageId, (m) => sends.push(m));
 
-    await runQueuedTask(record.acpxRecordId, task, {
+    await runQueuedTask(record.acpxRecordId, [task], {
       sharedClient: control.client,
       suppressSdkConsoleErrors: true,
     });
@@ -576,7 +576,7 @@ test("ddd76838: a plain end_turn with ZERO frames still warns (the silent-adapte
     const sends: QueueOwnerMessage[] = [];
     const task = makeQueueTask("req-silent", MAIN_PROMPT_TEXT, messageId, (m) => sends.push(m));
 
-    await runQueuedTask(record.acpxRecordId, task, {
+    await runQueuedTask(record.acpxRecordId, [task], {
       sharedClient: control.client,
       suppressSdkConsoleErrors: true,
     });
@@ -618,23 +618,25 @@ test("ddd76838 CONTROL: an absorbed (codex) steer terminal gets no warning despi
       },
     });
     // The injection path needs the real mid-turn plumbing: capture the handler.
-    let midTurnHandler: ((task: QueueTask) => void) | undefined;
-    const setMidTurnHandler = (handler: ((task: QueueTask) => void) | undefined): void => {
+    let midTurnHandler: ((injected: QueueTask[]) => void) | undefined;
+    const setMidTurnHandler = (handler: ((injected: QueueTask[]) => void) | undefined): void => {
       if (handler !== undefined) {
         // Inject on a microtask so the injection lands while the main turn runs.
         queueMicrotask(() => {
-          midTurnHandler?.({
-            requestId: "req-absorbed",
-            messageId: injectedMessageId,
-            message: INJECTED_PROMPT_TEXT,
-            prompt: textPrompt(INJECTED_PROMPT_TEXT),
-            permissionMode: "approve-all",
-            timeoutMs: 10_000,
-            waitForCompletion: false,
-            enqueuedAt: Date.now(),
-            send: () => {},
-            close: () => {},
-          } satisfies QueueTask);
+          midTurnHandler?.([
+            {
+              requestId: "req-absorbed",
+              messageId: injectedMessageId,
+              message: INJECTED_PROMPT_TEXT,
+              prompt: textPrompt(INJECTED_PROMPT_TEXT),
+              permissionMode: "approve-all",
+              timeoutMs: 10_000,
+              waitForCompletion: false,
+              enqueuedAt: Date.now(),
+              send: () => {},
+              close: () => {},
+            } satisfies QueueTask,
+          ]);
         });
       }
       midTurnHandler = handler;
@@ -645,7 +647,7 @@ test("ddd76838 CONTROL: an absorbed (codex) steer terminal gets no warning despi
       sends.push(m),
     );
 
-    await runQueuedTask(record.acpxRecordId, task, {
+    await runQueuedTask(record.acpxRecordId, [task], {
       sharedClient: control.client,
       setMidTurnHandler,
       suppressSdkConsoleErrors: true,

@@ -466,6 +466,53 @@ function isPermanentPromptAcpError(acp: OutputErrorAcpPayload): boolean {
   );
 }
 
+/**
+ * UMQ §22.1 — the ONE error class that splits a batch: the recipient's context cannot hold the
+ * prompt. Every other failure keeps today's per-member handling, so a pattern here must name a
+ * context-size refusal and nothing broader (never a bare "context window": a model says that).
+ * Shapes per adapter (verification/R13.md §6):
+ * - claude-agent-acp: JSON-RPC -32603 `Internal error: Prompt is too long` (`data.errorKind`
+ *   "invalid_request" is shared with other 400s, so the TEXT decides);
+ * - codex-acp: the app-server input cap, -32603 with `data.details` `Input exceeds the maximum
+ *   length of 1048576 characters.`; its model-context overflow is NOT an error — it ends `end_turn`
+ *   with codex's own sentence as the turn's agent text (`isContextOverflowText`);
+ * - pi-acp: `end_turn` + `_meta.piAcp.turnError` carrying the provider's verbatim message, after pi's
+ *   own compact-and-retry failed (`isContextOverflowText` on the turn error).
+ */
+export const CONTEXT_OVERFLOW = "CONTEXT_OVERFLOW";
+
+const CONTEXT_OVERFLOW_PATTERNS: readonly RegExp[] = [
+  /prompt is too long/iu,
+  /context[_ ]length[_ ]exceeded/iu,
+  /maximum context length/iu,
+  /ran out of room in the model's context window/iu,
+  /exceeds? (?:the )?(?:model's )?context window/iu,
+  /context overflow recovery failed/iu,
+  /input exceeds the maximum length of \d+ characters/iu,
+];
+
+export function isContextOverflowText(text: string | undefined): boolean {
+  return text !== undefined && CONTEXT_OVERFLOW_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+// codex's own sentence, which is the WHOLE reply of a turn codex could not fit. Deliberately the
+// only pattern matched against a reply: a model may well write "prompt is too long" in a real answer.
+const CODEX_CONTEXT_OVERFLOW_REPLY = /ran out of room in the model's context window/iu;
+
+export function isCodexContextOverflowReply(reply: string): boolean {
+  return CODEX_CONTEXT_OVERFLOW_REPLY.test(reply);
+}
+
+export function isContextOverflowError(error: unknown): boolean {
+  const acp = extractAcpError(error);
+  const details = asRecord(acp?.data)?.details;
+  return (
+    isContextOverflowText(acp?.message) ||
+    (typeof details === "string" && isContextOverflowText(details)) ||
+    isContextOverflowText(formatErrorMessage(error))
+  );
+}
+
 export function exitCodeForOutputErrorCode(code: OutputErrorCode): ExitCode {
   switch (code) {
     case "USAGE":

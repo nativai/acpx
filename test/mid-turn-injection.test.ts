@@ -231,10 +231,10 @@ function makeMockClient(handlers: {
 // (non-undefined) registration. The handler is preserved verbatim so the
 // production injection path runs unmodified.
 type MidTurnControl = {
-  setMidTurnHandler: (handler: ((task: QueueTask) => void) | undefined) => void;
+  setMidTurnHandler: (handler: ((injected: QueueTask[]) => void) | undefined) => void;
   registrations: number;
   clears: number;
-  currentHandler: ((task: QueueTask) => void) | undefined;
+  currentHandler: ((injected: QueueTask[]) => void) | undefined;
 };
 
 function makeMidTurnControl(
@@ -357,7 +357,7 @@ async function runAttempt0InjectionScenario(): Promise<void> {
             },
           );
           queueMicrotask(() => {
-            ctrl.currentHandler?.(injectedTask);
+            ctrl.currentHandler?.([injectedTask]);
             // Settle the injected prompt once it has been initiated.
             injectedResponse.resolve({ stopReason: "end_turn" });
           });
@@ -375,7 +375,7 @@ async function runAttempt0InjectionScenario(): Promise<void> {
         },
       );
 
-      await runQueuedTask(record.acpxRecordId, mainTask, {
+      await runQueuedTask(record.acpxRecordId, [mainTask], {
         sharedClient: control.client,
         setMidTurnHandler: midTurn.setMidTurnHandler,
         promptRetries: 1,
@@ -472,7 +472,7 @@ async function runRetryInjectionScenario(): Promise<void> {
             },
           );
           queueMicrotask(() => {
-            ctrl.currentHandler?.(injectedTask);
+            ctrl.currentHandler?.([injectedTask]);
             injectedResponse.resolve({ stopReason: "end_turn" });
           });
         }
@@ -486,7 +486,7 @@ async function runRetryInjectionScenario(): Promise<void> {
         () => {},
       );
 
-      await runQueuedTask(record.acpxRecordId, mainTask, {
+      await runQueuedTask(record.acpxRecordId, [mainTask], {
         sharedClient: control.client,
         setMidTurnHandler: midTurn.setMidTurnHandler,
         promptRetries: 1,
@@ -561,7 +561,7 @@ async function runFireAndForgetInjectionWithoutTerminalResponseScenario(): Promi
             false,
           );
           queueMicrotask(() => {
-            ctrl.currentHandler?.(injectedTask);
+            ctrl.currentHandler?.([injectedTask]);
           });
         }
       });
@@ -578,7 +578,7 @@ async function runFireAndForgetInjectionWithoutTerminalResponseScenario(): Promi
       );
 
       await withRaceTimeout(
-        runQueuedTask(record.acpxRecordId, mainTask, {
+        runQueuedTask(record.acpxRecordId, [mainTask], {
           sharedClient: control.client,
           setMidTurnHandler: midTurn.setMidTurnHandler,
           suppressSdkConsoleErrors: true,
@@ -647,7 +647,7 @@ async function runClaudeNoWaitInjectionIsAwaitedScenario(): Promise<void> {
             false, // waitForCompletion:false — the UI/board --no-wait path.
           );
           queueMicrotask(() => {
-            ctrl.currentHandler?.(injectedTask);
+            ctrl.currentHandler?.([injectedTask]);
           });
         }
       });
@@ -663,7 +663,7 @@ async function runClaudeNoWaitInjectionIsAwaitedScenario(): Promise<void> {
         },
       );
 
-      const runPromise = runQueuedTask(record.acpxRecordId, mainTask, {
+      const runPromise = runQueuedTask(record.acpxRecordId, [mainTask], {
         sharedClient: control.client,
         setMidTurnHandler: midTurn.setMidTurnHandler,
         suppressSdkConsoleErrors: true,
@@ -751,7 +751,7 @@ async function runCodexNoWaitInjectionStaysFireAndForgetScenario(): Promise<void
             injectedMessageId,
           );
           queueMicrotask(() => {
-            ctrl.currentHandler?.(injectedTask);
+            ctrl.currentHandler?.([injectedTask]);
           });
         }
       });
@@ -770,7 +770,7 @@ async function runCodexNoWaitInjectionStaysFireAndForgetScenario(): Promise<void
       );
 
       await withRaceTimeout(
-        runQueuedTask(record.acpxRecordId, mainTask, {
+        runQueuedTask(record.acpxRecordId, [mainTask], {
           sharedClient: control.client,
           setMidTurnHandler: midTurn.setMidTurnHandler,
           suppressSdkConsoleErrors: true,
@@ -893,9 +893,9 @@ async function runCodexStackedNoWaitInjectionsGetTerminalsScenario(): Promise<vo
             injectedMessageIdB,
           );
           queueMicrotask(() => {
-            ctrl.currentHandler?.(firstInjectedTask);
+            ctrl.currentHandler?.([firstInjectedTask]);
             void firstInjectionInitiated.promise.then(() => {
-              ctrl.currentHandler?.(secondInjectedTask);
+              ctrl.currentHandler?.([secondInjectedTask]);
             });
           });
         }
@@ -910,7 +910,7 @@ async function runCodexStackedNoWaitInjectionsGetTerminalsScenario(): Promise<vo
         mainMessageId,
       );
 
-      await runQueuedTask(record.acpxRecordId, mainTask, {
+      await runQueuedTask(record.acpxRecordId, [mainTask], {
         sharedClient: control.client,
         setMidTurnHandler: midTurn.setMidTurnHandler,
         suppressSdkConsoleErrors: true,
@@ -998,7 +998,7 @@ async function runCodexNoWaitInjectionFailsWithContainingTurnScenario(): Promise
             injectedMessageId,
           );
           queueMicrotask(() => {
-            ctrl.currentHandler?.(injectedTask);
+            ctrl.currentHandler?.([injectedTask]);
           });
         }
       });
@@ -1013,7 +1013,7 @@ async function runCodexNoWaitInjectionFailsWithContainingTurnScenario(): Promise
         mainMessageId,
       );
 
-      await runQueuedTask(record.acpxRecordId, mainTask, {
+      await runQueuedTask(record.acpxRecordId, [mainTask], {
         sharedClient: control.client,
         setMidTurnHandler: midTurn.setMidTurnHandler,
         suppressSdkConsoleErrors: true,
@@ -1111,7 +1111,7 @@ test("runQueuedTask emits active before prompt execution and idle after completi
         () => {},
       );
 
-      await runQueuedTask(record.acpxRecordId, mainTask, {
+      await runQueuedTask(record.acpxRecordId, [mainTask], {
         sharedClient: control.client,
         suppressSdkConsoleErrors: true,
       });
@@ -1166,7 +1166,7 @@ test("runQueuedTask emits subscription and effort in acpx/turn params", async ()
         () => {},
       );
 
-      await runQueuedTask(record.acpxRecordId, mainTask, {
+      await runQueuedTask(record.acpxRecordId, [mainTask], {
         sharedClient: control.client,
         suppressSdkConsoleErrors: true,
       });
@@ -1218,7 +1218,7 @@ test("idle marker waits for pending mid-turn injected prompt drain", async () =>
             injectedMessageId,
           );
           queueMicrotask(() => {
-            ctrl.currentHandler?.(injectedTask);
+            ctrl.currentHandler?.([injectedTask]);
           });
         }
       });
@@ -1233,7 +1233,7 @@ test("idle marker waits for pending mid-turn injected prompt drain", async () =>
         mainMessageId,
       );
 
-      const runPromise = runQueuedTask(record.acpxRecordId, mainTask, {
+      const runPromise = runQueuedTask(record.acpxRecordId, [mainTask], {
         sharedClient: control.client,
         setMidTurnHandler: midTurn.setMidTurnHandler,
         suppressSdkConsoleErrors: true,
@@ -1303,7 +1303,7 @@ test("mid-turn prompt injection threads messageId and emits delivery events", as
             injectedMessageId,
           );
           setTimeout(() => {
-            ctrl.currentHandler?.(injectedTask);
+            ctrl.currentHandler?.([injectedTask]);
           }, 10);
         }
       });
@@ -1318,7 +1318,7 @@ test("mid-turn prompt injection threads messageId and emits delivery events", as
         mainMessageId,
       );
 
-      await runQueuedTask(record.acpxRecordId, mainTask, {
+      await runQueuedTask(record.acpxRecordId, [mainTask], {
         sharedClient: control.client,
         setMidTurnHandler: midTurn.setMidTurnHandler,
         suppressSdkConsoleErrors: true,
@@ -1426,7 +1426,7 @@ test("runQueuedTask deduplicates a repeated messageId before invoking the agent"
         true,
         messageId,
       );
-      await runQueuedTask(record.acpxRecordId, firstTask, {
+      await runQueuedTask(record.acpxRecordId, [firstTask], {
         sharedClient: control.client,
         suppressSdkConsoleErrors: true,
       });
@@ -1440,7 +1440,7 @@ test("runQueuedTask deduplicates a repeated messageId before invoking the agent"
         true,
         messageId,
       );
-      await runQueuedTask(record.acpxRecordId, duplicateTask, {
+      await runQueuedTask(record.acpxRecordId, [duplicateTask], {
         sharedClient: control.client,
         suppressSdkConsoleErrors: true,
       });
@@ -1514,7 +1514,7 @@ test("runQueuedTask does not deduplicate a messageId whose first turn failed bef
         true,
         messageId,
       );
-      await runQueuedTask(record.acpxRecordId, firstTask, {
+      await runQueuedTask(record.acpxRecordId, [firstTask], {
         sharedClient: control.client,
         suppressSdkConsoleErrors: true,
       });
@@ -1531,7 +1531,7 @@ test("runQueuedTask does not deduplicate a messageId whose first turn failed bef
         true,
         messageId,
       );
-      await runQueuedTask(record.acpxRecordId, resendTask, {
+      await runQueuedTask(record.acpxRecordId, [resendTask], {
         sharedClient: control.client,
         suppressSdkConsoleErrors: true,
       });
@@ -1683,7 +1683,7 @@ test("C1 watchdog: tier-1 cancel recovers a routing hole (attributed sdk_idle, n
 
       const { stderr } = await captureStderr(async () => {
         const run = withTurnResponseTimeout(40, () =>
-          runQueuedTask(record.acpxRecordId, mainTask, {
+          runQueuedTask(record.acpxRecordId, [mainTask], {
             sharedClient: control.client,
             suppressSdkConsoleErrors: true,
           }),
@@ -1766,7 +1766,7 @@ test("C1 watchdog: tier-2 bounds a never-responding turn (TURN_RESPONSE_TIMEOUT)
       );
 
       const run = withTurnResponseTimeout(40, () =>
-        runQueuedTask(record.acpxRecordId, mainTask, {
+        runQueuedTask(record.acpxRecordId, [mainTask], {
           sharedClient: control.client,
           suppressSdkConsoleErrors: true,
         }),
@@ -1846,7 +1846,7 @@ test("C1 watchdog: a turn with no end-marker is never truncated (marker-gated)",
       );
 
       const run = withTurnResponseTimeout(40, () =>
-        runQueuedTask(record.acpxRecordId, mainTask, {
+        runQueuedTask(record.acpxRecordId, [mainTask], {
           sharedClient: control.client,
           suppressSdkConsoleErrors: true,
         }),
@@ -1967,7 +1967,7 @@ test("C3: drain backstop writes an INJECTED_RESPONSE_TIMEOUT terminal for a stil
             injectedMessageId,
           );
           queueMicrotask(() => {
-            ctrl.currentHandler?.(injectedTask);
+            ctrl.currentHandler?.([injectedTask]);
           });
         }
       });
@@ -1983,7 +1983,7 @@ test("C3: drain backstop writes an INJECTED_RESPONSE_TIMEOUT terminal for a stil
       );
 
       const run = withInjectedDrainTimeout(40, () =>
-        runQueuedTask(record.acpxRecordId, mainTask, {
+        runQueuedTask(record.acpxRecordId, [mainTask], {
           sharedClient: control.client,
           setMidTurnHandler: midTurn.setMidTurnHandler,
           suppressSdkConsoleErrors: true,
@@ -2061,7 +2061,7 @@ test("C2: a delivery terminal written after the per-turn writer closed still lan
             injectedMessageId,
           );
           queueMicrotask(() => {
-            ctrl.currentHandler?.(injectedTask);
+            ctrl.currentHandler?.([injectedTask]);
           });
         }
       });
@@ -2076,7 +2076,7 @@ test("C2: a delivery terminal written after the per-turn writer closed still lan
         "c2mmmmmm-mmmm-4mmm-8mmm-mmmmmmmmmmmm",
       );
 
-      const run = runQueuedTask(record.acpxRecordId, mainTask, {
+      const run = runQueuedTask(record.acpxRecordId, [mainTask], {
         sharedClient: control.client,
         setMidTurnHandler: midTurn.setMidTurnHandler,
         suppressSdkConsoleErrors: true,
@@ -2143,7 +2143,7 @@ test("493729fc F2: codex watchdog tier-2 bounds a never-responding main turn via
       );
 
       const run = withTurnResponseTimeout(40, () =>
-        runQueuedTask(record.acpxRecordId, mainTask, {
+        runQueuedTask(record.acpxRecordId, [mainTask], {
           sharedClient: control.client,
           suppressSdkConsoleErrors: true,
         }),
@@ -2193,7 +2193,7 @@ test("493729fc F2: a codex turn with no end-marker is never truncated", async ()
       );
 
       const run = withTurnResponseTimeout(40, () =>
-        runQueuedTask(record.acpxRecordId, mainTask, {
+        runQueuedTask(record.acpxRecordId, [mainTask], {
           sharedClient: control.client,
           suppressSdkConsoleErrors: true,
         }),
@@ -2263,7 +2263,7 @@ test("493729fc F4: codex wait-mode injection is absorbed — turn finalizes prom
             injectedMessageId,
           );
           queueMicrotask(() => {
-            ctrl.currentHandler?.(injectedTask);
+            ctrl.currentHandler?.([injectedTask]);
           });
         }
       });
@@ -2279,7 +2279,7 @@ test("493729fc F4: codex wait-mode injection is absorbed — turn finalizes prom
       );
 
       await withRaceTimeout(
-        runQueuedTask(record.acpxRecordId, mainTask, {
+        runQueuedTask(record.acpxRecordId, [mainTask], {
           sharedClient: control.client,
           setMidTurnHandler: midTurn.setMidTurnHandler,
           suppressSdkConsoleErrors: true,
@@ -2341,7 +2341,7 @@ test("493729fc F3: owner-exit sweep terminalizes still-open absorbed deliveries 
             injectedMessageId,
           );
           queueMicrotask(() => {
-            ctrl.currentHandler?.(injectedTask);
+            ctrl.currentHandler?.([injectedTask]);
           });
         }
       });
@@ -2355,7 +2355,7 @@ test("493729fc F3: owner-exit sweep terminalizes still-open absorbed deliveries 
         mainMessageId,
       );
 
-      const run = runQueuedTask(record.acpxRecordId, mainTask, {
+      const run = runQueuedTask(record.acpxRecordId, [mainTask], {
         sharedClient: control.client,
         setMidTurnHandler: midTurn.setMidTurnHandler,
         suppressSdkConsoleErrors: true,
@@ -2466,7 +2466,7 @@ test("F1: a message arriving while the drain awaits an injected prompt is still 
           return;
         }
         queueMicrotask(() => {
-          ctrl.currentHandler?.(
+          ctrl.currentHandler?.([
             makeQueueTask(
               "req-f1a-injected-1",
               INJECTED_PROMPT_TEXT,
@@ -2475,7 +2475,7 @@ test("F1: a message arriving while the drain awaits an injected prompt is still 
               false,
               firstInjectedId,
             ),
-          );
+          ]);
         });
       });
 
@@ -2488,7 +2488,7 @@ test("F1: a message arriving while the drain awaits an injected prompt is still 
         mainMessageId,
       );
 
-      const run = runQueuedTask(record.acpxRecordId, mainTask, {
+      const run = runQueuedTask(record.acpxRecordId, [mainTask], {
         sharedClient: control.client,
         setMidTurnHandler: midTurn.setMidTurnHandler,
         suppressSdkConsoleErrors: true,
@@ -2513,7 +2513,7 @@ test("F1: a message arriving while the drain awaits an injected prompt is still 
         "the mid-turn handler must stay registered while injected prompts are unsettled",
       );
       assert.equal(midTurn.clears, 0, "the handler must not be cleared before the drain completes");
-      handlerDuringDrain(
+      handlerDuringDrain([
         makeQueueTask(
           "req-f1a-injected-2",
           INJECTED_PROMPT_TEXT,
@@ -2522,7 +2522,7 @@ test("F1: a message arriving while the drain awaits an injected prompt is still 
           false,
           secondInjectedId,
         ),
-      );
+      ]);
 
       await withRaceTimeout(
         secondInFlight.promise,
@@ -2628,7 +2628,7 @@ test("F1: the drain backstop deadline is shared across loop passes, not re-armed
         }
         injections += 1;
         const id = `f1b00000-0000-4000-8000-${String(injections).padStart(12, "0")}`;
-        ctrl.currentHandler(
+        ctrl.currentHandler([
           makeQueueTask(
             `req-f1b-injected-${injections}`,
             INJECTED_PROMPT_TEXT,
@@ -2637,7 +2637,7 @@ test("F1: the drain backstop deadline is shared across loop passes, not re-armed
             false,
             id,
           ),
-        );
+        ]);
       };
 
       const midTurn = makeMidTurnControl((registration, ctrl) => {
@@ -2657,7 +2657,7 @@ test("F1: the drain backstop deadline is shared across loop passes, not re-armed
       );
 
       const run = withInjectedDrainTimeout(drainBudgetMs, () =>
-        runQueuedTask(record.acpxRecordId, mainTask, {
+        runQueuedTask(record.acpxRecordId, [mainTask], {
           sharedClient: control.client,
           setMidTurnHandler: midTurn.setMidTurnHandler,
           suppressSdkConsoleErrors: true,
@@ -2757,7 +2757,7 @@ test("AC-8/A1: a transient turn failure with no injections in flight is unchange
         mainMessageId,
       );
 
-      await runQueuedTask(record.acpxRecordId, mainTask, {
+      await runQueuedTask(record.acpxRecordId, [mainTask], {
         sharedClient: control.client,
         setMidTurnHandler: midTurn.setMidTurnHandler,
         suppressSdkConsoleErrors: true,
@@ -2843,7 +2843,7 @@ test("AC-8: an injected delivery failing with the primary carries a byte-identic
           return;
         }
         queueMicrotask(() => {
-          ctrl.currentHandler?.(
+          ctrl.currentHandler?.([
             makeQueueTask(
               "req-ac8b-injected",
               INJECTED_PROMPT_TEXT,
@@ -2852,7 +2852,7 @@ test("AC-8: an injected delivery failing with the primary carries a byte-identic
               false,
               injectedMessageId,
             ),
-          );
+          ]);
         });
       });
 
@@ -2866,7 +2866,7 @@ test("AC-8: an injected delivery failing with the primary carries a byte-identic
       );
 
       const run = withInjectedDrainTimeout(2_000, () =>
-        runQueuedTask(record.acpxRecordId, mainTask, {
+        runQueuedTask(record.acpxRecordId, [mainTask], {
           sharedClient: control.client,
           setMidTurnHandler: midTurn.setMidTurnHandler,
           suppressSdkConsoleErrors: true,
@@ -2934,7 +2934,7 @@ test("AC-9: the tier-2 watchdog path keeps injecting — an arriving message is 
           return;
         }
         queueMicrotask(() => {
-          ctrl.currentHandler?.(
+          ctrl.currentHandler?.([
             makeQueueTask(
               "req-ac9-injected-1",
               INJECTED_PROMPT_TEXT,
@@ -2943,7 +2943,7 @@ test("AC-9: the tier-2 watchdog path keeps injecting — an arriving message is 
               false,
               firstInjectedId,
             ),
-          );
+          ]);
         });
       });
 
@@ -2959,7 +2959,7 @@ test("AC-9: the tier-2 watchdog path keeps injecting — an arriving message is 
 
       const run = withTurnResponseTimeout(40, () =>
         withInjectedDrainTimeout(600, () =>
-          runQueuedTask(record.acpxRecordId, mainTask, {
+          runQueuedTask(record.acpxRecordId, [mainTask], {
             sharedClient: control.client,
             setMidTurnHandler: midTurn.setMidTurnHandler,
             suppressSdkConsoleErrors: true,
@@ -2982,7 +2982,7 @@ test("AC-9: the tier-2 watchdog path keeps injecting — an arriving message is 
         handlerDuringFailureDrain,
         "the mid-turn handler stays registered through the tier-2 failure drain",
       );
-      handlerDuringFailureDrain(
+      handlerDuringFailureDrain([
         makeQueueTask(
           "req-ac9-arriving",
           INJECTED_PROMPT_TEXT,
@@ -2991,7 +2991,7 @@ test("AC-9: the tier-2 watchdog path keeps injecting — an arriving message is 
           false,
           arrivingId,
         ),
-      );
+      ]);
       await withRaceTimeout(
         arrivingInFlight.promise,
         3_000,

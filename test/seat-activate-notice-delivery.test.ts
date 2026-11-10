@@ -378,30 +378,32 @@ test("ND9 · a re-run of an already-completed activation writes nothing and ther
   });
 });
 
-test("ND10 · NO ROOM (brick 2b3b259f §9 row 5b): a 503 no-capacity prints the refusal's own text and says the activation stands; JSON carries it as `refusal`", async () => {
-  const refusal =
-    "acpx: REFUSED reason=no_capacity nothing_started=true protocol=1 wake=holder-two\nacpx: no memory to wake session holder-t: PRODUCT TEXT.";
+test("ND10 · HELD (UMQ §7.3): a 202 carrying `held` prints 'notice queued for room for <successor> (delivery <id>) — delivered when the successor can be woken'; exit 0, the activation stands, nothing to paste or resend", async () => {
   await withRig(async (homeDir) => {
     const stub = await startStub({
-      status: 503,
+      status: 202,
       body: JSON.stringify({
-        message: refusal,
-        error: refusal,
-        code: "no-capacity",
-        reason: "no_capacity",
+        delivery_id: "dlv-held-1",
+        status: "queued",
+        held: { since: "2026-11-09T12:00:00.000Z", reason: "no_capacity", ahead: 0 },
+        message:
+          "Queued for room (delivery dlv-held-1): holder-t has no running agent (next in line).",
       }),
     });
     try {
       const text = await activate(homeDir, { ACPX_UI_INTERNAL_URL: stub.url }, [], "text");
       assert.equal(text.code, 0, `${text.stderr}${text.stdout}`);
-      assert.match(text.stdout, /--- notice for the successor ---\n⟦SEAT-ACTIVATION⟧/);
       assert.ok(
         text.stdout.includes(
-          "notice NOT delivered — no room to wake the successor now; the activation stands.",
+          "notice queued for room for holder-two (delivery dlv-held-1) — delivered when the successor can be woken",
         ),
         text.stdout,
       );
-      assert.ok(text.stdout.includes(refusal), "the product text, verbatim");
+      assert.doesNotMatch(text.stdout, /NOT delivered|--- notice for the successor ---/u);
+      assert.doesNotMatch(
+        text.stdout,
+        /send it later|never in a loop|retry later|send-message\.sh/u,
+      );
       assert.equal(await holderActive(homeDir, "holder-two"), true, "the activation itself landed");
     } finally {
       await stub.close();
@@ -409,19 +411,45 @@ test("ND10 · NO ROOM (brick 2b3b259f §9 row 5b): a 503 no-capacity prints the 
   });
 });
 
-test("ND11 · NO ROOM (JSON): {delivered:false, reason, refusal} — `refusal` is the 503's message verbatim", async () => {
+test("ND11 · HELD (JSON): {delivered:true, deliveryId, held:true}; and an OLD atrium's 503 no-capacity is a plain not-delivered — no `refusal`, no capacity text, the generic paste line", async () => {
   await withRig(async (homeDir) => {
-    const stub = await startStub({
-      status: 503,
-      body: JSON.stringify({ message: "acpx: PRODUCT TEXT.", code: "no-capacity" }),
+    const heldStub = await startStub({
+      status: 202,
+      body: JSON.stringify({
+        delivery_id: "dlv-held-2",
+        held: { since: "2026-11-09T12:00:00.000Z", reason: "memory_pressure", ahead: 2 },
+      }),
     });
     try {
-      const delivery = deliveryOf(await activate(homeDir, { ACPX_UI_INTERNAL_URL: stub.url }));
-      assert.equal(delivery.delivered, false);
-      assert.match(String(delivery.reason), /503 no-capacity/);
-      assert.equal(delivery.refusal, "acpx: PRODUCT TEXT.");
+      const held = deliveryOf(await activate(homeDir, { ACPX_UI_INTERNAL_URL: heldStub.url }));
+      assert.deepEqual(held, { delivered: true, deliveryId: "dlv-held-2", held: true });
     } finally {
-      await stub.close();
+      await heldStub.close();
     }
   });
+  for (const format of ["json", "text"] as const) {
+    await withRig(async (homeDir) => {
+      const old = await startStub({
+        status: 503,
+        body: JSON.stringify({ message: "acpx: PRODUCT TEXT.", code: "no-capacity" }),
+      });
+      try {
+        const run = await activate(homeDir, { ACPX_UI_INTERNAL_URL: old.url }, [], format);
+        if (format === "json") {
+          const delivery = deliveryOf(run);
+          assert.equal(delivery.delivered, false);
+          assert.match(String(delivery.reason), /HTTP 503/u);
+          assert.equal(Object.hasOwn(delivery, "refusal"), false);
+        } else {
+          assert.ok(
+            run.stdout.includes("notice NOT delivered — paste it to the successor"),
+            run.stdout,
+          );
+          assert.doesNotMatch(run.stdout, /no room to wake|never in a loop|send-message\.sh/u);
+        }
+      } finally {
+        await old.close();
+      }
+    });
+  }
 });

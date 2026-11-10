@@ -18,6 +18,7 @@ import {
   type Verdict,
   verdictFor,
 } from "./formula.js";
+import { governorDir, type GovernorLiveness, readGovernorLiveness } from "./governor/status.js";
 import {
   censusOwners,
   type LeaseExclusion,
@@ -99,6 +100,8 @@ export type OwnerSummary = {
 export type CapacitySnapshot = {
   readonly action: "capacity";
   readonly schema: 1;
+  /** UMQ K9 — what this acpx build can do for atrium ({@link ACPX_FEATURES}); readers ignore unknowns. */
+  readonly features: readonly string[];
   readonly box: string;
   /** Whose slots these are: `spawn` figures are net of {@link waiting}, `automation` gross. */
   readonly class: CapacityClass;
@@ -160,6 +163,11 @@ export type CapacitySnapshot = {
   /** The same reading under the basis NOT in force, so request and limit are both visible. */
   readonly alternatives: readonly AlternativeBasis[];
   readonly warnings: readonly string[];
+  /**
+   * The runaway process-tree governor's liveness, from its heartbeat file (CONCEPTION 5d7a23b6
+   * §6.4): a dead governor is visible wherever capacity is shown.
+   */
+  readonly governor: GovernorLiveness;
 };
 
 function boxName(): string {
@@ -186,6 +194,8 @@ export type ReadCapacityOptions = {
   readonly waiting?: WaitingQueue;
   /** Default `spawn`. */
   readonly admissionClass?: CapacityClass;
+  /** The governor's state dir (heartbeat); default `~/.acpx/governor`. */
+  readonly governorDir?: string;
 };
 
 const nul = <T>(value: T | undefined): T | null => (value === undefined ? null : value);
@@ -469,6 +479,14 @@ function waitingField(queue: WaitingQueue): CapacitySnapshot["waiting"] {
   };
 }
 
+/**
+ * UMQ K9 (CONTRACTS §3.1) — advertised on every `acpx --format json capacity` answer. atrium reads
+ * a field-less answer as "no features" and then delivers member by member (S5).
+ * `prompt-batch`: `prompt --batch-file` + the owner's `submit_prompt_batch`.
+ * `sessions-new-sleeping`: `sessions new|copy --sleeping` (a build without it answers exit 2).
+ */
+export const ACPX_FEATURES: readonly string[] = ["prompt-batch", "sessions-new-sleeping"];
+
 export function readCapacity(options: ReadCapacityOptions): CapacitySnapshot {
   const g = gather(options);
   const measured = measuredOf(g);
@@ -476,6 +494,7 @@ export function readCapacity(options: ReadCapacityOptions): CapacitySnapshot {
   return {
     action: "capacity",
     schema: 1,
+    features: ACPX_FEATURES,
     box: options.box ?? boxName(),
     class: options.admissionClass ?? "spawn",
     waiting: waitingField(options.waiting ?? NO_WAITING),
@@ -498,6 +517,11 @@ export function readCapacity(options: ReadCapacityOptions): CapacitySnapshot {
     pressure: pressureField(g),
     alternatives: g.budget.configured && measured ? alternativesFor(g, measured) : [],
     warnings: collectWarnings(g, measured),
+    governor: readGovernorLiveness(
+      options.governorDir ?? governorDir(),
+      g.now.getTime(),
+      options.sources.procRoot,
+    ),
   };
 }
 

@@ -1,0 +1,5 @@
+{
+  "source": "the session/prompt line a real acpx 5c21f164 (deployed devbox build) wrote for `prompt --no-wait --message-id 0a6deb9a-9999-4000-8000-000000000001 \"echo golden batch of one\"` on test/mock-agent.js; captured 2026-11-09 by lane A1",
+  "normalized": "the JSON-RPC `id` and `params.sessionId` are per-run values; the test replaces both with these placeholders on BOTH sides before comparing the remaining bytes",
+  "frame": "{\"jsonrpc\":\"2.0\",\"id\":\"<id>\",\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"<acp-session>\",\"prompt\":[{\"type\":\"text\",\"text\":\"echo golden batch of one\"}],\"messageId\":\"0a6deb9a-9999-4000-8000-000000000001\"}}"
+}

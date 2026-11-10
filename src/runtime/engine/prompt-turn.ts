@@ -1,3 +1,4 @@
+import type { AcpxBatchMeta } from "../../acp/batch-meta.js";
 import { TimeoutError, withTimeout } from "../../async-control.js";
 import { hasAgentReplyAfterPrompt } from "../../session/conversation-model.js";
 import type { PromptInput, RunPromptResult, SessionConversation } from "../../types.js";
@@ -9,7 +10,12 @@ type PromptTurnClient = {
   prompt: (
     sessionId: string,
     prompt: PromptInput | string,
-    options?: { messageId?: string; turnContext?: boolean; promptId?: string },
+    options?: {
+      messageId?: string;
+      turnContext?: boolean;
+      promptId?: string;
+      batchMeta?: AcpxBatchMeta;
+    },
   ) => Promise<{ stopReason: RunPromptResult["stopReason"]; _meta?: unknown }>;
   waitForSessionUpdatesIdle?: (options?: { idleMs?: number; timeoutMs?: number }) => Promise<void>;
 };
@@ -121,6 +127,8 @@ export async function runPromptTurn(params: {
   messageId?: string;
   /** brick a147982f — forwarded as `AcpPromptOptions.promptId` (`_claude/promptId`). */
   promptId?: string;
+  /** UMQ K4 — a batch turn's layout, forwarded as `_meta["acpx/batch"]`; absent for one prompt. */
+  batchMeta?: AcpxBatchMeta;
   onPromptStarted?: () => Promise<void> | void;
   /**
    * brick 570d2570 (C3) — called SYNCHRONOUSLY the moment the `session/prompt` response arrives, BEFORE the
@@ -153,6 +161,7 @@ export async function runPromptTurn(params: {
       messageId: params.messageId,
       turnContext: true,
       promptId: params.promptId,
+      ...(params.batchMeta ? { batchMeta: params.batchMeta } : {}),
     });
     await params.onPromptStarted?.();
     return await settleRpcResponse(params, await withTimeout(promptPromise, params.timeoutMs));

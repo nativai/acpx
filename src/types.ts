@@ -271,25 +271,7 @@ export type CapacityRefusalDetail = {
   message?: string;
   /** A WAKE refusal only: the released session that was not started. */
   wake?: { sessionId: string; seatId: string | null };
-  /** A WAKE refusal only: whether the text offers `send-message.sh --final-report`, and why. */
-  finalReport?: { offered: boolean; why: FinalReportWhy };
 };
-
-/**
- * Why a wake refusal does or does not offer `--final-report` (CONCEPTION §5.1 a–d, contract note
- * 2026-11-06 17:55Z): `leaf` / `cross-box` offer it; `orchestrator` says "not for you";
- * `no-capability` (no fresh capability marker), `no-sender` (no sender role — every bare
- * `acpx prompt`), `admission-busy` and `set` name nothing.
- */
-export type FinalReportWhy =
-  | "leaf"
-  | "cross-box"
-  | "orchestrator"
-  | "no-capability"
-  | "no-sender"
-  | "admission-busy"
-  /** brick 5c44d8ba: a refused ownerless `set` — a settings change, never a message to hold. */
-  | "set";
 
 /**
  * Local-box Codex subscription-cap admission result. This intentionally names
@@ -710,7 +692,19 @@ export type SessionContextFill = {
   compaction_tokens?: number;
 };
 
+/**
+ * `acpx.sleeping` (UMQ K7, CONCEPTION §6) — the session exists but no agent has ever run: the record
+ * carries `acpSessionId: ""` until the first wake materialises it (`runtime/engine/reconnect.ts`)
+ * and deletes this field. `fork.from` = the template record the first wake forks.
+ */
+export type SessionSleepingState = {
+  since: string;
+  fork?: { from: string };
+};
+
 export type SessionAcpxState = {
+  /** See {@link SessionSleepingState}. Present only until the first wake. */
+  sleeping?: SessionSleepingState;
   reset_on_next_ensure?: boolean;
   current_mode_id?: string;
   desired_mode_id?: string;

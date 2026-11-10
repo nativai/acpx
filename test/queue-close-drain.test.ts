@@ -195,7 +195,7 @@ test("L1.1 drain terminalizes a pinned pending delivery exactly once and never i
 
       // The message must NOT have been handed to the agent: close never starts
       // new work (KD-2 / C-2).
-      assert.equal(await owner.nextTask(0), undefined);
+      assert.equal(await owner.nextBatch(0).then((batch) => batch?.[0]), undefined);
 
       // (d) A subsequent owner.close() writes NO second terminal. A duplicate
       // here would reopen brick://932a1e5e.
@@ -218,8 +218,8 @@ test("L1.2 drain terminalizes tasks pinned in the runtime mid-turn buffer", asyn
       // Reproduce the runtime's capture phase: a registered mid-turn handler
       // that buffers instead of injecting (`midTurnCaptureActive`).
       const midTurnBuffer: QueueTask[] = [];
-      owner.setMidTurnHandler((task) => {
-        midTurnBuffer.push(task);
+      owner.setMidTurnHandler((tasks) => {
+        midTurnBuffer.push(...tasks);
         return true;
       });
       owner.setMidTurnCustodySource(() => midTurnBuffer.splice(0));
@@ -286,7 +286,7 @@ test("L1.3 a draining owner rejects new submissions instead of enqueuing them", 
       assert.equal(frame.message, QUEUE_OWNER_CLOSING_MESSAGE);
 
       assert.equal(owner.queueDepth(), 0, "a quiesced owner must land nothing in pending");
-      assert.equal(await owner.nextTask(0), undefined);
+      assert.equal(await owner.nextBatch(0).then((batch) => batch?.[0]), undefined);
       assert.deepEqual(await readDeliveryEvents(sessionId), []);
 
       lines.close();

@@ -18,7 +18,11 @@ import {
 import { locatePiSessionTranscript } from "../acp/harness-config-dir.js";
 import { projectAdvertisedComposedModels } from "../acp/model-support.js";
 import { resolveAgentNameFromCommand } from "../agent-registry.js";
-import { type AdmissionTicket, admitCreate } from "../capacity/admission.js";
+import {
+  type AdmissionTicket,
+  admitCreate,
+  declaredAdmissionClass,
+} from "../capacity/admission.js";
 import {
   findProfile,
   isSubscriptionProfileLocked,
@@ -34,6 +38,7 @@ import {
 import {
   AcpxOperationalError,
   AgentSpawnError,
+  CapacityRefusedError,
   ProfileClassMismatchError,
   ProfileUnknownError,
   SessionNotFoundError,
@@ -133,6 +138,12 @@ import {
   warnUncheckedBackgroundTasks,
   type BackgroundTasksJson,
 } from "./background-task-gate.js";
+import {
+  assertBatchFileFlags,
+  type BatchFileMember,
+  BatchFileUsageError,
+  parseBatchFile,
+} from "./batch-file.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import {
   type CreateCwdResolution,
@@ -162,11 +173,25 @@ import {
   type SessionsCloseFlags,
   type StatusFlags,
 } from "./flags.js";
-import { type MessageLedgerKind, withMessageLedger } from "./message-ledger.js";
+import {
+  type MessageLedgerKind,
+  resolveLedgerCaller,
+  withMessageLedger,
+} from "./message-ledger.js";
 import { emitJsonResult } from "./output/json-output.js";
 // Type-only, so the render module stays lazily imported at runtime.
 import type { FirstTurnOutcome, PruneRefusal, PruneScope } from "./output/render.js";
+import {
+  atriumDownRefusalLine,
+  decideAgentPromptRoute,
+  deliveredDirectlyLine,
+  type MessageRouteAnswer,
+  ROUTED_WAIT_MODE_LINE,
+  routedPromptLine,
+} from "./prompt-routing.js";
 import type { CloserTaskContext, QueueOwnerRecoveryResult } from "./queue/lease-store.js";
+import { type MemberTaskOptions, parseMemberTaskOptions } from "./queue/messages.js";
+import { runRoutedPrompt, type RoutedPromptOutcome } from "./routed-prompt.js";
 import {
   addressedSeatIdFromSelector,
   NoSessionError,
@@ -1241,6 +1266,7 @@ function buildSessionStartOptions(params: {
     cwd: params.agent.cwd,
     seatName: params.flags.name,
     resumeSessionId: params.flags.resumeSession,
+    ...(params.flags.sleeping === true ? { sleeping: true } : {}),
     parentSessionId: params.parent?.acpxRecordId,
     parentSessionUrl: params.parent?.sessionUrl,
     parentSeatId: params.parent?.seatId,
@@ -1518,9 +1544,15 @@ function copyDesiredConfigOptionsWithOverride(
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
+export const NOTHING_TO_COPY_YET_MESSAGE = "nothing to copy yet — it has never run";
+
 function assertCopyableSource(source: SessionRecord): void {
   if (source.kind === "subagent") {
     throw new Error("Cannot copy a subagent session");
+  }
+  // UMQ K7 (CONCEPTION §6.3): a sleeping session has no conversation and no ACP session to fork.
+  if (source.acpx?.sleeping || source.acpSessionId === "") {
+    throw new Error(`Cannot copy session ${source.acpxRecordId}: ${NOTHING_TO_COPY_YET_MESSAGE}`);
   }
 }
 
@@ -1715,6 +1747,7 @@ async function deliverPrompt(params: {
   config: ResolvedAcpxConfig;
   messageId?: string;
   onSubmitAccepted?: () => void;
+  batch?: BatchFileMember[];
 }) {
   const { createOutputFormatter } = await loadOutputModule();
   const { sendSession } = await loadSessionModule();
@@ -1749,8 +1782,238 @@ async function deliverPrompt(params: {
     waitForCompletion: params.waitForCompletion,
     messageId: params.messageId,
     onSubmitAccepted: params.onSubmitAccepted,
+    ...(params.batch ? { batch: params.batch } : {}),
     sessionOptions: sessionOptionsFromGlobalFlags(params.globalFlags),
   });
+}
+
+/**
+ * UMQ D1 — the routing half of {@link sendPromptToRecipient}: `not-routed` = take the direct path
+ * as always. Cheap conditions first; the owner-tree census last (R12).
+ */
+async function maybeRouteAgentPrompt(
+  context: SendPromptContext,
+): Promise<RoutedPromptOutcome | { kind: "not-routed" }> {
+  const { record, flags, globalFlags } = context;
+  const route = decideAgentPromptRoute({
+    caller: resolveLedgerCaller(),
+    messageId: flags.messageId,
+    batchFile: flags.batchFile !== undefined,
+  });
+  if (!route || (await recipientRunsDirectly(record, flags))) {
+    return { kind: "not-routed" };
+  }
+  return await runRoutedPrompt({
+    route,
+    record,
+    addressedSeat: context.addressedSeat,
+    prompt: context.prompt,
+    taskOptions: routedTaskOptions(context.command, globalFlags, context.permissionMode),
+    ownerInputs: {
+      sessionId: record.acpxRecordId,
+      permissionMode: context.permissionMode,
+      permissionModeExplicit: hasExplicitPermissionModeFlag(globalFlags),
+      nonInteractivePermissions: globalFlags.nonInteractivePermissions,
+      authPolicy: globalFlags.authPolicy,
+      terminal: globalFlags.terminal,
+    },
+  });
+}
+
+/**
+ * Wait mode (CONCEPTION §7.2): a recipient whose agent is running or starting takes today's direct
+ * path — no room question, and the reply streams as today. Anything else is routed, and not waited for.
+ */
+async function recipientRunsDirectly(record: SessionRecord, flags: PromptFlags): Promise<boolean> {
+  if (flags.wait === false) {
+    return false;
+  }
+  const [{ readQueueOwnerLiveness }, { isOwnerPossiblyAlive }] = await Promise.all([
+    import("./queue/lease-store.js"),
+    import("./session/session-control.js"),
+  ]);
+  return isOwnerPossiblyAlive(await readQueueOwnerLiveness(record.acpxRecordId));
+}
+
+/**
+ * What THIS command line asks of its turn — the per-task fields of `submit_prompt`, EXPLICIT ones
+ * only (`MemberTaskOptions`, CONTRACTS §6.3). Defaults ride no member: members with different
+ * options are different turns, so a default stamped on every routed prompt would split a batch that
+ * a person's or atrium's option-less message belongs to.
+ *
+ * ⚠️ `approve-all` is NOT carried: atrium's batch call runs `--approve-all` already (CONTRACTS §1.1),
+ * and agents pass it on nearly every line, so carrying it would make the common member "different".
+ */
+function routedTaskOptions(
+  command: Command,
+  globalFlags: GlobalFlags,
+  permissionMode: ReturnType<typeof resolvePermissionMode>,
+): MemberTaskOptions | undefined {
+  const opts = command.optsWithGlobals<Record<string, unknown>>();
+  const sessionOptions = Object.fromEntries(
+    Object.entries(sessionOptionsFromGlobalFlags(globalFlags)).filter(
+      ([, value]) => value !== undefined,
+    ),
+  );
+  const explicit: Record<string, unknown> = {
+    permissionMode:
+      hasExplicitPermissionModeFlag(globalFlags) && permissionMode !== "approve-all"
+        ? permissionMode
+        : undefined,
+    nonInteractivePermissions:
+      typeof opts.nonInteractivePermissions === "string"
+        ? globalFlags.nonInteractivePermissions
+        : undefined,
+    permissionPolicy: globalFlags.permissionPolicy,
+    timeoutMs: typeof opts.timeout === "number" ? globalFlags.timeout : undefined,
+    promptRetries: globalFlags.promptRetries,
+    sessionOptions: Object.keys(sessionOptions).length > 0 ? sessionOptions : undefined,
+  };
+  const parsed = parseMemberTaskOptions(explicit);
+  if (parsed === null) {
+    throw new InvalidArgumentError(
+      "the options on this prompt line cannot be carried to atrium's queue",
+    );
+  }
+  return withoutEmptyOptions(parsed);
+}
+
+/**
+ * `parseMemberTaskOptions` keeps only the session options the queue protocol carries, so a command
+ * line whose only session option is one it does not (`--subscription`, `--output-style`, …) parses
+ * to an EMPTY `sessionOptions`. An empty object is still "different options" to the owner's
+ * `nextBatch`: drop it, and the whole value when nothing is left. (Found by the real-agent self-test:
+ * the first POST carried `task_options: {"sessionOptions": {}}`.)
+ */
+function withoutEmptyOptions(
+  options: MemberTaskOptions | undefined,
+): MemberTaskOptions | undefined {
+  if (options === undefined) {
+    return undefined;
+  }
+  const { sessionOptions, ...rest } = options;
+  const kept: MemberTaskOptions = {
+    ...rest,
+    ...(sessionOptions !== undefined && Object.keys(sessionOptions).length > 0
+      ? { sessionOptions }
+      : {}),
+  };
+  return Object.keys(kept).length > 0 ? kept : undefined;
+}
+
+/** The recipient as a sender names it: the seat's name, else the seat or session id's first 8. */
+async function routedTargetLabel(
+  record: SessionRecord,
+  addressedSeat: string | undefined,
+): Promise<string> {
+  return (
+    (await seatDisplayName(record)) ??
+    (addressedSeat ?? record.seatId ?? record.acpxRecordId).slice(0, 8)
+  );
+}
+
+async function printRoutedSend(
+  context: SendPromptContext,
+  answer: MessageRouteAnswer,
+): Promise<void> {
+  const { record, addressedSeat, flags, outputPolicy } = context;
+  const { printRoutedPromptByFormat } = await loadOutputRenderModule();
+  const label = await routedTargetLabel(record, addressedSeat);
+  printRoutedPromptByFormat(
+    { acpxRecordId: record.acpxRecordId, answer, line: routedPromptLine(answer, label) },
+    outputPolicy.format,
+  );
+  if (flags.wait !== false && outputPolicy.format === "text") {
+    process.stderr.write(`${ROUTED_WAIT_MODE_LINE}\n`);
+  }
+}
+
+/**
+ * The direct path after a routed attempt that could not connect: if its wake gate refuses (exit
+ * 75), the refusal gains the one sentence that says why a sender is seeing it (CONTRACTS §5.5,
+ * A-10) — never in the generic wake text, which is also admit-wake's and atrium's own spawns'.
+ */
+async function withDirectFallbackRefusal<T>(
+  fallback: DirectFallback | undefined,
+  record: SessionRecord,
+  run: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    if (fallback && error instanceof CapacityRefusedError && error.capacityRefusal.wake) {
+      const who = (await seatDisplayName(record)) ?? `session ${record.acpxRecordId.slice(0, 8)}`;
+      const sentence = `${error.message.split("\n").slice(1).join("\n")}\n${atriumDownRefusalLine(who)}`;
+      throw new CapacityRefusedError({
+        tokenLine: error.stderrLine,
+        sentence,
+        detail: { ...error.capacityRefusal, message: sentence },
+      });
+    }
+    throw error;
+  }
+}
+
+/**
+ * UMQ K3 (CONTRACTS §1.1) — `prompt --no-wait --session-id <id> --batch-file <path|->`: atrium's ONE
+ * call for everything waiting for one recipient. A refusal is exit 2 with `acpx: --batch-file <rule>`
+ * on stderr, and nothing is submitted. Exit 0 = the owner accepted every member.
+ */
+async function handleBatchPrompt(
+  explicitAgentName: string | undefined,
+  promptParts: string[],
+  flags: PromptFlags & { batchFile: string },
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const members = await readBatchMembersOrExit(flags, promptParts, globalFlags.cwd);
+  validateExplicitCredentialFlags(globalFlags);
+  const outputPolicy = resolveRequestedOutputPolicy(globalFlags);
+  const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
+  const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const { printPromptSessionBanner, printQueuedPromptByFormat } = await loadOutputRenderModule();
+  const selector = resolveSessionTargetSelector({ flags, command });
+  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  await printPromptSessionBanner(record, agent.cwd, outputPolicy.format, outputPolicy.jsonStrict);
+  const result = await deliverPrompt({
+    sessionId: record.acpxRecordId,
+    prompt: members[0].prompt,
+    waitForCompletion: false,
+    globalFlags,
+    permissionMode,
+    permissionPolicy,
+    outputPolicy,
+    config,
+    batch: members,
+  });
+  if ("queued" in result) {
+    printQueuedPromptByFormat(result, outputPolicy.format);
+  }
+}
+
+async function readBatchMembersOrExit(
+  flags: PromptFlags & { batchFile: string },
+  promptParts: string[],
+  cwd: string,
+): Promise<BatchFileMember[]> {
+  try {
+    assertBatchFileFlags(flags, promptParts);
+    const source =
+      flags.batchFile === "-"
+        ? await readPromptInputFromStdin()
+        : await fs.readFile(path.resolve(cwd, flags.batchFile), "utf8").catch(() => {
+            throw new BatchFileUsageError(`cannot read ${flags.batchFile}`);
+          });
+    return parseBatchFile(source);
+  } catch (error) {
+    if (error instanceof BatchFileUsageError) {
+      process.stderr.write(`acpx: ${error.message}\n`);
+      process.exit(EXIT_CODES.USAGE);
+    }
+    throw error;
+  }
 }
 
 export async function handlePrompt(
@@ -1760,6 +2023,16 @@ export async function handlePrompt(
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
+  if (flags.batchFile !== undefined) {
+    await handleBatchPrompt(
+      explicitAgentName,
+      promptParts,
+      { ...flags, batchFile: flags.batchFile },
+      command,
+      config,
+    );
+    return;
+  }
   const globalFlags = resolveGlobalFlags(command, config);
   // ⚠️ THERE USED TO BE AN ORPHAN HARNESS-CONFIG-DIR SWEEP HERE, ON EVERY PROMPT
   // (brick 433f6bf8). REMOVED 2026-09-30 (brick d1e12500) — DO NOT REBUILD IT
@@ -1800,8 +2073,7 @@ export async function handlePrompt(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   warnReasoningEffortNotRoutable(globalFlags, agent.agentName);
   warnOutputStyleNotSupported(globalFlags, agent.agentName);
-  const { printPromptSessionBanner, printQueuedPromptByFormat, printServedBelowFloorWarning } =
-    await loadOutputRenderModule();
+  const { printPromptSessionBanner } = await loadOutputRenderModule();
   const selector = resolveSessionTargetSelector({ flags, command });
   const record = await requireExplicitSessionRecord(selector, agent.agentName);
   await assertExplicitSubscriptionMatchesExistingSession({
@@ -1812,32 +2084,84 @@ export async function handlePrompt(
   const prompt = await readPrompt(promptParts, flags.file, globalFlags.cwd);
 
   await printPromptSessionBanner(record, agent.cwd, outputPolicy.format, outputPolicy.jsonStrict);
-  const addressedSeat = addressedSeatIdFromSelector(selector);
-  const result = await withMessageLedger(
-    {
-      kind: "prompt",
-      to: { session: record.acpxRecordId, seat: addressedSeat ?? record.seatId ?? null },
-      addressedAs: addressedSeat === undefined ? "session" : "seat",
-      prompt,
-      messageId: flags.messageId,
-    },
-    (onSubmitAccepted) =>
-      deliverPrompt({
-        sessionId: record.acpxRecordId,
-        prompt,
-        waitForCompletion: flags.wait !== false,
-        globalFlags,
-        permissionMode,
-        permissionPolicy,
-        outputPolicy,
-        config,
-        messageId: flags.messageId,
-        onSubmitAccepted,
-      }),
-  );
+  await sendPromptToRecipient({
+    record,
+    addressedSeat: addressedSeatIdFromSelector(selector),
+    prompt,
+    flags,
+    globalFlags,
+    permissionMode,
+    permissionPolicy,
+    outputPolicy,
+    config,
+    command,
+  });
+}
 
+type SendPromptContext = {
+  record: SessionRecord;
+  addressedSeat: string | undefined;
+  prompt: PromptInput;
+  flags: PromptFlags;
+  globalFlags: GlobalFlags;
+  permissionMode: ReturnType<typeof resolvePermissionMode>;
+  permissionPolicy: PermissionPolicy | undefined;
+  outputPolicy: ReturnType<typeof resolveRequestedOutputPolicy>;
+  config: ResolvedAcpxConfig;
+  command: Command;
+};
+
+/**
+ * UMQ D1 (CONCEPTION §7.2): an AGENT's prompt goes through atrium's message queue, which decides
+ * deliver-now vs hold; every other prompt — and an agent's whose atrium cannot be reached — takes the
+ * direct path. `shouldRouteAgentPrompt` (prompt-routing.ts) is the one switch.
+ */
+async function sendPromptToRecipient(context: SendPromptContext): Promise<void> {
+  const routed = await maybeRouteAgentPrompt(context);
+  if (routed.kind === "sent") {
+    await printRoutedSend(context, routed.answer);
+    return;
+  }
+  await sendPromptDirect(context, routed.kind === "direct" ? routed : undefined);
+}
+
+/** Today's path: the wake gate, the owner's queue, the message ledger. */
+async function sendPromptDirect(
+  context: SendPromptContext,
+  fallback: DirectFallback | undefined,
+): Promise<void> {
+  const { record, addressedSeat, prompt, flags, globalFlags, outputPolicy } = context;
+  const { printQueuedPromptByFormat, printServedBelowFloorWarning } =
+    await loadOutputRenderModule();
+  const messageId = fallback?.messageId ?? flags.messageId;
+  const result = await withDirectFallbackRefusal(fallback, record, async () => {
+    return await withMessageLedger(
+      {
+        kind: "prompt",
+        to: { session: record.acpxRecordId, seat: addressedSeat ?? record.seatId ?? null },
+        addressedAs: addressedSeat === undefined ? "session" : "seat",
+        prompt,
+        messageId,
+      },
+      (onSubmitAccepted) =>
+        deliverPrompt({
+          sessionId: record.acpxRecordId,
+          prompt,
+          waitForCompletion: flags.wait !== false,
+          globalFlags,
+          permissionMode: context.permissionMode,
+          permissionPolicy: context.permissionPolicy,
+          outputPolicy,
+          config: context.config,
+          messageId,
+          onSubmitAccepted,
+        }),
+    );
+  });
+
+  noteDeliveredDirectly(fallback, outputPolicy.format);
   if ("queued" in result) {
-    printQueuedPromptByFormat(result, outputPolicy.format);
+    printQueuedPromptByFormat(result, outputPolicy.format, fallback ? { routed: false } : {});
     return;
   }
 
@@ -1856,6 +2180,15 @@ export async function handlePrompt(
     process.stderr.write(
       `[acpx] session reconnect failed, started fresh session: ${result.loadError}\n`,
     );
+  }
+}
+
+/** The direct path ran because a routed attempt could not be completed (UMQ D1, CONTRACTS §5.5). */
+type DirectFallback = Extract<RoutedPromptOutcome, { kind: "direct" }>;
+
+function noteDeliveredDirectly(fallback: DirectFallback | undefined, format: OutputFormat): void {
+  if (fallback && format === "text") {
+    process.stderr.write(`${deliveredDirectlyLine(fallback.deliveryId)}\n`);
   }
 }
 
@@ -2464,10 +2797,9 @@ function isOutputStyleConfigKey(configId: string): boolean {
  * brick://874fee67 — `acpx <agent> set outputStyle <name>`.
  *
  * Validated against the session's OWN advertised style list (a record read, so
- * it works with no owner running), then persisted. The owner is recycled
- * immediately when it is idle; when a turn is in flight the write is still
- * ACCEPTED and the owner recycles itself at the turn boundary. Refused only when
- * work is queued behind the active turn, which a recycle would drop.
+ * it works with no owner running), then persisted. A live owner rebinds its
+ * client at its next turn start, so the write is ACCEPTED whether the owner is
+ * idle, mid-turn or has work queued behind the turn.
  */
 export async function handleSetOutputStyle(
   explicitAgentName: string | undefined,
@@ -3497,12 +3829,42 @@ function noteTemplateAutoPromptReplaced(fromTemplate: string, globalFlags: Globa
   );
 }
 
+// UMQ K7 (CONCEPTION §6.1) — hidden `sessions new|copy --sleeping`. It allocates nothing (no adapter,
+// no `session/new`, no fork, no model apply), so neither verb is gated; that is exactly why it is
+// accepted only from atrium's automated starts, not as a queued fan-out for agents (decision 8).
+const SLEEPING_NEEDS_AUTOMATION_MESSAGE =
+  "acpx: --sleeping is for atrium's automated starts (ACPX_ADMISSION_CLASS=automation)";
+
+/** Exit 2, nothing created: the class check, then every flag that would start or feed an agent. */
+function refuseSleepingMisuse(refused: Readonly<Record<string, boolean>>): void {
+  if (declaredAdmissionClass() !== "automation") {
+    throw new InvalidArgumentError(SLEEPING_NEEDS_AUTOMATION_MESSAGE);
+  }
+  for (const [flag, given] of Object.entries(refused)) {
+    if (given) {
+      throw new InvalidArgumentError(
+        `--sleeping cannot be combined with ${flag}: a sleeping session's opening prompt is atrium's message`,
+      );
+    }
+  }
+}
+
 export async function handleSessionsNew(
   explicitAgentName: string | undefined,
   flags: SessionsNewFlags,
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
+  if (flags.sleeping === true) {
+    refuseSleepingMisuse({
+      "--prompt": flags.promptTextGiven === true,
+      "--prompt-file": flags.promptFile !== undefined,
+      "--from": flags.from !== undefined,
+      "--seat": flags.seat !== undefined,
+      "--from-template": flags.fromTemplate !== undefined,
+      "--resume-session": flags.resumeSession !== undefined,
+    });
+  }
   refuseFromWithTemplate(flags);
   refuseNewSessionFlagCombinations(flags);
   // Brick b40a9a5d decision 1 — the first turn is read and validated HERE, before anything
@@ -3619,12 +3981,16 @@ async function createSessionFromNewFlags(
   // never read as "no capacity" — and BEFORE anything exists, so a refusal (exit 75) leaves no
   // record, no seat and no transient adapter. A live `--from` predecessor is a succession and is
   // never gated; that is also the `sessions handover` successor, which comes through here.
-  const admission = await admitCreate({
-    verb: flags.from === undefined ? "sessions new" : "sessions new --from",
-    agentCommand: effectiveAgent.agentCommand,
-    recordId: flags.recordId,
-    successorOf: from?.acpxRecordId,
-  });
+  // A SLEEPING create allocates nothing, so it takes no ticket (UMQ K7, G6).
+  const admission =
+    flags.sleeping === true
+      ? undefined
+      : await admitCreate({
+          verb: flags.from === undefined ? "sessions new" : "sessions new --from",
+          agentCommand: effectiveAgent.agentCommand,
+          recordId: flags.recordId,
+          successorOf: from?.acpxRecordId,
+        });
   // brick://7a2d5c60 — a cold or stale cache makes the validation above stand
   // aside, which is why it was a production no-op on a box nobody had run
   // `acpx models` on. This kicks a refresh off and RETURNS IMMEDIATELY (detached
@@ -3632,7 +3998,9 @@ async function createSessionFromNewFlags(
   // one validates. It must stay after validation and before the spawn: awaiting
   // it, here or anywhere, would trade a silent no-op for a latency regression on
   // every first create (C4 §7.1).
-  warmCatalogueInBackground();
+  if (flags.sleeping !== true) {
+    warmCatalogueInBackground();
+  }
   const { createSession } = await loadSessionModule();
 
   const created = await createAdmitted(admission, () =>
@@ -3689,6 +4057,19 @@ export async function handleSessionsCopy(
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
+  if (flags.sleeping === true) {
+    await handleSleepingSessionsCopy(explicitAgentName, flags, command, config);
+    return;
+  }
+  await handleLiveSessionsCopy(explicitAgentName, flags, command, config);
+}
+
+async function handleLiveSessionsCopy(
+  explicitAgentName: string | undefined,
+  flags: SessionsCopyFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
   const handoffPrompt = (await resolveHandoffPrompt(flags))?.prompt;
   const { created, source, requestedCwd } = await runSessionCopy(
     explicitAgentName,
@@ -3730,6 +4111,43 @@ export async function handleSessionsCopy(
   const handoffText = handoffPrompt ? promptToDisplayText(handoffPrompt) : "";
   const deliverText = forkNotice + (handoffText ? handoffText : "");
   await deliverHandoffPrompt(created, textPrompt(deliverText), "fork-notice", command, config);
+}
+
+/**
+ * `sessions copy --from <template> --sleeping` (UMQ K7, CONCEPTION §6.1): the record only. The fork
+ * happens at the first wake, so a template re-baked in between gives the newer content (Q9). The
+ * fork notice a plain copy delivers as turn 1 is composed NOW and returned in the JSON for atrium
+ * to queue as the session's first message.
+ */
+async function handleSleepingSessionsCopy(
+  explicitAgentName: string | undefined,
+  flags: SessionsCopyFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  refuseSleepingMisuse({
+    "--prompt": flags.prompt !== undefined,
+    "--prompt-file": flags.promptFile !== undefined,
+    "--ephemeral": flags.ephemeral === true,
+    "--at-index": flags.atIndex !== undefined,
+    "--at-log-index": flags.atLogIndex !== undefined,
+  });
+  const { created, source, requestedCwd } = await runSessionCopy(
+    explicitAgentName,
+    flags,
+    command,
+    config,
+    false,
+  );
+  const { printCopiedSessionByFormat } = await loadOutputRenderModule();
+  printCopiedSessionByFormat(
+    created,
+    source,
+    resolveGlobalFlags(command, config).format,
+    undefined,
+    requestedCwd,
+    composeForkDivergenceNotice(created, source.acpxRecordId, source.seatId),
+  );
 }
 
 /** A validated first turn, and where it was read from (`--prompt-file`'s resolved path,
@@ -3872,7 +4290,11 @@ async function runSessionCopy(
   if (requireTemplate) {
     assertTemplateSource(source);
   }
-  const { forkAtMessageIndex, forkAtLogIndex } = await resolveCopyCut(source, flags);
+  // A sleeping copy forks at its first wake, always the whole template: no cut to resolve now.
+  const { forkAtMessageIndex, forkAtLogIndex } =
+    flags.sleeping === true
+      ? { forkAtMessageIndex: 0, forkAtLogIndex: undefined }
+      : await resolveCopyCut(source, flags);
   assertCopyAgentLock({ explicitAgentName, globalFlags, pathAgent, source, config });
   const destination = resolveCopyDestinationCwd(command, globalFlags, source);
   refuseUncopyablePiSource(source, destination.cwd);
@@ -3888,11 +4310,14 @@ async function runSessionCopy(
   );
   // The create gate (§6.1 A2) — copy, fork, by-the-way and `--from-template` all come through
   // here; see `createSessionFromNewFlags` for why it sits after validation and before the create.
-  const admission = await admitCreate({
-    verb: requireTemplate ? "sessions new --from-template" : "sessions copy",
-    agentCommand: source.agentCommand,
-    recordId: flags.recordId,
-  });
+  const admission =
+    flags.sleeping === true
+      ? undefined
+      : await admitCreate({
+          verb: requireTemplate ? "sessions new --from-template" : "sessions copy",
+          agentCommand: source.agentCommand,
+          recordId: flags.recordId,
+        });
 
   const [{ createSession }, { printCreatedSessionBanner }] = await Promise.all([
     loadSessionModule(),
@@ -3936,6 +4361,7 @@ async function runSessionCopy(
       forkAtMessageIndex: flags.atIndex,
       forkAtLogIndex: flags.atLogIndex,
       forkExpectEntry: flags.expectEntry,
+      ...(flags.sleeping === true ? { sleeping: true } : {}),
       seatFavorite: flags.favorite,
       mcpServers: config.mcpServers,
       permissionMode,
@@ -5323,8 +5749,8 @@ function activationHeadline(kind: "activated" | "resumed" | "already-active"): s
  * the first (`--no-notify`), and on the second nothing was written, so nothing is lost.
  */
 type NoticeOutcome =
-  | { kind: "delivered"; deliveryId?: string }
-  | { kind: "failed"; reason: string; capacityMessage?: string }
+  | { kind: "delivered"; deliveryId?: string; held?: true }
+  | { kind: "failed"; reason: string }
   | { kind: "suppressed" }
   | { kind: "not-resent" };
 
@@ -5344,21 +5770,25 @@ async function deliverOrSkipNotice(
     notice: result.notice,
   });
   if (delivery.delivered) {
-    return { kind: "delivered", deliveryId: delivery.deliveryId };
+    return {
+      kind: "delivered",
+      deliveryId: delivery.deliveryId,
+      ...(delivery.held ? { held: true as const } : {}),
+    };
   }
-  return { kind: "failed", reason: delivery.reason, capacityMessage: delivery.capacityMessage };
+  return { kind: "failed", reason: delivery.reason };
 }
 
 function noticeDeliveryJson(outcome: NoticeOutcome): Record<string, unknown> {
   if (outcome.kind === "delivered") {
-    return { delivered: true, ...(outcome.deliveryId ? { deliveryId: outcome.deliveryId } : {}) };
+    return {
+      delivered: true,
+      ...(outcome.deliveryId ? { deliveryId: outcome.deliveryId } : {}),
+      ...(outcome.held ? { held: true } : {}),
+    };
   }
   if (outcome.kind === "failed") {
-    return {
-      delivered: false,
-      reason: outcome.reason,
-      ...(outcome.capacityMessage === undefined ? {} : { refusal: outcome.capacityMessage }),
-    };
+    return { delivered: false, reason: outcome.reason };
   }
   return {
     delivered: false,
@@ -5411,8 +5841,7 @@ function printActivationText(
   // the notice carries no work. A failed delivery is never silent: the notice is printed and
   // the line below says to paste it.
   if (noticeOutcome.kind === "delivered") {
-    const delivery = noticeOutcome.deliveryId ? ` (delivery ${noticeOutcome.deliveryId})` : "";
-    process.stdout.write(`\nnotice delivered to ${result.successorId}${delivery}\n`);
+    process.stdout.write(`\n${noticeDeliveredText(result.successorId, noticeOutcome)}\n`);
     return;
   }
   process.stdout.write(`\n--- notice for the successor ---\n${result.notice}`);
@@ -5421,17 +5850,22 @@ function printActivationText(
   }
 }
 
-function noticeNotDeliveredText(outcome: { reason: string; capacityMessage?: string }): string {
-  if (outcome.capacityMessage === undefined) {
-    return `notice NOT delivered — paste it to the successor (${outcome.reason})\n`;
-  }
-  // brick 2b3b259f §9 row 5b: the box had no room to wake the successor. The activation stands;
-  // re-running `activate` does not re-send (`not-resent`), so the activator sends it later.
-  return (
-    `notice NOT delivered — no room to wake the successor now; the activation stands. ` +
-    `Send the notice above to the successor's seat later with send-message.sh, never in a loop:\n` +
-    `${outcome.capacityMessage}\n`
-  );
+/**
+ * The notice reached atrium's queue. Held (UMQ §7.3): atrium stored it and delivers it when the
+ * successor can be woken — the activator has nothing more to do.
+ */
+export function noticeDeliveredText(
+  successorId: string,
+  outcome: { deliveryId?: string; held?: true },
+): string {
+  const delivery = outcome.deliveryId ? ` (delivery ${outcome.deliveryId})` : "";
+  return outcome.held
+    ? `notice queued for room for ${successorId}${delivery} — delivered when the successor can be woken`
+    : `notice delivered to ${successorId}${delivery}`;
+}
+
+export function noticeNotDeliveredText(outcome: { reason: string }): string {
+  return `notice NOT delivered — paste it to the successor (${outcome.reason})\n`;
 }
 
 /** Whether the record is closed — a record that cannot be read counts as open, so the duty line stays. */

@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { mapWithConcurrency } from "../../async-control.js";
 import {
@@ -38,6 +37,10 @@ import {
   resolveMessagesLogCompactBytes,
 } from "../messages-log.js";
 import { appendDeletionManifest, type DeletionManifestEntry } from "./deletion-manifest.js";
+import {
+  mergeRecordDurableOptionsForPersist,
+  rememberSessionDurableOptionsBaseline,
+} from "./durable-options-merge.js";
 import { withSessionIndexLock } from "./index-lock.js";
 import {
   flushPendingSessionIndexUpdates,
@@ -59,13 +62,15 @@ import { withRecordFileLock } from "./record-file-lock.js";
 import { copySeatHolderFields, copySeatLinkageFields } from "./seat-fields.js";
 import { findHolderlessSeats, reapHolderlessSeats } from "./seat-holderless.js";
 import { serializeSessionRecordForDisk } from "./serialize.js";
+import { sessionBaseDir } from "./session-base-dir.js";
+import { dropStaleSleepingForPersist } from "./sleeping-merge.js";
 import {
   canonicalMarkBase,
   isQualifiedTemplateName,
   planMarkKey,
   resolveQualifiedTemplateKey,
 } from "./template-owner.js";
-import { pickLatestTemplate, type TemplateOrderKey } from "./template-slug.js";
+import { pickLatestTemplate, slugify, type TemplateOrderKey } from "./template-slug.js";
 
 export const DEFAULT_HISTORY_LIMIT = 20;
 
@@ -83,9 +88,7 @@ function sessionFilePath(acpxRecordId: string): string {
   return path.join(sessionBaseDir(), sessionRecordFileName(acpxRecordId));
 }
 
-export function sessionBaseDir(): string {
-  return path.join(process.env.ACPX_STATE_HOME || os.homedir(), ".acpx", "sessions");
-}
+export { sessionBaseDir };
 
 /**
  * Records this process loaded from the COLD ARCHIVE rather than the hot dir.
@@ -466,6 +469,21 @@ export async function writeSessionRecordAtBoundary(
     messagePersistence: "boundary",
     preserveLifecycle: true,
     logThrough: options.logThrough,
+  });
+}
+
+/**
+ * UMQ K7 — the write that ENDS a sleeping record's sleep (`runtime/engine/sleeping-materialisation.ts`):
+ * a boundary write (a forked record's inherited history must reach the messages sidecar) whose index
+ * entry is written IMMEDIATELY. The general rule throttles scalar index updates for a long-lived
+ * writer, and "sleeping" is a state a person reads off the session list: a row that kept saying so
+ * for seconds after the agent started would be the one stale thing on a live page.
+ */
+export async function writeSessionRecordAtBoundaryNow(record: SessionRecord): Promise<void> {
+  await writeSessionRecordInternal(record, {
+    messagePersistence: "boundary",
+    preserveLifecycle: true,
+    immediateIndexUpdate: true,
   });
 }
 
@@ -1269,6 +1287,17 @@ async function writeSessionRecordInternal(
       // pinned model: a stale/dropped write can't regress a record-pinned model,
       // while a deliberate set-model/subscription-switch/new --model still wins.
       mergeRecordPinnedModelForPersist(record, freshPersisted?.acpx);
+      // 🛑 THE DURABLE OPTIONS (output style, effort, mode, policy toggles), SAME BASELINE-DIFF
+      // PROTECTION, UNCONDITIONAL — brick://34f5f588. The turn's prompt-start write put back the
+      // `record.acpx` it had cloned at load, reverting an `acpx set outputStyle` accepted in
+      // between; only the live checkpoint merged these, no other writer did.
+      mergeRecordDurableOptionsForPersist(record, freshPersisted?.acpx);
+      // 🛑 `acpx.sleeping` ONLY GOES ONE WAY — brick://56d160be. The turn's live checkpoint put
+      // back the pre-wake `record.acpx` it held, flag included, after the materialisation had
+      // cleared it: `acp_session_id` set AND `sleeping` present, shown as "Sleeping" for a session
+      // that ran. Disk wins (not a baseline diff: the materialisation's own write re-captures the
+      // baseline, so the stale copy would read as deliberate). UNCONDITIONAL, like its neighbours.
+      dropStaleSleepingForPersist(record, freshPersisted);
       // 🛑 SAME BASELINE-DIFF PROTECTION, FOR WHO SERVED THE TURN (brick 4c272cab,
       // finding PM-1). UNCONDITIONAL — outside the `preserveLifecycle` branch above —
       // and that placement IS the fix: the write that clobbers this field is the
@@ -1329,6 +1358,7 @@ async function writeSessionRecordInternal(
     await updateIndexForWrittenRecord(sessionDir, record, path.basename(file), options);
     rememberSessionMetadataBaseline(record);
     rememberSessionModelBaseline(record);
+    rememberSessionDurableOptionsBaseline(record);
   });
 }
 

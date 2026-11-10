@@ -891,7 +891,7 @@ test("text: `acpx capacity` names what waits, in order — and says nothing when
   const spawnView = await runCli(["capacity"], asAgent(f), f.root);
   assert.match(
     spawnView.stdout,
-    /^waiting: 2 queued for room since (?:2026-10-31 )?01:00Z \(wakeup re-baker-2026-10-31, brick run 3f2a1c… "Implement X"\) — they start before new agent sessions; the slots above already leave room for them$/mu,
+    /^waiting: 2 queued for room since (?:2026-10-31 )?01:00Z \(wakeup re-baker-2026-10-31, brick run 3f2a1c… "Implement X"\) — atrium wakes them oldest first as room frees, each with everything waiting for it; the slots above already leave room for them$/mu,
   );
   assert.match(spawnView.stdout, /^tight: 0 new claude sessions/mu);
   const drainerView = await runCli(["capacity", "--class", "automation"], asAgent(f), f.root);
@@ -1166,4 +1166,18 @@ test("admissionLock: on an UNCONFIGURED box a busy lock is reported but never tu
   const probe = await probeJson(f, asAgent(f), ["--class", "automation", "--need", "1"]);
   assert.equal(probe.code, 0);
   assert.equal(lockOf(probe.json).busy, true);
+});
+
+// UMQ K9 (CONTRACTS §3.1) — atrium learns what this acpx can do from EVERY capacity answer, the
+// refusal included: a field-less answer reads as "no features" and atrium falls back to per-member
+// delivery (S5).
+test("N-A1-14: `capacity --need 99` (exit 75) still carries features ⊇ prompt-batch", async () => {
+  const f = makeBox({ requestMib: 2048 });
+  const refused = await probe(f, 99);
+  assert.equal(refused.code, 75);
+  assert.ok(Array.isArray(refused.json.features), "features is an array");
+  assert.ok((refused.json.features as string[]).includes("prompt-batch"));
+  const met = await probe(makeBox({ requestMib: 4000 }), 1);
+  assert.equal(met.code, 0);
+  assert.ok((met.json.features as string[]).includes("prompt-batch"), "and on a met answer");
 });

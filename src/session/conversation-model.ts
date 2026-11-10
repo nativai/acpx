@@ -697,6 +697,15 @@ export function cloneSessionConversation(
   return cloned;
 }
 
+function cloneSleeping(sleeping: SessionAcpxState["sleeping"]): SessionAcpxState["sleeping"] {
+  return sleeping
+    ? {
+        since: sleeping.since,
+        ...(sleeping.fork ? { fork: { from: sleeping.fork.from } } : {}),
+      }
+    : undefined;
+}
+
 export function cloneSessionAcpxState(
   state: SessionAcpxState | undefined,
 ): SessionAcpxState | undefined {
@@ -705,6 +714,8 @@ export function cloneSessionAcpxState(
   }
 
   return {
+    // UMQ K7 — a sleeping record must stay sleeping through every turn-path re-base.
+    sleeping: cloneSleeping(state.sleeping),
     current_mode_id: state.current_mode_id,
     desired_mode_id: state.desired_mode_id,
     desired_config_options: state.desired_config_options
@@ -993,6 +1004,32 @@ export function hasAgentReplyAfterPrompt(
   }
 
   return false;
+}
+
+/**
+ * UMQ §22.1 — the text the agent answered since `promptMessageId`'s User row: how a codex-acp
+ * context overflow shows itself (no error; the turn ends with codex's sentence as its only reply).
+ */
+export function agentTextAfterPrompt(
+  conversation: SessionConversation,
+  promptMessageId: string,
+): string {
+  let sawPrompt = false;
+  const parts: string[] = [];
+  for (const message of conversation.messages) {
+    if (!sawPrompt) {
+      sawPrompt = isUserMessage(message) && message.User.id === promptMessageId;
+      continue;
+    }
+    if (isAgentMessage(message)) {
+      for (const content of message.Agent.content) {
+        if ("Text" in content) {
+          parts.push(content.Text);
+        }
+      }
+    }
+  }
+  return parts.join("");
 }
 
 export type RecordSessionUpdateOptions = {

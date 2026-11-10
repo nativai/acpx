@@ -206,7 +206,7 @@ type DurableSessionOptions = NonNullable<SessionAcpxState["session_options"]>;
  *
  * Adding a field here is the whole edit; there is no second place to update.
  */
-const DURABLE_OVERLAY_FIELDS = [
+export const DURABLE_OVERLAY_FIELDS = [
   "model",
   // model_source rides alongside `model` so a provenance change carries too
   // (brick://5bac5564 Layer C).

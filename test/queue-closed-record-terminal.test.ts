@@ -157,7 +157,7 @@ async function withClosedRecordOwner(
           );
           const accepted = (await nextJsonLine(iterator)) as { type: string };
           assert.equal(accepted.type, "accepted");
-          const task = await owner.nextTask();
+          const task = await owner.nextBatch().then((batch) => batch?.[0]);
           assert(task);
           return { task, nextClientMessage: async () => await nextJsonLine(iterator) };
         },
@@ -183,7 +183,7 @@ test("A11/L1.13: a deliver-now task refused by a closed record writes a SESSION_
 
     // The owner pulls it and runs it against the closed record. This must not
     // throw: the refusal is handled, not propagated.
-    await runQueuedTask(sessionId, task, {});
+    await runQueuedTask(sessionId, [task], {});
 
     const events = await waitForDeliveryEvents(sessionId, 1);
     assert.equal(
@@ -207,7 +207,7 @@ test("A11/HC-1: the terminal acpx actually emits is classified a definitive give
       waitForCompletion: false,
       messageId: MESSAGE_ID,
     });
-    await runQueuedTask(sessionId, task, {});
+    await runQueuedTask(sessionId, [task], {});
 
     const events = await waitForDeliveryEvents(sessionId, 1);
     assert.equal(events.length, 1);
@@ -257,7 +257,7 @@ test("B3: a messageId-less task refused by a closed record leaves a durable trac
       // No messageId — this is what a bare CLI `prompt --no-wait` submits.
     });
 
-    await runQueuedTask(sessionId, task, {});
+    await runQueuedTask(sessionId, [task], {});
 
     const refused = await readRefusedEvents(sessionId);
     assert.equal(refused.length, 1, "the refusal must leave exactly one trace, keyed on requestId");
@@ -287,7 +287,7 @@ test("A11/HC-2: a task already terminalized by the closed-record refusal is not 
       waitForCompletion: false,
       messageId: MESSAGE_ID,
     });
-    await runQueuedTask(sessionId, task, {});
+    await runQueuedTask(sessionId, [task], {});
     assert.equal((await waitForDeliveryEvents(sessionId, 1)).length, 1);
 
     // Put the already-terminalized task back in front of the owner-exit writer —
@@ -316,7 +316,7 @@ test("A11/HC-3: a deliver-and-wait task refused by a closed record still answers
       messageId: MESSAGE_ID,
     });
 
-    await runQueuedTask(sessionId, task, {});
+    await runQueuedTask(sessionId, [task], {});
 
     const error = (await nextClientMessage()) as { type: string; detailCode?: string };
     assert.equal(error.type, "error");

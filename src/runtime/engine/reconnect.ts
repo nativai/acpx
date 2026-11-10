@@ -24,6 +24,7 @@ import {
 import {
   ModelFloorUnmetError,
   SessionConfigOptionReplayError,
+  SessionMaterialisationError,
   SessionModeReplayError,
   SessionModelReplayError,
   SessionResumeRequiredError,
@@ -45,12 +46,18 @@ import {
 import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
 import { guardServedModel, stampModelGuardBreadcrumb } from "../../session/model-guard.js";
 import { recordAppliedOutputStyleOutcome } from "../../session/output-style.js";
+import { writeSessionRecordAtBoundaryNow } from "../../session/persistence.js";
 import type { SessionRecord, SessionResumePolicy } from "../../types.js";
 import {
   applyLifecycleSnapshotToRecord,
   reconcileAgentSessionId,
   sessionHasRealAgentTurn,
 } from "./lifecycle.js";
+import {
+  finishSleepingMaterialisation,
+  forkTemplateForSleepingSession,
+  type SleepingForkInherited,
+} from "./sleeping-materialisation.js";
 
 export type ConnectedSessionController = {
   hasActivePrompt: () => boolean;
@@ -460,7 +467,47 @@ function restoreOriginalSessionState(params: {
   params.record.agentSessionId = params.agentSessionId;
 }
 
+/**
+ * Connect the record's session — or, for a SLEEPING record (UMQ K7, CONCEPTION §6.2), materialise
+ * it: ONE ordered step before the batch's `session/prompt`, in which a fresh `session/new` (or the
+ * template fork) is followed by the requested model, effort, mode and config exactly once
+ * (the preference replay below IS that step; the prompt path never applies the model again), and
+ * only then is `acpx.sleeping` deleted. Any failure leaves the record sleeping, byte for byte.
+ */
 export async function connectAndLoadSession(
+  options: ConnectAndLoadSessionOptions,
+): Promise<ConnectAndLoadSessionResult> {
+  if (options.record.acpx?.sleeping && options.record.acpSessionId !== "") {
+    // ⚠️ Sleeping means "never run": the record has no adapter session id. A record that carries a
+    // real `acpSessionId` AND a stray `acpx.sleeping` (an atrium-side path can leave the flag) is an
+    // ordinary session — materialising it would run a SECOND `session/new` and silently lose its
+    // history. Drop the flag, persist, and connect it like any other record (resume / load).
+    process.stderr.write(
+      `[acpx] session ${options.record.acpxRecordId} carries a stray acpx.sleeping although it ` +
+        `already ran (acpSessionId ${options.record.acpSessionId}); clearing the flag and ` +
+        `loading it as an ordinary session\n`,
+    );
+    delete options.record.acpx.sleeping;
+    await writeSessionRecordAtBoundaryNow(options.record);
+  }
+  if (!options.record.acpx?.sleeping) {
+    return await connectAndLoadSessionInner(options);
+  }
+  const before = structuredClone(options.record.acpx);
+  try {
+    return await connectAndLoadSessionInner(options);
+  } catch (error) {
+    options.record.acpSessionId = "";
+    options.record.agentSessionId = undefined;
+    options.record.acpx = before;
+    // An interrupt is the turn being cancelled, not a failed start; everything else is ONE code.
+    throw error instanceof InterruptedError
+      ? error
+      : new SessionMaterialisationError(options.record.acpxRecordId, error);
+  }
+}
+
+async function connectAndLoadSessionInner(
   options: ConnectAndLoadSessionOptions,
 ): Promise<ConnectAndLoadSessionResult> {
   const record = options.record;
@@ -564,6 +611,8 @@ export async function connectAndLoadSession(
     replayResult.desiredModelRestored,
     desiredModelId,
   );
+
+  await finishSleepingMaterialisation(record, loadState.sleepingFork);
 
   options.onSessionIdResolved?.(sessionId);
 
@@ -690,6 +739,8 @@ type RuntimeSessionLoadState = {
   resumed: boolean;
   shouldReplayPreferences: boolean;
   loadError?: string;
+  /** A sleeping COPY's first wake: what the template contributed (applied once the wake succeeds). */
+  sleepingFork?: SleepingForkInherited;
 };
 
 async function loadOrCreateRuntimeSession(params: {
@@ -700,6 +751,10 @@ async function loadOrCreateRuntimeSession(params: {
   timeoutMs?: number;
   verbose?: boolean;
 }): Promise<RuntimeSessionLoadState> {
+  if (params.record.acpx?.sleeping) {
+    return await materialiseSleepingRuntimeSession(params);
+  }
+
   if (params.reusingLoadedSession) {
     return {
       sessionId: params.record.acpSessionId,
@@ -726,6 +781,48 @@ async function loadOrCreateRuntimeSession(params: {
   }
 
   return await createFreshRuntimeSession(params.client, params.record, params.timeoutMs);
+}
+
+async function materialiseSleepingRuntimeSession(params: {
+  client: AcpClient;
+  record: SessionRecord;
+  sameSessionOnly: boolean;
+  timeoutMs?: number;
+  verbose?: boolean;
+}): Promise<RuntimeSessionLoadState> {
+  const templateId = params.record.acpx?.sleeping?.fork?.from;
+  if (templateId === undefined) {
+    return await createFreshRuntimeSession(params.client, params.record, params.timeoutMs);
+  }
+  const { forked, inherited, durableClaudeFork } = await forkTemplateForSleepingSession({
+    client: params.client,
+    record: params.record,
+    templateId,
+    timeoutMs: params.timeoutMs,
+  });
+  if (durableClaudeFork) {
+    // The durable id is not registered with the adapter: resume it (the model is then applied once,
+    // by the preference replay — the fork skips its own eager apply, as `sessions copy` does).
+    params.record.acpSessionId = forked.sessionId;
+    params.record.agentSessionId = forked.agentSessionId;
+    // ⚠️ same-session-only: a failed resume must FAIL the wake. The ordinary fallback — a fresh
+    // `session/new` for a record with no agent turn yet — would start the session WITHOUT the
+    // template's context and report success.
+    const sameSession = { ...params, sameSessionOnly: true };
+    const resumed = params.client.supportsResumeSession()
+      ? await resumeRuntimeSession(sameSession)
+      : await loadRuntimeSession(sameSession);
+    return { ...resumed, sleepingFork: inherited };
+  }
+  applyConfigOptionsToRecord(params.record, forked);
+  return {
+    sessionId: forked.sessionId,
+    pendingAgentSessionId: forked.agentSessionId,
+    sessionModels: forked.models,
+    resumed: false,
+    shouldReplayPreferences: true,
+    sleepingFork: inherited,
+  };
 }
 
 async function resumeRuntimeSession(params: {
