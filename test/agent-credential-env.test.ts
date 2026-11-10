@@ -33,7 +33,26 @@ const CANARY = "HP_1DC_NON_SECRET_CANARY";
 // Kept by decision (Daniel 2026-10-24) — a name pattern here would be a regression.
 const KEPT = ["GITHUB_TOKEN", "BROWSERLESS_TOKEN"] as const;
 
-const DUMP_EXTRA = [...AGENT_STRIPPED_CREDENTIAL_ENV, CANARY, ...KEPT, "HP_1DC_PROBE_AUTH"];
+// brick 51753638 (wisdom-pg) — the three Postgres passwords, as LITERALS. Every case from (a)
+// to the terminal one plants, dumps and asserts by iterating `AGENT_STRIPPED_CREDENTIAL_ENV`,
+// so a name dropped from that list drops out of all three steps at once and those cases stay
+// green. ⚠️ DO NOT DERIVE THIS FROM THE LIST: the literal is what makes case (e) go red when
+// an entry goes missing. `TRANSCRIPTS_PG_HOST` is the non-secret wiring beside them; it is kept.
+const WISDOM_PG_PASSWORDS = [
+  "TRANSCRIPTS_PG_PASSWORD",
+  "BRICK_NOTES_PG_PASSWORD",
+  "QMD_PG_PASSWORD",
+] as const;
+const WISDOM_PG_KEPT = "TRANSCRIPTS_PG_HOST";
+
+const DUMP_EXTRA = [
+  ...AGENT_STRIPPED_CREDENTIAL_ENV,
+  ...WISDOM_PG_PASSWORDS,
+  WISDOM_PG_KEPT,
+  CANARY,
+  ...KEPT,
+  "HP_1DC_PROBE_AUTH",
+];
 
 type Scratch = { stateHome: string; scratchDir: string; envDumpPath: string };
 
@@ -58,10 +77,8 @@ async function withEnv(vars: Record<string, string>, run: () => Promise<void>): 
 
 /** The ambient copies of every name this file asserts on, cleared for the test. */
 function clearedAmbient(): Record<string, string | undefined> {
-  const names = [
-    ...AGENT_STRIPPED_CREDENTIAL_ENV,
-    ...AGENT_STRIPPED_CREDENTIAL_ENV.map((name) => `ACPX_AUTH_${name}`),
-  ];
+  const all = [...AGENT_STRIPPED_CREDENTIAL_ENV, ...WISDOM_PG_PASSWORDS];
+  const names = [...all, ...all.map((name) => `ACPX_AUTH_${name}`), WISDOM_PG_KEPT];
   const saved: Record<string, string | undefined> = {};
   for (const name of names) {
     saved[name] = process.env[name];
@@ -131,7 +148,7 @@ async function spawnAndDumpEnv(
   }
 }
 
-function assertNoneOfTheFive(dump: Record<string, string>, origin: string): void {
+function assertNoneStripped(dump: Record<string, string>, origin: string): void {
   assert.equal(dump[CANARY], "1", `control (${origin}): the dump must capture inherited extras`);
   for (const name of AGENT_STRIPPED_CREDENTIAL_ENV) {
     assert.equal(name in dump, false, `${origin}: ${name} reached the agent`);
@@ -152,13 +169,13 @@ const prefixed = Object.fromEntries(
   AGENT_STRIPPED_CREDENTIAL_ENV.map((name) => [`ACPX_AUTH_${name}`, SENTINEL]),
 );
 
-test("(a) inherited under the PLAIN name: none of the five reaches the agent; non-secret env does", async () => {
+test("(a) inherited under the PLAIN name: no stripped name reaches the agent; non-secret env does", async () => {
   await withScratch(undefined, async (scratch) => {
     await withEnv(
       { ...plain, [CANARY]: "1", GITHUB_TOKEN: "kept-1", BROWSERLESS_TOKEN: "kept-2" },
       async () => {
         const dump = await spawnAndDumpEnv(scratch);
-        assertNoneOfTheFive(dump, "plain");
+        assertNoneStripped(dump, "plain");
         // Kept by decision, and a pattern-based strip would take them — pinned here.
         assert.equal(dump.GITHUB_TOKEN, "kept-1");
         assert.equal(dump.BROWSERLESS_TOKEN, "kept-2");
@@ -170,7 +187,7 @@ test("(a) inherited under the PLAIN name: none of the five reaches the agent; no
 test("(b) inherited as ACPX_AUTH_<NAME>: neither the prefixed form nor its promotion reaches the agent", async () => {
   await withScratch(undefined, async (scratch) => {
     await withEnv({ ...prefixed, [CANARY]: "1" }, async () => {
-      assertNoneOfTheFive(await spawnAndDumpEnv(scratch), "ACPX_AUTH_ prefix");
+      assertNoneStripped(await spawnAndDumpEnv(scratch), "ACPX_AUTH_ prefix");
     });
   });
 });
@@ -188,23 +205,60 @@ test("(c) declared in providers.json: no entry of ANY name is delivered into the
   await withScratch({ version: 1, box: "devbox", providers }, async (scratch) => {
     await withEnv({ [CANARY]: "1" }, async () => {
       const dump = await spawnAndDumpEnv(scratch);
-      assertNoneOfTheFive(dump, "providers.json");
+      assertNoneStripped(dump, "providers.json");
       assert.equal("HP_1DC_PROBE_AUTH" in dump, false, "a providers.json entry was delivered");
     });
   });
 });
 
-test("(d) a config authCredentials entry naming one of the five does not reach the agent", async () => {
+test("(d) a config authCredentials entry naming a stripped name does not reach the agent", async () => {
   await withScratch(undefined, async (scratch) => {
     await withEnv({ [CANARY]: "1" }, async () => {
-      assertNoneOfTheFive(await spawnAndDumpEnv(scratch, { ...plain }), "authCredentials");
+      assertNoneStripped(await spawnAndDumpEnv(scratch, { ...plain }), "authCredentials");
     });
   });
 });
 
+// One case per wisdom-pg password, each under both inherited forms, named by the literal above
+// (never via the list). A drop from `AGENT_STRIPPED_CREDENTIAL_ENV` turns exactly that case red.
+for (const name of WISDOM_PG_PASSWORDS) {
+  for (const form of [name, `ACPX_AUTH_${name}`]) {
+    test(`(e) wisdom-pg: ${form} in the parent env does not reach the agent`, async () => {
+      await withScratch(undefined, async (scratch) => {
+        await withEnv(
+          { [form]: SENTINEL, [WISDOM_PG_KEPT]: "wisdom-pg-rw", [CANARY]: "1" },
+          async () => {
+            const dump = await spawnAndDumpEnv(scratch);
+            assert.equal(
+              dump[CANARY],
+              "1",
+              `control (${form}): the dump must capture inherited extras`,
+            );
+            assert.equal(
+              dump[WISDOM_PG_KEPT],
+              "wisdom-pg-rw",
+              "the non-secret wiring must still arrive",
+            );
+            assert.equal(name in dump, false, `${form}: ${name} reached the agent`);
+            assert.equal(
+              `ACPX_AUTH_${name}` in dump,
+              false,
+              `${form}: ACPX_AUTH_${name} reached the agent`,
+            );
+            assert.ok(
+              !JSON.stringify(dump).includes(SENTINEL),
+              `${form}: the sentinel reached the agent`,
+            );
+          },
+        );
+      });
+    });
+  }
+}
+
 // The ACP terminal capability runs commands FOR the agent from the queue owner's own
 // environment, which can still hold a pre-rule snapshot. Same strip, inherited base only.
-test("terminal/create: the five are dropped from the inherited base; a name the request sets is kept", async () => {
+test("terminal/create: the stripped names are dropped from the inherited base; a name the request sets is kept", async () => {
   await withEnv({ ...plain, ...prefixed, [CANARY]: "1" }, async () => {
     const inherited = buildTerminalSpawnOptions("true", os.tmpdir(), undefined).env ?? {};
     assert.equal(inherited[CANARY], "1", "control: the terminal env inherits the base");
@@ -216,5 +270,26 @@ test("terminal/create: the five are dropped from the inherited base; a name the 
       buildTerminalSpawnOptions("true", os.tmpdir(), [{ name: "FAL_KEY", value: "explicit" }])
         .env ?? {};
     assert.equal(asked.FAL_KEY, "explicit");
+  });
+});
+
+test("(e) terminal/create: the wisdom-pg passwords, by literal name, are dropped from the inherited base", async () => {
+  const planted = Object.fromEntries(
+    WISDOM_PG_PASSWORDS.flatMap((name) => [
+      [name, SENTINEL],
+      [`ACPX_AUTH_${name}`, SENTINEL],
+    ]),
+  );
+  await withEnv({ ...planted, [WISDOM_PG_KEPT]: "wisdom-pg-rw" }, async () => {
+    const inherited = buildTerminalSpawnOptions("true", os.tmpdir(), undefined).env ?? {};
+    assert.equal(
+      inherited[WISDOM_PG_KEPT],
+      "wisdom-pg-rw",
+      "control: the terminal env inherits the base",
+    );
+    for (const name of WISDOM_PG_PASSWORDS) {
+      assert.equal(name in inherited, false, `terminal inherited ${name}`);
+      assert.equal(`ACPX_AUTH_${name}` in inherited, false, `terminal inherited ACPX_AUTH_${name}`);
+    }
   });
 });
