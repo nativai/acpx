@@ -36,6 +36,10 @@ import {
   resolveMessagesLogCompactBytes,
 } from "../messages-log.js";
 import { appendDeletionManifest, type DeletionManifestEntry } from "./deletion-manifest.js";
+import {
+  mergeRecordDurableOptionsForPersist,
+  rememberSessionDurableOptionsBaseline,
+} from "./durable-options-merge.js";
 import { withSessionIndexLock } from "./index-lock.js";
 import {
   flushPendingSessionIndexUpdates,
@@ -1275,6 +1279,11 @@ async function writeSessionRecordInternal(
       // pinned model: a stale/dropped write can't regress a record-pinned model,
       // while a deliberate set-model/subscription-switch/new --model still wins.
       mergeRecordPinnedModelForPersist(record, freshPersisted?.acpx);
+      // 🛑 THE DURABLE OPTIONS (output style, effort, mode, policy toggles), SAME BASELINE-DIFF
+      // PROTECTION, UNCONDITIONAL — brick://34f5f588. The turn's prompt-start write put back the
+      // `record.acpx` it had cloned at load, reverting an `acpx set outputStyle` accepted in
+      // between; only the live checkpoint merged these, no other writer did.
+      mergeRecordDurableOptionsForPersist(record, freshPersisted?.acpx);
       // 🛑 SAME BASELINE-DIFF PROTECTION, FOR WHO SERVED THE TURN (brick 4c272cab,
       // finding PM-1). UNCONDITIONAL — outside the `preserveLifecycle` branch above —
       // and that placement IS the fix: the write that clobbers this field is the
@@ -1335,6 +1344,7 @@ async function writeSessionRecordInternal(
     await updateIndexForWrittenRecord(sessionDir, record, path.basename(file), options);
     rememberSessionMetadataBaseline(record);
     rememberSessionModelBaseline(record);
+    rememberSessionDurableOptionsBaseline(record);
   });
 }
 

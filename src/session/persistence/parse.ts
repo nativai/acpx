@@ -11,6 +11,7 @@ import { SESSION_RECORD_SCHEMA } from "../../types.js";
 import { defaultSessionEventLog } from "../event-log.js";
 import { normalizeSessionOwnerOptions } from "../owner-options.js";
 import { normalizeRuntimeSessionId } from "../runtime-session-id.js";
+import { rememberSessionDurableOptionsBaseline } from "./durable-options-merge.js";
 import { rememberSessionMetadataBaseline } from "./metadata-merge.js";
 import { rememberSessionModelBaseline } from "./model-merge.js";
 import { parseSeatFieldsFromPersistedRecord } from "./seat-fields.js";
@@ -1548,7 +1549,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     return null;
   }
 
-  return rememberSessionModelBaseline(
+  const parsedRecord = rememberSessionModelBaseline(
     rememberSessionMetadataBaseline({
       schema: SESSION_RECORD_SCHEMA,
       acpxRecordId: record.acpx_record_id,
@@ -1601,4 +1602,5 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
       ...seatFields,
     }),
   );
+  return rememberSessionDurableOptionsBaseline(parsedRecord);
 }
