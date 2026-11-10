@@ -8,6 +8,7 @@ import { readLedgerFile } from "../src/capacity/ledger.js";
 import { reapLeftBehindTranscripts } from "../src/config/transcript-reap.js";
 import { connectAndLoadSession } from "../src/runtime/engine/reconnect.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
+import { removeTempHomeSync } from "./temp-home.js";
 import {
   admissionDir,
   agentStarts,
@@ -413,7 +414,7 @@ test("stray acpx.sleeping on a record that already RAN: the wake loads it (sessi
     } else {
       process.env.HOME = realHome;
     }
-    fs.rmSync(home, { recursive: true, force: true });
+    removeTempHomeSync(home);
   }
   assert.ok(calls.includes("session/load"), calls.join(","));
   assert.ok(!calls.includes("session/new"), calls.join(","));
