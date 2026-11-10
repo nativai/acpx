@@ -53,6 +53,7 @@ import {
 import { runQueuedTask } from "../src/cli/session/runtime.js";
 import type { PromptInput } from "../src/prompt-content.js";
 import type { DepthProjection } from "../src/session/depth-projection.js";
+import { sessionEventActivePath } from "../src/session/event-log.js";
 import { listSessionEvents } from "../src/session/events.js";
 import { writeSessionRecord } from "../src/session/persistence.js";
 import { connectSocket, nextJsonLine } from "./queue-test-helpers.js";
@@ -154,6 +155,38 @@ async function userRowsFor(home: string, sessionId: string): Promise<number> {
   }).length;
 }
 
+// The owner writes its `acpx/received` marker with a fire-and-forget async
+// appendFile AFTER it writes `accepted` (ipc-server.ts, handleSubmit) — and that
+// append is what CREATES the session's stream file. The first row then makes the
+// sessions dir read-only, so a stream file that does not exist yet can never be
+// created, the turn-start terminal (a best-effort appendFileSync into that same
+// file) is dropped, and the row reads `got []`. Measured: 1 red in 180 file runs
+// under 3 concurrent loops on 75ff653e, the libuv append losing the race to the
+// chmod. `accepted` on the socket does not order the two; the marker landing on
+// disk does — so wait on that, never on a sleep.
+async function waitForReceivedMarker(sessionId: string, requestId: string): Promise<void> {
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    const lines = await fs
+      .readFile(sessionEventActivePath(sessionId), "utf8")
+      .then((text) => text.split("\n"))
+      .catch(() => [] as string[]);
+    if (
+      lines.some((line) => {
+        if (!line.includes("acpx/received")) {
+          return false;
+        }
+        const event = JSON.parse(line) as { params?: { requestId?: string } };
+        return event.params?.requestId === requestId;
+      })
+    ) {
+      return;
+    }
+    assert(Date.now() < deadline, `the acpx/received marker for ${requestId} never reached disk`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 // One owner, one accepted no-wait task, exactly as acpx-ui submits it. `submit`
 // delivers the SAME messageId again — acpx-ui's re-drive.
 async function withAcceptedNoWaitTask(
@@ -210,6 +243,7 @@ async function withAcceptedNoWaitTask(
       );
       const accepted = (await nextJsonLine(lines[Symbol.asyncIterator]())) as { type: string };
       assert.equal(accepted.type, "accepted", "the owner accepted the task — custody is ours");
+      await waitForReceivedMarker(sessionId, requestId);
       const task = await owner.nextBatch().then((batch) => batch?.[0]);
       assert(task);
       return task;
