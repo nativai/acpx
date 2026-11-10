@@ -3841,9 +3841,20 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const preserveClosedState = async (): Promise<void> => {
     applyPersistedClosedState(await readPersistedLifecycle(record.acpxRecordId));
   };
+  // 🛑 TRUE WHILE `connectAndLoadSession` RUNS — brick://7fc0bc03 (and 56d160be). The connect owns
+  // `record.acpx`: it replaces and mutates that object (`available_models`, the advertised config,
+  // a first wake's deleted `sleeping`), while `acpxState` still holds the clone taken at turn load.
+  // A checkpoint firing in that span used to assign the pre-connect `acpxState` back onto
+  // `record.acpx` and write it: the wake's results vanished, so `applyPromptModelIfAdvertised` threw
+  // MODEL_NOT_ADVERTISED (~10 % of first wakes under load) and the woken record kept `sleeping`.
+  // The record write funnel still merges the durable options from disk, so skipping here loses none.
+  let connecting = false;
   const mergeLatestDurablePreferences = (
     persisted: PersistedSessionLifecycle | undefined,
   ): void => {
+    if (connecting) {
+      return;
+    }
     acpxState = cloneSessionAcpxState(
       mergeLatestDurableAcpxPreferences(acpxState, persisted?.acpx),
     );
@@ -4284,27 +4295,36 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     const connectStartedAt = Date.now();
     try {
       const connected = await measurePerf("runtime.connect_and_load", async () => {
-        return await connectAndLoadSession({
-          client,
-          record,
-          // The SAME resolved `sessionOptions` object handed to the AcpClient
-          // above — so what we stamp as APPLIED is what was actually sent.
-          outputStyle: sessionOptions?.outputStyle,
-          resumePolicy: options.resumePolicy,
-          timeoutMs: options.timeoutMs,
-          verbose: options.verbose,
-          activeController,
-          onClientAvailable: (controller) => {
-            options.onClientAvailable?.(controller);
-            notifiedClientAvailable = true;
-          },
-          onConnectedRecord: (connectedRecord) => {
-            connectedRecord.lastPromptAt = isoNow();
-          },
-          onSessionIdResolved: (sessionId) => {
-            activeSessionIdForControl = sessionId;
-          },
-        });
+        connecting = true;
+        try {
+          const result = await connectAndLoadSession({
+            client,
+            record,
+            // The SAME resolved `sessionOptions` object handed to the AcpClient
+            // above — so what we stamp as APPLIED is what was actually sent.
+            outputStyle: sessionOptions?.outputStyle,
+            resumePolicy: options.resumePolicy,
+            timeoutMs: options.timeoutMs,
+            verbose: options.verbose,
+            activeController,
+            onClientAvailable: (controller) => {
+              options.onClientAvailable?.(controller);
+              notifiedClientAvailable = true;
+            },
+            onConnectedRecord: (connectedRecord) => {
+              connectedRecord.lastPromptAt = isoNow();
+            },
+            onSessionIdResolved: (sessionId) => {
+              activeSessionIdForControl = sessionId;
+            },
+          });
+          // Re-base AT ONCE (no await between the connect's return and this line): from here the
+          // turn's `acpxState` carries what the connect wrote, so no later merge can undo it.
+          acpxState = cloneSessionAcpxState(record.acpx);
+          return result;
+        } finally {
+          connecting = false;
+        }
       });
       flushConnectOutput(connected.loadError);
       emitConnectPerfMetric(connectStartedAt, options.verbose);

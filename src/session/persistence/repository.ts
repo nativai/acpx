@@ -62,6 +62,7 @@ import { copySeatHolderFields, copySeatLinkageFields } from "./seat-fields.js";
 import { findHolderlessSeats, reapHolderlessSeats } from "./seat-holderless.js";
 import { serializeSessionRecordForDisk } from "./serialize.js";
 import { sessionBaseDir } from "./session-base-dir.js";
+import { dropStaleSleepingForPersist } from "./sleeping-merge.js";
 import { pickLatestTemplate, slugify, type TemplateOrderKey } from "./template-slug.js";
 
 export const DEFAULT_HISTORY_LIMIT = 20;
@@ -1284,6 +1285,12 @@ async function writeSessionRecordInternal(
       // `record.acpx` it had cloned at load, reverting an `acpx set outputStyle` accepted in
       // between; only the live checkpoint merged these, no other writer did.
       mergeRecordDurableOptionsForPersist(record, freshPersisted?.acpx);
+      // 🛑 `acpx.sleeping` ONLY GOES ONE WAY — brick://56d160be. The turn's live checkpoint put
+      // back the pre-wake `record.acpx` it held, flag included, after the materialisation had
+      // cleared it: `acp_session_id` set AND `sleeping` present, shown as "Sleeping" for a session
+      // that ran. Disk wins (not a baseline diff: the materialisation's own write re-captures the
+      // baseline, so the stale copy would read as deliberate). UNCONDITIONAL, like its neighbours.
+      dropStaleSleepingForPersist(record, freshPersisted);
       // 🛑 SAME BASELINE-DIFF PROTECTION, FOR WHO SERVED THE TURN (brick 4c272cab,
       // finding PM-1). UNCONDITIONAL — outside the `preserveLifecycle` branch above —
       // and that placement IS the fix: the write that clobbers this field is the
