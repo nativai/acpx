@@ -46,6 +46,7 @@ import {
 import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
 import { guardServedModel, stampModelGuardBreadcrumb } from "../../session/model-guard.js";
 import { recordAppliedOutputStyleOutcome } from "../../session/output-style.js";
+import { writeSessionRecordAtBoundaryNow } from "../../session/persistence.js";
 import type { SessionRecord, SessionResumePolicy } from "../../types.js";
 import {
   applyLifecycleSnapshotToRecord,
@@ -476,6 +477,19 @@ function restoreOriginalSessionState(params: {
 export async function connectAndLoadSession(
   options: ConnectAndLoadSessionOptions,
 ): Promise<ConnectAndLoadSessionResult> {
+  if (options.record.acpx?.sleeping && options.record.acpSessionId !== "") {
+    // ⚠️ Sleeping means "never run": the record has no adapter session id. A record that carries a
+    // real `acpSessionId` AND a stray `acpx.sleeping` (an atrium-side path can leave the flag) is an
+    // ordinary session — materialising it would run a SECOND `session/new` and silently lose its
+    // history. Drop the flag, persist, and connect it like any other record (resume / load).
+    process.stderr.write(
+      `[acpx] session ${options.record.acpxRecordId} carries a stray acpx.sleeping although it ` +
+        `already ran (acpSessionId ${options.record.acpSessionId}); clearing the flag and ` +
+        `loading it as an ordinary session\n`,
+    );
+    delete options.record.acpx.sleeping;
+    await writeSessionRecordAtBoundaryNow(options.record);
+  }
   if (!options.record.acpx?.sleeping) {
     return await connectAndLoadSessionInner(options);
   }

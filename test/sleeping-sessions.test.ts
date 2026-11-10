@@ -349,6 +349,84 @@ test("connectAndLoadSession on a sleeping record: session/new → model → (eff
   }
 });
 
+test("stray acpx.sleeping on a record that already RAN: the wake loads it (session/load), never session/new, acpSessionId unchanged, the flag removed and logged", async () => {
+  const calls: string[] = [];
+  const client = {
+    hasReusableSession: () => false,
+    start: async () => {
+      calls.push("start");
+    },
+    markAdvertisement: () => 0,
+    advertisedConfigOptionsSince: () => undefined,
+    getAgentLifecycleSnapshot: () => ({ running: true }),
+    supportsLoadSession: () => true,
+    supportsResumeSession: () => false,
+    loadSessionWithOptions: async () => {
+      calls.push("session/load");
+      return {};
+    },
+    createSession: async () => {
+      calls.push("session/new");
+      throw new Error("a record that already ran must never get a second session/new");
+    },
+    setSessionMode: async () => {},
+    setSessionModel: async () => {},
+    setSessionConfigOption: async () => ({ configOptions: [] }),
+  };
+  const controller = {
+    hasActivePrompt: () => false,
+    requestCancelActivePrompt: async () => false,
+    setSessionMode: async () => {},
+    setSessionModel: async () => {},
+    setSessionConfigOption: async () => ({ configOptions: [] }),
+  };
+  const record = makeSessionRecord(
+    {
+      acpxRecordId: "stray-sleeping-unit",
+      acpSessionId: "fab74f21-real-acp-session",
+      agentCommand: "agent",
+      cwd: process.cwd(),
+      acpx: { sleeping: { since: "2026-11-09T10:00:00.000Z" } },
+    },
+    { defaultAcpx: false },
+  );
+  const logged: string[] = [];
+  const realHome = process.env.HOME;
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-stray-sleeping-"));
+  process.env.HOME = home; // the flag removal persists the record: keep it out of the real store
+  const realWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    logged.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    await connectAndLoadSession({
+      client: client as never,
+      record,
+      timeoutMs: 1_000,
+      activeController: controller,
+    });
+  } finally {
+    process.stderr.write = realWrite;
+    if (realHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = realHome;
+    }
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+  assert.ok(calls.includes("session/load"), calls.join(","));
+  assert.ok(!calls.includes("session/new"), calls.join(","));
+  assert.equal(record.acpSessionId, "fab74f21-real-acp-session", "the session id is unchanged");
+  assert.equal(record.acpx?.sleeping, undefined, "the stray flag is removed");
+  assert.ok(
+    logged.some(
+      (line) => line.includes("stray-sleeping-unit") && line.includes("stray acpx.sleeping"),
+    ),
+    `one log line names it: ${logged.join("|")}`,
+  );
+});
+
 test("N-A2-6 twin · a materialisation failure fails the turn before it starts, leaves the session sleeping, and a later prompt wakes it", async () => {
   const f = makeBox({ requestMib: 4000, withMockExtraArgs: ["--set-session-model-fails"] });
   const run = await sleepingNew(f, [], ["--model", "sonnet"]);
