@@ -2711,10 +2711,9 @@ function isOutputStyleConfigKey(configId: string): boolean {
  * brick://874fee67 — `acpx <agent> set outputStyle <name>`.
  *
  * Validated against the session's OWN advertised style list (a record read, so
- * it works with no owner running), then persisted. The owner is recycled
- * immediately when it is idle; when a turn is in flight the write is still
- * ACCEPTED and the owner recycles itself at the turn boundary. Refused only when
- * work is queued behind the active turn, which a recycle would drop.
+ * it works with no owner running), then persisted. A live owner rebinds its
+ * client at its next turn start, so the write is ACCEPTED whether the owner is
+ * idle, mid-turn or has work queued behind the turn.
  */
 export async function handleSetOutputStyle(
   explicitAgentName: string | undefined,
