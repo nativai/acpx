@@ -48,6 +48,7 @@ export const RESERVED_HANDLES: readonly string[] = Object.freeze([
   "root",
   "person",
   "people",
+  "owner",
 ]);
 
 /** One row of a box's people list, as far as the resolver reads it (C6.2 holds more; extra keys are ignored). */

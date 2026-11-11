@@ -71,6 +71,7 @@ import {
   type SeatBrickLink,
   type SeatRecord,
 } from "../../session/persistence.js";
+import { withDefaultOwner } from "../../session/persistence/principal.js";
 import {
   refuseUnresumableConversation,
   resumeNotFoundMessage,
@@ -964,6 +965,7 @@ async function createSessionRecordWithClient(
 export async function createSleepingSession(
   inputOptions: SessionCreateOptions,
 ): Promise<SessionRecord> {
+  inputOptions = { ...inputOptions, metadata: await withDefaultOwner(inputOptions.metadata) };
   const bound: SessionCreateOptions = {
     ...inputOptions,
     cwd: effectiveCreateCwd(inputOptions.cwd),
@@ -1462,6 +1464,7 @@ async function creationSessionContext(options: SessionCreateOptions) {
 export async function createSessionWithClient(
   options: SessionCreateOptions,
 ): Promise<SessionCreateWithClientResult> {
+  options = { ...options, metadata: await withDefaultOwner(options.metadata) };
   const effectiveOptions: SessionCreateOptions = {
     ...options,
     // THE GUARANTEE of the fixed session root (brick 45917618 §5.2 E1): every record-creating create —
@@ -1586,6 +1589,7 @@ function outputStyleListFromAdvertised(
 }
 
 export async function createSession(options: SessionCreateOptions): Promise<SessionRecord> {
+  options = { ...options, metadata: await withDefaultOwner(options.metadata) };
   if (options.sleeping) {
     return await createSleepingSession(options);
   }

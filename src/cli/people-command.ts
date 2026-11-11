@@ -26,7 +26,7 @@ import {
 } from "../session/persistence/people-file.js";
 import { type MatchResult, type PersonHit, matchRef } from "../session/persistence/person.js";
 import { type RecordedPrincipal, recordedPrincipalOf } from "../session/persistence/principal.js";
-import { resolveSessionRecord } from "../session/persistence/repository.js";
+import { resolveSessionRecord, writeSessionRecord } from "../session/persistence/repository.js";
 import { EXIT_CODES } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import { resolveGlobalFlags } from "./flags.js";
@@ -259,7 +259,7 @@ export function registerPeopleCommand(parent: Command, config: ResolvedAcpxConfi
   const people = parent
     .command("people")
     .description(
-      "The box's people and whom a session works for — offline, read-only (list, resolve, principal)",
+      "The box's people and the owner a session works for — offline (list, resolve, principal, set-owner)",
     )
     .exitOverride(rethrow);
 
@@ -280,6 +280,44 @@ export function registerPeopleCommand(parent: Command, config: ResolvedAcpxConfi
     .exitOverride(rethrow)
     .action(async function (this: Command, ref: string) {
       await handleResolve(printerFor(resolveGlobalFlags(this, config).format), ref);
+    });
+
+  people
+    .command("set-owner <ref>")
+    .description(
+      "Assign a session's owner; preserves provenance and takes effect from its next turn",
+    )
+    .requiredOption("--session <id|url>", "Session whose owner changes")
+    .exitOverride(rethrow)
+    .action(async function (this: Command, ref: string, flags: { session: string }) {
+      const printer = printerFor(resolveGlobalFlags(this, config).format);
+      const id = sessionIdToRead(flags.session);
+      if (!id) {
+        printer.err(noSessionMessage(flags.session));
+        exitWith(PEOPLE_EXIT.USAGE);
+        return;
+      }
+      await withPeople(printer, async (rows) => {
+        const answer = matchRef(rows, ref);
+        if (!answer.ok) {
+          failureLines(ref, answer).forEach((line) => printer.err(line));
+          if (printer.json) {
+            printer.out(JSON.stringify(failureJson(answer)));
+          }
+          exitWith(failureCode(answer));
+          return;
+        }
+        const record = await resolveSessionRecord(id);
+        record.metadata = {
+          ...record.metadata,
+          principal_id: answer.person.id,
+          principal_name: answer.person.name,
+          principal_via: "assigned",
+        };
+        delete record.metadata.principal_from;
+        await writeSessionRecord(record);
+        printPrincipal(printer, recordedPrincipalOf(record.metadata)!);
+      });
     });
 
   people

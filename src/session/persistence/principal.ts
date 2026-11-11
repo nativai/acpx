@@ -1,3 +1,4 @@
+import { readPeopleFile, reportSkippedPeopleRows } from "./people-file.js";
 /**
  * The recorded principal of a session — "whose session is this" (PERSON-CONTRACT v3.1 C8; brick b0968426,
  * build block P1 of brick fcef527e).
@@ -17,7 +18,17 @@
  * CREATOR — the caller of the verb — and has no parameter through which a copy's source could reach it. Do
  * not add one: a copy that answered its source's person would hand one person's session to another.
  */
-import { isPersonId } from "./person.js";
+import { isPersonId, matchRef } from "./person.js";
+
+export const PRINCIPAL_VIAS = [
+  "started",
+  "armer",
+  "telegram",
+  "inherited",
+  "none",
+  "assigned",
+  "default",
+] as const;
 
 /** Key prefix of the principal entries in a record's metadata and on its index entry. */
 export const PRINCIPAL_METADATA_PREFIX = "principal_";
@@ -64,18 +75,23 @@ function nonEmpty(value: string | undefined): string | null {
 }
 
 /** Null when the record has no `principal_via` — a session that predates the keys ("not recorded"). */
+function validRecordedId(namesPerson: boolean, id: string | undefined): string | null {
+  return namesPerson && isPersonId(id) ? id : null;
+}
+
 export function recordedPrincipalOf(metadata: unknown): RecordedPrincipal | null {
   const entries = principalEntriesOf(metadata);
   const via = nonEmpty(entries?.[VIA_KEY]);
   if (!entries || via === null) {
     return null;
   }
+  const namesPerson = via !== "none" && PRINCIPAL_VIAS.some((v) => v === via);
   return {
     via,
     // The id is NOT trimmed: C1.1 admits no padding and no trailing LF, so `p-…\n` is not a person id.
-    id: entries[ID_KEY] === "" ? null : (entries[ID_KEY] ?? null),
-    name: nonEmpty(entries[NAME_KEY]),
-    from: nonEmpty(entries[FROM_KEY]),
+    id: validRecordedId(namesPerson, entries[ID_KEY]),
+    name: namesPerson ? nonEmpty(entries[NAME_KEY]) : null,
+    from: via === "inherited" ? nonEmpty(entries[FROM_KEY]) : null,
   };
 }
 
@@ -198,4 +214,26 @@ export function principalContextFields(metadata: unknown): {
 } {
   const env = principalEnvOf(metadata);
   return { principalId: env?.id ?? null, principalName: env?.name ?? null };
+}
+
+/** Creation only: a configured default replaces an explicit no-creator answer, never inheritance. */
+export async function withDefaultOwner(
+  metadata: Record<string, string> | undefined,
+  ref = process.env.ACPX_DEFAULT_OWNER,
+): Promise<Record<string, string> | undefined> {
+  if (!ref?.trim() || metadata?.principal_via !== "none") {
+    return metadata;
+  }
+  const read = await readPeopleFile();
+  reportSkippedPeopleRows(read);
+  const resolved = matchRef(read.rows, ref);
+  if (!resolved.ok) {
+    throw new Error(`ACPX_DEFAULT_OWNER ${JSON.stringify(ref)}: ${resolved.error}`);
+  }
+  return {
+    ...metadata,
+    principal_via: "default",
+    principal_id: resolved.person.id,
+    principal_name: resolved.person.name,
+  };
 }
