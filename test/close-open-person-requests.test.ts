@@ -49,6 +49,34 @@ function answer(rows: unknown[]): { status: number; body: string } {
   return { status: 200, body: JSON.stringify({ seat: ID, rows }) };
 }
 
+test("R1 A1 · only open questions block: explicit, legacy, and mixed rows", () => {
+  for (const needs_answer of [false, 0]) {
+    const read = classifyPersonMessagesAnswer(200, answer([{ ...row("open"), needs_answer }]).body);
+    assert.deepEqual(read, { kind: "answered", open: [] });
+    assert.equal(decideOnOpenPersonRequests(ID, read).proceed, true);
+  }
+  for (const question of [
+    row("open"),
+    { ...row("open"), needs_answer: true },
+    { ...row("open"), needs_answer: 1 },
+  ]) {
+    const read = classifyPersonMessagesAnswer(
+      200,
+      answer([
+        { ...row("open", OTHER), needs_answer: false },
+        question,
+        { ...row("done", OTHER), needs_answer: true },
+      ]).body,
+    );
+    assert.ok(read.kind === "answered");
+    assert.deepEqual(
+      read.open.map((r) => r.to),
+      [PERSON],
+    );
+    assert.equal(decideOnOpenPersonRequests(ID, read).proceed, false);
+  }
+});
+
 // ─── The read: what each answer of the route means ───────────────────────────
 
 test("ACPXG-1 · an open row is read as an open request; a closed row of every other state is not (positive control for the refusal)", () => {
@@ -390,13 +418,23 @@ test("ACPXG-1 · an agent closing ITSELF with a request open is refused too (no 
   });
 });
 
-test("ACPXG-2 · `--force` closes with the request still open — and never asks atrium (the seat-close hook closes the rows as session-closed)", async () => {
+test("ACPXG-2 · `--force` closes with the request still open and never asks atrium", async () => {
   await withRig(answer([row("open")]), async (rig) => {
     const id = await rig.create("asker");
     const closed = await rig.cli(["sessions", "close", "--session-id", id, "--force"]);
     assert.equal(closed.code, 0, closed.stderr);
     assert.equal((await rig.onDisk(id)).closed, true);
     assert.deepEqual(rig.stub.requests, [], "--force still read the rows");
+  });
+});
+
+test("R1 A1 · an agent closes after a plain message without --force", async () => {
+  await withRig(answer([{ ...row("open"), needs_answer: false }]), async (rig) => {
+    const id = await rig.create("last-status");
+    const closed = await rig.cli(["sessions", "close", "--session-id", id]);
+    assert.equal(closed.code, 0, closed.stderr);
+    assert.equal((await rig.onDisk(id)).closed, true);
+    assert.ok(rig.stub.requests.includes(`GET /api/sessions/${id}/person-messages`));
   });
 });
 

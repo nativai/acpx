@@ -9,9 +9,8 @@ import { callerIsAgent } from "./byway-close-guard.js";
 /**
  * `sessions close`'s open-person-request guard (brick 2587d30e, addressing v3 §8.3 / K18 P6).
  *
- * A closing session that still has a flagged message awaiting a PERSON's answer would drop that
- * request silently (atrium's seat-close hook closes the rows `session-closed`). So the close is
- * refused unless the caller adds `--force`, and with `--force` that hook does exactly that.
+ * An agent with an open question must resolve it or close with `--force`. Plain messages do not
+ * block closing. Atrium keeps the items open after an agent closes, including a forced close.
  *
  * ## The mechanism (O-11): a READ of atrium's rows, not a count in the session record
  *
@@ -33,8 +32,7 @@ import { callerIsAgent } from "./byway-close-guard.js";
  * `unreachable` (connection refused, timeout, a 5xx, a body that is not the rows shape): acpx
  * cannot know. The close PROCEEDS, said on stderr only under `--verbose` — a close must never be
  * blocked by an atrium that is down (it is what a wrap-up runs against, and on a box with no
- * atrium there is nothing to ask), and atrium's own seat-close hook still closes any rows, visibly
- * as `session-closed`, when it is back. ⚠️ NOT a default warning: every agent-run close on a box
+ * atrium there is nothing to ask). ⚠️ NOT a default warning: every agent-run close on a box
  * or a test rig without a reachable atrium would carry it, and fleet wrap-ups parse the close's
  * stderr (`2>&1 | tail -1`); `test/background-task-close-gate.test.ts` asserts that stderr exactly.
  *
@@ -44,14 +42,14 @@ import { callerIsAgent } from "./byway-close-guard.js";
  * (`callerIsAgent`: any of the identity variables acpx sets on every agent it runs, which atrium
  * strips before it spawns acpx). The silent loss this exists for is an agent (an orchestrator
  * closing its children, a session closing itself) dropping a person's request unseen; a PERSON's
- * close — atrium's UI close delegation, a human at a terminal — is deliberate, and the seat-close
- * hook closes the rows visibly as `session-closed`. So a non-agent caller is never asked and
+ * close — atrium's UI close delegation, a human at a terminal — is deliberate. Atrium acknowledges
+ * the items only for a signed-in person's Close. A non-agent CLI caller is never asked and
  * never warned. ⚠️ A self-close by an agent IS guarded (unlike the byway guard's exemption): an
  * agent that closes itself with a request open must resolve it or say `--force`.
  *
  * It is evaluated by the HANDLER, never inside `closeSession()`, so acpx's own internal closes
- * (template enable, handover) are untouched. And it asks only about a session whose close would
- * close the rows: a seat's ACTIVE holder, or a seat-less session. A retired predecessor
+ * (template enable, handover) are untouched. It asks only about a seat's ACTIVE holder, or a
+ * seat-less session. A retired predecessor
  * (`holderActive` false) or a prepared successor (no `holderActive`) leaves the seat — and its
  * rows — to the holder that remains: closing the predecessor after a hand-over (the duty
  * `sessions activate` prints) must never be refused.
@@ -76,7 +74,7 @@ export type OpenPersonRequestsFetch = (
   init: { signal: AbortSignal },
 ) => Promise<{ status: number; text(): Promise<string> }>;
 
-/** True when closing this record would close the seat's rows (see "Where it does NOT fire"). */
+/** True when this record is the holder responsible for the seat's questions. */
 export function closeWouldCloseRows(record: SessionRecord): boolean {
   if (record.closed === true) {
     return false;
@@ -111,7 +109,7 @@ function stringOr(value: unknown, fallback: string): string {
   return typeof value === "string" ? value : fallback;
 }
 
-/** `null` = a closed row; `undefined` = a row of a shape this reader does not know. */
+/** `null` = no open question; `undefined` = a row of a shape this reader does not know. */
 function readRow(row: unknown): OpenPersonRequest | null | undefined {
   if (!isRecord(row) || typeof row.state !== "string") {
     return undefined;
@@ -120,7 +118,8 @@ function readRow(row: unknown): OpenPersonRequest | null | undefined {
   if (!to) {
     return undefined;
   }
-  return row.state === "open"
+  // Wave-1 rows have no needs_answer field: they were all questions.
+  return row.state === "open" && row.needs_answer !== false && row.needs_answer !== 0
     ? { to, messageId: stringOr(row.message_id, ""), since: stringOr(row.created_at, "") }
     : null;
 }
