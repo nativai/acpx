@@ -567,8 +567,8 @@ export function registerSessionsCommand(
     // brick 2587d30e — shown in --help on purpose: an agent must read it before it reaches for it.
     .option(
       "--force",
-      "Agent callers: close even though the session has open requests to people (a flagged " +
-        "message still awaiting a person's answer). Those requests are closed as session-closed.",
+      "Agent callers: close despite open questions to people. Open questions and messages " +
+        "remain open; plain messages do not require --force. Only a person's Close in atrium acknowledges them.",
     )
     // brick 9d34a178 — shown in --help on purpose: an agent closing ITSELF must read these two.
     .option(

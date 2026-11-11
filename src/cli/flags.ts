@@ -228,8 +228,7 @@ export type SessionsCloseFlags = StatusFlags & {
   // gives any caller that deferral.
   now?: boolean;
   afterTurn?: boolean;
-  // brick 2587d30e (addressing v3 §8.3) — close even though the session has open requests to
-  // people; atrium then closes those requests as `session-closed`.
+  // Close despite open questions to people; the agent's close preserves open questions and messages.
   force?: boolean;
 };
 

@@ -524,7 +524,11 @@ test("ACPXG-1 · `--force` is shown in `sessions close --help` and carried by th
   await withRig(answer([]), async (rig) => {
     const help = await rig.cli(["sessions", "close", "--help"]);
     assert.match(help.stdout, /--force/);
-    assert.match(help.stdout.replace(/\s+/g, " "), /open requests to people/);
+    const text = help.stdout.replace(/\s+/g, " ");
+    assert.match(text, /open questions to people/);
+    assert.match(text, /Open questions and messages remain open/);
+    assert.match(text, /plain messages do not require --force/);
+    assert.doesNotMatch(text, /requests are closed as session-closed/);
   });
   const { closeRetryArgs } = await import("../src/cli/background-task-gate.js");
   assert.deepEqual(closeRetryArgs({ force: true }), ["--force"]);

@@ -257,6 +257,8 @@ acpx codex status
 acpx codex status --session-id <id>
 ```
 
+An agent's close leaves person messages and questions open for acknowledgement. An open question blocks an ordinary close with `OPEN_PERSON_REQUESTS`; `--force` closes without acknowledging it. Plain messages do not block closing. A signed-in person's Close in atrium acknowledges all open items in the seat.
+
 Behavior:
 
 - `sessions` and `sessions list` are equivalent
