@@ -24,7 +24,7 @@ import {
 const SOURCE_PATH = path.resolve(process.cwd(), "src/session/persistence/person.ts");
 const FIXTURE_PATH = path.resolve(process.cwd(), "test/fixtures/person.fixture.json");
 // ---- everything below this line is the same in both repos' person tests ----
-const PERSON_TS_SHA256 = "61dbd0575cec8b02c80b2de63f1c63b4286f957d8e3e0d9c63787e074ee33d9b";
+const PERSON_TS_SHA256 = "fb46b5309c1db343322d65e0a84aac313786b5a567ad476fcd7b93b7940025c9";
 const FIXTURE_SHA256 = "898ab29f987ae27a40c9b29775de1886fb090bc863575dab330765870853b032";
 
 interface IdRow {
@@ -394,7 +394,7 @@ test("C3.1 negatives: each of these is well-formed except the one property the g
   }
 });
 
-test("C7.3: RESERVED_HANDLES is exactly the contract's twenty words, immutable, and never a handle", () => {
+test("C7.3 amended 2026-11-10: RESERVED_HANDLES is exactly the contract's 21 words, immutable, and never a handle", () => {
   assert.deepEqual(
     [...RESERVED_HANDLES],
     [
@@ -418,8 +418,10 @@ test("C7.3: RESERVED_HANDLES is exactly the contract's twenty words, immutable, 
       "root",
       "person",
       "people",
+      "owner",
     ],
   );
+  assert.equal(RESERVED_HANDLES.length, 21);
   assert.equal(Object.isFrozen(RESERVED_HANDLES), true);
   assert.throws(() => (RESERVED_HANDLES as string[]).push("laatz"), TypeError);
   assert.equal(RESERVED_HANDLES.includes("laatz"), false);
@@ -439,6 +441,13 @@ test("C7.3: every reserved word is a well-formed handle, so only the explicit ch
     assert.equal(asLastName.includes(word), false, `a family name ${word} is never offered`);
     assert.equal(asLastName[0], `pat-${word}`.slice(0, 20));
   }
+});
+
+test("C7.3 owner amendment: owner is refused as a candidate while ownership remains available", () => {
+  assert.equal(RESERVED_HANDLES.includes("owner"), true);
+  assert.equal(take(handleCandidates("Owner", SOME_ID), 10).includes("owner"), false);
+  assert.equal(firstFree("Owner", SOME_ID, []), "owner-2");
+  assert.equal(firstFree("Ownership", SOME_ID, []), "ownership");
 });
 
 test("C7.3 positive control: the reserved check is an exact match — boxer and rooted are offered", () => {
