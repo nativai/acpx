@@ -561,6 +561,75 @@ async function waitFor(what: string, timeoutMs: number, ready: () => boolean): P
 const promptIndex = (ops: Op[], text: string) =>
   ops.findIndex((op) => op.method === "session/prompt" && op.text === text);
 
+test("R1 A9: owner assignment rebinds the warm adapter on its next turn, retaining the queue owner", async () => {
+  const rig = await makeRig(
+    "--claude-agent-acp --supports-resume-session --advertise-config-options",
+  );
+  const person = {
+    id: "p-fb566154c0bf245b7538",
+    name: "Daniel Laatz",
+    handle: "laatz",
+    former_handles: [],
+  };
+  fs.writeFileSync(
+    path.join(rig.root, ".acpx", "people.json"),
+    JSON.stringify({ v: 1, people: { [person.id]: person } }),
+  );
+  try {
+    assert.equal((await cli(rig, ["prompt", "--session-id", rig.id, "echo owner-before"])).code, 0);
+    const owner = ownerPidOf(rig);
+    const adapter = recordOf(rig).pid;
+    const set = await runCli(rig, [
+      "--format",
+      "json",
+      "people",
+      "set-owner",
+      "laatz",
+      "--session",
+      rig.id,
+    ]);
+    assert.equal(set.code, 0, set.stderr);
+    assert.equal(ownerPidOf(rig), owner);
+    assert.equal(recordOf(rig).pid, adapter, "assignment must not interrupt the current adapter");
+    const after = await cli(rig, ["prompt", "--session-id", rig.id, "echo owner-after"]);
+    assert.equal(after.code, 0, after.stderr);
+    assert.notEqual(recordOf(rig).pid, adapter, "owner-only metadata change did not rebind");
+    assert.equal(ownerPidOf(rig), owner);
+    assert.match(ownerLogOf(rig), /queue owner rebound session .* \(reason=settings\)/);
+  } finally {
+    await runCli(rig, ["--agent", rig.agent, "sessions", "close", "--session-id", rig.id]);
+    fs.rmSync(rig.root, { recursive: true, force: true });
+  }
+});
+
+test("R1 A9: principal id/name are binding inputs, provenance alone is not", () => {
+  const record = makeSessionRecord({
+    acpxRecordId: "owner-fp",
+    acpSessionId: "owner-fp",
+    agentCommand: CLAUDE_CMD,
+    cwd: "/",
+  });
+  const before = settingsBindingFingerprint(record);
+  const changes: Record<string, string>[] = [
+    { principal_id: "p-fb566154c0bf245b7538" },
+    { principal_name: "Daniel Laatz" },
+  ];
+  for (const metadata of changes) {
+    assert.notEqual(settingsBindingFingerprint({ ...record, metadata }), before);
+    assert.notEqual(
+      bindTurnOwnWrites(before, { ...record, metadata }, { model: "sonnet" }),
+      settingsBindingFingerprint({ ...record, metadata }),
+    );
+  }
+  assert.equal(
+    settingsBindingFingerprint({
+      ...record,
+      metadata: { principal_via: "assigned", started_by_name: "Creator" },
+    }),
+    before,
+  );
+});
+
 for (const change of [
   {
     verb: "effort",

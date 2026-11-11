@@ -1589,7 +1589,6 @@ function outputStyleListFromAdvertised(
 }
 
 export async function createSession(options: SessionCreateOptions): Promise<SessionRecord> {
-  options = { ...options, metadata: await withDefaultOwner(options.metadata) };
   if (options.sleeping) {
     return await createSleepingSession(options);
   }

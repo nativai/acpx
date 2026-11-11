@@ -38,7 +38,10 @@ type BindingSlots = Array<[slot: string, value: unknown]>;
 function settingsBindingSlots(record: SessionRecord): BindingSlots {
   const options = record.acpx?.session_options ?? {};
   const desired = record.acpx?.desired_config_options ?? {};
+  const metadata = record.metadata ?? {};
   return [
+    ["metadata.principal_id", metadata.principal_id ?? null],
+    ["metadata.principal_name", metadata.principal_name ?? null],
     ...BOUND_SESSION_OPTIONS.map((field): [string, unknown] => [
       `session_options.${field}`,
       options[field] ?? null,

@@ -5,14 +5,14 @@ import { readPeopleFile, reportSkippedPeopleRows } from "./people-file.js";
  *
  * It lives in the record's `metadata` as flat STRINGS, because `metadata` is `Record<string,string>` and
  * `parseMetadata` fails the WHOLE record load on any other value:
- *   principal_via   always written: started | armer | telegram | inherited | none
+ *   principal_via   started | armer | telegram | inherited | none | assigned | default
  *   principal_id    only when there is a principal (`p-` + 20 hex, C1)
  *   principal_name  only when there is a principal
  *   principal_from  the creator session's id, only when principal_via = inherited
  *
  * acpx writes `inherited` (a copy of the creator's answer, one hop) and `none` (no creator at all); the
  * `started` / `armer` / `telegram` rows are atrium's and arrive here through an explicit `--metadata`.
- * No verb rewrites the keys afterwards (C8.3).
+ * C8.8: people set-owner rewrites the owner atomically; provenance stays separate.
  *
  * ⚠️ THE PRINCIPAL OF A COPY IS ITS MAKER'S, NEVER ITS SOURCE'S (C8.3, G2). `withRecordedPrincipal` takes the
  * CREATOR — the caller of the verb — and has no parameter through which a copy's source could reach it. Do
