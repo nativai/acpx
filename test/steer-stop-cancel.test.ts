@@ -226,7 +226,8 @@ function cancelledDetailCode(stream: string, messageId: string): string | undefi
       params?.messageId === messageId &&
       params.phase === "cancelled"
     ) {
-      return String(params.error?.detailCode ?? "");
+      const detailCode = params.error?.detailCode;
+      return typeof detailCode === "string" ? detailCode : "";
     }
   }
   return undefined;
