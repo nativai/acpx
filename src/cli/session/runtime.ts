@@ -656,8 +656,9 @@ async function resolveRecordIfPromptAlreadyPersisted(
   if (!hasUserMessageId(cloneSessionConversation(latestRecord), messageId)) {
     return undefined;
   }
-  // Persistence alone is not proof of delivery: recordPromptStart writes the User message
-  // BEFORE the turn runs, so a turn that failed/never-completed leaves an orphaned prompt.
+  // Persistence alone is not proof of delivery: the User row is written at acceptance, just
+  // before the prompt goes on the wire (brick 6f461fe4), so a turn that failed after it, or never
+  // completed, leaves a row with no reply.
   // Only dedup when a real completion terminal exists for this messageId (Defect B, 182d241f).
   const events = await listSessionEvents(latestRecord.acpxRecordId);
   return hasCompletedDeliveryFor(events, messageId) ? latestRecord : undefined;
@@ -2684,9 +2685,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     return { messageId: promptMessageId, deduplicated: false };
   };
 
-  // UMQ §5.3 — N User rows, one per member, written in ONE boundary write; a member whose message
-  // already completed leaves (its `done / deduplicated`), and the rest keep their rows by id.
-  const recordBatchStart = async (
+  // UMQ §5.3 — a member whose message already completed leaves (its `done / deduplicated`); the
+  // rest run. Writes no User row: see `recordBatchStart` and the turn's main members (brick 6f461fe4).
+  const settleBatch = async (
     members: TurnMember[],
   ): Promise<{ delivered: TurnMember[]; deduplicated: TurnMember[]; record?: SessionRecord }> => {
     const settled = await resolveAlreadyDeliveredMessageIds(
@@ -2697,15 +2698,25 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       (member) => member.messageId !== undefined && settled.ids.has(member.messageId),
     );
     const delivered = members.filter((member) => !deduplicated.includes(member));
-    if (delivered.length > 0) {
-      await writeMemberRows(delivered);
-    }
     for (const member of deduplicated) {
       if (member.task) {
         member.task.terminalWritten = true;
       }
     }
     return { delivered, deduplicated, record: settled.record };
+  };
+
+  // UMQ §5.3 — N User rows, one per member, written in ONE boundary write; a member whose message
+  // already completed leaves (its `done / deduplicated`), and the rest keep their rows by id. Only
+  // for members whose prompt goes on the wire right after (gathered and injected members).
+  const recordBatchStart = async (
+    members: TurnMember[],
+  ): Promise<{ delivered: TurnMember[]; deduplicated: TurnMember[]; record?: SessionRecord }> => {
+    const started = await settleBatch(members);
+    if (started.delivered.length > 0) {
+      await writeMemberRows(started.delivered);
+    }
+    return started;
   };
 
   // One User row per member (kept by id when it already exists — F2), then ONE boundary write that
@@ -2735,25 +2746,35 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   };
 
   const startOnlyMember = async (only: TurnMember): Promise<SessionRecord | undefined> => {
-    const promptStart = await recordPromptStart(only.prompt, only.messageId);
-    only.userMessageId = promptStart.messageId;
     output.setContext({
       sessionId: record.acpxRecordId,
     });
-    if (!promptStart.deduplicated) {
+    const deduplicatedRecord =
+      only.messageId === undefined
+        ? undefined
+        : await resolveRecordIfPromptAlreadyPersisted(options.sessionRecordId, only.messageId);
+    if (!deduplicatedRecord) {
       return undefined;
     }
-    const deduplicatedRecord = promptStart.record ?? record;
+    only.userMessageId = only.messageId;
     await appendDeduplicatedDeliveryTerminal(deduplicatedRecord, only.context);
     return deduplicatedRecord;
   };
 
-  // The members' User rows. A turn of ONE (not a split part) takes today's path, unchanged.
+  // brick 6f461fe4 — turn start only DEDUPLICATES the main members. Their User rows are written
+  // at acceptance (`writeMemberRows`, in `runPromptAttempt`), immediately before the
+  // `session/prompt` goes on the wire.
+  // ⚠️ DO NOT MOVE THE ROW WRITE BACK HERE. It looks like the natural place, and it is the bug: the
+  // connect runs after this point (a cold owner's, or the replacement client's after a
+  // subscription switch, which resumes on the new account), and a turn cut inside it (a close, the
+  // owner's death, a connect failure) left `messages.ndjson` claiming a prompt the model never
+  // received (consol-stack 7781a8ca). Nothing in-process can retract a row after a SIGKILL, so the
+  // row must not exist before the wire. test/turn-cut-before-prompt.test.ts goes red if it does.
   const startMainMembers = async (): Promise<SessionRecord | undefined> => {
     if (mainMembers.length === 1 && !options.split) {
       return await startOnlyMember(mainMembers[0]);
     }
-    const started = await recordBatchStart(mainMembers);
+    const started = await settleBatch(mainMembers);
     output.setContext({
       sessionId: record.acpxRecordId,
     });
@@ -4658,6 +4679,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       turnWatchdogArmingMode === "claude-prompt-lifecycle" ? crypto.randomUUID() : undefined;
     const promptId = guardedPromptIdThisTurn;
     if (attempt === 0) {
+      // brick 6f461fe4 — the main members' User rows, with their `accepted`, right before the wire
+      // (see `startMainMembers`). Kept by id on a retry or a split part (F2).
+      await writeMemberRows(mainMembers);
       await gatherCapturedMembers();
     }
     for (const member of mainMembers) {
