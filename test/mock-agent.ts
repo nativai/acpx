@@ -1109,8 +1109,10 @@ class MockAgent implements Agent {
       await new Promise((resolve) => setTimeout(resolve, this.options.initializeDelayMs));
     }
     const holdFile = this.options.initializeHoldFile;
-    while (holdFile !== undefined && existsSync(holdFile)) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
+    if (holdFile !== undefined) {
+      while (existsSync(holdFile)) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
     }
     const sessionCapabilities = {
       ...(this.options.supportsCloseSession ? { close: {} } : {}),
