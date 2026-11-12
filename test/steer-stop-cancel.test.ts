@@ -108,7 +108,10 @@ async function runCli(
   });
 }
 
-async function withRig(run: (rig: Rig) => Promise<void>): Promise<void> {
+async function withRig(
+  run: (rig: Rig) => Promise<void>,
+  options: { withdrawParked?: boolean } = {},
+): Promise<void> {
   const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-steer-stop-"));
   const { server, url } = await startProbeServer();
   try {
@@ -126,6 +129,7 @@ async function withRig(run: (rig: Rig) => Promise<void>): Promise<void> {
       "--claude-agent-acp",
       "--supports-load-session",
       "--park-concurrent-prompts",
+      ...(options.withdrawParked ? ["--withdraw-parked-on-cancel"] : []),
       "--operation-log",
       opsFile,
     ].join(" ");
@@ -209,6 +213,23 @@ function phasesOf(stream: string, messageId: string): string[] {
     }
     return [`${String(params.phase)}/${String(params.stopReason)}`];
   });
+}
+
+/** The `error.detailCode` of `messageId`'s `cancelled` terminal (undefined if there is none). */
+function cancelledDetailCode(stream: string, messageId: string): string | undefined {
+  for (const frame of frames(stream)) {
+    const params = frame.params as
+      | { messageId?: unknown; phase?: unknown; error?: { detailCode?: unknown } }
+      | undefined;
+    if (
+      frame.method === "acpx/delivery" &&
+      params?.messageId === messageId &&
+      params.phase === "cancelled"
+    ) {
+      return String(params.error?.detailCode ?? "");
+    }
+  }
+  return undefined;
 }
 
 function turnActiveCount(stream: string): number {
@@ -403,5 +424,28 @@ test("21b73df0 negative — the same steer without a Stop is delivered once and 
       (frame) => frame.method === "session/update" && carries(frame, run.nonce),
     );
     assert.ok(answered, `the agent answered M2\n${diag}`);
+  });
+});
+
+// Requirement 1 of the consolidation (21b73df0): a reader tells, per delivery id and from positive evidence only,
+// "withdrawn before the agent began" from "the agent had it and was stopped".
+test("21b73df0 withdrawn mark — a steer the adapter confirms withdrawn ends CANCELLED_WITHDRAWN, the stopped turn CANCELLED_MID_TURN", async () => {
+  await withRig(
+    async (rig) => {
+      const run = await steerThenMaybeStop(rig, { stop: true, m1Text: "sleep 20341" });
+      const diag = `stream:\n${run.stream}`;
+      assert.equal(cancelledDetailCode(run.stream, run.m2), "CANCELLED_WITHDRAWN", diag);
+      assert.equal(cancelledDetailCode(run.stream, run.m1), "CANCELLED_MID_TURN", diag);
+    },
+    { withdrawParked: true },
+  );
+});
+
+test("21b73df0 withdrawn mark — negative: without the adapter's mark the steer is CANCELLED_MID_TURN, never inferred withdrawn", async () => {
+  await withRig(async (rig) => {
+    const run = await steerThenMaybeStop(rig, { stop: true, m1Text: "sleep 20353" });
+    const diag = `stream:\n${run.stream}`;
+    assert.equal(cancelledDetailCode(run.stream, run.m2), "CANCELLED_MID_TURN", diag);
+    assert.equal(cancelledDetailCode(run.stream, run.m1), "CANCELLED_MID_TURN", diag);
   });
 });

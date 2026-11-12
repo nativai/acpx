@@ -126,6 +126,11 @@ type MockAgentOptions = {
    * Opt-in, so the abort-on-arrival handover every other row relies on is unchanged.
    */
   parkConcurrentPrompts?: boolean;
+  /**
+   * brick 21b73df0 — `--withdraw-parked-on-cancel` (with `--park-concurrent-prompts`): a parked prompt the cancel
+   * answers carries claude-agent-acp's positive mark, `{ stopReason: "cancelled", _meta: { withdrawn: true } }`.
+   */
+  withdrawParkedOnCancel?: boolean;
   claudeAgentAcp: boolean;
   expectedForkMeta?: unknown;
   /**
@@ -516,6 +521,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let operationLogFile: string | undefined;
   let logConfigOptionOps = false;
   let parkConcurrentPrompts = false;
+  let withdrawParkedOnCancel = false;
   let pushConfigOnSetModel = false;
   let claudeAgentAcp = false;
   let expectedForkMeta: unknown;
@@ -713,6 +719,11 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--withdraw-parked-on-cancel") {
+      withdrawParkedOnCancel = true;
+      continue;
+    }
+
     if (token === "--push-config-on-set-model") {
       pushConfigOnSetModel = true;
       continue;
@@ -819,6 +830,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     logConfigOptionOps,
     pushConfigOnSetModel,
     parkConcurrentPrompts,
+    withdrawParkedOnCancel,
     claudeAgentAcp,
     expectedForkMeta,
     ...(modelAdvertisement !== undefined ? { modelAdvertisement } : {}),
@@ -1423,7 +1435,9 @@ class MockAgent implements Agent {
         (session.parked ??= []).push(resolve);
       });
       if (cancelled) {
-        return { stopReason: "cancelled" };
+        return this.options.withdrawParkedOnCancel
+          ? { stopReason: "cancelled", _meta: { withdrawn: true } }
+          : { stopReason: "cancelled" };
       }
       return await this.runPrompt(params, session, { recorded: true });
     }
