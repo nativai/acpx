@@ -1645,10 +1645,13 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     // the capture buffer lives here, so hand the owner an accessor that takes it.
     // UMQ §22.1 — and a context split's held-back half (`holdSplitCustody`).
     const splitHeld = new Set<QueueTask>();
+    // brick a0182aed — copies of a message id already in flight in the running turn: never sent in it, held
+    // here (custody, so a close drain or signal sweep terminalizes them) and requeued when the turn ends.
+    const deferredCopies: QueueTask[] = [];
     owner.setMidTurnCustodySource(() => {
       const held = [...splitHeld];
       splitHeld.clear();
-      return [...midTurnBuffer.splice(0).flat(), ...held];
+      return [...midTurnBuffer.splice(0).flat(), ...held, ...deferredCopies.splice(0)];
     });
 
     // UMQ §5.2 — gather at prompt send: what arrived while the adapter connected joins the turn's
@@ -1904,6 +1907,12 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
               takeGatheredTasks: midTurnInjectionSupported
                 ? () => takeGatheredTasks(head)
                 : undefined,
+              deferUntilTurnEnds: (tasks) => {
+                deferredCopies.push(...tasks);
+                for (const task of tasks) {
+                  appendDeliveryStreamEvent(options.sessionId, task, "queued");
+                }
+              },
               holdSplitCustody: (tasks) => {
                 for (const task of tasks) {
                   splitHeld.add(task);
@@ -1938,7 +1947,9 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         // go back to the normal pending queue — C4 (G3): order-preserving so the
         // oldest is not starved (the old per-item requeue reversed the batch),
         // and each stays visible as `queued` until it is accepted.
-        const leftovers = midTurnBuffer.splice(0).flat();
+        // brick a0182aed — and the copies of an in-flight id the turn deferred, after them: the requeue
+        // meets the message-id dedup with the first copy's terminal already written.
+        const leftovers = [...midTurnBuffer.splice(0).flat(), ...deferredCopies.splice(0)];
         if (leftovers.length > 0) {
           owner.requeueAll(leftovers);
           for (const leftover of leftovers) {

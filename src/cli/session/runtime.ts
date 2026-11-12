@@ -262,6 +262,11 @@ type RunSessionPromptOptions = Omit<
   // UMQ §5.2 — what reached the capture buffer while the adapter connected, taken ONCE, at the
   // first prompt send of the turn, to join its ONE prompt.
   takeGatheredTasks?: () => QueueTask[];
+  // brick a0182aed — a task carrying a message id ALREADY IN FLIGHT in this turn (a main member, or a
+  // copy injected earlier) is not sent again: the owner keeps it in custody and requeues it when the turn
+  // ends, where the message-id dedup settles it against the first copy's outcome (done → `deduplicated`;
+  // a failed first copy → this one is the re-drive). Absent (no queue owner): no deferral.
+  deferUntilTurnEnds?: (tasks: QueueTask[]) => void;
   // brick://b8e251eb: set on entering the region whose catch writes this
   // delivery's terminal itself. Still false on failure means NOTHING reached the
   // model and NO terminal was written — the queue owner then writes one.
@@ -1501,6 +1506,7 @@ function buildQueuedTaskRunOptions(
     batch: members,
     ...(split ? { split } : {}),
     takeGatheredTasks: options.takeGatheredTasks,
+    deferUntilTurnEnds: options.deferUntilTurnEnds,
     sessionRecordId,
     turnStart,
     previousTurnClient: options.sharedClient,
@@ -1855,6 +1861,11 @@ export async function runQueuedTask(
     setMidTurnHandler?: (handler: ((injected: QueueTask[]) => void) | undefined) => void;
     // UMQ §5.2 — the owner's capture buffer, taken once at the turn's first prompt send.
     takeGatheredTasks?: () => QueueTask[];
+    // brick a0182aed — a task carrying a message id ALREADY IN FLIGHT in this turn (a main member, or a
+    // copy injected earlier) is not sent again: the owner keeps it in custody and requeues it when the turn
+    // ends, where the message-id dedup settles it against the first copy's outcome (done → `deduplicated`;
+    // a failed first copy → this one is the re-drive). Absent (no queue owner): no deferral.
+    deferUntilTurnEnds?: (tasks: QueueTask[]) => void;
     // UMQ §22.1 — the members a context split holds back while their older half runs, put where the
     // owner's close drain and signal sweep can terminalize them (custody, corollary C-1). Returns
     // the release, called before those members run.
@@ -2619,6 +2630,40 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
 
   const conversation = cloneSessionConversation(record);
   let acpxState = cloneSessionAcpxState(record.acpx);
+  // brick a0182aed — THE SEND DEDUP: the message ids this turn has in flight (its main members, the
+  // copies it gathered, the copies it injected). A second copy of one of them is NOT sent: it goes back to
+  // the owner (`deferUntilTurnEnds`), which holds it in custody and requeues it when this turn ends, where
+  // the message-id dedup settles it against the first copy's terminal. The row dedup alone (F2) was not
+  // enough: it only sees a COMPLETED first copy, so a copy arriving during the first copy's connect was sent
+  // too, and the model read it twice (routed-prompt fallback vs atrium's own hand-off).
+  // ⚠️ DO NOT "SETTLE" THE DEFERRED COPY HERE AS done/deduplicated. Its first copy may still fail, and
+  // then the deferred copy is the legitimate re-drive. test/same-id-during-connect.test.ts.
+  const inFlightMessageIds = new Set<string>(
+    options.batch === undefined && options.messageId !== undefined ? [options.messageId] : [],
+  );
+  const deferInFlightCopies = (tasks: QueueTask[]): QueueTask[] => {
+    const kept: QueueTask[] = [];
+    const deferred: QueueTask[] = [];
+    for (const task of tasks) {
+      const id = task.messageId;
+      if (id !== undefined && options.deferUntilTurnEnds && inFlightMessageIds.has(id)) {
+        deferred.push(task);
+        continue;
+      }
+      if (id !== undefined) {
+        inFlightMessageIds.add(id);
+      }
+      kept.push(task);
+    }
+    if (deferred.length > 0) {
+      options.deferUntilTurnEnds?.(deferred);
+    }
+    return kept;
+  };
+  if (options.batch) {
+    // In place: the owner reads this array as the turn's members; a deferred copy is no longer one.
+    options.batch.splice(0, options.batch.length, ...deferInFlightCopies(options.batch));
+  }
   // UMQ §5.3 — the turn's members: the queue owner's batch, or this direct prompt alone. Gather
   // (§5.2) appends to it; members already delivered (dedup) leave it before the turn runs.
   const mainMembers: TurnMember[] = options.batch
@@ -4403,7 +4448,12 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       // so the agent sees the new message via its Pushable input mid-turn
       // rather than waiting for the current turn to end. Each injected promise
       // is tracked so the turn can await all of them once it finishes.
-      const injectTask = (injected: QueueTask[]): void => {
+      const injectTask = (submitted: QueueTask[]): void => {
+        // brick a0182aed — a copy of an id already in flight is deferred, never sent twice.
+        const injected = deferInFlightCopies(submitted);
+        if (injected.length === 0) {
+          return;
+        }
         const injectedPromise = runInjectedPromptTask(sessionId, injected);
         // Track (await) this injected promise when EITHER the caller is waiting
         // for completion (unchanged), OR the backend returns a terminal for an
@@ -4653,7 +4703,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   // UMQ §5.2 — gather at prompt send: the capture buffer's tasks join THIS prompt (User rows, then
   // `accepted` and main-delivery registration below) instead of being injected after it.
   const gatherCapturedMembers = async (): Promise<void> => {
-    const gathered = options.takeGatheredTasks?.() ?? [];
+    const gathered = deferInFlightCopies(options.takeGatheredTasks?.() ?? []);
     if (gathered.length === 0) {
       return;
     }
