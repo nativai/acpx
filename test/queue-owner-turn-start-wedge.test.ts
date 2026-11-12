@@ -367,8 +367,7 @@ test("b8e251eb: a turn that started and then failed keeps exactly ONE terminal (
 test("b8e251eb F2: a re-drive of a message whose first attempt never reached the model leaves ONE User row in the history", async () => {
   await withAcceptedNoWaitTask("acpx-b8e251eb-f2-", async ({ home, sessionId, task, submit }) => {
     let adapterStarts = true;
-    // Attempt 1 persists the User row (turn start succeeds), then the adapter fails
-    // to start inside the turn — before the prompt is ever sent.
+    // Attempt 1: the adapter fails to start inside the turn — before the prompt is ever sent.
     const mock = makeMockClient(async () => ({ stopReason: "end_turn" }), {
       onStart: async () => {
         if (!adapterStarts) {
@@ -385,7 +384,9 @@ test("b8e251eb F2: a re-drive of a message whose first attempt never reached the
         }),
     );
     assert.equal(mock.promptCalls(), 0, "attempt 1 never reached the model");
-    assert.equal(await userRowsFor(home, sessionId), 1, "attempt 1 persisted the User row");
+    // brick 6f461fe4: a prompt the adapter never received leaves NO User row (it used to leave one,
+    // which this row once asserted; that row is the defect: history claimed an unsent prompt).
+    assert.equal(await userRowsFor(home, sessionId), 0, "attempt 1 left no User row");
 
     // The re-drive of the SAME messageId, adapter healthy again.
     adapterStarts = true;

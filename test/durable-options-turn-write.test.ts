@@ -274,18 +274,23 @@ test("a set accepted while the turn's prompt-start write is parked is the value 
     const control = makePathologicalClient({ acpSessionId: record.acpSessionId });
     const lockPath = `${file}.lock`;
     await fs.writeFile(lockPath, "{}");
+    const connected = createDeferred<void>();
     const run = runQueuedTask(record.acpxRecordId, [makeTask("req-main", MAIN_PROMPT_TEXT, MAIN)], {
       sharedClient: control.client,
+      onClientAvailable: () => connected.resolve(),
       suppressSdkConsoleErrors: true,
     });
 
-    // The turn loaded the record and appended its User entry to the log; its record write is
-    // now parked on the lock — the window `acpx set` lands in.
-    await waitFor(async () => await logHas(logPath, MAIN), "the prompt-start log append");
+    // The turn loaded the record and is connecting; its next record write (since brick 6f461fe4
+    // the prompt-start write comes at acceptance, after the connect) parks on the lock — the
+    // window `acpx set` lands in.
+    await connected.promise;
+    await sleep(100);
     await plantSets(file, "New", "low");
     await fs.rm(lockPath, { force: true });
 
     await control.mainPromptInFlight;
+    assert.equal(await logHas(logPath, MAIN), true, "the prompt-start write logged the User row");
     control.resolveMainPrompt({ stopReason: "end_turn" });
     await run;
 
