@@ -197,7 +197,7 @@ async function copiesBehindBusyTurn(copies: number): Promise<void> {
       // The busy, unrelated turn.
       const t0 = Date.now();
       const marks: string[] = [];
-      const busy = rig.cli(["--approve-all", AGENT, "prompt", "--session-id", id, "sleep 15000"]);
+      const busy = rig.cli(["--approve-all", AGENT, "prompt", "--session-id", id, "sleep 30000"]);
       let busyDone: CliRunResult | undefined;
       void busy.then((r) => (busyDone = r));
       await waitFor(
