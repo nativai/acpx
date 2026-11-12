@@ -15,7 +15,8 @@
 // test/same-id-during-connect.test.ts, test/accepted-message-ids.test.ts.
 // F3 (case C6): a deferred copy whose sibling copy ended `cancelled` (the user stopped it) settles `cancelled` at the
 // turn's end instead of being requeued — nothing runs after a cancel (queue-owner-runtime.ts). A sibling that ended
-// `failed` is forgotten, so the deferred copy stays the re-drive.
+// `failed` is forgotten, so the deferred copy stays the re-drive. F4: a later accepted copy clears the id's earlier
+// cancels, so the latest accepted copy's outcome governs.
 // In-process only, by design: a deferred copy exists only inside the owner process whose turn deferred it.
 
 const MAX_IDS_PER_SESSION = 1_000;
@@ -49,6 +50,17 @@ function setCopyState(
 }
 
 export function noteMessageAccepted(sessionId: string, messageId: string, requestId: string): void {
+  // F4 — a later ACCEPTED copy supersedes an earlier cancel: the id's outcome is now this copy's (done → a deferred
+  // copy meets the dedup; failed → it is the re-drive; cancelled again → it settles cancelled). Within one turn only
+  // one copy of an id is accepted (the others are deferred), so the latest accepted copy IS the sibling whose turn
+  // deferred them.
+  // ⚠️ DO NOT LET A CANCEL STICK TO THE ID: a resend after a cancel would make every later duplicate settle
+  // `cancelled`, though delivered (C6RD) or owed a re-drive (its failed twin). test/same-id-during-connect.test.ts.
+  for (const [copy, state] of copiesOf(sessionId, messageId) ?? []) {
+    if (copy !== requestId && state === "cancelled") {
+      copiesOf(sessionId, messageId)?.delete(copy);
+    }
+  }
   setCopyState(sessionId, messageId, requestId, "accepted");
 }
 

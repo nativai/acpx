@@ -1407,6 +1407,30 @@ class MockAgent implements Agent {
       modelId: session.modelId,
     });
 
+    // brick a0182aed F4 — a turn that runs, then FAILS (not cancelled): a later copy of the same message id is the
+    // re-drive. A cancel during the sleep cancels it, as `sleep` does.
+    if (text.startsWith("sleep-then-fail ")) {
+      const ms = Number(text.slice("sleep-then-fail ".length).trim());
+      try {
+        await sleepWithCancel(Math.round(Number.isFinite(ms) ? ms : 0), promptAbort.signal);
+      } catch {
+        if (session.pendingPrompt === promptAbort) {
+          session.pendingPrompt = undefined;
+        }
+        return { stopReason: "cancelled" };
+      }
+      if (session.pendingPrompt === promptAbort) {
+        session.pendingPrompt = undefined;
+      }
+      const error = new Error("Internal error") as Error & {
+        code: number;
+        data: { details: string };
+      };
+      error.code = -32603;
+      error.data = { details: "sleep-then-fail" };
+      throw error;
+    }
+
     if (text === "partial-retryable-error") {
       try {
         await this.sendAssistantMessage(params.sessionId, "partial update");

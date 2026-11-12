@@ -696,3 +696,148 @@ test("F3 C6 — a user cancel while a copy is deferred: no turn runs after the c
     }
   });
 });
+
+// ---------------------------------------------------------------------------------------------------------------
+// TE F4 (a0182aed, case C6RD): the cancel of copy 1 must not stick to the id. After the cancel, a resend (copy 3) is
+// accepted; a duplicate of it (copy 4) deferred during copy 3's turn settles by copy 3's outcome: done → the
+// existing dedup (`done / deduplicated`); failed → copy 4 is the re-drive and is delivered once.
+// ---------------------------------------------------------------------------------------------------------------
+
+function receivedRequestIds(stream: string, messageId: string): string[] {
+  return frames(stream).flatMap((frame) => {
+    const params = frame.params as { messageId?: unknown; requestId?: unknown } | undefined;
+    return frame.method === "acpx/received" && params?.messageId === messageId
+      ? [String(params.requestId)]
+      : [];
+  });
+}
+
+async function waitForCopyPhase(
+  rig: Rig,
+  id: string,
+  messageId: string,
+  copyIndex: number,
+  matches: (phase: string) => boolean,
+  what: string,
+): Promise<void> {
+  try {
+    await waitFor(async () => {
+      const stream = await streamOf(rig, id);
+      const requestId = receivedRequestIds(stream, messageId)[copyIndex];
+      return (
+        requestId !== undefined &&
+        (phasesByRequest(stream, messageId).get(requestId) ?? []).some(matches)
+      );
+    }, what);
+  } catch (error) {
+    throw new Error(`${String(error)}\n${await diagnose(rig, id)}`, { cause: error });
+  }
+}
+
+const isTerminal = (phase: string): boolean => /^(done|failed|cancelled)\//u.test(phase);
+
+// Copies 1-4 of one id, in this order: 1 accepted, 2 deferred, the user's cancel; 3 (the resend) accepted, 4 deferred
+// during 3's turn; then 3 ends on its own and 4 settles. Returns each copy's phases, in arrival order.
+async function cancelThenResendWithDuplicate(
+  rig: Rig,
+  text: string,
+): Promise<{ id: string; copies: string[][]; stream: string; diag: string }> {
+  const id = await newSession(rig, { autoSubscription: false });
+  const messageId = randomUUID();
+  const copy1 = sendWaiting(rig, id, messageId, text);
+  await waitForCopyPhase(
+    rig,
+    id,
+    messageId,
+    0,
+    (p) => p.startsWith("accepted/"),
+    "copy 1 accepted",
+  );
+  assert.equal((await sendNoWait(rig, id, messageId, text)).code, 0);
+  await waitForCopyPhase(rig, id, messageId, 1, (p) => p.startsWith("queued/"), "copy 2 deferred");
+  const cancelled = await rig.cli(["claude", "cancel", "--session-id", id]);
+  assert.equal(cancelled.code, 0, `${cancelled.stdout}\n${cancelled.stderr}`);
+  await copy1;
+  await waitForCopyPhase(rig, id, messageId, 1, isTerminal, "copy 2 settled after the cancel");
+
+  const copy3 = sendWaiting(rig, id, messageId, text);
+  await waitForCopyPhase(
+    rig,
+    id,
+    messageId,
+    2,
+    (p) => p.startsWith("accepted/"),
+    "copy 3 accepted",
+  );
+  assert.equal((await sendNoWait(rig, id, messageId, text)).code, 0);
+  await waitForCopyPhase(rig, id, messageId, 3, (p) => p.startsWith("queued/"), "copy 4 deferred");
+  await copy3;
+  await waitForCopyPhase(rig, id, messageId, 3, isTerminal, "copy 4 settled");
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  const stream = await streamOf(rig, id);
+  const byRequest = phasesByRequest(stream, messageId);
+  const copies = receivedRequestIds(stream, messageId).map(
+    (request) => byRequest.get(request) ?? [],
+  );
+  return { id, copies, stream, diag: `copies (arrival order):\n${JSON.stringify(copies)}` };
+}
+
+test("F4 C6RD — after a cancel, a resend completes: its deferred duplicate settles done/deduplicated, not cancelled", async () => {
+  await withRig(async (rig) => {
+    const text = "sleep 12137";
+    const run = await cancelThenResendWithDuplicate(rig, text);
+    try {
+      assert.equal(run.copies.length, 4, run.diag);
+      assert.ok(
+        run.copies[0].some((p) => p.startsWith("cancelled/")),
+        `precondition: copy 1 cancelled\n${run.diag}`,
+      );
+      assert.ok(
+        run.copies[2].includes("done/end_turn"),
+        `precondition: the resend completed\n${run.diag}`,
+      );
+      assert.equal(
+        run.copies[3].at(-1),
+        "done/deduplicated",
+        `copy 4 settles by copy 3's outcome\n${run.diag}`,
+      );
+      assert.ok(
+        !run.copies[3].some((p) => p.startsWith("accepted/")),
+        `copy 4 never runs\n${run.diag}`,
+      );
+      assert.equal(nonceSends(run.stream, text), 2, `copies 1 and 3 only\n${run.diag}`);
+    } finally {
+      await rig.cli(["claude", "sessions", "close", "--session-id", run.id]);
+    }
+  });
+});
+
+test("F4 failed twin — after a cancel, a resend FAILS: its deferred duplicate is the re-drive, delivered once", async () => {
+  await withRig(async (rig) => {
+    const text = "sleep-then-fail 12137";
+    const run = await cancelThenResendWithDuplicate(rig, text);
+    try {
+      assert.equal(run.copies.length, 4, run.diag);
+      assert.ok(
+        run.copies[0].some((p) => p.startsWith("cancelled/")),
+        `precondition: copy 1 cancelled\n${run.diag}`,
+      );
+      assert.ok(
+        run.copies[2].some((p) => p.startsWith("failed/")),
+        `precondition: the resend failed\n${run.diag}`,
+      );
+      assert.ok(
+        !run.copies[3].some((p) => p.startsWith("cancelled/")),
+        `copy 4 is not cancelled\n${run.diag}`,
+      );
+      assert.equal(
+        run.copies[3].filter((p) => p.startsWith("accepted/")).length,
+        1,
+        `copy 4 is the re-drive, sent once\n${run.diag}`,
+      );
+      assert.equal(nonceSends(run.stream, text), 3, `copies 1, 3 and 4, each once\n${run.diag}`);
+    } finally {
+      await rig.cli(["claude", "sessions", "close", "--session-id", run.id]);
+    }
+  });
+});

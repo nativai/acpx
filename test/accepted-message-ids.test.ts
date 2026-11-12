@@ -50,3 +50,30 @@ test("negative: another session, or an id never accepted, is never a duplicate",
   assert.equal(wasMessageAcceptedByAnotherCopy("other", "m", "copy-2"), false);
   assert.equal(wasMessageAcceptedByAnotherCopy("s", "never", "copy-2"), false);
 });
+
+test("F4: a later accepted copy clears an earlier cancel of the id (a resend after a cancel)", () => {
+  resetAcceptedMessageIdsForTests();
+  noteMessageAccepted("s", "m", "copy-1");
+  noteMessageCancelled("s", "m", "copy-1");
+  noteMessageAccepted("s", "m", "copy-3");
+  assert.equal(wasAnotherCopyCancelled("s", "m", "copy-4"), false);
+  assert.equal(wasMessageAcceptedByAnotherCopy("s", "m", "copy-4"), true);
+});
+
+test("F4: the resend failing leaves neither a cancel nor an acceptance — copy 4 is the re-drive", () => {
+  resetAcceptedMessageIdsForTests();
+  noteMessageAccepted("s", "m", "copy-1");
+  noteMessageCancelled("s", "m", "copy-1");
+  noteMessageAccepted("s", "m", "copy-3");
+  forgetMessageAccepted("s", "m", "copy-3");
+  assert.equal(wasAnotherCopyCancelled("s", "m", "copy-4"), false);
+  assert.equal(wasMessageAcceptedByAnotherCopy("s", "m", "copy-4"), false);
+});
+
+test("F4: the resend cancelled again still stops copy 4", () => {
+  resetAcceptedMessageIdsForTests();
+  noteMessageCancelled("s", "m", "copy-1");
+  noteMessageAccepted("s", "m", "copy-3");
+  noteMessageCancelled("s", "m", "copy-3");
+  assert.equal(wasAnotherCopyCancelled("s", "m", "copy-4"), true);
+});
