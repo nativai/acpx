@@ -79,6 +79,7 @@ import {
   runPromptTurn,
   steeredFromMeta,
   turnErrorFromMeta,
+  withdrawnFromMeta,
 } from "../../runtime/engine/prompt-turn.js";
 import { connectAndLoadSession } from "../../runtime/engine/reconnect.js";
 import {
@@ -109,6 +110,7 @@ import { withDefaultModelForNewSession } from "../../session/default-model.js";
 import { CONSUMED_BEFORE_CUT, ConsumptionTracker } from "../../session/delivery-consumption.js";
 import {
   buildDeliveryEvent,
+  cancelledDeliveryError,
   deliveryTerminalWarning,
   hasCompletedDeliveryFor,
   type DeliveryEventError,
@@ -3516,6 +3518,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         // brick ddd76838 — a pi steer-ack (`end_turn` + `_meta.piAcp.steered`)
         // is recorded on the delivery record, not reduced to a bare end_turn.
         ...(steeredFromMeta(injectedResponse._meta) ? { steered: true } : {}),
+        // brick 21b73df0 — a Stop: withdrawn before the agent began (the adapter's positive mark) vs stopped mid-turn.
+        ...(injectedResponse.stopReason === "cancelled"
+          ? { error: cancelledDeliveryError(withdrawnFromMeta(injectedResponse._meta)) }
+          : {}),
       },
     );
     markAbsorbedDeliveryTerminalWritten(absorbedDelivery);
@@ -5110,7 +5116,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       ...(response.steered ? { steered: true } : {}),
       ...(turnErrorForTerminal
         ? { error: { code: 0, message: turnErrorForTerminal, detailCode: "" } }
-        : {}),
+        : terminalStopReason === "cancelled"
+          ? // brick 21b73df0 — same mark as a steered prompt's (`handleInjectedPromptResponse`).
+            { error: cancelledDeliveryError(response.withdrawn === true) }
+          : {}),
     });
   };
 

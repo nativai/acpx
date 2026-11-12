@@ -66,6 +66,18 @@ export function steeredFromMeta(meta: unknown): boolean {
 }
 
 /**
+ * brick 21b73df0 — claude-agent-acp's mark on a `cancelled` response: `_meta.withdrawn: true` means Claude Code
+ * itself confirmed it took the message back before running it (the interrupt receipt listed it). Absent / ill-typed
+ * ⇒ `false`: a plain `cancelled` is NOT a withdrawal, never inferred from an absence.
+ */
+export function withdrawnFromMeta(meta: unknown): boolean {
+  if (!meta || typeof meta !== "object") {
+    return false;
+  }
+  return (meta as { withdrawn?: unknown }).withdrawn === true;
+}
+
+/**
  * Wait for late `session/update` notifications to go quiet, best effort.
  *
  * Both legs of {@link runPromptTurn} drain identically — the success leg keeps its
@@ -88,6 +100,7 @@ type RpcTurnResult = {
   source: "rpc";
   turnError?: string;
   steered?: boolean;
+  withdrawn?: boolean;
 };
 
 /**
@@ -109,11 +122,13 @@ async function settleRpcResponse(
   await drainLateSessionUpdates(params.client);
   const turnError = turnErrorFromMeta(response._meta);
   const steered = steeredFromMeta(response._meta);
+  const withdrawn = withdrawnFromMeta(response._meta);
   return {
     stopReason: response.stopReason,
     source: "rpc",
     ...(turnError !== undefined ? { turnError } : {}),
     ...(steered ? { steered: true } : {}),
+    ...(withdrawn ? { withdrawn: true } : {}),
   };
 }
 
@@ -146,6 +161,7 @@ export async function runPromptTurn(params: {
   source: "rpc" | "session";
   turnError?: string;
   steered?: boolean;
+  withdrawn?: boolean;
 }> {
   try {
     // ⚠️ THE ONLY PLACE IN THE CODEBASE THAT OPTS INTO PER-TURN CONTEXT INJECTION
