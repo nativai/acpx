@@ -4,7 +4,9 @@ import test from "node:test";
 import {
   forgetMessageAccepted,
   noteMessageAccepted,
+  noteMessageCancelled,
   resetAcceptedMessageIdsForTests,
+  wasAnotherCopyCancelled,
   wasMessageAcceptedByAnotherCopy,
 } from "../src/cli/queue/accepted-message-ids.js";
 
@@ -20,11 +22,26 @@ test("negative: a request's OWN acceptance never makes it a duplicate (context s
   assert.equal(wasMessageAcceptedByAnotherCopy("s", "m", "copy-1"), false);
 });
 
-test("negative: a first copy that ended failed/cancelled no longer vouches for a later copy", () => {
+test("negative: a first copy that ended failed no longer vouches for a later copy, which is the re-drive", () => {
   resetAcceptedMessageIdsForTests();
   noteMessageAccepted("s", "m", "copy-1");
   forgetMessageAccepted("s", "m", "copy-1");
   assert.equal(wasMessageAcceptedByAnotherCopy("s", "m", "copy-2"), false);
+  assert.equal(wasAnotherCopyCancelled("s", "m", "copy-2"), false);
+});
+
+test("F3: a first copy that ended cancelled stops a later copy, and no longer reads as delivered", () => {
+  resetAcceptedMessageIdsForTests();
+  noteMessageAccepted("s", "m", "copy-1");
+  noteMessageCancelled("s", "m", "copy-1");
+  assert.equal(wasAnotherCopyCancelled("s", "m", "copy-2"), true);
+  assert.equal(wasMessageAcceptedByAnotherCopy("s", "m", "copy-2"), false);
+});
+
+test("F3 negative: a request's OWN cancel never stops itself", () => {
+  resetAcceptedMessageIdsForTests();
+  noteMessageCancelled("s", "m", "copy-1");
+  assert.equal(wasAnotherCopyCancelled("s", "m", "copy-1"), false);
 });
 
 test("negative: another session, or an id never accepted, is never a duplicate", () => {

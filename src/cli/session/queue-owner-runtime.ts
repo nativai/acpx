@@ -50,9 +50,11 @@ import type {
   SessionRecord,
   SessionSendOutcome,
 } from "../../types.js";
+import { wasAnotherCopyCancelled } from "../queue/accepted-message-ids.js";
 import { canJoinBatch, type DeferredCloseRequest } from "../queue/ipc-server.js";
 import {
   appendDeliveryStreamEvent,
+  appendDeliveryStreamEventSync,
   QUEUE_CONNECT_RETRY_MS,
   type QueueTask,
   SessionQueueOwner,
@@ -111,7 +113,11 @@ import {
   readQueueOwnerStartupFailureDetail,
   spawnQueueOwnerProcess,
 } from "./queue-owner-process.js";
-import { runQueuedTask, type SharedClientRebindReason } from "./runtime.js";
+import {
+  cancelledDeferredCopyResult,
+  runQueuedTask,
+  type SharedClientRebindReason,
+} from "./runtime.js";
 import { releaseConfigDirOnTerminalClose, writeTerminalCloseRecord } from "./terminal-close.js";
 import { createSendWakeGate, type SendWakeGate } from "./wake-gate.js";
 
@@ -1107,6 +1113,31 @@ function logTurnBoundaryRecycle(sessionId: string, reason: string, liveBackgroun
 // one built from the switched record — exactly what a cold-spawned owner on the new
 // subscription would build. Built first, closed second: a failed build keeps the old
 // client and returns undefined, and the turn falls back to a fresh client + recycle.
+// brick a0182aed F3 — a deferred copy of a message whose other copy the user cancelled: one `cancelled` terminal, a
+// waiting caller answered `cancelled`, never run (see the turn-end requeue in runSessionQueueOwner).
+async function settleDeferredCopyCancelled(sessionId: string, copy: QueueTask): Promise<void> {
+  if (copy.terminalWritten) {
+    copy.close();
+    return;
+  }
+  copy.terminalWritten = true;
+  appendDeliveryStreamEventSync(sessionId, copy, "cancelled", undefined, {
+    stopReason: "cancelled",
+  });
+  if (copy.waitForCompletion) {
+    try {
+      copy.send({
+        type: "result",
+        requestId: copy.requestId,
+        result: cancelledDeferredCopyResult(await resolveSessionRecord(sessionId)),
+      });
+    } catch {
+      // best effort: the terminal above is the record of it
+    }
+  }
+  copy.close();
+}
+
 // Closing the old client kills its adapter; proactive selection never gets here with
 // live background tasks (it defers), a lock switch can, and says so.
 // brick 6e27669f: the same replacement binds a settings change (`reason.kind ===
@@ -1949,7 +1980,22 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
         // and each stays visible as `queued` until it is accepted.
         // brick a0182aed — and the copies of an in-flight id the turn deferred, after them: the requeue
         // meets the message-id dedup with the first copy's terminal already written.
-        const leftovers = [...midTurnBuffer.splice(0).flat(), ...deferredCopies.splice(0)];
+        // F3 (TE case C6): EXCEPT a copy whose sibling copy ended `cancelled` — the user stopped that message, and
+        // nothing may run after a cancel (production has both copies in the one cancelled turn). It settles
+        // `cancelled` here and never starts a turn. A sibling that ended `failed` leaves it a re-drive.
+        // ⚠️ DO NOT REQUEUE IT FOR THE DEDUP TO SETTLE: `hasCompletedDeliveryFor` does not count a cancel as
+        // completed, so the requeue re-runs the work as a new turn 0.6 s after the user's cancel.
+        const leftovers: QueueTask[] = midTurnBuffer.splice(0).flat();
+        for (const copy of deferredCopies.splice(0)) {
+          if (
+            copy.messageId !== undefined &&
+            wasAnotherCopyCancelled(options.sessionId, copy.messageId, copy.requestId)
+          ) {
+            await settleDeferredCopyCancelled(options.sessionId, copy);
+            continue;
+          }
+          leftovers.push(copy);
+        }
         if (leftovers.length > 0) {
           owner.requeueAll(leftovers);
           for (const leftover of leftovers) {

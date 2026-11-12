@@ -482,7 +482,8 @@ function phasesByRequest(stream: string, messageId: string): Map<string, string[
 async function closeWhileCopyDeferred(
   rig: Rig,
   drainTimeoutMs: string,
-  // C4b needs copy 1's turn to outlast the close's start under load (the gate measured a 4 s turn ending first).
+  // Copy 1 must still be running when copy 2 arrives (C4c) and when the close starts (C4b): under load a 4 s turn
+  // ended first in both (gate and targeted runs), so both rows pass a longer one.
   text = "sleep 4137",
 ): Promise<{ id: string; messageId: string; text: string; close: CliRunResult; stream: string }> {
   const id = await newSession(rig, { autoSubscription: false });
@@ -552,7 +553,7 @@ function assertDeferredCopySettledDelivered(run: {
 
 test("F1 C4c — copy 1 completes while copy 2 is deferred, then the close: copy 2 is done/deduplicated, not 'NOT delivered'", async () => {
   await withRig(async (rig) => {
-    const run = await closeWhileCopyDeferred(rig, "30000");
+    const run = await closeWhileCopyDeferred(rig, "60000", "sleep 12137");
     const first = [...phasesByRequest(run.stream, run.messageId).values()].find((p) =>
       p.some((phase) => phase.startsWith("accepted/")),
     );
@@ -625,5 +626,73 @@ test("F1 C4a control — copy 1 cut inside its connect, copy 2 deferred: copy 2 
       close.stderr.includes(`NOT delivered: ${messageId}`),
       `the close still names it\n${diag}`,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// TE F3 (a0182aed, case C6): a user CANCEL while a copy is deferred. Nothing may run after the cancel: the deferred
+// copy must not start a new turn (the defer-and-requeue used to re-run it 0.6 s after the cancel, a second read of
+// the message). It settles `cancelled`, mirroring the copy the user stopped.
+// ---------------------------------------------------------------------------------------------------------------
+
+function turnActiveCount(stream: string): number {
+  return frames(stream).filter(
+    (frame) =>
+      frame.method === "acpx/turn" &&
+      (frame.params as { phase?: unknown } | undefined)?.phase === "active",
+  ).length;
+}
+
+test("F3 C6 — a user cancel while a copy is deferred: no turn runs after the cancel, the copy settles cancelled", async () => {
+  await withRig(async (rig) => {
+    const id = await newSession(rig, { autoSubscription: false });
+    const messageId = randomUUID();
+    const text = "sleep 20137";
+    try {
+      const first = sendWaiting(rig, id, messageId, text);
+      await waitFor(
+        async () =>
+          [...phasesByRequest(await streamOf(rig, id), messageId).values()].some((phases) =>
+            phases.some((phase) => phase.startsWith("accepted/")),
+          ),
+        "copy 1 mid-turn (accepted)",
+      );
+      const queued = await sendNoWait(rig, id, messageId, text);
+      assert.equal(queued.code, 0, `${queued.stdout}\n${queued.stderr}`);
+      await waitFor(async () => {
+        const byRequest = phasesByRequest(await streamOf(rig, id), messageId);
+        return [...byRequest.values()].some(
+          (phases) => phases.length > 0 && phases.every((p) => p.startsWith("queued/")),
+        );
+      }, "copy 2 deferred (queued)");
+      const cancelled = await rig.cli(["claude", "cancel", "--session-id", id]);
+      assert.equal(cancelled.code, 0, `${cancelled.stdout}\n${cancelled.stderr}`);
+      await first;
+      // A re-run would show up at once as a second `acpx/turn active` and copy 2's `accepted`.
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+      const stream = await streamOf(rig, id);
+      const byRequest = phasesByRequest(stream, messageId);
+      const diag = `stream deliveries:\n${JSON.stringify([...byRequest])}`;
+      const copy1 = [...byRequest.values()].find((p) =>
+        p.some((phase) => phase.startsWith("accepted/")),
+      );
+      assert.ok(
+        copy1?.some((phase) => phase.startsWith("cancelled/")),
+        `precondition: the user's cancel ended copy 1\n${diag}`,
+      );
+      assert.equal(turnActiveCount(stream), 1, `no turn after the cancel\n${diag}`);
+      assert.equal(
+        nonceSends(stream, text),
+        1,
+        `no second session/prompt after the cancel\n${diag}`,
+      );
+      const copy2 = [...byRequest.values()].find(
+        (p) => !p.some((phase) => phase.startsWith("accepted/")),
+      );
+      assert.ok(copy2, `copy 2 was never accepted\n${diag}`);
+      assert.equal(copy2.at(-1), "cancelled/cancelled", `copy 2 settles cancelled\n${diag}`);
+    } finally {
+      await rig.cli(["claude", "sessions", "close", "--session-id", id]);
+    }
   });
 });

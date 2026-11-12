@@ -53,7 +53,11 @@ import {
 } from "../../runtime/engine/failover.js";
 import { assertSessionCwdExists } from "../../session/session-cwd.js";
 import { SpawnLedgerError } from "../../spawn-ledger.js";
-import { forgetMessageAccepted, noteMessageAccepted } from "../queue/accepted-message-ids.js";
+import {
+  forgetMessageAccepted,
+  noteMessageAccepted,
+  noteMessageCancelled,
+} from "../queue/accepted-message-ids.js";
 import {
   registerAbsorbedDeliveries,
   unregisterAbsorbedDeliveries,
@@ -654,8 +658,9 @@ function deliveryErrorFrom(error: unknown): DeliveryEventError {
   };
 }
 
-// brick a0182aed (TE F1) — the owner's custody sweep settles a deferred copy of an id as delivered once ANOTHER copy
-// of it was `accepted` here, and no longer once that copy itself ended undelivered (accepted-message-ids.ts).
+// brick a0182aed (TE F1, F3) — the owner's custody sweep settles a deferred copy of an id as delivered once ANOTHER
+// copy of it was `accepted` here; a copy that ended `cancelled` stops a deferred sibling from running (F3); one that
+// ended `failed` vouches for nothing (accepted-message-ids.ts).
 function trackAcceptedCopy(
   sessionId: string,
   phase: DeliveryPhase,
@@ -663,7 +668,9 @@ function trackAcceptedCopy(
 ): void {
   if (phase === "accepted") {
     noteMessageAccepted(sessionId, context.messageId, context.requestId);
-  } else if (phase === "failed" || phase === "cancelled") {
+  } else if (phase === "cancelled") {
+    noteMessageCancelled(sessionId, context.messageId, context.requestId);
+  } else if (phase === "failed") {
     forgetMessageAccepted(sessionId, context.messageId, context.requestId);
   }
 }
@@ -710,6 +717,17 @@ async function appendDeduplicatedDeliveryTerminal(
   } finally {
     await eventWriter.close({ checkpoint: true });
   }
+}
+
+/** brick a0182aed F3 — what a WAITING deferred copy is answered when its sibling copy was cancelled: not run. */
+export function cancelledDeferredCopyResult(record: SessionRecord): SessionSendResult {
+  return {
+    stopReason: "cancelled",
+    sessionId: record.acpxRecordId,
+    permissionStats: { ...EMPTY_PERMISSION_STATS },
+    record,
+    resumed: true,
+  };
 }
 
 function deduplicatedSessionSendResult(record: SessionRecord): SessionSendResult {
