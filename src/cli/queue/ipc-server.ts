@@ -26,7 +26,7 @@ import type {
   BackgroundTaskAnswer,
   LiveBackgroundTask,
 } from "../session/background-task-tracker.js";
-import { wasMessageAccepted } from "./accepted-message-ids.js";
+import { wasMessageAcceptedByAnotherCopy } from "./accepted-message-ids.js";
 import {
   CONSUMED_CUT_BY_SESSION_CLOSE,
   consumedBeforeCutNote,
@@ -871,7 +871,10 @@ export class SessionQueueOwner {
       // not undelivered: its message reached the agent. Settled as the dedup of that copy, and kept out of the
       // close's "NOT delivered" list. A waiting caller keeps today's answer (no record to build a result from
       // on this synchronous path). See accepted-message-ids.ts.
-      if (task.messageId !== undefined && wasMessageAccepted(this.sessionId, task.messageId)) {
+      if (
+        task.messageId !== undefined &&
+        wasMessageAcceptedByAnotherCopy(this.sessionId, task.messageId, task.requestId)
+      ) {
         appendDeliveryStreamEventSync(this.sessionId, task, "done", undefined, {
           stopReason: "deduplicated",
         });

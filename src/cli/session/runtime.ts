@@ -53,7 +53,7 @@ import {
 } from "../../runtime/engine/failover.js";
 import { assertSessionCwdExists } from "../../session/session-cwd.js";
 import { SpawnLedgerError } from "../../spawn-ledger.js";
-import { noteMessageAccepted } from "../queue/accepted-message-ids.js";
+import { forgetMessageAccepted, noteMessageAccepted } from "../queue/accepted-message-ids.js";
 import {
   registerAbsorbedDeliveries,
   unregisterAbsorbedDeliveries,
@@ -652,6 +652,20 @@ function deliveryErrorFrom(error: unknown): DeliveryEventError {
       ? { effectiveAccount: normalized.effectiveAccount.effectiveAccount }
       : {}),
   };
+}
+
+// brick a0182aed (TE F1) — the owner's custody sweep settles a deferred copy of an id as delivered once ANOTHER copy
+// of it was `accepted` here, and no longer once that copy itself ended undelivered (accepted-message-ids.ts).
+function trackAcceptedCopy(
+  sessionId: string,
+  phase: DeliveryPhase,
+  context: DeliveryContext,
+): void {
+  if (phase === "accepted") {
+    noteMessageAccepted(sessionId, context.messageId, context.requestId);
+  } else if (phase === "failed" || phase === "cancelled") {
+    forgetMessageAccepted(sessionId, context.messageId, context.requestId);
+  }
 }
 
 async function resolveRecordIfPromptAlreadyPersisted(
@@ -3048,10 +3062,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // delta. (Written after the skip check so a suppressed duplicate accepted
     // does not rewind an already-open window.)
     if (phase === "accepted") {
-      // brick a0182aed (TE F1) — the owner's custody sweep settles a deferred copy of this id as delivered.
-      noteMessageAccepted(record.acpxRecordId, context.messageId);
       context.framesAtStart = sessionUpdateFrameCount;
     }
+    trackAcceptedCopy(record.acpxRecordId, phase, context);
     // Delivery-terminal warning — the SINGLE decision every terminal path
     // shares (deliveryTerminalWarning in delivery-events.ts; full narrowness
     // rationale lives there). A `steered: true` terminal always reports

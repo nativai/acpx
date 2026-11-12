@@ -482,10 +482,11 @@ function phasesByRequest(stream: string, messageId: string): Map<string, string[
 async function closeWhileCopyDeferred(
   rig: Rig,
   drainTimeoutMs: string,
+  // C4b needs copy 1's turn to outlast the close's start under load (the gate measured a 4 s turn ending first).
+  text = "sleep 4137",
 ): Promise<{ id: string; messageId: string; text: string; close: CliRunResult; stream: string }> {
   const id = await newSession(rig, { autoSubscription: false });
   const messageId = randomUUID();
-  const text = "sleep 4137";
   const first = sendWaiting(rig, id, messageId, text);
   // `accepted`, not the `session/prompt` frame: delivery events are written at once, while the turn's ACP
   // frames reach the stream file only at a checkpoint or the turn's end (brick 6f461fe4, residual 1).
@@ -570,7 +571,7 @@ test("F1 C4c — copy 1 completes while copy 2 is deferred, then the close: copy
 
 test("F1 C4b — the close cuts copy 1's turn while copy 2 is deferred: copy 2 is done/deduplicated, not failed", async () => {
   await withRig(async (rig) => {
-    const run = await closeWhileCopyDeferred(rig, CLOSE_DRAIN_TIMEOUT_MS);
+    const run = await closeWhileCopyDeferred(rig, CLOSE_DRAIN_TIMEOUT_MS, "sleep 20137");
     const first = [...phasesByRequest(run.stream, run.messageId).values()].find((p) =>
       p.some((phase) => phase.startsWith("accepted/")),
     );
