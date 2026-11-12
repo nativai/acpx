@@ -220,6 +220,74 @@ test("owner tree: the ancestry check agrees with the census (`self`) inside and 
 
 // ─── the routed send ──────────────────────────────────────────────────────────────────────────
 
+for (const refused of [false, true]) {
+  test(`07799b69: sessions new initial prompt uses the sender-visible route (${refused ? "refused" : "accepted"})`, async () => {
+    const {
+      f,
+      id: parent,
+      stub,
+    } = await routedRig((request) =>
+      refused
+        ? { status: 409, body: { error: "recipient closed", code: "SESSION_CLOSED" } }
+        : answerFor(request),
+    );
+    try {
+      const brief = path.join(f.root, "initial-brief.txt");
+      fs.writeFileSync(brief, "INITIAL_CHILD_MESSAGE_SENTINEL");
+      const source = `https://atrium.example.test/?session=${parent}`;
+      const result = await runCli(
+        [
+          ...baseArgs(f),
+          "--format",
+          "json",
+          "sessions",
+          "new",
+          "--no-brick",
+          "--parent-id",
+          parent,
+          "--prompt-file",
+          brief,
+        ],
+        agentEnv(f, { ACPX_SESSION_URL: source, ACPX_SESSION_RECORD_ID: parent }),
+        f.root,
+      );
+      assert.equal(
+        stub.requests.length,
+        1,
+        "the initial send must reach atrium, which owns the sender transcript marker",
+      );
+      const created = lastJson(result.stdout);
+      assert.equal(created.promptQueued, !refused);
+      assert.equal(result.code === 0, !refused, result.stderr);
+      assert.equal(stub.requests[0].url, `/api/sessions/${String(created.acpxRecordId)}/message`);
+      assert.equal(stub.requests[0].headers["x-source-session"], source);
+      assert.equal(
+        (stub.requests[0].body as { text: string }).text,
+        "INITIAL_CHILD_MESSAGE_SENTINEL",
+      );
+      assert.equal(
+        methods(f).filter((m) => m === "session/prompt").length,
+        0,
+        "no second direct delivery, including on an HTTP refusal",
+      );
+      assert.equal(
+        ledgerLines(f).length,
+        0,
+        "atrium owns the routed delivery; no duplicate CLI ledger row",
+      );
+      if (!refused) {
+        assert.equal(
+          result.stdout.trim().split("\n").length,
+          1,
+          "create still prints one JSON result",
+        );
+      }
+    } finally {
+      await stub.close();
+    }
+  });
+}
+
 test("routed prompt: delivering now → `[sent] delivery <id> → <seat>`; the CLI-minted id is the wire id; no owner started, no CLI ledger line", async () => {
   const { f, id, stub } = await routedRig();
   try {

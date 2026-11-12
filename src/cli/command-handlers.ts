@@ -4242,28 +4242,53 @@ async function deliverHandoffPrompt(
   validateExplicitCredentialFlags(globalFlags);
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
-  await withMessageLedger(
-    {
-      kind,
-      to: ledgerTargetOf(created),
-      addressedAs: "session",
-      prompt,
-    },
-    (onSubmitAccepted) =>
-      deliverPrompt({
-        sessionId: created.acpxRecordId,
+  const outputPolicy = resolveRequestedOutputPolicy(globalFlags);
+  // Initial sends belong in the sender transcript too. Use the ordinary agent-send
+  // route so atrium owns its marker and receiver attribution (07799b69 regression).
+  // Do not print a prompt result here: sessions new/copy owns the single create result.
+  const routed = await maybeRouteAgentPrompt({
+    record: created,
+    addressedSeat: undefined,
+    prompt,
+    flags: { wait: false },
+    globalFlags,
+    permissionMode,
+    permissionPolicy,
+    outputPolicy,
+    config,
+    command,
+  });
+  if (routed.kind === "sent") {
+    return;
+  }
+  const fallback = routed.kind === "direct" ? routed : undefined;
+  await withDirectFallbackRefusal(fallback, created, () =>
+    withMessageLedger(
+      {
+        kind,
+        to: ledgerTargetOf(created),
+        addressedAs: "session",
         prompt,
-        // Copy/fork handoff is a spawn-style fire-and-return operation: the parent
-        // gets the child's id/URL immediately while the copied session works async.
-        waitForCompletion: false,
-        globalFlags,
-        permissionMode,
-        permissionPolicy,
-        outputPolicy: resolveRequestedOutputPolicy(globalFlags),
-        config,
-        onSubmitAccepted,
-      }),
+        messageId: fallback?.messageId,
+      },
+      (onSubmitAccepted) =>
+        deliverPrompt({
+          sessionId: created.acpxRecordId,
+          prompt,
+          // Copy/fork handoff is a spawn-style fire-and-return operation: the parent
+          // gets the child's id/URL immediately while the copied session works async.
+          waitForCompletion: false,
+          globalFlags,
+          permissionMode,
+          permissionPolicy,
+          outputPolicy,
+          config,
+          onSubmitAccepted,
+          messageId: fallback?.messageId,
+        }),
+    ),
   );
+  noteDeliveredDirectly(fallback, outputPolicy.format);
 }
 
 // Shared core for `sessions copy`/`fork` and `sessions new --from-template`.
