@@ -26,6 +26,7 @@ import type {
   BackgroundTaskAnswer,
   LiveBackgroundTask,
 } from "../session/background-task-tracker.js";
+import { wasMessageAccepted } from "./accepted-message-ids.js";
 import {
   CONSUMED_CUT_BY_SESSION_CLOSE,
   consumedBeforeCutNote,
@@ -866,6 +867,27 @@ export class SessionQueueOwner {
       // (`absorbed-delivery-registry.ts`). Set for BOTH branches below, so a
       // second sweep re-sends nothing at all, not merely no stream terminal.
       task.terminalWritten = true;
+      // brick a0182aed (TE F1) — a deferred COPY of an id a turn of this owner already handed to the model is
+      // not undelivered: its message reached the agent. Settled as the dedup of that copy, and kept out of the
+      // close's "NOT delivered" list. A waiting caller keeps today's answer (no record to build a result from
+      // on this synchronous path). See accepted-message-ids.ts.
+      if (task.messageId !== undefined && wasMessageAccepted(this.sessionId, task.messageId)) {
+        appendDeliveryStreamEventSync(this.sessionId, task, "done", undefined, {
+          stopReason: "deduplicated",
+        });
+        if (task.waitForCompletion) {
+          task.send(
+            makeQueueOwnerError(
+              task.requestId,
+              "Queue owner shutting down before prompt execution",
+              "QUEUE_OWNER_SHUTTING_DOWN",
+              { retryable: true },
+            ),
+          );
+        }
+        task.close();
+        continue;
+      }
       undelivered.push({
         requestId: task.requestId,
         ...(task.messageId !== undefined ? { messageId: task.messageId } : {}),

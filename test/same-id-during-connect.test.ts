@@ -445,3 +445,184 @@ test("control — a re-drive of the same id after a FAILED first attempt still r
     }
   });
 });
+
+// ---------------------------------------------------------------------------------------------------------------
+// TE F1 (a0182aed): a close while a copy is DEFERRED. The deferred copy of an id that already reached the model
+// (accepted into the running turn, or done) must settle as `done / deduplicated`, never as `failed /
+// SESSION_CLOSED_UNDELIVERED`, and the close must not list the id as "NOT delivered … safe to resend". A deferred
+// copy whose id never reached the model keeps SESSION_CLOSED_UNDELIVERED (C4a).
+// ---------------------------------------------------------------------------------------------------------------
+
+function phasesByRequest(stream: string, messageId: string): Map<string, string[]> {
+  const byRequest = new Map<string, string[]>();
+  for (const frame of frames(stream)) {
+    const params = frame.params as
+      | {
+          messageId?: unknown;
+          requestId?: unknown;
+          phase?: unknown;
+          stopReason?: unknown;
+          error?: { detailCode?: unknown };
+        }
+      | undefined;
+    if (frame.method !== "acpx/delivery" || params?.messageId !== messageId) {
+      continue;
+    }
+    const key = String(params.requestId);
+    const detail = typeof params.error?.detailCode === "string" ? params.error.detailCode : "";
+    byRequest.set(key, [
+      ...(byRequest.get(key) ?? []),
+      `${String(params.phase)}/${String(params.stopReason)}${detail ? `/${detail}` : ""}`,
+    ]);
+  }
+  return byRequest;
+}
+
+// Copy 1 is MID-TURN (its `session/prompt` went out); copy 2 of the same id arrives and is deferred; then close.
+async function closeWhileCopyDeferred(
+  rig: Rig,
+  drainTimeoutMs: string,
+): Promise<{ id: string; messageId: string; text: string; close: CliRunResult; stream: string }> {
+  const id = await newSession(rig, { autoSubscription: false });
+  const messageId = randomUUID();
+  const text = "sleep 4137";
+  const first = sendWaiting(rig, id, messageId, text);
+  // `accepted`, not the `session/prompt` frame: delivery events are written at once, while the turn's ACP
+  // frames reach the stream file only at a checkpoint or the turn's end (brick 6f461fe4, residual 1).
+  await waitFor(
+    async () =>
+      [...phasesByRequest(await streamOf(rig, id), messageId).values()].some((phases) =>
+        phases.some((phase) => phase.startsWith("accepted/")),
+      ),
+    "copy 1 mid-turn (accepted)",
+  );
+  const queued = await sendNoWait(rig, id, messageId, text);
+  assert.equal(queued.code, 0, `${queued.stdout}\n${queued.stderr}`);
+  try {
+    await waitFor(async () => {
+      const byRequest = phasesByRequest(await streamOf(rig, id), messageId);
+      return [...byRequest.values()].some(
+        (phases) => phases.length > 0 && phases.every((p) => p.startsWith("queued/")),
+      );
+    }, "copy 2 deferred (queued)");
+  } catch (error) {
+    throw new Error(`${String(error)}\n${await diagnose(rig, id)}`, { cause: error });
+  }
+  const close = await rig.cli([
+    "claude",
+    "sessions",
+    "close",
+    "--session-id",
+    id,
+    "--drain-timeout",
+    drainTimeoutMs,
+  ]);
+  await first;
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  return { id, messageId, text, close, stream: await streamOf(rig, id) };
+}
+
+function assertDeferredCopySettledDelivered(run: {
+  messageId: string;
+  text: string;
+  close: CliRunResult;
+  stream: string;
+}): void {
+  const diag = `close stderr:\n${run.close.stderr}\nstream deliveries:\n${JSON.stringify([...phasesByRequest(run.stream, run.messageId)])}`;
+  // At most once: when the close cuts the turn (C4b) the owner dies before its buffered ACP frames reach the
+  // stream, so the one send may be unrecorded (brick 6f461fe4, residual 1). C4c asserts exactly one.
+  assert.ok(nonceSends(run.stream, run.text) <= 1, `the model read it at most once\n${diag}`);
+  const byRequest = phasesByRequest(run.stream, run.messageId);
+  assert.equal(byRequest.size, 2, `both copies have delivery events\n${diag}`);
+  const deferred = [...byRequest.values()].find(
+    (phases) => !phases.some((p) => p.startsWith("accepted/")),
+  );
+  assert.ok(deferred, `one copy was never accepted (the deferred one)\n${diag}`);
+  assert.ok(
+    deferred.some((p) => p === "done/deduplicated"),
+    `the deferred copy settles done/deduplicated\n${diag}`,
+  );
+  assert.ok(!deferred.some((p) => p.startsWith("failed/")), `never failed\n${diag}`);
+  assert.ok(
+    !run.close.stderr.includes(`NOT delivered: ${run.messageId}`),
+    `the close must not call a message the agent read "NOT delivered"\n${diag}`,
+  );
+}
+
+test("F1 C4c — copy 1 completes while copy 2 is deferred, then the close: copy 2 is done/deduplicated, not 'NOT delivered'", async () => {
+  await withRig(async (rig) => {
+    const run = await closeWhileCopyDeferred(rig, "30000");
+    const first = [...phasesByRequest(run.stream, run.messageId).values()].find((p) =>
+      p.some((phase) => phase.startsWith("accepted/")),
+    );
+    assert.ok(
+      first?.includes("done/end_turn"),
+      `precondition: copy 1 completed on its own: ${JSON.stringify(first)}`,
+    );
+    assert.equal(
+      nonceSends(run.stream, run.text),
+      1,
+      "C4c: the completed turn's one send is recorded",
+    );
+    assertDeferredCopySettledDelivered(run);
+  });
+});
+
+test("F1 C4b — the close cuts copy 1's turn while copy 2 is deferred: copy 2 is done/deduplicated, not failed", async () => {
+  await withRig(async (rig) => {
+    const run = await closeWhileCopyDeferred(rig, CLOSE_DRAIN_TIMEOUT_MS);
+    const first = [...phasesByRequest(run.stream, run.messageId).values()].find((p) =>
+      p.some((phase) => phase.startsWith("accepted/")),
+    );
+    assert.ok(
+      first?.some((phase) => phase.startsWith("done/delivered_at_close")),
+      `precondition: the close cut copy 1's turn (e50e171d): ${JSON.stringify(first)}`,
+    );
+    assertDeferredCopySettledDelivered(run);
+  });
+});
+
+test("F1 C4a control — copy 1 cut inside its connect, copy 2 deferred: copy 2 stays SESSION_CLOSED_UNDELIVERED", async () => {
+  await withRig(async (rig) => {
+    const id = await newSession(rig, { autoSubscription: false });
+    const messageId = randomUUID();
+    const text = `echo nonce-${randomUUID()}`;
+    await fs.writeFile(rig.holdFile, "");
+    const first = sendWaiting(rig, id, messageId, text);
+    await waitFor(
+      async () => receivedCount(await streamOf(rig, id), messageId) >= 1,
+      "copy 1 received",
+    );
+    const queued = await sendNoWait(rig, id, messageId, text);
+    assert.equal(queued.code, 0, `${queued.stdout}\n${queued.stderr}`);
+    await waitFor(
+      async () => receivedCount(await streamOf(rig, id), messageId) >= 2,
+      "copy 2 received",
+    );
+    const close = await rig.cli([
+      "claude",
+      "sessions",
+      "close",
+      "--session-id",
+      id,
+      "--drain-timeout",
+      CLOSE_DRAIN_TIMEOUT_MS,
+    ]);
+    await first;
+    await fs.rm(rig.holdFile, { force: true });
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    const stream = await streamOf(rig, id);
+    const diag = `close stderr:\n${close.stderr}\nstream deliveries:\n${JSON.stringify([...phasesByRequest(stream, messageId)])}`;
+    assert.equal(nonceSends(stream, text), 0, `nothing reached the model\n${diag}`);
+    const all = new Set([...phasesByRequest(stream, messageId).values()].flat());
+    assert.ok(
+      all.has("failed/null/SESSION_CLOSED_UNDELIVERED"),
+      `a copy that never reached the model stays SESSION_CLOSED_UNDELIVERED\n${diag}`,
+    );
+    assert.ok(!all.has("done/deduplicated"), `never deduplicated against nothing\n${diag}`);
+    assert.ok(
+      close.stderr.includes(`NOT delivered: ${messageId}`),
+      `the close still names it\n${diag}`,
+    );
+  });
+});

@@ -53,6 +53,7 @@ import {
 } from "../../runtime/engine/failover.js";
 import { assertSessionCwdExists } from "../../session/session-cwd.js";
 import { SpawnLedgerError } from "../../spawn-ledger.js";
+import { noteMessageAccepted } from "../queue/accepted-message-ids.js";
 import {
   registerAbsorbedDeliveries,
   unregisterAbsorbedDeliveries,
@@ -3047,6 +3048,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // delta. (Written after the skip check so a suppressed duplicate accepted
     // does not rewind an already-open window.)
     if (phase === "accepted") {
+      // brick a0182aed (TE F1) — the owner's custody sweep settles a deferred copy of this id as delivered.
+      noteMessageAccepted(record.acpxRecordId, context.messageId);
       context.framesAtStart = sessionUpdateFrameCount;
     }
     // Delivery-terminal warning — the SINGLE decision every terminal path
