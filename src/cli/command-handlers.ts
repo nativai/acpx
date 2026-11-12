@@ -101,6 +101,7 @@ import {
   writeSessionRecordWithLifecycle,
 } from "../session/persistence.js";
 import type { MigrateSlugsResult, TemplateRollbackResult } from "../session/persistence.js";
+import { readIndexEntryFromDisk, type SessionIndexEntry } from "../session/persistence/index.js";
 import {
   type PrincipalCreator,
   principalEntriesOf,
@@ -930,24 +931,35 @@ async function parentInheritableFields(parent: SessionRecord): Promise<ResolvedP
 
 /**
  * The first holder of `seatId` as a principal creator (brick 509d3884 O1): its record id and the
- * `principal_*` entries its index entry projects. Lowest ordinal wins; a holder that has none yet (a
- * prepared successor) is not a candidate. `undefined` when the seat has no numbered holder. A scan over the
- * index, run only when a session is created INTO a seat — a rare, operator-or-handover path.
+ * `principal_*` entries of its RECORD. Lowest ordinal wins; a holder that has none yet (a prepared
+ * successor) is not a candidate. `undefined` when the seat has no numbered holder. A scan over the index,
+ * run only when a session is created INTO a seat — a rare, operator-or-handover path.
+ *
+ * ⚠️ DO NOT "SIMPLIFY" THIS BACK TO THE INDEX ENTRY'S `principal` (brick d7a3c4d2). An acpx that predates the
+ * principal projection (b9c4a3d4 and older) rewrites the WHOLE index on every write and drops `principal` from
+ * every entry, so while such an owner lives the entry reads "no principal" for a first holder whose record has
+ * one — and the successor's recorded principal is write-once, so the loss would be permanent. The record is the
+ * truth: one read, here, on this rare path. The entry is used only when the record cannot be read.
+ * `test/principal-spawn-paths.test.ts` ("an index stripped by a pre-principal acpx") is the guard.
  */
 async function firstHolderOfSeat(seatId: string): Promise<PrincipalCreator | undefined> {
-  let first: { ordinal: number; creator: PrincipalCreator } | undefined;
+  let first: { ordinal: number; entry: SessionIndexEntry } | undefined;
   for (const entry of await listSessionIndexEntries()) {
     if (entry.seatId !== seatId || entry.holderOrdinal === undefined) {
       continue;
     }
     if (first === undefined || entry.holderOrdinal < first.ordinal) {
-      first = {
-        ordinal: entry.holderOrdinal,
-        creator: { acpxRecordId: entry.acpxRecordId, principal: entry.principal ?? {} },
-      };
+      first = { ordinal: entry.holderOrdinal, entry };
     }
   }
-  return first?.creator;
+  return first === undefined ? undefined : await creatorFromRecord(first.entry);
+}
+
+/** `entry`'s session as a principal creator, its `principal_*` taken from its RECORD (the entry's only when unreadable). */
+async function creatorFromRecord(entry: SessionIndexEntry): Promise<PrincipalCreator> {
+  const fromRecord = await readIndexEntryFromDisk(sessionBaseDir(), entry.file);
+  const principal = fromRecord ? fromRecord.principal : entry.principal;
+  return { acpxRecordId: entry.acpxRecordId, principal: principal ?? {} };
 }
 
 /**

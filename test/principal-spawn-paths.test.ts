@@ -469,6 +469,61 @@ test("O1: the CALLER is not the creator of a seat successor — a person's sessi
   });
 });
 
+// Brick d7a3c4d2: an acpx that predates the principal projection (b9c4a3d4) rewrites the whole index and drops
+// `principal` from every entry. The first holder's RECORD still has it, and a successor's recorded principal is
+// write-once — so rule 3 must answer from the record, not from the (stripped or stale) index entry.
+async function rewriteIndexEntries(
+  f: Fixture,
+  edit: (entry: Record<string, unknown>) => void,
+): Promise<Array<Record<string, unknown>>> {
+  const indexPath = path.join(path.dirname(sessionFilePath(f.home, "x")), "index.json");
+  const index = JSON.parse(await fs.readFile(indexPath, "utf8")) as {
+    entries: Array<Record<string, unknown>>;
+  };
+  index.entries.forEach(edit);
+  await fs.writeFile(indexPath, `${JSON.stringify(index)}\n`, "utf8");
+  return index.entries;
+}
+
+test("O1 (d7a3c4d2): a seat successor inherits the first holder's principal from its RECORD when a pre-principal acpx stripped the index", async () => {
+  await withMockHome(async (f) => {
+    const first = await createChild(f, QX);
+    const seat = await seatOf(f, first);
+    const before = await rewriteIndexEntries(f, () => undefined);
+    assert.ok(
+      before.find((e) => e.acpxRecordId === first)?.principal,
+      "the control: the new acpx projected the first holder's principal onto its entry",
+    );
+    const stripped = await rewriteIndexEntries(f, (entry) => delete entry.principal);
+    assert.equal(
+      stripped.filter((e) => e.principal !== undefined).length,
+      0,
+      "the old acpx's rewrite: no entry carries principal",
+    );
+    const successor = await createChild(f, ["--seat", seat]);
+    assert.deepEqual(principalKeys(await metadataOf(f.home, successor)), {
+      principal_via: "inherited",
+      principal_id: Q_ID,
+      principal_name: "Daniel Laatz",
+      principal_from: first,
+    });
+  });
+});
+
+test("O1 (d7a3c4d2): the RECORD beats a stale index entry — an entry naming someone else is not inherited", async () => {
+  await withMockHome(async (f) => {
+    const first = await createChild(f, QX);
+    const seat = await seatOf(f, first);
+    await rewriteIndexEntries(f, (entry) => {
+      if (entry.acpxRecordId === first) {
+        entry.principal = P;
+      }
+    });
+    const successor = await createChild(f, ["--seat", seat]);
+    assert.equal(principalKeys(await metadataOf(f.home, successor)).principal_id, Q_ID);
+  });
+});
+
 // X-1 (brick 509d3884, TE): C8.2 rule 2 (`spawned_by_session_id`, which `--no-parent` writes) outranks rule 3,
 // and atrium's walk has the same order — so the record must equal the walk: the CALLER, not the first holder.
 test("X-1: `sessions new --seat <seat> --no-parent` inside another person's session records the CALLER (rule 2 over rule 3); the bare-shell `--no-parent` control records the first holder", async () => {
