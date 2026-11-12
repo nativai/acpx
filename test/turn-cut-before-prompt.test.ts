@@ -10,8 +10,9 @@
 // ⚠️ WHY REAL PROCESSES. The loss is an owner and its adapter dying inside the connect, so every
 // row runs the real CLI, a real queue owner and a real adapter process (the mock, launched from a
 // `claude-agent-acp/` path so the Claude-family seam engages as in production). The adapter's
-// `initialize` is slowed so the connect is a window a close can land in, as the slow cold resume
-// was in the field.
+// `initialize` is HELD while a file exists, so the connect is a window a close can land in, as the
+// slow cold resume was in the field. A hold, not a delay: under load a fixed delay let the connect
+// finish before the close, and the row then measured nothing.
 //
 // The probe server answers the subscription usage probe: `dflt` (the registry default) is at 95 %
 // of its 5h window, `target` at 10 %, so selection moves an auto-subscription session off `dflt`
@@ -31,17 +32,16 @@ import { removeTempHome } from "./temp-home.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
-// Long enough that the close's drain barrier (below) times out while the turn is still
-// connecting; short enough to keep the rows quick.
-const INITIALIZE_DELAY_MS = 4_000;
 const CLOSE_DRAIN_TIMEOUT_MS = "500";
-const WAIT_MS = 20_000;
+const WAIT_MS = 60_000;
 
 type CliRunResult = { code: number | null; stdout: string; stderr: string };
 
 type Rig = {
   homeDir: string;
   cwd: string;
+  /** While this file exists, every adapter's `initialize` waits (the rows that hold the connect). */
+  holdFile: string;
   cli: (args: string[]) => Promise<CliRunResult>;
 };
 
@@ -117,7 +117,7 @@ async function runCli(
   });
 }
 
-async function withRig(adapterArgs: string[], run: (rig: Rig) => Promise<void>): Promise<void> {
+async function withRig(run: (rig: Rig) => Promise<void>): Promise<void> {
   const homeDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-turn-cut-"));
   const { server, url } = await startProbeServer();
   try {
@@ -127,12 +127,14 @@ async function withRig(adapterArgs: string[], run: (rig: Rig) => Promise<void>):
     await fs.mkdir(adapterDir, { recursive: true });
     const adapterPath = path.join(adapterDir, "index.js");
     await fs.symlink(MOCK_AGENT_PATH, adapterPath);
+    const holdFile = path.join(homeDir, "hold-initialize");
     const command = [
       "node",
       adapterPath,
       "--claude-agent-acp",
       "--supports-load-session",
-      ...adapterArgs,
+      "--initialize-hold-file",
+      holdFile,
     ].join(" ");
     await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
     await fs.writeFile(
@@ -164,7 +166,7 @@ async function withRig(adapterArgs: string[], run: (rig: Rig) => Promise<void>):
       { mode: 0o600 },
     );
     const base = { homeDir, cwd, probeUrl: url };
-    await run({ homeDir, cwd, cli: async (args) => await runCli(base, args) });
+    await run({ homeDir, cwd, holdFile, cli: async (args) => await runCli(base, args) });
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await removeTempHome(homeDir);
@@ -259,8 +261,8 @@ async function diagnose(rig: Rig, id: string): Promise<string> {
 }
 
 // Cut the turn while its client is still connecting: the turn is active (its `acpx/turn` frame is
-// written) and, for the swap rows, the owner has replaced its client; the adapter is still inside
-// its slowed `initialize`, so no `session/prompt` can have gone out.
+// written) and, for the swap rows, the owner has replaced its client; the adapter is still held
+// inside its `initialize`, so no `session/prompt` can have gone out.
 async function closeMidConnect(rig: Rig, id: string, opts: { swap: boolean }): Promise<void> {
   await waitFor(async () => {
     const stream = await readText(sessionFile(rig, id, ".stream.ndjson"));
@@ -280,6 +282,13 @@ async function closeMidConnect(rig: Rig, id: string, opts: { swap: boolean }): P
     CLOSE_DRAIN_TIMEOUT_MS,
   ]);
   assert.equal(closed.code, 0, `${closed.stdout}\n${closed.stderr}`);
+}
+
+// Release the hold: an owner or adapter that outlived the close must not now deliver the prompt
+// into the closed session. A short settle, then the negative assertions.
+async function releaseHoldAndSettle(rig: Rig): Promise<void> {
+  await fs.rm(rig.holdFile, { force: true });
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
 }
 
 async function assertNotLoggedAsSubmitted(rig: Rig, id: string, messageId: string): Promise<void> {
@@ -303,12 +312,14 @@ async function assertNotLoggedAsSubmitted(rig: Rig, id: string, messageId: strin
 }
 
 test("swap at turn start, close inside the replacement client's connect: the prompt is not logged as submitted", async () => {
-  await withRig(["--initialize-delay-ms", String(INITIALIZE_DELAY_MS)], async (rig) => {
+  await withRig(async (rig) => {
     const id = await newSession(rig, { autoSubscription: true });
     const messageId = randomUUID();
+    await fs.writeFile(rig.holdFile, "");
     const sent = sendPrompt(rig, id, messageId, "echo creation prompt");
     await closeMidConnect(rig, id, { swap: true });
     await sent;
+    await releaseHoldAndSettle(rig);
     const log = await readText(sessionFile(rig, id, ".owner.log"));
     assert.match(log, /switched session \S+ to target before the turn \(by selection\)/u);
     await assertNotLoggedAsSubmitted(rig, id, messageId);
@@ -316,12 +327,14 @@ test("swap at turn start, close inside the replacement client's connect: the pro
 });
 
 test("no swap (auto-subscription off), close inside the cold connect: the prompt is not logged as submitted", async () => {
-  await withRig(["--initialize-delay-ms", String(INITIALIZE_DELAY_MS)], async (rig) => {
+  await withRig(async (rig) => {
     const id = await newSession(rig, { autoSubscription: false });
     const messageId = randomUUID();
+    await fs.writeFile(rig.holdFile, "");
     const sent = sendPrompt(rig, id, messageId, "echo creation prompt");
     await closeMidConnect(rig, id, { swap: false });
     await sent;
+    await releaseHoldAndSettle(rig);
     const log = await readText(sessionFile(rig, id, ".owner.log"));
     assert.doesNotMatch(log, /replaced its adapter client/u, "the control row has no swap");
     await assertNotLoggedAsSubmitted(rig, id, messageId);
@@ -329,7 +342,7 @@ test("no swap (auto-subscription off), close inside the cold connect: the prompt
 });
 
 test("swap at turn start, no close: the prompt is delivered on the replacement client and logged once", async () => {
-  await withRig([], async (rig) => {
+  await withRig(async (rig) => {
     const id = await newSession(rig, { autoSubscription: true });
     try {
       const messageId = randomUUID();
@@ -351,7 +364,7 @@ test("swap at turn start, no close: the prompt is delivered on the replacement c
 });
 
 test("no swap, no close: a normal turn is delivered and logged once (unchanged)", async () => {
-  await withRig([], async (rig) => {
+  await withRig(async (rig) => {
     const id = await newSession(rig, { autoSubscription: false });
     try {
       const messageId = randomUUID();

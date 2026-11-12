@@ -59,6 +59,9 @@ type MockAgentOptions = {
   hangOnNewSession: boolean;
   /** UMQ A1 — hold `initialize` this long: a deterministic "the adapter is still connecting" window. */
   initializeDelayMs?: number;
+  /** brick 6f461fe4 — hold `initialize` while this file exists: a "still connecting" window the
+   *  test opens AFTER `sessions new` and holds open for as long as it needs, independent of load. */
+  initializeHoldFile?: string;
   /** brick 074a1bd9 — fail `session/new` the way a pi-acp with a dead pi does.
    *  The string, when set, names the extension file pi dies on — pi loads every
    *  extension and aborts on the unloadable one, which is not necessarily the
@@ -496,6 +499,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let ignoreSigterm = false;
   let hangOnNewSession = false;
   let initializeDelayMs: number | undefined;
+  let initializeHoldFile: string | undefined;
   let failNewSessionOnSeededExtension = false;
   let failNewSessionExtensionName: string | undefined;
   let envDumpFile: string | undefined;
@@ -645,6 +649,12 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--initialize-hold-file") {
+      initializeHoldFile = parseOptionValue(argv, index + 1, token);
+      index += 1;
+      continue;
+    }
+
     if (token === "--fail-new-session-on-seeded-extension") {
       failNewSessionOnSeededExtension = true;
       // Optional value: names the extension file pi dies on (see the option
@@ -758,6 +768,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   return {
     hangOnNewSession,
     initializeDelayMs,
+    initializeHoldFile,
     failNewSessionOnSeededExtension,
     failNewSessionExtensionName,
     newSessionMeta: Object.keys(newSessionMeta).length > 0 ? { ...newSessionMeta } : undefined,
@@ -1096,6 +1107,10 @@ class MockAgent implements Agent {
   async initialize(): Promise<InitializeResponse> {
     if (this.options.initializeDelayMs !== undefined) {
       await new Promise((resolve) => setTimeout(resolve, this.options.initializeDelayMs));
+    }
+    const holdFile = this.options.initializeHoldFile;
+    while (holdFile !== undefined && existsSync(holdFile)) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
     }
     const sessionCapabilities = {
       ...(this.options.supportsCloseSession ? { close: {} } : {}),
