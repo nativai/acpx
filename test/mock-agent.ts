@@ -119,6 +119,18 @@ type MockAgentOptions = {
    * Opt-in so every existing operation-log row stays byte-identical.
    */
   pushConfigOnSetModel?: boolean;
+  /**
+   * brick 21b73df0 — `--park-concurrent-prompts`: claude-agent-acp's promptQueueing. A prompt that arrives while
+   * another runs is PARKED (recorded on arrival) until that one ends, then runs; `session/cancel` answers every
+   * parked prompt `cancelled` at once and aborts the running one. The cancel is recorded in the operation log too.
+   * Opt-in, so the abort-on-arrival handover every other row relies on is unchanged.
+   */
+  parkConcurrentPrompts?: boolean;
+  /**
+   * brick 21b73df0 — `--withdraw-parked-on-cancel` (with `--park-concurrent-prompts`): a parked prompt the cancel
+   * answers carries claude-agent-acp's positive mark, `{ stopReason: "cancelled", _meta: { withdrawn: true } }`.
+   */
+  withdrawParkedOnCancel?: boolean;
   claudeAgentAcp: boolean;
   expectedForkMeta?: unknown;
   /**
@@ -133,6 +145,8 @@ type MockAgentOptions = {
 
 type SessionState = {
   pendingPrompt?: AbortController;
+  /** `--park-concurrent-prompts`: resolve `true` = cancelled, `false` = the running prompt ended, run now. */
+  parked?: Array<(cancelled: boolean) => void>;
   hasCompletedPrompt: boolean;
   modeId: string;
   configValues: Record<string, string | boolean>;
@@ -506,6 +520,8 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let envDumpExtra: string[] | undefined;
   let operationLogFile: string | undefined;
   let logConfigOptionOps = false;
+  let parkConcurrentPrompts = false;
+  let withdrawParkedOnCancel = false;
   let pushConfigOnSetModel = false;
   let claudeAgentAcp = false;
   let expectedForkMeta: unknown;
@@ -698,6 +714,16 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--park-concurrent-prompts") {
+      parkConcurrentPrompts = true;
+      continue;
+    }
+
+    if (token === "--withdraw-parked-on-cancel") {
+      withdrawParkedOnCancel = true;
+      continue;
+    }
+
     if (token === "--push-config-on-set-model") {
       pushConfigOnSetModel = true;
       continue;
@@ -803,6 +829,8 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     operationLogFile,
     logConfigOptionOps,
     pushConfigOnSetModel,
+    parkConcurrentPrompts,
+    withdrawParkedOnCancel,
     claudeAgentAcp,
     expectedForkMeta,
     ...(modelAdvertisement !== undefined ? { modelAdvertisement } : {}),
@@ -1395,17 +1423,60 @@ class MockAgent implements Agent {
       );
     }
 
+    if (this.options.parkConcurrentPrompts && session.pendingPrompt) {
+      this.recordOperation({
+        method: "session/prompt",
+        sessionId: params.sessionId,
+        text: getPromptText(params.prompt),
+        modelId: session.modelId,
+        parked: true,
+      });
+      const cancelled = await new Promise<boolean>((resolve) => {
+        (session.parked ??= []).push(resolve);
+      });
+      if (cancelled) {
+        return this.options.withdrawParkedOnCancel
+          ? { stopReason: "cancelled", _meta: { withdrawn: true } }
+          : { stopReason: "cancelled" };
+      }
+      return await this.runPrompt(params, session, { recorded: true });
+    }
+    return await this.runPrompt(params, session, { recorded: false });
+  }
+
+  private async runPrompt(
+    params: PromptRequest,
+    session: SessionState,
+    run: { recorded: boolean },
+  ): Promise<PromptResponse> {
+    try {
+      return await this.runPromptBody(params, session, run);
+    } finally {
+      // `--park-concurrent-prompts`: the running prompt ended — the oldest parked one takes the stream.
+      if (this.options.parkConcurrentPrompts && session.pendingPrompt === undefined) {
+        session.parked?.shift()?.(false);
+      }
+    }
+  }
+
+  private async runPromptBody(
+    params: PromptRequest,
+    session: SessionState,
+    run: { recorded: boolean },
+  ): Promise<PromptResponse> {
     session.pendingPrompt?.abort();
     const promptAbort = new AbortController();
     session.pendingPrompt = promptAbort;
     const text = getPromptText(params.prompt);
     // `modelId` is the model this turn is SERVED by — what a "served by" assertion reads.
-    this.recordOperation({
-      method: "session/prompt",
-      sessionId: params.sessionId,
-      text,
-      modelId: session.modelId,
-    });
+    if (!run.recorded) {
+      this.recordOperation({
+        method: "session/prompt",
+        sessionId: params.sessionId,
+        text,
+        modelId: session.modelId,
+      });
+    }
 
     // brick a0182aed F4 — a turn that runs, then FAILS (not cancelled): a later copy of the same message id is the
     // re-drive. A cancel during the sleep cancels it, as `sleep` does.
@@ -1555,7 +1626,14 @@ class MockAgent implements Agent {
   }
 
   async cancel(params: { sessionId: SessionId }): Promise<void> {
-    this.sessions.get(params.sessionId)?.pendingPrompt?.abort();
+    const session = this.sessions.get(params.sessionId);
+    if (this.options.parkConcurrentPrompts) {
+      this.recordOperation({ method: "session/cancel", sessionId: params.sessionId });
+      for (const resolve of session?.parked?.splice(0) ?? []) {
+        resolve(true);
+      }
+    }
+    session?.pendingPrompt?.abort();
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {

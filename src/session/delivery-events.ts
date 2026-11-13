@@ -186,6 +186,23 @@ export const EMPTY_DELIVERY_ERROR: DeliveryEventError = {
 };
 
 /**
+ * brick 21b73df0 — the `error.detailCode` of a `cancelled` terminal for a prompt acpx sent (main or steered):
+ *  - `CANCELLED_WITHDRAWN` — the adapter answered `_meta.withdrawn: true`: Claude Code confirmed it took the message
+ *    back before the agent began on it. Positive evidence only.
+ *  - `CANCELLED_MID_TURN` — any other `cancelled` response: the agent had the message and was stopped.
+ * `message` stays empty: acpx-ui reads a non-empty message as a failure note, and a Stop is not a failure.
+ */
+export const CANCELLED_WITHDRAWN_DETAIL_CODE = "CANCELLED_WITHDRAWN";
+export const CANCELLED_MID_TURN_DETAIL_CODE = "CANCELLED_MID_TURN";
+
+export function cancelledDeliveryError(withdrawn: boolean): DeliveryEventError {
+  return {
+    ...EMPTY_DELIVERY_ERROR,
+    detailCode: withdrawn ? CANCELLED_WITHDRAWN_DETAIL_CODE : CANCELLED_MID_TURN_DETAIL_CODE,
+  };
+}
+
+/**
  * True iff `events` contains a delivery terminal proving the prompt actually COMPLETED a
  * turn: an `acpx/delivery` `phase:"done"` for `messageId` whose `stopReason` is a genuine
  * completion (`end_turn`/`max_tokens`/`max_turns`) rather than a prior dedup echo

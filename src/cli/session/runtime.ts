@@ -79,6 +79,7 @@ import {
   runPromptTurn,
   steeredFromMeta,
   turnErrorFromMeta,
+  withdrawnFromMeta,
 } from "../../runtime/engine/prompt-turn.js";
 import { connectAndLoadSession } from "../../runtime/engine/reconnect.js";
 import {
@@ -109,6 +110,7 @@ import { withDefaultModelForNewSession } from "../../session/default-model.js";
 import { CONSUMED_BEFORE_CUT, ConsumptionTracker } from "../../session/delivery-consumption.js";
 import {
   buildDeliveryEvent,
+  cancelledDeliveryError,
   deliveryTerminalWarning,
   hasCompletedDeliveryFor,
   type DeliveryEventError,
@@ -2890,6 +2892,14 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     { checkpoint: false },
   );
   const pendingMessages: AcpJsonRpcMessage[] = [];
+  // brick 21b73df0 — ONE order for every write of the buffered ACP frames and of a delivery event, so an
+  // event can never overtake a frame that reached the wire before it (`writeDurableDeliveryEvent`).
+  let streamWriteOrder: Promise<void> = Promise.resolve();
+  const inStreamWriteOrder = (write: () => Promise<void>): Promise<void> => {
+    const next = streamWriteOrder.then(write, write);
+    streamWriteOrder = next.catch(() => {});
+    return next;
+  };
   const pendingConnectOutputMessages: AcpJsonRpcMessage[] = [];
   const sessionOptions = mergeSessionOptions(
     options.sessionOptions,
@@ -3127,7 +3137,19 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   const writeDurableDeliveryEvent = async (event: AcpJsonRpcMessage): Promise<void> => {
     if (!eventWriterClosed) {
       try {
-        await eventWriter.appendMessage(event);
+        // 🛑 brick 21b73df0 — FLUSH THE BUFFERED ACP FRAMES FIRST, in the same ordered write. Do not "save a write"
+        // by appending the event alone. The frames wait in `pendingMessages` until a checkpoint or the turn's end,
+        // while this event goes to the file at once. Unflushed, a steer's `session/prompt` (sent milliseconds after
+        // its `accepted`) landed AFTER its `cancelled` terminal and the `session/cancel`, so the stream read "acpx
+        // sent a message it had already settled cancelled". Three agents attributed a Claude-adapter defect to acpx
+        // from that order. With the flush, the stream's line order is wire order up to each delivery event.
+        // test/steer-stop-cancel.test.ts "stream order" reds without it.
+        await inStreamWriteOrder(async () => {
+          if (pendingMessages.length > 0) {
+            await eventWriter.appendMessages(pendingMessages.splice(0), { checkpoint: false });
+          }
+          await eventWriter.appendMessage(event);
+        });
         return;
       } catch (error) {
         if (!isClosedEventWriterError(error)) {
@@ -3496,6 +3518,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
         // brick ddd76838 — a pi steer-ack (`end_turn` + `_meta.piAcp.steered`)
         // is recorded on the delivery record, not reduced to a bare end_turn.
         ...(steeredFromMeta(injectedResponse._meta) ? { steered: true } : {}),
+        // brick 21b73df0 — a Stop: withdrawn before the agent began (the adapter's positive mark) vs stopped mid-turn.
+        ...(injectedResponse.stopReason === "cancelled"
+          ? { error: cancelledDeliveryError(withdrawnFromMeta(injectedResponse._meta)) }
+          : {}),
       },
     );
     markAbsorbedDeliveryTerminalWritten(absorbedDelivery);
@@ -3918,9 +3944,15 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       return;
     }
 
-    const batch = pendingMessages.splice(0);
-    await measurePerf("session.events.flush_pending", async () => {
-      await eventWriter.appendMessages(batch, { checkpoint });
+    // The splice happens inside the ordered write, so a delivery event queued before this flush keeps its place.
+    await inStreamWriteOrder(async () => {
+      const batch = pendingMessages.splice(0);
+      if (batch.length === 0) {
+        return;
+      }
+      await measurePerf("session.events.flush_pending", async () => {
+        await eventWriter.appendMessages(batch, { checkpoint });
+      });
     });
   };
   const applyPersistedClosedState = (persisted: PersistedSessionLifecycle | undefined): void => {
@@ -5084,7 +5116,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       ...(response.steered ? { steered: true } : {}),
       ...(turnErrorForTerminal
         ? { error: { code: 0, message: turnErrorForTerminal, detailCode: "" } }
-        : {}),
+        : terminalStopReason === "cancelled"
+          ? // brick 21b73df0 — same mark as a steered prompt's (`handleInjectedPromptResponse`).
+            { error: cancelledDeliveryError(response.withdrawn === true) }
+          : {}),
     });
   };
 
