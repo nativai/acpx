@@ -3270,7 +3270,10 @@ test("a CANCEL with no close still ends the delivery cancelled — only a close 
       15_000,
     );
     assert.equal(terminal.phase, "cancelled");
-    assert.equal(terminal.error?.detailCode ?? "", "");
+    // brick 21b73df0 — a plain Stop's terminal now says WHICH cancel it was (CANCELLED_MID_TURN; a parked prompt the
+    // adapter confirms withdrawn says CANCELLED_WITHDRAWN). What this control guards is unchanged: no close code.
+    assert.notEqual(terminal.error?.detailCode, "SESSION_CLOSED_TURN_CANCELLED");
+    assert.equal(terminal.error?.detailCode, "CANCELLED_MID_TURN");
   });
 });
 
