@@ -99,7 +99,7 @@ export async function creationSessionContext(
 
 /** Creation rules 4/5 for a record-less one-shot (it never refuses: no `--os` on exec). */
 function execOsChoice(): string | null {
-  const os = resolveOsChoiceForCreate({ kind: "exec" });
+  const os = resolveOsChoiceForCreate({ creation: "exec" });
   if (!os.ok) {
     return null;
   }

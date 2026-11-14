@@ -181,12 +181,12 @@ function explicitRootRefusal(normalised: string): string | undefined {
  * `copy` = a user fork / copy; `byway` = a by-the-way copy; `template` = a template copy; `plain` = a
  * fresh `sessions new` or seat join; `exec` / `flow` = record-less or caller-less creates.
  */
-export type OsCreateKind = "plain" | "successor" | "copy" | "byway" | "template" | "exec" | "flow";
+export type OsCreation = "plain" | "successor" | "copy" | "byway" | "template" | "exec" | "flow";
 
 export type OsCreateInput = {
   /** `--os`, verbatim. */
   explicit?: string;
-  kind: OsCreateKind;
+  creation: OsCreation;
   /** The SOURCE record's stored `atrium_os` (successor / copy / byway). `null` = stored default. */
   sourceChoice?: string | null;
   /** A LOCAL parent record's stored `atrium_os`; `undefined` = no local parent resolved. */
@@ -201,7 +201,7 @@ export type OsCreateResolution =
   | { ok: true; /** `undefined` = default: nothing stored. */ choice?: string; warnings: string[] }
   | { ok: false; reason: string };
 
-const INHERITS_FROM_SOURCE: ReadonlySet<OsCreateKind> = new Set(["successor", "copy", "byway"]);
+const INHERITS_FROM_SOURCE: ReadonlySet<OsCreation> = new Set(["successor", "copy", "byway"]);
 
 /**
  * THE creation precedence (§2.1, v5 §3 / review M7 + m1). First match wins:
@@ -234,7 +234,7 @@ function resolvePrecedence(input: OsCreateInput, env: NodeJS.ProcessEnv): OsCrea
       ? { ok: true, choice: validated.choice, warnings: [] }
       : { ok: false, reason: `--os ${input.explicit}: ${validated.reason}` };
   }
-  if (INHERITS_FROM_SOURCE.has(input.kind) && input.sourceChoice !== undefined) {
+  if (INHERITS_FROM_SOURCE.has(input.creation) && input.sourceChoice !== undefined) {
     return { ok: true, choice: normaliseStoredChoice(input.sourceChoice), warnings: [] };
   }
   if (input.parentChoice !== undefined) {

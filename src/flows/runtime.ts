@@ -1300,7 +1300,7 @@ export class FlowRunner {
 
 /** P3a §2.2 — a flow-created session's OS: the runner's `$ATRIUM_OS` (rule 4), else default. */
 function flowSessionOsMetadata(): Record<string, string> | undefined {
-  const os = resolveOsChoiceForCreate({ kind: "flow" });
+  const os = resolveOsChoiceForCreate({ creation: "flow" });
   if (!os.ok) {
     return undefined;
   }

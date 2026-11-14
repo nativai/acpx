@@ -474,17 +474,17 @@ test("formatPrimerErrorStamp: ISO time + one-line reason, capped at 200 chars", 
 test("creation rule 1: --os validated; a refusal stops the create; --os default beats every rule", async () => {
   await withWorkspaceDir((dir) => {
     const b = makeOsRoot(dir, "B");
-    assert.deepEqual(resolveOsChoiceForCreate({ explicit: b, kind: "plain" }), {
+    assert.deepEqual(resolveOsChoiceForCreate({ explicit: b, creation: "plain" }), {
       ok: true,
       choice: b,
       warnings: [],
     });
-    const refused = resolveOsChoiceForCreate({ explicit: "/tmp/x", kind: "plain" });
+    const refused = resolveOsChoiceForCreate({ explicit: "/tmp/x", creation: "plain" });
     assert.equal(refused.ok, false);
     assert.deepEqual(
       resolveOsChoiceForCreate({
         explicit: "default",
-        kind: "successor",
+        creation: "successor",
         sourceChoice: b,
         parentChoice: b,
       }),
@@ -495,14 +495,18 @@ test("creation rule 1: --os validated; a refusal stops the create; --os default 
 
 test("creation rule 2 (M7): a successor takes the SOURCE's choice even when its parent is default", () => {
   const result = resolveOsChoiceForCreate({
-    kind: "successor",
+    creation: "successor",
     sourceChoice: "/workspace/os/wt",
     parentChoice: null,
   });
   assert.deepEqual(result, { ok: true, choice: "/workspace/os/wt", warnings: [] });
   // NEGATIVE: a fork of a DEFAULT source made by an override caller stays default.
   assert.deepEqual(
-    resolveOsChoiceForCreate({ kind: "copy", sourceChoice: null, parentChoice: "/workspace/x" }),
+    resolveOsChoiceForCreate({
+      creation: "copy",
+      sourceChoice: null,
+      parentChoice: "/workspace/x",
+    }),
     {
       ok: true,
       choice: undefined,
@@ -515,7 +519,7 @@ test("creation rule 3 beats rule 4: a child of a default parent ignores the call
   await withWorkspaceDir((dir) => {
     const b = makeOsRoot(dir, "B");
     assert.deepEqual(
-      resolveOsChoiceForCreate({ kind: "plain", parentChoice: null, env: { ATRIUM_OS: b } }),
+      resolveOsChoiceForCreate({ creation: "plain", parentChoice: null, env: { ATRIUM_OS: b } }),
       {
         ok: true,
         choice: undefined,
@@ -523,14 +527,18 @@ test("creation rule 3 beats rule 4: a child of a default parent ignores the call
       },
     );
     assert.deepEqual(
-      resolveOsChoiceForCreate({ kind: "plain", parentChoice: "default", env: { ATRIUM_OS: b } }),
+      resolveOsChoiceForCreate({
+        creation: "plain",
+        parentChoice: "default",
+        env: { ATRIUM_OS: b },
+      }),
       {
         ok: true,
         choice: undefined,
         warnings: [],
       },
     );
-    assert.deepEqual(resolveOsChoiceForCreate({ kind: "plain", parentChoice: b, env: {} }), {
+    assert.deepEqual(resolveOsChoiceForCreate({ creation: "plain", parentChoice: b, env: {} }), {
       ok: true,
       choice: b,
       warnings: [],
@@ -541,14 +549,14 @@ test("creation rule 3 beats rule 4: a child of a default parent ignores the call
 test("creation rule 4: no local parent → the caller's ATRIUM_OS when it differs from the box default", async () => {
   await withWorkspaceDir((dir) => {
     const b = makeOsRoot(dir, "B");
-    assert.deepEqual(resolveOsChoiceForCreate({ kind: "plain", env: { ATRIUM_OS: b } }), {
+    assert.deepEqual(resolveOsChoiceForCreate({ creation: "plain", env: { ATRIUM_OS: b } }), {
       ok: true,
       choice: b,
       warnings: [],
     });
     // equal to the box default → nothing stored (scenario 1)
     assert.deepEqual(
-      resolveOsChoiceForCreate({ kind: "plain", env: { ATRIUM_OS: b, ATRIUM_OS_DEFAULT: b } }),
+      resolveOsChoiceForCreate({ creation: "plain", env: { ATRIUM_OS: b, ATRIUM_OS_DEFAULT: b } }),
       {
         ok: true,
         choice: undefined,
@@ -556,7 +564,7 @@ test("creation rule 4: no local parent → the caller's ATRIUM_OS when it differ
       },
     );
     // an invalid value warns and falls to default — never refuses the create
-    const invalid = resolveOsChoiceForCreate({ kind: "exec", env: { ATRIUM_OS: "/tmp/nope" } });
+    const invalid = resolveOsChoiceForCreate({ creation: "exec", env: { ATRIUM_OS: "/tmp/nope" } });
     assert.equal(invalid.ok, true);
     assert.equal(invalid.ok && invalid.choice, undefined);
     assert.match(
@@ -568,7 +576,7 @@ test("creation rule 4: no local parent → the caller's ATRIUM_OS when it differ
 
 test("T8 a template copy warns when the template was baked under another OS, and only then", () => {
   const differs = resolveOsChoiceForCreate({
-    kind: "template",
+    creation: "template",
     parentChoice: null,
     template: { id: "tpl-1", choice: "/workspace/os/x" },
     env: {},
@@ -578,7 +586,11 @@ test("T8 a template copy warns when the template was baked under another OS, and
     differs.ok ? differs.warnings.join("") : "",
     /template tpl-1 was baked under OS \/workspace\/os\/x; this copy runs on default/,
   );
-  const same = resolveOsChoiceForCreate({ kind: "template", template: { id: "tpl-1" }, env: {} });
+  const same = resolveOsChoiceForCreate({
+    creation: "template",
+    template: { id: "tpl-1" },
+    env: {},
+  });
   assert.deepEqual(same, { ok: true, choice: undefined, warnings: [] });
 });
 
@@ -605,6 +617,4 @@ test("applySnapshotOsObservation: string sets, null deletes, undefined leaves; n
   assert.deepEqual(record.metadata, { atrium_os: "/w", atrium_os_fallback: "2026" });
   // NEUTRAL: a default session with nothing observed keeps NO metadata at all.
   const bare = { acpxRecordId: "b" } as unknown as SessionRecord;
-  applySnapshotOsObservation(bare, { revision: null, fallbackAt: null, primerError: null });
-  assert.equal(bare.metadata, undefined);
-});
+  applySnapshotOsObservation(bare, { revision: null, fallbackAt: null,

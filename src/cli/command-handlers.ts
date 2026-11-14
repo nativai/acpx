@@ -981,10 +981,10 @@ function newSessionOsInput(
   return from
     ? {
         explicit: flags.os,
-        kind: "successor",
+        creation: "successor",
         sourceChoice: from.metadata?.[ATRIUM_OS_KEY] ?? null,
       }
-    : { explicit: flags.os, kind: "plain", parentChoice: inherit?.os };
+    : { explicit: flags.os, creation: "plain", parentChoice: inherit?.os };
 }
 
 /** §2.1: a template copy ⇔ `--from-template`, a `template_source` marker, or a template-record source. */
@@ -1012,12 +1012,16 @@ function copyOsInput(
   if (isTemplateCopy(flags, source, requireTemplate)) {
     return {
       explicit: flags.os,
-      kind: "template",
+      creation: "template",
       parentChoice: caller?.os,
       template: { id: source.acpxRecordId, choice: sourceChoice },
     };
   }
-  return { explicit: flags.os, kind: flags.ephemeral === true ? "byway" : "copy", sourceChoice };
+  return {
+    explicit: flags.os,
+    creation: flags.ephemeral === true ? "byway" : "copy",
+    sourceChoice,
+  };
 }
 
 /**
@@ -6500,5 +6504,4 @@ export async function handleSessionsRepairAccountSeam(
     process.stdout.write(`${result.repaired.length}\n`);
     return;
   }
-  process.stdout.write(`${formatAccountSeamRepairResult(result)}\n`);
-}
+  process.stdout.write(`${formatAccountSeamRepairResult(r
