@@ -1,4 +1,9 @@
-import type { AgentLifecycleSnapshot } from "../../acp/client.js";
+import {
+  ATRIUM_OS_FALLBACK_KEY,
+  ATRIUM_OS_PRIMER_ERROR_KEY,
+  ATRIUM_OS_REVISION_KEY,
+} from "../../acp/atrium-os.js";
+import type { AgentLifecycleSnapshot, AgentOsObservation } from "../../acp/client.js";
 import { copyLoggedMessageCount } from "../../session/messages-log-bookkeeping.js";
 import { setHarnessConfigDir } from "../../session/mode-preference.js";
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
@@ -47,6 +52,51 @@ function applySnapshotBreadcrumbs(record: SessionRecord, snapshot: AgentLifecycl
   }
 }
 
+/**
+ * P3a §1.6 — the OS observations land on `record.metadata` (never `record.acpx`: metadata survives
+ * every allowlist rebuild and every acpx build, §1.1). Per key: a string SETS it, `null` DELETES it,
+ * `undefined` leaves it — so a spawn that rendered no primer (codex resume) keeps a stored
+ * creation-time failure, and a snapshot without `os` (teardown, an unspawned client) touches nothing.
+ *
+ * ⚠️ NOT truthy-gated like the breadcrumbs above, on purpose: `null` is the clear that a later good
+ * spawn must be able to write (`atrium_os_fallback` once the path is back, the primer alarm once a
+ * render succeeds). The gate is `undefined`, which only an absent observation produces.
+ */
+/** One key of the per-key rule; `true` when it changed `metadata`. */
+function applyObservationKey(
+  metadata: Record<string, string>,
+  key: string,
+  value: string | null | undefined,
+): boolean {
+  if (value === null && key in metadata) {
+    delete metadata[key];
+    return true;
+  }
+  if (typeof value === "string" && metadata[key] !== value) {
+    metadata[key] = value;
+    return true;
+  }
+  return false;
+}
+
+export function applySnapshotOsObservation(
+  record: SessionRecord,
+  os: AgentOsObservation | undefined,
+): void {
+  if (!os) {
+    return;
+  }
+  const metadata: Record<string, string> = { ...record.metadata };
+  const touched = [
+    applyObservationKey(metadata, ATRIUM_OS_REVISION_KEY, os.revision),
+    applyObservationKey(metadata, ATRIUM_OS_FALLBACK_KEY, os.fallbackAt),
+    applyObservationKey(metadata, ATRIUM_OS_PRIMER_ERROR_KEY, os.primerError),
+  ].includes(true);
+  if (touched) {
+    record.metadata = Object.keys(metadata).length > 0 ? metadata : undefined;
+  }
+}
+
 export function applyLifecycleSnapshotToRecord(
   record: SessionRecord,
   snapshot: AgentLifecycleSnapshot | undefined,
@@ -67,6 +117,7 @@ export function applyLifecycleSnapshotToRecord(
   // so a new spawn site cannot record one and forget the other.
   setHarnessConfigDir(record, snapshot.harnessConfigDir, snapshot.piSessionDir);
   applySnapshotBreadcrumbs(record, snapshot);
+  applySnapshotOsObservation(record, snapshot.os);
   // TE F-3 — the turn-END leg. The usage_update path writes this field during the
   // turn; this one catches a shim line that landed after the last update, which
   // is what left a FIRST turn null 3/3 against real OpenRouter. Truthy-gated like

@@ -1,6 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import type { PromptResponse } from "@agentclientprotocol/sdk";
+import { isOsCompatLinkInPlace } from "../../acp/atrium-os.js";
 import type { EffectiveAccountMetadata } from "../../acp/auth-env.js";
 import type { AcpxBatchMeta, BatchSplitPart } from "../../acp/batch-meta.js";
 import { splitCommandLine } from "../../acp/client-process.js";
@@ -5326,6 +5327,8 @@ export async function runOnce(runOptions: RunOnceOptions): Promise<RunPromptResu
       options.onPermissionEscalation?.(event);
     },
     sessionContext: execSessionContext(options),
+    // P3a §4.5 (C11) — exec hosts an agent conversation too: refuse an unprimed create after the swap.
+    requireOsPrimer: isOsCompatLinkInPlace(),
     sessionOptions: options.sessionOptions,
   });
 

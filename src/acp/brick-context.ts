@@ -24,6 +24,9 @@ type BrickContextOptions = {
   // reaches the brick CLI through the child ENV (`ACPX_SEAT_URL`), never as a flag — see
   // `brickContextEnv`. Absent for a seat-less child.
   seatId?: string;
+  // P3a §8.3(3) — the child's OS root (its spawn's `$ATRIUM_OS`), so a box-side `brick` CLI renders the
+  // include line for the child's OS, not the queue owner's. Reaches the CLI through the env only.
+  atriumOs?: string;
 };
 
 function trimmedOrUndefined(value: string | null | undefined): string | undefined {
@@ -57,6 +60,7 @@ export async function resolveBrickContext(
     options.timeoutMs ?? BRICK_CONTEXT_TIMEOUT_MS,
     options.sessionId,
     options.seatId,
+    options.atriumOs,
   );
 }
 
@@ -87,8 +91,21 @@ const FALLBACK_IDENTITY_BASE_URL = "http://localhost";
  * deleted: the brick CLI then renders its placeholder instead of the SPAWNER's folder, which a codex
  * primer would otherwise keep in the thread history. A seat is only meaningful with a session.
  */
-function brickContextEnv(sessionId?: string, seatId?: string): NodeJS.ProcessEnv {
+function brickContextEnv(
+  sessionId?: string,
+  seatId?: string,
+  atriumOs?: string,
+): NodeJS.ProcessEnv {
   const env = brickChildEnv();
+  // P3a §8.3(3) — `ATRIUM_OS` is session identity like the two URLs below: SET to the child's root, or
+  // DELETED (the CLI then falls back to the box default) — never the owner's ambient value, which can be
+  // ANOTHER session's OS.
+  const root = atriumOs?.trim();
+  if (root) {
+    env.ATRIUM_OS = root;
+  } else {
+    delete env.ATRIUM_OS;
+  }
   const session = sessionId?.trim();
   const seat = seatId?.trim();
   if (!session) {
@@ -111,6 +128,7 @@ function execBrickContext(
   timeoutMs: number,
   sessionId?: string,
   seatId?: string,
+  atriumOs?: string,
 ): Promise<string | undefined> {
   return new Promise<string | undefined>((resolve) => {
     let child: ReturnType<typeof spawn>;
@@ -126,7 +144,7 @@ function execBrickContext(
         // `process.env` WHOLESALE, realm credential included. There was no error and no warning;
         // the child worked perfectly. This path never reaches `auth-env.ts`'s delete list, so the
         // contract's prefix-strip remedy could not cover it: the list is never consulted here.
-        env: brickContextEnv(sessionId, seatId),
+        env: brickContextEnv(sessionId, seatId, atriumOs),
       });
     } catch (error) {
       warnBrickContext(brickId, `spawn failed: ${describeError(error)}`);

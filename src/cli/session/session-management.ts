@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
+import { isOsCompatLinkInPlace } from "../../acp/atrium-os.js";
 import { ForkCutUnresolvedError } from "../../acp/claude-fork-anchor.js";
 import {
   AcpClient,
@@ -1473,6 +1474,8 @@ export async function createSessionWithClient(
     // buildAgentEnvironment, so a null acpxRecordId only skips ACPX_SESSION_URL
     // on this one spawn — it is set on the next spawn from the persisted record).
     sessionContext: await creationSessionContext(effectiveOptions),
+    // P3a §4.5 (C11) — from the wisdom swap on, a create whose OS primer fails is refused.
+    requireOsPrimer: isOsCompatLinkInPlace(),
   });
 
   try {

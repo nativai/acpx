@@ -183,10 +183,10 @@ test("D3 a provider returning whitespace only contributes nothing, not an empty 
 // The registry ships EMPTY, and the synchronous guard.
 // ---------------------------------------------------------------------------
 
-test("the shipped registry holds exactly the context alarm (brick 4f3fa88c)", () => {
+test("the shipped registry holds exactly the context alarm and the OS notice (4f3fa88c, P3a §4.4)", () => {
   assert.deepEqual(
     turnContextProviders().map((entry) => entry.id),
-    ["context-alarm"],
+    ["context-alarm", "atrium-os-notice"],
   );
 });
 

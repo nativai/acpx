@@ -85,6 +85,11 @@ function toCommandLine(command: string, args: string[] | undefined): string {
 // `buildAgentEnvironment` drops them (brick 1dc24c1c): a terminal command is something the
 // AGENT runs, and the queue owner's own environment can still carry a pre-rule snapshot.
 // Like `PORT`, a request that names one explicitly keeps it.
+//
+// ⚠️ LATENT OS BYPASS (P3a §3.9): this env is acpx's own, so it carries the queue owner's `ATRIUM_OS`
+// and PATH, not the session's — `applyAtriumOsEnvironment` is not applied, because no session context
+// reaches this manager. No deployed adapter calls ACP `terminal/create` (P3a review); wire the session's
+// context through before one does.
 function toEnvObject(env: CreateTerminalRequest["env"]): NodeJS.ProcessEnv {
   const merged: NodeJS.ProcessEnv = { ...process.env };
   delete merged.PORT;

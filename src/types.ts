@@ -398,6 +398,14 @@ export type AcpClientOptions = {
   verbose?: boolean;
   /** One type with the env builder's (P3a §6): a field added there is a field here. */
   sessionContext?: AgentSessionContext;
+  /**
+   * P3a §4.5 (C11 refuse) — set ONLY by the two creates that host an agent conversation
+   * (`createSessionWithClient`, `acpx exec`), to `isOsCompatLinkInPlace()`. When true, a primer that
+   * fails at THIS client's creating render (claude/codex `session/new`, pi's config dir) is retried
+   * once and then the create throws `OsPrimerRequiredError`. Never inferred from `acpxRecordId === ""`:
+   * model-probe and advertisement spawns carry that marker too and must never refuse.
+   */
+  requireOsPrimer?: boolean;
   sessionOptions?: {
     model?: string;
     /**

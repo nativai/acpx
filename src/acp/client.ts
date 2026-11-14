@@ -154,6 +154,17 @@ type CrossCwdForkStage = {
   transform?: (content: Buffer) => Buffer;
 };
 import {
+  armAtriumOsNotice,
+  type AtriumOsOutcome,
+  clearAtriumOsNotice,
+  fallbackNoticeText,
+  formatPrimerErrorStamp,
+  OsPrimerRequiredError,
+  primerErrorReason,
+  primerNoticeText,
+  resolveOsRevision,
+} from "./atrium-os.js";
+import {
   HARNESS_FACTS,
   harnessIdForAgentCommand,
   harnessProvisionsModelCatalogue,
@@ -197,7 +208,7 @@ import {
   formatSessionControlAcpSummary,
   maybeWrapSessionControlError,
 } from "./session-control-errors.js";
-import { resolveSessionPrimer } from "./session-primer.js";
+import { resolveSessionPrimerOutcome } from "./session-primer.js";
 import { TerminalManager } from "./terminal-manager.js";
 import {
   buildTurnContextRequest,
@@ -763,6 +774,21 @@ export type AgentLifecycleSnapshot = {
    * it. Lands as `session_options.served_via_shim`.
    */
   servedViaShim?: boolean;
+  /**
+   * P3a §1.6 — the OS observations of THIS client's latest spawn, landed on `record.metadata` by
+   * `applySnapshotOsObservation`. Per key: a string SETS it, `null` DELETES it, `undefined` leaves it.
+   * Absent before any spawn, so a teardown snapshot of an unspawned client touches nothing.
+   */
+  os?: AgentOsObservation;
+};
+
+export type AgentOsObservation = {
+  /** `atrium_os_revision` — always string-or-null after a spawn. */
+  revision?: string | null;
+  /** `atrium_os_fallback` — the ISO time the stored path was unusable; `null` when it applied. */
+  fallbackAt?: string | null;
+  /** `atrium_os_primer_error` — `undefined` when this spawn rendered no primer (codex resume). */
+  primerError?: string | null;
 };
 
 type ConsoleErrorMethod = typeof console.error;
@@ -1103,6 +1129,12 @@ export class AcpClient {
   private lastKnownPid?: number;
   private lastKnownPidIdentity?: RecordPidIdentity;
   private latestProvisioningWarning?: ProvisioningWarningBreadcrumb;
+  /** P3a — the OS root this client's latest spawn resolved (`applyAtriumOsEnvironment`). */
+  private atriumOsOutcome?: AtriumOsOutcome;
+  /** P3a §1.6 — the latest spawn's OS observations, reported through the lifecycle snapshot. */
+  private osObservation?: AgentOsObservation;
+  /** P3a §4.5 — refuse applies to this client's FIRST creating render only, never to a respawn. */
+  private osPrimerRefuseSpent = false;
   /**
    * The box settings file was rejected on THIS session's most recent spawn
    * (brick 4c272cab / TE F-1). Refreshed at every shim start, so repairing the
@@ -1249,6 +1281,7 @@ export class AcpClient {
         : undefined,
       harnessConfigDir: this.harnessConfigDir,
       piSessionDir: this.piSessionDir,
+      os: this.osObservation ? { ...this.osObservation } : undefined,
       // `undefined` rather than `false` when unset: the write leg is truthy-gated
       // (like provisioningWarning), so a literal `false` here would be
       // indistinguishable from "not shim-served" while still being a value acpx
@@ -1480,7 +1513,11 @@ export class AcpClient {
       (warning) => {
         this.latestProvisioningWarning = warning;
       },
+      (outcome) => {
+        this.atriumOsOutcome = outcome;
+      },
     );
+    await this.observeAtriumOs(spawnOptions.env);
     // ── P0: model POLICY, before any credential or route work (brick 30eb2003) ──
     //
     // ★ THE ENFORCEMENT for "Claude-family models are not available on the
@@ -1588,7 +1625,7 @@ export class AcpClient {
       sessionId: this.resolveConfigDirId(),
       cwd: this.options.cwd,
       primer: composePrimerWithBrickContext(
-        await resolveSessionPrimer(env),
+        await this.renderOsPrimer(env, true),
         await this.resolveBrickContext(),
       ),
       model: this.options.sessionOptions?.model,
@@ -2245,7 +2282,7 @@ export class AcpClient {
     ) {
       return undefined;
     }
-    const primer = await this.resolvePrimerForSpawnEnv();
+    const primer = await this.resolvePrimerForSpawnEnv(true);
     const brickContext = await this.resolveBrickContext();
     return buildPrimerSessionMeta(channel, primer, optionsMeta?.systemPrompt, brickContext);
   }
@@ -2267,7 +2304,7 @@ export class AcpClient {
     if (typeof optionsMeta?.systemPrompt === "string" && optionsMeta.systemPrompt.length > 0) {
       return undefined;
     }
-    const primer = await this.resolvePrimerForSpawnEnv();
+    const primer = await this.resolvePrimerForSpawnEnv(false);
     const brickContext = await this.resolveBrickContext();
     return buildPrimerSessionMeta(channel, primer, optionsMeta?.systemPrompt, brickContext);
   }
@@ -2324,14 +2361,93 @@ export class AcpClient {
    * Skipping the primer instead leaves a warning behind and keeps session
    * creation fail-open, same as any other primer failure.
    */
-  private async resolvePrimerForSpawnEnv(): Promise<string | undefined> {
+  private async resolvePrimerForSpawnEnv(creating: boolean): Promise<string | undefined> {
     if (!this.agentSpawnEnv) {
       process.stderr.write(
         "[acpx] session primer skipped: agent spawn environment unavailable (agent not started); continuing unprimed\n",
       );
       return undefined;
     }
-    return await resolveSessionPrimer(this.agentSpawnEnv);
+    return await this.renderOsPrimer(this.agentSpawnEnv, creating);
+  }
+
+  /**
+   * P3a §1.6 / §4 — the OS bookkeeping of a fresh spawn, run right after its env is built and BEFORE
+   * any primer render of that spawn (so a render's outcome overrides the carry below):
+   * - the revision (§1.3; ≤ 2 s, awaited, so it is in place before any snapshot is read);
+   * - the missing-root fallback (§4.3): stamped, and armed as the next turn's notice;
+   * - the codex carry (§4.2): a primer failure an EARLIER spawn stored re-arms the notice. A spawn that
+   *   renders its own primer clears or replaces it in `renderOsPrimer`.
+   */
+  private async observeAtriumOs(env: NodeJS.ProcessEnv): Promise<void> {
+    const outcome = this.atriumOsOutcome;
+    if (!outcome) {
+      return;
+    }
+    const recordId = env.ACPX_SESSION_RECORD_ID;
+    clearAtriumOsNotice(recordId);
+    this.osObservation = {
+      revision: await resolveOsRevision(outcome.root),
+      fallbackAt: outcome.fallback?.at ?? null,
+    };
+    if (outcome.fallback) {
+      armAtriumOsNotice(
+        recordId,
+        "fallback",
+        fallbackNoticeText(outcome.fallback.missing, outcome.root),
+      );
+    }
+    const stored = this.options.sessionContext?.osPrimerError?.trim();
+    if (stored) {
+      armAtriumOsNotice(
+        recordId,
+        "primer",
+        primerNoticeText(primerErrorReason(stored), outcome.root),
+      );
+    }
+  }
+
+  /**
+   * Render the OS primer in `env` and record how it went (§4.1–§4.2, §4.5). A success clears this
+   * session's primer alarm; a FAILED render stamps it (`atrium_os_primer_error`) and arms the notice.
+   * On this client's first CREATING render with `requireOsPrimer` (the compatibility link is in place)
+   * a failure is retried once, then refused with `OsPrimerRequiredError` — before `session/new` is sent.
+   */
+  private async renderOsPrimer(
+    env: NodeJS.ProcessEnv,
+    creating: boolean,
+  ): Promise<string | undefined> {
+    const refuse = this.takeOsPrimerRefusal(creating);
+    let outcome = await resolveSessionPrimerOutcome(env);
+    if (!outcome.ok && refuse) {
+      outcome = await resolveSessionPrimerOutcome(env);
+    }
+    if (outcome.ok) {
+      this.osObservation = { ...this.osObservation, primerError: null };
+      clearAtriumOsNotice(env.ACPX_SESSION_RECORD_ID, "primer");
+      return outcome.text;
+    }
+    if (refuse) {
+      throw new OsPrimerRequiredError(outcome.reason);
+    }
+    this.recordOsPrimerFailure(env, outcome.reason);
+    return undefined;
+  }
+
+  /** `true` exactly once per client: its first creating render, when `requireOsPrimer` is set. */
+  private takeOsPrimerRefusal(creating: boolean): boolean {
+    if (!creating || this.osPrimerRefuseSpent) {
+      return false;
+    }
+    this.osPrimerRefuseSpent = true;
+    return this.options.requireOsPrimer === true;
+  }
+
+  /** The C11 alarm's two halves: the record stamp (Atrium's badge) and the next turn's notice. */
+  private recordOsPrimerFailure(env: NodeJS.ProcessEnv, reason: string): void {
+    this.osObservation = { ...this.osObservation, primerError: formatPrimerErrorStamp(reason) };
+    const root = this.atriumOsOutcome?.root ?? env.ATRIUM_OS ?? "";
+    armAtriumOsNotice(env.ACPX_SESSION_RECORD_ID, "primer", primerNoticeText(reason, root));
   }
 
   private async resolveBrickContext(): Promise<string | undefined> {
@@ -2345,7 +2461,11 @@ export class AcpClient {
     // (`brickContextEnv`), so the block renders its placeholder — never the spawner's folder.
     // C7: the workspace path is `<brick>/agents/<seat8>/holders/<session8>/`, so the primer's line can only
     // equal $ACPX_AGENT_FOLDER if brick is told the seat the folder was derived from.
-    return await resolveBrickContext(brick, brickContextIdentity(this.options.sessionContext));
+    return await resolveBrickContext(brick, {
+      ...brickContextIdentity(this.options.sessionContext),
+      // P3a §8.3(3): the brick CLI renders its include line for THIS spawn's OS root.
+      atriumOs: this.atriumOsOutcome?.root,
+    });
   }
 
   /**

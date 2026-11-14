@@ -44,7 +44,7 @@ import type { AcpClientOptions } from "../types.js";
 import { commandCarriesAdapterToken } from "./adapter-token.js";
 import { isClaudeFamilyAgent } from "./agent-command.js";
 import { deleteAgentStrippedCredentialEnv } from "./agent-credential-env.js";
-import { appendAgentOsBinToPath } from "./agent-os-bin-path.js";
+import { type AtriumOsOutcome, applyAtriumOsEnvironment } from "./atrium-os.js";
 import { splitCommandLine } from "./client-process.js";
 import { isCodexAcpCommand } from "./codex-compat.js";
 import { harnessIdForAgentCommand } from "./harness-capabilities.js";
@@ -556,6 +556,16 @@ export type AgentSessionContext = {
    */
   principalId?: string | null;
   principalName?: string | null;
+  /**
+   * P3a §1.5 — the session's stored OS choice, the raw `metadata.atrium_os` (absent / `default` = the
+   * box default). `applyAtriumOsEnvironment` resolves it to the spawn's `$ATRIUM_OS` and PATH.
+   */
+  osChoice?: string | null;
+  /**
+   * P3a §4.2 (codex carry) — the record's `metadata.atrium_os_primer_error`: a primer failure stored by
+   * an earlier spawn. A spawn that renders no primer of its own re-arms the OS notice from it.
+   */
+  osPrimerError?: string | null;
 };
 
 /**
@@ -748,6 +758,7 @@ function buildAgentEnvironment(
   lookupOptions?: SubscriptionLookupOptions,
   agentCommand?: string,
   onProvisioningWarning?: ProvisioningWarningHandler,
+  onAtriumOs?: (outcome: AtriumOsOutcome) => void,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   promotePrefixedAuthEnvironment(env);
@@ -1183,7 +1194,11 @@ function buildAgentEnvironment(
   // (checked 2026-10-24, key names only); the strip applies to them by decision anyway — agent
   // API access goes through Cardea, never an ambient variable.
   deleteAgentStrippedCredentialEnv(env);
-  appendAgentOsBinToPath(env);
+  // P3a §3.3 — the session's OS root: `ATRIUM_OS` always written, PATH stripped of every other OS bin
+  // and `<root>/bin` prepended. ⚠️ STAYS THE LAST STEP, after the credential strip (which only deletes
+  // names, so the order between the two is free; PATH and ATRIUM_OS are never credentials).
+  const osOutcome = applyAtriumOsEnvironment(env, sessionContext?.osChoice);
+  onAtriumOs?.(osOutcome);
   return env;
 }
 
@@ -2141,6 +2156,7 @@ export function buildAgentSpawnOptions(
   lookupOptions?: SubscriptionLookupOptions,
   agentCommand?: string,
   onProvisioningWarning?: ProvisioningWarningHandler,
+  onAtriumOs?: (outcome: AtriumOsOutcome) => void,
 ): {
   cwd: string;
   env: NodeJS.ProcessEnv;
@@ -2155,6 +2171,7 @@ export function buildAgentSpawnOptions(
       lookupOptions,
       agentCommand,
       onProvisioningWarning,
+      onAtriumOs,
     ),
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,

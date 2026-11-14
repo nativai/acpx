@@ -60,6 +60,7 @@
  * `requires-mitigation` because it cannot honestly claim neutrality for text it never inspects.
  */
 import { contextAlarmLineForTurnStart } from "../session/context-alarm-detector.js";
+import { takeAtriumOsNotice } from "./atrium-os.js";
 import { harnessIdForAgentCommand, type HarnessId } from "./harness-capabilities.js";
 
 /**
@@ -219,7 +220,25 @@ const contextAlarmProvider: TurnContextProvider = {
   resolve: (request) => contextAlarmLineForTurnStart(request.sessionId),
 };
 
-const SHIPPED_PROVIDERS: readonly TurnContextProvider[] = [contextAlarmProvider];
+/**
+ * P3a §4.4 — THE OS NOTICE: a spawn that fell back from a missing OS root, or whose primer failed (or
+ * carries an earlier failure), arms a one-off `⟦OS-NOTICE⟧`; the next turn that process serves opens
+ * with it, on every harness. Consumed on read, so it is delivered once per spawn.
+ *
+ * `requires-mitigation` like the context alarm: it tells the agent to stop or to load its primer, so
+ * read as the user's words it WOULD change what the agent does. One synchronous map lookup, no I/O,
+ * keyed by the session's own `ACPX_SESSION_RECORD_ID` (set on every turn-serving spawn).
+ */
+const atriumOsNoticeProvider: TurnContextProvider = {
+  id: "atrium-os-notice",
+  attribution: { kind: "requires-mitigation", evidence: `M1e/${TURN_CONTEXT_ENVELOPE_ID}` },
+  resolve: (request) => takeAtriumOsNotice(request.sessionEnv.ACPX_SESSION_RECORD_ID),
+};
+
+const SHIPPED_PROVIDERS: readonly TurnContextProvider[] = [
+  contextAlarmProvider,
+  atriumOsNoticeProvider,
+];
 
 let registeredProviders: readonly TurnContextProvider[] = SHIPPED_PROVIDERS;
 

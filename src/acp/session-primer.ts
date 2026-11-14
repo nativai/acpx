@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { buildSpawnCommandOptions } from "../spawn-command-options.js";
+import { processOsRoot } from "./atrium-os.js";
 
 /**
  * The OS-primer resolver: runs the shared session-context script once per acpx
@@ -10,10 +11,10 @@ import { buildSpawnCommandOptions } from "../spawn-command-options.js";
  * Replaces the Claude-Code `SessionStart` hook, which only reached `claude` and
  * truncated the payload to a saved-to-path preview.
  *
- * The default points at the dynamic `shared/session-context.sh` (host block +
- * agents.md via includeFull.sh), run PER box so the host block stays live. The
- * `ACPX_SESSION_PRIMER_COMMAND` seam mirrors the agent-registry overrides: it
- * lets the fleet relocate the script and lets dev/test point at a marked or
+ * The default points at the dynamic `shared/session-context.sh` of the SESSION's
+ * OS root (`$ATRIUM_OS`, P3a §3.5 — host block + agents.md via includeFull.sh),
+ * run PER box so the host block stays live. The `ACPX_SESSION_PRIMER_COMMAND`
+ * seam (developers only) wins over it: it lets dev/test point at a marked or
  * fast primer without an acpx release.
  *
  * The primer is rendered in the SESSION's environment — the caller passes the
@@ -27,8 +28,7 @@ import { buildSpawnCommandOptions } from "../spawn-command-options.js";
  * Passing the whole child env — not a copied subset of "the vars today's guards
  * read" — is what keeps a newly added guard correct without a change here.
  */
-const DEFAULT_SESSION_PRIMER_COMMAND =
-  "/wisdom/Operating System/Harnesses/shared/session-context.sh";
+const SESSION_PRIMER_SCRIPT = "Harnesses/shared/session-context.sh";
 
 const SESSION_PRIMER_TIMEOUT_MS = 5_000;
 
@@ -68,12 +68,19 @@ function buildPrimerMemoKey(command: string, env: NodeJS.ProcessEnv): string {
     .digest("hex");
 }
 
-function resolveSessionPrimerCommand(): string {
-  const override = process.env.ACPX_SESSION_PRIMER_COMMAND;
+/**
+ * P3a §3.5 — read from the SESSION env: an explicit `ACPX_SESSION_PRIMER_COMMAND` wins (it is not
+ * stripped from agent envs, so a stack's children keep it); else the session's own OS root. Every
+ * spawn env carries `ATRIUM_OS` (`applyAtriumOsEnvironment`); a bare env falls back through
+ * `processOsRoot`, which with nothing set is `/wisdom/Operating System` — the command is then
+ * byte-identical to the pre-P3a literal.
+ */
+export function resolveSessionPrimerCommand(sessionEnv: NodeJS.ProcessEnv): string {
+  const override = sessionEnv.ACPX_SESSION_PRIMER_COMMAND;
   if (typeof override === "string" && override.trim().length > 0) {
     return override;
   }
-  return DEFAULT_SESSION_PRIMER_COMMAND;
+  return `${processOsRoot(sessionEnv)}/${SESSION_PRIMER_SCRIPT}`;
 }
 
 function warnPrimer(command: string, reason: string): void {
@@ -101,21 +108,35 @@ function warnPrimer(command: string, reason: string): void {
 export async function resolveSessionPrimer(
   sessionEnv: NodeJS.ProcessEnv,
 ): Promise<string | undefined> {
-  const command = resolveSessionPrimerCommand();
-  const key = buildPrimerMemoKey(command, sessionEnv);
-  if (memoizedPrimerKey === key) {
-    return memoizedPrimer;
-  }
-  const primer = await execSessionPrimer(command, sessionEnv);
-  if (primer !== undefined) {
-    memoizedPrimer = primer;
-    memoizedPrimerKey = key;
-  }
-  return primer;
+  const outcome = await resolveSessionPrimerOutcome(sessionEnv);
+  return outcome.ok ? outcome.text : undefined;
 }
 
-function execSessionPrimer(command: string, env: NodeJS.ProcessEnv): Promise<string | undefined> {
-  return new Promise<string | undefined>((resolve) => {
+/**
+ * A primer RENDER and how it went (P3a §4.1): `{ok:false, reason}` is a FAILED render — spawn error,
+ * non-zero exit, timeout or empty output — and `reason` is the `warnPrimer` text. A primer that is
+ * deliberately absent (channel `none`, a human `--system-prompt`) never reaches this function.
+ */
+export type SessionPrimerOutcome = { ok: true; text: string } | { ok: false; reason: string };
+
+export async function resolveSessionPrimerOutcome(
+  sessionEnv: NodeJS.ProcessEnv,
+): Promise<SessionPrimerOutcome> {
+  const command = resolveSessionPrimerCommand(sessionEnv);
+  const key = buildPrimerMemoKey(command, sessionEnv);
+  if (memoizedPrimerKey === key && memoizedPrimer !== undefined) {
+    return { ok: true, text: memoizedPrimer };
+  }
+  const outcome = await execSessionPrimer(command, sessionEnv);
+  if (outcome.ok) {
+    memoizedPrimer = outcome.text;
+    memoizedPrimerKey = key;
+  }
+  return outcome;
+}
+
+function execSessionPrimer(command: string, env: NodeJS.ProcessEnv): Promise<SessionPrimerOutcome> {
+  return new Promise<SessionPrimerOutcome>((resolve) => {
     let child: ReturnType<typeof spawn>;
     try {
       // The primer command is a single executable path (the default carries
@@ -130,15 +151,16 @@ function execSessionPrimer(command: string, env: NodeJS.ProcessEnv): Promise<str
         }),
       );
     } catch (error) {
-      warnPrimer(command, `spawn failed: ${describeError(error)}`);
-      resolve(undefined);
+      const reason = `spawn failed: ${describeError(error)}`;
+      warnPrimer(command, reason);
+      resolve({ ok: false, reason });
       return;
     }
 
     let stdout = "";
     let stderr = "";
     let settled = false;
-    const finish = (value: string | undefined) => {
+    const finish = (value: SessionPrimerOutcome) => {
       if (settled) {
         return;
       }
@@ -149,11 +171,16 @@ function execSessionPrimer(command: string, env: NodeJS.ProcessEnv): Promise<str
       child.stderr?.removeAllListeners();
       resolve(value);
     };
+    const fail = (reason: string) => {
+      if (!settled) {
+        warnPrimer(command, reason);
+      }
+      finish({ ok: false, reason });
+    };
 
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
-      warnPrimer(command, `timed out after ${SESSION_PRIMER_TIMEOUT_MS}ms`);
-      finish(undefined);
+      fail(`timed out after ${SESSION_PRIMER_TIMEOUT_MS}ms`);
     }, SESSION_PRIMER_TIMEOUT_MS);
 
     child.stdout?.setEncoding("utf8");
@@ -165,22 +192,19 @@ function execSessionPrimer(command: string, env: NodeJS.ProcessEnv): Promise<str
       stderr += chunk;
     });
     child.once("error", (error) => {
-      warnPrimer(command, `exec error: ${describeError(error)}`);
-      finish(undefined);
+      fail(`exec error: ${describeError(error)}`);
     });
     child.once("close", (code) => {
       if (code !== 0) {
         const tail = stderr.trim();
-        warnPrimer(command, `exited with code ${code ?? "null"}${tail ? `: ${tail}` : ""}`);
-        finish(undefined);
+        fail(`exited with code ${code ?? "null"}${tail ? `: ${tail}` : ""}`);
         return;
       }
       if (stdout.trim().length === 0) {
-        warnPrimer(command, "produced empty output");
-        finish(undefined);
+        fail("produced empty output");
         return;
       }
-      finish(stdout);
+      finish({ ok: true, text: stdout });
     });
   });
 }

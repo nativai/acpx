@@ -1,3 +1,4 @@
+import { resolveOsChoiceForCreate } from "../acp/atrium-os.js";
 import type { AgentSessionContext } from "../acp/auth-env.js";
 import { resolveAndEnsureAgentFolder } from "../cli/session/agent-folder.js";
 import { resolveSessionBrickContext } from "../cli/session/brick-link.js";
@@ -48,6 +49,8 @@ export async function sessionContextFromRecord(
     seatOrdinal: record.holderOrdinal ?? null,
     parentSeatId: record.parentSeatId ?? null,
     ...principalContextFields(record.metadata),
+    osChoice: record.metadata?.atrium_os ?? null,
+    osPrimerError: record.metadata?.atrium_os_primer_error ?? null,
   };
 }
 
@@ -88,12 +91,31 @@ export async function creationSessionContext(
     agentFolder: null,
     subscriptionId: options.sessionOptions?.subscription ?? null,
     profileId: options.sessionOptions?.profile ?? null,
+    // The creation precedence (§2) has already resolved the choice into the metadata the record is
+    // born with, so the creation spawn reads it from there.
+    osChoice: options.metadata?.atrium_os ?? null,
   };
 }
 
-/** `acpx exec`'s context: a one-shot with no record (moved from runtime.ts `runOnce`). */
+/** Creation rules 4/5 for a record-less one-shot (it never refuses: no `--os` on exec). */
+function execOsChoice(): string | null {
+  const os = resolveOsChoiceForCreate({ kind: "exec" });
+  if (!os.ok) {
+    return null;
+  }
+  for (const warning of os.warnings) {
+    process.stderr.write(`${warning}\n`);
+  }
+  return os.choice ?? null;
+}
+
+/**
+ * `acpx exec`'s context: a one-shot with no record (moved from runtime.ts `runOnce`). It has no
+ * parent and no source, so its OS is creation rules 4/5 — the caller's `$ATRIUM_OS`, else default.
+ */
 export function execSessionContext(options: RunOnceOptions): AgentSessionContext {
   return {
+    osChoice: execOsChoice(),
     acpxRecordId: "",
     sessionName: null,
     subscriptionId: options.sessionOptions?.subscription ?? null,
