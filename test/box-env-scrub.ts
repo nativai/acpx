@@ -55,6 +55,15 @@ export const SESSION_IDENTITY_ENV = ["ACPX_SESSION_RECORD_ID"] as const;
 export const SESSION_ROOT_ENV = "ACPX_SESSION_ROOT";
 
 /**
+ * P3a — the OS-root knobs. From P3a on every agent shell carries `ATRIUM_OS` (its session's root), and
+ * from P4a every box process carries `ATRIUM_OS_DEFAULT`; a dev-slot stack still sets the retired
+ * `ACPX_AGENT_OS_BIN`. An agent on an explicit OS running this suite would otherwise have creation
+ * rule 4 store ITS root on every session a CLI row creates, and the box default would follow the box.
+ * Every OS row sets what it needs explicitly, so the suite starts with all three absent.
+ */
+export const OS_ROOT_ENV = ["ATRIUM_OS", "ATRIUM_OS_DEFAULT", "ACPX_AGENT_OS_BIN"] as const;
+
+/**
  * brick ecfb0461 — THE SUITE MUST NEVER SEND THE BOX'S OpenRouter KEY OVER THE WIRE.
  *
  * Same family as the two scrubs above (make the starting environment a property of
@@ -115,6 +124,7 @@ export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env
     if (
       name.startsWith(BOX_PI_ENV_PREFIX) ||
       (SESSION_IDENTITY_ENV as readonly string[]).includes(name) ||
+      (OS_ROOT_ENV as readonly string[]).includes(name) ||
       name === SESSION_ROOT_ENV
     ) {
       delete env[name];

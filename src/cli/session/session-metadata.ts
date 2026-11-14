@@ -1,5 +1,8 @@
 import { InvalidArgumentError } from "commander";
-import { PRINCIPAL_METADATA_PREFIX } from "../../session/persistence/principal.js";
+import {
+  ATRIUM_OS_METADATA_PREFIX,
+  PRINCIPAL_METADATA_PREFIX,
+} from "../../session/persistence/principal.js";
 import type { SessionRecord } from "../../types.js";
 import { isBrickUuid } from "./brick-link.js";
 
@@ -15,6 +18,13 @@ export function validateSessionMetadataValue(key: string, value: string): string
   if (key.startsWith(PRINCIPAL_METADATA_PREFIX)) {
     throw new InvalidArgumentError(
       `${key} is recorded once, when the session is created, and cannot be changed afterwards`,
+    );
+  }
+  // P3a §5: the OS choice has ONE writer after creation, so its validation cannot be bypassed, and the
+  // three observation keys are acpx-owned (the lifecycle snapshot writes them).
+  if (key.startsWith(ATRIUM_OS_METADATA_PREFIX)) {
+    throw new InvalidArgumentError(
+      `${key} is not set with set-metadata; use acpx sessions set-os <session> <default|path>`,
     );
   }
   const trimmed = value.trim();

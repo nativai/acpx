@@ -13,7 +13,7 @@ import type { SessionRecord } from "../../types.js";
 import { modelSetMethodKnownUnsupported } from "../mode-preference.js";
 import { isIndexLockTimeoutError, withSessionIndexLock } from "./index-lock.js";
 import { parseSessionRecord } from "./parse.js";
-import { PRINCIPAL_METADATA_PREFIX, stringEntriesWithPrefix } from "./principal.js";
+import { atriumOsFrom, PRINCIPAL_METADATA_PREFIX, stringEntriesWithPrefix } from "./principal.js";
 import {
   brickFieldsToIndexEntry,
   parseBrickFieldsFromIndexEntry,
@@ -204,6 +204,16 @@ export type SessionIndexEntry = {
    * session, with typecheck and build green. `test/session-index-principal.test.ts` is the guard.
    */
   principal?: Record<string, string>;
+  /**
+   * P3a §1.7 — the session's OS choice and its observations: exactly the record's `metadata` entries
+   * whose key starts with `atrium_os` (`atrium_os`, `atrium_os_revision`, `atrium_os_fallback`,
+   * `atrium_os_primer_error`), keys and string values VERBATIM. Absent for a default session with no
+   * observation. Atrium's chat header reads it on the hot path.
+   *
+   * ⚠️ BOTH index legs carry it, exactly as `principal` does: missing from the parse leg, it is stripped
+   * from every untouched entry on the next rewrite of any other session. `test/session-index-atrium-os.test.ts`.
+   */
+  atriumOs?: Record<string, string>;
   /**
    * UMQ K7 (CONCEPTION §6.3) — `true` while `record.acpx.sleeping` is set: the session exists but no
    * agent has run, `acpSessionId` is `""`. Absent = not sleeping. ⚠️ BOTH index legs carry it
@@ -605,6 +615,8 @@ function parseIndexEntry(raw: unknown): SessionIndexEntry | undefined {
     startedBy: startedByFrom(record.startedBy),
     // BOTH index legs: the projection leg is `toSessionIndexEntry`'s `principalFrom(metadata)`.
     principal: principalFrom(record.principal),
+    // BOTH index legs (P3a §1.7): the projection leg is `toSessionIndexEntry`'s `atriumOsFrom(metadata)`.
+    atriumOs: atriumOsFrom(record.atriumOs),
     // BOTH index legs (UMQ K7): the projection leg is `toSessionIndexEntry`'s `sleeping` / `createdBy`.
     sleeping: record.sleeping === true ? true : undefined,
     createdBy: createdByFromIndexEntry(record.createdBy),
@@ -790,6 +802,8 @@ export function toSessionIndexEntry(record: SessionRecord, fileName: string): Se
     startedBy: startedByFrom(metadata),
     // BOTH index legs: the parse leg is `parseIndexEntry`'s `principal`.
     principal: principalFrom(metadata),
+    // BOTH index legs (P3a §1.7): the parse leg is `parseIndexEntry`'s `atriumOs`.
+    atriumOs: atriumOsFrom(metadata),
     // BOTH index legs (UMQ K7): the parse leg is `parseIndexEntry`'s `sleeping` / `createdBy`.
     sleeping: acpx?.sleeping ? true : undefined,
     createdBy: createdByOf(

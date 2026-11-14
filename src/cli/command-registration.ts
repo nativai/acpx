@@ -29,6 +29,7 @@ import {
   handleSessionsSetMetadata,
   handleSessionsActivate,
   handleSessionsHandover,
+  handleSessionsSetOs,
   handleSessionsSetParent,
   handleSessionsShow,
   handleSessionsTemplate,
@@ -501,6 +502,13 @@ export function registerSessionsCommand(
     )
     .option("--no-brick", "Do not link, and do not inherit the spawning session's brick.")
     .option(
+      "--os <default|path>",
+      "The session's Operating System: `default` (follows this box) or an OS root under /workspace/ " +
+        "or /opt/atrium-os/ (a directory holding agents.md). Without it: a successor, fork or " +
+        "by-the-way takes its source's; a child its parent's; otherwise $ATRIUM_OS, else default.",
+      (value: string) => parseNonEmptyValue("OS", value),
+    )
+    .option(
       "--from-template <id>",
       "Instantiate from a saved template: an acpx record id, ACP session id or unique suffix; a " +
         "machine-wide template name (`reviewer`); or a person's template (`<handle>/<base>`, e.g. " +
@@ -655,6 +663,13 @@ Closing your OWN session (run from inside it, e.g. --seat "$ACPX_SEAT_URL"):
       (value: string) => parseNonEmptyValue("Brick ref", value),
     )
     .option("--no-brick", "Do not link, and do not inherit the spawning session's brick.")
+    .option(
+      "--os <default|path>",
+      "The session's Operating System: `default` (follows this box) or an OS root under /workspace/ " +
+        "or /opt/atrium-os/ (a directory holding agents.md). Without it: a successor, fork or " +
+        "by-the-way takes its source's; a child its parent's; otherwise $ATRIUM_OS, else default.",
+      (value: string) => parseNonEmptyValue("OS", value),
+    )
     .option("--ephemeral", "Mark the copy as a by-the-way ephemeral side-thread")
     .option(
       "--prompt <text>",
@@ -761,6 +776,31 @@ Closing your OWN session (run from inside it, e.g. --seat "$ACPX_SEAT_URL"):
   ) {
     await handleSessionsSetMetadata(explicitAgentName, key, value, flags, this, config);
   });
+
+  sessionsCommand
+    .command("set-os")
+    .description(
+      "Set a session's Operating System in place — `default` (follows this box) or an OS root under " +
+        "/workspace/ or /opt/atrium-os/. No agent connection, no restart: it takes effect at the " +
+        "session's next agent start (codex keeps the primer it was created with)",
+    )
+    .argument(
+      "<session>",
+      "acpx record id, ACP session id, unique suffix, or acpx-ui ?session= URL (never a name)",
+      (value: string) => parseNonEmptyValue("Session", value),
+    )
+    .argument("<choice>", "`default` or an OS root path", (value: string) =>
+      parseNonEmptyValue("OS choice", value),
+    )
+    .option("--dry-run", "Validate and show the change; write nothing")
+    .action(async function (
+      this: Command,
+      session: string,
+      choice: string,
+      flags: { dryRun?: boolean },
+    ) {
+      await handleSessionsSetOs(session, choice, flags, this, config);
+    });
 
   sessionsCommand
     .command("set-parent")

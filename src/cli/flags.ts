@@ -121,6 +121,8 @@ export type SessionsNewFlags = {
   from?: string;
   metadata?: Record<string, string>;
   brick?: string | false;
+  /** `--os <default|path>` (P3a §2.1 rule 1) — the session's OS choice, validated at create. */
+  os?: string;
   fromTemplate?: string;
   // The new session's FIRST TURN (brick b40a9a5d). Commander couples `--prompt <text>`
   // and `--no-prompt` onto this one property:
@@ -158,6 +160,8 @@ export type SessionsCopyFlags = {
   parentSeat?: string;
   metadata?: Record<string, string>;
   brick?: string | false;
+  /** `--os <default|path>` (P3a §2.1 rule 1); also carried from `sessions new --from-template`. */
+  os?: string;
   ephemeral?: boolean;
   prompt?: string;
   promptFile?: string;

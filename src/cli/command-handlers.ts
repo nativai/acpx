@@ -2,6 +2,13 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { Command, InvalidArgumentError } from "commander";
 import { acpAdapterKind, resolveClaudeDefaultDisallowedTools } from "../acp/agent-command.js";
+import {
+  ATRIUM_OS_KEY,
+  normaliseStoredChoice,
+  type OsCreateInput,
+  resolveOsChoiceForCreate,
+  validateOsChoice,
+} from "../acp/atrium-os.js";
 import { resolveAcpxUiBaseUrl } from "../acp/auth-env.js";
 import { isLegacyZedCodexAcpInvocation } from "../acp/codex-compat.js";
 import { exitCodeForOutputErrorCode, normalizeOutputError } from "../acp/error-normalization.js";
@@ -903,6 +910,11 @@ type ResolvedParentSession = {
    * absent for a cross-box parent whose record is not here. Read only by `withRecordedPrincipal`.
    */
   principal?: Record<string, string>;
+  /**
+   * P3a §2.1 rule 3 — the parent's stored OS choice: `null` for a LOCAL record that stores none
+   * (= default), absent for a cross-box parent whose record is not here (rule 4 then applies).
+   */
+  os?: string | null;
 };
 
 // Snapshot the parent record's inheritable fields. Agent-type + model + effort
@@ -926,7 +938,86 @@ async function parentInheritableFields(parent: SessionRecord): Promise<ResolvedP
     effort: parent.acpx?.desired_config_options?.effort,
     outputStyle: sessionOptions?.output_style,
     principal: principalEntriesOf(parent.metadata) ?? {},
+    os: parent.metadata?.[ATRIUM_OS_KEY] ?? null,
   };
+}
+
+/**
+ * P3a §2 — fold the creation precedence (`resolveOsChoiceForCreate`) into a create's metadata:
+ * `atrium_os` is SET to the result, or ABSENT for default. Every caller-supplied `atrium_os*` key is
+ * dropped first — `--metadata atrium_os=…` would bypass validation, and the observation keys are
+ * acpx-owned (§5). A `--os` refusal throws `InvalidArgumentError` (exit 2) before anything is created;
+ * the rule-4 and template notes go to stderr.
+ */
+function withOsChoice(
+  metadata: Record<string, string> | undefined,
+  input: OsCreateInput,
+): Record<string, string> | undefined {
+  const resolution = resolveOsChoiceForCreate(input);
+  if (!resolution.ok) {
+    throw new InvalidArgumentError(resolution.reason);
+  }
+  for (const warning of resolution.warnings) {
+    process.stderr.write(`${warning}\n`);
+  }
+  const next: Record<string, string> = {};
+  for (const [key, value] of Object.entries(metadata ?? {})) {
+    if (!key.startsWith(ATRIUM_OS_KEY)) {
+      next[key] = value;
+    }
+  }
+  if (resolution.choice !== undefined) {
+    next[ATRIUM_OS_KEY] = resolution.choice;
+  }
+  return Object.keys(next).length > 0 ? next : undefined;
+}
+
+/** A `sessions new`'s precedence input (§2.2): `--from` is a successor (rule 2), else the caller (rule 3). */
+function newSessionOsInput(
+  flags: SessionsNewFlags,
+  from: SessionRecord | undefined,
+  inherit: ResolvedParentSession | undefined,
+): OsCreateInput {
+  return from
+    ? {
+        explicit: flags.os,
+        kind: "successor",
+        sourceChoice: from.metadata?.[ATRIUM_OS_KEY] ?? null,
+      }
+    : { explicit: flags.os, kind: "plain", parentChoice: inherit?.os };
+}
+
+/** §2.1: a template copy ⇔ `--from-template`, a `template_source` marker, or a template-record source. */
+function isTemplateCopy(
+  flags: SessionsCopyFlags,
+  source: SessionRecord,
+  requireTemplate: boolean,
+): boolean {
+  return (
+    requireTemplate || flags.metadata?.template_source !== undefined || isTemplateRecord(source)
+  );
+}
+
+/**
+ * A copy's precedence input (§2.2): a template copy takes the CALLER (rule 3) and is checked against the
+ * template's own choice (m1); a fork / copy / by-the-way takes the SOURCE (rule 2).
+ */
+function copyOsInput(
+  flags: SessionsCopyFlags,
+  source: SessionRecord,
+  caller: ResolvedParentSession | undefined,
+  requireTemplate: boolean,
+): OsCreateInput {
+  const sourceChoice = source.metadata?.[ATRIUM_OS_KEY] ?? null;
+  if (isTemplateCopy(flags, source, requireTemplate)) {
+    return {
+      explicit: flags.os,
+      kind: "template",
+      parentChoice: caller?.os,
+      template: { id: source.acpxRecordId, choice: sourceChoice },
+    };
+  }
+  return { explicit: flags.os, kind: flags.ephemeral === true ? "byway" : "copy", sourceChoice };
 }
 
 /**
@@ -1270,6 +1361,8 @@ function buildSessionStartOptions(params: {
    * (brick 509d3884 O1, X-1): the seat's first holder, whose answer the new holder copies (C8.2 rule 3)
    * instead of the caller's or a bare shell's `none`. Absent when rule 2 (`--no-parent`) applies. */
   seatJoin?: { firstHolder: PrincipalCreator | undefined };
+  /** `flags.metadata` with the OS precedence folded in (`withOsChoice`). */
+  osMetadata: Record<string, string> | undefined;
 }): Parameters<SessionModule["createSession"]>[0] {
   return {
     agentCommand: params.agent.agentCommand,
@@ -1307,13 +1400,15 @@ function buildSessionStartOptions(params: {
     // brick b0968426 (C8.3): the principal is the CREATOR's — the spawning caller, or the old session under
     // `--from` (a handover successor answers its seat's principal) — resolved as `params.inherit`. Into an
     // existing seat with no `--from` the creator is the seat's first holder (C8.2 rule 3; brick 509d3884 O1).
+    // P3a §2 — `params.osMetadata` is the metadata with the creation precedence already folded in
+    // (`withOsChoice`, computed by the caller BEFORE anything is created, so a `--os` refusal creates nothing).
     metadata: recordPrincipal(
       withInheritedBrick(
         applyBrickFlag(
           // §5.8 carry rule: a `--from` / handover successor continues in the old session's worktree.
           params.from
-            ? withInheritedWorktree(params.flags.metadata, params.from.metadata)
-            : params.flags.metadata,
+            ? withInheritedWorktree(params.osMetadata, params.from.metadata)
+            : params.osMetadata,
           params.resolvedBrick,
         ),
         params.inherit?.brick,
@@ -3797,6 +3892,7 @@ function templateCopyFlags(flags: SessionsNewFlags, templateId: string): Session
     // spawned by slug records the concrete version it actually came from.
     metadata: { ...flags.metadata, template_source: templateId },
     brick: flags.brick,
+    os: flags.os,
     parentId: flags.parentId,
     parentSessionUrl: flags.parentSessionUrl,
     parentSeat: flags.parentSeat,
@@ -3938,6 +4034,8 @@ async function createSessionFromNewFlags(
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   // Brick 06b01b6b — an unknown `--from` refuses here, before anything is created.
   const { from, parent, inherit, spawnedBySessionId } = await resolveNewSessionLineage(flags);
+  // P3a §2 — the OS precedence, and the `--os` refusal, before anything is created.
+  const osMetadata = withOsChoice(flags.metadata, newSessionOsInput(flags, from, inherit));
   const joining = seatToJoin(flags, from);
   if (flags.favorite === true && joining !== undefined) {
     throw new InvalidArgumentError(favoriteOnJoinMessage(joining));
@@ -4031,6 +4129,7 @@ async function createSessionFromNewFlags(
         resolvedBrick,
         resolvedBrickValidated,
         seatJoin,
+        osMetadata,
       }),
     ),
   );
@@ -4342,6 +4441,11 @@ async function runSessionCopy(
   // /fork origin (forkFromSessionId) — the "both edges" write. With no parent
   // context the `?.` guards omit both fields → byte-identical to today.
   const { caller, parent, spawnedBySessionId } = await resolveCopyLineage(flags);
+  // P3a §2 — resolved (and `--os` validated) before the admission and the create.
+  const osMetadata = withOsChoice(
+    copyMetadata(flags, source, forkAtMessageIndex, forkAtLogIndex, requireTemplate),
+    copyOsInput(flags, source, caller, requireTemplate),
+  );
   const { value: resolvedBrick, validated: resolvedBrickValidated } = await resolveBrickFlagValue(
     flags.brick,
   );
@@ -4375,10 +4479,7 @@ async function runSessionCopy(
       // `source` is deliberately not an argument of `withRecordedPrincipal`.
       metadata: withRecordedPrincipal(
         withInheritedBrick(
-          applyBrickFlag(
-            copyMetadata(flags, source, forkAtMessageIndex, forkAtLogIndex, requireTemplate),
-            resolvedBrick,
-          ),
+          applyBrickFlag(osMetadata, resolvedBrick),
           caller?.brick, // spawn-parent brick (byway via --parent-id) — KEEP; the CALLER's under --no-parent
           resolvedBrick === false,
         ),
@@ -6129,6 +6230,76 @@ async function refuseUnlessActiveHolder(
 function seatAddressFor(seatId: string): string {
   const base = resolveAcpxUiBaseUrl(process.env)?.replace(/\/+$/, "");
   return base ? `${base}/?seat=${seatId}` : seatId;
+}
+
+/** The line `set-os` prints, verbatim from v5 §3 row 12. */
+const SET_OS_EFFECT_NOTE =
+  "takes effect at the session's next agent start; codex keeps the primer it was created with (its commands and PATH follow).";
+
+/**
+ * `acpx sessions set-os <session> <default|path>` (P3a §5): the ONE writer of a session's stored OS
+ * choice after creation. Validated like `--os` (a refusal is exit 2 and writes nothing), written in
+ * place with no agent connection, and the live owner is NOT restarted — the next spawn reads the new
+ * value through the context builder. `default` DELETES `atrium_os`. Addressed by id or `?session=` URL,
+ * never by a name.
+ */
+export async function handleSessionsSetOs(
+  session: string,
+  choice: string,
+  flags: { dryRun?: boolean },
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const validated = validateOsChoice(choice);
+  if (!validated.ok) {
+    throw new InvalidArgumentError(`set-os ${choice}: ${validated.reason}`);
+  }
+  const record = await resolveSessionRecord(parseSessionIdFromUrl(session) ?? session);
+  const change = {
+    previous: normaliseStoredChoice(record.metadata?.[ATRIUM_OS_KEY]) ?? "default",
+    choice: validated.choice ?? "default",
+    dryRun: flags.dryRun === true,
+  };
+  if (!change.dryRun) {
+    await writeOsChoice(record, validated.choice);
+  }
+  printSetOsResult(record.acpxRecordId, change, globalFlags.format);
+}
+
+/**
+ * In place, never a copy of the record: the parse-time metadata baseline is keyed on THIS object, and it
+ * is what lets the per-key merge apply the `default` DELETE against the file on disk.
+ */
+async function writeOsChoice(record: SessionRecord, choice: string | undefined): Promise<void> {
+  const metadata: Record<string, string> = { ...record.metadata };
+  if (choice === undefined) {
+    delete metadata[ATRIUM_OS_KEY];
+  } else {
+    metadata[ATRIUM_OS_KEY] = choice;
+  }
+  record.metadata = Object.keys(metadata).length > 0 ? metadata : undefined;
+  await writeSessionRecord(record);
+}
+
+function printSetOsResult(
+  acpxRecordId: string,
+  change: { previous: string; choice: string; dryRun: boolean },
+  format: OutputFormat,
+): void {
+  const json = {
+    acpxRecordId,
+    previous: change.previous,
+    choice: change.choice,
+    ...(change.dryRun ? { dryRun: true } : {}),
+  };
+  if (emitJsonResult(format, json) || format === "quiet") {
+    return;
+  }
+  const verb = change.dryRun ? "would set" : "set";
+  process.stdout.write(
+    `${acpxRecordId}: OS ${verb} ${change.previous} -> ${change.choice}\n${SET_OS_EFFECT_NOTE}\n`,
+  );
 }
 
 export async function handleSessionsSetParent(

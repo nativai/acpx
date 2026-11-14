@@ -56,6 +56,17 @@ export function stringEntriesWithPrefix(
   return Object.keys(picked).length > 0 ? picked : undefined;
 }
 
+/**
+ * P3a §1.7 — the per-session OS keys (`atrium_os`, `atrium_os_revision`, `atrium_os_fallback`,
+ * `atrium_os_primer_error`) share this prefix; the index entry projects them as `atriumOs`, verbatim.
+ */
+export const ATRIUM_OS_METADATA_PREFIX = "atrium_os";
+
+/** The record's `atrium_os*` metadata, verbatim; undefined when it carries none (the default session). */
+export function atriumOsFrom(source: unknown): Record<string, string> | undefined {
+  return stringEntriesWithPrefix(source, ATRIUM_OS_METADATA_PREFIX);
+}
+
 /** The record's `principal_*` metadata, verbatim; undefined when it carries none. */
 export function principalEntriesOf(metadata: unknown): Record<string, string> | undefined {
   return stringEntriesWithPrefix(metadata, PRINCIPAL_METADATA_PREFIX);

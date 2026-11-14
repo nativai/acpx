@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { ATRIUM_OS_KEY, resolveOsChoiceForCreate } from "../acp/atrium-os.js";
 import type { AcpClient } from "../acp/client.js";
 import { InterruptedError, TimeoutError, withInterrupt, withTimeout } from "../async-control.js";
 import { resolveSessionRoot } from "../config/session-root.js";
@@ -1086,6 +1087,8 @@ export class FlowRunner {
       timeoutMs,
       verbose: this.verbose,
       sessionOptions: this.sessionOptions,
+      // P3a §2.2 — a flow session has no parent and no source: creation rules 4/5.
+      metadata: flowSessionOsMetadata(),
     });
 
     const binding: FlowSessionBinding = {
@@ -1293,4 +1296,16 @@ export class FlowRunner {
       },
     };
   }
+}
+
+/** P3a §2.2 — a flow-created session's OS: the runner's `$ATRIUM_OS` (rule 4), else default. */
+function flowSessionOsMetadata(): Record<string, string> | undefined {
+  const os = resolveOsChoiceForCreate({ kind: "flow" });
+  if (!os.ok) {
+    return undefined;
+  }
+  for (const warning of os.warnings) {
+    process.stderr.write(`${warning}\n`);
+  }
+  return os.choice === undefined ? undefined : { [ATRIUM_OS_KEY]: os.choice };
 }

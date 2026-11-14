@@ -69,6 +69,20 @@ test("c2df657e: the scrub removes ACPX_SESSION_RECORD_ID (product-set session id
   ]);
 });
 
+test("P3a: the scrub removes the OS-root knobs (ATRIUM_OS, ATRIUM_OS_DEFAULT, ACPX_AGENT_OS_BIN)", () => {
+  const env: NodeJS.ProcessEnv = {
+    ATRIUM_OS: "/workspace/projects/os/wt",
+    ATRIUM_OS_DEFAULT: "/opt/atrium-os/current",
+    ACPX_AGENT_OS_BIN: "/r/os/Operating System/bin",
+    ATRIUM_OS_STATUS_FILE: "/kept",
+    HOME: "/home/node",
+  };
+  const removed = scrubBoxHarnessEnvOverrides(env);
+  assert.deepEqual(removed, ["ACPX_AGENT_OS_BIN", "ATRIUM_OS", "ATRIUM_OS_DEFAULT"]);
+  // NEGATIVE: a name that merely shares the prefix is left alone.
+  assert.equal(env.ATRIUM_OS_STATUS_FILE, "/kept");
+});
+
 test("45917618: the scrub removes ACPX_SESSION_ROOT (a rig's session-root seam), even when empty", () => {
   for (const value of ["/workspace", ""]) {
     const env: NodeJS.ProcessEnv = {
