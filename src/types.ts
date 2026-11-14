@@ -14,7 +14,7 @@ import type { CostUnit, SessionCostFigure } from "./models/cost-provenance.js";
 import type { ReapReport } from "./process-tree-reap.js";
 import type { DepthProjection } from "./session/depth-projection.js";
 export type { McpServer, SessionNotification } from "@agentclientprotocol/sdk";
-import type { EffectiveAccountMetadata } from "./acp/auth-env.js";
+import type { AgentSessionContext, EffectiveAccountMetadata } from "./acp/auth-env.js";
 import type { LastTurnProviderBreadcrumb } from "./acp/openrouter-attribution.js";
 import type { RoutingPolicyWarningBreadcrumb } from "./acp/openrouter-provider-policy.js";
 import type { RecordPidIdentity } from "./process-identity.js";
@@ -396,37 +396,8 @@ export type AcpClientOptions = {
   terminal?: boolean;
   suppressSdkConsoleErrors?: boolean;
   verbose?: boolean;
-  sessionContext?: {
-    acpxRecordId: string;
-    sessionName?: string | null;
-    parentSessionId?: string | null;
-    /** Full parent acpx-ui URL (host+id) for cross-machine lineage. (FW-19) */
-    parentSessionUrl?: string | null;
-    brick?: string | null;
-    brickPath?: string | null;
-    agentFolder?: string | null;
-    /** C7 (brick 09197f03) — `<brick>/agents/<seat8>/`, exported as $ACPX_SEAT_FOLDER; null when seat-less. */
-    seatFolder?: string | null;
-    subscriptionId?: string | null;
-    /** Profile id from session_options.profile — takes priority over subscriptionId. */
-    profileId?: string | null;
-    /**
-     * Per-session reasoning effort override for openrouter profiles. Overrides
-     * the profile's default reasoningEffort. Validated against the profile's
-     * valid effort set inside applyProfileAuth.
-     */
-    reasoningEffort?: string | null;
-    /** SEATS (C3/D-B1-9, brick 5ad22d5d) — mirrors AgentSessionContext.seatId
-     * in auth-env.ts (a separately-declared, structurally-identical type). */
-    seatId?: string | null;
-    /** Mirrors AgentSessionContext.parentSeatId in auth-env.ts. */
-    parentSeatId?: string | null;
-    /** eb8b1fa3 — the holder's own ordinal; mirrors AgentSessionContext.seatOrdinal in auth-env.ts. */
-    seatOrdinal?: number | null;
-    /** Mirrors AgentSessionContext.principalId / principalName in auth-env.ts (C8.6). */
-    principalId?: string | null;
-    principalName?: string | null;
-  };
+  /** One type with the env builder's (P3a §6): a field added there is a field here. */
+  sessionContext?: AgentSessionContext;
   sessionOptions?: {
     model?: string;
     /**

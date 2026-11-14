@@ -51,6 +51,7 @@ import {
   selectSubscriptionBeforeTurn,
   stampLastTurnSubscription,
 } from "../../runtime/engine/failover.js";
+import { execSessionContext, sessionContextFromRecord } from "../../session/session-context.js";
 import { assertSessionCwdExists } from "../../session/session-cwd.js";
 import { SpawnLedgerError } from "../../spawn-ledger.js";
 import {
@@ -164,8 +165,6 @@ import {
   writeSessionRecordAtBoundary,
   type PersistedSessionLifecycle,
 } from "../../session/persistence.js";
-import { principalContextFields } from "../../session/persistence/principal.js";
-import { seatDisplayName } from "../../session/seat-display-name.js";
 import { withoutSettingsFlags } from "../../session/settings-binding.js";
 import {
   SESSION_RECORD_SCHEMA,
@@ -218,9 +217,7 @@ import {
 } from "../queue/main-turn-delivery.js";
 import { type QueueOwnerActiveSessionController } from "../queue/owner-turn-controller.js";
 import { isSessionCloseDrainActive } from "../queue/session-close-intent.js";
-import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
 import { buildBatchPrompt } from "./batch-envelope.js";
-import { resolveSessionBrickContext } from "./brick-link.js";
 import type { RunOnceOptions, SessionSendOptions } from "./contracts.js";
 import { createSubagentBoundaryWriteEnqueuer } from "./subagent-boundary-write.js";
 
@@ -4018,10 +4015,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   });
 
   const ownClient = options.client == null;
-  const displayName = options.client == null ? await seatDisplayName(record) : undefined;
-  const { brick, brickPath } = await resolveSessionBrickContext(record);
-  // Only an owned client builds its own adapter env — a supplied one needs no folder created here.
-  const agentFolders = ownClient ? resolveAndEnsureAgentFolder(record, brickPath) : null;
+  // Only an owned client builds its own adapter env — a supplied one needs no context (and no
+  // agent folder created) here, so the builder runs inside the `??` only.
   const client =
     options.client ??
     new AcpClient({
@@ -4036,23 +4031,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       terminal: options.terminal,
       suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
       verbose: options.verbose,
-      sessionContext: {
-        acpxRecordId: record.acpxRecordId,
-        sessionName: displayName ?? null,
-        parentSessionId: record.parentSessionId ?? null,
-        parentSessionUrl: record.parentSessionUrl ?? null,
-        brick,
-        brickPath,
-        agentFolder: agentFolders?.agentFolder ?? null,
-        seatFolder: agentFolders?.seatFolder ?? null,
-        subscriptionId: record.acpx?.session_options?.subscription ?? null,
-        profileId: record.acpx?.session_options?.profile ?? null,
-        reasoningEffort: sessionOptions?.reasoningEffort ?? null,
-        seatId: record.seatId ?? null,
-        seatOrdinal: record.holderOrdinal ?? null,
-        parentSeatId: record.parentSeatId ?? null,
-        ...principalContextFields(record.metadata),
-      },
+      sessionContext: await sessionContextFromRecord(record, {
+        reasoningEffort: sessionOptions?.reasoningEffort,
+      }),
       sessionOptions,
     });
   // brick://7531ef5c: end a previous turn still live on the owner's shared client
@@ -5344,13 +5325,7 @@ export async function runOnce(runOptions: RunOnceOptions): Promise<RunPromptResu
       output.onPermissionEscalation(event);
       options.onPermissionEscalation?.(event);
     },
-    sessionContext: {
-      acpxRecordId: "",
-      sessionName: null,
-      subscriptionId: options.sessionOptions?.subscription ?? null,
-      profileId: options.sessionOptions?.profile ?? null,
-      reasoningEffort: options.sessionOptions?.reasoningEffort ?? null,
-    },
+    sessionContext: execSessionContext(options),
     sessionOptions: options.sessionOptions,
   });
 

@@ -79,8 +79,8 @@ import {
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import { explainSeatRowMissing } from "../../session/seat-backfill.js";
 import { withBrickCache } from "../../session/seat-brick.js";
+import { creationSessionContext } from "../../session/session-context.js";
 import type { SessionRecord, SessionSleepingState } from "../../types.js";
-import { resolveSessionBrickContext } from "./brick-link.js";
 import { DEFAULT_QUEUE_OWNER_TTL_MS } from "./contracts.js";
 import type {
   AgentOutputStyleListOptions,
@@ -1420,45 +1420,6 @@ async function forkSessionRecordWithClient(
       },
     );
   }
-}
-
-// Build the best-effort sessionContext for the first (creation) spawn. The ?? null chains mirror
-// the sessionContext shape in queue-owner-runtime.ts / connected-session.ts (trivial field-mapping).
-// eslint-disable-next-line complexity -- ?? null field-mapping; cannot simplify without losing null safety
-async function creationSessionContext(options: SessionCreateOptions) {
-  // No record yet, so no record seatId — but a JOIN names its seat (`options.seatId`), and
-  // that seat's brick is the one this spawn must carry, not the spawner's ambient value
-  // `options.metadata` holds until `createSessionRecordWithClient` reconciles it.
-  const { brick, brickPath } = await resolveSessionBrickContext({
-    seatId: options.seatId,
-    metadata: options.metadata,
-  });
-  return {
-    acpxRecordId: "",
-    sessionName: normalizeName(options.seatName) ?? null,
-    parentSessionId: options.parentSessionId ?? null,
-    // The full parent URL (real host) reaches the bridge at session/new AND becomes
-    // ACPX_PARENT_SESSION_URL for this spawn. It is also persisted onto the record
-    // (brick://c6e3618b), so later recover/keepwarm spawns reload the real host
-    // instead of re-deriving one against the LOCAL base URL — which silently
-    // re-hosts a cross-box parent onto this box. (FW-19)
-    parentSessionUrl: options.parentSessionUrl ?? null,
-    // SEATS (C3/D-B1-9). This session's OWN seatId is deliberately NOT set
-    // here: it does not exist yet at this point (minted inside
-    // createSessionRecordWithClient's record literal, which runs AFTER this
-    // context is built) — same reasoning as acpxRecordId:"" above; it is set
-    // from the persisted record on the NEXT spawn. The PARENT's seat id is
-    // already resolvable at this point (same-box parent, resolved before
-    // createSession was called — see ResolvedParentSession.seatId in
-    // command-handlers.ts), so it is available even on this transient spawn,
-    // mirroring parentSessionUrl immediately above.
-    parentSeatId: options.parentSeatId ?? null,
-    brick,
-    brickPath,
-    agentFolder: null,
-    subscriptionId: options.sessionOptions?.subscription ?? null,
-    profileId: options.sessionOptions?.profile ?? null,
-  };
 }
 
 export async function createSessionWithClient(

@@ -8,7 +8,7 @@ import { principalContextFields } from "../src/session/persistence/principal.js"
 // PERSON-CONTRACT C8.6 / CONCEPTION §4.2: `ACPX_PRINCIPAL_ID` / `ACPX_PRINCIPAL_NAME` are set from the record in a
 // child of a person-created session, and UNSET (not empty) in a child of a session with no principal — even
 // when the caller's own environment carries a person (the strip). The real owner path is exercised by
-// principal-spawn-paths.test.ts; this file pins buildAgentEnvironment and the four record-built contexts.
+// principal-spawn-paths.test.ts; this file pins buildAgentEnvironment and the one record-built context builder.
 
 const P = "p-9df6e3afab610ff30d1a";
 const NAME = "Daniel Brammertz";
@@ -132,10 +132,12 @@ test("a malformed principal id is no principal: nothing is exported, and no padd
   });
 });
 
-// ⚠️ THE FOUR LEGS. `sessionContext` is rebuilt from a record at four sites, field by field; a field missing from
-// one is a silent half-fix — the first prompt through that leg has no principal while every in-memory test is
-// green. The list is GENERATED from the code: every `seatId: record.seatId ?? null` line under src/ must be
-// followed by the principal spread. The positive control is the count; a shrunken census fails loudly.
+// ⚠️ THE ONE LEG. `sessionContext` was rebuilt from a record at four sites, field by field; a field missing from
+// one was a silent half-fix — the first prompt through that leg had no principal while every in-memory test was
+// green. P3a §6 merged them into `sessionContextFromRecord` (src/session/session-context.ts), whose return type
+// makes a missed field a compile error. The census stays GENERATED from the code: every
+// `seatId: record.seatId ?? null` line under src/ must be followed by the principal spread, and there must be
+// exactly ONE — a second hand-built record context is the regression this count catches.
 test("every sessionContext built from a record carries the principal beside seatId", () => {
   // Resolved from cwd, not import.meta.dirname: the suite runs the COMPILED tests out of dist-test/.
   const srcDir = path.join(process.cwd(), "src");
@@ -169,7 +171,7 @@ test("every sessionContext built from a record carries the principal beside seat
       }
     });
   }
-  assert.equal(sites, 4, `expected exactly 4 record-built sessionContext sites, found ${sites}`);
+  assert.equal(sites, 1, `expected exactly 1 record-built sessionContext site, found ${sites}`);
   assert.equal(spreads, sites, "a principal spread outside a record-built context is a stray");
   assert.deepEqual(missing, []);
 });

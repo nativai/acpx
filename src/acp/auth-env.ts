@@ -502,7 +502,7 @@ export type AgentSessionContext = {
   brick?: string | null;
   brickPath?: string | null;
   agentFolder?: string | null;
-  /** C7 (brick 09197f03) — `<brick>/agents/<seat8>/`; mirrors AcpClientOptions.sessionContext.seatFolder. */
+  /** C7 (brick 09197f03) — `<brick>/agents/<seat8>/`, exported as $ACPX_SEAT_FOLDER; null when seat-less. */
   seatFolder?: string | null;
   /**
    * Selected Claude subscription id (from ~/.acpx/subscriptions/registry.json).

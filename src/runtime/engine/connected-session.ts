@@ -1,16 +1,13 @@
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { AcpClient } from "../../acp/client.js";
 import { withInterrupt } from "../../async-control.js";
-import { resolveAndEnsureAgentFolder } from "../../cli/session/agent-folder.js";
-import { resolveSessionBrickContext } from "../../cli/session/brick-link.js";
 import {
   persistSessionOwnerOptions,
   resolveSessionOwnerOptions,
   ownerOptionsToInput,
 } from "../../session/owner-options.js";
 import { absolutePath, isoNow } from "../../session/persistence.js";
-import { principalContextFields } from "../../session/persistence/principal.js";
-import { seatDisplayName } from "../../session/seat-display-name.js";
+import { sessionContextFromRecord } from "../../session/session-context.js";
 import { DEFAULT_PERMISSION_MODE } from "../../types.js";
 import type {
   AcpPermissionDecision,
@@ -115,9 +112,7 @@ export async function withConnectedSession<T>(
     terminal: options.terminal,
   });
   persistSessionOwnerOptions(record, ownerOptionsToInput(ownerOptions));
-  const displayName = await seatDisplayName(record);
-  const { brick, brickPath } = await resolveSessionBrickContext(record);
-  const agentFolders = resolveAndEnsureAgentFolder(record, brickPath);
+  const sessionContext = await sessionContextFromRecord(record);
   const client =
     options.createClient?.({
       agentCommand: record.agentCommand,
@@ -130,22 +125,7 @@ export async function withConnectedSession<T>(
       authPolicy: ownerOptions.auth_policy,
       terminal: ownerOptions.terminal,
       verbose: options.verbose,
-      sessionContext: {
-        acpxRecordId: record.acpxRecordId,
-        sessionName: displayName ?? null,
-        parentSessionId: record.parentSessionId ?? null,
-        parentSessionUrl: record.parentSessionUrl ?? null,
-        brick,
-        brickPath,
-        agentFolder: agentFolders?.agentFolder ?? null,
-        seatFolder: agentFolders?.seatFolder ?? null,
-        subscriptionId: record.acpx?.session_options?.subscription ?? null,
-        profileId: record.acpx?.session_options?.profile ?? null,
-        seatId: record.seatId ?? null,
-        seatOrdinal: record.holderOrdinal ?? null,
-        parentSeatId: record.parentSeatId ?? null,
-        ...principalContextFields(record.metadata),
-      },
+      sessionContext,
       sessionOptions: sessionOptionsFromRecord(record),
     }) ??
     new AcpClient({
@@ -159,22 +139,7 @@ export async function withConnectedSession<T>(
       authPolicy: ownerOptions.auth_policy,
       terminal: ownerOptions.terminal,
       verbose: options.verbose,
-      sessionContext: {
-        acpxRecordId: record.acpxRecordId,
-        sessionName: displayName ?? null,
-        parentSessionId: record.parentSessionId ?? null,
-        parentSessionUrl: record.parentSessionUrl ?? null,
-        brick,
-        brickPath,
-        agentFolder: agentFolders?.agentFolder ?? null,
-        seatFolder: agentFolders?.seatFolder ?? null,
-        subscriptionId: record.acpx?.session_options?.subscription ?? null,
-        profileId: record.acpx?.session_options?.profile ?? null,
-        seatId: record.seatId ?? null,
-        seatOrdinal: record.holderOrdinal ?? null,
-        parentSeatId: record.parentSeatId ?? null,
-        ...principalContextFields(record.metadata),
-      },
+      sessionContext,
       sessionOptions: sessionOptionsFromRecord(record),
     });
   let activeSessionIdForControl = record.acpSessionId;

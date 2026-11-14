@@ -126,7 +126,7 @@ export async function stampBrickSessionStarted(
 /**
  * The `ACPX_BRICK` / `ACPX_BRICK_PATH` pair for a spawn — the SEAT's brick for a seated
  * session (`decideSessionBrick`), never the record's `metadata.brick` cache read raw.
- * All four env-builder sites call this; a fifth must too.
+ * Both env-builder sites call this (`session-context.ts`: the record builder and the creation one).
  */
 export async function resolveSessionBrickContext(
   subject: Pick<SessionRecord, "seatId" | "metadata">,

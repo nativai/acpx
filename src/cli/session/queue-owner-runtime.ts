@@ -35,8 +35,7 @@ import {
   writeSessionRecord,
   writeSessionRecordAtBoundary,
 } from "../../session/persistence.js";
-import { principalContextFields } from "../../session/persistence/principal.js";
-import { seatDisplayName } from "../../session/seat-display-name.js";
+import { sessionContextFromRecord } from "../../session/session-context.js";
 import {
   bindTurnOwnWrites,
   settingsBindingFingerprint,
@@ -77,9 +76,7 @@ import {
 } from "../queue/lease-store.js";
 import { QueueOwnerTurnController } from "../queue/owner-turn-controller.js";
 import { terminalizeAbsorbedDeliveriesOnOwnerExit } from "./absorbed-delivery-registry.js";
-import { resolveAndEnsureAgentFolder } from "./agent-folder.js";
 import { createBackgroundTaskTracker } from "./background-task-tracker.js";
-import { resolveSessionBrickContext } from "./brick-link.js";
 import {
   DEFAULT_QUEUE_OWNER_TTL_MS,
   normalizeOwnerIdleReleaseMs,
@@ -220,29 +217,6 @@ async function submitToRunningOwner(
     sessionOptions: options.sessionOptions,
     onSubmitAccepted: options.onSubmitAccepted,
   });
-}
-
-// eslint-disable-next-line complexity -- mirrors the sessionContext shape from runtime.ts / connected-session.ts; the ?. chains are load-bearing and cannot be simplified further without losing null safety
-async function sessionContextFromRecord(record: Awaited<ReturnType<typeof resolveSessionRecord>>) {
-  const displayName = await seatDisplayName(record);
-  const { brick, brickPath } = await resolveSessionBrickContext(record);
-  const agentFolders = resolveAndEnsureAgentFolder(record, brickPath);
-  return {
-    acpxRecordId: record.acpxRecordId,
-    sessionName: displayName ?? null,
-    parentSessionId: record.parentSessionId ?? null,
-    parentSessionUrl: record.parentSessionUrl ?? null,
-    brick,
-    brickPath,
-    agentFolder: agentFolders?.agentFolder ?? null,
-    seatFolder: agentFolders?.seatFolder ?? null,
-    subscriptionId: record.acpx?.session_options?.subscription ?? null,
-    profileId: record.acpx?.session_options?.profile ?? null,
-    seatId: record.seatId ?? null,
-    seatOrdinal: record.holderOrdinal ?? null,
-    parentSeatId: record.parentSeatId ?? null,
-    ...principalContextFields(record.metadata),
-  };
 }
 
 async function createQueueOwnerSharedClient(
