@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import fsp from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { resolveAndEnsureAgentFolder } from "../src/cli/session/agent-folder.js";
@@ -12,6 +11,7 @@ import {
   sessionContextFromRecord,
 } from "../src/session/session-context.js";
 import type { SessionRecord } from "../src/types.js";
+import { withTempHome } from "./temp-home.js";
 
 // P3a §6 (C12): the four record-backed `sessionContext` literals (queue owner, prompt turn, and the two
 // branches of withConnectedSession) became ONE builder. This file holds a verbatim copy of the old
@@ -55,20 +55,9 @@ async function oldLiteral(record: SessionRecord, reasoningEffort?: string | null
   };
 }
 
+/** A throwaway state home pinned as `ACPX_STATE_HOME` (the seat store `seatDisplayName` reads lives under it). */
 async function withStateHome(run: (dir: string) => Promise<void>): Promise<void> {
-  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "acpx-session-context-"));
-  const previous = process.env.ACPX_STATE_HOME;
-  process.env.ACPX_STATE_HOME = dir;
-  try {
-    await run(dir);
-  } finally {
-    if (previous === undefined) {
-      delete process.env.ACPX_STATE_HOME;
-    } else {
-      process.env.ACPX_STATE_HOME = previous;
-    }
-    await fsp.rm(dir, { recursive: true, force: true });
-  }
+  await withTempHome("acpx-session-context-", run, { pin: ["ACPX_STATE_HOME"] });
 }
 
 function fullRecord(brickDir: string): SessionRecord {

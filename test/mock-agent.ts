@@ -48,6 +48,7 @@ import {
   type SessionInfo,
   type SessionModelState,
 } from "@agentclientprotocol/sdk";
+import { TURN_CONTEXT_OPEN_TAG } from "../src/acp/turn-context.js";
 import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
 
 type ParsedCommand = {
@@ -212,6 +213,24 @@ function assertJsonEqual(actual: unknown, expected: unknown, label: string): voi
   if (actualJson !== expectedJson) {
     throw new Error(`Unexpected ${label}: expected ${expectedJson}, received ${actualJson}`);
   }
+}
+
+/**
+ * acpx's per-turn context (`src/acp/turn-context.ts`) arrives as its OWN first text block, ahead of the user's
+ * blocks. A real agent reads it as system context, not as the user's command, so the mock splits it off: the
+ * operation log records it as `turnContext` and `text` stays the user's words, which is what every command
+ * dispatch and every `entry.text === …` assertion means. (P3a: a failed primer — the `/nonexistent` primer
+ * idiom these tests use — now arms an OS notice on that channel.)
+ */
+function splitTurnContext(prompt: ContentBlock[]): {
+  turnContext?: string;
+  userPrompt: ContentBlock[];
+} {
+  const [first, ...rest] = prompt;
+  if (first?.type === "text" && first.text.startsWith(TURN_CONTEXT_OPEN_TAG)) {
+    return { turnContext: first.text, userPrompt: rest };
+  }
+  return { userPrompt: prompt };
 }
 
 function getPromptText(prompt: ContentBlock[]): string {
@@ -1424,10 +1443,12 @@ class MockAgent implements Agent {
     }
 
     if (this.options.parkConcurrentPrompts && session.pendingPrompt) {
+      const parkedSplit = splitTurnContext(params.prompt);
       this.recordOperation({
         method: "session/prompt",
         sessionId: params.sessionId,
-        text: getPromptText(params.prompt),
+        text: getPromptText(parkedSplit.userPrompt),
+        ...(parkedSplit.turnContext === undefined ? {} : { turnContext: parkedSplit.turnContext }),
         modelId: session.modelId,
         parked: true,
       });
@@ -1467,13 +1488,15 @@ class MockAgent implements Agent {
     session.pendingPrompt?.abort();
     const promptAbort = new AbortController();
     session.pendingPrompt = promptAbort;
-    const text = getPromptText(params.prompt);
+    const { turnContext, userPrompt } = splitTurnContext(params.prompt);
+    const text = getPromptText(userPrompt);
     // `modelId` is the model this turn is SERVED by — what a "served by" assertion reads.
     if (!run.recorded) {
       this.recordOperation({
         method: "session/prompt",
         sessionId: params.sessionId,
         text,
+        ...(turnContext === undefined ? {} : { turnContext }),
         modelId: session.modelId,
       });
     }

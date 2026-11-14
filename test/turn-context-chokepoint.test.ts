@@ -30,7 +30,8 @@ import { TURN_CONTEXT_OPEN_TAG, TURN_CONTEXT_TEST_PAYLOAD_ENV } from "../src/acp
 
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 
-type MockOperation = { method?: string; text?: string };
+/** `turnContext`: the mock splits acpx's leading turn-context block off the user's `text` (mock-agent.ts). */
+type MockOperation = { method?: string; text?: string; turnContext?: string };
 
 /** One `session/prompt` as the MOCK AGENT received it — the wire, not our reconstruction. */
 async function readPromptOperations(operationLog: string): Promise<MockOperation[]> {
@@ -122,6 +123,7 @@ test("K2 with the seam unset the wire text is the user's words, unmodified — A
     false,
     "no envelope may appear when nothing is configured to inject",
   );
+  assert.equal(operations[0].turnContext, undefined, "no context block when nothing is configured");
 });
 
 test("K3 with the seam armed the envelope reaches the wire AHEAD of the user's text — AC2 end to end", async () => {
@@ -132,15 +134,17 @@ test("K3 with the seam armed the envelope reaches the wire AHEAD of the user's t
     userText: "just the user",
   });
   assert.equal(operations.length, 1, "still exactly one send on a decorated turn");
-  const text = operations[0].text ?? "";
   // K2 is this row's control: the same instrument, same harness, reports the envelope ABSENT
   // when nothing is configured. Without it, K3 passes on an instrument that cannot see text.
-  assert.ok(text.includes(TURN_CONTEXT_OPEN_TAG), "the envelope must reach the wire");
-  assert.ok(text.includes(nonce), "the payload must reach the wire");
-  assert.ok(text.includes("just the user"), "the user's text must survive");
-  assert.ok(
-    text.indexOf(TURN_CONTEXT_OPEN_TAG) < text.indexOf("just the user"),
-    "the block is PREPENDED: the user's own words stay last and most salient",
+  // The mock records the block as `turnContext` only when it is the FIRST content block, so its
+  // presence there is the "prepended" proof; the user's words follow as their own blocks.
+  const block = operations[0].turnContext ?? "";
+  assert.ok(block.startsWith(TURN_CONTEXT_OPEN_TAG), "the envelope must reach the wire, first");
+  assert.ok(block.includes(nonce), "the payload must reach the wire");
+  assert.equal(
+    operations[0].text,
+    "just the user",
+    "the user's text must survive, after the block",
   );
 });
 

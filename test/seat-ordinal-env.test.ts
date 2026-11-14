@@ -76,10 +76,10 @@ test("a context with no ordinal DELETES a stale inherited ACPX_SEAT_ORDINAL (FW-
   });
 });
 
-// ⚠️ THE FOUR LEGS. `sessionContext` is rebuilt from a record at four sites, field by field; a field missing from
-// one is a silent half-fix (the first prompt through that leg has no ordinal). The list is GENERATED from the code:
-// every `seatId: record.seatId ?? null` line under src/ must be followed by the ordinal line. The positive control is
-// the count — four sites today; a shrunken census (a renamed field the scan no longer sees) fails loudly.
+// ⚠️ THE ONE LEG. `sessionContext` was rebuilt from a record at four sites, field by field; P3a §6 merged them into
+// `sessionContextFromRecord` (src/session/session-context.ts), whose return type makes a missed field a compile
+// error. The census stays GENERATED from the code: every `seatId: record.seatId ?? null` line under src/ must be
+// followed by the ordinal line, and there must be exactly ONE — a second hand-built record context fails loudly.
 test("every sessionContext built from a record carries seatOrdinal beside seatId", () => {
   // Resolved from cwd, not import.meta.dirname: the suite runs the COMPILED tests out of dist-test/.
   const srcDir = path.join(process.cwd(), "src");
@@ -109,6 +109,6 @@ test("every sessionContext built from a record carries seatOrdinal beside seatId
       }
     });
   }
-  assert.equal(sites, 4, `expected exactly 4 record-built sessionContext sites, found ${sites}`);
+  assert.equal(sites, 1, `expected exactly 1 record-built sessionContext site, found ${sites}`);
   assert.deepEqual(missing, []);
 });

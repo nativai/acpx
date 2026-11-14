@@ -83,6 +83,15 @@ test("P3a: the scrub removes the OS-root knobs (ATRIUM_OS, ATRIUM_OS_DEFAULT, AC
   assert.equal(env.ATRIUM_OS_STATUS_FILE, "/kept");
 });
 
+test("the scrub removes the box's ACPX_DEFAULT_OWNER (an isolated HOME cannot resolve it)", () => {
+  const env: NodeJS.ProcessEnv = {
+    ACPX_DEFAULT_OWNER: "p-9df6e3afab610ff30d1a",
+    HOME: "/home/node",
+  };
+  assert.deepEqual(scrubBoxHarnessEnvOverrides(env), ["ACPX_DEFAULT_OWNER"]);
+  assert.equal("ACPX_DEFAULT_OWNER" in env, false);
+});
+
 test("45917618: the scrub removes ACPX_SESSION_ROOT (a rig's session-root seam), even when empty", () => {
   for (const value of ["/workspace", ""]) {
     const env: NodeJS.ProcessEnv = {

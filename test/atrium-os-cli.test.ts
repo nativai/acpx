@@ -20,7 +20,7 @@ const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 
 type CliResult = { code: number | null; stdout: string; stderr: string };
-type Fixture = { home: string; cwd: string; envDump: string; osBase: string };
+type Fixture = { home: string; cwd: string; envDump: string; osBase: string; opsLog: string };
 
 function runCli(
   args: string[],
@@ -112,6 +112,7 @@ async function withFixture(run: (fixture: Fixture) => Promise<void>): Promise<vo
       const cwd = path.join(home, "workspace");
       await fs.mkdir(cwd, { recursive: true });
       const envDump = path.join(home, "adapter-env.json");
+      const opsLog = path.join(home, "agent-ops.jsonl");
       // The mock at a real Claude adapter's path shape, so acpx renders the OS primer for it
       // (`resolvePrimerChannel` keys on the claude-agent-acp path).
       const entry = path.join(home, "claude-agent-acp", "dist", "index.mjs");
@@ -122,14 +123,14 @@ async function withFixture(run: (fixture: Fixture) => Promise<void>): Promise<vo
       );
       const agentCommand =
         `node ${JSON.stringify(entry)} --supports-fork-session --supports-load-session ` +
-        `--env-dump-file ${JSON.stringify(envDump)} ` +
+        `--env-dump-file ${JSON.stringify(envDump)} --operation-log ${JSON.stringify(opsLog)} ` +
         "--env-dump-extra ATRIUM_OS,ATRIUM_OS_DEFAULT,PATH";
       await fs.mkdir(path.join(home, ".acpx"), { recursive: true });
       await fs.writeFile(
         path.join(home, ".acpx", "config.json"),
         `${JSON.stringify({ agents: { claude: { command: agentCommand } } })}\n`,
       );
-      await run({ home, cwd, envDump, osBase });
+      await run({ home, cwd, envDump, osBase, opsLog });
     });
   } finally {
     rmSync(osBase, { recursive: true, force: true });
@@ -249,6 +250,21 @@ async function indexEntryOf(
 }
 
 const urlOf = (id: string): string => `http://localhost:3456/?session=${id}`;
+
+/**
+ * The OS notice the agent received with its LAST prompt: the turn-context block the mock split off the
+ * user's text (mock-agent.ts `splitTurnContext`). `""` when that prompt carried none.
+ */
+async function lastTurnContext(fixture: Fixture): Promise<string> {
+  const raw = await fs.readFile(fixture.opsLog, "utf8").catch(() => "");
+  const prompts = raw
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as { method?: string; text?: string; turnContext?: string })
+    .filter((op) => op.method === "session/prompt");
+  assert.ok(prompts.length > 0, "positive control: the mock logged the prompt");
+  return prompts.at(-1)?.turnContext ?? "";
+}
 
 test("T1/T28 a session created without --os carries no atrium_os* key and no index atriumOs", async () => {
   await withFixture(async (f) => {
@@ -453,7 +469,10 @@ test("T10 a missing stored path falls back to the box default, says so once, and
 
     const first = await prompt(f, id, "echo hi", boxEnv(f), "30");
     assert.equal(first.code, 0, first.stderr);
-    assert.match(first.stdout, /⟦OS-NOTICE⟧ This session's Operating System .*C OS was not found/);
+    assert.match(
+      await lastTurnContext(f),
+      /⟦OS-NOTICE⟧ This session's Operating System .*C OS was not found/,
+    );
     assert.equal((await adapterEnv(f)).ATRIUM_OS, box);
     const meta = await metadataOf(f, id);
     assert.equal(meta.atrium_os, c, "the stored choice is never changed by a fallback");
@@ -461,7 +480,7 @@ test("T10 a missing stored path falls back to the box default, says so once, and
     // NEGATIVE: a second turn served by the SAME owner process carries no notice (once per spawn).
     const second = await prompt(f, id, "echo again", boxEnv(f), "30");
     assert.equal(second.code, 0, second.stderr);
-    assert.doesNotMatch(second.stdout, /OS-NOTICE/);
+    assert.equal(await lastTurnContext(f), "");
     assert.match(second.stdout, /again/);
   });
 });
@@ -477,7 +496,7 @@ test("T10 recovery: once the path is back, the next agent start applies it and c
     await fs.writeFile(path.join(c, "agents.md"), "# C\n");
     const back = await prompt(f, id, "echo hi", boxEnv(f));
     assert.equal(back.code, 0, back.stderr);
-    assert.doesNotMatch(back.stdout, /OS-NOTICE/);
+    assert.equal(await lastTurnContext(f), "");
     assert.equal((await adapterEnv(f)).ATRIUM_OS, c);
     assert.equal((await metadataOf(f, id)).atrium_os_fallback, undefined);
   });
@@ -495,11 +514,11 @@ test("T18/T19 a failed primer render creates the session (real directory: alarm 
 
     const turn = await prompt(f, id, "echo hi", failing);
     assert.equal(turn.code, 0, turn.stderr);
-    assert.match(turn.stdout, /⟦OS-NOTICE⟧ Your Operating System primer did not load/);
+    assert.match(await lastTurnContext(f), /⟦OS-NOTICE⟧ Your Operating System primer did not load/);
 
     const good = await prompt(f, id, "echo hi", boxEnv(f));
     assert.equal(good.code, 0, good.stderr);
-    assert.doesNotMatch(good.stdout, /OS-NOTICE/);
+    assert.equal(await lastTurnContext(f), "");
     assert.equal((await metadataOf(f, id)).atrium_os_primer_error, undefined);
   });
 });

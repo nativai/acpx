@@ -64,6 +64,15 @@ export const SESSION_ROOT_ENV = "ACPX_SESSION_ROOT";
 export const OS_ROOT_ENV = ["ATRIUM_OS", "ATRIUM_OS_DEFAULT", "ACPX_AGENT_OS_BIN"] as const;
 
 /**
+ * The box's default session owner (`withDefaultOwner`, PERSON-CONTRACT): devbox exports it into every agent
+ * shell, so a suite run from one inherits it, and every CLI row whose isolated HOME has no people file then
+ * fails `sessions new` with `ACPX_DEFAULT_OWNER "<id>": unknown` — rc 1 and an EMPTY stderr (the error is on
+ * stdout as JSON). Measured on P3a's gate, 2026-11-14: byway-guard.test.ts 11/20 red with it inherited, 20/20
+ * with it scrubbed. No row sets it; a row that wants one passes it in its child env.
+ */
+export const DEFAULT_OWNER_ENV = "ACPX_DEFAULT_OWNER";
+
+/**
  * brick ecfb0461 — THE SUITE MUST NEVER SEND THE BOX'S OpenRouter KEY OVER THE WIRE.
  *
  * Same family as the two scrubs above (make the starting environment a property of
@@ -125,6 +134,7 @@ export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env
       name.startsWith(BOX_PI_ENV_PREFIX) ||
       (SESSION_IDENTITY_ENV as readonly string[]).includes(name) ||
       (OS_ROOT_ENV as readonly string[]).includes(name) ||
+      name === DEFAULT_OWNER_ENV ||
       name === SESSION_ROOT_ENV
     ) {
       delete env[name];

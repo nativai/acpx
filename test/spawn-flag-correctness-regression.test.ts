@@ -347,25 +347,40 @@ test("T4.1 BUG2: --model X is recorded onto session_options.model", async () => 
 // T1 runbook (record → real adapter home). Labeled structural in VERIFICATION.md.
 // ---------------------------------------------------------------------------
 
-const PROFILE_THREADING_SITES = [
-  "runtime/engine/connected-session.ts",
-  "cli/session/queue-owner-runtime.ts",
-  "cli/session/runtime.ts",
-  "cli/session/session-management.ts",
+// P3a §6 (C12) merged the four hand-built contexts into `session/session-context.ts`: the record builder
+// (owner, prompt turn, connected session ×2), the creation builder and exec's. So the sentinel now asserts
+// (1) all THREE builders there thread profileId, and (2) every former site builds its context through one
+// of them rather than a literal of its own.
+const PROFILE_THREADING_BUILDERS = "session/session-context.ts";
+const PROFILE_THREADING_SITES: [string, RegExp][] = [
+  ["runtime/engine/connected-session.ts", /sessionContextFromRecord\(/],
+  ["cli/session/queue-owner-runtime.ts", /sessionContextFromRecord\(/],
+  ["cli/session/runtime.ts", /sessionContextFromRecord\(/],
+  ["cli/session/session-management.ts", /creationSessionContext\(/],
 ];
 
 // profileId assigned from <something>.session_options?.profile OR
-// options.sessionOptions?.profile (session-management threads from the options).
+// options.sessionOptions?.profile (the creation and exec builders thread from the options).
 const THREADING_RE =
-  /profileId:\s*[^,\n]*(?:session_options\?\.\s*profile|sessionOptions\?\.\s*profile)/;
+  /profileId:\s*[^,\n]*(?:session_options\?\.\s*profile|sessionOptions\?\.\s*profile)/g;
 
-for (const site of PROFILE_THREADING_SITES) {
-  test(`T4.2 BUG1: ${site} threads profileId from session_options.profile`, async () => {
+test(`T4.2 BUG1: ${PROFILE_THREADING_BUILDERS} threads profileId in all three context builders`, async () => {
+  const source = await fs.readFile(path.join(SRC_DIR, PROFILE_THREADING_BUILDERS), "utf8");
+  assert.equal(
+    source.match(THREADING_RE)?.length ?? 0,
+    3,
+    "record, creation and exec builders must each thread profileId from session_options.profile",
+  );
+});
+
+for (const [site, builder] of PROFILE_THREADING_SITES) {
+  test(`T4.2 BUG1: ${site} builds its sessionContext through the shared builder`, async () => {
     const source = await fs.readFile(path.join(SRC_DIR, site), "utf8");
-    assert.match(
+    assert.match(source, builder, `${site} must build its context with ${builder.source}`);
+    assert.doesNotMatch(
       source,
       THREADING_RE,
-      `${site} must thread profileId from the recorded session_options.profile`,
+      `${site} hand-builds a profileId again — use ${PROFILE_THREADING_BUILDERS}`,
     );
   });
 }
