@@ -617,4 +617,6 @@ test("applySnapshotOsObservation: string sets, null deletes, undefined leaves; n
   assert.deepEqual(record.metadata, { atrium_os: "/w", atrium_os_fallback: "2026" });
   // NEUTRAL: a default session with nothing observed keeps NO metadata at all.
   const bare = { acpxRecordId: "b" } as unknown as SessionRecord;
-  applySnapshotOsObservation(bare, { revision: null, fallbackAt: null,
+  applySnapshotOsObservation(bare, { revision: null, fallbackAt: null, primerError: null });
+  assert.equal(bare.metadata, undefined);
+});

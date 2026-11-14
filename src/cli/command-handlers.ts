@@ -6504,4 +6504,5 @@ export async function handleSessionsRepairAccountSeam(
     process.stdout.write(`${result.repaired.length}\n`);
     return;
   }
-  process.stdout.write(`${formatAccountSeamRepairResult(r
+  process.stdout.write(`${formatAccountSeamRepairResult(result)}\n`);
+}
