@@ -24,7 +24,7 @@ import {
 const SOURCE_PATH = path.resolve(process.cwd(), "src/session/persistence/person.ts");
 const FIXTURE_PATH = path.resolve(process.cwd(), "test/fixtures/person.fixture.json");
 // ---- everything below this line is the same in both repos' person tests ----
-const PERSON_TS_SHA256 = "fb46b5309c1db343322d65e0a84aac313786b5a567ad476fcd7b93b7940025c9";
+const PERSON_TS_SHA256 = "12c8e6c802e7d6ef2497c20c5193f72583ce9c754b62ca6745f7888ff329e853";
 const FIXTURE_SHA256 = "898ab29f987ae27a40c9b29775de1886fb090bc863575dab330765870853b032";
 
 interface IdRow {

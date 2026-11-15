@@ -179,25 +179,34 @@ function humanDns(actor: unknown): { issuer: string; subject: string } | null {
 }
 
 /**
- * The Telegram leg (Telegram CONCEPTION 5.5, K7). A forwarded Telegram message carries the actor
- * `{kind:'human', channel:'telegram', verified:false, name, telegram_user_id, person_id, box}`; its person
- * is the `person_id` the bridge wrote, and only when that is a well-formed id (C1.1: exact, no padding, no
- * case-folding). It is a stored id, never a hash of anything, and nothing else about the actor is read:
- * another channel carrying a `person_id` is not a person by it.
+ * The server-minted channel legs. A forwarded Telegram message carries the actor
+ * `{kind:'human', channel:'telegram', verified:false, name, telegram_user_id, person_id, box}` (Telegram CONCEPTION 5.5,
+ * K7); a mail from a person's CONFIRMED address carries `{kind:'human', channel:'email', verified:false, name, person_id}`
+ * (spawn by mail, brick b49466df, CONCEPTION v3 D2 — minted only by atrium's router-only listener). Its person is the
+ * `person_id` atrium wrote, and only when that is a well-formed id (C1.1: exact, no padding, no case-folding). It is a stored
+ * id, never a hash of anything, and nothing else about the actor is read: any OTHER channel carrying a `person_id` is not a
+ * person by it. Both channels are written server-side only; no request body or header can carry one.
  */
+const PERSON_ID_CHANNELS: ReadonlySet<string> = new Set(["telegram", "email"]);
+
 function telegramPersonId(actor: unknown): string | null {
   if (typeof actor !== "object" || actor === null) {
     return null;
   }
   const { kind, channel, person_id } = actor as Record<string, unknown>;
-  return kind === "human" && channel === "telegram" && isPersonId(person_id) ? person_id : null;
+  return kind === "human" &&
+    typeof channel === "string" &&
+    PERSON_ID_CHANNELS.has(channel) &&
+    isPersonId(person_id)
+    ? person_id
+    : null;
 }
 
 /**
  * C1.1 + C2.1. `p-` + the first 20 hex of sha256(UTF-8(issuer + "\n" + subject)), the DNs exactly as stored
  * (no trim, no case-folding, no re-ordering). `null` for every non-person: an agent, a system component,
  * an unverified or anonymous human, a human without both DNs. Does not throw for any JSON-shaped input.
- * A human actor without a verified certificate is a person only through the Telegram leg above.
+ * A human actor without a verified certificate is a person only through the channel legs above (Telegram, email).
  */
 export function personIdOf(actor: unknown): string | null {
   const dns = humanDns(actor);
