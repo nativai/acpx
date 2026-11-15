@@ -9,6 +9,7 @@ import {
   armAtriumOsNotice,
   boxDefaultOsRoot,
   clearAtriumOsNotice,
+  fallbackNoticeText,
   formatPrimerErrorStamp,
   isOsCompatLinkInPlace,
   LEGACY_OS_ROOT,
@@ -619,4 +620,64 @@ test("applySnapshotOsObservation: string sets, null deletes, undefined leaves; n
   const bare = { acpxRecordId: "b" } as unknown as SessionRecord;
   applySnapshotOsObservation(bare, { revision: null, fallbackAt: null, primerError: null });
   assert.equal(bare.metadata, undefined);
+});
+
+// ── P3a follow-up (TE notes N1, N2, N4) ───────────────────────────────────────────────────────────
+
+test("N1 an empty or blank choice reads as default (§1.4 rule 1), never a refusal", () => {
+  for (const raw of ["", "   "]) {
+    assert.deepEqual(validateOsChoice(raw), { ok: true }, JSON.stringify(raw));
+  }
+  assert.deepEqual(
+    resolveOsChoiceForCreate({ explicit: "", creation: "copy", sourceChoice: "/workspace/x" }),
+    {
+      ok: true,
+      choice: undefined,
+      warnings: [],
+    },
+  );
+});
+
+test("N2 a /workspace symlink that RESOLVES outside the shared roots is refused; the stored path stays unresolved", async () => {
+  await withWorkspaceDir(async (dir) => {
+    await withTmpDir((tmp) => {
+      const outside = makeOsRoot(tmp, "pod-local");
+      const link = path.join(dir, "link-to-tmp");
+      fs.symlinkSync(outside, link);
+      const refused = validateOsChoice(link);
+      assert.equal(refused.ok, false);
+      assert.match(
+        refused.ok ? "" : refused.reason,
+        /resolves to .*, which is not under \/workspace\//,
+      );
+      // NEGATIVE: a symlink whose target IS under the roots is accepted, and stored as spelled (§1.4 step 2).
+      const inside = makeOsRoot(dir, "real");
+      const goodLink = path.join(dir, "current");
+      fs.symlinkSync(inside, goodLink);
+      assert.deepEqual(validateOsChoice(goodLink), { ok: true, choice: goodLink });
+    });
+  });
+});
+
+test("N2 a symlink resolving INTO a dot-folder is refused too", async () => {
+  await withWorkspaceDir((dir) => {
+    makeOsRoot(path.join(dir, ".hidden"), "x");
+    const link = path.join(dir, "to-hidden");
+    fs.symlinkSync(path.join(dir, ".hidden", "x OS"), link);
+    const refused = validateOsChoice(link);
+    assert.equal(refused.ok, false);
+    assert.match(refused.ok ? "" : refused.reason, /resolves to .*dot-folders/);
+  });
+});
+
+test("N4 fallbackNoticeText: the primer clause only where the primer follows", () => {
+  const follows = fallbackNoticeText("/workspace/x", "/wisdom/Operating System");
+  assert.match(follows, /its commands and primer, not \/workspace\/x's/);
+  const kept = fallbackNoticeText("/workspace/x", "/wisdom/Operating System", false);
+  assert.match(
+    kept,
+    /your commands and PATH now use the box default \(\/wisdom\/Operating System\)/,
+  );
+  assert.match(kept, /the primer you received when this session was created is unchanged/);
+  assert.doesNotMatch(kept, /commands and primer/);
 });

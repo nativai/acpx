@@ -23,7 +23,7 @@ if (envLogPath) {
   const has = (name) => (Object.hasOwn(process.env, name) ? process.env[name] : null);
   fs.appendFileSync(
     envLogPath,
-    `${JSON.stringify({ verb, ACPX_SESSION_URL: has("ACPX_SESSION_URL"), ACPX_SEAT_URL: has("ACPX_SEAT_URL") })}\n`,
+    `${JSON.stringify({ verb, ACPX_SESSION_URL: has("ACPX_SESSION_URL"), ACPX_SEAT_URL: has("ACPX_SEAT_URL"), ATRIUM_OS: has("ATRIUM_OS") })}\n`,
     "utf8",
   );
 }

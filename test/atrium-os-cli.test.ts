@@ -7,7 +7,7 @@
 import "./install-owner-reaper.js";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
@@ -128,7 +128,18 @@ async function withFixture(run: (fixture: Fixture) => Promise<void>): Promise<vo
       await fs.mkdir(path.join(home, ".acpx"), { recursive: true });
       await fs.writeFile(
         path.join(home, ".acpx", "config.json"),
-        `${JSON.stringify({ agents: { claude: { command: agentCommand } } })}\n`,
+        `${JSON.stringify({
+          agents: {
+            claude: { command: agentCommand },
+            // codex-shaped (the mock's --codex-acp): renders its primer only at session/new, never on resume
+            codex: {
+              command:
+                `node ${JSON.stringify(MOCK_AGENT_PATH)} --codex-acp --supports-load-session ` +
+                `--env-dump-file ${JSON.stringify(envDump)} --operation-log ${JSON.stringify(opsLog)} ` +
+                "--env-dump-extra ATRIUM_OS,ATRIUM_OS_DEFAULT,PATH",
+            },
+          },
+        })}\n`,
       );
       await run({ home, cwd, envDump, osBase, opsLog });
     });
@@ -175,6 +186,7 @@ async function prompt(
   text: string,
   env: Record<string, string | undefined>,
   ttl = "0.01",
+  agent: "claude" | "codex" = "claude",
 ): Promise<CliResult> {
   await fs.rm(fixture.envDump, { force: true });
   const result = await runCli(
@@ -186,7 +198,7 @@ async function prompt(
       ttl,
       "--format",
       "quiet",
-      "claude",
+      agent,
       "prompt",
       "--session-id",
       id,
@@ -547,5 +559,124 @@ test("T18 negative: a deliberately suppressed primer (human --system-prompt) rai
     assert.equal(result.code, 0, result.stderr);
     const id = (JSON.parse(result.stdout.trim()) as { acpxRecordId: string }).acpxRecordId;
     assert.equal((await metadataOf(f, id)).atrium_os_primer_error, undefined);
+  });
+});
+
+// ── P3a follow-up: G2 (codex carry through the record), G3 (caller metadata stripped), N1 (`--os ""`) ──
+
+test("G2 a stored atrium_os_primer_error reaches the FIRST owner turn of a codex session that renders nothing", async () => {
+  await withFixture(async (f) => {
+    await prepareBox(f);
+    const create = async (): Promise<string> => {
+      const result = await runCli(
+        ["--cwd", f.cwd, "--format", "json", "codex", "sessions", "new"],
+        f.home,
+        boxEnv(f),
+      );
+      assert.equal(result.code, 0, result.stderr);
+      return (JSON.parse(result.stdout.trim()) as { acpxRecordId: string }).acpxRecordId;
+    };
+    const stored = "2026-11-14T21:01:27.410Z exec error: spawn /nonexistent/primer.sh ENOENT";
+    const seeded = await create();
+    // As the creation spawn of an unprimed codex session leaves it (no owner is alive after a create).
+    const file = sessionFilePath(f.home, seeded);
+    const record = JSON.parse(await fs.readFile(file, "utf8")) as {
+      metadata?: Record<string, string>;
+    };
+    record.metadata = { ...record.metadata, atrium_os_primer_error: stored };
+    await fs.writeFile(file, `${JSON.stringify(record)}\n`);
+
+    const turn = await prompt(f, seeded, "echo hi", boxEnv(f), "0.01", "codex");
+    assert.equal(turn.code, 0, turn.stderr);
+    const notice = await lastTurnContext(f);
+    assert.match(
+      notice,
+      /⟦OS-NOTICE⟧ Your Operating System primer did not load \(exec error: spawn \/nonexistent/,
+    );
+    // the resume rendered nothing, so nothing cleared it: the key stays until a render succeeds
+    assert.equal((await metadataOf(f, seeded)).atrium_os_primer_error, stored);
+
+    // NEGATIVE: the same codex session shape with no stored failure gets no notice.
+    const clean = await create();
+    assert.equal((await prompt(f, clean, "echo hi", boxEnv(f), "0.01", "codex")).code, 0);
+    assert.equal(await lastTurnContext(f), "");
+  });
+});
+
+test("G3 caller-supplied --metadata atrium_os* never reaches the record; --os still decides", async () => {
+  await withFixture(async (f) => {
+    await prepareBox(f);
+    const b = makeOsRoot(f.osBase, "B");
+    const bypass = await create(
+      f,
+      [
+        "--metadata",
+        "atrium_os=/tmp/not-validated",
+        "--metadata",
+        `atrium_os_revision=${"a".repeat(40)}`,
+      ],
+      boxEnv(f),
+    );
+    assert.deepEqual(osKeys(await metadataOf(f, bypass)), {}, "nothing stored, nothing observed");
+    const explicit = await create(
+      f,
+      [
+        "--os",
+        b,
+        "--metadata",
+        "atrium_os=/tmp/not-validated",
+        "--metadata",
+        "atrium_os_fallback=x",
+      ],
+      boxEnv(f),
+    );
+    assert.deepEqual(osKeys(await metadataOf(f, explicit)), { atrium_os: b });
+    // control: an ordinary key on the same flag still lands
+    const other = await create(f, ["--metadata", "atrium_note=kept"], boxEnv(f));
+    assert.equal((await metadataOf(f, other)).atrium_note, "kept");
+  });
+});
+
+test('N1 `--os ""` and `set-os <id> ""` mean default (exit 0), not a usage error', async () => {
+  await withFixture(async (f) => {
+    await prepareBox(f);
+    const b = makeOsRoot(f.osBase, "B");
+    // rule 1: an explicit empty --os is default and beats the caller's own ATRIUM_OS (rule 4)
+    const id = await create(f, ["--os", ""], boxEnv(f, { ATRIUM_OS: b }));
+    assert.equal((await metadataOf(f, id)).atrium_os, undefined);
+    assert.equal((await runCli(["sessions", "set-os", id, b], f.home, boxEnv(f))).code, 0);
+    const cleared = await runCli(
+      ["--format", "json", "sessions", "set-os", id, ""],
+      f.home,
+      boxEnv(f),
+    );
+    assert.equal(cleared.code, 0, cleared.stderr);
+    assert.deepEqual(JSON.parse(cleared.stdout.trim()), {
+      acpxRecordId: id,
+      previous: b,
+      choice: "default",
+    });
+    assert.equal((await metadataOf(f, id)).atrium_os, undefined);
+  });
+});
+
+test("N2 `--os <a /workspace symlink to /tmp>` exits 2 and creates nothing", async () => {
+  await withFixture(async (f) => {
+    await prepareBox(f);
+    const outsideDir = mkdtempSync("/tmp/acpx-atrium-os-outside-");
+    try {
+      const outside = makeOsRoot(outsideDir, "pod-local");
+      const link = path.join(f.osBase, "link-to-tmp");
+      symlinkSync(outside, link);
+      const result = await runCli(
+        ["--cwd", f.cwd, "claude", "sessions", "new", "--os", link],
+        f.home,
+        boxEnv(f),
+      );
+      assert.equal(result.code, 2, result.stderr);
+      assert.match(result.stderr, /resolves to .*not under \/workspace\//);
+    } finally {
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
   });
 });

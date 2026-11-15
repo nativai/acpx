@@ -2394,7 +2394,12 @@ export class AcpClient {
       armAtriumOsNotice(
         recordId,
         "fallback",
-        fallbackNoticeText(outcome.fallback.missing, outcome.root),
+        fallbackNoticeText(
+          outcome.fallback.missing,
+          outcome.root,
+          // codex keeps its creation-time developer instructions: only commands and PATH switch (N4)
+          resolvePrimerChannel(this.options.agentCommand) !== "developer-instructions",
+        ),
       );
     }
     const stored = this.options.sessionContext?.osPrimerError?.trim();

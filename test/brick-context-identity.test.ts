@@ -31,6 +31,8 @@ type ShimEnvRow = {
   verb: string;
   ACPX_SESSION_URL: string | null;
   ACPX_SEAT_URL: string | null;
+  /** P3a §8.3(3): the OS root the brick CLI renders its include line for. */
+  ATRIUM_OS: string | null;
 };
 
 /**
@@ -249,5 +251,57 @@ test("a session with no seat still parses remotely, with no seat var; the creati
       assert.equal(rows[1].ACPX_SEAT_URL, null);
     },
     { BRICK_SHIM_REMOTE_PARSE: "1", ACPX_UI_BASE_URL: "https://atrium.example.test" },
+  );
+});
+
+// G4 (P3a §8.3(3)): `ATRIUM_OS` is session identity like the two URLs — SET to the child's root, or DELETED;
+// never the queue owner's ambient value, which can be ANOTHER session's OS.
+const OWNER_OS = "/workspace/projects/os-of-the-owner";
+const CHILD_OS = "/workspace/projects/os-of-the-child";
+
+test("G4 brick's env carries the CHILD's OS root, not the owner's inherited ATRIUM_OS", async () => {
+  await withShim(
+    async ({ envLog }) => {
+      await resolveBrickContext(BRICK_ID, { sessionId: CHILD_SESSION, atriumOs: CHILD_OS });
+      const [row] = await readJsonl<ShimEnvRow>(envLog);
+      assert.equal(row.ATRIUM_OS, CHILD_OS);
+    },
+    { ATRIUM_OS: OWNER_OS },
+  );
+});
+
+test("G4 negative: with no root for the child, the owner's ATRIUM_OS is DELETED, not inherited", async () => {
+  for (const atriumOs of [undefined, "", "  "]) {
+    await withShim(
+      async ({ envLog }) => {
+        await resolveBrickContext(BRICK_ID, { sessionId: CHILD_SESSION, atriumOs });
+        const [row] = await readJsonl<ShimEnvRow>(envLog);
+        assert.equal(row.ATRIUM_OS, null, `atriumOs=${JSON.stringify(atriumOs)}`);
+      },
+      { ATRIUM_OS: OWNER_OS },
+    );
+  }
+});
+
+test("G4 AcpClient hands the brick CLI the root its own spawn resolved", async () => {
+  const client = new AcpClient({
+    agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+    cwd: process.cwd(),
+    permissionMode: "approve-reads",
+    sessionContext: { acpxRecordId: CHILD_SESSION, brick: BRICK_ID },
+  });
+  // What `resolveAgentLaunchPlan` records from `applyAtriumOsEnvironment` at a real spawn.
+  (client as unknown as { atriumOsOutcome: unknown }).atriumOsOutcome = { root: CHILD_OS };
+  (client as unknown as { connection: unknown }).connection = {
+    newSession: async () => ({ sessionId: "session-g4" }),
+  };
+  await withShim(
+    async ({ envLog }) => {
+      await client.createSession(process.cwd());
+      const [row] = await readJsonl<ShimEnvRow>(envLog);
+      assert.equal(row.verb, "context", "positive control: the brick block was rendered");
+      assert.equal(row.ATRIUM_OS, CHILD_OS);
+    },
+    { ATRIUM_OS: OWNER_OS },
   );
 });

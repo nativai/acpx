@@ -506,7 +506,8 @@ export function registerSessionsCommand(
       "The session's Operating System: `default` (follows this box) or an OS root under /workspace/ " +
         "or /opt/atrium-os/ (a directory holding agents.md). Without it: a successor, fork or " +
         "by-the-way takes its source's; a child its parent's; otherwise $ATRIUM_OS, else default.",
-      (value: string) => parseNonEmptyValue("OS", value),
+      // NOT parseNonEmptyValue: `--os ""` means default (§1.4 rule 1); validateOsChoice decides.
+      (value: string) => value,
     )
     .option(
       "--from-template <id>",
@@ -668,7 +669,8 @@ Closing your OWN session (run from inside it, e.g. --seat "$ACPX_SEAT_URL"):
       "The session's Operating System: `default` (follows this box) or an OS root under /workspace/ " +
         "or /opt/atrium-os/ (a directory holding agents.md). Without it: a successor, fork or " +
         "by-the-way takes its source's; a child its parent's; otherwise $ATRIUM_OS, else default.",
-      (value: string) => parseNonEmptyValue("OS", value),
+      // NOT parseNonEmptyValue: `--os ""` means default (§1.4 rule 1); validateOsChoice decides.
+      (value: string) => value,
     )
     .option("--ephemeral", "Mark the copy as a by-the-way ephemeral side-thread")
     .option(
@@ -789,9 +791,8 @@ Closing your OWN session (run from inside it, e.g. --seat "$ACPX_SEAT_URL"):
       "acpx record id, ACP session id, unique suffix, or acpx-ui ?session= URL (never a name)",
       (value: string) => parseNonEmptyValue("Session", value),
     )
-    .argument("<choice>", "`default` or an OS root path", (value: string) =>
-      parseNonEmptyValue("OS choice", value),
-    )
+    // `""` reads as default, like `--os ""` (§1.4 rule 1): validateOsChoice decides, not the parser.
+    .argument("<choice>", "`default` (or empty) or an OS root path")
     .option("--dry-run", "Validate and show the change; write nothing")
     .action(async function (
       this: Command,

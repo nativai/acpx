@@ -163,15 +163,34 @@ function isPathRepresentable(value: string): boolean {
 }
 
 /** §1.4 rules 4, 5 and 7 for a normalised explicit path; `undefined` = acceptable. */
+//
+// ⚠️ Rules 4 and 5 are checked on the path AS GIVEN and on its REALPATH. The stored string is never
+// realpath'd (step 2), but a `/workspace/x` symlink to `/tmp/y` must not pass rule 4 by its spelling:
+// the target would live on one pod only, which is what rule 4 exists to prevent (P3a TE note N2).
 function explicitRootRefusal(normalised: string): string | undefined {
-  if (!ALLOWED_OS_CHOICE_ROOTS.some((root) => normalised.startsWith(root))) {
+  const spelled = rootAndDotRefusal(normalised);
+  if (spelled !== undefined) {
+    return spelled;
+  }
+  let real: string;
+  try {
+    real = realpathSync(normalised);
+  } catch {
+    return "not a directory holding a regular agents.md";
+  }
+  const resolved = rootAndDotRefusal(real);
+  if (resolved !== undefined) {
+    return `resolves to ${real}, which is ${resolved}`;
+  }
+  return isUsableOsRoot(normalised) ? undefined : "not a directory holding a regular agents.md";
+}
+
+function rootAndDotRefusal(candidate: string): string | undefined {
+  if (!ALLOWED_OS_CHOICE_ROOTS.some((root) => candidate.startsWith(root))) {
     return `not under ${ALLOWED_OS_CHOICE_ROOTS.join(" or ")}`;
   }
-  if (normalised.split("/").some((component) => component.startsWith("."))) {
+  if (candidate.split("/").some((component) => component.startsWith("."))) {
     return "a path component starts with '.' (dot-folders are not allowed)";
-  }
-  if (!isUsableOsRoot(normalised)) {
-    return "not a directory holding a regular agents.md";
   }
   return undefined;
 }
@@ -430,8 +449,16 @@ function oneLine(text: string, max = 200): string {
   return text.replace(/\s+/g, " ").trim().slice(0, max);
 }
 
-export function fallbackNoticeText(missing: string, root: string): string {
-  return `⟦OS-NOTICE⟧ This session's Operating System ${missing} was not found when your agent started, so you are running on the box default (${root}) — its commands and primer, not ${missing}'s. If you were testing ${missing}, stop and tell whoever started you.`;
+/**
+ * `primerFollows`: whether this harness re-renders its primer at every agent start (claude: on resume; pi:
+ * per spawn). Codex does NOT — it keeps the developer instructions it was created with — so for codex only
+ * the commands and PATH switch, and the notice must not claim the primer did (P3a TE note N4).
+ */
+export function fallbackNoticeText(missing: string, root: string, primerFollows = true): string {
+  const what = primerFollows
+    ? `you are running on the box default (${root}) — its commands and primer, not ${missing}'s`
+    : `your commands and PATH now use the box default (${root}), not ${missing}'s; the primer you received when this session was created is unchanged`;
+  return `⟦OS-NOTICE⟧ This session's Operating System ${missing} was not found when your agent started, so ${what}. If you were testing ${missing}, stop and tell whoever started you.`;
 }
 
 export function primerNoticeText(reason: string, root: string): string {
