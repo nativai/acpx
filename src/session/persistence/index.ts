@@ -472,12 +472,17 @@ function parseIndexAccountSwitch(value: unknown): SessionIndexAccountSwitch | un
 }
 
 export type SessionCreatedBy = {
-  kind: "wakeup" | "trigger-run" | "auto-session";
+  kind: "wakeup" | "trigger-run" | "auto-session" | "mail";
   label: string;
   ref: string;
 };
 
-const CREATED_BY_KINDS: ReadonlySet<string> = new Set(["wakeup", "trigger-run", "auto-session"]);
+const CREATED_BY_KINDS: ReadonlySet<string> = new Set([
+  "wakeup",
+  "trigger-run",
+  "auto-session",
+  "mail",
+]);
 
 function createdByOf(kind: unknown, label: unknown, ref: unknown): SessionCreatedBy | undefined {
   return typeof kind === "string" &&

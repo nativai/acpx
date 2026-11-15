@@ -760,6 +760,30 @@ test("the index projection: sleeping, createdBy (kind/label/ref from three metad
       "projection-1.json",
     );
     assert.equal(bad.createdBy, undefined, "an unknown kind is absent, never guessed");
+
+    // A mail spawn (acpx-ui `server/mail/`) records kind "mail"; both index legs keep it.
+    const mailEntry = toSessionIndexEntry(
+      makeSessionRecord(
+        {
+          ...base,
+          metadata: {
+            created_by_kind: "mail",
+            created_by_label: "Daniel Brammertz",
+            created_by_ref: "6f1c2a9e-7b1d-5c55-9a0e-5d2f8e6b1a40",
+          },
+        },
+        { defaultAcpx: false },
+      ),
+      "projection-1.json",
+    );
+    assert.deepEqual(mailEntry.createdBy, {
+      kind: "mail",
+      label: "Daniel Brammertz",
+      ref: "6f1c2a9e-7b1d-5c55-9a0e-5d2f8e6b1a40",
+    });
+    await writeSessionIndex(dir, { files: ["projection-1.json"], entries: [mailEntry] });
+    const mailBack = (await readSessionIndex(dir))?.entries[0];
+    assert.deepEqual(mailBack?.createdBy, mailEntry.createdBy, "the parse leg keeps kind mail");
     assert.equal(bad.sleeping, undefined, "an ordinary record is not sleeping");
     assert.equal(bad.forkTemplate, undefined);
   } finally {
