@@ -80,6 +80,9 @@ type MockAgentOptions = {
   supportsLoadSession: boolean;
   supportsResumeSession: boolean;
   supportsForkSession: boolean;
+  /** Like the real Claude adapter: `session/fork` throws resourceNotFound(<the NEW fork id>) when
+   *  `<CLAUDE_CONFIG_DIR>/projects/<slug(request cwd)>/<source id>.jsonl` is missing (brick 765510a3). */
+  claudeForkRequiresSourceTranscript: boolean;
   supportsCloseSession: boolean;
   supportsListSessions: boolean;
   listPageSize: number;
@@ -510,6 +513,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let supportsLoadSession = false;
   let supportsResumeSession = false;
   let supportsForkSession = false;
+  let claudeForkRequiresSourceTranscript = false;
   let supportsCloseSession = false;
   let supportsListSessions = false;
   let listPageSize = 100;
@@ -567,6 +571,11 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
 
     if (token === "--supports-fork-session") {
       supportsForkSession = true;
+      continue;
+    }
+
+    if (token === "--claude-fork-requires-source-transcript") {
+      claudeForkRequiresSourceTranscript = true;
       continue;
     }
 
@@ -824,6 +833,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     supportsLoadSession,
     supportsResumeSession,
     supportsForkSession,
+    claudeForkRequiresSourceTranscript,
     supportsCloseSession,
     supportsListSessions,
     listPageSize,
@@ -1343,6 +1353,25 @@ class MockAgent implements Agent {
 
     const source = this.sessions.get(params.sessionId);
     const sessionId = randomUUID();
+    const claudeTranscriptAtRequestCwd = existsSync(
+      transcriptJsonlPath(
+        process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude"),
+        params.cwd,
+        params.sessionId,
+      ),
+    );
+    if (this.options.claudeForkRequiresSourceTranscript && !claudeTranscriptAtRequestCwd) {
+      this.recordOperation({
+        method: "session/fork",
+        sourceSessionId: params.sessionId,
+        sessionId,
+        cwd: params.cwd,
+        claudeTranscriptAtRequestCwd,
+        claudeConfigDir: process.env.CLAUDE_CONFIG_DIR ?? null,
+        refused: "resource-not-found",
+      });
+      throw RequestError.resourceNotFound(sessionId);
+    }
     const forkState = source ?? createSessionState(false);
     this.sessions.set(sessionId, forkState);
     this.recordOperation({
@@ -1353,13 +1382,8 @@ class MockAgent implements Agent {
       processCwd: process.cwd(),
       // What the real Claude adapter needs: Claude Code resumes the source from
       // `projects/<slug(request cwd)>/<source id>.jsonl` (brick 45917618 §5.5 D6).
-      claudeTranscriptAtRequestCwd: existsSync(
-        transcriptJsonlPath(
-          process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude"),
-          params.cwd,
-          params.sessionId,
-        ),
-      ),
+      claudeTranscriptAtRequestCwd,
+      claudeConfigDir: process.env.CLAUDE_CONFIG_DIR ?? null,
       // What pi-acp would read: the source JSONL in the copy's own pi session dir, and the cwd its
       // `session` header names (brick 45917618 §5.5 D7).
       piStagedHeaderCwd: piStagedHeaderCwd(params.sessionId),

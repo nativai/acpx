@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
-  resolveExistingTranscriptPath,
+  selectFreshestTranscript,
   transcriptJsonlPath,
 } from "../config/subscription-transcript.js";
 import { chooseSubscriptionConfigDir, loadSubscriptionRegistry } from "../config/subscriptions.js";
@@ -86,16 +86,43 @@ export async function readClaudeTranscript(
   acpSessionId: string,
   subscriptionId: string | undefined,
 ): Promise<string | undefined> {
-  const configDir = resolveClaudeConfigDir(subscriptionId);
-  const resolved = await resolveExistingTranscriptPath(configDir, cwd, acpSessionId);
-  if (!resolved) {
+  const sourcePath = await locateClaudeForkSourceTranscript(
+    resolveClaudeConfigDir(subscriptionId),
+    cwd,
+    acpSessionId,
+  );
+  if (!sourcePath) {
     return undefined;
   }
   try {
-    return await fs.readFile(resolved.path, "utf8");
+    return await fs.readFile(sourcePath, "utf8");
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Where a Claude fork finds its SOURCE transcript when the fork runs under `configDir`. The answer
+ * is the freshest copy across every known config dir: the fork's own dir first, then every
+ * registered subscription, then `~/.claude`. Both slug forms are checked.
+ *
+ * The fork's own dir is NOT enough. A transcript lives under the subscription that ran it, and a
+ * fork can run on another one: a sleeping template copy that failover moved off the template's
+ * exhausted subscription, or a copy pinned elsewhere. Claude Code then resumes the source under a
+ * dir that never saw it, and the adapter answers `Resource not found: <the NEW fork's id>`.
+ * That happened to session 716286ae (brick 765510a3).
+ *
+ * ⚠️ DO NOT NARROW THIS BACK TO `resolveExistingTranscriptPath(configDir, …)`. It looks
+ * equivalent whenever source and fork share a subscription, which is the case every same-account
+ * test covers. `test/session-root-cli.test.ts` → "765510a3" holds the cross-subscription shape.
+ */
+export async function locateClaudeForkSourceTranscript(
+  configDir: string,
+  cwd: string,
+  acpSessionId: string,
+): Promise<string | undefined> {
+  const { best } = await selectFreshestTranscript({ cwd, acpSessionId }, configDir);
+  return best?.jsonlPath;
 }
 
 export async function materializeClaudeForkSession(args: {
@@ -156,18 +183,17 @@ async function stageClaudeSourceTranscriptForDestination(args: {
     return async () => {};
   }
 
-  // Source may still sit under the pre-fix slug (brick://ae715773); fall back to
+  // Source may still sit under the pre-fix slug (brick://ae715773) or under another
+  // subscription's config dir (brick 765510a3); fall back to
   // the primary path when neither exists so the readFile below fails naming the
   // canonical location. The DESTINATION is always primary — Claude Code is about
   // to read it, and it reads only that form.
-  const resolvedSource = await resolveExistingTranscriptPath(
-    args.configDir,
-    args.sourceCwd,
-    args.sourceAcpSessionId,
-  );
   const sourcePath =
-    resolvedSource?.path ??
-    transcriptJsonlPath(args.configDir, args.sourceCwd, args.sourceAcpSessionId);
+    (await locateClaudeForkSourceTranscript(
+      args.configDir,
+      args.sourceCwd,
+      args.sourceAcpSessionId,
+    )) ?? transcriptJsonlPath(args.configDir, args.sourceCwd, args.sourceAcpSessionId);
   const destinationPath = transcriptJsonlPath(
     args.configDir,
     args.destinationCwd,

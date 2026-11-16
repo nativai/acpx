@@ -40,10 +40,7 @@ import {
 import { resolveBuiltInAgentLaunch } from "../agent-registry.js";
 import { TimeoutError, withTimeout } from "../async-control.js";
 import type { ProvisioningWarningBreadcrumb } from "../config/os-harness-provisioning.js";
-import {
-  resolveExistingTranscriptPath,
-  transcriptJsonlPath,
-} from "../config/subscription-transcript.js";
+import { transcriptJsonlPath } from "../config/subscription-transcript.js";
 import {
   AgentDisconnectedError,
   AgentSpawnError,
@@ -127,6 +124,7 @@ import {
   resolveClaudeForkCutByRecord,
 } from "./claude-fork-anchor.js";
 import {
+  locateClaudeForkSourceTranscript,
   materializeClaudeForkSession,
   readClaudeTranscript,
   resolveClaudeConfigDir,
@@ -2730,11 +2728,14 @@ export class AcpClient {
     sessionCwd: string,
   ): Promise<CrossCwdForkStage | undefined> {
     const sourceCwd = forkContext.sourceCwd;
-    if (path.resolve(sourceCwd) === path.resolve(sessionCwd)) {
-      return undefined;
-    }
+    // A Claude fork is staged even within ONE cwd: its source can sit under another subscription
+    // than the one this fork runs on (brick 765510a3). `claudeForkStage` returns undefined when the
+    // source already is at the destination path.
     if (forkContext.claudeFork) {
       return await this.claudeForkStage(sourceCwd, sourceAcpSessionId, sessionCwd);
+    }
+    if (path.resolve(sourceCwd) === path.resolve(sessionCwd)) {
+      return undefined;
     }
     const { command, args } = splitCommandLine(this.options.agentCommand);
     if (!isPiAcpCommand(command, args)) {
@@ -2749,11 +2750,16 @@ export class AcpClient {
     sessionCwd: string,
   ): Promise<{ sourcePath: string; stagedPath: string } | undefined> {
     const configDir = resolveClaudeConfigDir(this.claudeCopySubscriptionSelection());
-    // The source may still sit under the pre-fix slug (brick://ae715773); the STAGED copy is
-    // always at the primary path, the only form Claude Code reads.
-    const resolved = await resolveExistingTranscriptPath(configDir, sourceCwd, sourceAcpSessionId);
-    const sourcePath =
-      resolved?.path ?? transcriptJsonlPath(configDir, sourceCwd, sourceAcpSessionId);
+    // The source may sit under the pre-fix slug (brick://ae715773) or under ANOTHER subscription's
+    // config dir (brick 765510a3: a template copy that failover moved off the template's account).
+    // The STAGED copy is always at the primary path under THIS fork's config dir, the only place
+    // the adapter's Claude Code reads.
+    const located = await locateClaudeForkSourceTranscript(
+      configDir,
+      sourceCwd,
+      sourceAcpSessionId,
+    );
+    const sourcePath = located ?? transcriptJsonlPath(configDir, sourceCwd, sourceAcpSessionId);
     const stagedPath = transcriptJsonlPath(configDir, sessionCwd, sourceAcpSessionId);
     return sourcePath === stagedPath ? undefined : { sourcePath, stagedPath };
   }

@@ -1624,11 +1624,34 @@ function copySessionOptionsWithOverride(
   source: SessionRecord,
   globalFlags: GlobalFlags,
 ): ReturnType<typeof sourceSessionOptions> {
-  const base = sourceSessionOptions(source);
+  const base = withoutTemplateCredential(source, sourceSessionOptions(source));
   const merged = { ...base };
   applyCopyCredentialOverride(merged, globalFlags, base?.profile ?? base?.subscription);
   applyGuardedCopyModel(merged, globalFlags, base?.model);
   return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+/**
+ * brick 765510a3 (Daniel, 2026-11-16: "It doesn't make sense for the template to be bound to any
+ * subscription"): a copy of a TEMPLATE takes its model and effort from it, never its
+ * subscription. The copy gets its subscription by normal selection (an explicit
+ * `--profile`/`--subscription`, otherwise the registry default and failover), like any new session.
+ * The template's own subscription is only where its one turn happened to run. Inheriting it pinned
+ * every start to that account, so an exhausted account failed all of them, and a lock on it refused
+ * them. A copy of an ordinary session still inherits, as before.
+ *
+ * ⚠️ DO NOT DROP THE TEMPLATE GATE TO "SIMPLIFY". A fork of a working session keeps its account on
+ * purpose. `test/fork-cross-subscription.test.ts` → "765510a3 template binding" pins both sides.
+ */
+function withoutTemplateCredential(
+  source: SessionRecord,
+  options: ReturnType<typeof sourceSessionOptions>,
+): ReturnType<typeof sourceSessionOptions> {
+  if (source.template === undefined || options === undefined) {
+    return options;
+  }
+  const { profile: _profile, subscription: _subscription, ...rest } = options;
+  return Object.keys(rest).length > 0 ? rest : undefined;
 }
 
 // Mirror of the above for `desiredConfigOptions` — the persisted desired effort
