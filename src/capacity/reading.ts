@@ -3,8 +3,10 @@ import os from "node:os";
 import { queueBaseDir } from "../cli/queue/paths.js";
 import { sessionBaseDir } from "../session/persistence/repository.js";
 import { type Basis, type BudgetResolution, readPodInfo, resolveBudget } from "./budget.js";
+import { type BuildFigure, buildTest, chargeBuildReservations, holderOf } from "./build.js";
 import { type CgroupReading, type NodeReading, readCgroup, readNode } from "./cgroup.js";
 import {
+  BUILD_CONSTANTS,
   CAPACITY_CONSTANTS,
   type CapacityConstants,
   HARNESSES,
@@ -168,6 +170,11 @@ export type CapacitySnapshot = {
    * §6.4): a dead governor is visible wherever capacity is shown.
    */
   readonly governor: GovernorLiveness;
+  /**
+   * The release build's test and holder (CONCEPTION 25479d40 §5.1): `fits` is what `--need-build`
+   * exits on and what `acpx capacity run-build` waits for. The build is never in `owners.starting`.
+   */
+  readonly build: BuildFigure;
 };
 
 function boxName(): string {
@@ -196,6 +203,14 @@ export type ReadCapacityOptions = {
   readonly admissionClass?: CapacityClass;
   /** The governor's state dir (heartbeat); default `~/.acpx/governor`. */
   readonly governorDir?: string;
+  /** The release build's estimate for `build.needBytes`; default `BUILD_CONSTANTS.buildReserveBytes`. */
+  readonly buildBytes?: number;
+  /**
+   * Count the reading process in `C` (review R11): `run-build` is a LONG-LIVED reader that stays in
+   * the cgroup for the whole build, so excluding it, as the short-lived `acpx capacity` must, would
+   * under-read `C` by its own ~60 MiB in the unsafe direction. It stays out of every owner tree.
+   */
+  readonly countReader?: boolean;
 };
 
 const nul = <T>(value: T | undefined): T | null => (value === undefined ? null : value);
@@ -214,12 +229,33 @@ type Gathered = {
   readonly slotDeduction: number;
 };
 
+/** The reading process: excluded from `C` — unless it is `run-build`, which counts itself (R11). */
+function readerOf(options: ReadCapacityOptions): ReaderFootprint {
+  const footprint = readReaderFootprint(options.sources.procRoot);
+  return options.countReader ? { pid: footprint.pid, bytes: 0 } : footprint;
+}
+
+/** Pending reservations with every building release build charged at its remainder (R12). */
+function pendingOf(
+  options: ReadCapacityOptions,
+  cgroup: CgroupReading,
+  reader: ReaderFootprint,
+  census: OwnerCensus,
+): PendingPartition {
+  const raw = cgroup.committed?.committedBytes;
+  const committedNow = raw === undefined ? undefined : Math.max(0, raw - reader.bytes);
+  return partitionPending(
+    chargeBuildReservations(options.pending ?? [], options.sources.procRoot, committedNow),
+    new Set(census.owners.map((owner) => owner.sessionId)),
+  );
+}
+
 function gather(options: ReadCapacityOptions): Gathered {
   const constants = options.constants ?? CAPACITY_CONSTANTS;
   const now = options.now ?? new Date();
   const { sources } = options;
   const cgroup = readCgroup(sources.cgroupRoot);
-  const reader = readReaderFootprint(sources.procRoot);
+  const reader = readerOf(options);
   const census = censusOwners({
     queueDir: sources.queueDir,
     sessionsDir: sources.sessionsDir,
@@ -228,10 +264,7 @@ function gather(options: ReadCapacityOptions): Gathered {
     freshMs: constants.leaseFreshMs,
     readerPid: reader.pid,
   });
-  const pending = partitionPending(
-    options.pending ?? [],
-    new Set(census.owners.map((owner) => owner.sessionId)),
-  );
+  const pending = pendingOf(options, cgroup, reader, census);
   return {
     reader,
     constants,
@@ -485,7 +518,43 @@ function waitingField(queue: WaitingQueue): CapacitySnapshot["waiting"] {
  * `prompt-batch`: `prompt --batch-file` + the owner's `submit_prompt_batch`.
  * `sessions-new-sleeping`: `sessions new|copy --sleeping` (a build without it answers exit 2).
  */
-export const ACPX_FEATURES: readonly string[] = ["prompt-batch", "sessions-new-sleeping"];
+export const ACPX_FEATURES: readonly string[] = [
+  "prompt-batch",
+  "sessions-new-sleeping",
+  // `acpx capacity run-build` + the `build` object + `--need-build` (CONCEPTION 25479d40 §5.1).
+  // The capability probe the deploy recipe and refresh.sh read before wrapping a refresh (R4).
+  "run-build",
+];
+
+function buildFigureOf(
+  g: Gathered,
+  measured: Measured | undefined,
+  formula: FormulaResult | undefined,
+  buildBytes: number | undefined,
+): BuildFigure {
+  const needBytes = buildBytes ?? BUILD_CONSTANTS.buildReserveBytes;
+  const holder = holderOf(g.pending.builds);
+  if (!measured || !formula) {
+    return buildTest({ needBytes, configured: g.budget.configured, holder });
+  }
+  return buildTest({
+    needBytes,
+    configured: g.budget.configured,
+    holder,
+    measured: {
+      limitBytes: measured.limit,
+      committedBytes: measured.committed,
+      marginBytes: formula.marginBytes,
+      oomMarginBytes: formula.oomMarginBytes,
+      chargedBytes: formula.chargedBytes,
+      buildBytes: g.pending.buildBytes,
+      // The formula's own G3 predicate: an unknown request counts as borrowing.
+      borrowing: g.budget.requestBytes === undefined || measured.budget > g.budget.requestBytes,
+      nodeAvailableBytes: g.node.availableBytes,
+      nodeFloorBytes: g.constants.nodeFloorBytes,
+    },
+  });
+}
 
 export function readCapacity(options: ReadCapacityOptions): CapacitySnapshot {
   const g = gather(options);
@@ -522,6 +591,7 @@ export function readCapacity(options: ReadCapacityOptions): CapacitySnapshot {
       g.now.getTime(),
       options.sources.procRoot,
     ),
+    build: buildFigureOf(g, measured, formula, options.buildBytes),
   };
 }
 

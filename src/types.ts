@@ -248,10 +248,10 @@ export type AutomationCapacityReservedDetail = {
 
 /** Why the create gate refused (CONCEPTION f7587c86 §8.2) — the `reason=` token on stderr. */
 export type CapacityRefusalReason =
-  | "no_capacity"
-  | "memory_pressure"
-  | "node_pressure"
-  | "admission_busy";
+  // A release build found no room within its `--wait` (`acpx capacity run-build`, CONCEPTION
+  // 25479d40 §5.2): exit 75, nothing run. Its token line carries its own fields (need_mib, room_mib,
+  // waited_s, live), not the create gate's.
+  "no_room_for_build" | "no_capacity" | "memory_pressure" | "node_pressure" | "admission_busy";
 
 /**
  * Additive JSON-RPC data of a capacity refusal. `capacity` is the same snapshot `acpx capacity
