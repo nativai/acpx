@@ -9,7 +9,8 @@ import { callerIsAgent } from "./byway-close-guard.js";
 /**
  * `sessions close`'s open-person-request guard (brick 2587d30e, addressing v3 §8.3 / K18 P6).
  *
- * An agent with an open question must resolve it or close with `--force`. Plain messages do not
+ * An agent's close over an open question is refused; the refusal says how to settle it
+ * (`openRequestsMessage`), or the agent closes with `--force`. Plain messages do not
  * block closing. Atrium keeps the items open after an agent closes, including a forced close.
  *
  * ## The mechanism (O-11): a READ of atrium's rows, not a count in the session record
@@ -178,9 +179,27 @@ export async function readOpenPersonRequests(
   }
 }
 
+/**
+ * The refusal names the exact settle command (brick 2085f83b, finding X-CLI-2: advice without a
+ * command was ignored). ⚠️ Never advise "resolve them" again: an ANSWERED question stays open —
+ * the person's ✓ Done or reply clears it — and `--resolve … --close-only` only withdraws a
+ * question never needed and never answered, closing ALL that seat's items to the person. Same
+ * text as the OS (`Skills/acpx/send-message.md`, `SKILL.md`); the ACPXG-1 rows pin it.
+ */
 export function openRequestsMessage(sessionId: string, open: readonly OpenPersonRequest[]): string {
+  const people = new Map(open.map((request) => [request.to.id, request.to]));
   const names = [...new Set(open.map((request) => request.to.name))].join(", ");
-  return `${sessionId} has open requests to ${names}; resolve them or add --force`;
+  const commands = [...people.values()]
+    .map((to) => `send-message.sh --resolve person:${to.handle ?? to.id} --close-only`)
+    .join("; ");
+  const one = open.length === 1;
+  return (
+    `${sessionId} has ${one ? "an open question" : "open questions"} to ${names}. ` +
+    `Answered? Leave ${one ? "it" : "them"} open: their ✓ Done or reply clears ${one ? "it" : "them"}; ` +
+    "close later, or add --force (their items stay open for them). " +
+    `Never needed and never answered? From that session: ${commands} ` +
+    `(${people.size === 1 ? "withdraws" : "each withdraws"} ALL its open items to that person); then close.`
+  );
 }
 
 export type OpenPersonRequestsDecision =

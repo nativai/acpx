@@ -169,12 +169,35 @@ test("ACPXG-1 · open requests refuse with the exact wording, the names de-dupli
   assert.ok(!decision.proceed);
   assert.equal(
     decision.message,
-    `${ID} has open requests to Daniel Laatz, Ada Voss; resolve them or add --force`,
+    `${ID} has open questions to Daniel Laatz, Ada Voss. ` +
+      "Answered? Leave them open: their ✓ Done or reply clears them; close later, or add --force (their items stay open for them). " +
+      "Never needed and never answered? From that session: send-message.sh --resolve person:laatz --close-only; send-message.sh --resolve person:p-2 --close-only " +
+      "(each withdraws ALL its open items to that person); then close.",
   );
   assert.equal(decision.message, openRequestsMessage(ID, decision.open));
   assert.deepEqual(decideOnOpenPersonRequests(ID, { kind: "answered", open: [] }), {
     proceed: true,
   });
+});
+
+// Brick 2085f83b (finding X-CLI-2): the refusal prints the exact settle command, one per person,
+// and never the old "resolve them" advice — which is wrong for an ANSWERED question (leave it open).
+test("2085f83b · the refusal prints one settle command per person — handle when known, the person id otherwise — and never 'resolve them'", () => {
+  const read = classifyPersonMessagesAnswer(
+    200,
+    answer([row("open", OTHER), row("open", OTHER)]).body,
+  );
+  const decision = decideOnOpenPersonRequests(ID, read);
+  assert.ok(!decision.proceed);
+  assert.equal(
+    decision.message,
+    `${ID} has open questions to Ada Voss. ` +
+      "Answered? Leave them open: their ✓ Done or reply clears them; close later, or add --force (their items stay open for them). " +
+      "Never needed and never answered? From that session: send-message.sh --resolve person:p-2 --close-only " +
+      "(withdraws ALL its open items to that person); then close.",
+  );
+  assert.doesNotMatch(decision.message, /resolve them/);
+  assert.equal(decision.message.split("--resolve").length - 1, 1, "one command per person");
 });
 
 test("ACPXG-3 · the route-absent decision proceeds, says so only under --verbose, and differs from `0 open` (which says nothing)", () => {
@@ -345,10 +368,14 @@ test("ACPXG-1 · `sessions close` is REFUSED while a request is open — exit 1,
     assert.equal(refused.code, 1, refused.stderr);
     assert.ok(
       refused.stderr.includes(
-        `${id} has open requests to Daniel Laatz; resolve them or add --force`,
+        `sessions close: OPEN_PERSON_REQUESTS: ${id} has an open question to Daniel Laatz. ` +
+          "Answered? Leave it open: their ✓ Done or reply clears it; close later, or add --force (their items stay open for them). " +
+          "Never needed and never answered? From that session: send-message.sh --resolve person:laatz --close-only " +
+          "(withdraws ALL its open items to that person); then close.\n",
       ),
       refused.stderr,
     );
+    assert.doesNotMatch(refused.stderr, /resolve them or add --force/);
     assert.notEqual((await rig.onDisk(id)).closed, true, "a refused close moved the record");
     assert.ok(
       rig.stub.requests.includes(`GET /api/sessions/${id}/person-messages`),
@@ -413,7 +440,7 @@ test("ACPXG-1 · an agent closing ITSELF with a request open is refused too (no 
     const self = { ACPX_SESSION_URL: `https://ui.example.test/?session=${id}` };
     const refused = await rig.cli(["sessions", "close", "--session-id", id], undefined, self);
     assert.equal(refused.code, 1, refused.stderr);
-    assert.match(refused.stderr, /has open requests to Daniel Laatz/);
+    assert.match(refused.stderr, /has an open question to Daniel Laatz/);
     assert.notEqual((await rig.onDisk(id)).closed, true);
   });
 });
@@ -456,7 +483,7 @@ test("ACPXG-2 · NEGATIVE — a hand-over keeps the rows: closing the RETIRED pr
 
     const refused = await rig.cli(["sessions", "close", "--session-id", successor]);
     assert.equal(refused.code, 1, refused.stderr);
-    assert.match(refused.stderr, /has open requests to Daniel Laatz/);
+    assert.match(refused.stderr, /has an open question to Daniel Laatz/);
   });
 });
 
