@@ -5,7 +5,7 @@ import {
   readWaitingForProbe,
   type WakeDecision,
 } from "../capacity/admission.js";
-import { type Harness, HARNESSES, isHarness, MIB } from "../capacity/constants.js";
+import { BUILD_CONSTANTS, type Harness, HARNESSES, isHarness, MIB } from "../capacity/constants.js";
 import { governorLivenessLine } from "../capacity/governor/status.js";
 import {
   type AdmissionLockState,
@@ -20,6 +20,7 @@ import {
   needMetReason,
   readCapacity,
 } from "../capacity/reading.js";
+import { type RunBuildResult, runBuild } from "../capacity/run-build.js";
 import { EXIT_CODES, type OutputFormat } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import { parseOutputFormat, resolveGlobalFlags } from "./flags.js";
@@ -42,7 +43,13 @@ import { ownerMayBeRunning, wakeRequestFor } from "./session/wake-gate.js";
  * exits 0 — fail open.
  */
 
-type CapacityFlags = { agent?: Harness; need?: number; class?: CapacityClass };
+type CapacityFlags = {
+  agent?: Harness;
+  need?: number;
+  class?: CapacityClass;
+  /** `--need-build` (CONCEPTION 25479d40 §5.1): exit 0 when `build.fits`, else 75. */
+  needBuild?: boolean;
+};
 
 const CLASSES: readonly CapacityClass[] = ["spawn", "automation"];
 
@@ -107,11 +114,16 @@ const yours = (s: CapacitySnapshot): string =>
 function chargeLine(s: CapacitySnapshot, charged: number, base: number): string {
   const ownerCharge = s.owners.trees.reduce((sum, tree) => sum + tree.chargedBytes, 0);
   const workingSet = s.workingSetBytes === null ? "" : ` · working set ${gib(s.workingSetBytes)}`;
+  // A release build's reservation is in `pendingBytes` but never in `owners.starting` (R12).
+  const buildCharge = s.build.holder?.chargedBytes ?? 0;
   const starting =
-    s.owners.starting > 0 ? ` + ${s.owners.starting} starting ${gib(s.pendingBytes)}` : "";
+    s.owners.starting > 0
+      ? ` + ${s.owners.starting} starting ${gib(s.pendingBytes - buildCharge)}`
+      : "";
+  const build = s.build.holder ? ` + release build ${gib(buildCharge)}` : "";
   return (
     `charged ${gib(charged)} = base ${gib(base)} + ${plural(s.owners.live, "owner")}${yours(s)} ` +
-    `${gib(ownerCharge)}${starting} · committed ${gib(s.committedBytes ?? 0)} (anon + kernel) · margin ` +
+    `${gib(ownerCharge)}${starting}${build} · committed ${gib(s.committedBytes ?? 0)} (anon + kernel) · margin ` +
     `${gib(s.marginBytes ?? 0)}${workingSet}`
   );
 }
@@ -193,12 +205,30 @@ function pressureLine(s: CapacitySnapshot): string {
   return parts.filter((part) => part !== undefined).join(" · ");
 }
 
+/**
+ * `release build: …` (CONCEPTION 25479d40 §5.1): whether a release build fits now, and the one that
+ * holds the reservation, if any.
+ */
+export function buildLine(s: CapacitySnapshot, now: Date = new Date()): string {
+  const holder = s.build.holder;
+  if (holder === null) {
+    return `release build: ${s.build.reason}`;
+  }
+  const what = holder.phase === "building" ? "running" : "waiting for room";
+  const pids = holder.buildPid === null ? `pid ${holder.pid}` : `build pid ${holder.buildPid}`;
+  return (
+    `release build: ${what} since ${sinceLabel(holder.since, now)} (${pids}; ` +
+    `${gib(holder.chargedBytes)} of ${gib(holder.bytes)} still reserved) — another would: ${s.build.reason}`
+  );
+}
+
 export function renderCapacityText(s: CapacitySnapshot): string {
   const waiting = waitingLine(s);
   const lines = [
     headLine(s),
     ...slotLines(s),
     ...(waiting ? [waiting] : []),
+    buildLine(s),
     pressureLine(s),
     ...s.alternatives.map(
       (alt) =>
@@ -243,10 +273,16 @@ function lockLine(lock: AdmissionLockState): string | undefined {
 
 type NeedRequest = { readonly need: number; readonly verdict: NeedVerdict };
 
+/** `--need-build`: `build.fits`, with the build line's own reason (§5.1). */
+function needBuildVerdict(snapshot: CapacitySnapshot): NeedVerdict {
+  return { met: snapshot.build.fits, reason: snapshot.build.reason };
+}
+
 function writeCapacityText(
   snapshot: CapacitySnapshot,
   lock: AdmissionLockState,
   request: NeedRequest | undefined,
+  buildRequest: NeedVerdict | undefined,
 ): void {
   process.stdout.write(renderCapacityText(snapshot));
   const busyLine = lockLine(lock);
@@ -259,6 +295,10 @@ function writeCapacityText(
       `need ${plural(request.need, `${snapshot.agent} slot`)}: ${label} — ${request.verdict.reason}\n`,
     );
   }
+  if (buildRequest) {
+    const label = buildRequest.met ? "met (exit 0)" : "NOT MET (exit 75)";
+    process.stdout.write(`need build: ${label} — ${buildRequest.reason}\n`);
+  }
 }
 
 function writeCapacity(
@@ -266,9 +306,10 @@ function writeCapacity(
   snapshot: CapacitySnapshot,
   lock: AdmissionLockState,
   request: NeedRequest | undefined,
+  buildRequest: NeedVerdict | undefined,
 ): void {
   const body = { ...snapshot, admissionLock: lock };
-  const json = request
+  const withNeed = request
     ? {
         ...body,
         need: request.need,
@@ -276,6 +317,14 @@ function writeCapacity(
         needMetReason: request.verdict.reason,
       }
     : body;
+  const json = buildRequest
+    ? {
+        ...withNeed,
+        needBuild: true,
+        needBuildMet: buildRequest.met,
+        needBuildReason: buildRequest.reason,
+      }
+    : withNeed;
   if (emitJsonResult(format, json)) {
     return;
   }
@@ -283,7 +332,7 @@ function writeCapacity(
     process.stdout.write(`${snapshot.slotsAfterMakeRoom?.[snapshot.agent] ?? snapshot.verdict}\n`);
     return;
   }
-  writeCapacityText(snapshot, lock, request);
+  writeCapacityText(snapshot, lock, request, buildRequest);
 }
 
 async function handleCapacity(
@@ -304,10 +353,16 @@ async function handleCapacity(
     flags.need === undefined
       ? undefined
       : { need: flags.need, verdict: needVerdict(snapshot, flags.need, lock) };
-  writeCapacity(format, snapshot, lock, request);
-  if (request && !request.verdict.met) {
+  const buildRequest = flags.needBuild ? needBuildVerdict(snapshot) : undefined;
+  writeCapacity(format, snapshot, lock, request, buildRequest);
+  if (!allMet([request?.verdict, buildRequest])) {
     process.exitCode = EXIT_CODES.CAPACITY;
   }
+}
+
+/** `--need N` and `--need-build` together: exit 75 when either asked-for verdict is not met. */
+function allMet(verdicts: ReadonlyArray<NeedVerdict | undefined>): boolean {
+  return verdicts.every((verdict) => verdict === undefined || verdict.met);
 }
 
 /**
@@ -333,6 +388,10 @@ export function registerCapacityCommand(parent: Command, config: ResolvedAcpxCon
       "Whose slots: spawn (default; net of queued automation) or automation (gross)",
       parseClass,
     )
+    .option(
+      "--need-build",
+      "Exit 75 unless a release build fits now (the `build` object's `fits`); 0 when it does",
+    )
     .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
     // Subcommands are registered BEFORE `program.exitOverride()` (cli-core `main`), so without
     // this commander exits a usage error with its own 1. Thrown, it reaches
@@ -349,6 +408,87 @@ export function registerCapacityCommand(parent: Command, config: ResolvedAcpxCon
   // `enablePositionalOptions()` (inherited) keeps `capacity --class spawn|automation` apart from
   // `admit-wake --class delivery|automation`. Rows "admit-wake: CLI" in test/capacity-wake.test.ts.
   registerAdmitWakeCommand(capacity, config);
+  // `run-build`'s `passThroughOptions` needs positional options on its IMMEDIATE parent. The program
+  // turns them on (inherited), but a bare `registerDefaultCommands` (a test, another embedder) does
+  // not, and commander then throws at registration. Row "registration: `capacity` is in BOTH …" in
+  // test/capacity.test.ts.
+  capacity.enablePositionalOptions();
+  registerRunBuildCommand(capacity, config);
+}
+
+// ── `acpx capacity run-build` (CONCEPTION 25479d40 §3.2) ─────────────────────────────────────────
+
+type RunBuildFlags = { bytes?: number; wait?: number; format?: OutputFormat };
+
+function parseMib(value: string): number {
+  if (!/^[1-9]\d*$/u.test(value.trim())) {
+    throw new InvalidArgumentError("Expected a positive integer (MiB)");
+  }
+  return Number(value.trim()) * MIB;
+}
+
+function parseSeconds(value: string): number {
+  if (!/^\d+$/u.test(value.trim())) {
+    throw new InvalidArgumentError("Expected a whole number of seconds");
+  }
+  return Number(value.trim());
+}
+
+export function runBuildJson(result: RunBuildResult): Record<string, unknown> {
+  return { action: "run-build", schema: 1, ...result };
+}
+
+/**
+ * Exit: the child's own code once it ran; 75 with `REFUSED reason=no_room_for_build` when no room
+ * appeared within `--wait` (nothing run), or 75 with `DENIED` when `refresh.sh --status` says a
+ * refresh already runs (K4); 128+n after TERM/INT/HUP; 2 on usage. The refusal is THROWN — before
+ * any child ran — so it takes the CLI's ordinary capacity-refusal path (stderr token, JSON error).
+ */
+async function handleRunBuild(
+  parts: string[],
+  flags: RunBuildFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const { format } = resolveGlobalFlags(command, config);
+  const [program, ...args] = parts;
+  const result = await runBuild({
+    command: program,
+    args,
+    bytes: flags.bytes ?? BUILD_CONSTANTS.buildReserveBytes,
+    waitS: flags.wait ?? BUILD_CONSTANTS.buildWaitDefaultS,
+  });
+  emitJsonResult(format, runBuildJson(result));
+  process.exitCode = result.exitCode;
+}
+
+function registerRunBuildCommand(capacity: Command, config: ResolvedAcpxConfig): void {
+  capacity
+    .command("run-build")
+    .description(
+      "Run a release build once this box has room for it, holding that room in the admission " +
+        "ledger while it runs; exit 75 with nothing run if no room appears within --wait.",
+    )
+    .argument("<command...>", "The build command and its arguments, after --")
+    .option(
+      "--bytes <MiB>",
+      `The build's memory estimate (default ${Math.round(BUILD_CONSTANTS.buildReserveBytes / MIB)})`,
+      parseMib,
+    )
+    .option(
+      "--wait <seconds>",
+      `How long to wait for room (default ${BUILD_CONSTANTS.buildWaitDefaultS})`,
+      parseSeconds,
+    )
+    .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
+    // Everything after the build command is ITS argv, never ours (`-- refresh.sh --status`).
+    .passThroughOptions()
+    .exitOverride((error) => {
+      throw error;
+    })
+    .action(async function (this: Command, parts: string[], flags: RunBuildFlags) {
+      await handleRunBuild(parts, flags, this, config);
+    });
 }
 
 // ── `acpx capacity admit-wake` (brick 2b3b259f, CONCEPTION §4.1) ─────────────────────────────────

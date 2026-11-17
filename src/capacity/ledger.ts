@@ -17,8 +17,8 @@ import {
   judgeLockHolder,
   releaseIdentityFileLock,
 } from "../session/persistence/identity-file-lock.js";
-import type { Harness } from "./constants.js";
-import type { PendingReservation } from "./pending.js";
+import { BUILD_CONSTANTS, type Harness } from "./constants.js";
+import type { BuildReservation, PendingReservation } from "./pending.js";
 
 /**
  * The admission ledger (CONCEPTION f7587c86 §5): box-global state under
@@ -58,12 +58,19 @@ function passwdHome(): string {
 
 export type AdmissionClass = "interactive" | "delivery" | "automation" | "spawn";
 
+/**
+ * `maintenance` is a release build's (CONCEPTION 25479d40 §3.2): written only by `run-build`, never
+ * a class anyone can send (`ACPX_ADMISSION_CLASS` knows only {@link AdmissionClass}).
+ */
+export type EntryClass = AdmissionClass | "maintenance";
+
 export type PendingEntry = {
   readonly key: string;
   readonly sessionId?: string;
-  readonly harness: Harness;
+  /** Absent only on a release build's entry, which starts no harness. */
+  readonly harness?: Harness;
   readonly bytes: number;
-  readonly class: AdmissionClass;
+  readonly class: EntryClass;
   readonly origin: string;
   readonly admittedAt: string;
   readonly expiresAt: string;
@@ -80,9 +87,22 @@ export type PendingEntry = {
    * so it counts a wake entry like a bound create until its TTL.
    */
   readonly kind: EntryKind;
+  /** `build` only: `waiting` until the build test held, then `building` (§3.2 steps 1, 4). */
+  readonly phase?: "waiting" | "building";
+  /** `build` only, once started: the child's pid and birth identity (its start ticks), R3. */
+  readonly buildPid?: number;
+  readonly buildIdentity?: Record<string, unknown>;
+  readonly buildStartedAt?: string;
+  /** `build` only, once started: `C` at the start — the base of the cgroup-rise remainder (R12). */
+  readonly committedAtStartBytes?: number;
 };
 
-export type EntryKind = "create" | "wake";
+/**
+ * `build` (CONCEPTION 25479d40 §3.2): a release build's reservation, key `build:<uuid>`, written by
+ * `acpx capacity run-build`. Never bound, so an older reader counts it as an unbound create: in `P`
+ * at its full bytes while `run-build` lives, dropped when it dies (K5, review R10) — conservative.
+ */
+export type EntryKind = "create" | "wake" | "build";
 
 /** Thrown by the lock policy on timeout — the gate turns it into `admission_busy` (§3.3). */
 export class AdmissionLockTimeoutError extends Error {
@@ -235,14 +255,60 @@ export async function writeLedgerFile(
   await fs.rename(temporary, file);
 }
 
-/** TTL and container instance (§5, drop rules 1 and 3). Rule 2 needs the census: `partitionPending`. */
+/**
+ * TTL and container instance (§5, drop rules 1 and 3). Rule 2 needs the census: `partitionPending`.
+ *
+ * A release build's entry outlives its `expiresAt` while its admitter or its build child is PROVABLY
+ * the process it recorded (`matching`): `run-build` re-stamps the entry, but a SIGKILLed one cannot,
+ * and its build may run on for longer than the 10 min (CONCEPTION 25479d40 §3.2 step 1, review R6:
+ * "expiry then only removes an entry whose processes can no longer be judged"). Row "liveEntries
+ * build:" in test/capacity-run-build.test.ts.
+ */
 export function liveEntries(entries: readonly PendingEntry[], nowMs: number): PendingEntry[] {
   const instance = containerInstance();
   return entries.filter(
     (entry) =>
-      Date.parse(entry.expiresAt) > nowMs &&
+      (Date.parse(entry.expiresAt) > nowMs || buildProvablyRunning(entry)) &&
       (instance === "unknown" || entry.instance === "unknown" || entry.instance === instance),
   );
+}
+
+function buildProvablyRunning(entry: PendingEntry): boolean {
+  if (entry.kind !== "build") {
+    return false;
+  }
+  const admitter = parseProcessBirthIdentity(entry.admitterIdentity);
+  if (observeProcessIncarnation(entry.admitterPid, admitter) === "matching") {
+    return true;
+  }
+  return (
+    entry.buildPid !== undefined &&
+    observeProcessIncarnation(entry.buildPid, parseProcessBirthIdentity(entry.buildIdentity)) ===
+      "matching"
+  );
+}
+
+/** The build child is recorded and not provably gone — an unjudgeable one keeps the room (§9). */
+function buildChildAlive(entry: PendingEntry): boolean {
+  if (entry.buildPid === undefined) {
+    return false;
+  }
+  const identity = parseProcessBirthIdentity(entry.buildIdentity);
+  return observeProcessIncarnation(entry.buildPid, identity) !== "gone";
+}
+
+function buildReservationOf(entry: PendingEntry): BuildReservation {
+  const building = entry.phase === "building" && entry.buildPid !== undefined;
+  return {
+    phase: building ? "building" : "waiting",
+    since: (building ? entry.buildStartedAt : undefined) ?? entry.admittedAt,
+    admitterPid: entry.admitterPid,
+    ...(entry.buildPid === undefined ? {} : { buildPid: entry.buildPid }),
+    buildAlive: buildChildAlive(entry),
+    ...(entry.committedAtStartBytes === undefined
+      ? {}
+      : { committedAtStartBytes: entry.committedAtStartBytes }),
+  };
 }
 
 /** `gone` is the only proof of death; an unjudgeable admitter keeps its reservation (rounds up, §9). */
@@ -251,7 +317,7 @@ function admitterAlive(entry: PendingEntry): boolean {
   return observeProcessIncarnation(entry.admitterPid, identity) !== "gone";
 }
 
-export function ttlFor(admissionClass: AdmissionClass | undefined): number {
+export function ttlFor(admissionClass: EntryClass | undefined): number {
   return admissionClass === "automation" ? ADMISSION_TTL_AUTOMATION_MS : ADMISSION_TTL_MS;
 }
 
@@ -312,8 +378,35 @@ export function reservationsOf(
       admitterAlive: admitterAlive(entry),
       bound,
       spent: bound && sessionSpent(sessionsDir, sessionId, boundAt, entry.kind),
+      ...(entry.kind === "build" ? { build: buildReservationOf(entry) } : {}),
     };
   });
+}
+
+/**
+ * A release build's reservation (CONCEPTION 25479d40 §3.2 step 1): `waiting`, class `maintenance`,
+ * this process as admitter, `expiresAt` = now + {@link BUILD_CONSTANTS.buildExpiryRestampS}.
+ */
+export function newBuildEntry(params: { key: string; bytes: number; now: Date }): PendingEntry {
+  const identity = getOwnProcessIdentity();
+  return {
+    key: params.key,
+    bytes: params.bytes,
+    class: "maintenance",
+    origin: "capacity run-build",
+    admittedAt: params.now.toISOString(),
+    expiresAt: buildExpiry(params.now),
+    instance: containerInstance(),
+    admitterPid: process.pid,
+    ...(identity ? { admitterIdentity: serializeProcessBirthIdentity(identity) } : {}),
+    kind: "build",
+    phase: "waiting",
+  };
+}
+
+/** The re-stamped expiry of a build entry (review R6). */
+export function buildExpiry(now: Date): string {
+  return new Date(now.getTime() + BUILD_CONSTANTS.buildExpiryRestampS * 1000).toISOString();
 }
 
 export function newEntry(params: {

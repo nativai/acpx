@@ -155,3 +155,25 @@ export function liveFloorFor(harness: Harness | "unknown", constants: CapacityCo
     ? Math.max(...HARNESSES.map((h) => constants.liveFloorBytes[h]))
     : constants.liveFloorBytes[harness];
 }
+
+/**
+ * The release build's admission (CONCEPTION 25479d40 §3.2, §3.3): `acpx capacity run-build`. Fleet
+ * constants, re-derived by commit from `run-build`'s own `kind: "build"` log lines (peak rise of `C`
+ * per build, 100 ms samples), never auto-tuned.
+ */
+export const BUILD_CONSTANTS = {
+  /**
+   * The heaviest project build's measured peak rise of `C`, rounded up to 64 MiB: acpx-ui's server
+   * `tsc`, 1,878 MiB (§2.4) → 1,920. No extra percentage — agents' growth during the build is `G`'s.
+   */
+  buildReserveBytes: 1920 * MIB,
+  /** `G = buildGrowthFraction × M`: what agents may grow while the build runs (§3.2 step 3). */
+  buildGrowthFraction: 0.5,
+  /** `--wait` default: past it, `run-build` exits 75 having run nothing (§3.2 step 6). */
+  buildWaitDefaultS: 900,
+  /**
+   * The entry's `expiresAt` = now + this, re-stamped on every evaluation and every minute while
+   * building (review R6), so expiry removes only an entry whose processes cannot be judged.
+   */
+  buildExpiryRestampS: 600,
+} as const;

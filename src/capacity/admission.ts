@@ -179,9 +179,34 @@ function refusalSentence(
   return (
     `acpx: the box has no memory for another agent session (${snapshot.owners.live} live, ` +
     `${snapshot.owners.starting} starting; ${gib(snapshot.chargedBytes)} charged of a ` +
-    `${gib(snapshot.budgetBytes)} budget). ${nothing} See 'acpx capacity'; close sessions you ` +
+    `${gib(snapshot.budgetBytes)} budget).${buildClause(snapshot)} ${nothing} See 'acpx capacity'; close sessions you ` +
     `have finished with, or retry when one finishes.`
   );
+}
+
+/**
+ * A `no_capacity` refusal while a release build holds its reservation names it (CONCEPTION 25479d40
+ * §5.2), so the agent knows the wait is a build's, and short — from `build.holder`.
+ */
+export function buildClause(snapshot: CapacitySnapshot): string {
+  const holder = snapshot.build.holder;
+  if (holder === null) {
+    return "";
+  }
+  const since = Number.isNaN(Date.parse(holder.since))
+    ? "?"
+    : `${new Date(holder.since).toISOString().slice(11, 16)}Z`;
+  return holder.phase === "building"
+    ? ` A release build is running on this box (since ${since}); its room frees when it finishes.`
+    : ` A release build is waiting for room on this box (since ${since}); new agent work is held until it has run.`;
+}
+
+/** The decision line's release-build fields, only while one holds its reservation. */
+function buildLogFields(snapshot: CapacitySnapshot | undefined): Record<string, unknown> {
+  const holder = snapshot?.build.holder;
+  return holder
+    ? { buildKey: holder.key, buildPhase: holder.phase, buildChargedBytes: holder.chargedBytes }
+    : {};
 }
 
 function snapshotTokenFields(snapshot: CapacitySnapshot): string[] {
@@ -286,6 +311,7 @@ function logLine(
     harness: ctx.harness,
     waiting: waiting.count,
     ...(snapshot ? snapshotFields(snapshot, ctx.harness) : {}),
+    ...buildLogFields(snapshot),
     ...extra,
   };
 }
@@ -663,6 +689,7 @@ function wakeLogLine(
     decision,
     ...wakeIdentityFields(ctx),
     ...reading,
+    ...buildLogFields(snapshot),
     ...extra,
   };
 }
@@ -869,7 +896,7 @@ function wakeNoRoomLine(input: WakeTextInput, snapshot: CapacitySnapshot): strin
     `acpx: no memory to wake ${who}: it has no running agent process (released after idle, or ` +
     `stopped), and starting one needs ~${needMib} MiB the box does not have ` +
     `(${snapshot.owners.live} live, ${snapshot.owners.starting} starting; ` +
-    `${gib(snapshot.chargedBytes)} charged of a ${gib(snapshot.budgetBytes)} budget). ${nothing}`
+    `${gib(snapshot.chargedBytes)} charged of a ${gib(snapshot.budgetBytes)} budget).${buildClause(snapshot)} ${nothing}`
   );
 }
 
