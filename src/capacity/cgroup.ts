@@ -73,14 +73,32 @@ export function committedFromMemoryStat(
   return { committedBytes: anon + kernel, anonBytes: anon, kernelBytes: kernel, warnings };
 }
 
-export type Psi = { readonly someAvg10?: number; readonly fullAvg10?: number };
+export type Psi = {
+  readonly someAvg10?: number;
+  readonly fullAvg10?: number;
+  /** `some` avg60 / avg300: G5 (brick 4d74a0d9) decides on these, never on avg10. */
+  readonly someAvg60?: number;
+  readonly someAvg300?: number;
+};
+
+const PSI_FIELDS: ReadonlyArray<readonly ["some" | "full", string, keyof Psi]> = [
+  ["some", "10", "someAvg10"],
+  ["some", "60", "someAvg60"],
+  ["some", "300", "someAvg300"],
+  ["full", "10", "fullAvg10"],
+];
 
 export function parsePressure(raw: string | undefined): Psi {
-  const out: { someAvg10?: number; fullAvg10?: number } = {};
+  const out: { -readonly [K in keyof Psi]: Psi[K] } = {};
   for (const line of (raw ?? "").split("\n")) {
-    const match = /^(some|full)\s.*\bavg10=(\d+(?:\.\d+)?)/u.exec(line.trim());
-    if (match) {
-      out[match[1] === "some" ? "someAvg10" : "fullAvg10"] = Number(match[2]);
+    const trimmed = line.trim();
+    for (const [kind, window, field] of PSI_FIELDS) {
+      const match = new RegExp(`^${kind}\\s.*\\bavg${window}=(\\d+(?:\\.\\d+)?)`, "u").exec(
+        trimmed,
+      );
+      if (match) {
+        out[field] = Number(match[1]);
+      }
     }
   }
   return out;

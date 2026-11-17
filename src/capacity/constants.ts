@@ -29,6 +29,16 @@ export type CapacityConstants = {
   readonly nodeFloorBytes: number;
   /** `psi_hold` — PSI memory `full` avg10 (%) at which nothing is admitted (G4). */
   readonly psiHold: number;
+  /**
+   * G5, the CPU guard (CONCEPTION 25479d40 §4.2; brick 4d74a0d9): container `cpu.pressure some` thresholds
+   * in %. `busy` (avg60 ≥ `cpuBusyAvg60`) only warns; `saturated` (avg60 ≥ `cpuSaturatedAvg60` AND
+   * avg300 ≥ `cpuSaturatedAvg300` — the persistence condition that keeps one build or test run from
+   * refusing anyone) refuses an agent's own create. Re-derived by commit from the decision log, never
+   * auto-tuned (K10).
+   */
+  readonly cpuBusyAvg60: number;
+  readonly cpuSaturatedAvg60: number;
+  readonly cpuSaturatedAvg300: number;
   /** A podinfo budget below this is a unit error (wrong `divisor`), not a box size (§3.3). */
   readonly budgetMinBytes: number;
   /** Leases older than this are not parsed: a live owner rewrites its lease every 5 s (§5). */
@@ -111,6 +121,9 @@ export const CAPACITY_CONSTANTS: CapacityConstants = {
   baseFloorBytes: 512 * MIB,
   nodeFloorBytes: 3 * 1024 * MIB,
   psiHold: 10,
+  cpuBusyAvg60: 30,
+  cpuSaturatedAvg60: 50,
+  cpuSaturatedAvg300: 40,
   budgetMinBytes: 256 * MIB,
   leaseFreshMs: 5 * 60_000,
   governor: {

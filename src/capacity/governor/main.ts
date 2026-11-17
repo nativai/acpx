@@ -25,6 +25,9 @@ import { realSignaller } from "./sweep.js";
  * "run" as a prompt (F19). The production start takes no argv.
  */
 
+/** What the supervisor resolves to find this file; its resolution changing is a new build (review R5). */
+const ACPX_BIN_LINK = "/usr/local/bin/acpx";
+
 const log = (line: string): void => {
   process.stdout.write(`${line}\n`);
 };
@@ -94,6 +97,7 @@ async function main(): Promise<number> {
       selfPid: process.pid,
       uid: os.userInfo().uid,
       entryFile: fileURLToPath(import.meta.url),
+      acpxLink: ACPX_BIN_LINK,
       scanner: readers.scan,
     },
     {

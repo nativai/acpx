@@ -1,6 +1,7 @@
 import { type Command, InvalidArgumentError, Option } from "commander";
 import {
   admitWake,
+  cpuRefuses,
   readPendingReservationsForProbe,
   readWaitingForProbe,
   type WakeDecision,
@@ -222,6 +223,22 @@ export function buildLine(s: CapacitySnapshot, now: Date = new Date()): string {
   );
 }
 
+/** G5's state in one line; `busy` only warns, `saturated` says what is refused. */
+export function cpuLine(s: CapacitySnapshot): string {
+  const { cpu } = s;
+  const pct = (value: number | null): string => (value === null ? "?" : `${Math.round(value)} %`);
+  const figures = `some avg60 ${pct(cpu.someAvg60)}, avg300 ${pct(cpu.someAvg300)}; ${plural(cpu.cpus, "CPU")}`;
+  if (cpu.state === "saturated") {
+    const effect = cpu.refusesAgentCreates
+      ? "new agent sessions are refused until it eases"
+      : "not enforced on this box";
+    return `cpu: saturated (${figures}) — ${effect}`;
+  }
+  return cpu.state === "busy"
+    ? `cpu: busy (${figures}) — warning only; new agent sessions are still admitted`
+    : `cpu: ok (${figures})`;
+}
+
 export function renderCapacityText(s: CapacitySnapshot): string {
   const waiting = waitingLine(s);
   const lines = [
@@ -230,6 +247,7 @@ export function renderCapacityText(s: CapacitySnapshot): string {
     ...(waiting ? [waiting] : []),
     buildLine(s),
     pressureLine(s),
+    cpuLine(s),
     ...s.alternatives.map(
       (alt) =>
         `on the ${alt.basis} basis: budget ${gib(alt.budgetBytes)} → ` +
@@ -260,6 +278,17 @@ function needVerdict(
       reason:
         `admission_busy: the box's admission lock is held by a live process, so creates are ` +
         `refused until it frees; retry after ${lock.retryAfterS ?? "?"} s`,
+    };
+  }
+  if (needMet(snapshot, need) && cpuRefuses(snapshot)) {
+    // G5 mirrors the create gate: only class `spawn` (an agent's fan-out probe), never atrium's
+    // `--class automation` release probe (`cpuRefuses`).
+    return {
+      met: false,
+      reason:
+        `cpu_pressure: the box's CPU is saturated (some avg60 ${snapshot.cpu.someAvg60 ?? "?"} %, ` +
+        `avg300 ${snapshot.cpu.someAvg300 ?? "?"} %), so a new agent session is refused; ` +
+        `retry after 120 s`,
     };
   }
   return { met: needMet(snapshot, need), reason: needMetReason(snapshot, need) };

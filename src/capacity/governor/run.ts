@@ -110,6 +110,13 @@ export type GovernorDeps = {
   readonly uid: number;
   /** The entry file watched for a new build (§7.2 self-restart); undefined = never restart. */
   readonly entryFile?: string;
+  /**
+   * The path whose resolution names the CURRENT acpx build (production: `/usr/local/bin/acpx`;
+   * undefined = not watched). The supervisor starts `dirname(readlink -f <this>)/capacity/governor/
+   * main.js`, so once the build lives in a per-release directory (brick 4d74a0d9, review R5) the entry
+   * file itself never changes: a changed resolution is the new-build signal.
+   */
+  readonly acpxLink?: string;
   readonly setPriority?: (nice: number) => void;
   /** The `/proc` scan; default the synchronous streaming scanner (production: `parallelScanner`). */
   readonly scanner?: ProcScanner;
@@ -317,6 +324,18 @@ function fileSignature(file: string | undefined): string | undefined {
   }
 }
 
+/** `readlink -f`: undefined when the link (or its target) cannot be resolved. */
+function resolveLink(link: string | undefined): string | undefined {
+  if (!link) {
+    return undefined;
+  }
+  try {
+    return fs.realpathSync(link);
+  } catch {
+    return undefined;
+  }
+}
+
 function commTop(members: readonly GovProc[]): Array<[string, number]> {
   const counts = new Map<string, number>();
   for (const m of members) {
@@ -363,6 +382,8 @@ export class Governor {
   private fastUntilMs = 0;
   private peaks: PeaksDay;
   private entrySignature: string | undefined;
+  private acpxResolvedAtStart: string | undefined;
+  private entryMissingLogged = false;
   private entryChangedAtMs: number | undefined;
   private startedAtMs: number;
   private niceApplied: number | null = null;
@@ -453,6 +474,7 @@ export class Governor {
       this.finishStopsInFlight();
     }
     this.entrySignature = fileSignature(this.deps.entryFile);
+    this.acpxResolvedAtStart = resolveLink(this.deps.acpxLink);
     this.recordPendingPeaks(this.deps.now());
     const flags = `${this.settings.testMode ? " test=true" : ""}${this.settings.testRig ? " test-rig" : ""}`;
     this.deps.log(
@@ -1561,14 +1583,55 @@ export class Governor {
     return true;
   }
 
-  /** The entry file differs from the one this process started from, unchanged for 10 s. */
-  private newBuildStable(nowMs: number): boolean {
+  /**
+   * What says "a new build is installed", or undefined. Two signals (review R5, amended by the HoD
+   * after TE2's case I):
+   *   - `readlink -f <acpxLink>` resolves to a different path than at start (a swap to a new release
+   *     directory leaves this process's own file untouched, so nothing else would ever fire);
+   *   - the entry file is PRESENT with a changed inode/mtime/size (an in-place rebuild finished).
+   *
+   * ⚠️ DO NOT MAKE A MISSING ENTRY FILE A RESTART SIGNAL. It reads like the obvious completion of R5
+   * and it is the bug: on today's in-place layout `tsdown --clean` leaves `main.js` absent for
+   * 19–28 s while it builds, so the governor would exit after 10 s, the supervisor
+   * (`entrypoint-control.sh`) would find no `main.js` and sleep 300 s, and the box would run the
+   * following acpx-ui build (1.9 GiB) with no R2 — and with no governor at all if that build fails.
+   * A missing file with an unchanged resolution means "a build is in flight or failed": keep
+   * running from memory. Under F the path changes on every swap, so "missing" adds nothing there.
+   * Rows: "self-restart (R5) negative: a missing entry file …" in test/governor-daemon.test.ts.
+   */
+  private newBuildSignal(): string | undefined {
+    return this.linkBuildSignal() ?? this.entryBuildSignal();
+  }
+
+  private entryBuildSignal(): string | undefined {
     const signature = fileSignature(this.deps.entryFile);
-    const changed =
-      signature !== undefined && signature !== "missing" && signature !== this.entrySignature;
-    if (!changed || this.lastSeenSignature !== signature) {
-      this.lastSeenSignature = changed ? signature : undefined;
-      this.entryChangedAtMs = changed ? nowMs : undefined;
+    if (signature === "missing") {
+      if (!this.entryMissingLogged) {
+        this.entryMissingLogged = true;
+        this.deps.log(
+          "process-governor: entry file is missing (a build is in flight or failed); running from memory",
+        );
+      }
+      return undefined;
+    }
+    this.entryMissingLogged = false;
+    return signature !== undefined && signature !== this.entrySignature ? signature : undefined;
+  }
+
+  private linkBuildSignal(): string | undefined {
+    const resolved = resolveLink(this.deps.acpxLink);
+    if (resolved === undefined || this.acpxResolvedAtStart === undefined) {
+      return undefined;
+    }
+    return resolved === this.acpxResolvedAtStart ? undefined : `link:${resolved}`;
+  }
+
+  /** A new build is signalled and the signal is unchanged for 10 s. */
+  private newBuildStable(nowMs: number): boolean {
+    const signal = this.newBuildSignal();
+    if (signal === undefined || this.lastSeenSignature !== signal) {
+      this.lastSeenSignature = signal;
+      this.entryChangedAtMs = signal === undefined ? undefined : nowMs;
       return false;
     }
     return nowMs - (this.entryChangedAtMs ?? nowMs) >= SELF_RESTART_STABLE_MS;
