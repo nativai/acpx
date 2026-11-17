@@ -408,6 +408,11 @@ export function registerCapacityCommand(parent: Command, config: ResolvedAcpxCon
   // `enablePositionalOptions()` (inherited) keeps `capacity --class spawn|automation` apart from
   // `admit-wake --class delivery|automation`. Rows "admit-wake: CLI" in test/capacity-wake.test.ts.
   registerAdmitWakeCommand(capacity, config);
+  // `run-build`'s `passThroughOptions` needs positional options on its IMMEDIATE parent. The program
+  // turns them on (inherited), but a bare `registerDefaultCommands` (a test, another embedder) does
+  // not, and commander then throws at registration. Row "registration: `capacity` is in BOTH …" in
+  // test/capacity.test.ts.
+  capacity.enablePositionalOptions();
   registerRunBuildCommand(capacity, config);
 }
 
