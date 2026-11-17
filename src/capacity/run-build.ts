@@ -123,6 +123,25 @@ function durationText(seconds: number): string {
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * `promise`, or `fallback()` after `ms` — whichever settles first; the timer is CLEARED either way.
+ * ⚠️ DO NOT RACE AGAINST A PLAIN `sleep()`. The losing timer stays armed and holds the event loop:
+ * `run-build` lingered 3 s after a SIGTERM-stopped build and up to 5 s after a signal while waiting
+ * (measured in a workbench). Row "run-build exits promptly after SIGTERM" in
+ * test/capacity-run-build.test.ts.
+ */
+async function within<T>(promise: Promise<T>, ms: number, fallback: () => T): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<T>((resolve) => {
+    timer = setTimeout(() => resolve(fallback()), ms);
+  });
+  try {
+    return await Promise.race([promise, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** An executable on PATH, or undefined. */
 function onPath(name: string, env: NodeJS.ProcessEnv): string | undefined {
   for (const dir of (env.PATH ?? "").split(path.delimiter)) {
@@ -233,10 +252,7 @@ async function stopGroup(pgid: number): Promise<void> {
 
 /** The child's exit, or a synthetic one when even SIGKILL did not reap it in time (D state). */
 async function exitedWithin(child: Child, ms: number): Promise<Exit> {
-  return await Promise.race([
-    child.exited,
-    sleep(ms).then((): Exit => ({ code: null, signal: "SIGKILL" })),
-  ]);
+  return await within(child.exited, ms, (): Exit => ({ code: null, signal: "SIGKILL" }));
 }
 
 function exitCodeOf(exit: Exit): number {
@@ -929,7 +945,7 @@ async function waitAndBuild(
       return await refuseAtDeadline(ctx, request, state, waitedS);
     }
     await reportWaiting(ctx, state, now);
-    await Promise.race([sleep(Math.min(tickMs, state.deadline - now)), signals.next()]);
+    await within(signals.next(), Math.min(tickMs, state.deadline - now), () => undefined);
   }
 }
 

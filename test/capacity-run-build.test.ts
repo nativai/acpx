@@ -629,7 +629,7 @@ test("AC-7: SIGKILLed run-build — the entry survives while its build child liv
   assert.equal(gone.json.pendingBytes, 0);
 });
 
-test("AC-7: SIGTERM to run-build mid-build — the build's whole process group is gone within 5 s, the entry removed", async () => {
+test("AC-7: SIGTERM to run-build mid-build — the build's whole process group is gone within 5 s, the entry removed, and run-build exits promptly after SIGTERM", async () => {
   const box = makeBox(FITS);
   const marker = path.join(box.root, "ran.json");
   const cli = startCli(runBuildArgs(box, marker, { holdMs: 60_000, grand: true }), box.env);
@@ -640,6 +640,10 @@ test("AC-7: SIGTERM to run-build mid-build — the build's whole process group i
   assert.ok(facts.grandPid, "the child started a grandchild in its group");
   const t0 = Date.now();
   cli.proc.kill("SIGTERM");
+  await cli.exited;
+  // run-build exits promptly after SIGTERM: no armed grace timer may hold its event loop (it lingered
+  // 3 s when the exit was raced against a plain sleep).
+  assert.ok(Date.now() - t0 < 2000, `run-build exited ${Date.now() - t0} ms after SIGTERM`);
   const run = await cli.done;
   await until(
     "child and grandchild gone",
