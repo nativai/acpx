@@ -97,6 +97,19 @@ export type OwnerSummary = {
   readonly facts?: OwnerRecordFacts;
 };
 
+export type CpuGuardState = "ok" | "busy" | "saturated";
+
+export type CpuState = {
+  readonly state: CpuGuardState;
+  /** `saturated` on a configured, measured box: an agent's own create (class `spawn`) is refused. */
+  readonly refusesAgentCreates: boolean;
+  readonly someAvg10: number | null;
+  readonly someAvg60: number | null;
+  readonly someAvg300: number | null;
+  readonly cpus: number;
+  readonly load1: number | null;
+};
+
 export type CapacitySnapshot = {
   readonly action: "capacity";
   readonly schema: 1;
@@ -160,6 +173,11 @@ export type CapacitySnapshot = {
     readonly cpuPsiSomeAvg10: number | null;
     readonly nodeLoad1: number | null;
   };
+  /**
+   * G5's inputs and verdict (brick 4d74a0d9). NOT a formula guard: `freeSlots`, `slotsAfterMakeRoom`,
+   * `bindingGuard` and `verdict` stay memory-only, so a wake or atrium's automation probe never sees CPU.
+   */
+  readonly cpu: CpuState;
   /** The same reading under the basis NOT in force, so request and limit are both visible. */
   readonly alternatives: readonly AlternativeBasis[];
   readonly warnings: readonly string[];
@@ -307,6 +325,13 @@ function measurementWarnings(g: Gathered): string[] {
     : [];
 }
 
+function cpuWarnings(g: Gathered): string[] {
+  const { someAvg60, someAvg300 } = g.cgroup.cpuPressure;
+  return someAvg60 === undefined || someAvg300 === undefined
+    ? ["cpu.pressure unreadable: the CPU guard (G5) is not applied"]
+    : [];
+}
+
 function collectWarnings(g: Gathered, measured: Measured | undefined): string[] {
   const warnings = [
     ...g.budget.warnings,
@@ -322,6 +347,7 @@ function collectWarnings(g: Gathered, measured: Measured | undefined): string[] 
     const figures = measured ? "; the figures use the cgroup limit as the budget" : "";
     warnings.push(`no ${g.sources.podinfoDir}: unconfigured, nothing is refused${figures}`);
   }
+  warnings.push(...cpuWarnings(g));
   if (g.node.availableBytes === undefined) {
     warnings.push("node MemAvailable unreadable: the borrowing guard (G3) is not applied");
   }
@@ -466,6 +492,34 @@ function pressureField(g: Gathered): CapacitySnapshot["pressure"] {
   };
 }
 
+/**
+ * G5's state from the container's `cpu.pressure some`. Fails OPEN: an unreadable avg60 is `ok` and
+ * never refuses (a warning says so, `collectWarnings`); `saturated` needs BOTH windows, so an
+ * unreadable avg300 can at most make the box `busy`.
+ */
+function cpuField(g: Gathered, measured: boolean): CpuState {
+  const { someAvg10, someAvg60, someAvg300 } = g.cgroup.cpuPressure;
+  const c = g.constants;
+  let state: CpuGuardState = "ok";
+  if (someAvg60 !== undefined && someAvg60 >= c.cpuBusyAvg60) {
+    state =
+      someAvg60 >= c.cpuSaturatedAvg60 &&
+      someAvg300 !== undefined &&
+      someAvg300 >= c.cpuSaturatedAvg300
+        ? "saturated"
+        : "busy";
+  }
+  return {
+    state,
+    refusesAgentCreates: state === "saturated" && g.budget.configured && measured,
+    someAvg10: nul(someAvg10),
+    someAvg60: nul(someAvg60),
+    someAvg300: nul(someAvg300),
+    cpus: os.availableParallelism(),
+    load1: nul(g.node.load1),
+  };
+}
+
 function waitingField(queue: WaitingQueue): CapacitySnapshot["waiting"] {
   return {
     count: queue.count,
@@ -484,8 +538,13 @@ function waitingField(queue: WaitingQueue): CapacitySnapshot["waiting"] {
  * a field-less answer as "no features" and then delivers member by member (S5).
  * `prompt-batch`: `prompt --batch-file` + the owner's `submit_prompt_batch`.
  * `sessions-new-sleeping`: `sessions new|copy --sleeping` (a build without it answers exit 2).
+ * `cpu-guard`: the snapshot's `cpu` object and G5 (an agent's create refused `cpu_pressure`).
  */
-export const ACPX_FEATURES: readonly string[] = ["prompt-batch", "sessions-new-sleeping"];
+export const ACPX_FEATURES: readonly string[] = [
+  "prompt-batch",
+  "sessions-new-sleeping",
+  "cpu-guard",
+];
 
 export function readCapacity(options: ReadCapacityOptions): CapacitySnapshot {
   const g = gather(options);
@@ -515,6 +574,7 @@ export function readCapacity(options: ReadCapacityOptions): CapacitySnapshot {
     ...formulaFields(formula),
     owners: ownersField(g),
     pressure: pressureField(g),
+    cpu: cpuField(g, measured !== undefined),
     alternatives: g.budget.configured && measured ? alternativesFor(g, measured) : [],
     warnings: collectWarnings(g, measured),
     governor: readGovernorLiveness(

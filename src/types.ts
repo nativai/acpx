@@ -251,6 +251,7 @@ export type CapacityRefusalReason =
   | "no_capacity"
   | "memory_pressure"
   | "node_pressure"
+  | "cpu_pressure"
   | "admission_busy";
 
 /**

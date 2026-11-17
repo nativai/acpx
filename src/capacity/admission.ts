@@ -170,6 +170,9 @@ function refusalSentence(
     return `acpx: other session creations held the box's admission lock for 5 s. ${nothing} Retry in a few seconds; 'acpx capacity' shows the room left.`;
   }
   const nothing = `Nothing was started or queued.${queuedClause(snapshot)}`;
+  if (reason === "cpu_pressure") {
+    return `acpx: the box's CPU is saturated (${snapshot.cpu.someAvg60 ?? "?"} % of the last minute waiting for CPU, ${snapshot.owners.live} sessions live). No session was created. Spawn fewer, or later; messages to existing sessions are still delivered.`;
+  }
   if (reason === "memory_pressure") {
     return `acpx: the box is stalling on memory right now (PSI full avg10 ${snapshot.pressure.psiFullAvg10 ?? "?"} %). ${nothing} See 'acpx capacity'; retry in a minute.`;
   }
@@ -184,7 +187,19 @@ function refusalSentence(
   );
 }
 
-function snapshotTokenFields(snapshot: CapacitySnapshot): string[] {
+/** G5 asks for patience, not a different shape: avg300 ≥ 40 % needs minutes to ease. */
+const CPU_PRESSURE_RETRY_AFTER_S = 120;
+
+function snapshotTokenFields(snapshot: CapacitySnapshot, reason: CapacityRefusalReason): string[] {
+  if (reason === "cpu_pressure") {
+    // The memory figures (`free_slots`, `need_mib`, …) would describe a refusal that was not about memory.
+    return [
+      `box=${snapshot.box}`,
+      `cpu_some_avg60=${snapshot.cpu.someAvg60 ?? "?"}`,
+      `cpu_some_avg300=${snapshot.cpu.someAvg300 ?? "?"}`,
+      `live=${snapshot.owners.live}`,
+    ];
+  }
   return [
     `box=${snapshot.box}`,
     `basis=${snapshot.basis}`,
@@ -200,6 +215,9 @@ function snapshotTokenFields(snapshot: CapacitySnapshot): string[] {
  * `automation` create, the whole queue, itself included). Additive — `protocol=1` keeps its meaning.
  */
 function retryAfterOf(reason: CapacityRefusalReason): number {
+  if (reason === "cpu_pressure") {
+    return CPU_PRESSURE_RETRY_AFTER_S;
+  }
   return reason === "admission_busy" ? ADMISSION_BUSY_RETRY_AFTER_S : 60;
 }
 
@@ -212,7 +230,7 @@ function tokenFields(
     `reason=${reason}`,
     "nothing_started=true",
     "protocol=1",
-    ...(snapshot ? snapshotTokenFields(snapshot) : []),
+    ...(snapshot ? snapshotTokenFields(snapshot, reason) : []),
     `retry_after_s=${retryAfterOf(reason)}`,
     `queued_ahead=${queuedAhead}`,
   ];
@@ -262,6 +280,9 @@ function snapshotFields(snapshot: CapacitySnapshot, harness: Harness): Record<st
     live: snapshot.owners.live,
     starting: snapshot.owners.starting,
     cpuPsiSomeAvg10: snapshot.pressure.cpuPsiSomeAvg10,
+    cpuPsiSomeAvg60: snapshot.cpu.someAvg60,
+    cpuPsiSomeAvg300: snapshot.cpu.someAvg300,
+    cpuState: snapshot.cpu.state,
     nodeLoad1: snapshot.pressure.nodeLoad1,
   };
 }
@@ -307,10 +328,26 @@ function notGatedReason(
     : undefined;
 }
 
+/**
+ * G5 (brick 4d74a0d9, CONCEPTION 25479d40 §4.2, review R1): a CREATE-ONLY check for class `spawn`.
+ *
+ * ⚠️ DO NOT MOVE THIS INTO `computeFormula` / `freeSlots` / `needMet`. Those serve the wake gate
+ * (`judgeWake`) and atrium's `acpx capacity --class automation --need 1` release probe as well: a
+ * CPU term there would freeze every wake and atrium's whole held-message queue for the length of a
+ * CPU episode (3 h on 2026-11-17), labelled as a memory refusal. Rows: "G5 never refuses …" in
+ * test/capacity-cpu-guard.test.ts.
+ */
+export function cpuRefuses(snapshot: CapacitySnapshot): boolean {
+  return snapshot.class === "spawn" && snapshot.cpu.refusesAgentCreates;
+}
+
 /** The decision on a gated create: `acpx capacity --need 1`'s own test, nothing else. */
 function admitOrRefuse(ctx: GateContext, snapshot: CapacitySnapshot, now: Date): Decision {
   if (!needMet(snapshot, 1)) {
     return { kind: "refused", error: capacityRefusal(reasonOf(snapshot, ctx.harness), snapshot) };
+  }
+  if (cpuRefuses(snapshot)) {
+    return { kind: "refused", error: capacityRefusal("cpu_pressure", snapshot) };
   }
   const entry = newEntry({
     key: ctx.request.recordId ?? `adm-${randomUUID()}`,
