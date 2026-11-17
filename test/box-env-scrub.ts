@@ -127,6 +127,21 @@ export const NOTICE_DELIVERY_DEAD_ORIGIN = "http://127.0.0.1:9";
 export const RUNTIME_INFO_PATH_ENV = "ACPX_RUNTIME_INFO_PATH";
 export const NO_RUNTIME_INFO_PATH = "/nonexistent/acpx-test/runtime-info.json";
 
+/**
+ * brick 78623030 — whether the box mounts `/wisdom/Operating System` as the OS compatibility link is BOX
+ * state, and with the link present `sessions new` REFUSES a create whose primer did not render
+ * (`OsPrimerRequiredError`, a published guarantee). ~26 rows across `cli.test`, `integration.test`,
+ * `atrium-os-cli.test`, `session-root-cli.test` and `settings-rebind.test` deliberately render NO primer
+ * (`ACPX_SESSION_PRIMER_COMMAND=/nonexistent/…`) and expect the create to succeed — true only where the
+ * link is absent, so they were green in a workbench without the mount and red the day it gained one.
+ * The suite therefore points the product's seam (`OS_COMPAT_LINK_ENV`) at a path that does not exist,
+ * making "the link is absent" a property of the repo. A row asserting the refusal points it at a temp
+ * symlink in its own child env (`test/os-compat-link-cli.test.ts`) — it never depends on the box.
+ */
+/** The product seam's name (`OS_COMPAT_LINK_ENV`, `src/acp/atrium-os.ts`); a test pins the two equal. */
+export const OS_COMPAT_LINK_ENV = "ACPX_OS_COMPAT_LINK";
+export const NO_OS_COMPAT_LINK_PATH = "/nonexistent/acpx-test/operating-system-compat-link";
+
 export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env): string[] {
   const removed: string[] = [];
   for (const name of Object.keys(env)) {
@@ -144,5 +159,6 @@ export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env
   env[NO_ENTITLEMENT_FETCH_ENV] = "1";
   env.ACPX_UI_INTERNAL_URL = NOTICE_DELIVERY_DEAD_ORIGIN;
   env[RUNTIME_INFO_PATH_ENV] = NO_RUNTIME_INFO_PATH;
+  env[OS_COMPAT_LINK_ENV] = NO_OS_COMPAT_LINK_PATH;
   return removed.toSorted();
 }

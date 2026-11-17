@@ -20,6 +20,15 @@ export const ATRIUM_OS_ENV = "ATRIUM_OS";
 export const ATRIUM_OS_DEFAULT_ENV = "ATRIUM_OS_DEFAULT";
 /** Today's OS root, and — once P6 swaps it — the compatibility link (§4.5). */
 export const LEGACY_OS_ROOT = "/wisdom/Operating System";
+/**
+ * TEST-ONLY SEAM (brick 78623030). Names the path `isOsCompatLinkInPlace` inspects in place of
+ * `LEGACY_OS_ROOT`, so a test decides whether "the compatibility link exists" instead of inheriting
+ * whether the box it runs on mounts `/wisdom/Operating System`. Unset (every production process) ⇒ the
+ * real path, and the mandatory-OS refusal is exactly as published. The suite bootstrap
+ * (`test/box-env-scrub.ts`) points it at a path that does not exist; a row asserting the refusal points
+ * it at a temp symlink (`test/os-compat-link-cli.test.ts`).
+ */
+export const OS_COMPAT_LINK_ENV = "ACPX_OS_COMPAT_LINK";
 /** P2 creates `<root>/bin/.atrium-os-bin` in every OS release; the PATH strip keys on it. */
 export const OS_BIN_MARKER = ".atrium-os-bin";
 /**
@@ -378,7 +387,9 @@ export async function resolveOsRevision(root: string): Promise<string | null> {
  * symlink, and a create whose primer fails is then refused. Evaluated per create. The path is a
  * parameter so tests point it at a temp symlink — never test it by touching the real path on a box.
  */
-export function isOsCompatLinkInPlace(linkPath: string = LEGACY_OS_ROOT): boolean {
+export function isOsCompatLinkInPlace(
+  linkPath: string = nonEmpty(process.env[OS_COMPAT_LINK_ENV]) ?? LEGACY_OS_ROOT,
+): boolean {
   try {
     return lstatSync(linkPath).isSymbolicLink();
   } catch {

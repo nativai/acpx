@@ -16,11 +16,20 @@
 
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
+import {
+  isOsCompatLinkInPlace,
+  LEGACY_OS_ROOT,
+  OS_COMPAT_LINK_ENV as PRODUCT_OS_COMPAT_LINK_ENV,
+} from "../src/acp/atrium-os.js";
 import {
   BOX_PI_ENV_PREFIX,
   NO_ENTITLEMENT_FETCH_ENV,
   NOTICE_DELIVERY_DEAD_ORIGIN,
+  NO_OS_COMPAT_LINK_PATH,
+  OS_COMPAT_LINK_ENV,
   NO_RUNTIME_INFO_PATH,
   RUNTIME_INFO_PATH_ENV,
   scrubBoxHarnessEnvOverrides,
@@ -43,6 +52,7 @@ test("3b1ec678: the scrub removes every ACPX_PI_* override and leaves the rest a
   // belongs in the surviving set — it is pinned on its own below.
   assert.deepEqual(Object.keys(env).toSorted(), [
     NO_ENTITLEMENT_FETCH_ENV,
+    OS_COMPAT_LINK_ENV,
     RUNTIME_INFO_PATH_ENV,
     "ACPX_SESSION_URL",
     "ACPX_UI_INTERNAL_URL",
@@ -62,6 +72,7 @@ test("c2df657e: the scrub removes ACPX_SESSION_RECORD_ID (product-set session id
   assert.deepEqual(removed, ["ACPX_SESSION_RECORD_ID"]);
   assert.deepEqual(Object.keys(env).toSorted(), [
     NO_ENTITLEMENT_FETCH_ENV,
+    OS_COMPAT_LINK_ENV,
     RUNTIME_INFO_PATH_ENV,
     "ACPX_SESSION_URL",
     "ACPX_UI_INTERNAL_URL",
@@ -106,6 +117,7 @@ test("45917618: the scrub removes ACPX_SESSION_ROOT (a rig's session-root seam),
     assert.deepEqual(removed, ["ACPX_SESSION_ROOT"], JSON.stringify(value));
     assert.deepEqual(Object.keys(env).toSorted(), [
       NO_ENTITLEMENT_FETCH_ENV,
+      OS_COMPAT_LINK_ENV,
       RUNTIME_INFO_PATH_ENV,
       "ACPX_SESSION_URL",
       "ACPX_UI_INTERNAL_URL",
@@ -186,4 +198,38 @@ test("ebfe4c3c: the suite never keys the Claude advertisement on this box's info
   assert.equal(fs.existsSync(NO_RUNTIME_INFO_PATH), false, "the seam must point at NOTHING");
   // …and the bootstrap applied it in THIS process.
   assert.equal(process.env[RUNTIME_INFO_PATH_ENV], NO_RUNTIME_INFO_PATH);
+});
+
+test("78623030: the suite never inherits whether this box mounts the OS compatibility link", async () => {
+  const env: NodeJS.ProcessEnv = {
+    [OS_COMPAT_LINK_ENV]: "/wisdom/Operating System",
+    HOME: "/home/node",
+  };
+  scrubBoxHarnessEnvOverrides(env);
+  // an inherited value is OVERWRITTEN, not honoured
+  assert.equal(env[OS_COMPAT_LINK_ENV], NO_OS_COMPAT_LINK_PATH);
+  assert.equal(fs.existsSync(NO_OS_COMPAT_LINK_PATH), false, "the seam must point at NOTHING");
+  // the scrub's name IS the product seam's name (a rename in src cannot silently disarm the scrub)
+  assert.equal(OS_COMPAT_LINK_ENV, PRODUCT_OS_COMPAT_LINK_ENV);
+  // …the bootstrap applied it in THIS process, so the product answers "no link" — on a box that mounts one too
+  assert.equal(process.env[OS_COMPAT_LINK_ENV], NO_OS_COMPAT_LINK_PATH);
+  assert.equal(isOsCompatLinkInPlace(), false);
+
+  // NEGATIVE CONTROL: the seam is live, not decorative — pointed at a symlink the product says "in place";
+  // at a directory or nothing it says "absent"; unset it reads the real path (the published default).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-compat-link-"));
+  const saved = process.env[OS_COMPAT_LINK_ENV];
+  try {
+    const link = path.join(dir, "link");
+    fs.symlinkSync(dir, link);
+    process.env[OS_COMPAT_LINK_ENV] = link;
+    assert.equal(isOsCompatLinkInPlace(), true);
+    process.env[OS_COMPAT_LINK_ENV] = dir;
+    assert.equal(isOsCompatLinkInPlace(), false, "a real directory is not the link");
+    delete process.env[OS_COMPAT_LINK_ENV];
+    assert.equal(isOsCompatLinkInPlace(), isOsCompatLinkInPlace(LEGACY_OS_ROOT));
+  } finally {
+    process.env[OS_COMPAT_LINK_ENV] = saved;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
