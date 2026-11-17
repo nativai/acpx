@@ -811,6 +811,100 @@ test("self-restart: a changed entry file, stable for 10 s, makes the governor ex
   assert.deepEqual(governor.tick(), { exitCode: 0 });
 });
 
+/** Two fake release trees and a `bin/acpx` link that a swap flips (the production shape after F). */
+function releaseTrees(box: FakeBox) {
+  const releases = ["rel-a", "rel-b"].map((name) => {
+    const dir = path.join(box.root, name);
+    fs.mkdirSync(path.join(dir, "capacity", "governor"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "cli.js"), name);
+    fs.writeFileSync(path.join(dir, "capacity", "governor", "main.js"), name);
+    return dir;
+  });
+  const link = path.join(box.root, "acpx-link");
+  fs.symlinkSync(path.join(releases[0], "cli.js"), link);
+  const swap = (to: string): void => {
+    fs.rmSync(`${link}.new`, { force: true });
+    fs.symlinkSync(path.join(to, "cli.js"), `${link}.new`);
+    fs.renameSync(`${link}.new`, link);
+  };
+  return { releases, link, swap, entry: path.join(releases[0], "capacity", "governor", "main.js") };
+}
+
+test("self-restart (R5): a swapped acpx — the resolved link path changed, entry file untouched — exits 0 after 10 s", (t) => {
+  const box = new FakeBox();
+  t.after(() => box.cleanup());
+  box.standardSystem();
+  const trees = releaseTrees(box);
+  const governor = startedGovernor(box, {}, {}, { entryFile: trees.entry, acpxLink: trees.link });
+  assert.ok("nextMs" in governor.tick());
+  box.nowMs += 60_000;
+  assert.ok("nextMs" in governor.tick(), "unchanged path: no restart however long it runs");
+  trees.swap(trees.releases[1]);
+  assert.equal(
+    fs.readFileSync(trees.entry, "utf8"),
+    "rel-a",
+    "the old release's file is untouched",
+  );
+  box.nowMs += 1000;
+  assert.ok("nextMs" in governor.tick(), "changed, not yet stable");
+  box.nowMs += 9000;
+  assert.ok("nextMs" in governor.tick());
+  box.nowMs += 1500;
+  assert.deepEqual(governor.tick(), { exitCode: 0 });
+});
+
+test("self-restart (R5): a missing entry file (the old release deleted) exits 0 after 10 s", (t) => {
+  const box = new FakeBox();
+  t.after(() => box.cleanup());
+  box.standardSystem();
+  const trees = releaseTrees(box);
+  const governor = startedGovernor(box, {}, {}, { entryFile: trees.entry, acpxLink: trees.link });
+  assert.ok("nextMs" in governor.tick());
+  fs.rmSync(trees.entry);
+  box.nowMs += 1000;
+  assert.ok("nextMs" in governor.tick(), "missing, not yet stable");
+  box.nowMs += 10_500;
+  assert.deepEqual(governor.tick(), { exitCode: 0 });
+});
+
+test("self-restart (R5): a missing entry file with no link watched also exits (the old rule ignored it)", (t) => {
+  const box = new FakeBox();
+  t.after(() => box.cleanup());
+  box.standardSystem();
+  const entry = path.join(box.root, "main.js");
+  fs.writeFileSync(entry, "v1");
+  const governor = startedGovernor(box, {}, {}, { entryFile: entry });
+  assert.ok("nextMs" in governor.tick());
+  fs.rmSync(entry);
+  box.nowMs += 1000;
+  assert.ok("nextMs" in governor.tick());
+  box.nowMs += 10_500;
+  assert.deepEqual(governor.tick(), { exitCode: 0 });
+});
+
+test("self-restart (R5) negative: an unchanged link and entry never restart; an unresolvable link is no signal; a swap that flips back inside 10 s restarts nothing", (t) => {
+  const box = new FakeBox();
+  t.after(() => box.cleanup());
+  box.standardSystem();
+  const trees = releaseTrees(box);
+  const governor = startedGovernor(box, {}, {}, { entryFile: trees.entry, acpxLink: trees.link });
+  for (let i = 0; i < 20; i += 1) {
+    box.nowMs += 5000;
+    assert.ok("nextMs" in governor.tick(), "unchanged path over 100 s");
+  }
+  fs.rmSync(trees.link);
+  box.nowMs += 20_000;
+  assert.ok("nextMs" in governor.tick(), "a link that cannot be resolved is not a new build");
+  box.nowMs += 20_000;
+  assert.ok("nextMs" in governor.tick());
+  trees.swap(trees.releases[1]);
+  box.nowMs += 1000;
+  assert.ok("nextMs" in governor.tick());
+  trees.swap(trees.releases[0]);
+  box.nowMs += 20_000;
+  assert.ok("nextMs" in governor.tick(), "back on the original path before it was stable");
+});
+
 test("heartbeat: liveness, mode and kills for `acpx capacity` / `acpx governor status`", async (t) => {
   const box = stormBox(t, 130);
   const governor = startedGovernor(box);

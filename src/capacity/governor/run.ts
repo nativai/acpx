@@ -110,6 +110,13 @@ export type GovernorDeps = {
   readonly uid: number;
   /** The entry file watched for a new build (§7.2 self-restart); undefined = never restart. */
   readonly entryFile?: string;
+  /**
+   * The path whose resolution names the CURRENT acpx build (production: `/usr/local/bin/acpx`;
+   * undefined = not watched). The supervisor starts `dirname(readlink -f <this>)/capacity/governor/
+   * main.js`, so once the build lives in a per-release directory (brick 4d74a0d9, review R5) the entry
+   * file itself never changes: a changed resolution is the new-build signal.
+   */
+  readonly acpxLink?: string;
   readonly setPriority?: (nice: number) => void;
   /** The `/proc` scan; default the synchronous streaming scanner (production: `parallelScanner`). */
   readonly scanner?: ProcScanner;
@@ -317,6 +324,18 @@ function fileSignature(file: string | undefined): string | undefined {
   }
 }
 
+/** `readlink -f`: undefined when the link (or its target) cannot be resolved. */
+function resolveLink(link: string | undefined): string | undefined {
+  if (!link) {
+    return undefined;
+  }
+  try {
+    return fs.realpathSync(link);
+  } catch {
+    return undefined;
+  }
+}
+
 function commTop(members: readonly GovProc[]): Array<[string, number]> {
   const counts = new Map<string, number>();
   for (const m of members) {
@@ -363,6 +382,7 @@ export class Governor {
   private fastUntilMs = 0;
   private peaks: PeaksDay;
   private entrySignature: string | undefined;
+  private acpxResolvedAtStart: string | undefined;
   private entryChangedAtMs: number | undefined;
   private startedAtMs: number;
   private niceApplied: number | null = null;
@@ -453,6 +473,7 @@ export class Governor {
       this.finishStopsInFlight();
     }
     this.entrySignature = fileSignature(this.deps.entryFile);
+    this.acpxResolvedAtStart = resolveLink(this.deps.acpxLink);
     this.recordPendingPeaks(this.deps.now());
     const flags = `${this.settings.testMode ? " test=true" : ""}${this.settings.testRig ? " test-rig" : ""}`;
     this.deps.log(
@@ -1561,14 +1582,42 @@ export class Governor {
     return true;
   }
 
-  /** The entry file differs from the one this process started from, unchanged for 10 s. */
-  private newBuildStable(nowMs: number): boolean {
+  /**
+   * What says "a new build is installed", or undefined. Three signals (review R5):
+   *   - the entry file's inode/mtime/size changed (an in-place rebuild);
+   *   - the entry file is MISSING (its release directory was swapped out and deleted; an in-place
+   *     `tsdown --clean` also empties it for a few seconds, which the 10 s wait below absorbs);
+   *   - `readlink -f <acpxLink>` resolves to a different path than at start (a swap to a new release
+   *     directory leaves this process's own file untouched, so nothing else would ever fire).
+   * ⚠️ DO NOT DROP THE MISSING CASE ("a missing file is no change" was the old rule): after a swap
+   * the old release is deleted at the NEXT refresh and the governor would then sit on a deleted tree.
+   */
+  private newBuildSignal(): string | undefined {
+    return this.entryBuildSignal() ?? this.linkBuildSignal();
+  }
+
+  private entryBuildSignal(): string | undefined {
     const signature = fileSignature(this.deps.entryFile);
-    const changed =
-      signature !== undefined && signature !== "missing" && signature !== this.entrySignature;
-    if (!changed || this.lastSeenSignature !== signature) {
-      this.lastSeenSignature = changed ? signature : undefined;
-      this.entryChangedAtMs = changed ? nowMs : undefined;
+    if (signature === "missing") {
+      return this.entrySignature === "missing" ? undefined : signature;
+    }
+    return signature !== undefined && signature !== this.entrySignature ? signature : undefined;
+  }
+
+  private linkBuildSignal(): string | undefined {
+    const resolved = resolveLink(this.deps.acpxLink);
+    if (resolved === undefined || this.acpxResolvedAtStart === undefined) {
+      return undefined;
+    }
+    return resolved === this.acpxResolvedAtStart ? undefined : `link:${resolved}`;
+  }
+
+  /** A new build is signalled and the signal is unchanged for 10 s. */
+  private newBuildStable(nowMs: number): boolean {
+    const signal = this.newBuildSignal();
+    if (signal === undefined || this.lastSeenSignature !== signal) {
+      this.lastSeenSignature = signal;
+      this.entryChangedAtMs = signal === undefined ? undefined : nowMs;
       return false;
     }
     return nowMs - (this.entryChangedAtMs ?? nowMs) >= SELF_RESTART_STABLE_MS;
