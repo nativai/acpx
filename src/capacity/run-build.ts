@@ -103,8 +103,47 @@ type Exit = { readonly code: number | null; readonly signal: NodeJS.Signals | nu
 const gibOf = (bytes: number): string => (Math.max(0, bytes) / (1024 * MIB)).toFixed(1);
 const mibOf = (bytes: number): number => Math.round(bytes / MIB);
 
+/** stderr broke (its reader went away): nothing more is written to it. */
+let stderrBroken = false;
+
+/** Every stderr line of `run-build` goes through here — never once its reader has gone. */
+function writeErr(text: string): void {
+  if (!stderrBroken && !process.stderr.destroyed) {
+    process.stderr.write(text);
+  }
+}
+
 function say(line: string): void {
-  process.stderr.write(`[run-build] ${line}\n`);
+  writeErr(`[run-build] ${line}\n`);
+}
+
+const BROKEN_PIPE_CODES = new Set(["EPIPE", "ERR_STREAM_DESTROYED"]);
+
+/**
+ * ⚠️ `run-build`'s EXIT CODE IS ITS CONTRACT (75 = no room, nothing run; else the child's code, or
+ * 128+n). The CLI-wide handler (`src/cli.ts`) turns an EPIPE on stdout/stderr into `process.exit(0)`,
+ * which is right for a reader-paged listing and wrong here: a deploy script piping run-build's stderr
+ * into a reader that stops early read rc 0 for a refused build and for a build killed by SIGPIPE
+ * (TE2 A1-16). For THIS invocation only, a broken pipe is swallowed — writes to that stream stop and
+ * the exit code stands. Any other stream error still goes to the listeners that were there before.
+ * Rows "A1-16 F.1" and "A1-16 F.2" in test/capacity-run-build.test.ts.
+ */
+function keepExitCodeOnBrokenPipes(): void {
+  for (const stream of [process.stdout, process.stderr]) {
+    const previous = stream.listeners("error") as Array<(error: Error) => void>;
+    stream.removeAllListeners("error");
+    stream.on("error", (error: NodeJS.ErrnoException) => {
+      if (BROKEN_PIPE_CODES.has(error.code ?? "")) {
+        if (stream === process.stderr) {
+          stderrBroken = true;
+        }
+        return;
+      }
+      for (const listener of previous) {
+        listener.call(stream, error);
+      }
+    });
+  }
 }
 
 function signalExitCode(signal: string): number {
@@ -930,7 +969,7 @@ async function waitAndBuild(
     const result = await tick(ctx);
     if (result.kind === "fail-open") {
       // An instrument fault (EACCES, ENOSPC, EROFS) fails OPEN, loudly, as the create gate does.
-      process.stderr.write(
+      writeErr(
         `[acpx] WARNING: release build admission failed (${result.message}); running it without a reservation\n`,
       );
       await logBuild(ctx, "fail-open", undefined, { error: result.message });
@@ -966,7 +1005,7 @@ async function runBuildTrapped(
   const running = refreshAlreadyRunning(request.command, request.args, ctx.env);
   if (running !== undefined) {
     await logBuild(ctx, "denied", undefined, { refreshStatus: running });
-    process.stderr.write(
+    writeErr(
       `[run-build] DENIED: another refresh is already running (${running}); nothing was reserved or run — retry when it has finished (refresh.sh --status). Exit 75.\n`,
     );
     return emptyResult("denied", 75, null, ctx.bytes, 0);
@@ -988,6 +1027,9 @@ export async function runBuild(request: RunBuildRequest): Promise<RunBuildResult
     argv: [...priorityPrefix(env), request.command, ...request.args],
     label: path.basename(request.command),
   };
+  // Kept to the end of the process, not just of this function: the refusal is printed and the exit
+  // code set by the CLI's error path AFTER `runBuild` has thrown.
+  keepExitCodeOnBrokenPipes();
   const signals = trapSignals();
   try {
     return await runBuildTrapped(ctx, request, signals);

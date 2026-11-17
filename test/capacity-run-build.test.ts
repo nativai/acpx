@@ -733,6 +733,66 @@ test("run-build: a missing command is a usage error (exit 2), never a run", asyn
 });
 
 // ---------------------------------------------------------------------------------------------
+// A1-16 (TE2): the exit code survives a stderr whose reader has gone
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * run-build with its stderr on a pipe whose READER is already closed: every write it makes gets
+ * EPIPE. The CLI-wide handler would turn that into `exit(0)`; run-build must keep its own code.
+ */
+function runWithDeadStderr(args: string[], env: NodeJS.ProcessEnv): Promise<number | null> {
+  const proc = spawn(process.execPath, [CLI_PATH, ...args], {
+    env,
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  proc.stderr?.destroy();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => proc.kill("SIGKILL"), 60_000);
+    proc.once("exit", (code) => {
+      clearTimeout(timer);
+      resolve(code);
+    });
+  });
+}
+
+test("NEGATIVE A1-16 F.1: no room with stderr's reader gone ⇒ still exit 75, nothing run, refusal logged, ledger clean", async () => {
+  const box = makeBox(WAITS);
+  const marker = path.join(box.root, "ran.json");
+  const code = await runWithDeadStderr(runBuildArgs(box, marker, { wait: 2 }), box.env);
+  assert.equal(code, 75, "the no-room exit code, not the EPIPE handler's 0");
+  assert.equal(fs.existsSync(marker), false, "nothing ran");
+  assert.deepEqual(buildEntries(box), []);
+  assert.ok(decisionLog(box).some((l) => l.kind === "build" && l.decision === "refused"));
+});
+
+test("NEGATIVE A1-16 F.2: the build dies of SIGPIPE on the dead stderr ⇒ 141; a build that lives exits with its own code", async () => {
+  const box = makeBox(FITS);
+  const args = (script: string) => [
+    "capacity",
+    "run-build",
+    "--bytes",
+    "1000",
+    "--",
+    "sh",
+    "-c",
+    script,
+  ];
+  const killed = await runWithDeadStderr(args("sleep 1; echo late >&2; exit 5"), box.env);
+  assert.equal(killed, 141, "128 + SIGPIPE, not 0");
+  const lived = await runWithDeadStderr(args("sleep 1; exit 5"), box.env);
+  assert.equal(lived, 5, "the child's own code survives run-build's own EPIPE'd lines");
+  assert.deepEqual(buildEntries(box), []);
+  const done = decisionLog(box).filter((l) => l.kind === "build" && l.decision === "done");
+  assert.deepEqual(
+    done.map((l) => [l.exitCode, l.exitSignal]),
+    [
+      [null, "SIGPIPE"],
+      [5, null],
+    ],
+  );
+});
+
+// ---------------------------------------------------------------------------------------------
 // Static imports only (§3.2 step 7)
 // ---------------------------------------------------------------------------------------------
 
