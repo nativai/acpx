@@ -233,3 +233,37 @@ test("78623030: the suite never inherits whether this box mounts the OS compatib
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("78623030: the compat-link seam is ignored outside node --test, so it cannot disable the mandatory-OS refusal", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-compat-link-marker-"));
+  const savedLink = process.env[OS_COMPAT_LINK_ENV];
+  const savedMarker = process.env.NODE_TEST_CONTEXT;
+  try {
+    assert.notEqual(savedMarker, undefined, "this row must itself run under node --test");
+    const link = path.join(dir, "link");
+    fs.symlinkSync(dir, link);
+    const real = isOsCompatLinkInPlace(LEGACY_OS_ROOT);
+    delete process.env.NODE_TEST_CONTEXT; // a PRODUCTION process: no test marker
+    // The two seam values give OPPOSITE answers when honoured (symlink → true, missing → false), so on any box
+    // — link mounted or not — at least one would differ from the real answer if the seam leaked.
+    process.env[OS_COMPAT_LINK_ENV] = link;
+    assert.equal(
+      isOsCompatLinkInPlace(),
+      real,
+      "a symlink seam without the marker must be ignored",
+    );
+    process.env[OS_COMPAT_LINK_ENV] = path.join(dir, "missing");
+    assert.equal(
+      isOsCompatLinkInPlace(),
+      real,
+      "a missing-path seam without the marker must be ignored",
+    );
+    // control: with the marker the same seam values ARE honoured
+    process.env.NODE_TEST_CONTEXT = savedMarker;
+    assert.equal(isOsCompatLinkInPlace(), false);
+    process.env[OS_COMPAT_LINK_ENV] = link;
+    assert.equal(isOsCompatLinkInPlace(), true);
+  } finally {
+    process.env.NODE_TEST_CONTEXT = savedMarker;
+    process.env[OS_COMPAT_LINK_ENV] = savedLink;
+    fs.rmSyn
