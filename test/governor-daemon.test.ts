@@ -853,33 +853,62 @@ test("self-restart (R5): a swapped acpx — the resolved link path changed, entr
   assert.deepEqual(governor.tick(), { exitCode: 0 });
 });
 
-test("self-restart (R5): a missing entry file (the old release deleted) exits 0 after 10 s", (t) => {
+test("self-restart (R5) negative: an entry file missing for 30 s with an unchanged link never exits; once restored with a new mtime it restarts, once, after 10 s stable", (t) => {
   const box = new FakeBox();
   t.after(() => box.cleanup());
   box.standardSystem();
   const trees = releaseTrees(box);
-  const governor = startedGovernor(box, {}, {}, { entryFile: trees.entry, acpxLink: trees.link });
+  const logs: string[] = [];
+  const governor = startedGovernor(
+    box,
+    {},
+    {},
+    { entryFile: trees.entry, acpxLink: trees.link, log: (line) => logs.push(line) },
+  );
   assert.ok("nextMs" in governor.tick());
+  // `tsdown --clean` empties dist/: main.js is absent for 19–28 s on the in-place layout (TE2 case I)
   fs.rmSync(trees.entry);
+  for (let i = 0; i < 6; i += 1) {
+    box.nowMs += 5000;
+    assert.ok("nextMs" in governor.tick(), `absent ${(i + 1) * 5} s: no exit`);
+  }
+  assert.equal(
+    logs.filter((line) => /entry file is missing/u.test(line)).length,
+    1,
+    "the absence is logged once, not per tick",
+  );
+  fs.writeFileSync(trees.entry, "rebuilt — a new build");
+  fs.utimesSync(trees.entry, new Date(box.nowMs + 60_000), new Date(box.nowMs + 60_000));
   box.nowMs += 1000;
-  assert.ok("nextMs" in governor.tick(), "missing, not yet stable");
-  box.nowMs += 10_500;
+  assert.ok("nextMs" in governor.tick(), "restored, not yet stable");
+  box.nowMs += 9000;
+  assert.ok("nextMs" in governor.tick());
+  box.nowMs += 1500;
   assert.deepEqual(governor.tick(), { exitCode: 0 });
 });
 
-test("self-restart (R5): a missing entry file with no link watched also exits (the old rule ignored it)", (t) => {
-  const box = new FakeBox();
-  t.after(() => box.cleanup());
-  box.standardSystem();
-  const entry = path.join(box.root, "main.js");
-  fs.writeFileSync(entry, "v1");
-  const governor = startedGovernor(box, {}, {}, { entryFile: entry });
-  assert.ok("nextMs" in governor.tick());
-  fs.rmSync(entry);
-  box.nowMs += 1000;
-  assert.ok("nextMs" in governor.tick());
-  box.nowMs += 10_500;
-  assert.deepEqual(governor.tick(), { exitCode: 0 });
+test("self-restart (R5) negative: an entry file missing and never restored never exits, with or without a link watched", (t) => {
+  for (const watchLink of [true, false]) {
+    const box = new FakeBox();
+    t.after(() => box.cleanup());
+    box.standardSystem();
+    const trees = releaseTrees(box);
+    const governor = startedGovernor(
+      box,
+      {},
+      {},
+      watchLink ? { entryFile: trees.entry, acpxLink: trees.link } : { entryFile: trees.entry },
+    );
+    assert.ok("nextMs" in governor.tick());
+    fs.rmSync(trees.entry);
+    for (let i = 0; i < 120; i += 1) {
+      box.nowMs += 10_000;
+      assert.ok(
+        "nextMs" in governor.tick(),
+        `absent ${(i + 1) * 10} s (link watched: ${watchLink})`,
+      );
+    }
+  }
 });
 
 test("self-restart (R5) negative: an unchanged link and entry never restart; an unresolvable link is no signal; a swap that flips back inside 10 s restarts nothing", (t) => {

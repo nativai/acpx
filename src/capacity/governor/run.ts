@@ -383,6 +383,7 @@ export class Governor {
   private peaks: PeaksDay;
   private entrySignature: string | undefined;
   private acpxResolvedAtStart: string | undefined;
+  private entryMissingLogged = false;
   private entryChangedAtMs: number | undefined;
   private startedAtMs: number;
   private niceApplied: number | null = null;
@@ -1583,24 +1584,37 @@ export class Governor {
   }
 
   /**
-   * What says "a new build is installed", or undefined. Three signals (review R5):
-   *   - the entry file's inode/mtime/size changed (an in-place rebuild);
-   *   - the entry file is MISSING (its release directory was swapped out and deleted; an in-place
-   *     `tsdown --clean` also empties it for a few seconds, which the 10 s wait below absorbs);
+   * What says "a new build is installed", or undefined. Two signals (review R5, amended by the HoD
+   * after TE2's case I):
    *   - `readlink -f <acpxLink>` resolves to a different path than at start (a swap to a new release
-   *     directory leaves this process's own file untouched, so nothing else would ever fire).
-   * ⚠️ DO NOT DROP THE MISSING CASE ("a missing file is no change" was the old rule): after a swap
-   * the old release is deleted at the NEXT refresh and the governor would then sit on a deleted tree.
+   *     directory leaves this process's own file untouched, so nothing else would ever fire);
+   *   - the entry file is PRESENT with a changed inode/mtime/size (an in-place rebuild finished).
+   *
+   * ⚠️ DO NOT MAKE A MISSING ENTRY FILE A RESTART SIGNAL. It reads like the obvious completion of R5
+   * and it is the bug: on today's in-place layout `tsdown --clean` leaves `main.js` absent for
+   * 19–28 s while it builds, so the governor would exit after 10 s, the supervisor
+   * (`entrypoint-control.sh`) would find no `main.js` and sleep 300 s, and the box would run the
+   * following acpx-ui build (1.9 GiB) with no R2 — and with no governor at all if that build fails.
+   * A missing file with an unchanged resolution means "a build is in flight or failed": keep
+   * running from memory. Under F the path changes on every swap, so "missing" adds nothing there.
+   * Rows: "self-restart (R5) negative: a missing entry file …" in test/governor-daemon.test.ts.
    */
   private newBuildSignal(): string | undefined {
-    return this.entryBuildSignal() ?? this.linkBuildSignal();
+    return this.linkBuildSignal() ?? this.entryBuildSignal();
   }
 
   private entryBuildSignal(): string | undefined {
     const signature = fileSignature(this.deps.entryFile);
     if (signature === "missing") {
-      return this.entrySignature === "missing" ? undefined : signature;
+      if (!this.entryMissingLogged) {
+        this.entryMissingLogged = true;
+        this.deps.log(
+          "process-governor: entry file is missing (a build is in flight or failed); running from memory",
+        );
+      }
+      return undefined;
     }
+    this.entryMissingLogged = false;
     return signature !== undefined && signature !== this.entrySignature ? signature : undefined;
   }
 
