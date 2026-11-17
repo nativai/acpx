@@ -266,4 +266,6 @@ test("78623030: the compat-link seam is ignored outside node --test, so it canno
   } finally {
     process.env.NODE_TEST_CONTEXT = savedMarker;
     process.env[OS_COMPAT_LINK_ENV] = savedLink;
-    fs.rmSyn
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
