@@ -178,6 +178,8 @@ export const BUILD_CONSTANTS = {
   /**
    * The heaviest project build's measured peak rise of `C`, rounded up to 64 MiB: acpx-ui's server
    * `tsc`, 1,878 MiB (§2.4) → 1,920. No extra percentage — agents' growth during the build is `G`'s.
+   * After D (acpx-ui `build:deploy`, 2026-11-18) the measured acpx-ui peak is ~1,036 MiB (vite ~1,003): re-derive
+   * this from `run-build`'s logged peaks once boxes deploy with it, by commit, never auto-tuned.
    */
   buildReserveBytes: 1920 * MIB,
   /** `G = buildGrowthFraction × M`: what agents may grow while the build runs (§3.2 step 3). */
