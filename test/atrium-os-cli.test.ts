@@ -562,6 +562,74 @@ test("T18 negative: a deliberately suppressed primer (human --system-prompt) rai
   });
 });
 
+// ── brick 78623030: the mandatory-OS refusal through the REAL CLI, whatever the box mounts ───────────
+//
+// The suite's bootstrap points `ACPX_OS_COMPAT_LINK` at a path that does not exist (`test/box-env-scrub.ts`),
+// so every row above runs as "the compatibility link is absent". These rows hand the child a temp SYMLINK
+// instead — the link "in place" — and assert the published guarantee itself; they read nothing of the box's
+// `/wisdom/Operating System`.
+
+function compatLinkIn(fixture: Fixture): string {
+  const link = path.join(fixture.osBase, "compat link");
+  symlinkSync(path.join(fixture.osBase, "box OS"), link);
+  return link;
+}
+
+test("C11 with the compatibility link in place, a create whose primer did not render is REFUSED and leaves no session", async () => {
+  await withFixture(async (f) => {
+    await prepareBox(f);
+    const failing = boxEnv(f, {
+      ACPX_SESSION_PRIMER_COMMAND: path.join(f.osBase, "no-such-primer.sh"),
+      ACPX_OS_COMPAT_LINK: compatLinkIn(f),
+    });
+    const result = await runCli(
+      ["--cwd", f.cwd, "--format", "json", "claude", "sessions", "new"],
+      f.home,
+      failing,
+    );
+    assert.notEqual(result.code, 0, "the create must be refused");
+    assert.match(
+      `${result.stdout}\n${result.stderr}`,
+      /refusing to create the session: its Operating System primer did not render/,
+    );
+    const sessionsDir = path.join(f.home, ".acpx", "sessions");
+    const records = (await fs.readdir(sessionsDir).catch(() => [] as string[])).filter(
+      (name) => name.endsWith(".json") && name !== "index.json",
+    );
+    assert.deepEqual(records, [], "a refused create writes no session record");
+  });
+});
+
+test("C11 negatives: the link in place with a primer that renders creates; the link absent with a failing primer creates", async () => {
+  await withFixture(async (f) => {
+    await prepareBox(f);
+    // link in place, primer renders → created (the refusal is keyed on the FAILED render, not on the link)
+    await create(f, [], boxEnv(f, { ACPX_OS_COMPAT_LINK: compatLinkIn(f) }));
+    // link absent (a missing path), primer fails → created with the alarm only
+    const id = await create(
+      f,
+      [],
+      boxEnv(f, {
+        ACPX_SESSION_PRIMER_COMMAND: path.join(f.osBase, "no-such-primer.sh"),
+        ACPX_OS_COMPAT_LINK: path.join(f.osBase, "no such link"),
+      }),
+    );
+    assert.ok((await metadataOf(f, id)).atrium_os_primer_error);
+    // a REAL DIRECTORY at the link path is not the link: alarm only, as before the swap
+    const directory = path.join(f.osBase, "real directory");
+    mkdirSync(directory);
+    const id2 = await create(
+      f,
+      [],
+      boxEnv(f, {
+        ACPX_SESSION_PRIMER_COMMAND: path.join(f.osBase, "no-such-primer.sh"),
+        ACPX_OS_COMPAT_LINK: directory,
+      }),
+    );
+    assert.ok((await metadataOf(f, id2)).atrium_os_primer_error);
+  });
+});
+
 // ── P3a follow-up: G2 (codex carry through the record), G3 (caller metadata stripped), N1 (`--os ""`) ──
 
 test("G2 a stored atrium_os_primer_error reaches the FIRST owner turn of a codex session that renders nothing", async () => {
