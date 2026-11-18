@@ -170,9 +170,7 @@ test("ACPXG-1 · open requests refuse with the exact wording, the names de-dupli
   assert.equal(
     decision.message,
     `${ID} has open questions to Daniel Laatz, Ada Voss. ` +
-      "Answered? Leave them open: their ✓ Done or reply clears them; close later, or add --force (their items stay open for them). " +
-      "Never needed and never answered? From that session: send-message.sh --resolve person:laatz --close-only; send-message.sh --resolve person:p-2 --close-only " +
-      "(each withdraws ALL its open items to that person); then close.",
+      "They stay open until their ✓ Done or reply clears them; close later, or add --force (their items stay open for them).",
   );
   assert.equal(decision.message, openRequestsMessage(ID, decision.open));
   assert.deepEqual(decideOnOpenPersonRequests(ID, { kind: "answered", open: [] }), {
@@ -180,9 +178,9 @@ test("ACPXG-1 · open requests refuse with the exact wording, the names de-dupli
   });
 });
 
-// Brick 2085f83b (finding X-CLI-2): the refusal prints the exact settle command, one per person,
-// and never the old "resolve them" advice — which is wrong for an ANSWERED question (leave it open).
-test("2085f83b · the refusal prints one settle command per person — handle when known, the person id otherwise — and never 'resolve them'", () => {
+// Brick 2085f83b shipped a settle command; Daniel (18 Nov) removed it: the refusal only says the
+// question stays open until the person's ✓ Done or reply, and never advises resolve/withdraw.
+test("2085f83b · the refusal names no settle or withdraw command, however many people — and never 'resolve them'", () => {
   const read = classifyPersonMessagesAnswer(
     200,
     answer([row("open", OTHER), row("open", OTHER)]).body,
@@ -192,12 +190,9 @@ test("2085f83b · the refusal prints one settle command per person — handle wh
   assert.equal(
     decision.message,
     `${ID} has open questions to Ada Voss. ` +
-      "Answered? Leave them open: their ✓ Done or reply clears them; close later, or add --force (their items stay open for them). " +
-      "Never needed and never answered? From that session: send-message.sh --resolve person:p-2 --close-only " +
-      "(withdraws ALL its open items to that person); then close.",
+      "They stay open until their ✓ Done or reply clears them; close later, or add --force (their items stay open for them).",
   );
-  assert.doesNotMatch(decision.message, /resolve them/);
-  assert.equal(decision.message.split("--resolve").length - 1, 1, "one command per person");
+  assert.doesNotMatch(decision.message, /--resolve|--close-only|withdraw|resolve them/i);
 });
 
 test("ACPXG-3 · the route-absent decision proceeds, says so only under --verbose, and differs from `0 open` (which says nothing)", () => {
@@ -369,13 +364,11 @@ test("ACPXG-1 · `sessions close` is REFUSED while a request is open — exit 1,
     assert.ok(
       refused.stderr.includes(
         `sessions close: OPEN_PERSON_REQUESTS: ${id} has an open question to Daniel Laatz. ` +
-          "Answered? Leave it open: their ✓ Done or reply clears it; close later, or add --force (their items stay open for them). " +
-          "Never needed and never answered? From that session: send-message.sh --resolve person:laatz --close-only " +
-          "(withdraws ALL its open items to that person); then close.\n",
+          "It stays open until their ✓ Done or reply clears it; close later, or add --force (their items stay open for them).\n",
       ),
       refused.stderr,
     );
-    assert.doesNotMatch(refused.stderr, /resolve them or add --force/);
+    assert.doesNotMatch(refused.stderr, /--resolve|--close-only|withdraw|resolve them/i);
     assert.notEqual((await rig.onDisk(id)).closed, true, "a refused close moved the record");
     assert.ok(
       rig.stub.requests.includes(`GET /api/sessions/${id}/person-messages`),
