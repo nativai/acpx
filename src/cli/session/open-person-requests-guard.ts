@@ -9,8 +9,8 @@ import { callerIsAgent } from "./byway-close-guard.js";
 /**
  * `sessions close`'s open-person-request guard (brick 2587d30e, addressing v3 §8.3 / K18 P6).
  *
- * An agent's close over an open question is refused; the refusal says how to settle it
- * (`openRequestsMessage`), or the agent closes with `--force`. Plain messages do not
+ * An agent's close over an open question is refused; the refusal says the question stays open
+ * until the person's ✓ Done or reply (`openRequestsMessage`), or the agent closes with `--force`. Plain messages do not
  * block closing. Atrium keeps the items open after an agent closes, including a forced close.
  *
  * ## The mechanism (O-11): a READ of atrium's rows, not a count in the session record
@@ -46,7 +46,7 @@ import { callerIsAgent } from "./byway-close-guard.js";
  * close — atrium's UI close delegation, a human at a terminal — is deliberate. Atrium acknowledges
  * the items only for a signed-in person's Close. A non-agent CLI caller is never asked and
  * never warned. ⚠️ A self-close by an agent IS guarded (unlike the byway guard's exemption): an
- * agent that closes itself with a request open must resolve it or say `--force`.
+ * agent that closes itself with a request open must wait (close later) or say `--force`.
  *
  * It is evaluated by the HANDLER, never inside `closeSession()`, so acpx's own internal closes
  * (template enable, handover) are untouched. It asks only about a seat's ACTIVE holder, or a
@@ -180,25 +180,18 @@ export async function readOpenPersonRequests(
 }
 
 /**
- * The refusal names the exact settle command (brick 2085f83b, finding X-CLI-2: advice without a
- * command was ignored). ⚠️ Never advise "resolve them" again: an ANSWERED question stays open —
- * the person's ✓ Done or reply clears it — and `--resolve … --close-only` only withdraws a
- * question never needed and never answered, closing ALL that seat's items to the person. Same
- * text as the OS (`Skills/acpx/send-message.md`, `SKILL.md`); the ACPXG-1 rows pin it.
+ * The refusal says the question stays open until the person's ✓ Done or reply clears it, and
+ * offers only `--force` (brick 2085f83b first shipped a settle command here; Daniel, 18 Nov,
+ * removed it). ⚠️ Never advise "resolve them" or print a `--resolve` / withdraw command: the
+ * close guard does not encourage withdrawing a person's question.
  */
 export function openRequestsMessage(sessionId: string, open: readonly OpenPersonRequest[]): string {
-  const people = new Map(open.map((request) => [request.to.id, request.to]));
   const names = [...new Set(open.map((request) => request.to.name))].join(", ");
-  const commands = [...people.values()]
-    .map((to) => `send-message.sh --resolve person:${to.handle ?? to.id} --close-only`)
-    .join("; ");
   const one = open.length === 1;
   return (
     `${sessionId} has ${one ? "an open question" : "open questions"} to ${names}. ` +
-    `Answered? Leave ${one ? "it" : "them"} open: their ✓ Done or reply clears ${one ? "it" : "them"}; ` +
-    "close later, or add --force (their items stay open for them). " +
-    `Never needed and never answered? From that session: ${commands} ` +
-    `(${people.size === 1 ? "withdraws" : "each withdraws"} ALL its open items to that person); then close.`
+    `${one ? "It stays" : "They stay"} open until their ✓ Done or reply clears ${one ? "it" : "them"}; ` +
+    "close later, or add --force (their items stay open for them)."
   );
 }
 
