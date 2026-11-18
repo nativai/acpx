@@ -136,7 +136,7 @@ export const NO_RUNTIME_INFO_PATH = "/nonexistent/acpx-test/runtime-info.json";
  * link is absent, so they were green in a workbench without the mount and red the day it gained one.
  * The suite therefore points the product's seam (`OS_COMPAT_LINK_ENV`) at a path that does not exist,
  * making "the link is absent" a property of the repo. A row asserting the refusal points it at a temp
- * symlink in its own child env (`test/os-compat-link-cli.test.ts`) — it never depends on the box.
+ * symlink in its own child env (`test/atrium-os-cli.test.ts`, the C11 rows) — it never depends on the box.
  */
 /** The product seam's name (`OS_COMPAT_LINK_ENV`, `src/acp/atrium-os.ts`); a test pins the two equal. */
 export const OS_COMPAT_LINK_ENV = "ACPX_OS_COMPAT_LINK";

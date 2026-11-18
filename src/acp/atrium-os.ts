@@ -26,7 +26,7 @@ export const LEGACY_OS_ROOT = "/wisdom/Operating System";
  * whether the box it runs on mounts `/wisdom/Operating System`. Unset (every production process) ⇒ the
  * real path, and the mandatory-OS refusal is exactly as published. The suite bootstrap
  * (`test/box-env-scrub.ts`) points it at a path that does not exist; a row asserting the refusal points
- * it at a temp symlink (`test/os-compat-link-cli.test.ts`).
+ * it at a temp symlink (`test/atrium-os-cli.test.ts`, the C11 rows).
  */
 export const OS_COMPAT_LINK_ENV = "ACPX_OS_COMPAT_LINK";
 
