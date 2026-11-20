@@ -20,7 +20,9 @@ import {
   readPiAdvertisedModelIds,
   readReplyLine,
   resetPiKnowledgeMemo,
+  PI_INCOMPLETE_KNOWLEDGE_TTL_MS,
   type PiRpcSpawn,
+  type PiRpcTiming,
 } from "../src/acp/pi-model-knowledge.js";
 import { deriveBilling } from "../src/models/catalogue.js";
 import { deriveCostFigure, reportedCost, type CostUnit } from "../src/models/cost-provenance.js";
@@ -436,7 +438,7 @@ test("pi knowledge: an EMPTY answer is null — never cached, never memoised", (
     let answer: string[] = [];
     const reader = () => {
       asks += 1;
-      return answer;
+      return { ids: answer, complete: true };
     };
 
     resetPiKnowledgeMemo();
@@ -482,12 +484,12 @@ test("pi knowledge: a cached `ids: []` is never used — the poisoned 24 h cache
     const writeCacheFile = (ids: string[]) =>
       writeFileSync(
         cachePath,
-        JSON.stringify({ fetchedAt: new Date().toISOString(), ids, binary: stamp }),
+        JSON.stringify({ fetchedAt: new Date().toISOString(), ids, binary: stamp, complete: true }),
       );
     let asks = 0;
     const reader = () => {
       asks += 1;
-      return ["real/one"];
+      return { ids: ["real/one"], complete: true };
     };
 
     // Fresh, same binary, empty: exactly the cache on all five boxes today.
@@ -554,7 +556,11 @@ test("pi knowledge read env: placeholder key, isolated agent dir, no session dir
 
   assert.equal(child.OPENROUTER_API_KEY, PI_KNOWLEDGE_PLACEHOLDER_KEY);
   assert.equal(child.PI_CODING_AGENT_DIR, "/tmp/isolated");
-  assert.equal("PI_CODING_AGENT_SESSION_DIR" in child, false, "a missing session dir hangs pi");
+  assert.equal(
+    "PI_CODING_AGENT_SESSION_DIR" in child,
+    false,
+    "pi would mkdir an inherited session dir outside the throwaway agent dir",
+  );
   assert.equal(child.PATH, "/some/bin", "the rest of the env still reaches pi");
   assert.ok(
     !Object.values(child).includes(REAL_LOOKING_KEY),
@@ -572,11 +578,21 @@ test("pi knowledge read env: placeholder key, isolated agent dir, no session dir
 
 const REPLY = '{"type":"response","id":"acpx-knowledge","data":{"models":[{"id":"a/b"}]}}\n';
 
+/** Stand-in pi rows: a short refresh wait, and a deadline well inside the suite's patience. */
+const FAST: PiRpcTiming = { refreshWaitMs: 300, deadlineMs: 5_000 };
+
 test("pi knowledge RPC: the spawned pi gets the isolated env, and the temp dir is removed after success", () => {
   // A holder, not a `let`: TS's flow analysis cannot see a closure's assignment.
-  const captured: { env?: NodeJS.ProcessEnv; dirExisted?: boolean } = {};
-  const spawn: PiRpcSpawn = (_command, _args, options) => {
+  const captured: {
+    env?: NodeJS.ProcessEnv;
+    dirExisted?: boolean;
+    command?: string;
+    args?: string[];
+  } = {};
+  const spawn: PiRpcSpawn = (command, args, options) => {
     captured.env = options.env;
+    captured.command = command;
+    captured.args = args;
     const dir = options.env.PI_CODING_AGENT_DIR ?? "";
     captured.dirExisted = existsSync(dir);
     // What pi itself does with its agent dir, even for this read.
@@ -595,7 +611,10 @@ test("pi knowledge RPC: the spawned pi gets the isolated env, and the temp dir i
     spawn,
   );
 
-  assert.deepEqual(ids, ["a/b"]);
+  // No refresh marker in this reply ⇒ the answer is the floor, never "complete".
+  assert.deepEqual(ids, { ids: ["a/b"], complete: false });
+  assert.equal(captured.command, process.execPath, "the read runs the node driver");
+  assert.equal(captured.args?.[2], "pi", "the driver must be handed the pi command");
   const seen = captured.env;
   assert.ok(seen, "the spawn was never called");
   const agentDir = seen.PI_CODING_AGENT_DIR ?? "";
@@ -654,17 +673,231 @@ test("pi knowledge RPC: a REAL child process sees the placeholder and the isolat
     );
     chmodSync(fakePi, 0o755);
 
-    const ids = readAdvertisedViaRpc(fakePi, {
-      PATH: process.env.PATH,
-      OPENROUTER_API_KEY: REAL_LOOKING_KEY,
-      PI_CODING_AGENT_SESSION_DIR: "/does/not/exist",
-    });
-    assert.ok(ids, "the stand-in pi did not answer");
-    const [key, agentDir, sessionDir] = ids;
+    const read = readAdvertisedViaRpc(
+      fakePi,
+      {
+        PATH: process.env.PATH,
+        OPENROUTER_API_KEY: REAL_LOOKING_KEY,
+        PI_CODING_AGENT_SESSION_DIR: "/does/not/exist",
+      },
+      undefined,
+      FAST,
+    );
+    assert.ok(read, "the stand-in pi did not answer");
+    const [key, agentDir, sessionDir] = read.ids;
     assert.equal(key, PI_KNOWLEDGE_PLACEHOLDER_KEY);
     assert.ok(agentDir?.startsWith(tmpdir()), `not a temp dir: ${agentDir}`);
     assert.equal(sessionDir, "session-dir=unset");
     assert.equal(existsSync(agentDir ?? ""), false, "the real read left its temp dir behind");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ── Brick d406ec77, defect D1: the read waits for pi's OWN refresh ───────────
+//
+// The first `get_available_models` answers from pi's BUNDLE. On a box whose
+// bundle predates a model (deepseek/deepseek-v4.1-flash on the 09-06 build), that
+// floor calls the model unknown and acpx fabricates an entry over pi's real one.
+// The read now waits for pi to write its refreshed `models-store.json`, then asks
+// again. These rows drive the real driver against a stand-in pi.
+
+const STAND_IN_PI = [
+  "#!/usr/bin/env node",
+  'const fs = require("fs"), path = require("path");',
+  "const dir = process.env.PI_CODING_AGENT_DIR, mode = process.env.FAKE_PI_MODE;",
+  "fs.writeFileSync(process.env.FAKE_PI_INFO, JSON.stringify({ pid: process.pid, dir }));",
+  'fs.writeFileSync(path.join(dir, "auth.json"), "{}");',
+  "let refreshed = false;",
+  'if (mode === "refresh") setTimeout(() => {',
+  '  fs.writeFileSync(path.join(dir, "models-store.json"), JSON.stringify({ openrouter: { models: [{ id: "new/model" }] } }));',
+  "  refreshed = true;",
+  "}, 150);",
+  'if (mode === "hang") { setInterval(() => {}, 1000); } else {',
+  '  let buf = ""; process.stdin.setEncoding("utf8");',
+  '  process.stdin.on("data", (d) => { buf += d; let i;',
+  '    while ((i = buf.indexOf("\\n")) >= 0) { const req = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1);',
+  '      const ids = refreshed ? ["old/model", "new/model"] : ["old/model"];',
+  '      process.stdout.write(JSON.stringify({ type: "response", id: req.id, data: { models: ids.map((id) => ({ id })) } }) + "\\n"); } });',
+  '  process.stdin.on("end", () => process.exit(0));',
+  "}",
+  "",
+].join("\n");
+
+function withStandInPi<T>(
+  mode: "refresh" | "never" | "hang",
+  run: (fakePi: string, env: NodeJS.ProcessEnv, info: () => { pid: number; dir: string }) => T,
+): T {
+  const root = mkdtempSync(join(tmpdir(), "acpx-pi-standin-"));
+  try {
+    const fakePi = join(root, "pi");
+    writeFileSync(fakePi, STAND_IN_PI);
+    chmodSync(fakePi, 0o755);
+    const infoPath = join(root, "info.json");
+    const env = { PATH: process.env.PATH, FAKE_PI_MODE: mode, FAKE_PI_INFO: infoPath };
+    return run(
+      fakePi,
+      env,
+      () => JSON.parse(readFileSync(infoPath, "utf8")) as { pid: number; dir: string },
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const D1_TIMING: PiRpcTiming = { refreshWaitMs: 3_000, deadlineMs: 8_000 };
+
+test("pi knowledge D1: the answer asked AFTER pi's refresh lands wins, and is complete", () => {
+  withStandInPi("refresh", (fakePi, env, info) => {
+    const started = Date.now();
+    const read = readAdvertisedViaRpc(fakePi, env, undefined, D1_TIMING);
+    const elapsed = Date.now() - started;
+    assert.deepEqual(read, { ids: ["old/model", "new/model"], complete: true });
+    assert.ok(
+      elapsed < D1_TIMING.refreshWaitMs,
+      `waited out the cap (${elapsed} ms) instead of the signal`,
+    );
+    assert.equal(existsSync(info().dir), false, "temp agent dir left behind");
+  });
+});
+
+test("pi knowledge D1 control: a refresh that never lands ⇒ the FLOOR, marked incomplete", () => {
+  withStandInPi("never", (fakePi, env, info) => {
+    const started = Date.now();
+    const read = readAdvertisedViaRpc(fakePi, env, undefined, FAST);
+    assert.deepEqual(read, { ids: ["old/model"], complete: false });
+    assert.ok(Date.now() - started >= FAST.refreshWaitMs, "the read did not wait for the refresh");
+    assert.equal(existsSync(info().dir), false, "temp agent dir left behind");
+  });
+});
+
+test("pi knowledge D1: a pi that HANGS is killed at the deadline — null, no orphan, no temp dir", () => {
+  withStandInPi("hang", (fakePi, env, info) => {
+    const started = Date.now();
+    const read = readAdvertisedViaRpc(fakePi, env, undefined, {
+      refreshWaitMs: 200,
+      deadlineMs: 1_000,
+    });
+    const elapsed = Date.now() - started;
+    assert.equal(read, null);
+    assert.ok(elapsed < 4_000, `the hard bound did not hold: ${elapsed} ms`);
+    const { pid, dir } = info();
+    assert.throws(() => process.kill(pid, 0), /ESRCH/, `stand-in pi ${pid} survived the read`);
+    assert.equal(existsSync(dir), false, "temp agent dir left behind");
+  });
+});
+
+test("pi knowledge D1: `complete` only when the SECOND answer came after the refresh landed", () => {
+  const frame = (id: string, ids: string[]) =>
+    JSON.stringify({ type: "response", id, data: { models: ids.map((m) => ({ id: m })) } });
+  const marker = (landed: boolean) => JSON.stringify({ type: "acpx-refresh", landed });
+  const cases: Array<[string, string[], unknown]> = [
+    [
+      "second answer, landed",
+      [frame("acpx-knowledge-floor", ["a"]), frame("acpx-knowledge", ["a", "b"]), marker(true)],
+      { ids: ["a", "b"], complete: true },
+    ],
+    [
+      "second answer, NOT landed",
+      [frame("acpx-knowledge-floor", ["a"]), frame("acpx-knowledge", ["a"]), marker(false)],
+      { ids: ["a"], complete: false },
+    ],
+    [
+      "landed, but only the floor answered",
+      [frame("acpx-knowledge-floor", ["a"]), marker(true)],
+      { ids: ["a"], complete: false },
+    ],
+    ["nothing answered", [marker(true)], null],
+  ];
+  for (const [label, lines, expected] of cases) {
+    const spawn: PiRpcSpawn = () => ({ stdout: `${lines.join("\n")}\n` });
+    assert.deepEqual(readAdvertisedViaRpc("pi", {}, spawn), expected, label);
+  }
+});
+
+test("pi knowledge D1: an INCOMPLETE answer lives one hour (cache AND memo); a complete one a day", () => {
+  const root = mkdtempSync(join(tmpdir(), "acpx-pi-ttl-"));
+  try {
+    const stamp = "/usr/bin/pi:1:2";
+    const t0 = Date.parse("2026-11-20T12:00:00Z");
+    const later = t0 + PI_INCOMPLETE_KNOWLEDGE_TTL_MS + 60_000;
+    // Still well inside the 24 h a complete answer gets.
+    const muchLater = later + PI_INCOMPLETE_KNOWLEDGE_TTL_MS + 60_000;
+    for (const complete of [false, true]) {
+      const cachePath = join(root, `k-${complete}.json`);
+      let asks = 0;
+      const reader = () => {
+        asks += 1;
+        return { ids: ["old/model"], complete };
+      };
+      resetPiKnowledgeMemo();
+      readPiAdvertisedModelIds(
+        {},
+        { cachePath, readAdvertised: reader, binaryStamp: stamp, now: t0 },
+      );
+      assert.equal(
+        (JSON.parse(readFileSync(cachePath, "utf8")) as { complete?: boolean }).complete,
+        complete,
+      );
+      // Same process (memo NOT reset), just past the short TTL.
+      readPiAdvertisedModelIds(
+        {},
+        { cachePath, readAdvertised: reader, binaryStamp: stamp, now: later },
+      );
+      // A new process (memo reset), past the short TTL of the cache the second
+      // read wrote: now the cache FILE decides, with no memo in the way.
+      resetPiKnowledgeMemo();
+      readPiAdvertisedModelIds(
+        {},
+        { cachePath, readAdvertised: reader, binaryStamp: stamp, now: muchLater },
+      );
+      assert.equal(
+        asks,
+        complete ? 1 : 3,
+        complete
+          ? "a complete answer must be reused for the day"
+          : "a floor-only answer was reused past its hour",
+      );
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("pi knowledge D1: a cache written BEFORE `complete` existed is re-asked once", () => {
+  const root = mkdtempSync(join(tmpdir(), "acpx-pi-legacy-"));
+  try {
+    const stamp = "/usr/bin/pi:1:2";
+    let asks = 0;
+    const reader = () => {
+      asks += 1;
+      return { ids: ["old/model", "new/model"], complete: true };
+    };
+    for (const legacy of [true, false]) {
+      const cachePath = join(root, `k-${legacy}.json`);
+      // The floor-only cache the previous build wrote on four boxes: fresh, same binary, no field.
+      writeFileSync(
+        cachePath,
+        JSON.stringify({
+          fetchedAt: new Date().toISOString(),
+          ids: ["old/model"],
+          binary: stamp,
+          ...(legacy ? {} : { complete: true }),
+        }),
+      );
+      asks = 0;
+      resetPiKnowledgeMemo();
+      const known = readPiAdvertisedModelIds(
+        {},
+        { cachePath, readAdvertised: reader, binaryStamp: stamp },
+      );
+      assert.equal(
+        asks,
+        legacy ? 1 : 0,
+        legacy ? "legacy cache trusted" : "control: complete cache re-asked",
+      );
+      assert.equal(known?.has("new/model"), legacy);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -711,7 +944,7 @@ test("pi knowledge: the cache is keyed by the pi BINARY's identity, and a mismat
     let asks = 0;
     const reader = () => {
       asks += 1;
-      return ["fresh/from-the-binary"];
+      return { ids: ["fresh/from-the-binary"], complete: true };
     };
 
     // A cold read stamps the cache with the binary it asked.
@@ -757,7 +990,7 @@ test("pi knowledge: NO resolvable pi ⇒ NO spawn is attempted at all, and the m
     let asks = 0;
     const reader = () => {
       asks += 1;
-      return ["should/never-be-reached"];
+      return { ids: ["should/never-be-reached"], complete: true };
     };
 
     // `binaryStamp: null` is the "pi is not on PATH" state — the state EVERY box
