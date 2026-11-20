@@ -39,7 +39,7 @@ import {
   resolveProviderObject,
 } from "./openrouter-provider-policy.js";
 import { writePiAuthFile } from "./pi-auth-file.js";
-import { readPiAdvertisedModelIds } from "./pi-model-knowledge.js";
+import { readPiAdvertisedModelIds, readPiKeptOpenRouterModels } from "./pi-model-knowledge.js";
 
 /**
  * ONE per-session harness config dir, serving THREE purposes (CONCEPTION §5.3).
@@ -1701,16 +1701,22 @@ function writePiModelProvisioning(
   modelId: string | undefined,
   files: string[],
 ): void {
-  // The box's catalogue is parsed fresh from disk on every call, so mutating the
+  // The knowledge read comes FIRST when a model is named: a read whose refresh
+  // lands keeps pi's own refreshed block, and the overlay below must already see
+  // it on the very first spawn (brick d406ec77, D1). `readPiAdvertisedModelIds`
+  // returns `null` when pi could not be asked, which must NOT be read as "pi
+  // knows nothing".
+  const piKnown = modelId === undefined ? null : readPiAdvertisedModelIds(env);
+
+  // The overlay is parsed fresh from disk on every call, so mutating the
   // entries here cannot reach anything else.
-  const boxModels = readBoxPiOpenRouterModels(boxAgentDir);
+  const boxModels = resolvePiOverlayModels(boxAgentDir, env);
   repairAnthropicBaseUrls(boxModels);
 
   if (modelId === undefined) {
-    // Return BEFORE `readPiAdvertisedModelIds`, which is a ~539 ms `spawnSync` on
-    // a cold cache. A session that named no model must not pay it to learn that
-    // it has nothing to look up. `readBoxPiOpenRouterModels` above is a plain
-    // `readFileSync`, not that spawn, so hoisting it costs this branch nothing.
+    // Never pays `readPiAdvertisedModelIds` (a ~1-2 s spawn on a cold cache): a
+    // session that named no model must not pay it to learn that it has nothing
+    // to look up. The overlay above is plain `readFileSync`s, not that spawn.
     //
     // ⚠️ AND THE CAP IS NOT GATED ON `modelId`, for exactly the reason the
     // Anthropic `baseUrl` repair is not (see the call site): a session created
@@ -1725,9 +1731,14 @@ function writePiModelProvisioning(
   // are BUNDLED, and on every dev box the overlay file does not exist at all — so
   // the "a slug the catalogue already carries needs nothing" protection below was
   // unreachable for EVERY model, and each session replaced pi's real entry with a
-  // fabricated one. `readPiAdvertisedModelIds` returns `null` when pi could not be
-  // asked, which must NOT be read as "pi knows nothing".
-  const alreadyKnown = piAlreadyKnows(boxModels, modelId, readPiAdvertisedModelIds(env));
+  // fabricated one.
+  //
+  // ⚠️ `piKnown` is pi's FLOOR (its bundle), never its post-refresh view, so this
+  // asks exactly "will the session's pi know this model when it starts?": its
+  // bundle, or the overlay we are about to hand it. A post-refresh answer here
+  // would provision nothing for a model only a fresh refresh knows while the
+  // overlay is an older box store, and pi would refuse the model (D1).
+  const alreadyKnown = piAlreadyKnows(boxModels, modelId, piKnown);
 
   // ⚠️ ONE QUESTION, ASKED ONCE, ANSWERED FOR BOTH FILES — the two writers must
   // not be able to disagree. A slug pi already knows gets NO fabricated entry in
@@ -2182,6 +2193,18 @@ type PiCatalogueModel = {
  * error: the bundled catalogue still resolves, so the session simply gets the
  * provisioned slug on top of it.
  */
+/**
+ * THE box overlay (brick d406ec77, D1): the box's own `models-store.json`
+ * `openrouter` models when there are any, ELSE pi's own refreshed block kept by
+ * the last complete knowledge read (an invalid or absent block is `[]`, i.e. no
+ * overlay). A non-empty box store always wins, so a box that has one is unchanged;
+ * a box with an empty one gets the same shape, from pi's own data.
+ */
+function resolvePiOverlayModels(boxAgentDir: string, env: NodeJS.ProcessEnv): PiCatalogueModel[] {
+  const own = readBoxPiOpenRouterModels(boxAgentDir);
+  return own.length > 0 ? own : (readPiKeptOpenRouterModels(env) as PiCatalogueModel[]);
+}
+
 function readBoxPiOpenRouterModels(boxAgentDir: string): PiCatalogueModel[] {
   try {
     const parsed = JSON.parse(readFileSync(join(boxAgentDir, "models-store.json"), "utf8")) as {

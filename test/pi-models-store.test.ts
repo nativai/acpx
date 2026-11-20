@@ -9,18 +9,21 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { applyHarnessConfigDir } from "../src/acp/harness-config-dir.js";
 import {
   PI_KNOWLEDGE_PLACEHOLDER_KEY,
   piKnowledgeCachePath,
+  piKeptOverlayPath,
   piKnowledgeReadEnv,
   readAdvertisedViaRpc,
+  readPiKeptOpenRouterModels,
   readPiAdvertisedModelIds,
   readReplyLine,
   resetPiKnowledgeMemo,
   PI_INCOMPLETE_KNOWLEDGE_TTL_MS,
+  type PiAdvertisedRead,
   type PiRpcSpawn,
   type PiRpcTiming,
 } from "../src/acp/pi-model-knowledge.js";
@@ -699,8 +702,9 @@ test("pi knowledge RPC: a REAL child process sees the placeholder and the isolat
 // The first `get_available_models` answers from pi's BUNDLE. On a box whose
 // bundle predates a model (deepseek/deepseek-v4.1-flash on the 09-06 build), that
 // floor calls the model unknown and acpx fabricates an entry over pi's real one.
-// The read now waits for pi to write its refreshed `models-store.json`, then asks
-// again. These rows drive the real driver against a stand-in pi.
+// The read now waits for pi to write its refreshed `models-store.json` and KEEPS
+// that block; the ids stay the floor. These rows drive the real driver against a
+// stand-in pi.
 
 const STAND_IN_PI = [
   "#!/usr/bin/env node",
@@ -747,12 +751,16 @@ function withStandInPi<T>(
 
 const D1_TIMING: PiRpcTiming = { refreshWaitMs: 3_000, deadlineMs: 8_000 };
 
-test("pi knowledge D1: the answer asked AFTER pi's refresh lands wins, and is complete", () => {
+test("pi knowledge D1: a refresh that lands ⇒ the FLOOR ids plus pi's own refreshed block, complete", () => {
   withStandInPi("refresh", (fakePi, env, info) => {
     const started = Date.now();
     const read = readAdvertisedViaRpc(fakePi, env, undefined, D1_TIMING);
     const elapsed = Date.now() - started;
-    assert.deepEqual(read, { ids: ["old/model", "new/model"], complete: true });
+    assert.deepEqual(read, {
+      ids: ["old/model"],
+      complete: true,
+      openrouter: { models: [{ id: "new/model" }] },
+    });
     assert.ok(
       elapsed < D1_TIMING.refreshWaitMs,
       `waited out the cap (${elapsed} ms) instead of the signal`,
@@ -761,7 +769,7 @@ test("pi knowledge D1: the answer asked AFTER pi's refresh lands wins, and is co
   });
 });
 
-test("pi knowledge D1 control: a refresh that never lands ⇒ the FLOOR, marked incomplete", () => {
+test("pi knowledge D1 control: a refresh that never lands ⇒ the FLOOR, no block, incomplete", () => {
   withStandInPi("never", (fakePi, env, info) => {
     const started = Date.now();
     const read = readAdvertisedViaRpc(fakePi, env, undefined, FAST);
@@ -787,30 +795,46 @@ test("pi knowledge D1: a pi that HANGS is killed at the deadline — null, no or
   });
 });
 
-test("pi knowledge D1: `complete` only when the SECOND answer came after the refresh landed", () => {
-  const frame = (id: string, ids: string[]) =>
-    JSON.stringify({ type: "response", id, data: { models: ids.map((m) => ({ id: m })) } });
+test("pi knowledge D1: `complete` only when the driver saw the refresh land AND the block is readable", () => {
+  const floor = JSON.stringify({
+    type: "response",
+    id: "acpx-knowledge",
+    data: { models: [{ id: "a" }] },
+  });
   const marker = (landed: boolean) => JSON.stringify({ type: "acpx-refresh", landed });
-  const cases: Array<[string, string[], unknown]> = [
+  const block = { models: [{ id: "b", thinkingLevelMap: { max: "max" } }] };
+  const cases: Array<[string, string[], unknown, unknown]> = [
     [
-      "second answer, landed",
-      [frame("acpx-knowledge-floor", ["a"]), frame("acpx-knowledge", ["a", "b"]), marker(true)],
-      { ids: ["a", "b"], complete: true },
+      "landed, block written",
+      [floor, marker(true)],
+      { openrouter: block },
+      { ids: ["a"], complete: true, openrouter: block },
     ],
     [
-      "second answer, NOT landed",
-      [frame("acpx-knowledge-floor", ["a"]), frame("acpx-knowledge", ["a"]), marker(false)],
+      "block written, NOT landed",
+      [floor, marker(false)],
+      { openrouter: block },
       { ids: ["a"], complete: false },
     ],
+    ["landed, no block on disk", [floor, marker(true)], undefined, { ids: ["a"], complete: false }],
     [
-      "landed, but only the floor answered",
-      [frame("acpx-knowledge-floor", ["a"]), marker(true)],
+      "landed, EMPTY block",
+      [floor, marker(true)],
+      { openrouter: { models: [] } },
       { ids: ["a"], complete: false },
     ],
-    ["nothing answered", [marker(true)], null],
+    ["nothing answered", [marker(true)], { openrouter: block }, null],
   ];
-  for (const [label, lines, expected] of cases) {
-    const spawn: PiRpcSpawn = () => ({ stdout: `${lines.join("\n")}\n` });
+  for (const [label, lines, store, expected] of cases) {
+    const spawn: PiRpcSpawn = (_c, _a, options) => {
+      if (store !== undefined) {
+        writeFileSync(
+          join(options.env.PI_CODING_AGENT_DIR ?? "", "models-store.json"),
+          JSON.stringify(store),
+        );
+      }
+      return { stdout: `${lines.join("\n")}\n` };
+    };
     assert.deepEqual(readAdvertisedViaRpc("pi", {}, spawn), expected, label);
   }
 });
@@ -898,6 +922,228 @@ test("pi knowledge D1: a cache written BEFORE `complete` existed is re-asked onc
       );
       assert.equal(known?.has("new/model"), legacy);
     }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ── Brick d406ec77, D1: the KEPT block is the overlay when the box store is empty ──
+//
+// The rule: the box overlay = the box's own `models-store.json` openrouter block
+// when it is non-empty, ELSE pi's own refreshed block that acpx kept from its last
+// COMPLETE knowledge read. Everything downstream is unchanged.
+
+const DS_ID = "deepseek/deepseek-v4.1-flash";
+/** Shaped like pi's own refreshed row (devbox-staging, 2026-11-20). */
+const PI_DS_ENTRY = {
+  id: DS_ID,
+  name: "DeepSeek: DeepSeek V4.1 Flash",
+  api: "openai-completions",
+  provider: "openrouter",
+  baseUrl: "https://openrouter.ai/api/v1",
+  reasoning: true,
+  input: ["text"],
+  cost: { input: 0.05, output: 0.2, cacheRead: 0.01, cacheWrite: 0 },
+  contextWindow: 1_048_576,
+  maxTokens: 65_536,
+  thinkingLevelMap: {
+    off: "none",
+    minimal: null,
+    low: "low",
+    medium: null,
+    high: "high",
+    xhigh: null,
+    max: "max",
+  },
+};
+const PI_GLM_ENTRY = {
+  ...PI_DS_ENTRY,
+  id: "z-ai/glm-5.3-flash",
+  name: "Z.ai: GLM 5.3 Flash",
+  thinkingLevelMap: { low: "low", high: "high", max: "max" },
+};
+
+function keep(
+  fx: Fixture,
+  models: unknown[],
+  options: { ageMs?: number; binary?: string } = {},
+): void {
+  writeFileSync(
+    piKeptOverlayPath(fx.env.ACPX_PI_KNOWLEDGE_CACHE as string),
+    JSON.stringify({
+      fetchedAt: new Date(Date.now() - (options.ageMs ?? 0)).toISOString(),
+      binary: options.binary,
+      openrouter: { lastModified: 1, checkedAt: 1, models },
+    }),
+  );
+}
+
+const storeEntry = (p: ReturnType<typeof provisioningFor>, id: string) =>
+  (p.store?.json.openrouter.models as Array<{ id: string }> | undefined)?.find((m) => m.id === id);
+const configEntry = (p: ReturnType<typeof provisioningFor>, id: string) =>
+  ((p.config?.json.providers?.openrouter?.models ?? []) as Array<{ id: string }>).find(
+    (m) => m.id === id,
+  );
+
+test("D1 overlay: EMPTY box store + kept block ⇒ the session store carries PI's entry, map intact, nothing fabricated", () => {
+  const withBlock = fixture({ piKnows: ["z-ai/glm-5.3-flash"] });
+  const without = fixture({ piKnows: ["z-ai/glm-5.3-flash"] });
+  try {
+    keep(withBlock, [PI_DS_ENTRY]);
+    const kept = provisioningFor(withBlock, `openrouter/${DS_ID}`);
+    assert.deepEqual(storeEntry(kept, DS_ID), PI_DS_ENTRY, "pi's own row, byte for byte");
+    assert.equal(kept.store?.json.openrouter.models.length, 1, "nothing fabricated beside it");
+    assert.equal(configEntry(kept, DS_ID), undefined, "no fabricated models.json definition");
+
+    // Control: no kept block ⇒ today's D1 behaviour — a fabricated, map-less entry
+    // in BOTH files (usable model, wrong ladder).
+    const fabricated = provisioningFor(without, `openrouter/${DS_ID}`);
+    const entry = storeEntry(fabricated, DS_ID) as { thinkingLevelMap?: unknown } | undefined;
+    assert.ok(entry, "control: the model must still be provisioned");
+    assert.equal(entry.thinkingLevelMap, undefined);
+    assert.ok(configEntry(fabricated, DS_ID));
+  } finally {
+    rmSync(withBlock.root, { recursive: true, force: true });
+    rmSync(without.root, { recursive: true, force: true });
+  }
+});
+
+test("D1 overlay: a NON-EMPTY box store wins — the kept block changes nothing (devbox stays identical)", () => {
+  const boxOverlay = [PI_GLM_ENTRY];
+  const plain = fixture({ piKnows: ["z-ai/glm-5.3-flash"], boxOverlay });
+  const withBlock = fixture({ piKnows: ["z-ai/glm-5.3-flash"], boxOverlay });
+  try {
+    keep(withBlock, [PI_DS_ENTRY, { ...PI_GLM_ENTRY, name: "KEPT-MARKER" }]);
+    for (const model of [DS_ID, "z-ai/glm-5.3-flash"]) {
+      const a = provisioningFor(plain, `openrouter/${model}`);
+      const b = provisioningFor(withBlock, `openrouter/${model}`);
+      assert.deepEqual(b.store?.json.openrouter.models, a.store?.json.openrouter.models, model);
+      assert.deepEqual(b.config?.json, a.config?.json, model);
+      assert.ok(
+        !JSON.stringify(b.store?.json ?? {}).includes("KEPT-MARKER"),
+        `${model}: the kept block leaked past a non-empty box store`,
+      );
+    }
+    // The comparison is not vacuous: with the box store, DS is still fabricated.
+    const ds = storeEntry(provisioningFor(withBlock, `openrouter/${DS_ID}`), DS_ID) as {
+      thinkingLevelMap?: unknown;
+    };
+    assert.equal(ds.thinkingLevelMap, undefined);
+  } finally {
+    rmSync(plain.root, { recursive: true, force: true });
+    rmSync(withBlock.root, { recursive: true, force: true });
+  }
+});
+
+test("D1 overlay: a STALE kept block is ignored (floor path); a fresh one is used", () => {
+  const stale = fixture({ piKnows: ["z-ai/glm-5.3-flash"] });
+  const fresh = fixture({ piKnows: ["z-ai/glm-5.3-flash"] });
+  try {
+    keep(stale, [PI_DS_ENTRY], { ageMs: 25 * 60 * 60 * 1000 });
+    keep(fresh, [PI_DS_ENTRY], { ageMs: 23 * 60 * 60 * 1000 });
+    const s1 = storeEntry(provisioningFor(stale, `openrouter/${DS_ID}`), DS_ID) as {
+      thinkingLevelMap?: unknown;
+    };
+    assert.equal(s1.thinkingLevelMap, undefined, "a 25 h old block was used");
+    assert.deepEqual(storeEntry(provisioningFor(fresh, `openrouter/${DS_ID}`), DS_ID), PI_DS_ENTRY);
+  } finally {
+    rmSync(stale.root, { recursive: true, force: true });
+    rmSync(fresh.root, { recursive: true, force: true });
+  }
+});
+
+test("D1 overlay: a kept block from ANOTHER pi binary is ignored; the same binary's is used", () => {
+  const root = mkdtempSync(join(tmpdir(), "acpx-pi-kept-bin-"));
+  try {
+    const cachePath = join(root, "k.json");
+    writeFileSync(
+      piKeptOverlayPath(cachePath),
+      JSON.stringify({
+        fetchedAt: new Date().toISOString(),
+        binary: "/usr/bin/pi:1:2",
+        openrouter: { models: [PI_DS_ENTRY] },
+      }),
+    );
+    const read = (binaryStamp: string | null) =>
+      readPiKeptOpenRouterModels({}, { cachePath, binaryStamp });
+    assert.deepEqual(read("/usr/bin/pi:9:9"), [], "a different pi build's block was used");
+    assert.deepEqual(read("/usr/bin/pi:1:2"), [PI_DS_ENTRY]);
+    assert.deepEqual(read(null), [PI_DS_ENTRY], "no resolvable pi ⇒ freshness alone decides");
+    // Beside the knowledge cache, never under a pi agent dir.
+    assert.equal(dirname(piKeptOverlayPath(cachePath)), root);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("D1 overlay: a COMPLETE knowledge cache with NO kept block takes the floor path — the model stays usable", () => {
+  const fx = fixture({ piKnows: ["z-ai/glm-5.3-flash"] });
+  try {
+    writeFileSync(
+      fx.env.ACPX_PI_KNOWLEDGE_CACHE as string,
+      JSON.stringify({
+        fetchedAt: new Date().toISOString(),
+        ids: ["z-ai/glm-5.3-flash"],
+        complete: true,
+      }),
+    );
+    const p = provisioningFor(fx, `openrouter/${DS_ID}`);
+    assert.ok(
+      storeEntry(p, DS_ID),
+      "pi will not advertise it without an entry: it must be provisioned",
+    );
+    assert.ok(configEntry(p, DS_ID));
+    // Control: the same cache WITH the block ⇒ pi's entry, nothing fabricated.
+    keep(fx, [PI_DS_ENTRY]);
+    resetPiKnowledgeMemo();
+    const q = provisioningFor(fx, `openrouter/${DS_ID}`);
+    assert.deepEqual(storeEntry(q, DS_ID), PI_DS_ENTRY);
+    assert.equal(configEntry(q, DS_ID), undefined);
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test("D1 overlay: an UNKNOWN model is still provisioned on top of the kept block", () => {
+  const fx = fixture({ piKnows: ["z-ai/glm-5.3-flash"], catalogue: [KNOWN_ROW] });
+  try {
+    keep(fx, [PI_DS_ENTRY]);
+    const p = provisioningFor(fx, `openrouter/${KNOWN_ID}`);
+    const provisioned = storeEntry(p, KNOWN_ID) as { cost: { input: number } } | undefined;
+    assert.ok(provisioned, "the unknown model lost its entry");
+    assert.equal(provisioned.cost.input, 0.15, "real rates, not zeros");
+    assert.ok(configEntry(p, KNOWN_ID), "and its models.json definition");
+    assert.deepEqual(storeEntry(p, DS_ID), PI_DS_ENTRY, "the kept rows ride along untouched");
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test("D1 kept block: a complete read writes it; a FLOOR-ONLY read never overwrites it", () => {
+  const root = mkdtempSync(join(tmpdir(), "acpx-pi-kept-write-"));
+  try {
+    const cachePath = join(root, "k.json");
+    const keptPath = piKeptOverlayPath(cachePath);
+    const stamp = "/usr/bin/pi:1:2";
+    const readWith = (read: PiAdvertisedRead) => {
+      rmSync(cachePath, { force: true }); // force a fresh read each time
+      resetPiKnowledgeMemo();
+      readPiAdvertisedModelIds({}, { cachePath, readAdvertised: () => read, binaryStamp: stamp });
+    };
+    const keptModels = () =>
+      (JSON.parse(readFileSync(keptPath, "utf8")) as { openrouter: { models: unknown[] } })
+        .openrouter.models;
+
+    readWith({ ids: ["a"], complete: true, openrouter: { models: [{ id: "x" }] } });
+    assert.deepEqual(keptModels(), [{ id: "x" }]);
+    assert.equal((JSON.parse(readFileSync(keptPath, "utf8")) as { binary?: string }).binary, stamp);
+
+    readWith({ ids: ["a"], complete: false });
+    assert.deepEqual(keptModels(), [{ id: "x" }], "a floor-only read clobbered the kept block");
+
+    // Control: a later COMPLETE read does replace it.
+    readWith({ ids: ["a"], complete: true, openrouter: { models: [{ id: "y" }] } });
+    assert.deepEqual(keptModels(), [{ id: "y" }]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
