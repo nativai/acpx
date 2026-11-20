@@ -328,41 +328,56 @@ export function readAdvertisedViaRpc(
   env: NodeJS.ProcessEnv,
   spawn: PiRpcSpawn = spawnSync,
 ): string[] | null {
-  let agentDir: string;
-  try {
-    agentDir = mkdtempSync(join(tmpdir(), "acpx-pi-knowledge-"));
-  } catch {
+  const agentDir = makeReadAgentDir();
+  if (agentDir === null) {
     return null;
   }
   try {
-    const result = spawn(piCommand, ["--mode", "rpc", "--no-themes"], {
-      encoding: "utf8",
-      timeout: PI_RPC_TIMEOUT_MS,
-      killSignal: "SIGKILL",
-      maxBuffer: PI_RPC_MAX_BUFFER,
-      env: piKnowledgeReadEnv(env, agentDir),
-      input: `${JSON.stringify({ type: "get_available_models", id: RPC_REQUEST_ID })}\n`,
-    });
-    if (result.error || typeof result.stdout !== "string") {
-      return null;
-    }
-    for (const line of result.stdout.split("\n")) {
-      const reply = readReplyLine(line);
-      if (reply.kind === "other") {
-        continue;
-      }
-      return reply.kind === "ids" ? reply.ids : null;
-    }
-    return null;
+    return idsFromRpcResult(
+      spawn(piCommand, ["--mode", "rpc", "--no-themes"], {
+        encoding: "utf8",
+        timeout: PI_RPC_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+        maxBuffer: PI_RPC_MAX_BUFFER,
+        env: piKnowledgeReadEnv(env, agentDir),
+        input: `${JSON.stringify({ type: "get_available_models", id: RPC_REQUEST_ID })}\n`,
+      }),
+    );
   } catch {
     return null;
   } finally {
-    try {
-      rmSync(agentDir, { recursive: true, force: true });
-    } catch {
-      // A leftover temp dir must not fail a session create; this read never throws.
-    }
+    removeReadAgentDir(agentDir);
   }
+}
+
+function makeReadAgentDir(): string | null {
+  try {
+    return mkdtempSync(join(tmpdir(), "acpx-pi-knowledge-"));
+  } catch {
+    return null;
+  }
+}
+
+function removeReadAgentDir(agentDir: string): void {
+  try {
+    rmSync(agentDir, { recursive: true, force: true });
+  } catch {
+    // A leftover temp dir must not fail a session create; this read never throws.
+  }
+}
+
+function idsFromRpcResult(result: ReturnType<PiRpcSpawn>): string[] | null {
+  if (result.error || typeof result.stdout !== "string") {
+    return null;
+  }
+  for (const line of result.stdout.split("\n")) {
+    const reply = readReplyLine(line);
+    if (reply.kind === "other") {
+      continue;
+    }
+    return reply.kind === "ids" ? reply.ids : null;
+  }
+  return null;
 }
 
 /**
