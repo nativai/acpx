@@ -1,14 +1,26 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { applyHarnessConfigDir } from "../src/acp/harness-config-dir.js";
 import {
+  PI_KNOWLEDGE_PLACEHOLDER_KEY,
   piKnowledgeCachePath,
+  piKnowledgeReadEnv,
+  readAdvertisedViaRpc,
   readPiAdvertisedModelIds,
   readReplyLine,
   resetPiKnowledgeMemo,
+  type PiRpcSpawn,
 } from "../src/acp/pi-model-knowledge.js";
 import { deriveBilling } from "../src/models/catalogue.js";
 import { deriveCostFigure, reportedCost, type CostUnit } from "../src/models/cost-provenance.js";
@@ -383,9 +395,7 @@ test("pi knowledge: the cache path honours the PASSED env, never the process's o
   );
 });
 
-test("pi knowledge: a failure to ASK is null, and is not the same as an empty set", () => {
-  // These two lead to opposite decisions — "pi knows nothing, provision
-  // everything" vs "I could not establish it" — so they must not collapse.
+test("pi knowledge: a failure to ASK is null, and a stale cache beats nothing", () => {
   const root = mkdtempSync(join(tmpdir(), "acpx-pi-know-"));
   try {
     const cachePath = join(root, "k.json");
@@ -395,14 +405,8 @@ test("pi knowledge: a failure to ASK is null, and is not the same as an empty se
       null,
       "could not ask ⇒ null",
     );
-    const empty = readPiAdvertisedModelIds({}, { cachePath, readAdvertised: () => [] });
-    assert.ok(empty instanceof Set, "asked and got nothing ⇒ an empty Set, not null");
-    assert.equal(empty.size, 0);
 
     // A stale cache beats nothing when pi cannot be asked.
-    // ⚠️ The reset is load-bearing, not hygiene: the empty Set above is now
-    // MEMOISED under this cachePath, and without clearing it this assertion would
-    // read the previous answer instead of the file it just wrote.
     resetPiKnowledgeMemo();
     writeFileSync(
       cachePath,
@@ -410,6 +414,257 @@ test("pi knowledge: a failure to ASK is null, and is not the same as an empty se
     );
     const stale = readPiAdvertisedModelIds({}, { cachePath, readAdvertised: () => null });
     assert.deepEqual([...(stale ?? [])], ["a/b"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ── Brick d406ec77: the read pi filtered to NOTHING ─────────────────────────
+//
+// pi's `get_available_models` lists only providers with auth. The read's env lost
+// its OpenRouter key, pi answered `[]`, and acpx cached that for 24 h as "pi knows
+// nothing" — so every OpenRouter model got a fabricated, map-less entry. An empty
+// answer is now a FAILED read, and the read runs with a placeholder key in a
+// throwaway agent dir.
+
+test("pi knowledge: an EMPTY answer is null — never cached, never memoised", () => {
+  const root = mkdtempSync(join(tmpdir(), "acpx-pi-empty-"));
+  try {
+    const cachePath = join(root, "k.json");
+    const stamp = "/usr/bin/pi:1:2";
+    let asks = 0;
+    let answer: string[] = [];
+    const reader = () => {
+      asks += 1;
+      return answer;
+    };
+
+    resetPiKnowledgeMemo();
+    assert.equal(
+      readPiAdvertisedModelIds({}, { cachePath, readAdvertised: reader, binaryStamp: stamp }),
+      null,
+      "pi bundles hundreds of models: an empty answer means it filtered them away",
+    );
+    assert.equal(existsSync(cachePath), false, "an empty answer must not be cached");
+
+    // Not memoised: the very next call (no memo reset) must ask pi again and
+    // get the real answer, instead of replaying the failure.
+    answer = ["z-ai/glm-5.3-flash"];
+    assert.deepEqual(
+      [
+        ...(readPiAdvertisedModelIds(
+          {},
+          { cachePath, readAdvertised: reader, binaryStamp: stamp },
+        ) ?? []),
+      ],
+      ["z-ai/glm-5.3-flash"],
+    );
+    assert.equal(asks, 2, "the empty answer was memoised — pi was not asked again");
+
+    // Control: a NON-empty answer IS cached and memoised, so the two rows above
+    // are not passing on a reader that never caches anything.
+    assert.deepEqual((JSON.parse(readFileSync(cachePath, "utf8")) as { ids: string[] }).ids, [
+      "z-ai/glm-5.3-flash",
+    ]);
+    answer = [];
+    readPiAdvertisedModelIds({}, { cachePath, readAdvertised: reader, binaryStamp: stamp });
+    assert.equal(asks, 2, "a real answer must be memoised");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("pi knowledge: a cached `ids: []` is never used — the poisoned 24 h cache retires itself", () => {
+  const root = mkdtempSync(join(tmpdir(), "acpx-pi-poison-"));
+  try {
+    const cachePath = join(root, "k.json");
+    const stamp = "/usr/bin/pi:1:2";
+    const writeCacheFile = (ids: string[]) =>
+      writeFileSync(
+        cachePath,
+        JSON.stringify({ fetchedAt: new Date().toISOString(), ids, binary: stamp }),
+      );
+    let asks = 0;
+    const reader = () => {
+      asks += 1;
+      return ["real/one"];
+    };
+
+    // Fresh, same binary, empty: exactly the cache on all five boxes today.
+    writeCacheFile([]);
+    resetPiKnowledgeMemo();
+    assert.deepEqual(
+      [
+        ...(readPiAdvertisedModelIds(
+          {},
+          { cachePath, readAdvertised: reader, binaryStamp: stamp },
+        ) ?? []),
+      ],
+      ["real/one"],
+    );
+    assert.equal(asks, 1, "a cached empty list was trusted instead of asking pi");
+
+    // ... and when pi cannot be asked, the empty cache is not a fallback either:
+    // the answer is "could not establish", never an empty set.
+    writeCacheFile([]);
+    resetPiKnowledgeMemo();
+    assert.equal(
+      readPiAdvertisedModelIds({}, { cachePath, readAdvertised: () => null, binaryStamp: stamp }),
+      null,
+    );
+    writeCacheFile([]);
+    resetPiKnowledgeMemo();
+    assert.equal(
+      readPiAdvertisedModelIds({}, { cachePath, readAdvertised: reader, binaryStamp: null }),
+      null,
+      "no pi on PATH: an empty cache must not read as 'pi knows nothing'",
+    );
+
+    // Control: a NON-empty cache with the same stamp is used without asking.
+    writeCacheFile(["cached/one"]);
+    resetPiKnowledgeMemo();
+    asks = 0;
+    assert.deepEqual(
+      [
+        ...(readPiAdvertisedModelIds(
+          {},
+          { cachePath, readAdvertised: reader, binaryStamp: stamp },
+        ) ?? []),
+      ],
+      ["cached/one"],
+    );
+    assert.equal(asks, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+const REAL_LOOKING_KEY = "sk-or-v1-this-is-the-inherited-real-key";
+
+test("pi knowledge read env: placeholder key, isolated agent dir, no session dir", () => {
+  const inherited: NodeJS.ProcessEnv = {
+    PATH: "/some/bin",
+    HOME: "/home/someone",
+    OPENROUTER_API_KEY: REAL_LOOKING_KEY,
+    PI_CODING_AGENT_DIR: "/home/someone/.pi/agent",
+    PI_CODING_AGENT_SESSION_DIR: "/does/not/exist",
+  };
+  const before = JSON.stringify(inherited);
+  const child = piKnowledgeReadEnv(inherited, "/tmp/isolated");
+
+  assert.equal(child.OPENROUTER_API_KEY, PI_KNOWLEDGE_PLACEHOLDER_KEY);
+  assert.equal(child.PI_CODING_AGENT_DIR, "/tmp/isolated");
+  assert.equal("PI_CODING_AGENT_SESSION_DIR" in child, false, "a missing session dir hangs pi");
+  assert.equal(child.PATH, "/some/bin", "the rest of the env still reaches pi");
+  assert.ok(
+    !Object.values(child).includes(REAL_LOOKING_KEY),
+    "the real key must not reach the read under any name",
+  );
+  assert.equal(JSON.stringify(inherited), before, "the caller's env must not be mutated");
+
+  // Without any inherited key the placeholder is still supplied: that is the
+  // production state (the key lives in auth.json), and the one that read 0 models.
+  assert.equal(
+    piKnowledgeReadEnv({ PATH: "/some/bin" }, "/tmp/isolated").OPENROUTER_API_KEY,
+    PI_KNOWLEDGE_PLACEHOLDER_KEY,
+  );
+});
+
+const REPLY = '{"type":"response","id":"acpx-knowledge","data":{"models":[{"id":"a/b"}]}}\n';
+
+test("pi knowledge RPC: the spawned pi gets the isolated env, and the temp dir is removed after success", () => {
+  // A holder, not a `let`: TS's flow analysis cannot see a closure's assignment.
+  const captured: { env?: NodeJS.ProcessEnv; dirExisted?: boolean } = {};
+  const spawn: PiRpcSpawn = (_command, _args, options) => {
+    captured.env = options.env;
+    const dir = options.env.PI_CODING_AGENT_DIR ?? "";
+    captured.dirExisted = existsSync(dir);
+    // What pi itself does with its agent dir, even for this read.
+    writeFileSync(join(dir, "auth.json"), "{}");
+    mkdirSync(join(dir, "sessions", "--cwd--"), { recursive: true });
+    return { stdout: REPLY };
+  };
+
+  const ids = readAdvertisedViaRpc(
+    "pi",
+    {
+      OPENROUTER_API_KEY: REAL_LOOKING_KEY,
+      PI_CODING_AGENT_DIR: "/home/someone/.pi/agent",
+      PI_CODING_AGENT_SESSION_DIR: "/does/not/exist",
+    },
+    spawn,
+  );
+
+  assert.deepEqual(ids, ["a/b"]);
+  const seen = captured.env;
+  assert.ok(seen, "the spawn was never called");
+  const agentDir = seen.PI_CODING_AGENT_DIR ?? "";
+  assert.equal(captured.dirExisted, true, "pi must be handed a directory that exists");
+  assert.ok(agentDir.startsWith(tmpdir()), `not a temp dir: ${agentDir}`);
+  assert.notEqual(agentDir, "/home/someone/.pi/agent", "the box's agent dir leaked into the read");
+  assert.equal(seen.OPENROUTER_API_KEY, PI_KNOWLEDGE_PLACEHOLDER_KEY);
+  assert.equal("PI_CODING_AGENT_SESSION_DIR" in seen, false);
+  assert.ok(!Object.values(seen).includes(REAL_LOOKING_KEY));
+  assert.equal(
+    existsSync(agentDir),
+    false,
+    "the temp agent dir (with pi's writes) was left behind",
+  );
+});
+
+test("pi knowledge RPC: the temp dir is removed on every FAILURE path too, and the read never throws", () => {
+  const failures: Array<[string, PiRpcSpawn]> = [
+    ["spawn error", () => ({ error: new Error("ENOENT"), stdout: null })],
+    ["no reply frame", () => ({ stdout: "garbage\n" })],
+    [
+      "spawn throws",
+      () => {
+        throw new Error("boom");
+      },
+    ],
+  ];
+  for (const [label, failing] of failures) {
+    let agentDir = "";
+    const spawn: PiRpcSpawn = (command, args, options) => {
+      agentDir = options.env.PI_CODING_AGENT_DIR ?? "";
+      writeFileSync(join(agentDir, "auth.json"), "{}");
+      return failing(command, args, options);
+    };
+    assert.equal(readAdvertisedViaRpc("pi", {}, spawn), null, label);
+    assert.ok(agentDir.startsWith(tmpdir()), `${label}: spawn was not reached`);
+    assert.equal(existsSync(agentDir), false, `${label}: temp agent dir left behind`);
+  }
+});
+
+test("pi knowledge RPC: a REAL child process sees the placeholder and the isolated dir", () => {
+  // The rows above inject the spawn; this one runs the default `spawnSync` against
+  // a stand-in `pi` that echoes what it was given back as model ids.
+  const root = mkdtempSync(join(tmpdir(), "acpx-pi-fake-"));
+  try {
+    const fakePi = join(root, "pi");
+    writeFileSync(
+      fakePi,
+      [
+        "#!/bin/sh",
+        "cat >/dev/null",
+        'touch "$PI_CODING_AGENT_DIR/auth.json"',
+        'printf \'{"type":"response","id":"acpx-knowledge","data":{"models":[{"id":"%s"},{"id":"%s"},{"id":"session-dir=%s"}]}}\\n\' "$OPENROUTER_API_KEY" "$PI_CODING_AGENT_DIR" "${PI_CODING_AGENT_SESSION_DIR-unset}"',
+        "",
+      ].join("\n"),
+    );
+    chmodSync(fakePi, 0o755);
+
+    const ids = readAdvertisedViaRpc(fakePi, {
+      PATH: process.env.PATH,
+      OPENROUTER_API_KEY: REAL_LOOKING_KEY,
+      PI_CODING_AGENT_SESSION_DIR: "/does/not/exist",
+    });
+    assert.ok(ids, "the stand-in pi did not answer");
+    const [key, agentDir, sessionDir] = ids;
+    assert.equal(key, PI_KNOWLEDGE_PLACEHOLDER_KEY);
+    assert.ok(agentDir?.startsWith(tmpdir()), `not a temp dir: ${agentDir}`);
+    assert.equal(sessionDir, "session-dir=unset");
+    assert.equal(existsSync(agentDir ?? ""), false, "the real read left its temp dir behind");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -75,11 +75,51 @@
  * **Never widen this to "the total pi will eventually advertise" without
  * re-measuring the race — a reader that is sometimes complete is worse than one
  * that is reliably a floor, because only the second one is safe to reason about.**
+ *
+ * ## ⚠️ THE READ CARRIES A PLACEHOLDER KEY IN A THROWAWAY AGENT DIR (brick d406ec77)
+ *
+ * pi filters `get_available_models` by AUTH: it lists only models whose provider
+ * has a credential. The September numbers above were taken while
+ * `OPENROUTER_API_KEY` was still in the session env. Once the OpenRouter
+ * credential moved into pi's per-session `auth.json` (written AFTER this read),
+ * the read's env carried none, and pi answered an empty list that was cached as
+ * "pi knows nothing" for 24 h. Every OpenRouter model then got a fabricated,
+ * map-less entry that shadowed pi's own on boxes with an empty
+ * `~/.pi/agent/models-store.json`. Measured 2026-11-20 on devbox, pi 0.84.4, in a
+ * throwaway `PI_CODING_AGENT_DIR`:
+ *
+ * ```
+ *   no OpenRouter key          -> 0 models
+ *   placeholder key (not real) -> 379 openrouter models
+ * ```
+ *
+ * pi filters on the credential's PRESENCE, so {@link PI_KNOWLEDGE_PLACEHOLDER_KEY}
+ * is enough: the read lists models and runs no turn. Never copy the real key in;
+ * that only puts a live credential into one more process.
+ *
+ * The read runs in a fresh temp agent dir that is always removed, because pi
+ * WRITES `auth.json`, `models-store.json` and `sessions/` into the agent dir it
+ * runs with, even for this read. Pointed at the box's `~/.pi/agent` it would
+ * write there. `PI_CODING_AGENT_SESSION_DIR` is dropped: an inherited value that
+ * names a missing directory hangs pi with no output.
+ *
+ * And because pi always bundles hundreds of models, an EMPTY answer is a failed
+ * read, never "pi knows nothing": it is not cached, not memoised, and a cached
+ * empty list is ignored. That is what retires the poisoned caches already on
+ * disk without anyone deleting them.
  */
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 /** Long enough that the spawn is amortised to nothing; short enough that a pi
@@ -96,6 +136,12 @@ const PI_RPC_TIMEOUT_MS = 15_000;
 const PI_RPC_MAX_BUFFER = 64 * 1024 * 1024;
 
 const RPC_REQUEST_ID = "acpx-knowledge";
+
+/** A fixed, deliberately non-secret stand-in for an OpenRouter credential. pi
+ *  lists a provider's models only when that provider has auth, and it checks
+ *  PRESENCE, not validity, so this is all the catalogue read needs. Never derive
+ *  it from, or replace it with, a real key. */
+export const PI_KNOWLEDGE_PLACEHOLDER_KEY = "acpx-pi-catalogue-probe-not-a-key";
 
 export type PiModelKnowledge = {
   /** ISO-8601 of the read these ids came from. */
@@ -160,13 +206,20 @@ function readCache(cachePath: string): PiModelKnowledge | null {
     if (typeof parsed !== "object" || parsed === null) {
       return null;
     }
-    const ids = (parsed as PiModelKnowledge).ids;
-    if (!Array.isArray(ids)) {
+    const listed = (parsed as PiModelKnowledge).ids;
+    if (!Array.isArray(listed)) {
+      return null;
+    }
+    const ids = listed.filter((id): id is string => typeof id === "string");
+    if (ids.length === 0) {
+      // A cached EMPTY list is the poisoned answer of a read pi filtered to
+      // nothing (brick d406ec77), never real knowledge: pi always bundles
+      // hundreds of models. Treat it as no cache at all.
       return null;
     }
     return {
       fetchedAt: (parsed as PiModelKnowledge).fetchedAt ?? new Date(0).toISOString(),
-      ids: ids.filter((id): id is string => typeof id === "string"),
+      ids,
       binary: (parsed as PiModelKnowledge).binary,
     };
   } catch {
@@ -233,20 +286,87 @@ export function readReplyLine(line: string): PiReplyLine {
 }
 
 /**
+ * The env the catalogue read hands pi: the caller's env, plus a placeholder
+ * OpenRouter credential and an isolated agent dir, minus any inherited session
+ * dir. See the module header (brick d406ec77) for why each one is needed.
+ */
+export function piKnowledgeReadEnv(env: NodeJS.ProcessEnv, agentDir: string): NodeJS.ProcessEnv {
+  const childEnv: NodeJS.ProcessEnv = {
+    ...env,
+    PI_CODING_AGENT_DIR: agentDir,
+    OPENROUTER_API_KEY: PI_KNOWLEDGE_PLACEHOLDER_KEY,
+  };
+  delete childEnv.PI_CODING_AGENT_SESSION_DIR;
+  return childEnv;
+}
+
+/** `spawnSync`'s shape, narrowed to what the read uses, so tests can inject it. */
+export type PiRpcSpawn = (
+  command: string,
+  args: string[],
+  options: {
+    encoding: "utf8";
+    timeout: number;
+    killSignal: "SIGKILL";
+    maxBuffer: number;
+    env: NodeJS.ProcessEnv;
+    input: string;
+  },
+) => { error?: Error; stdout: string | null };
+
+/**
  * One `pi --mode rpc` round-trip. Returns `null` — never throws — when pi is not
  * installed, does not answer, or answers something unparseable: the caller must
  * be able to tell "pi advertises nothing" (impossible) from "I could not ask"
  * (routine on a box without pi).
+ *
+ * Runs in a fresh temp agent dir that is removed whatever happens, because pi
+ * writes into the agent dir it is given (module header, brick d406ec77).
  */
-function readAdvertisedViaRpc(piCommand: string, env: NodeJS.ProcessEnv): string[] | null {
-  const result = spawnSync(piCommand, ["--mode", "rpc", "--no-themes"], {
-    encoding: "utf8",
-    timeout: PI_RPC_TIMEOUT_MS,
-    killSignal: "SIGKILL",
-    maxBuffer: PI_RPC_MAX_BUFFER,
-    env,
-    input: `${JSON.stringify({ type: "get_available_models", id: RPC_REQUEST_ID })}\n`,
-  });
+export function readAdvertisedViaRpc(
+  piCommand: string,
+  env: NodeJS.ProcessEnv,
+  spawn: PiRpcSpawn = spawnSync,
+): string[] | null {
+  const agentDir = makeReadAgentDir();
+  if (agentDir === null) {
+    return null;
+  }
+  try {
+    return idsFromRpcResult(
+      spawn(piCommand, ["--mode", "rpc", "--no-themes"], {
+        encoding: "utf8",
+        timeout: PI_RPC_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+        maxBuffer: PI_RPC_MAX_BUFFER,
+        env: piKnowledgeReadEnv(env, agentDir),
+        input: `${JSON.stringify({ type: "get_available_models", id: RPC_REQUEST_ID })}\n`,
+      }),
+    );
+  } catch {
+    return null;
+  } finally {
+    removeReadAgentDir(agentDir);
+  }
+}
+
+function makeReadAgentDir(): string | null {
+  try {
+    return mkdtempSync(join(tmpdir(), "acpx-pi-knowledge-"));
+  } catch {
+    return null;
+  }
+}
+
+function removeReadAgentDir(agentDir: string): void {
+  try {
+    rmSync(agentDir, { recursive: true, force: true });
+  } catch {
+    // A leftover temp dir must not fail a session create; this read never throws.
+  }
+}
+
+function idsFromRpcResult(result: ReturnType<PiRpcSpawn>): string[] | null {
   if (result.error || typeof result.stdout !== "string") {
     return null;
   }
@@ -381,9 +501,12 @@ function establishPiKnowledge(ctx: KnowledgeContext): Set<string> | null {
     return cached ? new Set(cached.ids) : null;
   }
   const ids = ctx.readAdvertised(ctx.piCommand, ctx.env);
-  if (ids === null) {
+  if (ids === null || ids.length === 0) {
     // Could not ask. A STALE cache is still far better than nothing — it is a
     // list of ids pi advertised recently, and pi's catalogue moves slowly.
+    // ⚠️ An EMPTY answer is the same failure, not "pi knows nothing": pi always
+    // bundles hundreds of models, so empty means pi filtered them all away
+    // (brick d406ec77). Caching it would provision every model for 24 h.
     return cached ? new Set(cached.ids) : null;
   }
   writeCache(ctx.cachePath, {
@@ -420,10 +543,10 @@ export function resetPiKnowledgeMemo(): void {
  * The model ids pi already knows — memo first, cache second, one RPC read on a
  * miss, and no spawn at all when pi is not resolvable.
  *
- * `null` means **"could not be established"** (pi absent, or it did not answer)
- * and is deliberately distinct from an empty set: the caller must not read a
- * failure to ask as "pi knows nothing", because those two lead to opposite
- * decisions.
+ * `null` means **"could not be established"** (pi absent, it did not answer, or
+ * it answered an empty list), and this function never returns an empty set: the
+ * caller must not read a failure to ask as "pi knows nothing", because those two
+ * lead to opposite decisions.
  */
 export function readPiAdvertisedModelIds(
   env: NodeJS.ProcessEnv = process.env,
