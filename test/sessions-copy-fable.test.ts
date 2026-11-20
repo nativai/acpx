@@ -149,8 +149,15 @@ async function servedModel(r: Rig, sessionId: string, text: string): Promise<unk
   return prompts[0]?.modelId;
 }
 
+/**
+ * Best effort: an agent may not close a by-the-way copy (BYWAY_CLOSE_REFUSED), so the result is
+ * not asserted; `install-owner-reaper` reaps every owner the temp HOME leaves behind.
+ */
 async function closeSession(r: Rig, id: string): Promise<void> {
-  await runCli(["--cwd", r.cwd, ...COMMON, "claude", "sessions", "close", id], r.homeDir);
+  await runCli(
+    ["--cwd", r.cwd, ...COMMON, "claude", "sessions", "close", "--session-id", id],
+    r.homeDir,
+  );
 }
 
 test("15252af6: a by-the-way copy of an ordinary Fable session stays on fable, explicit, unguarded — and its first turn is served by fable", async () => {
