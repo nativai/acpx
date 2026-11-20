@@ -28,8 +28,9 @@
  *
  * What is left is pi's own **documented RPC surface**, which is the interface
  * pi-acp itself drives: `pi --mode rpc` + `{"type":"get_available_models"}`.
- * Measured cost: **539 ms** via `spawnSync` (exit 0 — pi terminates on stdin
- * EOF), so this is affordable once and then cached.
+ * Measured cost: **539 ms** for one ask (exit 0 — pi terminates on stdin EOF);
+ * with the wait for pi's refresh (below) about 1-2 s, so this is affordable once
+ * and then cached.
  *
  * ## ⚠️ THIS RUNS ON THE SESSION-CREATE PATH — WHAT BOUNDS IT (brick ff298f02)
  *
@@ -53,28 +54,44 @@
  * 15 s is affordable *because* of bounds 1–3: it is a worst case paid once per
  * binary, not per create.
  *
- * ## ⚠️ THE REFRESH RACE, MEASURED — and why this reader is a FLOOR, not a total
+ * ## ⚠️ THE REFRESH: KEEP PI'S OWN REFRESHED BLOCK (brick d406ec77, defect D1)
  *
  * pi refreshes its remote catalogue in the background at startup, so the answer
- * depends on WHEN you ask. Measured, varying only the wait:
+ * depends on WHEN you ask. `get_available_models` first answers from pi's
+ * **bundle** (the floor); about a second later pi writes its refreshed
+ * `openrouter` block into `<agent dir>/models-store.json`. Measured 2026-11-20,
+ * placeholder key, isolated agent dir, pi 0.84.4:
  *
  * ```
- *   ask after    0 ms -> 333 models      ask after 1200 ms -> 374 models
- *   ask after  300 ms -> 333 models      ask after 3000 ms -> 374 models
+ *   devbox          (bundle 2026-09-15): floor 379, store write after 1.1-1.7 s
+ *   devbox-staging  (bundle 2026-09-06): floor 333, store write after 0.75-0.84 s
  * ```
  *
- * A synchronous read therefore returns the **bundled floor (333)**, not the full
- * 374. **This is deliberate and it degrades in the SAFE direction:** a model in
- * the ~41 remote-only rows is classified "pi does not know it", so we write an
- * entry for it — but now with **real** rates, context window and max-tokens from
- * acpx's own catalogue, which is strictly better than the zeros this brick
- * removes. The residual (such a model still loses its `thinkingLevelMap`) is
- * filed under 6253611b rather than papered over: closing it means waiting on
- * pi's refresh, which would put >1.2 s on every session create.
+ * A model newer than the box's pi bundle (`deepseek/deepseek-v4.1-flash` on the
+ * 09-06 build) is outside the floor. It is not enough to KNOW that pi will learn
+ * it after its refresh: a session's pi starts from its bundle plus the session's
+ * `models-store.json`, and lists models for `session/new` BEFORE its own refresh
+ * lands. Measured on devbox-staging: knowing it and provisioning nothing got the
+ * create refused ("the ACP agent did not advertise that model").
  *
- * **Never widen this to "the total pi will eventually advertise" without
- * re-measuring the race — a reader that is sometimes complete is worse than one
- * that is reliably a floor, because only the second one is safe to reason about.**
+ * So the read waits for a POSITIVE signal (pi's own store write, capped at
+ * {@link PI_REFRESH_WAIT_MS}) and KEEPS that block in an acpx-owned file beside the
+ * knowledge cache ({@link piKeptOverlayPath}). When a box's own
+ * `~/.pi/agent/models-store.json` is empty, the kept block becomes the box overlay
+ * ({@link readPiKeptOpenRouterModels}), so the session's pi starts with pi's own
+ * entries, maps included: the shape a box with a populated store already has.
+ *
+ * ⚠️ **THE IDS STAY THE FLOOR, ON PURPOSE.** The provisioning decision is
+ * "the floor OR the overlay has it", which is exactly what the session's pi knows
+ * when it starts. Do NOT replace the floor with a post-refresh answer: when the
+ * overlay is the box's own (older) store, a model only the fresh refresh knows
+ * would then get no entry and be refused, the failure above.
+ *
+ * When the refresh does not land in time (offline, pi.dev down), nothing is kept,
+ * and the knowledge is marked `complete: false` and lives only
+ * {@link PI_INCOMPLETE_KNOWLEDGE_TTL_MS}, so the next read soon tries again. The
+ * driver ({@link RPC_DRIVER_SCRIPT}) kills pi at its own deadline, inside
+ * {@link PI_RPC_TIMEOUT_MS}. The cost (~1-2 s) is paid once per pi binary per TTL.
  *
  * ## ⚠️ THE READ CARRIES A PLACEHOLDER KEY IN A THROWAWAY AGENT DIR (brick d406ec77)
  *
@@ -100,8 +117,10 @@
  * The read runs in a fresh temp agent dir that is always removed, because pi
  * WRITES `auth.json`, `models-store.json` and `sessions/` into the agent dir it
  * runs with, even for this read. Pointed at the box's `~/.pi/agent` it would
- * write there. `PI_CODING_AGENT_SESSION_DIR` is dropped: an inherited value that
- * names a missing directory hangs pi with no output.
+ * write there. `PI_CODING_AGENT_SESSION_DIR` is dropped for the same reason: pi
+ * 0.84.4 does NOT hang on a missing one during this RPC read (measured by the
+ * test-engineer); it `mkdir`s it, i.e. it would create a directory at whatever
+ * inherited path it was handed, outside the throwaway dir.
  *
  * And because pi always bundles hundreds of models, an EMPTY answer is a failed
  * read, never "pi knows nothing": it is not cached, not memoised, and a cached
@@ -132,10 +151,22 @@ export const PI_KNOWLEDGE_TTL_MS = 24 * 60 * 60 * 1000;
  *  that has wedged is precisely the process that would catch it. */
 const PI_RPC_TIMEOUT_MS = 15_000;
 
+/** How long the read waits for pi's own refresh to land before it settles for the
+ *  floor. Measured landing: 0.75-1.7 s. */
+export const PI_REFRESH_WAIT_MS = 6_000;
+
+/** The driver kills pi here, before `spawnSync`'s own SIGKILL can orphan it. */
+const PI_DRIVER_DEADLINE_MS = PI_RPC_TIMEOUT_MS - 2_000;
+
+/** A floor-only (incomplete) cache is re-asked after an hour, not a day. */
+export const PI_INCOMPLETE_KNOWLEDGE_TTL_MS = 60 * 60 * 1000;
+
 /** pi's catalogue reply is ~140 KB today; leave generous headroom. */
 const PI_RPC_MAX_BUFFER = 64 * 1024 * 1024;
 
 const RPC_REQUEST_ID = "acpx-knowledge";
+/** The driver's own last line: did pi's refresh land before it closed stdin? */
+const REFRESH_MARKER_TYPE = "acpx-refresh";
 
 /** A fixed, deliberately non-secret stand-in for an OpenRouter credential. pi
  *  lists a provider's models only when that provider has auth, and it checks
@@ -154,7 +185,24 @@ export type PiModelKnowledge = {
    *  HOWEVER RECENT it is. Absent on caches written before this field existed,
    *  which therefore read as stale exactly once. */
   binary?: string;
+  /** `true` when pi's refresh landed and its block was kept beside this cache;
+   *  `false` when only the floor was read (short TTL). Absent on caches written
+   *  before this field existed, which therefore read as stale exactly once. */
+  complete?: boolean;
 };
+
+/** pi's own `openrouter` block from its `models-store.json`. */
+export type PiOpenRouterBlock = { models: unknown[] } & Record<string, unknown>;
+
+/** One read: pi's FLOOR ids, and pi's refreshed block when its refresh landed. */
+export type PiAdvertisedRead = {
+  ids: string[];
+  complete: boolean;
+  openrouter?: PiOpenRouterBlock;
+};
+
+/** The kept block on disk: pi's refreshed block plus the read it came from. */
+type KeptOverlay = { fetchedAt: string; binary?: string; openrouter: PiOpenRouterBlock };
 
 export type PiKnowledgeDeps = {
   /** Overrides the cache file outright (tests). */
@@ -163,7 +211,7 @@ export type PiKnowledgeDeps = {
   piCommand?: string;
   now?: number;
   /** Injected in tests so no real process is spawned. */
-  readAdvertised?: (piCommand: string, env: NodeJS.ProcessEnv) => string[] | null;
+  readAdvertised?: (piCommand: string, env: NodeJS.ProcessEnv) => PiAdvertisedRead | null;
   /** Overrides the binary identity stamp (tests). `null` states "pi is not
    *  resolvable", which is the no-spawn path. `undefined` means "compute it". */
   binaryStamp?: string | null;
@@ -194,6 +242,50 @@ export function piKnowledgeCachePath(env: NodeJS.ProcessEnv = process.env): stri
   );
 }
 
+/**
+ * Where pi's own refreshed `openrouter` block is kept: BESIDE the knowledge cache,
+ * acpx-owned, never under any `~/.pi/agent`. See the module header.
+ */
+export function piKeptOverlayPath(cachePath: string): string {
+  const base = cachePath.endsWith(".json") ? cachePath.slice(0, -".json".length) : cachePath;
+  return `${base}.openrouter-store.json`;
+}
+
+function readKeptOverlay(path: string): KeptOverlay | null {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<KeptOverlay>;
+    const block = parsed.openrouter;
+    if (typeof parsed.fetchedAt !== "string" || !block || !Array.isArray(block.models)) {
+      return null;
+    }
+    return { fetchedAt: parsed.fetchedAt, binary: parsed.binary, openrouter: block };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The models of pi's own refreshed `openrouter` block, kept by the last COMPLETE
+ * knowledge read, when that block is still valid: under the full TTL and written
+ * against the pi binary we would ask now (freshness alone when pi is not
+ * resolvable, as for the knowledge cache). Anything else is `[]`, i.e. no overlay.
+ * This never spawns pi; it only reads what a read already kept.
+ */
+export function readPiKeptOpenRouterModels(
+  env: NodeJS.ProcessEnv = process.env,
+  deps: PiKnowledgeDeps = {},
+): unknown[] {
+  const { cachePath, now, piCommand } = resolveDeps(env, deps);
+  const kept = readKeptOverlay(piKeptOverlayPath(cachePath));
+  if (kept === null) {
+    return [];
+  }
+  const fetchedAt = Date.parse(kept.fetchedAt);
+  const fresh = Number.isFinite(fetchedAt) && now - fetchedAt < PI_KNOWLEDGE_TTL_MS;
+  const stamp = resolveStamp(env, deps, piCommand);
+  return fresh && (stamp === null || kept.binary === stamp) ? kept.openrouter.models : [];
+}
+
 function readCache(cachePath: string): PiModelKnowledge | null {
   let raw: string;
   try {
@@ -221,6 +313,7 @@ function readCache(cachePath: string): PiModelKnowledge | null {
       fetchedAt: (parsed as PiModelKnowledge).fetchedAt ?? new Date(0).toISOString(),
       ids,
       binary: (parsed as PiModelKnowledge).binary,
+      complete: (parsed as PiModelKnowledge).complete,
     };
   } catch {
     // A truncated or hand-mangled cache is a cold cache, never a crash: a
@@ -229,13 +322,13 @@ function readCache(cachePath: string): PiModelKnowledge | null {
   }
 }
 
-/** Atomic tmp + rename — a reader never sees a half-written cache. */
-function writeCache(cachePath: string, knowledge: PiModelKnowledge): void {
+/** Atomic tmp + rename — a reader never sees a half-written file. */
+function writeJsonAtomic(path: string, value: PiModelKnowledge | KeptOverlay): void {
   try {
-    mkdirSync(dirname(cachePath), { recursive: true });
-    const tmpPath = `${cachePath}.${process.pid}.tmp`;
-    writeFileSync(tmpPath, `${JSON.stringify(knowledge)}\n`, "utf8");
-    renameSync(tmpPath, cachePath);
+    mkdirSync(dirname(path), { recursive: true });
+    const tmpPath = `${path}.${process.pid}.tmp`;
+    writeFileSync(tmpPath, `${JSON.stringify(value)}\n`, "utf8");
+    renameSync(tmpPath, path);
   } catch {
     // Caching is an optimisation. A read-only or full disk must not fail a
     // session create; the next spawn simply pays the ~539 ms again.
@@ -261,7 +354,7 @@ const NOT_OUR_LINE: PiReplyLine = { kind: "other" };
 
 /** Exported for tests: the three-way distinction is the whole point, and it is
  *  not reachable through `spawnSync` without a real pi. */
-export function readReplyLine(line: string): PiReplyLine {
+export function readReplyLine(line: string, requestId: string = RPC_REQUEST_ID): PiReplyLine {
   if (!line.trim()) {
     return NOT_OUR_LINE;
   }
@@ -272,7 +365,7 @@ export function readReplyLine(line: string): PiReplyLine {
     return NOT_OUR_LINE;
   }
   const frame = parsed as { type?: unknown; id?: unknown; data?: { models?: unknown } };
-  if (frame.type !== "response" || frame.id !== RPC_REQUEST_ID) {
+  if (frame.type !== "response" || frame.id !== requestId) {
     return NOT_OUR_LINE;
   }
   const models = frame.data?.models;
@@ -300,6 +393,45 @@ export function piKnowledgeReadEnv(env: NodeJS.ProcessEnv, agentDir: string): No
   return childEnv;
 }
 
+/**
+ * The synchronous driver `readAdvertisedViaRpc` runs as `node -e`, because
+ * `spawnSync` cannot hold pi's stdin open while pi refreshes. Argv:
+ * `<pi command> <refresh wait ms> <deadline ms> <request>`; env: the isolated
+ * read env. It asks once (the floor), polls `models-store.json` in the read's
+ * agent dir until pi has written a non-empty `openrouter.models` (or the wait is
+ * up), then closes stdin, and kills pi at its deadline. pi's stdout is buffered
+ * and written at the end, followed by ONE marker line saying whether the refresh
+ * landed, so the marker can never split a reply frame.
+ */
+export const RPC_DRIVER_SCRIPT = [
+  `const {spawn}=require("child_process"),fs=require("fs"),path=require("path");`,
+  `const [cmd,waitMs,deadlineMs,req]=process.argv.slice(1);`,
+  `const t0=Date.now();`,
+  `const store=path.join(process.env.PI_CODING_AGENT_DIR,"models-store.json");`,
+  `const pi=spawn(cmd,["--mode","rpc","--no-themes"],{stdio:["pipe","pipe","ignore"]});`,
+  `let out="",landed=false;`,
+  `pi.stdout.setEncoding("utf8");pi.stdout.on("data",(d)=>{out+=d;});`,
+  `pi.stdin.on("error",()=>{});`,
+  `const has=()=>{try{const o=JSON.parse(fs.readFileSync(store,"utf8")).openrouter;`,
+  `return !!(o&&Array.isArray(o.models)&&o.models.length>0);}catch{return false;}};`,
+  `pi.stdin.write(req+"\\n");`,
+  `const poll=setInterval(()=>{landed=has();`,
+  `if(landed||Date.now()-t0>=Number(waitMs)){clearInterval(poll);pi.stdin.end();}},25);`,
+  `const kill=setTimeout(()=>{pi.kill("SIGKILL");},Number(deadlineMs));`,
+  `const done=()=>{clearInterval(poll);clearTimeout(kill);};`,
+  `pi.on("error",()=>{done();process.exitCode=1;});`,
+  `pi.on("close",()=>{done();`,
+  `process.stdout.write(out+"\\n"+JSON.stringify({type:${JSON.stringify(REFRESH_MARKER_TYPE)},landed})+"\\n");});`,
+].join("");
+
+/** Bounds of one read; injected in tests so a stand-in pi runs in milliseconds. */
+export type PiRpcTiming = { refreshWaitMs: number; deadlineMs: number };
+
+const PI_RPC_TIMING: PiRpcTiming = {
+  refreshWaitMs: PI_REFRESH_WAIT_MS,
+  deadlineMs: PI_DRIVER_DEADLINE_MS,
+};
+
 /** `spawnSync`'s shape, narrowed to what the read uses, so tests can inject it. */
 export type PiRpcSpawn = (
   command: string,
@@ -310,38 +442,54 @@ export type PiRpcSpawn = (
     killSignal: "SIGKILL";
     maxBuffer: number;
     env: NodeJS.ProcessEnv;
-    input: string;
   },
 ) => { error?: Error; stdout: string | null };
 
 /**
- * One `pi --mode rpc` round-trip. Returns `null` — never throws — when pi is not
- * installed, does not answer, or answers something unparseable: the caller must
- * be able to tell "pi advertises nothing" (impossible) from "I could not ask"
- * (routine on a box without pi).
+ * One read of pi's model knowledge: the floor ids, plus pi's own refreshed
+ * `openrouter` block once its refresh has landed (module header, brick d406ec77
+ * D1). Returns `null`
+ * — never throws — when pi is not installed, does not answer, or answers
+ * something unparseable: the caller must be able to tell "pi advertises nothing"
+ * (impossible) from "I could not ask" (routine on a box without pi).
  *
  * Runs in a fresh temp agent dir that is removed whatever happens, because pi
- * writes into the agent dir it is given (module header, brick d406ec77).
+ * writes into the agent dir it is given; that write is also the refresh signal,
+ * and the block it wrote is read back before the dir goes.
  */
 export function readAdvertisedViaRpc(
   piCommand: string,
   env: NodeJS.ProcessEnv,
   spawn: PiRpcSpawn = spawnSync,
-): string[] | null {
+  timing: PiRpcTiming = PI_RPC_TIMING,
+): PiAdvertisedRead | null {
   const agentDir = makeReadAgentDir();
   if (agentDir === null) {
     return null;
   }
   try {
-    return idsFromRpcResult(
-      spawn(piCommand, ["--mode", "rpc", "--no-themes"], {
-        encoding: "utf8",
-        timeout: PI_RPC_TIMEOUT_MS,
-        killSignal: "SIGKILL",
-        maxBuffer: PI_RPC_MAX_BUFFER,
-        env: piKnowledgeReadEnv(env, agentDir),
-        input: `${JSON.stringify({ type: "get_available_models", id: RPC_REQUEST_ID })}\n`,
-      }),
+    return readFromRpcResult(
+      spawn(
+        process.execPath,
+        [
+          "-e",
+          RPC_DRIVER_SCRIPT,
+          piCommand,
+          String(timing.refreshWaitMs),
+          String(timing.deadlineMs),
+          JSON.stringify({ type: "get_available_models", id: RPC_REQUEST_ID }),
+        ],
+        {
+          encoding: "utf8",
+          // The driver's own deadline fires first; this SIGKILL is the backstop
+          // for the driver itself, never the expected path.
+          timeout: Math.min(PI_RPC_TIMEOUT_MS, timing.deadlineMs + 2_000),
+          killSignal: "SIGKILL",
+          maxBuffer: PI_RPC_MAX_BUFFER,
+          env: piKnowledgeReadEnv(env, agentDir),
+        },
+      ),
+      agentDir,
     );
   } catch {
     return null;
@@ -366,18 +514,60 @@ function removeReadAgentDir(agentDir: string): void {
   }
 }
 
-function idsFromRpcResult(result: ReturnType<PiRpcSpawn>): string[] | null {
+/** The ids of the first frame answering our request; `null` when absent or malformed. */
+function floorIds(lines: string[]): string[] | null {
+  for (const line of lines) {
+    const reply = readReplyLine(line);
+    if (reply.kind !== "other") {
+      return reply.kind === "ids" ? reply.ids : null;
+    }
+  }
+  return null;
+}
+
+function refreshLanded(lines: string[]): boolean {
+  return lines.some((line) => {
+    try {
+      const frame = JSON.parse(line) as { type?: unknown; landed?: unknown };
+      return frame.type === REFRESH_MARKER_TYPE && frame.landed === true;
+    } catch {
+      return false;
+    }
+  });
+}
+
+/** pi's own `openrouter` block from a `models-store.json`, or `null` when there
+ *  is none with at least one model. */
+function readOpenRouterBlock(storePath: string): PiOpenRouterBlock | null {
+  try {
+    const parsed = JSON.parse(readFileSync(storePath, "utf8")) as { openrouter?: unknown };
+    const block = parsed.openrouter as PiOpenRouterBlock | undefined;
+    return block && Array.isArray(block.models) && block.models.length > 0 ? block : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The floor ids, and pi's refreshed block when the driver saw it land. Only a
+ * block that is readable when we look makes the read `complete`.
+ */
+function readFromRpcResult(
+  result: ReturnType<PiRpcSpawn>,
+  agentDir: string,
+): PiAdvertisedRead | null {
   if (result.error || typeof result.stdout !== "string") {
     return null;
   }
-  for (const line of result.stdout.split("\n")) {
-    const reply = readReplyLine(line);
-    if (reply.kind === "other") {
-      continue;
-    }
-    return reply.kind === "ids" ? reply.ids : null;
+  const lines = result.stdout.split("\n");
+  const ids = floorIds(lines);
+  if (ids === null) {
+    return null;
   }
-  return null;
+  const block = refreshLanded(lines)
+    ? readOpenRouterBlock(join(agentDir, "models-store.json"))
+    : null;
+  return block ? { ids, complete: true, openrouter: block } : { ids, complete: false };
 }
 
 /**
@@ -454,9 +644,22 @@ function resolveStamp(
   return piBinaryStamp(piCommand, env);
 }
 
+/**
+ * How long an answer may be reused. A complete one (pi's refresh had landed)
+ * keeps the full TTL; the floor gets the short one; a cache that does not say
+ * (written before `complete` existed) is stale at once, because the build that
+ * wrote it read only the floor (brick d406ec77, D1).
+ */
+function ttlFor(complete: boolean | undefined): number {
+  if (complete === true) {
+    return PI_KNOWLEDGE_TTL_MS;
+  }
+  return complete === false ? PI_INCOMPLETE_KNOWLEDGE_TTL_MS : 0;
+}
+
 function isFresh(cached: PiModelKnowledge, now: number): boolean {
   const fetchedAt = Date.parse(cached.fetchedAt);
-  return Number.isFinite(fetchedAt) && now - fetchedAt < PI_KNOWLEDGE_TTL_MS;
+  return Number.isFinite(fetchedAt) && now - fetchedAt < ttlFor(cached.complete);
 }
 
 /**
@@ -484,40 +687,58 @@ function resolveDeps(env: NodeJS.ProcessEnv, deps: PiKnowledgeDeps) {
 type KnowledgeContext = {
   cachePath: string;
   now: number;
-  readAdvertised: (piCommand: string, env: NodeJS.ProcessEnv) => string[] | null;
+  readAdvertised: (piCommand: string, env: NodeJS.ProcessEnv) => PiAdvertisedRead | null;
   piCommand: string;
   stamp: string | null;
   env: NodeJS.ProcessEnv;
 };
 
-function establishPiKnowledge(ctx: KnowledgeContext): Set<string> | null {
+/** What one establish produced, and whether it came from pi's refreshed view. */
+type Knowledge = { value: Set<string>; complete: boolean };
+
+function fromCache(cached: PiModelKnowledge | null): Knowledge | null {
+  return cached ? { value: new Set(cached.ids), complete: cached.complete === true } : null;
+}
+
+function establishPiKnowledge(ctx: KnowledgeContext): Knowledge | null {
   const cached = readCache(ctx.cachePath);
   if (cached && isUsable(cached, ctx.stamp, ctx.now)) {
-    return new Set(cached.ids);
+    return fromCache(cached);
   }
   if (ctx.stamp === null) {
     // pi is not resolvable on the env we would spawn with, so there is nothing to
     // ask and NO SPAWN IS ATTEMPTED. A stale cache still beats nothing.
-    return cached ? new Set(cached.ids) : null;
+    return fromCache(cached);
   }
-  const ids = ctx.readAdvertised(ctx.piCommand, ctx.env);
-  if (ids === null || ids.length === 0) {
+  const read = ctx.readAdvertised(ctx.piCommand, ctx.env);
+  if (read === null || read.ids.length === 0) {
     // Could not ask. A STALE cache is still far better than nothing — it is a
     // list of ids pi advertised recently, and pi's catalogue moves slowly.
     // ⚠️ An EMPTY answer is the same failure, not "pi knows nothing": pi always
     // bundles hundreds of models, so empty means pi filtered them all away
     // (brick d406ec77). Caching it would provision every model for 24 h.
-    return cached ? new Set(cached.ids) : null;
+    return fromCache(cached);
   }
-  writeCache(ctx.cachePath, {
-    fetchedAt: new Date(ctx.now).toISOString(),
-    ids,
+  const fetchedAt = new Date(ctx.now).toISOString();
+  writeJsonAtomic(ctx.cachePath, {
+    fetchedAt,
+    ids: read.ids,
     binary: ctx.stamp,
+    complete: read.complete,
   });
-  return new Set(ids);
+  // ⚠️ ONLY a complete read replaces the kept block. A floor-only read (refresh
+  // did not land) must never overwrite a valid block with nothing.
+  if (read.complete && read.openrouter) {
+    writeJsonAtomic(piKeptOverlayPath(ctx.cachePath), {
+      fetchedAt,
+      binary: ctx.stamp,
+      openrouter: read.openrouter,
+    });
+  }
+  return { value: new Set(read.ids), complete: read.complete };
 }
 
-type MemoEntry = { at: number; value: Set<string> };
+type MemoEntry = { at: number; value: Set<string>; complete: boolean };
 
 /**
  * Keyed by cache path AND binary identity, so a pi upgrade or a differently
@@ -529,7 +750,8 @@ type MemoEntry = { at: number; value: Set<string> };
  * every session for the next 24 h provision a fabricated entry. The failure path
  * is also the cheap one to repeat: when pi is not resolvable there is no spawn to
  * save (a `stat` decides), and when pi IS resolvable, paying a retry to notice it
- * came back is the trade we want.
+ * came back is the trade we want. A floor-only (incomplete) answer is memoised
+ * for the short TTL only, exactly as it is cached.
  */
 const knowledgeMemo = new Map<string, MemoEntry>();
 
@@ -540,8 +762,10 @@ export function resetPiKnowledgeMemo(): void {
 }
 
 /**
- * The model ids pi already knows — memo first, cache second, one RPC read on a
- * miss, and no spawn at all when pi is not resolvable.
+ * The model ids pi knows WITHOUT any store, i.e. its bundle (the floor) — memo
+ * first, cache second, one RPC read on a miss, and no spawn at all when pi is not
+ * resolvable. A read whose refresh landed also keeps pi's refreshed block for
+ * {@link readPiKeptOpenRouterModels}.
  *
  * `null` means **"could not be established"** (pi absent, it did not answer, or
  * it answered an empty list), and this function never returns an empty set: the
@@ -557,15 +781,15 @@ export function readPiAdvertisedModelIds(
   const memoKey = `${cachePath} ${stamp ?? ""}`;
 
   const memo = knowledgeMemo.get(memoKey);
-  if (memo && now - memo.at < PI_KNOWLEDGE_TTL_MS) {
+  if (memo && now - memo.at < ttlFor(memo.complete)) {
     // A COPY: the memo must not be mutable through its callers.
     return new Set(memo.value);
   }
 
-  const value = establishPiKnowledge({ cachePath, now, readAdvertised, piCommand, stamp, env });
-  if (value === null) {
+  const known = establishPiKnowledge({ cachePath, now, readAdvertised, piCommand, stamp, env });
+  if (known === null) {
     return null;
   }
-  knowledgeMemo.set(memoKey, { at: now, value });
-  return new Set(value);
+  knowledgeMemo.set(memoKey, { at: now, value: known.value, complete: known.complete });
+  return new Set(known.value);
 }
