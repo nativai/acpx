@@ -1642,11 +1642,15 @@ function applyGuardedCopyModel(
 function copySessionOptionsWithOverride(
   source: SessionRecord,
   globalFlags: GlobalFlags,
-  templateCopy: boolean,
+  copy: { flags: SessionsCopyFlags; requireTemplate: boolean },
 ): ReturnType<typeof sourceSessionOptions> {
   const base = withoutTemplateCredential(source, sourceSessionOptions(source));
   const merged = { ...base };
   applyCopyCredentialOverride(merged, globalFlags, base?.profile ?? base?.subscription);
+  // brick 15252af6: the Fable guard binds a template copy only. A record that carries a
+  // `template` block at all counts, as it does for `withoutTemplateCredential`.
+  const templateCopy =
+    isTemplateCopy(copy.flags, source, copy.requireTemplate) || source.template !== undefined;
   applyGuardedCopyModel(merged, globalFlags, base?.model, templateCopy);
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
@@ -4557,13 +4561,10 @@ async function runSessionCopy(
       terminal: globalFlags.terminal,
       timeoutMs: globalFlags.timeout,
       verbose: globalFlags.verbose,
-      sessionOptions: copySessionOptionsWithOverride(
-        source,
-        globalFlags,
-        // brick 15252af6: the Fable guard binds a template copy only. A record that carries a
-        // `template` block at all counts, as it does for `withoutTemplateCredential`.
-        isTemplateCopy(flags, source, requireTemplate) || source.template !== undefined,
-      ),
+      sessionOptions: copySessionOptionsWithOverride(source, globalFlags, {
+        flags,
+        requireTemplate,
+      }),
       desiredConfigOptions: copyDesiredConfigOptionsWithOverride(source, globalFlags),
     }),
   );

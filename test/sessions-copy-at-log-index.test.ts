@@ -1358,27 +1358,42 @@ async function resolveSubagentCut(
   });
 }
 
-test("15252af6: a cut whose nearest uuid is a sub-agent sidechain row walks back to the nearest MAIN-chain uuid", async () => {
+test("15252af6: a window poisoned by sidechain uuids is resolved by PROOF — the context a clean record would give", async () => {
   await withTempHome("acpx-at-log-index-", async (homeDir) => {
-    // n=5: the window ends on u2 (s-3), whose predecessor a1 is s-3 too. The nearest main-chain
-    // uuid is u1's inherited m-a0 — a User entry's uuid is the boundary BEFORE it, so the agent's
-    // context provably ends at absolute index 2, short of the cut.
+    // n=5: the window ends on u2 (s-3), whose predecessor a1 is s-3 too. Proven: the context ends
+    // at a1's last main-chain row m-a1, before u2 — exactly what the record gives once a1 carries
+    // its own m-a1 (control below). The plain walk-back would stop at m-a0, a whole turn early.
+    const cut = { uuid: "m-a1", contextEndLogIndex: 4 };
     assert.deepEqual(
       await resolveSubagentCut(homeDir, SUBAGENT_RECORD, SUBAGENT_MAIN_ROWS, SUBAGENT_SIDE_ROWS, 5),
-      { uuid: "m-a0", contextEndLogIndex: 2 },
+      cut,
     );
-    // n=6 (a2 = s-5) walks back the same way.
-    assert.equal(
-      (
-        await resolveSubagentCut(
-          homeDir,
-          SUBAGENT_RECORD,
-          SUBAGENT_MAIN_ROWS,
-          SUBAGENT_SIDE_ROWS,
-          6,
-        )
-      ).uuid,
-      "m-a0",
+    const clean = [
+      ...SUBAGENT_RECORD.slice(0, 3),
+      withUuid(replied("delegated research"), "m-a1"),
+      withUuid(said("u2", "and the schedule?"), "m-a1"),
+    ];
+    assert.deepEqual(
+      await resolveSubagentCut(homeDir, clean, SUBAGENT_MAIN_ROWS, SUBAGENT_SIDE_ROWS, 5),
+      cut,
+      "control: the unpoisoned record resolves the same cut by its own uuid",
+    );
+  });
+});
+
+test("15252af6: when the proof REFUSES, a poisoned window walks back to the nearest MAIN-chain uuid", async () => {
+  await withTempHome("acpx-at-log-index-", async (homeDir) => {
+    // u2's text appears twice in the transcript (a re-delivery), so the proof refuses; the
+    // walk-back skips both sidechain uuids and lands on u1's inherited m-a0. A User entry's uuid
+    // is the boundary BEFORE it, so the context provably ends at absolute index 2.
+    const redelivered = [
+      ...SUBAGENT_MAIN_ROWS.slice(0, 6),
+      tUser("m-u2-again", "and the schedule?"),
+      ...SUBAGENT_MAIN_ROWS.slice(6),
+    ];
+    assert.deepEqual(
+      await resolveSubagentCut(homeDir, SUBAGENT_RECORD, redelivered, SUBAGENT_SIDE_ROWS, 5),
+      { uuid: "m-a0", contextEndLogIndex: 2 },
     );
   });
 });
@@ -1390,7 +1405,7 @@ test("15252af6: an inline isSidechain row of the main file is skipped as well", 
       ...SUBAGENT_SIDE_ROWS,
       ...SUBAGENT_MAIN_ROWS.slice(5),
     ];
-    assert.equal((await resolveSubagentCut(homeDir, SUBAGENT_RECORD, inline, [], 5)).uuid, "m-a0");
+    assert.equal((await resolveSubagentCut(homeDir, SUBAGENT_RECORD, inline, [], 5)).uuid, "m-a1");
   });
 });
 
@@ -1470,7 +1485,7 @@ test("15252af6 through the CLI: the byway copy sends the main-chain uuid as resu
       id: "subagent-byway",
       // The mock refuses the fork unless `_meta` is EXACTLY this — the sidechain s-3 fails it.
       agentCommand: withForkMeta(MOCK_CLAUDE, {
-        claudeCode: { options: { resumeSessionAt: "m-a0" } },
+        claudeCode: { options: { resumeSessionAt: "m-a1" } },
       }),
       cwd: path.join(homeDir, "workspace"),
       logLines: lines(SUBAGENT_RECORD),

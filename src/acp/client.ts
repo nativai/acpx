@@ -346,7 +346,8 @@ export function resolveIndexForkMeta(
  *
  * brick 15252af6: a uuid in `offMainChain` (a Task sub-agent's sidechain row, stamped by a
  * pre-fix acpx) counts as NO uuid — Claude Code cannot resume at it — so the walk goes on to the
- * nearest earlier main-chain one. Test: `test/sessions-copy-at-log-index.test.ts` → "15252af6".
+ * nearest earlier main-chain one (after the proof, `skipsSidechainUuid`). Test:
+ * `test/sessions-copy-at-log-index.test.ts` → "15252af6".
  */
 function nearestClaudeUuidIndex(
   window: readonly SessionMessage[],
@@ -405,16 +406,15 @@ export async function resolveLogIndexClaudeCut(args: {
     content,
   );
   const walkedAt = nearestClaudeUuidIndex(window, offMainChain);
+  const proven =
+    content !== undefined && skipsSidechainUuid(window, walkedAt, offMainChain)
+      ? proveCutOrUndefined(content, args, window)
+      : undefined;
+  if (proven !== undefined) {
+    return proven;
+  }
   if (walkedAt !== -1) {
-    const uuid = forkEntryClaudeUuid(window[walkedAt]) as string;
-    if (content !== undefined) {
-      assertUuidAfterLastCompaction(content, uuid, args.atIndex);
-    }
-    const count = walkedBackContextEnd(window, walkedAt);
-    return {
-      uuid,
-      ...(count === undefined ? {} : { contextEndLogIndex: args.atIndex - window.length + count }),
-    };
+    return walkedBackCut(window, walkedAt, content, args.atIndex);
   }
   if (content === undefined) {
     throw new ForkCutUnresolvedError(
@@ -428,6 +428,67 @@ export async function resolveLogIndexClaudeCut(args: {
     before: args.history.before,
     after: args.history.after,
   });
+}
+
+/** The cut at the walked-back entry `window[walkedAt]`, refused when older than the last compaction. */
+function walkedBackCut(
+  window: readonly SessionMessage[],
+  walkedAt: number,
+  content: string | undefined,
+  atIndex: number,
+): LogIndexClaudeCut {
+  const uuid = forkEntryClaudeUuid(window[walkedAt]) as string;
+  if (content !== undefined) {
+    assertUuidAfterLastCompaction(content, uuid, atIndex);
+  }
+  const count = walkedBackContextEnd(window, walkedAt);
+  return {
+    uuid,
+    ...(count === undefined ? {} : { contextEndLogIndex: atIndex - window.length + count }),
+  };
+}
+
+/**
+ * brick 15252af6: did the walk-back pass over an entry whose uuid is a sub-agent sidechain row?
+ * On a record a pre-fix acpx stamped, every turn that ran a Task sub-agent can carry one, so the
+ * nearest main-chain uuid can lie many turns back — on devbox 3abc91b3 a cut at the end kept the
+ * context only to entry 41 of 50. Such a window is resolved by PROOF first (the same proof a
+ * uuid-free window takes, `claude-fork-anchor.ts`), which there ends the context at 49.
+ */
+function skipsSidechainUuid(
+  window: readonly SessionMessage[],
+  walkedAt: number,
+  offMainChain: ReadonlySet<string>,
+): boolean {
+  return window.slice(walkedAt + 1).some((entry) => {
+    const uuid = forkEntryClaudeUuid(entry);
+    return uuid !== undefined && offMainChain.has(uuid);
+  });
+}
+
+/**
+ * The proven cut, or `undefined` when the proof refuses — the caller then keeps the walked-back
+ * main-chain uuid, which is never later than the cut either. Any other error (the compaction
+ * refusal) propagates.
+ */
+function proveCutOrUndefined(
+  content: string,
+  args: { atIndex: number; history: LogIndexHistory },
+  window: readonly SessionMessage[],
+): LogIndexClaudeCut | undefined {
+  try {
+    return resolveClaudeForkCutByRecord(content, {
+      atLogIndex: args.atIndex,
+      window,
+      before: args.history.before,
+      after: args.history.after,
+    });
+  } catch (error) {
+    if (error instanceof ForkCutUnresolvedError) {
+      return undefined;
+    }
+    throw error;
+  }
 }
 
 /**
