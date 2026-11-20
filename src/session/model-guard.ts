@@ -13,7 +13,7 @@ export const NON_FABLE_DEFAULT_MODEL = "opus";
 // `session_options.model_source` (Layer C). `metadata`/nested non-string values
 // fail the whole record load (brick://d4f7d808) — a single string is safe.
 //  - explicit    : THIS invocation passed `--model` / `set model` for it
-//  - inherited    : copied from the parent/source session's model
+//  - inherited    : copied from the parent's (or a template copy's source's) model
 //  - default      : no explicit and no inheritable parent value
 //  - failover     : chosen by the failover retarget path
 //  - guard-forced : an implicit Fable was rewritten to the non-Fable default
@@ -25,7 +25,10 @@ export const NON_FABLE_DEFAULT_MODEL = "opus";
 //  - succession   : `sessions new --from <holder>` INTO the holder's own seat carried the
 //    predecessor's pin unchanged (brick 28964dd8). A successor is the same seat continuing,
 //    not a child, and the predecessor's pin already passed the guard — so both tiers accept
-//    it exactly as they accept `explicit`. Children and forks never get it.
+//    it exactly as they accept `explicit`. Children never get it; a fork / copy / by-the-way
+//    of an ordinary session carries its source's `model_source` VERBATIM, so it keeps one
+//    (brick 15252af6 — a fork is the same conversation and keeps its model, Fable included).
+//    Only a TEMPLATE copy is guarded like a spawn.
 export type ModelSource =
   | "explicit"
   | "inherited"
@@ -122,7 +125,7 @@ export function guardImplicitFable(params: {
  * pre-fix/legacy record) the belt must NOT force — a deliberate Fable pin (e.g.
  * the Mail-Server session `session_options.model="fable"`) and an implicit
  * inherited-Fable pin are INDISTINGUISHABLE without provenance, and force-flipping
- * the former would break Daniel's real Fable sessions. Every NEW spawn/copy/set is
+ * the former would break Daniel's real Fable sessions. Every NEW spawn/template-copy/set is
  * still protected at the resolution tier regardless. DO NOT "tighten" this to force
  * on absent provenance — that reintroduces the legacy-Fable breakage.
  */

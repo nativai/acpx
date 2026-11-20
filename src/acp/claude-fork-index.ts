@@ -102,6 +102,65 @@ export async function readClaudeTranscript(
 }
 
 /**
+ * brick 15252af6 — the uuids a fork must NOT resume at: rows PROVEN to sit on a Task sub-agent's
+ * sidechain (any `<session>/subagents/*.jsonl` beside ANY copy of the transcript, or an
+ * `isSidechain: true` row in `content`) that are not also a main-chain row of `content`. Claude
+ * Code resumes only along the main chain, so `resumeSessionAt` at one of these fails with
+ * `No message found with message.uuid of: …` (JSON-RPC -32603).
+ *
+ * ⚠️ DO NOT WIDEN THIS TO "ANY UUID ABSENT FROM THE MAIN TRANSCRIPT". The main read can be one of
+ * several copies a failover left behind, and a provenance uuid is deliberately trusted over the
+ * transcript (`test/byway-fork-provenance.test.ts` → "(A6) … provenance present"). Only a uuid
+ * positively found on a sidechain is excluded, so no read can make a valid uuid look invalid.
+ * Every copy's `subagents/` is scanned because Claude Code writes a sub-agent beside the copy
+ * that was live at the time, and a later port moves only the main file.
+ */
+export async function readOffMainChainClaudeUuids(
+  cwd: string,
+  acpSessionId: string,
+  subscriptionId: string | undefined,
+  content: string | undefined,
+): Promise<ReadonlySet<string>> {
+  const rows = content === undefined ? [] : parseTranscriptLines(content);
+  const sidechain = new Set(uuidsOf(rows.filter((row) => row.isSidechain === true)));
+  const { candidates } = await selectFreshestTranscript(
+    { cwd, acpSessionId },
+    resolveClaudeConfigDir(subscriptionId),
+  );
+  for (const candidate of candidates) {
+    for (const uuid of await readSubagentUuids(candidate.jsonlPath.replace(/\.jsonl$/, ""))) {
+      sidechain.add(uuid);
+    }
+  }
+  for (const uuid of uuidsOf(rows.filter((row) => row.isSidechain !== true))) {
+    sidechain.delete(uuid);
+  }
+  return sidechain;
+}
+
+async function readSubagentUuids(sessionDir: string): Promise<string[]> {
+  const subagentsDir = path.join(sessionDir, "subagents");
+  const names = await fs.readdir(subagentsDir).catch(() => [] as string[]);
+  const uuids: string[] = [];
+  for (const name of names.filter((entry) => entry.endsWith(".jsonl"))) {
+    const text = await fs.readFile(path.join(subagentsDir, name), "utf8").catch(() => "");
+    uuids.push(...uuidsOf(parseTranscriptLines(text)));
+  }
+  return uuids;
+}
+
+function uuidsOf(rows: readonly ClaudeJsonlRecord[]): string[] {
+  return rows.flatMap((row) => (typeof row.uuid === "string" ? [row.uuid] : []));
+}
+
+function parseTranscriptLines(content: string): ClaudeJsonlRecord[] {
+  return content
+    .split("\n")
+    .map(parseClaudeJsonlRecord)
+    .filter((row): row is ClaudeJsonlRecord => row !== undefined);
+}
+
+/**
  * Where a Claude fork finds its SOURCE transcript when the fork runs under `configDir`. The answer
  * is the freshest copy across every known config dir: the fork's own dir first, then every
  * registered subscription, then `~/.claude`. Both slug forms are checked.

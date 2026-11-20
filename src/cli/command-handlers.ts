@@ -1589,15 +1589,34 @@ function applyCopyModelOverrides(
 // (assertCopyAgentLock), so no cross-agent gating is needed. When neither the
 // flag nor the source sets a field it is omitted → falls to the box default, and
 // with no explicit flag the result is byte-identical to `sourceSessionOptions`.
-// brick://5bac5564 R2: a copy/fork inherits the SOURCE record's model. Guard it the
-// same way as a spawn — an implicit Fable copied from a Fable source is forced to the
-// non-Fable default; an explicit `--model fable` is preserved. Then stamp provenance.
+// brick://5bac5564 R2, narrowed by brick 15252af6 (Daniel, 2026-11-20): a TEMPLATE copy is
+// a new piece of work, so its inherited model is guarded like a spawn — an implicit Fable is
+// forced to the non-Fable default, an explicit `--model fable` is preserved. A fork / copy /
+// by-the-way of an ORDINARY session is the same conversation and KEEPS the source's model and
+// its `model_source` verbatim, Fable included: forcing it off Fable loses Anthropic's prompt
+// cache and costs more, not less.
+//
+// ⚠️ DO NOT "SIMPLIFY" THE ORDINARY-SOURCE BRANCH INTO `resolveSpawnModelSource(undefined, base)`.
+// That yields "inherited", and the serve-time belt (`guardServedModel`) forces an "inherited"
+// Fable at the first turn — the copy would be downgraded anyway, one step later. Tests:
+// `test/sessions-copy-fable.test.ts`.
 function applyGuardedCopyModel(
   merged: NonNullable<ReturnType<typeof sourceSessionOptions>>,
   globalFlags: GlobalFlags,
   baseModel: string | undefined,
+  templateCopy: boolean,
 ): void {
   const explicitModel = globalFlags.model;
+  if (!templateCopy && !explicitModel?.trim()) {
+    // `merged` already holds the source's own `model` and `model_source`.
+    applyCopyModelOverrides(
+      merged,
+      undefined,
+      withInheritedReasoningEffort(globalFlags.reasoningEffort, merged.reasoningEffort),
+      withInheritedOutputStyle(globalFlags.outputStyle, merged.outputStyle),
+    );
+    return;
+  }
   const guarded = guardImplicitFable({
     resolvedModel: withInheritedModel(explicitModel, baseModel),
     explicitModel,
@@ -1623,11 +1642,16 @@ function applyGuardedCopyModel(
 function copySessionOptionsWithOverride(
   source: SessionRecord,
   globalFlags: GlobalFlags,
+  copy: { flags: SessionsCopyFlags; requireTemplate: boolean },
 ): ReturnType<typeof sourceSessionOptions> {
   const base = withoutTemplateCredential(source, sourceSessionOptions(source));
   const merged = { ...base };
   applyCopyCredentialOverride(merged, globalFlags, base?.profile ?? base?.subscription);
-  applyGuardedCopyModel(merged, globalFlags, base?.model);
+  // brick 15252af6: the Fable guard binds a template copy only. A record that carries a
+  // `template` block at all counts, as it does for `withoutTemplateCredential`.
+  const templateCopy =
+    isTemplateCopy(copy.flags, source, copy.requireTemplate) || source.template !== undefined;
+  applyGuardedCopyModel(merged, globalFlags, base?.model, templateCopy);
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
@@ -4537,7 +4561,10 @@ async function runSessionCopy(
       terminal: globalFlags.terminal,
       timeoutMs: globalFlags.timeout,
       verbose: globalFlags.verbose,
-      sessionOptions: copySessionOptionsWithOverride(source, globalFlags),
+      sessionOptions: copySessionOptionsWithOverride(source, globalFlags, {
+        flags,
+        requireTemplate,
+      }),
       desiredConfigOptions: copyDesiredConfigOptionsWithOverride(source, globalFlags),
     }),
   );

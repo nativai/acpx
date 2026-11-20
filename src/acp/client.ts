@@ -127,6 +127,7 @@ import {
   locateClaudeForkSourceTranscript,
   materializeClaudeForkSession,
   readClaudeTranscript,
+  readOffMainChainClaudeUuids,
   resolveClaudeConfigDir,
   resolveClaudeUuidForAcpxIndex,
 } from "./claude-fork-index.js";
@@ -342,9 +343,20 @@ export function resolveIndexForkMeta(
  * carries a `claude_uuid`, else of the nearest EARLIER entry that does. Walking
  * back errs earlier by part of a turn, never later: an entry's uuid never lies
  * past its own content.
+ *
+ * brick 15252af6: a uuid in `offMainChain` (a Task sub-agent's sidechain row, stamped by a
+ * pre-fix acpx) counts as NO uuid — Claude Code cannot resume at it — so the walk goes on to the
+ * nearest earlier main-chain one (after the proof, `skipsSidechainUuid`). Test:
+ * `test/sessions-copy-at-log-index.test.ts` → "15252af6".
  */
-function nearestClaudeUuidIndex(window: readonly SessionMessage[]): number {
-  return window.findLastIndex((entry) => forkEntryClaudeUuid(entry) !== undefined);
+function nearestClaudeUuidIndex(
+  window: readonly SessionMessage[],
+  offMainChain: ReadonlySet<string>,
+): number {
+  return window.findLastIndex((entry) => {
+    const uuid = forkEntryClaudeUuid(entry);
+    return uuid !== undefined && !offMainChain.has(uuid);
+  });
 }
 
 /**
@@ -387,17 +399,22 @@ export async function resolveLogIndexClaudeCut(args: {
 }): Promise<LogIndexClaudeCut> {
   const window = args.sourceMessages ?? [];
   const content = await readClaudeTranscript(args.cwd, args.acpSessionId, args.subscriptionId);
-  const walkedAt = nearestClaudeUuidIndex(window);
+  const offMainChain = await readOffMainChainClaudeUuids(
+    args.cwd,
+    args.acpSessionId,
+    args.subscriptionId,
+    content,
+  );
+  const walkedAt = nearestClaudeUuidIndex(window, offMainChain);
+  const proven =
+    content !== undefined && skipsSidechainUuid(window, walkedAt, offMainChain)
+      ? proveCutOrUndefined(content, args, window)
+      : undefined;
+  if (proven !== undefined) {
+    return proven;
+  }
   if (walkedAt !== -1) {
-    const uuid = forkEntryClaudeUuid(window[walkedAt]) as string;
-    if (content !== undefined) {
-      assertUuidAfterLastCompaction(content, uuid, args.atIndex);
-    }
-    const count = walkedBackContextEnd(window, walkedAt);
-    return {
-      uuid,
-      ...(count === undefined ? {} : { contextEndLogIndex: args.atIndex - window.length + count }),
-    };
+    return walkedBackCut(window, walkedAt, content, args.atIndex);
   }
   if (content === undefined) {
     throw new ForkCutUnresolvedError(
@@ -413,6 +430,67 @@ export async function resolveLogIndexClaudeCut(args: {
   });
 }
 
+/** The cut at the walked-back entry `window[walkedAt]`, refused when older than the last compaction. */
+function walkedBackCut(
+  window: readonly SessionMessage[],
+  walkedAt: number,
+  content: string | undefined,
+  atIndex: number,
+): LogIndexClaudeCut {
+  const uuid = forkEntryClaudeUuid(window[walkedAt]) as string;
+  if (content !== undefined) {
+    assertUuidAfterLastCompaction(content, uuid, atIndex);
+  }
+  const count = walkedBackContextEnd(window, walkedAt);
+  return {
+    uuid,
+    ...(count === undefined ? {} : { contextEndLogIndex: atIndex - window.length + count }),
+  };
+}
+
+/**
+ * brick 15252af6: did the walk-back pass over an entry whose uuid is a sub-agent sidechain row?
+ * On a record a pre-fix acpx stamped, every turn that ran a Task sub-agent can carry one, so the
+ * nearest main-chain uuid can lie many turns back — on devbox 3abc91b3 a cut at the end kept the
+ * context only to entry 41 of 50. Such a window is resolved by PROOF first (the same proof a
+ * uuid-free window takes, `claude-fork-anchor.ts`), which there ends the context at 49.
+ */
+function skipsSidechainUuid(
+  window: readonly SessionMessage[],
+  walkedAt: number,
+  offMainChain: ReadonlySet<string>,
+): boolean {
+  return window.slice(walkedAt + 1).some((entry) => {
+    const uuid = forkEntryClaudeUuid(entry);
+    return uuid !== undefined && offMainChain.has(uuid);
+  });
+}
+
+/**
+ * The proven cut, or `undefined` when the proof refuses — the caller then keeps the walked-back
+ * main-chain uuid, which is never later than the cut either. Any other error (the compaction
+ * refusal) propagates.
+ */
+function proveCutOrUndefined(
+  content: string,
+  args: { atIndex: number; history: LogIndexHistory },
+  window: readonly SessionMessage[],
+): LogIndexClaudeCut | undefined {
+  try {
+    return resolveClaudeForkCutByRecord(content, {
+      atLogIndex: args.atIndex,
+      window,
+      before: args.history.before,
+      after: args.history.after,
+    });
+  } catch (error) {
+    if (error instanceof ForkCutUnresolvedError) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
 /**
  * Resolve the Claude-ACP fork `resumeSessionAt` uuid (A6 — completes the
  * durable-provenance mechanism for the mainstream Claude adapter path,
@@ -420,9 +498,8 @@ export async function resolveLogIndexClaudeCut(args: {
  * .claude_uuid` directly, immune to record/transcript index divergence, and
  * falls back to `resolveClaudeUuidForAcpxIndex`'s index-arithmetic
  * reconstruction only when the entry carries no provenance (pre-provenance
- * sessions/entries — currently ALL Claude-ACP entries, since the adapter does
- * not yet stamp `_meta.claudeUuid`; this makes the branch a no-op until it
- * does).
+ * sessions/entries) or a provenance uuid proven to be a sub-agent sidechain row
+ * (brick 15252af6 — Claude Code cannot resume there).
  */
 export async function resolveClaudeForkResumeAt(args: {
   cwd: string;
@@ -437,7 +514,7 @@ export async function resolveClaudeForkResumeAt(args: {
     return (await resolveLogIndexClaudeCut({ ...args, history: args.logIndexHistory })).uuid;
   }
   const provenanceUuid = forkEntryClaudeUuid(args.sourceMessages?.[args.atIndex - 1]);
-  if (provenanceUuid) {
+  if (provenanceUuid && !(await isOffMainChain(args, provenanceUuid))) {
     return provenanceUuid;
   }
   return resolveClaudeUuidForAcpxIndex({
@@ -447,6 +524,21 @@ export async function resolveClaudeForkResumeAt(args: {
     subscriptionId: args.subscriptionId,
     recordMessageTotal: args.sourceMessages?.length,
   });
+}
+
+/** brick 15252af6: a provenance uuid PROVEN to be a sub-agent sidechain row is never sent. */
+async function isOffMainChain(
+  args: { cwd: string; acpSessionId: string; subscriptionId?: string },
+  uuid: string,
+): Promise<boolean> {
+  const content = await readClaudeTranscript(args.cwd, args.acpSessionId, args.subscriptionId);
+  const offMainChain = await readOffMainChainClaudeUuids(
+    args.cwd,
+    args.acpSessionId,
+    args.subscriptionId,
+    content,
+  );
+  return offMainChain.has(uuid);
 }
 
 export type AcpPromptOptions = {

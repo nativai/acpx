@@ -287,8 +287,29 @@ function isAgentMessage(message: SessionMessage): message is { Agent: SessionAge
  */
 function claudeUuidFromUpdate(update: ExtendedSessionUpdate): string | undefined {
   const meta = asRecord((update as { _meta?: unknown })._meta);
+  if (isSubagentMeta(meta)) {
+    return undefined;
+  }
   const value = meta?.claudeUuid;
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/**
+ * brick 15252af6: an update streamed from INSIDE a Task sub-agent carries the sub-agent's own
+ * transcript uuid (`subagents/agent-<id>.jsonl`), never one of the main chain. claude-agent-acp
+ * marks such updates with `_meta.claudeCode.parentToolUseId` (and `subagentId` when it knows the
+ * sub-agent). Stamping one made the entry's provenance a uuid Claude Code cannot resume at, so
+ * every `--at-log-index` copy cut there failed with `No message found with message.uuid`.
+ * Not stamping is the safe direction: the cut walks back to an earlier main-chain uuid.
+ * Test: `test/byway-fork-provenance.test.ts` → "15252af6".
+ */
+function isSubagentMeta(meta: Record<string, unknown> | undefined): boolean {
+  const claudeCode = asRecord(meta?.claudeCode);
+  return isNonEmptyString(claudeCode?.parentToolUseId) || isNonEmptyString(claudeCode?.subagentId);
+}
+
+function isNonEmptyString(value: unknown): boolean {
+  return typeof value === "string" && value.length > 0;
 }
 
 /**
