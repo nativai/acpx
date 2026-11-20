@@ -1274,3 +1274,213 @@ test("Codex on a record longer than 200 entries gets the ABSOLUTE n (even-snappe
     assert.equal(copied.record.metadata?.fork_at_log_index, "230");
   });
 });
+
+// ── brick 15252af6: a Task sub-agent's sidechain uuid is never the resume point ──────────────────
+//
+// A pre-fix acpx stamped the uuid of the LAST update streamed into an entry, and an update from
+// inside a Task sub-agent carries the sub-agent's own transcript uuid — a row of
+// `<session>/subagents/agent-<id>.jsonl`, never of the main chain. Claude Code resumes only along
+// the main chain, so a cut whose walk-back landed there failed with JSON-RPC -32603
+// `No message found with message.uuid of: …` (devbox 3abc91b3, 2026-11-20; that record's last
+// eight entries all carry one). Shape below: synthetic ids, the real layout.
+
+const sidechainRow = (uuid: string, text: string): Row => ({
+  ...tText(uuid, text),
+  isSidechain: true,
+});
+
+async function writeSubagent(
+  homeDir: string,
+  cwd: string,
+  acpSessionId: string,
+  rows: Row[],
+): Promise<void> {
+  const transcriptPath = transcriptJsonlPath(path.join(homeDir, ".claude"), cwd, acpSessionId);
+  const dir = path.join(transcriptPath.replace(/\.jsonl$/, ""), "subagents");
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(
+    path.join(dir, "agent-a0000000000000001.jsonl"),
+    `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`,
+  );
+}
+
+const withUuid = (entry: SessionMessage, uuid: string): SessionMessage =>
+  entry !== "Resume" && "Agent" in entry
+    ? { Agent: { ...entry.Agent, claude_uuid: uuid } }
+    : entry !== "Resume" && "User" in entry
+      ? { User: { ...entry.User, claude_uuid: uuid } }
+      : entry;
+
+// [0] u0, [1] a0 (main m-a0), [2] u1 (inherits m-a0), [3] a1 POISONED s-3, [4] u2 inherits s-3,
+// [5] a2 POISONED s-5.
+const SUBAGENT_RECORD: SessionMessage[] = [
+  said("u0", "research the venue"),
+  withUuid(replied("first look"), "m-a0"),
+  withUuid(said("u1", "dig deeper"), "m-a0"),
+  withUuid(replied("delegated research"), "s-3"),
+  withUuid(said("u2", "and the schedule?"), "s-3"),
+  withUuid(replied("schedule"), "s-5"),
+];
+const SUBAGENT_MAIN_ROWS: Row[] = [
+  tUser("m-u0", "research the venue"),
+  tText("m-a0", "first look"),
+  tUser("m-u1", "dig deeper"),
+  tToolUse("m-use", "toolu_outer"),
+  tToolResult("m-res", "toolu_outer"),
+  tText("m-a1", "delegated research"),
+  tUser("m-u2", "and the schedule?"),
+  tText("m-a2", "schedule"),
+];
+const SUBAGENT_SIDE_ROWS: Row[] = [
+  sidechainRow("s-1", "inner start"),
+  sidechainRow("s-3", "inner middle"),
+  sidechainRow("s-5", "inner end"),
+];
+
+async function resolveSubagentCut(
+  homeDir: string,
+  record: SessionMessage[],
+  mainRows: Row[],
+  sideRows: Row[],
+  n: number,
+) {
+  const cwd = path.join(homeDir, "project");
+  await writeRows(homeDir, cwd, "session-subagent", mainRows);
+  if (sideRows.length > 0) {
+    await writeSubagent(homeDir, cwd, "session-subagent", sideRows);
+  }
+  return await resolveLogIndexClaudeCut({
+    cwd,
+    acpSessionId: "session-subagent",
+    atIndex: n,
+    sourceMessages: record.slice(Math.max(0, n - 200), n),
+    history: { before: record.slice(0, n), after: record.slice(n) },
+  });
+}
+
+test("15252af6: a cut whose nearest uuid is a sub-agent sidechain row walks back to the nearest MAIN-chain uuid", async () => {
+  await withTempHome("acpx-at-log-index-", async (homeDir) => {
+    // n=5: the window ends on u2 (s-3), whose predecessor a1 is s-3 too. The nearest main-chain
+    // uuid is u1's inherited m-a0 — a User entry's uuid is the boundary BEFORE it, so the agent's
+    // context provably ends at absolute index 2, short of the cut.
+    assert.deepEqual(
+      await resolveSubagentCut(homeDir, SUBAGENT_RECORD, SUBAGENT_MAIN_ROWS, SUBAGENT_SIDE_ROWS, 5),
+      { uuid: "m-a0", contextEndLogIndex: 2 },
+    );
+    // n=6 (a2 = s-5) walks back the same way.
+    assert.equal(
+      (
+        await resolveSubagentCut(
+          homeDir,
+          SUBAGENT_RECORD,
+          SUBAGENT_MAIN_ROWS,
+          SUBAGENT_SIDE_ROWS,
+          6,
+        )
+      ).uuid,
+      "m-a0",
+    );
+  });
+});
+
+test("15252af6: an inline isSidechain row of the main file is skipped as well", async () => {
+  await withTempHome("acpx-at-log-index-", async (homeDir) => {
+    const inline = [
+      ...SUBAGENT_MAIN_ROWS.slice(0, 5),
+      ...SUBAGENT_SIDE_ROWS,
+      ...SUBAGENT_MAIN_ROWS.slice(5),
+    ];
+    assert.equal((await resolveSubagentCut(homeDir, SUBAGENT_RECORD, inline, [], 5)).uuid, "m-a0");
+  });
+});
+
+test("15252af6: only a PROVEN sidechain uuid is skipped — one merely absent from the transcript is still sent", async () => {
+  await withTempHome("acpx-at-log-index-", async (homeDir) => {
+    // A provenance uuid the main read does not hold (a copy a failover left short) is trusted, as
+    // A6 trusts provenance over the transcript: the main read cannot prove it invalid.
+    const record = [...SUBAGENT_RECORD.slice(0, 4), withUuid(said("u2", "x"), "elsewhere-1")];
+    assert.equal(
+      (await resolveSubagentCut(homeDir, record, SUBAGENT_MAIN_ROWS, SUBAGENT_SIDE_ROWS, 5)).uuid,
+      "elsewhere-1",
+    );
+    // A sidechain uuid that ALSO appears as a main-chain row is a main-chain uuid.
+    assert.equal(
+      (
+        await resolveSubagentCut(
+          homeDir,
+          SUBAGENT_RECORD,
+          [...SUBAGENT_MAIN_ROWS, tText("s-3", "also main")],
+          SUBAGENT_SIDE_ROWS,
+          5,
+        )
+      ).uuid,
+      "s-3",
+    );
+  });
+});
+
+test("15252af6: a window whose EVERY uuid is a sidechain row falls to the proof path", async () => {
+  await withTempHome("acpx-at-log-index-", async (homeDir) => {
+    const record = [said("u0", "research the venue"), withUuid(replied("first look"), "s-1")];
+    assert.deepEqual(
+      await resolveSubagentCut(
+        homeDir,
+        record,
+        SUBAGENT_MAIN_ROWS.slice(0, 2),
+        SUBAGENT_SIDE_ROWS,
+        2,
+      ),
+      { uuid: "m-a0" },
+    );
+  });
+});
+
+test("15252af6: --at-index never sends a sidechain provenance uuid; it falls to the transcript resolution", async () => {
+  await withTempHome("acpx-at-log-index-", async (homeDir) => {
+    const cwd = path.join(homeDir, "project");
+    await writeRows(homeDir, cwd, "session-subagent", SUBAGENT_MAIN_ROWS);
+    await writeSubagent(homeDir, cwd, "session-subagent", SUBAGENT_SIDE_ROWS);
+    const resolved = await resolveClaudeForkResumeAt({
+      cwd,
+      acpSessionId: "session-subagent",
+      atIndex: 4,
+      sourceMessages: SUBAGENT_RECORD.slice(0, 4),
+    });
+    assert.notEqual(resolved, "s-3");
+    assert.ok(
+      SUBAGENT_MAIN_ROWS.some((row) => row.uuid === resolved),
+      `not a main-chain uuid: ${String(resolved)}`,
+    );
+    // Control: a main-chain provenance uuid is still sent directly.
+    assert.equal(
+      await resolveClaudeForkResumeAt({
+        cwd,
+        acpSessionId: "session-subagent",
+        atIndex: 2,
+        sourceMessages: SUBAGENT_RECORD.slice(0, 2),
+      }),
+      "m-a0",
+    );
+  });
+});
+
+test("15252af6 through the CLI: the byway copy sends the main-chain uuid as resumeSessionAt", async () => {
+  await withTempHome("acpx-at-log-index-", async (homeDir) => {
+    const source: Source = {
+      id: "subagent-byway",
+      // The mock refuses the fork unless `_meta` is EXACTLY this — the sidechain s-3 fails it.
+      agentCommand: withForkMeta(MOCK_CLAUDE, {
+        claudeCode: { options: { resumeSessionAt: "m-a0" } },
+      }),
+      cwd: path.join(homeDir, "workspace"),
+      logLines: lines(SUBAGENT_RECORD),
+    };
+    await writeSource(homeDir, source);
+    await writeRows(homeDir, source.cwd, `acp-${source.id}`, SUBAGENT_MAIN_ROWS);
+    await writeSubagent(homeDir, source.cwd, `acp-${source.id}`, SUBAGENT_SIDE_ROWS);
+
+    const copied = await copy(homeDir, source, ["--at-log-index", "5"]);
+    assert.equal(copied.log.length, 5);
+    assert.equal(entryId(copied.log.at(-1)), "u2");
+  });
+});

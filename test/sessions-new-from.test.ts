@@ -478,8 +478,9 @@ test("--from cannot be combined with --from-template", async () => {
 });
 
 // Brick 28964dd8 — a successor (`--from` INTO the predecessor's own seat) runs on the
-// predecessor's EXACT model, Fable included, recorded `model_source: succession`. A child or a
-// fork of a Fable session still has an implicit Fable guard-forced off it (brick 5bac5564).
+// predecessor's EXACT model, Fable included, recorded `model_source: succession`. A child of a
+// Fable session still has an implicit Fable guard-forced off it (brick 5bac5564); a fork keeps
+// its source's model (brick 15252af6, `test/sessions-copy-fable.test.ts`).
 
 const SUCCESSION_TURN = "succession-first-turn";
 

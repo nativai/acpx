@@ -127,6 +127,7 @@ import {
   locateClaudeForkSourceTranscript,
   materializeClaudeForkSession,
   readClaudeTranscript,
+  readOffMainChainClaudeUuids,
   resolveClaudeConfigDir,
   resolveClaudeUuidForAcpxIndex,
 } from "./claude-fork-index.js";
@@ -342,9 +343,19 @@ export function resolveIndexForkMeta(
  * carries a `claude_uuid`, else of the nearest EARLIER entry that does. Walking
  * back errs earlier by part of a turn, never later: an entry's uuid never lies
  * past its own content.
+ *
+ * brick 15252af6: a uuid in `offMainChain` (a Task sub-agent's sidechain row, stamped by a
+ * pre-fix acpx) counts as NO uuid — Claude Code cannot resume at it — so the walk goes on to the
+ * nearest earlier main-chain one. Test: `test/sessions-copy-at-log-index.test.ts` → "15252af6".
  */
-function nearestClaudeUuidIndex(window: readonly SessionMessage[]): number {
-  return window.findLastIndex((entry) => forkEntryClaudeUuid(entry) !== undefined);
+function nearestClaudeUuidIndex(
+  window: readonly SessionMessage[],
+  offMainChain: ReadonlySet<string>,
+): number {
+  return window.findLastIndex((entry) => {
+    const uuid = forkEntryClaudeUuid(entry);
+    return uuid !== undefined && !offMainChain.has(uuid);
+  });
 }
 
 /**
@@ -387,7 +398,13 @@ export async function resolveLogIndexClaudeCut(args: {
 }): Promise<LogIndexClaudeCut> {
   const window = args.sourceMessages ?? [];
   const content = await readClaudeTranscript(args.cwd, args.acpSessionId, args.subscriptionId);
-  const walkedAt = nearestClaudeUuidIndex(window);
+  const offMainChain = await readOffMainChainClaudeUuids(
+    args.cwd,
+    args.acpSessionId,
+    args.subscriptionId,
+    content,
+  );
+  const walkedAt = nearestClaudeUuidIndex(window, offMainChain);
   if (walkedAt !== -1) {
     const uuid = forkEntryClaudeUuid(window[walkedAt]) as string;
     if (content !== undefined) {
@@ -420,9 +437,8 @@ export async function resolveLogIndexClaudeCut(args: {
  * .claude_uuid` directly, immune to record/transcript index divergence, and
  * falls back to `resolveClaudeUuidForAcpxIndex`'s index-arithmetic
  * reconstruction only when the entry carries no provenance (pre-provenance
- * sessions/entries — currently ALL Claude-ACP entries, since the adapter does
- * not yet stamp `_meta.claudeUuid`; this makes the branch a no-op until it
- * does).
+ * sessions/entries) or a provenance uuid proven to be a sub-agent sidechain row
+ * (brick 15252af6 — Claude Code cannot resume there).
  */
 export async function resolveClaudeForkResumeAt(args: {
   cwd: string;
@@ -437,7 +453,7 @@ export async function resolveClaudeForkResumeAt(args: {
     return (await resolveLogIndexClaudeCut({ ...args, history: args.logIndexHistory })).uuid;
   }
   const provenanceUuid = forkEntryClaudeUuid(args.sourceMessages?.[args.atIndex - 1]);
-  if (provenanceUuid) {
+  if (provenanceUuid && !(await isOffMainChain(args, provenanceUuid))) {
     return provenanceUuid;
   }
   return resolveClaudeUuidForAcpxIndex({
@@ -447,6 +463,21 @@ export async function resolveClaudeForkResumeAt(args: {
     subscriptionId: args.subscriptionId,
     recordMessageTotal: args.sourceMessages?.length,
   });
+}
+
+/** brick 15252af6: a provenance uuid PROVEN to be a sub-agent sidechain row is never sent. */
+async function isOffMainChain(
+  args: { cwd: string; acpSessionId: string; subscriptionId?: string },
+  uuid: string,
+): Promise<boolean> {
+  const content = await readClaudeTranscript(args.cwd, args.acpSessionId, args.subscriptionId);
+  const offMainChain = await readOffMainChainClaudeUuids(
+    args.cwd,
+    args.acpSessionId,
+    args.subscriptionId,
+    content,
+  );
+  return offMainChain.has(uuid);
 }
 
 export type AcpPromptOptions = {

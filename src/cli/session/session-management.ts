@@ -115,7 +115,7 @@ function modelApplyParamsFromOptions(options: SessionCreateOptions): {
 
 // brick://5bac5564 Layer B: when the resolution-tier guard rewrote an implicit Fable,
 // return the {blocked, forcedTo} pair for the loud breadcrumb + messages mirror. The
-// pre-guard provenance of a guard-forced spawn/copy is deterministically "inherited"
+// pre-guard provenance of a guard-forced spawn/template copy is deterministically "inherited"
 // (the guard only fires when a Fable value arrived via inheritance; an explicit Fable
 // is preserved and "default" never yields Fable) — stamped by the caller.
 function spawnGuardForcedInfo(

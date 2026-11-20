@@ -341,3 +341,89 @@ test("(A4) claudeUuid survives the messages_log round-trip", async () => {
     assert.equal(userClaudeUuid(hydrated.messages[2]), "steer-uuid");
   });
 });
+
+// ── brick 15252af6: a Task sub-agent's own transcript uuid is never stamped ─────────────────────
+//
+// claude-agent-acp tags every update streamed from INSIDE a sub-agent with
+// `_meta.claudeCode.parentToolUseId` (+ `subagentId` once it knows the sub-agent) and that
+// sub-agent's own transcript uuid, which lives in `subagents/agent-<id>.jsonl`, not on the main
+// chain. Stamped last-wins, it poisoned the entry and every User entry inheriting from it, and a
+// `--at-log-index` copy cut there failed with `No message found with message.uuid`. The shape
+// below is the real production update (devbox, 2026-11-20), with synthetic ids.
+
+function subagentUpdate(
+  claudeCode: Record<string, unknown>,
+  claudeUuid: string,
+  sessionUpdate: "tool_call_update" | "agent_message_chunk" = "tool_call_update",
+): SessionNotification {
+  const _meta = { claudeCode, claudeUuid };
+  return {
+    sessionId: "session-1",
+    update:
+      sessionUpdate === "tool_call_update"
+        ? { sessionUpdate, toolCallId: "toolu_inner", status: "completed", _meta }
+        : { sessionUpdate, content: { type: "text", text: "inner" }, _meta },
+  } as SessionNotification;
+}
+
+test("15252af6: an update from INSIDE a sub-agent does not stamp its uuid; a main-chain one does", () => {
+  const conversation = createSessionConversation(TS);
+  let state = undefined;
+  recordPromptSubmission(conversation, "research this", TS);
+  state = recordSessionUpdate(conversation, state, agentChunk("delegating", "main-1"), TS);
+
+  // The full production shape: toolName + parentToolUseId + subagentId (+ name).
+  state = recordSessionUpdate(
+    conversation,
+    state,
+    subagentUpdate(
+      {
+        toolName: "WebFetch",
+        parentToolUseId: "toolu_outer",
+        subagentId: "a0000000000000001",
+        subagentName: "researcher",
+      },
+      "side-1",
+    ),
+    TS,
+  );
+  assert.equal(agentClaudeUuid(conversation.messages[1]), "main-1");
+
+  // Either marker alone is enough: parentToolUseId without a known sub-agent (the adapter's
+  // string path passes no subagentCache) …
+  state = recordSessionUpdate(
+    conversation,
+    state,
+    subagentUpdate({ parentToolUseId: "toolu_outer" }, "side-2", "agent_message_chunk"),
+    TS,
+  );
+  // … and subagentId without parentToolUseId.
+  state = recordSessionUpdate(
+    conversation,
+    state,
+    subagentUpdate({ toolName: "Agent", subagentId: "a0000000000000001" }, "side-3"),
+    TS,
+  );
+  assert.equal(agentClaudeUuid(conversation.messages[1]), "main-1");
+
+  // Control: a main-chain update carrying claudeCode WITHOUT either marker still stamps.
+  state = recordSessionUpdate(
+    conversation,
+    state,
+    subagentUpdate({ toolName: "Bash" }, "main-2"),
+    TS,
+  );
+  assert.equal(agentClaudeUuid(conversation.messages[1]), "main-2");
+  // Empty markers are no markers.
+  recordSessionUpdate(
+    conversation,
+    state,
+    subagentUpdate({ parentToolUseId: "", subagentId: "" }, "main-3"),
+    TS,
+  );
+  assert.equal(agentClaudeUuid(conversation.messages[1]), "main-3");
+
+  // The next User entry inherits the main-chain uuid, not a sidechain one.
+  recordPromptSubmission(conversation, "thanks", TS);
+  assert.equal(userClaudeUuid(conversation.messages[2]), "main-3");
+});
