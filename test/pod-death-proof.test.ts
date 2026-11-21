@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { DEATH_PROOF_TIMEOUT_MS, proveDeath } from "../src/pod/death-proof.js";
+import { DEATH_PROOF_TIMEOUT_MS, apiConfig, apiGet, proveDeath } from "../src/pod/death-proof.js";
 import { KIT_NAMESPACE, makeServiceAccountDir } from "./pod-kit/two-pods.js";
 import { startFakeApi, type FakeApi } from "./pod-lock-fake-api.js";
 
@@ -205,4 +205,33 @@ test("F1 NEVER: a Status NotFound naming ANOTHER object is no answer about this 
     shim.closeAllConnections();
     await new Promise<void>((resolve) => shim.close(() => resolve()));
   }
+});
+
+// Carried from A6: the HTTP GET is exported so `agent-pod-lookup.ts` drops its copy. One client.
+
+test("apiConfig / apiGet are exported: the seam-configured client answers a GET, query string included, and bounds the body", async () => {
+  const config = apiConfig(env);
+  assert.ok(config, "configured from the seam");
+  assert.equal(config.namespace, KIT_NAMESPACE);
+  api.state.pods.set("ag-holder", { uid: HOLDER.uid, phase: "Running" });
+  const answer = await apiGet(
+    config,
+    `/api/v1/namespaces/${KIT_NAMESPACE}/pods/ag-holder`,
+    AbortSignal.timeout(2_000),
+  );
+  assert.equal(answer?.status, 200);
+  // a body over the caller's cap is no answer (undefined), never a truncated one
+  assert.equal(
+    await apiGet(
+      config,
+      `/api/v1/namespaces/${KIT_NAMESPACE}/pods/ag-holder`,
+      AbortSignal.timeout(2_000),
+      20,
+    ),
+    undefined,
+  );
+  assert.equal(
+    apiConfig({ NODE_TEST_CONTEXT: "x", ACPX_POD_SA_DIR: "/nonexistent/sa" }),
+    undefined,
+  );
 });

@@ -15,6 +15,7 @@ import {
   ownPodIdentity,
   parsePodRef,
   podModeRequested,
+  podTestHome,
   type LockHostPlace,
   type PodIdentity,
   type PodRef,
@@ -259,7 +260,12 @@ export function judgeLockHolder(
 export function identityLockBody(legacyBody: Record<string, unknown>): Record<string, unknown> {
   const identity = getOwnProcessIdentity();
   const pod = deps.lockPod();
-  if (!pod && deps.podModeRequested()) {
+  // C1.1 A-5, sharpened (HoD ruling P1, test-engineer 0b53d599): in pod mode — AND whenever the place
+  // file says this is an agent pod, whatever the switch and whatever env is missing — a writer
+  // without a complete identity refuses and holds nothing. Otherwise a scrubbed env (`env -i`, a
+  // login shell, a missing SA mount) writes a body WITHOUT `pod`, and the control pod takes that
+  // LIVE holder over in milliseconds by today's rule (a different boot ⇒ "gone").
+  if (!pod && (deps.podModeRequested() || deps.place() === "agent-pod")) {
     throw new PodIdentityMissingError();
   }
   return {
@@ -349,16 +355,22 @@ export async function removeLockIfUnchanged(lockPath: string, raw: string): Prom
 // process with `NV_POD_*` and one without bound two different names, so they never serialized; a
 // breaker stalled between its re-read and its unlink then deleted the fresh lock the other had just
 // taken — two holders of one lock. `test/pod-lock-primitive.test.ts` "F2" rows pin it.
-// Only under `node --test` (`NODE_TEST_CONTEXT`) is the uid appended, so two test "pods" that share
-// one network namespace stay apart (test/pod-kit/two-pods.ts).
+// Only under the explicit test-pod seam (`ACPX_POD_TEST_HOME`, honoured under `node --test` only) is
+// the uid appended, so two test "pods" that share one network namespace stay apart
+// (test/pod-kit/two-pods.ts).
 // ---------------------------------------------------------------------------------------------
 
 export const BREAK_MUTEX_NAME = "\0acpx-lock-break";
 
-/** The break mutex's socket name for this process (see above). */
+/**
+ * The break mutex's socket name for this process (see above). ⚠️ THE SUFFIX COMES ONLY FROM THE
+ * EXPLICIT TEST-POD SEAM (`ACPX_POD_TEST_HOME`, itself honoured only under a truthy
+ * `NODE_TEST_CONTEXT`) — NEVER from `NODE_TEST_CONTEXT` ALONE (test-engineer H1): a leaked
+ * `NODE_TEST_CONTEXT=" "`, `"0"`, `"false"` or `"child"` in ONE process of a pod would otherwise split
+ * it from the rest and bring F2 back. `test/pod-lock-primitive.test.ts` "H1" pins it.
+ */
 export function breakMutexNameFor(env: NodeJS.ProcessEnv, own: PodIdentity | undefined): string {
-  // Truthiness: an EMPTY NODE_TEST_CONTEXT honours no seam (stream HoD ruling, A1's F5 class).
-  if (!env.NODE_TEST_CONTEXT) {
+  if (podTestHome(env) === undefined) {
     return BREAK_MUTEX_NAME;
   }
   return `${BREAK_MUTEX_NAME}.${own ? own.uid : "no-identity"}`;
@@ -517,6 +529,34 @@ export function lockBreakLedgerPath(podUid: string): string {
   return path.join(stateHomeDir(), "lock-breaks", `${podUid}.ndjson`);
 }
 
+/** The holder's boot id: the legacy `boot` field, else the birth identity's. */
+function holderBoot(body: Record<string, unknown> | undefined): string | undefined {
+  if (typeof body?.boot === "string") {
+    return body.boot;
+  }
+  const identity = body?.processIdentity;
+  const boot =
+    identity && typeof identity === "object"
+      ? (identity as { bootId?: unknown }).bootId
+      : undefined;
+  return typeof boot === "string" ? boot : undefined;
+}
+
+function holderHost(body: Record<string, unknown> | undefined): string | null {
+  return typeof body?.host === "string" ? body.host : null;
+}
+
+/** The broken holder as the ledger records it. L1: host and boot too, so a cross-pod break is readable. */
+function holderRecord(body: Record<string, unknown> | undefined) {
+  return {
+    pod: parsePodRef(body?.pod) ?? null,
+    pid: (body && holderPid(body)) ?? null,
+    token: bodyToken(body) ?? null,
+    host: holderHost(body),
+    boot: holderBoot(body) ?? null,
+  };
+}
+
 function breakLine(
   lockPath: string,
   body: Record<string, unknown> | undefined,
@@ -527,11 +567,7 @@ function breakLine(
     v: 1,
     ts: new Date(deps.nowMs()).toISOString(),
     lock: lockPath,
-    holder: {
-      pod: parsePodRef(body?.pod) ?? null,
-      pid: (body && holderPid(body)) ?? null,
-      token: bodyToken(body) ?? null,
-    },
+    holder: holderRecord(body),
     breaker: { pod: own, pid: process.pid },
     proof,
   };

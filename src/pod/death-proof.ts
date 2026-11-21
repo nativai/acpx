@@ -36,8 +36,8 @@ export const POD_API_URL_ENV = "ACPX_POD_API_URL";
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const TERMINAL_PHASES = new Set(["Succeeded", "Failed"]);
 
-type ApiConfig = { base: URL; token: string; ca?: Buffer; namespace?: string };
-type ApiAnswer = { status: number; body: unknown } | undefined;
+export type ApiConfig = { base: URL; token: string; ca?: Buffer; namespace?: string };
+export type ApiAnswer = { status: number; body: unknown } | undefined;
 
 function testApiBase(env: NodeJS.ProcessEnv): URL | undefined {
   const override = env[POD_API_URL_ENV]?.trim();
@@ -65,7 +65,8 @@ function readCa(env: NodeJS.ProcessEnv): Buffer | undefined {
   }
 }
 
-function apiConfig(env: NodeJS.ProcessEnv): ApiConfig | undefined {
+/** The in-cluster API (or the test seam) from `env`: base URL, token, CA, namespace. Shared with A6. */
+export function apiConfig(env: NodeJS.ProcessEnv): ApiConfig | undefined {
   let base: URL | undefined;
   try {
     base = apiBase(env);
@@ -87,8 +88,17 @@ function parseJson(text: string): unknown {
   }
 }
 
-/** One GET; undefined on ANY transport failure (refused, reset, TLS, abort, oversized body). */
-function apiGet(config: ApiConfig, apiPath: string, signal: AbortSignal): Promise<ApiAnswer> {
+/**
+ * One GET; undefined on ANY transport failure (refused, reset, TLS, abort, oversized body).
+ * Exported so `src/pod/agent-pod-lookup.ts` (A6) uses THIS client, not a copy; `maxBytes` defaults to
+ * 1 MiB (a pod or node), a pod LIST asks for more. `apiPath` may carry a query string.
+ */
+export function apiGet(
+  config: ApiConfig,
+  apiPath: string,
+  signal: AbortSignal,
+  maxBytes: number = MAX_RESPONSE_BYTES,
+): Promise<ApiAnswer> {
   const url = new URL(apiPath, config.base);
   const transport = url.protocol === "https:" ? https : http;
   return new Promise((resolve) => {
@@ -105,7 +115,7 @@ function apiGet(config: ApiConfig, apiPath: string, signal: AbortSignal): Promis
         let size = 0;
         response.on("data", (chunk: Buffer) => {
           size += chunk.length;
-          if (size > MAX_RESPONSE_BYTES) {
+          if (size > maxBytes) {
             request.destroy();
             resolve(undefined);
             return;
