@@ -289,6 +289,26 @@ test("departures from C4's request shape are recorded by name, never silently ac
   });
 });
 
+test("C9: only an optional tool (pi-extensions) may be left out of releases; a required one may not", async () => {
+  await withBroker({}, async (broker) => {
+    const { key, body } = wellFormedAgentRequest("session-releases");
+    const releases = { ...(body.releases as Record<string, string>) };
+    delete releases["pi-extensions"];
+    await postAgent(broker, key, { ...body, releases });
+    assert.deepEqual(broker.requests.at(-1)?.problems, [], "pi-extensions absent is no problem");
+    await fetch(`${broker.url}/v1/agents/${key}`, { method: "DELETE" });
+    delete releases["claude-agent-acp"];
+    await postAgent(broker, key, { ...body, releases });
+    assert.deepEqual(broker.requests.at(-1)?.problems, ["releases_missing:claude-agent-acp"]);
+    await fetch(`${broker.url}/v1/agents/${key}`, { method: "DELETE" });
+    await postAgent(broker, key, {
+      ...body,
+      releases: { ...(body.releases as object), "pi-extensions": "" },
+    });
+    assert.deepEqual(broker.requests.at(-1)?.problems, ["releases_invalid:pi-extensions"]);
+  });
+});
+
 test("DELETE removes the Job; the next POST for the key creates a fresh one", async () => {
   await withBroker({ delete: { delayMs: 120 } }, async (broker) => {
     const { key, body } = wellFormedAgentRequest("session-delete");

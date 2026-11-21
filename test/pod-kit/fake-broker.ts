@@ -32,6 +32,9 @@ export const RELEASE_TOOLS = [
   "pi-acp",
   "pi-extensions",
 ] as const;
+// C9 as ruled 2026-11-21: only a tool marked `optional` in runtime-links.sh's LINKS table may be
+// left out of `releases` — today `pi-extensions`, and only it. Any other absent tool is a problem.
+export const OPTIONAL_RELEASE_TOOLS: readonly string[] = ["pi-extensions"];
 
 export type BrokerStep = string | { line: string; delayMs?: number };
 
@@ -101,7 +104,7 @@ export interface BrokerRequestRecord {
   /**
    * Departures from C4's request shape, by name — the fake never rejects for these (the contract
    * names no answer), a test asserts the list is empty: `invalid_json`, `contract_missing`,
-   * `field_missing:<f>`, `field_invalid:<f>`, `releases_missing:<tool>`, `key_mismatch`.
+   * `field_missing:<f>`, `field_invalid:<f>`, `releases_missing:<tool>` (a required tool; `pi-extensions` may be left out), `releases_invalid:<tool>`, `key_mismatch`.
    */
   problems: string[];
   /** The Job this request created or followed; null for a request that reached no Job. */
@@ -216,8 +219,13 @@ function validateRequest(body: Record<string, unknown>, key: string): string[] {
     problems.push("field_invalid:releases");
   } else {
     for (const tool of RELEASE_TOOLS) {
-      if (typeof releases[tool] !== "string" || releases[tool].length === 0) {
-        problems.push(`releases_missing:${tool}`);
+      const value = releases[tool];
+      if (value === undefined) {
+        if (!OPTIONAL_RELEASE_TOOLS.includes(tool)) {
+          problems.push(`releases_missing:${tool}`);
+        }
+      } else if (typeof value !== "string" || value.length === 0) {
+        problems.push(`releases_invalid:${tool}`);
       }
     }
   }
