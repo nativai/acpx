@@ -54,8 +54,8 @@ export function podStartingRefusal(input: {
     `acpx: REFUSED reason=pod_starting nothing_started=true protocol=1 ` +
     `retry_after_s=${retryAfterS} phase=${input.phase} wake=${input.wake}`;
   const sentence =
-    `acpx: the session's agent pod ${PHASE_SENTENCE[input.phase]}. Nothing was run; the message is ` +
-    `delivered when the pod is ready — retry in ${retryAfterS} s.`;
+    `acpx: the session's agent pod ${PHASE_SENTENCE[input.phase]}. Nothing was run; the message ` +
+    `stays queued and is delivered when the pod is ready.`;
   return new CapacityRefusedError({
     tokenLine,
     sentence,
@@ -87,8 +87,7 @@ export function agentCapRefusal(input: {
     (input.wake === undefined ? "" : ` wake=${input.wake}`);
   const sentence =
     `acpx: no agent pod can be started on this box now (${input.live} of ${input.cap} in use; ` +
-    `${input.why}). Nothing was started; it is delivered when room frees — retry in ` +
-    `${AGENT_CAP_RETRY_AFTER_S} s.`;
+    `${input.why}). Nothing was started; the message stays queued until room frees.`;
   return new CapacityRefusedError({
     tokenLine,
     sentence,

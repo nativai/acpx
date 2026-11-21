@@ -60,7 +60,7 @@ function harness(
   const record: RoutedRecord | undefined =
     "record" in over
       ? over.record
-      : { acpxRecordId: SESSION, agentCommand: CLAUDE, seatId: "seat-1", name: "worker" };
+      : { acpxRecordId: SESSION, agentCommand: CLAUDE, seatId: "seat-1" };
   const outcome = over.outcome ?? 0;
   h.deps = {
     argv: () => ["claude", "prompt", "--session-id", SESSION, "hello"],
@@ -128,7 +128,6 @@ test("routed-ensure: the call goes to the session's key as class owner-ensure, w
     seat: "seat-1",
     harness: "claude",
     admissionClass: "delivery",
-    sessionName: "worker",
   });
   assert.equal(h.stdinReads, 0, "text given: stdin is not read");
 });

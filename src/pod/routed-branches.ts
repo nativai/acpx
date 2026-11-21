@@ -36,7 +36,6 @@ export type RoutedRecord = {
   acpxRecordId: string;
   agentCommand: string;
   seatId?: string;
-  name?: string;
 };
 
 export type BranchDeps = {
@@ -163,7 +162,6 @@ function sessionTarget(record: RoutedRecord, deps: BranchDeps) {
     seat: record.seatId ?? record.acpxRecordId,
     harness: deps.harnessOf(record.agentCommand) as AgentHarness,
     ...(admissionClass ? { admissionClass } : {}),
-    ...(record.name ? { sessionName: record.name } : {}),
   };
 }
 
