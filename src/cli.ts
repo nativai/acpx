@@ -52,8 +52,8 @@ async function start(): Promise<void> {
   const outcome = await runPlacementStep({
     argv: placementArgv(process.argv),
     builtInAgents: () => listBuiltInAgents(),
-    loadTargetResolver: async () => (await import("./pod/target-resolver.js")).targetResolver,
     write: (line) => process.stderr.write(`${line}\n`),
+    writeStdout: (line) => process.stdout.write(`${line}\n`),
   });
   if (outcome !== "proceed") {
     process.exitCode = outcome.exitCode;

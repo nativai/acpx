@@ -19,6 +19,17 @@ export type GrammarNode = {
   readonly aliases?: readonly string[];
   readonly valueFlags: readonly string[];
   readonly children?: readonly string[];
+  /**
+   * Commander gives this command an implicit `help` subcommand (it has subcommands and no action of
+   * its own). ⚠️ The program and every agent command have an action, so they have NONE: there the
+   * token `help` is prompt text (F1). Read from commander's own `Help.visibleCommands`.
+   */
+  readonly helpCommand?: true;
+  /**
+   * `""` only: tokens `TOP_LEVEL_VERBS` claims that no command answers (`help`). configurePublicCli
+   * registers no agent of that name, so the token is the program's prompt.
+   */
+  readonly claimed?: readonly string[];
 };
 
 export const COMMAND_GRAMMAR: Readonly<Record<string, GrammarNode>> = {
@@ -46,6 +57,7 @@ export const COMMAND_GRAMMAR: Readonly<Record<string, GrammarNode>> = {
       "--timeout",
       "--ttl",
     ],
+    claimed: ["help"],
   },
   prompt: {
     valueFlags: [
@@ -160,7 +172,7 @@ export const COMMAND_GRAMMAR: Readonly<Record<string, GrammarNode>> = {
   "sessions export": { valueFlags: ["--output", "--session-id", "--session-url"] },
   "sessions import": { valueFlags: ["--cwd"] },
   "sessions prune": { valueFlags: ["--before", "--older-than"] },
-  seats: { valueFlags: [] },
+  seats: { valueFlags: [], helpCommand: true },
   "seats reconcile-archive": { valueFlags: ["--format"] },
   "seats set-brick": { valueFlags: ["--format"] },
   "seats rename": { valueFlags: ["--format"] },
@@ -174,15 +186,15 @@ export const COMMAND_GRAMMAR: Readonly<Record<string, GrammarNode>> = {
   context: {
     valueFlags: ["--alarm", "--seat", "--session", "--session-id", "--session-url", "-s"],
   },
-  "agent-folders": { valueFlags: [] },
+  "agent-folders": { valueFlags: [], helpCommand: true },
   "agent-folders migrate": { valueFlags: ["--format", "--pool", "--sessions-dir"] },
-  transcripts: { valueFlags: [] },
+  transcripts: { valueFlags: [], helpCommand: true },
   "transcripts dedup": { valueFlags: ["--format", "--manifest", "--session"] },
   "transcripts restore": { valueFlags: ["--format", "--to"] },
   subscriptions: { valueFlags: [] },
   "subscriptions list": { valueFlags: ["--format"] },
   "subscriptions usage": { valueFlags: ["--format"] },
-  "subscriptions ceiling": { valueFlags: [] },
+  "subscriptions ceiling": { valueFlags: [], helpCommand: true },
   "subscriptions ceiling show": { valueFlags: ["--format"] },
   "subscriptions ceiling set": { valueFlags: ["--format"] },
   "subscriptions ceiling set-default": { valueFlags: ["--format"] },
@@ -216,18 +228,18 @@ export const COMMAND_GRAMMAR: Readonly<Record<string, GrammarNode>> = {
     valueFlags: ["--class", "--format", "--sender", "--sender-role", "--session-id"],
   },
   "capacity run-build": { valueFlags: ["--bytes", "--format", "--wait"] },
-  people: { valueFlags: [] },
+  people: { valueFlags: [], helpCommand: true },
   "people list": { valueFlags: [] },
   "people resolve": { valueFlags: [] },
   "people set-owner": { valueFlags: ["--session"] },
   "people principal": { valueFlags: ["--session"] },
-  governor: { valueFlags: [] },
+  governor: { valueFlags: [], helpCommand: true },
   "governor status": { valueFlags: ["--format"] },
   "governor scan": { valueFlags: ["--format"] },
   config: { valueFlags: [] },
   "config show": { valueFlags: ["--format"] },
   "config init": { valueFlags: ["--format"] },
-  flow: { valueFlags: [] },
+  flow: { valueFlags: [], helpCommand: true },
   "flow run": { valueFlags: ["--default-agent", "--input-file", "--input-json"] },
   "<agent>": {
     valueFlags: ["--file", "--session", "--session-id", "--session-url", "-f", "-s"],

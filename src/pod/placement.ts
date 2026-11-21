@@ -4,6 +4,7 @@ import path from "node:path";
 import { queueKeyForSession } from "../cli/queue/paths.js";
 import { isControlPod } from "../config/control-pod.js";
 import { acpxStateRoot } from "../session/persistence/session-base-dir.js";
+import { ownPodIdentity } from "./identity.js";
 
 /**
  * C1.1 — the switch and "where am I" (CONTRACTS-r4 C1.1, brick b479441f).
@@ -35,14 +36,6 @@ export const AGENT_POD_FILE_NAME = ".nv-agent";
  */
 export const TEST_HOME_ENV = "ACPX_POD_TEST_HOME";
 
-/** The pod identity C1.1 requires (A-5): the downward API and the service-account namespace. */
-export const POD_NAME_ENV = "NV_POD_NAME";
-export const POD_UID_ENV = "NV_POD_UID";
-export const NODE_NAME_ENV = "NV_NODE_NAME";
-export const SERVICE_ACCOUNT_DIR = "/var/run/secrets/kubernetes.io/serviceaccount";
-/** A5's seam for the service-account directory (`src/pod/identity.ts` on ap/a5-pod-lock). */
-export const POD_SA_DIR_ENV = "ACPX_POD_SA_DIR";
-
 export type Place = "control" | "own-pod" | "other-pod";
 
 /**
@@ -63,8 +56,13 @@ export type HostFacts = {
   homedir: string;
 };
 
+/**
+ * ⚠️ A NON-EMPTY `NODE_TEST_CONTEXT` (node's runner sets `child` / `child-v8`), the same test as
+ * A5's service-account seam (`serviceAccountDir`), so the two seams the predicate reads agree on
+ * an empty value (F5): `NODE_TEST_CONTEXT=""` honours neither.
+ */
 function testHome(env: NodeJS.ProcessEnv): string | undefined {
-  if (env.NODE_TEST_CONTEXT === undefined) {
+  if (!env.NODE_TEST_CONTEXT) {
     return undefined;
   }
   const seam = env[TEST_HOME_ENV]?.trim();
@@ -80,18 +78,31 @@ export function canonicalHome(env: NodeJS.ProcessEnv = process.env): string {
  * its deepest existing ancestor, plus the rest — so a not-yet-created `.acpx` under a symlinked home
  * still resolves through the link.
  */
-function resolvedPath(p: string): string {
+function resolvedPath(p: string, depth = 0): string {
   const absolute = path.resolve(p);
   const rest: string[] = [];
   for (let dir = absolute; ; dir = path.dirname(dir)) {
     try {
       return path.join(fs.realpathSync(dir), ...rest);
     } catch {
+      // A DANGLING symlink (F6): acpx would create its target THROUGH the link, so follow it.
+      const link = danglingLinkTarget(dir);
+      if (link !== undefined && depth < 40) {
+        return resolvedPath(path.join(path.resolve(path.dirname(dir), link), ...rest), depth + 1);
+      }
       if (dir === path.dirname(dir)) {
         return absolute;
       }
       rest.unshift(path.basename(dir));
     }
+  }
+}
+
+function danglingLinkTarget(p: string): string | undefined {
+  try {
+    return fs.lstatSync(p).isSymbolicLink() ? fs.readlinkSync(p) : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -133,36 +144,13 @@ export function podModeVerdict(facts: HostFacts): PodModeVerdict {
   return { mode: "pod" };
 }
 
-function nonEmpty(value: string | undefined): string | undefined {
-  const trimmed = value?.trim();
-  return trimmed ? trimmed : undefined;
-}
-
-function serviceAccountNamespace(env: NodeJS.ProcessEnv): string | undefined {
-  const override = env.NODE_TEST_CONTEXT ? nonEmpty(env[POD_SA_DIR_ENV]) : undefined;
-  try {
-    return nonEmpty(
-      fs.readFileSync(path.join(override ?? SERVICE_ACCOUNT_DIR, "namespace"), "utf8"),
-    );
-  } catch {
-    return undefined;
-  }
-}
-
 /**
  * C1.1 A-5: the process can name its pod — `NV_POD_NAME`, `NV_POD_UID`, `NV_NODE_NAME` and the
- * service-account namespace file, every one present and non-blank. ⚠️ THE ONE PLACE A1 reads the
- * identity; once A5's `src/pod/identity.ts` is on `agent-pods` this delegates to it (A5 reads the
- * same sources with the same `ACPX_POD_SA_DIR` seam, but treats node and namespace as optional —
- * the switch requires all four).
+ * service-account namespace file, all four. Delegates to A5's `ownPodIdentity` (`./identity.ts`),
+ * the one reader of those sources (and of its `ACPX_POD_SA_DIR` test seam).
  */
 export function podIdentityComplete(env: NodeJS.ProcessEnv = process.env): boolean {
-  return (
-    nonEmpty(env[POD_NAME_ENV]) !== undefined &&
-    nonEmpty(env[POD_UID_ENV]) !== undefined &&
-    nonEmpty(env[NODE_NAME_ENV]) !== undefined &&
-    serviceAccountNamespace(env) !== undefined
-  );
+  return ownPodIdentity(env) !== undefined;
 }
 
 function liveHostFacts(env: NodeJS.ProcessEnv): HostFacts {

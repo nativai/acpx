@@ -21,6 +21,7 @@ import {
   type HostFacts,
   type PodModeVerdict,
 } from "../src/pod/placement.js";
+import { makeSessionRecord, writeSessionRecordFile } from "./runtime-test-helpers.js";
 
 // brick b479441f — C1.1 (the switch, "where am I"), its amendment (NV_POD_UID), C1.2's dispatch and
 // C7.2's `unclassified_command`. Every guarantee has a negative case: an input right in every other
@@ -265,6 +266,8 @@ test("three places: control / the session's own pod / another agent pod", () => 
 
 // ─── C1.2: the dispatch, pure ────────────────────────────────────────────────────────────────────
 
+/** `target`: what the own-session check answers (counted in `ownTargetCalls`). */
+let ownTargetCalls = 0;
 function decide(
   argv: string[],
   over: { verdict?: PodModeVerdict; pod?: string; target?: string | null } = {},
@@ -274,8 +277,10 @@ function decide(
     verdict: over.verdict ?? { mode: "pod" },
     podFile: over.pod ? { kind: "pod", name: over.pod } : { kind: "absent" },
     builtInAgents: ["claude", "codex", "pi"],
-    env: {},
-    ...(over.target !== undefined ? { resolvedTarget: over.target } : {}),
+    ownTarget: () => {
+      ownTargetCalls += 1;
+      return over.target ?? null;
+    },
   });
 }
 
@@ -302,9 +307,25 @@ test("control pod: each class takes its C1.2 cell", () => {
   assert.equal(summary(decide(["prompt", "--help"])), "local", "help runs nothing");
 });
 
-test("agent pod: a target-dependent class waits for the resolved target, then decides by it", () => {
+test("agent pod: a target-dependent class decides by the own-session check, asked only then", () => {
   const pod = agentPodName("rec-own");
-  assert.equal(summary(decide(["prompt", "--session-id", "x", "hi"], { pod })), "resolve-target");
+  ownTargetCalls = 0;
+  assert.equal(
+    summary(decide(["prompt", "--session-id", "x", "hi"], { pod })),
+    "branch:message-route",
+  );
+  assert.equal(ownTargetCalls, 1);
+  for (const argv of [
+    ["sessions", "new"],
+    ["exec", "hi"],
+    ["seats", "zzz"],
+    ["governor", "status"],
+  ]) {
+    decide(argv, { pod });
+  }
+  assert.equal(ownTargetCalls, 1, "F2: no target lookup where the route does not depend on it");
+  decide(["prompt", "hi"], { target: "rec-own" });
+  assert.equal(ownTargetCalls, 1, "F2: never on the control pod");
   assert.equal(summary(decide(["prompt", "hi"], { pod, target: "rec-own" })), "local");
   assert.equal(
     summary(decide(["prompt", "hi"], { pod, target: "rec-other" })),
@@ -341,7 +362,7 @@ test("A-7: control-pod maintenance refuses in an agent pod (control_pod_only), r
     assert.equal(decide(argv).kind, "local", `${JSON.stringify(argv)} on the control pod`);
   }
   // Ordinary `local` commands still run in an agent pod.
-  assert.equal(decide(["help"], { pod }).kind, "local");
+  assert.equal(decide(["seats", "help"], { pod }).kind, "local");
   assert.equal(decide(["--version"], { pod }).kind, "local");
 });
 
@@ -367,7 +388,12 @@ test("identity missing: everything but `local` refuses with exit 2 and the C7.2 
     assert.equal(refusalFor(d)?.exitCode, 2);
     assert.equal(refusalFor(d)?.lines[0], "acpx: REFUSED reason=pod_identity_missing");
   }
-  for (const argv of [["--version"], ["help"], ["governor", "status"], ["sessions", "new", "-h"]]) {
+  for (const argv of [
+    ["--version"],
+    ["seats", "help"],
+    ["governor", "status"],
+    ["sessions", "new", "-h"],
+  ]) {
     assert.equal(decide(argv, { verdict }).kind, "local", JSON.stringify(argv));
   }
 });
@@ -633,4 +659,250 @@ test("tripwire site 2 — the owner spawn: spawnQueueOwnerProcess refuses on the
     "acpx: REFUSED reason=bridge_on_control_pod nothing_started=true protocol=1 what=owner",
     "identity missing is fail-closed too",
   );
+});
+
+// ─── The A1 verification's findings (VERIFICATION.md at 045b3d71) ────────────────────────────────
+
+/** A sandbox home with one open record in its store (written the way acpx's tests write records). */
+async function homeWithRecord(recordId: string, acpId: string, podFile?: string): Promise<string> {
+  const home = podHome(podFile === undefined ? {} : { podFile });
+  await writeSessionRecordFile(
+    home,
+    makeSessionRecord({
+      acpxRecordId: recordId,
+      acpSessionId: acpId,
+      agentCommand: "agent",
+      cwd: home,
+    }),
+  );
+  return home;
+}
+
+function tree(dir: string): string[] {
+  const out: string[] = [];
+  const walk = (d: string) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) {
+        walk(p);
+      } else {
+        out.push(path.relative(dir, p));
+      }
+    }
+  };
+  walk(dir);
+  return out.toSorted();
+}
+
+test("F1 CLI: `help` in a prompt, in ANOTHER agent pod, is routed (message-route) — no owner starts", async () => {
+  const rec = "2c3a1f4e-0b5d-4c6e-9f70-81a2b3c4d5e6";
+  const home = await homeWithRecord(
+    rec,
+    "5e4d3c2b-1a09-4887-a665-544332211000",
+    "ag-0123456789abcdef01234567",
+  );
+  const before = tree(home);
+  const r = run(
+    ["--approve-all", "claude", "--session-id", rec, "--no-wait", "help", "me"],
+    podEnv(home),
+  );
+  assert.equal(r.status, 2, r.stderr);
+  assert.equal(
+    r.stderr.split("\n")[0],
+    "acpx: REFUSED reason=pod_branch_unbuilt nothing_started=true protocol=1 branch=message-route class=owner-ensure place=other-pod path=<agent>",
+  );
+  assert.deepEqual(tree(home), before, "nothing written: no lease, no stream, no ledger, no index");
+});
+
+test("F1 CLI: `acpx help …` on the control pod is a prompt — refused at the step, before any write", () => {
+  const home = podHome();
+  for (const argv of [
+    ["help"],
+    ["help", "sessions"],
+    ["claude", "--session-id", "X", "help", "me"],
+  ]) {
+    const r = run(argv, podEnv(home));
+    assert.equal(r.status, 2, JSON.stringify(argv));
+    assert.match(r.stderr.split("\n")[0], /branch=routed-ensure class=owner-ensure place=control/u);
+  }
+  assert.deepEqual(tree(home), [], "no index, no ledger — the step refused before acpx loaded");
+  // And under pod_identity_missing a `help` prompt is NOT "diagnosable": it refuses.
+  const r = run(["help", "me"], podEnv(podHome(), { NV_POD_UID: undefined }));
+  assert.equal(r.status, 2);
+  assert.equal(r.stderr.split("\n")[0], "acpx: REFUSED reason=pod_identity_missing");
+});
+
+test("F2 CLI: in an agent pod the REFUSED token is stderr line 1, and no index is written", async () => {
+  // No index at all: today's resolver would rebuild it (and say so on stderr) — the step must not.
+  const empty = podHome({ podFile: "ag-0123456789abcdef01234567" });
+  fs.mkdirSync(path.join(empty, ".acpx", "sessions"), { recursive: true });
+  const r1 = run(["sessions", "set-os", "nobody", "default"], podEnv(empty));
+  assert.equal(r1.status, 2);
+  assert.equal(
+    r1.stderr.split("\n")[0].startsWith("acpx: REFUSED reason=pod_branch_unbuilt"),
+    true,
+    r1.stderr,
+  );
+  assert.equal(fs.existsSync(path.join(empty, ".acpx", "sessions", "index.json")), false);
+  // A store with a record and an index: the bytes are untouched.
+  const rec = "7d6c5b4a-3928-4170-8e6d-5c4b3a291807";
+  const home = await homeWithRecord(
+    rec,
+    "1a2b3c4d-5e6f-4a8b-9c0d-1e2f3a4b5c6d",
+    "ag-0123456789abcdef01234567",
+  );
+  const index = path.join(home, ".acpx", "sessions", "index.json");
+  fs.writeFileSync(index, JSON.stringify({ schema: "x", entries: [], files: [] }));
+  const bytes = fs.readFileSync(index, "utf8");
+  const r2 = run(["sessions", "set-metadata", "k", "v", "--session-id", rec], podEnv(home));
+  assert.equal(
+    r2.stderr.split("\n")[0].startsWith("acpx: REFUSED reason=pod_branch_unbuilt"),
+    true,
+    r2.stderr,
+  );
+  assert.equal(fs.readFileSync(index, "utf8"), bytes, "index.json untouched");
+});
+
+test("F2: the own-session check answers OWN only on exact evidence, read-only", async () => {
+  const { ownTargetRecordId } = await import("../src/pod/own-target.js");
+  const dir = tmpDir();
+  const rec = "aaaaaaaa-1111-4222-8333-444444444444";
+  const acp = "bbbbbbbb-5555-4666-8777-888888888888";
+  const pod = agentPodName(rec);
+  fs.writeFileSync(
+    path.join(dir, "index.json"),
+    JSON.stringify({
+      entries: [
+        { acpxRecordId: rec, acpSessionId: acp },
+        {
+          acpxRecordId: "cccccccc-0000-4000-8000-000000000a99",
+          acpSessionId: "dddddddd-0000-4000-8000-000000000a99",
+        },
+      ],
+    }),
+  );
+  fs.writeFileSync(
+    path.join(dir, "seats.json"),
+    JSON.stringify({ "seat-1": { active_holder_id: rec } }),
+  );
+  const own = (target: Parameters<typeof ownTargetRecordId>[0]) =>
+    ownTargetRecordId(target, pod, dir);
+  assert.equal(own({ via: "flag", flag: "--session-id", value: rec }), rec, "record id");
+  assert.equal(own({ via: "operand", value: rec }), rec, "operand");
+  assert.equal(
+    own({ via: "flag", flag: "--session-url", value: `https://a/?session=${rec}` }),
+    rec,
+  );
+  assert.equal(own({ via: "flag", flag: "--seat", value: "seat-1" }), rec, "seat → active holder");
+  assert.equal(own({ via: "flag", flag: "--session-url", value: "https://a/?seat=seat-1" }), rec);
+  assert.equal(own({ via: "flag", flag: "--session-id", value: acp }), rec, "ACP id via the index");
+  assert.equal(
+    own({ via: "flag", flag: "--session-id", value: "444444444444" }),
+    rec,
+    "unique suffix",
+  );
+  // Negatives: another session, an ambiguous suffix, nothing, unreadable files.
+  assert.equal(
+    own({ via: "flag", flag: "--session-id", value: "cccccccc-0000-4000-8000-000000000a99" }),
+    null,
+  );
+  assert.equal(own({ via: "flag", flag: "--session-id", value: "a99" }), null, "ambiguous suffix");
+  assert.equal(ownTargetRecordId(undefined, pod, dir), null);
+  assert.equal(
+    ownTargetRecordId({ via: "flag", flag: "--seat", value: "seat-1" }, pod, tmpDir()),
+    null,
+  );
+  assert.deepEqual(fs.readdirSync(dir).toSorted(), ["index.json", "seats.json"], "read-only");
+});
+
+test("F3 CLI: --format json carries the placement refusal in error.data (C7.2)", () => {
+  const home = podHome();
+  const r = run(["--format", "json", "prompt", "--session-id", "x", "hi"], podEnv(home));
+  assert.equal(r.status, 2);
+  const out = JSON.parse(r.stdout.trim()) as {
+    error: { code: number; data: Record<string, unknown> };
+  };
+  assert.equal(out.error.code, -32602);
+  assert.equal(out.error.data.reason, "pod_branch_unbuilt");
+  assert.equal(out.error.data.branch, "routed-ensure");
+  assert.equal(out.error.data.nothing_started, true);
+  assert.equal(out.error.data.tokenLine, r.stderr.split("\n")[0], "line 1 stays on stderr too");
+  const u = run(["--format", "json", "seats", "zzz"], podEnv(home));
+  assert.equal(
+    (JSON.parse(u.stdout) as { error: { data: { reason: string } } }).error.data.reason,
+    "unclassified_command",
+  );
+  const pod = podEnv(podHome({ podFile: "ag-0123456789abcdef01234567" }));
+  const leaf = run(["governor", "status", "--format", "json"], pod);
+  assert.equal(
+    (JSON.parse(leaf.stdout) as { error: { data: { reason: string } } }).error.data.reason,
+    "control_pod_only",
+  );
+  // --json-strict: JSON on stdout, nothing on stderr.
+  const strict = run(["--format", "json", "--json-strict", "prompt", "hi"], podEnv(home));
+  assert.equal(strict.stderr, "");
+  assert.equal(
+    (JSON.parse(strict.stdout) as { error: { data: { reason: string } } }).error.data.reason,
+    "pod_branch_unbuilt",
+  );
+  // Text mode: nothing on stdout.
+  assert.equal(run(["prompt", "hi"], podEnv(home)).stdout, "");
+});
+
+test('F5: NODE_TEST_CONTEXT="" honours NEITHER seam (home and service account agree)', () => {
+  const home = tmpDir();
+  assert.equal(canonicalHome({ NODE_TEST_CONTEXT: "", [TEST_HOME_ENV]: home }), CANONICAL_HOME);
+  const verdict = podModeVerdict(
+    facts({
+      controlRole: false,
+      homedir: home,
+      env: { NODE_TEST_CONTEXT: "", [TEST_HOME_ENV]: home },
+    }),
+  );
+  assert.equal(mode(verdict), "off:not-control-role", "the home seam is off, as the SA seam is");
+});
+
+test("F6: a DANGLING `.acpx` symlink to the canonical `.acpx` is followed — judged canonical", () => {
+  const seamHome = tmpDir(); // its `.acpx` does not exist yet
+  const ash = tmpDir();
+  fs.symlinkSync(path.join(seamHome, ".acpx"), path.join(ash, ".acpx"));
+  assert.equal(
+    mode(
+      podModeVerdict(
+        facts({ homedir: "/x", env: { ACPX_POD_TEST_HOME: seamHome, ACPX_STATE_HOME: ash } }),
+      ),
+    ),
+    "pod",
+  );
+  const elsewhere = tmpDir();
+  const ash2 = tmpDir();
+  fs.symlinkSync(path.join(elsewhere, ".acpx"), path.join(ash2, ".acpx"));
+  assert.equal(
+    mode(
+      podModeVerdict(
+        facts({ homedir: "/x", env: { ACPX_POD_TEST_HOME: seamHome, ACPX_STATE_HOME: ash2 } }),
+      ),
+    ),
+    "refuse:test_seam_outside_sandbox",
+    "a dangling link elsewhere is still elsewhere",
+  );
+});
+
+test("ruling Q: archive MAINTENANCE is control_pod_only in an agent pod; archiving named sessions is passed through", () => {
+  const pod = agentPodName("rec-own");
+  for (const argv of [
+    ["sessions", "archive", "--apply"],
+    ["sessions", "archive", "--compress", "--apply"],
+    ["sessions", "archive", "--decompress", "--all", "--apply"],
+    ["sessions", "archive", "--status"],
+    ["sessions", "prune", "--older-than", "3"],
+  ]) {
+    assert.equal(summary(decide(argv, { pod })), "refuse-control-pod-only", JSON.stringify(argv));
+    assert.equal(summary(decide(argv)), "local", `${JSON.stringify(argv)} on the control pod`);
+  }
+  assert.equal(
+    summary(decide(["sessions", "archive", "--ids", "a", "b", "--apply"], { pod })),
+    "branch:pass-through",
+  );
+  assert.equal(summary(decide(["sessions", "restore", "a"], { pod })), "branch:pass-through");
 });
