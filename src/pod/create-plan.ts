@@ -276,7 +276,7 @@ function podSwitchHome(env: NodeJS.ProcessEnv): string | undefined {
     return undefined;
   }
   const home = seam ?? "/home/node";
-  return stateHomeInUse(env) === path.join(home, ".acpx") ? home : undefined;
+  return resolvedPath(stateHomeInUse(env)) === resolvedPath(home) ? home : undefined;
 }
 
 /** A1's seam (`ACPX_POD_TEST_HOME`), honoured ONLY under `node --test` — never on a box. */
@@ -287,8 +287,17 @@ function testSeamHome(env: NodeJS.ProcessEnv): string | undefined {
   return env.ACPX_POD_TEST_HOME?.trim() || undefined;
 }
 
+/** The home acpx's state lives under (`<it>/.acpx`) — exactly how every state-path resolver reads it. */
 function stateHomeInUse(env: NodeJS.ProcessEnv): string {
-  return path.resolve(env.ACPX_STATE_HOME?.trim() || path.join(os.homedir(), ".acpx"));
+  return env.ACPX_STATE_HOME?.trim() || os.homedir();
+}
+
+function resolvedPath(p: string): string {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
 }
 
 /** ⚠️ Only ENOENT is "the control pod": an unreadable `.nv-agent` is an agent pod (A1's fail-safe side). */
