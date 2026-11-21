@@ -235,6 +235,8 @@ export const COMMAND_GRAMMAR: Readonly<Record<string, GrammarNode>> = {
   "people resolve": { valueFlags: [] },
   "people set-owner": { valueFlags: ["--session"] },
   "people principal": { valueFlags: ["--session"] },
+  box: { valueFlags: [], helpCommand: true },
+  "box refresh": { valueFlags: ["--format"] },
   governor: { valueFlags: [], helpCommand: true },
   "governor status": { valueFlags: ["--format"] },
   "governor scan": { valueFlags: ["--format"] },
