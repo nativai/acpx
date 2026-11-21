@@ -1103,3 +1103,56 @@ test("releases (C9): ONLY pi-extensions may be left out; every other tool, absen
     fs.symlinkSync(`.releases/${tool}/r`, path.join(dir, tool));
   }
 });
+
+test("--address: the pod IP from the broker's ready line, or from the API lookup, goes to the transport; never a non-IP", async () => {
+  const broker = await startBroker({ lines: [READY] });
+  try {
+    const stub = makeStub();
+    await runRoutedCall(ensureOptions(stub, broker.origin));
+    const [fromBroker] = stub.calls();
+    assert.ok(fromBroker);
+    assert.equal(flag(fromBroker, "--address"), "10.1.2.3");
+  } finally {
+    broker.close();
+  }
+  const stub2 = makeStub();
+  await runRoutedCall(
+    baseOptions(stub2, {
+      lookup: async () => ({ state: "exists", uid: UID, ready: true, ip: "fd00::5" }),
+    }),
+  );
+  assert.equal(flag(stub2.calls()[0], "--address"), "fd00::5");
+  // Negatives: no IP known, or something that is not an IP (a hostname, a flag-looking string), is not passed.
+  for (const ip of [undefined, "ag-x.ag.dev-devbox.svc", "--evil", "10.1.2", ""]) {
+    const stub3 = makeStub();
+    await runRoutedCall(
+      baseOptions(stub3, { lookup: async () => ({ state: "exists", uid: UID, ready: true, ip }) }),
+    );
+    assert.equal(stub3.calls()[0]?.argv.includes("--address"), false, String(ip));
+  }
+});
+
+test("transport lines beyond the table (T1): bad_request → not_run; 124 DEADLINE lines → unknown; a trailing TEST MODE line changes nothing", async () => {
+  const stub = makeStub({
+    exit: 64,
+    stderr:
+      "agent-exec: REFUSED reason=bad_request command_not_run=true protocol=1\nremedy\nagent-exec: TEST MODE target-config=/x (loopback agent pod only; never production)\n",
+  });
+  const options = baseOptions(stub);
+  const error = await expectRouted(runRoutedCall(options));
+  assert.equal(
+    error.stderrLine,
+    `acpx: ROUTED outcome=not_run reason=bad_request call_id=${options.callId}`,
+  );
+  for (const line of [
+    "agent-exec: DEADLINE call_id=c command_not_run=true protocol=1\n",
+    "agent-exec: DEADLINE call_id=c command_ended=true protocol=1\n",
+    "partial output\nagent-exec: DEADLINE call_id=c client watchdog\n",
+  ]) {
+    const unknown = await expectRouted(
+      runRoutedCall(baseOptions(makeStub({ exit: 124, stderr: line }))),
+    );
+    assert.equal(unknown.outcome, "unknown");
+    assert.equal(unknown.reason, "deadline");
+  }
+});

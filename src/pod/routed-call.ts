@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
 import fs from "node:fs";
+import { isIP } from "node:net";
 import path from "node:path";
 import {
   type AgentHarness,
@@ -77,6 +78,8 @@ export type AgentPodLookup = (key: string) => Promise<
       ready: boolean;
       /** When the API server says the pod became Ready (epoch ms). Absent = unknown. */
       readyAtMs?: number;
+      /** The pod's IP, when the API server gave it: the transport connects to it (`--address`). */
+      ip?: string;
     }
   | { state: "absent" }
   | { state: "unknown" }
@@ -372,7 +375,7 @@ function isRefusalCandidate(firstLine: string): boolean {
   return REFUSAL_LINE_RE.test(firstLine);
 }
 
-type EnsuredPod = { uid: string; readyAtMs: number | undefined };
+type EnsuredPod = { uid: string; readyAtMs: number | undefined; ip?: string };
 
 function brokerRequestOf(
   options: RoutedCallOptions,
@@ -440,7 +443,7 @@ async function brokerAnswerOutcome(
   now: () => number,
 ): Promise<EnsuredPod> {
   if (answer.kind === "ready") {
-    return { uid: answer.uid, readyAtMs: now() };
+    return { uid: answer.uid, readyAtMs: now(), ip: answer.ip };
   }
   if (answer.kind === "refused") {
     throw brokerRefusal(answer, ctx);
@@ -516,7 +519,7 @@ async function ensureOwnerPod(
     throw admissionBusyRefusal();
   }
   if (found.state === "exists" && found.ready) {
-    return { uid: found.uid, readyAtMs: found.readyAtMs };
+    return { uid: found.uid, readyAtMs: found.readyAtMs, ip: found.ip };
   }
   return await askBroker(options, callId, now);
 }
@@ -546,7 +549,7 @@ async function resolvePod(
   if (found.state === "unknown") {
     throw admissionBusyRefusal();
   }
-  return { uid: found.uid, readyAtMs: found.readyAtMs };
+  return { uid: found.uid, readyAtMs: found.readyAtMs, ip: found.ip };
 }
 
 function deadlineFor(options: RoutedCallOptions): number {
@@ -567,6 +570,8 @@ function transportArgs(input: {
   callId: string;
   deadlineAtMs: number;
   expectUid: string;
+  /** The pod's IP from the broker's `ready` line or the API server; anything but an IP is not passed. */
+  address: string | undefined;
   payloadPath: string | undefined;
   argv: string[];
 }): string[] {
@@ -581,6 +586,9 @@ function transportArgs(input: {
     String(input.deadlineAtMs),
     "--expect-uid",
     input.expectUid,
+    ...(input.address !== undefined && isIP(input.address) !== 0
+      ? ["--address", input.address]
+      : []),
     ...(input.payloadPath ? ["--payload", input.payloadPath] : []),
     "--",
     ...input.argv,
@@ -608,6 +616,7 @@ async function dispatch(
       callId: ctx.callId,
       deadlineAtMs: ctx.callStartMs + deadlineFor(options),
       expectUid: pod.uid,
+      address: pod.ip,
       payloadPath: ctx.payloadPath,
       argv,
     }),
