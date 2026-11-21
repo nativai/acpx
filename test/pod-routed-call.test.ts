@@ -18,6 +18,8 @@ import {
   isUnderSharedRoot,
   OWNER_ENSURE_DEADLINE_MS,
   OWNER_IF_POD_DEADLINE_MS,
+  RELEASE_TOOLS_OPTIONAL,
+  RELEASE_TOOLS_REQUIRED,
   resolveReleases,
   runRoutedCall,
   sweepRoutedPayloads,
@@ -655,7 +657,7 @@ test("agent_unreachable right after this call's own broker `ready` is inside the
         baseOptions(stub, {
           class: "owner-ensure",
           lookup: ABSENT,
-          releases: { acpx: "r1" },
+          releases: { ok: true, releases: { acpx: "r1" } },
           broker: { origin: broker.origin },
         }),
       ),
@@ -691,7 +693,7 @@ function ensureOptions(stub: Stub, origin: string, overrides: Partial<RoutedCall
   return baseOptions(stub, {
     class: "owner-ensure" as RoutedClass,
     lookup: ABSENT,
-    releases: { acpx: "rel-1", pi: "rel-2" },
+    releases: { ok: true, releases: { acpx: "rel-1", pi: "rel-2" } },
     broker: { origin },
     argv: ["prompt", "--file", "-"],
     ...overrides,
@@ -953,14 +955,29 @@ test("owner-if-pod: no pod → `no_pod` (answered from the record) with nothing 
   assert.equal(stub.calls().length, 0);
 });
 
-test("owner-ensure: a call without resolved releases is refused before the broker is asked", async () => {
+test("owner-ensure: a required tool whose link cannot be resolved fails BEFORE the broker, naming it", async () => {
   const broker = await startBroker({ lines: [READY] });
   try {
     const stub = makeStub();
-    const options = ensureOptions(stub, broker.origin, { releases: undefined });
+    const options = ensureOptions(stub, broker.origin, {
+      releases: { ok: false, tool: "claude-agent-acp" },
+    });
     const error = await expectRouted(runRoutedCall(options));
-    assert.equal(error.reason, "releases_unresolved");
-    assert.equal(broker.seen.length, 0);
+    assert.equal(
+      error.stderrLine,
+      `acpx: ROUTED outcome=not_run reason=release_unresolved tool=claude-agent-acp call_id=${options.callId}`,
+    );
+    assert.equal(exitCodeForOutputErrorCode(normalizeOutputError(error).code), 1);
+    assert.equal(broker.seen.length, 0, "the broker was not called");
+    assert.equal(stub.calls().length, 0);
+    // A READY pod needs no releases at all: the failure belongs to the broker call only.
+    await runRoutedCall(
+      ensureOptions(stub, broker.origin, {
+        lookup: PRESENT,
+        releases: { ok: false, tool: "acpx" },
+      }),
+    );
+    assert.equal(stub.calls().length, 1);
   } finally {
     broker.close();
   }
@@ -973,11 +990,12 @@ test("agentPodKey: first 24 hex of the SHA-256 of the session id (the lease key)
   assert.equal(agentPodKey("a"), "ca978112ca1bbdcafac231b3");
 });
 
-test("brokerClassOf: spawn and automation as declared; a person, a delivery and an undeclared call are interactive; a one-shot is utility", () => {
+test("brokerClassOf: a person (interactive, or undeclared) is interactive; an agent's delivery is spawn; spawn and automation as declared; a one-shot is utility", () => {
   assert.equal(brokerClassOf("spawn", "owner-ensure"), "spawn");
   assert.equal(brokerClassOf("automation", "owner-ensure"), "automation");
   assert.equal(brokerClassOf("interactive", "owner-ensure"), "interactive");
-  assert.equal(brokerClassOf("delivery", "owner-ensure"), "interactive");
+  // Negative: an agent's delivery must NOT pass the reserve that exists so a person can always get a pod.
+  assert.equal(brokerClassOf("delivery", "owner-ensure"), "spawn");
   assert.equal(brokerClassOf(undefined, "owner-ensure"), "interactive");
   assert.equal(brokerClassOf("spawn", "one-shot"), "utility");
 });
@@ -1020,4 +1038,68 @@ test("releases (C9): the directory name each tool's link points to now; a missin
   // Negative: a missing required link.
   fs.rmSync(path.join(dir, "codex-acp"));
   assert.deepEqual(resolveReleases(dir), { ok: false, tool: "codex-acp" });
+});
+
+test("deadline counts from the CALL START: a 20 s wake leaves a 25 s deadline in the per-call values", async () => {
+  const broker = await startBroker({ lines: ["scheduling", READY] });
+  try {
+    const stub = makeStub();
+    const base = 1_800_000_000_000;
+    let reads = 0;
+    // The first read is the call start; every later read is 20 s on (the wake took 20 s).
+    const now = () => base + (reads++ === 0 ? 0 : 20_000);
+    await runRoutedCall(ensureOptions(stub, broker.origin, { now }));
+    const [call] = stub.calls();
+    assert.ok(call);
+    assert.equal(Number(flag(call, "--deadline-ms")), base + OWNER_ENSURE_DEADLINE_MS);
+    assert.equal(Number(flag(call, "--deadline-ms")) - (base + 20_000), 25_000);
+  } finally {
+    broker.close();
+  }
+});
+
+test("deadline: owner-if-pod counts its 20 s from the call start too", async () => {
+  const stub = makeStub();
+  const base = 1_800_000_000_000;
+  let reads = 0;
+  await runRoutedCall(baseOptions(stub, { now: () => base + (reads++ === 0 ? 0 : 5_000) }));
+  const [call] = stub.calls();
+  assert.ok(call);
+  assert.equal(Number(flag(call, "--deadline-ms")), base + OWNER_IF_POD_DEADLINE_MS);
+});
+
+test("unknown outcome: the dropped partial stderr goes to the debug sink, never lost silently", async () => {
+  const stub = makeStub({ exit: 255, stderr: "partial one\npartial two" });
+  const seen: Array<{ callId: string; reason: string; stderr: string }> = [];
+  const options = baseOptions(stub, { debug: (entry) => seen.push(entry) });
+  await expectRouted(runRoutedCall(options));
+  assert.deepEqual(seen, [
+    { callId: options.callId ?? "", reason: "connection", stderr: "partial one\npartial two" },
+  ]);
+  // Negative: no sink handed in → the default log beside the payload directory gets the line.
+  const stub2 = makeStub({ exit: 124, stderr: "late words\n" });
+  await expectRouted(runRoutedCall(baseOptions(stub2)));
+  const log = fs.readFileSync(path.join(stub2.dir, "routed-calls.log"), "utf8").trim();
+  const entry = JSON.parse(log) as { reason: string; dropped_stderr: string };
+  assert.equal(entry.reason, "deadline");
+  assert.equal(entry.dropped_stderr, "late words\n");
+  // A call that ends normally leaves nothing in it.
+  const stub3 = makeStub({ exit: 0, stderr: "fine\n" });
+  await runRoutedCall(baseOptions(stub3));
+  assert.equal(fs.existsSync(path.join(stub3.dir, "routed-calls.log")), false);
+});
+
+test("releases (C9): ONLY pi-extensions may be left out; every other tool, absent, is named as unresolved", () => {
+  assert.deepEqual([...RELEASE_TOOLS_OPTIONAL], ["pi-extensions"]);
+  const dir = fs.mkdtempSync(path.join(TMP_ROOT, "runtime-each-"));
+  for (const tool of RELEASE_TOOLS_REQUIRED) {
+    fs.mkdirSync(path.join(dir, ".releases", tool, "r"), { recursive: true });
+    fs.symlinkSync(`.releases/${tool}/r`, path.join(dir, tool));
+  }
+  assert.equal(resolveReleases(dir).ok, true, "without pi-extensions it still resolves");
+  for (const tool of RELEASE_TOOLS_REQUIRED) {
+    fs.rmSync(path.join(dir, tool));
+    assert.deepEqual(resolveReleases(dir), { ok: false, tool }, `${tool} absent`);
+    fs.symlinkSync(`.releases/${tool}/r`, path.join(dir, tool));
+  }
 });

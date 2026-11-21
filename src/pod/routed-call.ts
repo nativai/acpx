@@ -111,8 +111,12 @@ export type RoutedCallOptions = {
   callerIdentity?: Partial<Record<(typeof CALLER_IDENTITY_VARS)[number], string>>;
   /** The caller's environment: read for `ACPX_LOCKED_BY`, `PATH`, `HOME`; nothing else is forwarded. */
   env: NodeJS.ProcessEnv;
-  /** `owner-ensure`: the release names of C9 (`resolveReleases`). */
-  releases?: Record<string, string>;
+  /**
+   * `owner-ensure`: C9's `releases`, as `resolveReleases()` answers. Default: resolved when the
+   * broker is about to be asked. A required tool whose link cannot be resolved fails the call before
+   * the broker is called (`ROUTED outcome=not_run reason=release_unresolved tool=<name>`).
+   */
+  releases?: ResolveReleasesResult;
   /** The API server's view of the pod. Required for `owner-ensure` and `owner-if-pod`. */
   lookup?: AgentPodLookup;
   /** `one-shot` only: the uid the caller expects (the pod's, from its lookup). */
@@ -121,6 +125,12 @@ export type RoutedCallOptions = {
   stdout?: NodeJS.WritableStream;
   stderr?: NodeJS.WritableStream;
   now?: () => number;
+  /**
+   * Receives the partial stderr of a call whose outcome is unknown (it is dropped from the output
+   * so the ROUTED line is first, never lost silently). Default: appended to `routed-calls.log`
+   * beside the payload directory.
+   */
+  debug?: (entry: { callId: string; reason: string; stderr: string }) => void;
   /** Test seams. */
   transportPath?: string;
   payloadDir?: string;
@@ -133,13 +143,23 @@ export type RoutedCallResult =
   /** `owner-if-pod` and no pod: the caller answers from the record. Nothing was sent. */
   | { kind: "no_pod" };
 
-/** The admission class → the broker's class (C4). `delivery` and a person are `interactive`. */
+/**
+ * The admission class → the broker's class (C4). Only a PERSON's action passes the reserve, so only
+ * `interactive` (atrium: an authenticated human actor, or a person's wakeup trigger; acpx: no
+ * declared class = a person at a terminal) maps to `interactive`. `delivery` is atrium's class for
+ * an agent's, unattributed or unknown sender — the class atrium already turns into `spawn` for a
+ * create (`sessionCreate.ts` createClass) — and `automation` is a system actor.
+ * Evidence: reports/CLASS-MAPPING.md.
+ */
 export function brokerClassOf(
   admissionClass: string | undefined,
   routed: RoutedClass,
 ): BrokerAgentClass {
   if (routed === "one-shot") {
     return "utility";
+  }
+  if (admissionClass === "delivery") {
+    return "spawn";
   }
   if (admissionClass === "spawn" || admissionClass === "automation") {
     return admissionClass;
@@ -435,18 +455,30 @@ async function brokerAnswerOutcome(
   throw await wakeBoundRefusal(answer.phase, ctx);
 }
 
+/** C9: the names to send, or the named failure that stops the call BEFORE the broker is called. */
+function releasesOrFail(options: RoutedCallOptions, callId: string): Record<string, string> {
+  const releases = options.releases ?? resolveReleases();
+  if (!releases.ok) {
+    throw new RoutedCallError({
+      outcome: "not_run",
+      reason: "release_unresolved",
+      tool: releases.tool,
+      callId,
+    });
+  }
+  return releases.releases;
+}
+
 async function askBroker(
   options: RoutedCallOptions,
   callId: string,
   now: () => number,
 ): Promise<EnsuredPod> {
+  const releases = releasesOrFail(options, callId);
   const sources = readAgentBrokerOriginSources();
   const origin = options.broker?.origin ?? resolveAgentBrokerOrigin(options.env, sources);
   if (!origin) {
     throw admissionBusyRefusal();
-  }
-  if (!options.releases) {
-    throw new RoutedCallError({ outcome: "not_run", reason: "releases_unresolved", callId });
   }
   const brokerOptions = {
     origin,
@@ -455,7 +487,7 @@ async function askBroker(
   };
   const answer = await ensureAgentPod(
     options.key,
-    brokerRequestOf(options, options.releases),
+    brokerRequestOf(options, releases),
     brokerOptions,
   );
   const ctx: BrokerContext = {
@@ -558,7 +590,14 @@ function transportArgs(input: {
 async function dispatch(
   options: RoutedCallOptions,
   pod: EnsuredPod,
-  ctx: { callId: string; now: () => number; payloadPath: string | undefined },
+  ctx: {
+    callId: string;
+    now: () => number;
+    payloadPath: string | undefined;
+    /** C2 (stream HoD, 2026-11-21): the deadline counts from the CALL START, the broker POST included. */
+    callStartMs: number;
+    debug: NonNullable<RoutedCallOptions["debug"]>;
+  },
 ): Promise<RoutedCallResult> {
   const stderr = options.stderr ?? process.stderr;
   const argv = typeof options.argv === "function" ? options.argv(ctx.payloadPath) : options.argv;
@@ -567,7 +606,7 @@ async function dispatch(
     args: transportArgs({
       key: options.key,
       callId: ctx.callId,
-      deadlineAtMs: ctx.now() + deadlineFor(options),
+      deadlineAtMs: ctx.callStartMs + deadlineFor(options),
       expectUid: pod.uid,
       payloadPath: ctx.payloadPath,
       argv,
@@ -588,6 +627,7 @@ async function dispatch(
     stderr,
     readyAtMs: pod.readyAtMs,
     nowMs: ctx.now(),
+    debug: ctx.debug,
   });
 }
 
@@ -599,6 +639,7 @@ async function dispatch(
 export async function runRoutedCall(options: RoutedCallOptions): Promise<RoutedCallResult> {
   const callId = options.callId ?? randomUUID();
   const now = options.now ?? Date.now;
+  const callStartMs = now();
   const payloadDir = options.payloadDir ?? ROUTED_PAYLOAD_DIR;
 
   if (!isUnderSharedRoot(options.cwd)) {
@@ -616,10 +657,30 @@ export async function runRoutedCall(options: RoutedCallOptions): Promise<RoutedC
     if (options.payload !== undefined) {
       payloadPath = writeRoutedPayload(payloadDir, callId, options.payload);
     }
-    return await dispatch(options, pod, { callId, now, payloadPath });
+    const debug =
+      options.debug ?? appendDroppedStderr(path.join(path.dirname(payloadDir), "routed-calls.log"));
+    return await dispatch(options, pod, { callId, now, payloadPath, callStartMs, debug });
   } finally {
     removeQuietly(payloadPath);
   }
+}
+
+/** The default debug sink: one JSON line per call whose partial stderr was dropped. Best effort. */
+function appendDroppedStderr(file: string): NonNullable<RoutedCallOptions["debug"]> {
+  return (entry) => {
+    try {
+      const line = JSON.stringify({
+        at: new Date().toISOString(),
+        call_id: entry.callId,
+        reason: entry.reason,
+        dropped_stderr: entry.stderr.slice(0, 8192),
+      });
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.appendFileSync(file, `${line}\n`, { mode: 0o600 });
+    } catch {
+      // A debug log that cannot be written must not change the call's outcome.
+    }
+  };
 }
 
 function removeQuietly(file: string | undefined): void {
@@ -645,6 +706,7 @@ type SettleContext = {
   /** When this pod became Ready, if known; unknown counts as past the unreachable bound. */
   readyAtMs: number | undefined;
   nowMs: number;
+  debug: NonNullable<RoutedCallOptions["debug"]>;
 };
 
 /** The pod is ending, or its contract is older than the call needs (C2 table, row 4). */
@@ -669,14 +731,26 @@ function refusalOutcome(exitCode: number, reason: string, ctx: SettleContext): E
   return new RoutedCallError({ outcome: "not_run", reason, callId: ctx.callId });
 }
 
+/** 124 / 255: the request may have run. The command's partial stderr goes to the debug sink. */
+function unknownOutcome(run: TransportRun, exitCode: number, ctx: SettleContext): Error {
+  const reason = exitCode === 124 ? "deadline" : "connection";
+  if (run.heldStderr.length > 0) {
+    ctx.debug({ callId: ctx.callId, reason, stderr: run.heldStderr.toString("utf8") });
+  }
+  return new RoutedCallError({ outcome: "unknown", reason, callId: ctx.callId });
+}
+
 /**
- * C2's outcome table. For an unknown outcome the command's partial stderr is dropped, not relayed:
- * the ROUTED line must be the first stderr line, which the atrium server reads.
+ * C2's outcome table. For an unknown outcome the command's partial stderr is dropped from the
+ * output, not relayed: the ROUTED line must be the first stderr line, which the atrium server reads.
  */
 function settle(run: TransportRun, ctx: SettleContext): RoutedCallResult {
-  const { callId } = ctx;
   if (run.spawnError !== undefined) {
-    throw new RoutedCallError({ outcome: "not_run", reason: "transport_unavailable", callId });
+    throw new RoutedCallError({
+      outcome: "not_run",
+      reason: "transport_unavailable",
+      callId: ctx.callId,
+    });
   }
   // Killed by a signal after it started: the request may have been sent.
   const exitCode = run.exitCode ?? 255;
@@ -685,16 +759,20 @@ function settle(run: TransportRun, ctx: SettleContext): RoutedCallResult {
     throw refusalOutcome(exitCode, refusal, ctx);
   }
   if (exitCode === 124 || exitCode === 255) {
-    const reason = exitCode === 124 ? "deadline" : "connection";
-    throw new RoutedCallError({ outcome: "unknown", reason, callId });
+    throw unknownOutcome(run, exitCode, ctx);
   }
   if (run.heldStderr.length > 0) {
     ctx.stderr.write(run.heldStderr);
   }
-  return { kind: "completed", exitCode, callId };
+  return { kind: "completed", exitCode, callId: ctx.callId };
 }
 
-/** C9: the release directory name each tool's link points to NOW. */
+/**
+ * C9: the release directory name each tool's link points to NOW. The required / optional split is
+ * `runtime-links.sh`'s `LINKS` table (stream HoD, agreed with infra): only a tool marked `optional`
+ * there — today `pi-extensions`, and only it — may be left out; a required one that cannot be
+ * resolved fails the call before the broker is asked.
+ */
 export const RELEASE_TOOLS_REQUIRED = [
   "acpx",
   "acpx-ui",

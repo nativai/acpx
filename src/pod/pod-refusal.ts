@@ -121,9 +121,17 @@ export class RoutedCallError extends AcpxOperationalError {
   readonly outcome: "not_run" | "unknown";
   readonly reason: string;
   readonly callId: string;
+  readonly tool: string | undefined;
 
-  constructor(params: { outcome: "not_run" | "unknown"; reason: string; callId: string }) {
-    const line = `acpx: ROUTED outcome=${params.outcome} reason=${params.reason} call_id=${params.callId}`;
+  constructor(params: {
+    outcome: "not_run" | "unknown";
+    reason: string;
+    callId: string;
+    /** `release_unresolved` only (C9): the tool whose link could not be resolved. */
+    tool?: string;
+  }) {
+    const tool = params.tool === undefined ? "" : ` tool=${params.tool}`;
+    const line = `acpx: ROUTED outcome=${params.outcome} reason=${params.reason}${tool} call_id=${params.callId}`;
     super(line, {
       outputCode: "RUNTIME",
       detailCode: `routed-${params.outcome}`,
@@ -134,5 +142,6 @@ export class RoutedCallError extends AcpxOperationalError {
     this.outcome = params.outcome;
     this.reason = params.reason;
     this.callId = params.callId;
+    this.tool = params.tool;
   }
 }
