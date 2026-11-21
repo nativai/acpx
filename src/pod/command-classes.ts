@@ -334,6 +334,11 @@ export const COMMAND_TABLE: Readonly<Record<string, CommandEntry>> = {
     reason: "control-pod maintenance (K2 `local`)",
     controlPodOnly: true,
   },
+  box: { class: "local", reason: "group: help only" },
+  "box refresh": {
+    class: "control-store",
+    reason: "A-17: starts the box release on the control pod; an agent pod passes it through",
+  },
   config: { class: "read", reason: "`config` = show" },
   "config show": { class: "read", reason: "reads config files" },
   "config init": { class: "control-store", reason: "writes the box's config file" },
