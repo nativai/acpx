@@ -78,17 +78,25 @@ export function canonicalHome(env: NodeJS.ProcessEnv = process.env): string {
  * its deepest existing ancestor, plus the rest — so a not-yet-created `.acpx` under a symlinked home
  * still resolves through the link.
  */
-function resolvedPath(p: string, depth = 0): string {
+export function resolvedPath(
+  p: string,
+  realpath: (dir: string) => string = fs.realpathSync,
+  depth = 0,
+): string {
   const absolute = path.resolve(p);
   const rest: string[] = [];
   for (let dir = absolute; ; dir = path.dirname(dir)) {
     try {
-      return path.join(fs.realpathSync(dir), ...rest);
+      return path.join(realpath(dir), ...rest);
     } catch {
       // A DANGLING symlink (F6): acpx would create its target THROUGH the link, so follow it.
       const link = danglingLinkTarget(dir);
       if (link !== undefined && depth < 40) {
-        return resolvedPath(path.join(path.resolve(path.dirname(dir), link), ...rest), depth + 1);
+        return resolvedPath(
+          path.join(path.resolve(path.dirname(dir), link), ...rest),
+          realpath,
+          depth + 1,
+        );
       }
       if (dir === path.dirname(dir)) {
         return absolute;

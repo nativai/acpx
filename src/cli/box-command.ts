@@ -174,7 +174,7 @@ export function registerBoxCommand(parent: Command, config: ResolvedAcpxConfig):
   box
     .command("refresh")
     .description(
-      "Release this box: start /opt/bootstrap/refresh.sh detached and return its log path; a refusal (exit 75) is passed through",
+      "Release this box: start /opt/bootstrap/refresh.sh detached and return its log path; a refusal (exit 75) is passed through. The release's result is in the log and the runtime-status record, not in this answer",
     )
     .option("--format <fmt>", "Output format: text, json, quiet", parseOutputFormat)
     .action(async function (this: Command) {

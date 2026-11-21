@@ -529,35 +529,45 @@ const EXEMPT_OPERANDS: Readonly<Record<string, string>> = {
   "flow run": "class local, never passed",
 };
 
+/**
+ * THE predicates of the discovery — the discovery row and its "bites" row both call these two
+ * functions, so the negative case cannot test a copy (R2-N2).
+ */
+function undecidedOperands(commandPath: string, command: Command): string[] {
+  return command.registeredArguments.flatMap((arg, n) => {
+    const pathish =
+      PATHISH.test(arg.name()) || PATHISH.test(arg.description) || arg.name() === "choice";
+    const decided =
+      PATH_OPERAND_RULES[commandPath]?.[n] !== undefined || commandPath in EXEMPT_OPERANDS;
+    return pathish && !decided ? [`${commandPath} <${arg.name()}> (operand ${n})`] : [];
+  });
+}
+
+/** Flags are decided PER COMMAND (`<path> <flag>`): one command's exemption never covers another's (R2-N3). */
+function undecidedFlags(commandPath: string, command: Command): string[] {
+  return command.options.flatMap((option) => {
+    const flag = option.long;
+    const takesValue = option.required || option.optional;
+    const pathish =
+      flag !== undefined && takesValue && /<[^>]*(file|path|dir)/iu.test(option.flags);
+    return flag !== undefined &&
+      pathish &&
+      !(flag in PATH_FLAG_RULES) &&
+      !(`${commandPath} ${flag}` in VERBATIM_FLAGS)
+      ? [`${commandPath} ${flag}`]
+      : [];
+  });
+}
+
 test("no passed-through command grows an UNDECIDED file/path-valued operand or flag (discovering, from commander itself)", () => {
   const undecided: string[] = [];
   for (const { path: commandPath, command } of leaves()) {
     const entry = COMMAND_TABLE[commandPath];
-    if (!entry || !PASSABLE.has(entry.class)) {
-      continue;
-    }
-    command.registeredArguments.forEach((arg, n) => {
-      const pathish =
-        PATHISH.test(arg.name()) || PATHISH.test(arg.description) || arg.name() === "choice";
-      const decided =
-        PATH_OPERAND_RULES[commandPath]?.[n] !== undefined || commandPath in EXEMPT_OPERANDS;
-      if (pathish && !decided) {
-        undecided.push(`${commandPath} <${arg.name()}> (operand ${n})`);
-      }
-    });
-    for (const option of command.options) {
-      const flag = option.long;
-      const takesValue = option.required || option.optional;
-      const pathish =
-        flag !== undefined && takesValue && /<[^>]*(file|path|dir)/iu.test(option.flags);
-      if (
-        flag !== undefined &&
-        pathish &&
-        !(flag in PATH_FLAG_RULES) &&
-        !(flag in VERBATIM_FLAGS)
-      ) {
-        undecided.push(`${commandPath} ${flag}`);
-      }
+    if (entry && PASSABLE.has(entry.class)) {
+      undecided.push(
+        ...undecidedOperands(commandPath, command),
+        ...undecidedFlags(commandPath, command),
+      );
     }
   }
   assert.deepEqual(
@@ -569,44 +579,46 @@ test("no passed-through command grows an UNDECIDED file/path-valued operand or f
 
 /** Path-valued flags that travel verbatim: the control pod's own operator paths, or never passed. */
 const VERBATIM_FLAGS: Readonly<Record<string, string>> = {
-  "--backup-dir": "sessions repair-account-seam: an operator's directory on the control pod",
-  "--exclude-ids": "sessions archive: the scheduler's file on the control pod (control-pod only)",
-  "--manifest-out": "sessions archive: control-pod only",
-  "--to": "sessions archive: control-pod only",
-  "--cat": "sessions archive: control-pod only",
-  "--pool": "agent-folders migrate: an operator's pool directory on the control pod",
-  "--sessions-dir": "agent-folders migrate: an operator's directory on the control pod",
-  "--manifest": "transcripts dedup: an operator's manifest file on the control pod",
-  "--filter-cwd": "sessions list: a filter value, not a file",
-  "--output": "sessions export: class read, never passed",
-  "--input-file": "flow run: local, never passed",
-  "--batch-file": "prompt: atrium's own delivery, refused by the message-route branch",
-  "--cwd": "a session's cwd: inert under the session root (acpx's own help)",
+  // key: "<command path> <flag>"
+  "sessions repair-account-seam --backup-dir":
+    "sessions repair-account-seam: an operator's directory on the control pod",
+  "sessions archive --exclude-ids":
+    "sessions archive: the scheduler's file on the control pod (control-pod only)",
+  "sessions archive --manifest-out": "sessions archive: control-pod only",
+  "transcripts restore --to":
+    "operator maintenance of the control pod's own transcript store: the path as given (found by R2-N3: a sessions-archive exemption used to hide it)",
+  "sessions archive --to": "sessions archive: control-pod only",
+  "sessions archive --cat": "sessions archive: control-pod only",
+  "agent-folders migrate --pool":
+    "agent-folders migrate: an operator's pool directory on the control pod",
+  "agent-folders migrate --sessions-dir":
+    "agent-folders migrate: an operator's directory on the control pod",
+  "transcripts dedup --manifest":
+    "transcripts dedup: an operator's manifest file on the control pod",
+  "sessions list --filter-cwd": "sessions list: a filter value, not a file",
+  "sessions export --output": "sessions export: class read, never passed",
+  "flow run --input-file": "flow run: local, never passed",
+  "prompt --batch-file": "prompt: atrium's own delivery, refused by the message-route branch",
 };
 
-test("the discovery bites: a fresh path-valued operand and flag, registered here, in no table, are flagged", () => {
+test("the discovery bites: a fresh path-valued operand and flag, registered here, in no table, are flagged by THE discovery's own predicates", () => {
   const program = new Command();
   const fresh = program
     .command("fresh-create")
     .argument("<archive-path>", "an archive")
     .option("--bundle <file>", "a bundle file");
-  const flagged: string[] = [];
-  fresh.registeredArguments.forEach((arg, n) => {
-    if (PATHISH.test(arg.name()) && PATH_OPERAND_RULES["fresh-create"]?.[n] === undefined) {
-      flagged.push(`<${arg.name()}>`);
-    }
-  });
-  for (const option of fresh.options) {
-    if (
-      option.long &&
-      /<(file|path|dir)/iu.test(option.flags) &&
-      !(option.long in PATH_FLAG_RULES) &&
-      !(option.long in VERBATIM_FLAGS)
-    ) {
-      flagged.push(option.long);
-    }
-  }
-  assert.deepEqual(flagged, ["<archive-path>", "--bundle"]);
+  assert.deepEqual(
+    [...undecidedOperands("fresh-create", fresh), ...undecidedFlags("fresh-create", fresh)],
+    ["fresh-create <archive-path> (operand 0)", "fresh-create --bundle"],
+  );
+});
+
+test("R2-N3: a verbatim exemption is per command — `sessions archive --to` does not decide another command's `--to`", () => {
+  assert.ok("sessions archive --to" in VERBATIM_FLAGS);
+  const program = new Command();
+  const other = program.command("restore").option("--to <path>", "write here");
+  assert.deepEqual(undecidedFlags("fresh-command", other), ["fresh-command --to"]);
+  assert.deepEqual(undecidedFlags("sessions archive", other), []);
 });
 
 // ─── O-4: progress during the wait; N-1 and O-2 live in their own files ──────────────────────────
@@ -679,7 +691,7 @@ test("O-4: the CLI prints the progress line on stderr during the wait — and no
     assert.equal(text.status, 75);
     assert.match(
       text.stderr,
-      /^acpx: still waiting for atrium \(attempt \d+, \d+ s of the \d+ s call-home budget left\)/mu,
+      /^\[acpx\] still waiting for atrium \(attempt \d+, \d+ s of the \d+ s call-home budget left\)/mu,
     );
     const strict = await runCli(
       ["--json-strict", "--format", "json", "sessions", "new", "--name", "c"],
@@ -726,4 +738,77 @@ test("A-24: a 400 call-id-mismatch is pass_through_refused, exit 2, ONE request 
       assert.equal(atrium.requests.filter((q) => q.route === "call").length, 1, "not retried");
     },
   );
+});
+
+// ─── R2-F5, R2-F3b, O-1 ──────────────────────────────────────────────────────────────────────────
+
+test("R2-F5: after a wait over 30 s the FIRST `acpx:` line on stderr is the C7.2 token; progress lines start with [acpx]", async () => {
+  const { home } = agentPodHome();
+  await withAtrium({ phases: [{ mode: "away" }] }, async (atrium) => {
+    const r = await runCli(
+      ["sessions", "new", "--name", "c"],
+      agentPodEnv(home, atrium.url, {
+        ACPX_CALL_HOME_BUDGET_MS: "1500",
+        ACPX_CALL_HOME_RETRY_MS: "100",
+        ACPX_CALL_HOME_PROGRESS_MS: "300",
+      }),
+    );
+    assert.equal(r.status, 75);
+    const lines = r.stderr.split("\n");
+    assert.ok(
+      lines.some((l) => l.startsWith("[acpx] still waiting")),
+      "a progress line was printed",
+    );
+    assert.match(
+      lines.find((l) => l.startsWith("acpx:")) ?? "",
+      /^acpx: REFUSED reason=atrium_away nothing_started=true/u,
+    );
+    assert.equal(lines.filter((l) => l.startsWith("acpx: still")).length, 0);
+  });
+  assert.ok(!waitingLine({ attempts: 1, elapsedMs: 0, remainingMs: 1000 }).startsWith("acpx:"));
+});
+
+test("R2-F3b: a DANGLING symlink under /workspace that points outside is refused; one that points inside passes", () => {
+  const root = fs.realpathSync(tmpDir("acpx-a3-dangling-"));
+  const outside = fs.realpathSync(tmpDir("acpx-a3-out-"));
+  fs.symlinkSync(path.join(outside, "not-yet"), path.join(root, "dangling-out"));
+  fs.symlinkSync(path.join(root, "also-not-yet"), path.join(root, "dangling-in"));
+  assert.equal(
+    underSharedRoot(path.join(root, "dangling-out"), [root]),
+    false,
+    "leaves through a dangling link",
+  );
+  assert.equal(underSharedRoot(path.join(root, "dangling-out", "b.md"), [root]), false);
+  assert.equal(
+    underSharedRoot(path.join(root, "dangling-in", "b.md"), [root]),
+    true,
+    "positive control",
+  );
+  assert.equal(realPathOf(path.join(root, "dangling-out")), path.join(outside, "not-yet"));
+  // The same through a two-link chain.
+  fs.symlinkSync(path.join(root, "dangling-out"), path.join(root, "chain"));
+  assert.equal(underSharedRoot(path.join(root, "chain"), [root]), false);
+});
+
+test("O-1: the --batch-file / --message-id scan stops at `--`: words after it are prompt text and route as a prompt", async () => {
+  const { home } = agentPodHome();
+  const other = "cccccccc-0000-4000-8000-000000000a99";
+  const { addRecord } = await import("./pod-a3-helpers.js");
+  await addRecord(home, other, "dddddddd-5555-4666-8777-888888888888");
+  await withAtrium({}, async (atrium) => {
+    const env = agentPodEnv(home, atrium.url, FAST);
+    const routed = await runCli(
+      ["prompt", "--session-id", other, "--no-wait", "--", "--batch-file", "x"],
+      env,
+    );
+    assert.equal(routed.status, 0, routed.stderr);
+    assert.equal(atrium.requests.filter((q) => q.route === "session_message").length, 1);
+    // Negative: the same option BEFORE `--` is still refused.
+    const refused = await runCli(
+      ["prompt", "--session-id", other, "--no-wait", "--batch-file", "x", "--", "hi"],
+      env,
+    );
+    assert.equal(refused.status, 2);
+    assert.match(refused.stderr, /prompt_option_not_routable/u);
+  });
 });

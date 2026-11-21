@@ -96,9 +96,13 @@ export type WaitInfo = { attempts: number; elapsedMs: number; remainingMs: numbe
 
 const PROGRESS_EVERY_MS = 30_000;
 
-/** The progress line (stderr): the attempt count and the seconds left of the budget. */
+/**
+ * The progress line (stderr): the attempt count and the seconds left of the budget. ⚠️ IT STARTS WITH
+ * `[acpx]`, NEVER `acpx:` — the first `acpx:` line on stderr must stay the C7.2 token after any wait
+ * (R2-F5; a reader of the refusal takes the first `acpx:` line).
+ */
 export function waitingLine(info: WaitInfo): string {
-  return `acpx: still waiting for atrium (attempt ${info.attempts}, ${Math.round(info.remainingMs / 1000)} s of the ${Math.round((info.elapsedMs + info.remainingMs) / 1000)} s call-home budget left); the command is not lost — it is retried until atrium answers.`;
+  return `[acpx] still waiting for atrium (attempt ${info.attempts}, ${Math.round(info.remainingMs / 1000)} s of the ${Math.round((info.elapsedMs + info.remainingMs) / 1000)} s call-home budget left); the command is not lost — it is retried until atrium answers.`;
 }
 
 export type CallHomeParams = {

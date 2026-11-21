@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { PASS_THROUGH_DEADLINE_MS, type UnknownAdvice } from "./call-home.js";
 import { PASS_THROUGH_INHERIT, type CommandClass } from "./command-classes.js";
+import { resolvedPath } from "./placement.js";
 
 /**
  * The request a pass-through sends (CONTRACTS-r4 C6.2; brick 7eb9686f): acpx's arguments with every
@@ -110,27 +111,15 @@ export const NO_RECORD_ID_CREATE_PATHS: readonly string[] = Object.freeze(["sess
 // ─── real paths ───────────────────────────────────────────────────────────────────────────────
 
 /**
- * The real path of `file`, symlinks followed, even when `file` does not exist yet: its deepest EXISTING
- * ancestor is resolved and the rest appended (the A1 placement code's own `resolvedPath` rule).
+ * The real path of `file`, symlinks followed, even when `file` does not exist yet — and a DANGLING
+ * symlink followed to where it would be created (R2-F3b). It is A1's `resolvedPath`, reused: one
+ * rule for "where does this path really lead".
  */
 export function realPathOf(
   file: string,
   realpath: (p: string) => string = fs.realpathSync,
 ): string {
-  const rest: string[] = [];
-  let current = file;
-  for (;;) {
-    try {
-      return path.join(realpath(current), ...rest);
-    } catch {
-      const parent = path.dirname(current);
-      if (parent === current) {
-        return file;
-      }
-      rest.unshift(path.basename(current));
-      current = parent;
-    }
-  }
+  return resolvedPath(file, realpath);
 }
 
 function under(file: string, root: string): boolean {
