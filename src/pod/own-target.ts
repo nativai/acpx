@@ -10,19 +10,30 @@ import { agentPodName } from "./placement.js";
  * placement decision comes first and its refusal token stays stderr line 1 (C7.2), and no agent pod
  * writes the box-wide index (K7 rule 1; A-8).
  *
- * ⚠️ IT ONLY EVER ANSWERS "OWN" ON EXACT EVIDENCE, and that is the safe direction: "not own" sends
- * the command to the control pod (pass-through / message route), where acpx's full resolver runs.
- * The candidates for a selector: the value itself (a record id); `?session=` of a URL; a seat's
- * active holder (`seats.json`); and, through `index.json` if it can be read, the record whose ACP
- * id is the value or whose record or ACP id ends with it uniquely. A candidate counts only if THIS
- * pod is named for it (`ag-<key of the record id>`).
+ * ⚠️ WHAT "OWN" MEANS — and the pass-through (A3, `pass-through-branch.ts`) depends on it: "own" is
+ * answered ONLY when ONE selector names the session by a form acpx's resolver accepts for that flag
+ * and the record it reaches is this pod's. Everything else — "not own" — goes to the control pod,
+ * where acpx's full resolver runs and refuses what it refuses. So "own" is never inexact:
+ *   - several selectors (two different selector flags, a flag and the operand: `conflict`) → not own;
+ *   - a URL carrying BOTH `?session=` and `?seat=` → not own;
+ *   - a URL as the value of `--session-id` → not own (a URL is for `--session-url` and `--seat`);
+ *   - `-s` and `--session` → not own, except `--session <id|url>` of the `people` commands, where it
+ *     is the id flag (on every other command it is a session NAME, which acpx refuses);
+ *   - a CLOSED seat (`closed_at` set) names no holder → not own.
+ * R2-a of the A1 re-test named these 8 shapes; each is a negative row in `test/pod-own-target.test.ts`.
+ *
+ * The candidates for an exact selector: the value itself (a record id); `?session=` of a URL; a
+ * seat's active holder (`seats.json`); and, through `index.json` if it can be read, the record whose
+ * ACP id is the value or whose record or ACP id ends with it uniquely. A candidate counts only if
+ * THIS pod is named for it (`ag-<key of the record id>`).
  */
 export function ownTargetRecordId(
   target: TargetSelector | undefined,
   podName: string,
   sessionsDir: string = path.join(acpxStateRoot(), "sessions"),
+  command: { path?: string; conflict?: boolean } = {},
 ): string | null {
-  if (!target) {
+  if (!target || command.conflict === true || !selectorIsExact(target, command.path)) {
     return null;
   }
   for (const id of candidates(target, sessionsDir)) {
@@ -31,6 +42,27 @@ export function ownTargetRecordId(
     }
   }
   return null;
+}
+
+/** Per flag: is a value of THIS form one acpx's resolver accepts for it? (Unlisted flags: yes.) */
+const EXACT_FORM_BY_FLAG: Readonly<
+  Record<
+    string,
+    (url: { session?: string; seat?: string } | undefined, commandPath?: string) => boolean
+  >
+> = {
+  "-s": () => false,
+  "--session": (_url, commandPath) => commandPath?.startsWith("people ") === true,
+  "--session-id": (url) => url === undefined,
+};
+
+/** The forms acpx's resolver accepts for this flag (see the docstring above). */
+function selectorIsExact(target: TargetSelector, commandPath: string | undefined): boolean {
+  const url = parseUrl(target.value.trim());
+  if (url?.session !== undefined && url.seat !== undefined) {
+    return false;
+  }
+  return target.via === "operand" || (EXACT_FORM_BY_FLAG[target.flag]?.(url, commandPath) ?? true);
 }
 
 function candidates(target: TargetSelector, sessionsDir: string): string[] {
@@ -77,15 +109,21 @@ function readJson(file: string): unknown {
   }
 }
 
-function seatHolder(sessionsDir: string, seatId: string): string[] {
+type SeatRow = { active_holder_id?: unknown; closed_at?: unknown };
+
+function readSeatRow(sessionsDir: string, seatId: string): SeatRow | undefined {
   const store = readJson(path.join(sessionsDir, "seats.json"));
   const row =
     store && typeof store === "object" ? (store as Record<string, unknown>)[seatId] : undefined;
-  const holder =
-    row && typeof row === "object"
-      ? (row as { active_holder_id?: unknown }).active_holder_id
-      : undefined;
-  return typeof holder === "string" && holder ? [holder] : [];
+  return row && typeof row === "object" ? (row as SeatRow) : undefined;
+}
+
+function seatHolder(sessionsDir: string, seatId: string): string[] {
+  const seat = readSeatRow(sessionsDir, seatId);
+  // A closed seat names no holder (R2-a): acpx's resolver refuses it, so it is never "own".
+  const closed = typeof seat?.closed_at === "string" && seat.closed_at !== "";
+  const holder = seat?.active_holder_id;
+  return !closed && typeof holder === "string" && holder ? [holder] : [];
 }
 
 type IndexEntry = { acpxRecordId?: unknown; acpSessionId?: unknown };

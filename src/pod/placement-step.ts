@@ -295,7 +295,21 @@ export function refusalJson(refusal: Refusal): string {
  * The branch implementations later blocks plug in. Until a block registers its branch, the branch
  * refuses with `pod_branch_unbuilt`. A handler returns the process exit code.
  */
-export type BranchHandler = (decision: PlacementDecision & { kind: "branch" }) => Promise<number>;
+export type BranchHandler = (
+  decision: PlacementDecision & { kind: "branch" },
+  context: BranchContext,
+) => Promise<number>;
+
+/**
+ * What a branch handler is handed beyond the decision (brick 7eb9686f): the argv the decision was
+ * made on — the pass-through forwards acpx's arguments verbatim (C6.2) — and the same line writers
+ * the refusals use.
+ */
+export type BranchContext = {
+  argv: readonly string[];
+  write: (line: string) => void;
+  writeStdout: (line: string) => void;
+};
 
 const branchHandlers = new Map<PodBranch, BranchHandler>();
 
@@ -329,13 +343,20 @@ export async function runPlacementStep(params: {
     verdict,
     podFile,
     builtInAgents: params.builtInAgents(),
-    ownTarget: (c) => (podFile.kind === "pod" ? ownTargetRecordId(c.target, podFile.name) : null),
+    ownTarget: (c) =>
+      podFile.kind === "pod"
+        ? ownTargetRecordId(c.target, podFile.name, undefined, {
+            path: c.path,
+            conflict: c.targetConflict,
+          })
+        : null,
   });
-  return await act(decision, params.write, params.writeStdout ?? params.write);
+  return await act(decision, params.argv, params.write, params.writeStdout ?? params.write);
 }
 
 async function act(
   decision: PlacementDecision,
+  argv: readonly string[],
   write: (line: string) => void,
   writeStdout: (line: string) => void,
 ): Promise<"proceed" | { exitCode: number }> {
@@ -344,7 +365,7 @@ async function act(
   }
   const handler = decision.kind === "branch" ? branchHandler(decision.branch) : undefined;
   if (handler && decision.kind === "branch") {
-    return { exitCode: await handler(decision) };
+    return { exitCode: await handler(decision, { argv, write, writeStdout }) };
   }
   // A decision with no refusal is unreachable by the type; fail closed rather than proceed.
   const refusal = refusalFor(decision) ?? {

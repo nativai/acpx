@@ -1,4 +1,10 @@
 import { AcpxOperationalError, SessionClosedError } from "../errors.js";
+import {
+  atriumAwayFailure,
+  callHome,
+  callHomeUnknownFailure,
+  type CallHomeFailure,
+} from "../pod/call-home.js";
 import type { PromptInput, SessionRecord } from "../types.js";
 import {
   atriumRequest,
@@ -27,6 +33,11 @@ import {
  */
 export type RoutedPromptOutcome =
   | { kind: "sent"; answer: MessageRouteAnswer }
+  /**
+   * Call-home mode only (an agent pod): atrium did not take the message within the budget. There is
+   * no direct path — the caller prints the failure and exits with its code (C7.2).
+   */
+  | { kind: "failed"; failure: CallHomeFailure }
   | {
       kind: "direct";
       deliveryId: string;
@@ -57,6 +68,9 @@ export async function runRoutedPrompt(params: RoutedPromptParams): Promise<Route
 
   const deliveryId = mintDeliveryId();
   const base = route.atrium.internalUrl;
+  if (route.callHome) {
+    return await runCallHomePrompt({ ...params, deliveryId, base, env });
+  }
   const exchange = await atriumRequest({
     method: "POST",
     url: `${base}${messageRoutePath(record, params.addressedSeat)}`,
@@ -69,6 +83,59 @@ export async function runRoutedPrompt(params: RoutedPromptParams): Promise<Route
     env,
   });
   return await outcomeOfExchange(exchange, { ...params, deliveryId, base, env });
+}
+
+/**
+ * A prompt for another session from an agent pod (C6.1, C7.2): the same message route and the same
+ * body, in the call-home loop. The send is idempotent by `delivery_id`, so a send whose answer never
+ * came is settled by asking atrium for that id (`settle`): known → its answer; unknown → send again.
+ * Never `direct`: after the budget the outcome is `failed` (`atrium_away`, nothing queued).
+ */
+async function runCallHomePrompt(
+  params: RoutedPromptParams & { deliveryId: string; base: string; env: NodeJS.ProcessEnv },
+): Promise<RoutedPromptOutcome> {
+  const { record, env, base, deliveryId } = params;
+  const url = `${base}${messageRoutePath(record, params.addressedSeat)}`;
+  const body = buildMessageRouteBody({
+    prompt: params.prompt,
+    deliveryId,
+    taskOptions: params.taskOptions,
+  });
+  const outcome = await callHome({
+    send: () =>
+      atriumRequest({
+        method: "POST",
+        url,
+        headers: { "x-source-session": env.ACPX_SESSION_URL?.trim() || "anonymous" },
+        body,
+        env,
+      }),
+    settle: async () => {
+      const status = await atriumRequest({
+        method: "GET",
+        url: `${base}/api/sessions/${encodeURIComponent(record.acpxRecordId)}/delivery/${encodeURIComponent(deliveryId)}`,
+        env,
+      });
+      return status.kind === "response" && status.status >= 200 && status.status < 300
+        ? { kind: "answered", status: status.status, body: status.body }
+        : { kind: "retry" };
+    },
+    env,
+  });
+  if (outcome.kind === "away") {
+    return { kind: "failed", failure: atriumAwayFailure(outcome.waitedMs) };
+  }
+  if (outcome.kind === "unknown") {
+    return { kind: "failed", failure: callHomeUnknownFailure(outcome.reason, deliveryId) };
+  }
+  if (outcome.status < 200 || outcome.status >= 300) {
+    // Not a 503: a refusal (a 403 is FINAL — never retried), reported as the direct path would.
+    throw refusalOf(outcome.status, outcome.body, record);
+  }
+  // ⚠️ NO `persistRoutedSendOwnerOptions` HERE, unlike the direct route below: it writes the
+  // RECIPIENT's record, and an agent pod never writes another session's record (one writing machine
+  // per file, C10). The options this command line carried travel in `task_options`.
+  return { kind: "sent", answer: parseAnswer(outcome.body, deliveryId) };
 }
 
 async function outcomeOfExchange(

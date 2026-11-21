@@ -372,6 +372,13 @@ export type Classification =
       /** `--help` / `-h` given: commander prints help and runs nothing. */
       help: boolean;
       target?: TargetSelector;
+      /**
+       * More than one selector names the session — two different selector flags, or a flag and the
+       * operand (brick 7eb9686f, R2-a). The chosen `target` is then only the FIRST of them: the
+       * placement step never calls that "this pod's own" (`own-target.ts`), and acpx's resolver refuses
+       * such a line. Two values of the SAME flag are not a conflict (the last wins, in both readers).
+       */
+      targetConflict: boolean;
       /** `one-shot`: this invocation is the from-records form. */
       fromRecords: boolean;
       /** This invocation is control-pod maintenance (A-7): it refuses in an agent pod. */
@@ -540,6 +547,17 @@ function targetFromFlags(spec: TargetSpec, scan: Scan): TargetSelector | undefin
   return undefined;
 }
 
+/** How many DIFFERENT selectors (flags with a value, the operand) name the session. */
+function selectorCount(entry: CommandEntry, scan: Scan): number {
+  const spec = entry.target;
+  if (!spec) {
+    return 0;
+  }
+  const flags = spec.flags.filter((flag) => Boolean(scan.values.get(flag))).length;
+  const operand = spec.operand !== undefined && scan.operands[spec.operand] ? 1 : 0;
+  return flags + operand;
+}
+
 function targetOf(entry: CommandEntry, scan: Scan): TargetSelector | undefined {
   const spec = entry.target;
   if (!spec) {
@@ -681,7 +699,12 @@ export function classifyArgv(
   if (pre !== undefined) {
     const entry = PRE_COMMANDER_PATHS[pre];
     const base = { contract: COMMAND_CLASSES_CONTRACT, path: pre, class: entry.class, entry };
-    const flags = { help: false, fromRecords: false, controlPodOnly: false };
+    const flags = {
+      help: false,
+      targetConflict: false,
+      fromRecords: false,
+      controlPodOnly: false,
+    };
     return { kind: "classified", ...base, ...flags, output: outputMode(top) };
   }
   const walk = walkArgv(argv, options.builtInAgents);
@@ -754,6 +777,7 @@ function finish(walk: Walk, output: OutputMode): Classification {
     entry,
     help: walk.help,
     ...(target ? { target } : {}),
+    targetConflict: selectorCount(entry, walk.scan) > 1,
     fromRecords,
     controlPodOnly: isControlPodOnly(entry, walk.scan),
     output,

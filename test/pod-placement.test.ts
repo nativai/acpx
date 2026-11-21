@@ -21,6 +21,8 @@ import {
   type HostFacts,
   type PodModeVerdict,
 } from "../src/pod/placement.js";
+import { runCli } from "./pod-a3-helpers.js";
+import { startRecordedAtrium } from "./pod-kit/recorded-atrium.js";
 import { makeSessionRecord, writeSessionRecordFile } from "./runtime-test-helpers.js";
 
 // brick b479441f — C1.1 (the switch, "where am I"), its amendment (NV_POD_UID), C1.2's dispatch and
@@ -439,6 +441,34 @@ function podEnv(home: string, over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return env;
 }
 
+/**
+ * A3 built the `pass-through` and `message-route` branches: an agent pod's command now CALLS HOME.
+ * These rows ask what the branch did, against lane X1's recorded atrium, with the call-home budget
+ * compressed by its test-only seam (honoured only under NODE_TEST_CONTEXT, `pod-call-home.test.ts`).
+ */
+async function runCallingHome(
+  argv: string[],
+  home: string,
+  script: Parameters<typeof startRecordedAtrium>[0] = {},
+) {
+  const atrium = await startRecordedAtrium(script);
+  try {
+    const result = await runCli(
+      argv,
+      podEnv(home, {
+        ACPX_UI_INTERNAL_URL: atrium.url,
+        ACPX_CALL_HOME_BUDGET_MS: "600",
+        ACPX_CALL_HOME_RETRY_MS: "100",
+        ACPX_CALL_HOME_ANSWER_TIMEOUT_MS: "600",
+        ACPX_ROUTED_PROMPT_ANSWER_TIMEOUT_MS: "600",
+      }),
+    );
+    return { result, requests: atrium.requests };
+  } finally {
+    await atrium.close();
+  }
+}
+
 function run(argv: string[], env: NodeJS.ProcessEnv): Run {
   const result = spawnSync(process.execPath, [CLI, ...argv], {
     env,
@@ -527,11 +557,18 @@ test("CLI: a local-routed command runs as today in pod mode (the step lets it th
   assert.doesNotMatch(r.stderr, /REFUSED/u);
 });
 
-test("CLI: agent pod — a record command about an unresolvable session is passed through (refused until A3)", () => {
+test("CLI: agent pod — a record command about an unresolvable session is passed through (A3: it reaches atrium)", async () => {
   const home = podHome({ podFile: agentPodName("rec-own") });
-  const r = run(["sessions", "set-os", "rec-nobody", "default"], podEnv(home));
-  assert.equal(r.status, 2, r.stderr);
-  assert.match(r.stderr, /branch=pass-through class=record place=other-pod/u);
+  const { result, requests } = await runCallingHome(
+    ["sessions", "set-os", "rec-nobody", "default"],
+    home,
+    { calls: [{ answer: { exit: 4, stderr: "no session\n" } }] },
+  );
+  assert.equal(result.status, 4, result.stderr);
+  assert.equal(result.stderr, "no session\n", "the control pod's answer, verbatim");
+  const calls = requests.filter((q) => q.route === "call");
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0]?.body?.argv, ["sessions", "set-os", "rec-nobody", "default"]);
 });
 
 const DETERMINISTIC: string[][] = [
@@ -713,15 +750,15 @@ test("F1 CLI: `help` in a prompt, in ANOTHER agent pod, is routed (message-route
     "ag-0123456789abcdef01234567",
   );
   const before = tree(home);
-  const r = run(
+  const { result: r, requests } = await runCallingHome(
     ["--approve-all", "claude", "--session-id", rec, "--no-wait", "help", "me"],
-    podEnv(home),
+    home,
   );
-  assert.equal(r.status, 2, r.stderr);
-  assert.equal(
-    r.stderr.split("\n")[0],
-    "acpx: REFUSED reason=pod_branch_unbuilt nothing_started=true protocol=1 branch=message-route class=owner-ensure place=other-pod path=<agent>",
-  );
+  assert.equal(r.status, 0, r.stderr);
+  // A3: the message-route branch posted it — `help me` is prompt TEXT, routed, never the help command.
+  const sent = requests.filter((q) => q.route === "session_message");
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0]?.body?.text, "help me");
   assert.deepEqual(tree(home), before, "nothing written: no lease, no stream, no ledger, no index");
 });
 
@@ -747,10 +784,14 @@ test("F2 CLI: in an agent pod the REFUSED token is stderr line 1, and no index i
   // No index at all: today's resolver would rebuild it (and say so on stderr) — the step must not.
   const empty = podHome({ podFile: "ag-0123456789abcdef01234567" });
   fs.mkdirSync(path.join(empty, ".acpx", "sessions"), { recursive: true });
-  const r1 = run(["sessions", "set-os", "nobody", "default"], podEnv(empty));
-  assert.equal(r1.status, 2);
+  // (A3: the placement decision still comes first and writes nothing — the command is passed through,
+  // and with atrium away its refusal token is stderr line 1.)
+  const { result: r1 } = await runCallingHome(["sessions", "set-os", "nobody", "default"], empty, {
+    phases: [{ mode: "away" }],
+  });
+  assert.equal(r1.status, 75);
   assert.equal(
-    r1.stderr.split("\n")[0].startsWith("acpx: REFUSED reason=pod_branch_unbuilt"),
+    r1.stderr.split("\n")[0].startsWith("acpx: REFUSED reason=atrium_away"),
     true,
     r1.stderr,
   );
@@ -765,9 +806,13 @@ test("F2 CLI: in an agent pod the REFUSED token is stderr line 1, and no index i
   const index = path.join(home, ".acpx", "sessions", "index.json");
   fs.writeFileSync(index, JSON.stringify({ schema: "x", entries: [], files: [] }));
   const bytes = fs.readFileSync(index, "utf8");
-  const r2 = run(["sessions", "set-metadata", "k", "v", "--session-id", rec], podEnv(home));
+  const { result: r2 } = await runCallingHome(
+    ["sessions", "set-metadata", "k", "v", "--session-id", rec],
+    home,
+    { phases: [{ mode: "away" }] },
+  );
   assert.equal(
-    r2.stderr.split("\n")[0].startsWith("acpx: REFUSED reason=pod_branch_unbuilt"),
+    r2.stderr.split("\n")[0].startsWith("acpx: REFUSED reason=atrium_away"),
     true,
     r2.stderr,
   );

@@ -1964,7 +1964,9 @@ async function maybeRouteAgentPrompt(
     messageId: flags.messageId,
     batchFile: flags.batchFile !== undefined,
   });
-  if (!route || (await recipientRunsDirectly(record, flags))) {
+  // Call-home mode (an agent pod's prompt for another session): always routed — no owner of this
+  // recipient runs in THIS pod, so "its agent is running" is no reason to stream directly.
+  if (!route || (!route.callHome && (await recipientRunsDirectly(record, flags)))) {
     return { kind: "not-routed" };
   }
   return await runRoutedPrompt({
@@ -2284,6 +2286,18 @@ async function sendPromptToRecipient(context: SendPromptContext): Promise<void> 
   const routed = await maybeRouteAgentPrompt(context);
   if (routed.kind === "sent") {
     await printRoutedSend(context, routed.answer);
+    return;
+  }
+  if (routed.kind === "failed") {
+    const { emitCallHomeFailure } = await import("../pod/call-home.js");
+    const { format, jsonStrict } = context.outputPolicy;
+    emitCallHomeFailure(
+      routed.failure,
+      format === "json" ? (jsonStrict ? "json-strict" : "json") : "text",
+      (line) => void process.stderr.write(`${line}\n`),
+      (line) => void process.stdout.write(`${line}\n`),
+    );
+    process.exitCode = routed.failure.exitCode;
     return;
   }
   await sendPromptDirect(context, routed.kind === "direct" ? routed : undefined);
@@ -4710,6 +4724,14 @@ async function deliverHandoffPrompt(
   if (routed.kind === "sent") {
     return;
   }
+  if (routed.kind === "failed") {
+    // Call-home mode never reaches a create's handoff (creates pass through), but a failure here must
+    // not fall to the direct path below: report it as the first message not delivered.
+    throw new AcpxOperationalError(
+      `the handoff prompt for ${created.acpxRecordId} was not queued in atrium: ${routed.failure.lines[0]}`,
+      { outputCode: "RUNTIME", detailCode: "ATRIUM_AWAY", origin: "cli" },
+    );
+  }
   const fallback = routed.kind === "direct" ? routed : undefined;
   await withDirectFallbackRefusal(fallback, created, () =>
     withMessageLedger(
@@ -4781,7 +4803,7 @@ async function postFirstMessageToAtrium(
       return;
     }
     throw new AcpxOperationalError(
-      `the first message for ${created.acpxRecordId} could not be queued in atrium (${routed.why}); ` +
+      `the first message for ${created.acpxRecordId} could not be queued in atrium (${routed.kind === "direct" ? routed.why : "away"}); ` +
         "in pod mode nothing is delivered directly",
       { outputCode: "RUNTIME", detailCode: "ATRIUM_AWAY", origin: "cli" },
     );
