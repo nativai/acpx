@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   AGENT_BROKER_CONTRACT,
+  deleteAgent,
   ensureAgentPod,
   getAgents,
   resolveAgentBrokerOrigin,
@@ -258,4 +259,52 @@ test("origin: built from the namespace; NV_AGENT_BROKER_URL steers only under NO
     "http://127.0.0.1:9",
   );
   assert.equal(resolveAgentBrokerOrigin({}, {}), undefined);
+});
+
+test("DELETE /v1/agents/<key>?uid=<uid>: 200 empty = deleted; 200 `refused reason=uid_mismatch` = refused; the uid is always sent", async () => {
+  const UID = "33333333-3333-4333-8333-333333333333";
+  const ok = await startBroker({ del: { body: "" } });
+  try {
+    assert.deepEqual(await deleteAgent(KEY, { uid: UID, origin: ok.origin }), { kind: "deleted" });
+    assert.equal(ok.seen[0]?.method, "DELETE");
+    assert.equal(ok.seen[0]?.url, `/v1/agents/${KEY}?uid=${UID}`);
+  } finally {
+    ok.close();
+  }
+  const mismatch = await startBroker({ del: { body: "refused reason=uid_mismatch\n" } });
+  try {
+    assert.deepEqual(await deleteAgent(KEY, { uid: UID, origin: mismatch.origin }), {
+      kind: "refused",
+      reason: "uid_mismatch",
+    });
+  } finally {
+    mismatch.close();
+  }
+});
+
+test("DELETE: a 5xx, a body that is no answer, a dead broker and a missing uid are never `deleted`", async () => {
+  const UID = "33333333-3333-4333-8333-333333333333";
+  for (const del of [{ status: 503, body: "" }, { body: "something odd" }]) {
+    const broker = await startBroker({ del });
+    try {
+      assert.equal(
+        (await deleteAgent(KEY, { uid: UID, origin: broker.origin })).kind,
+        "unavailable",
+      );
+    } finally {
+      broker.close();
+    }
+  }
+  const dead = await startBroker({});
+  const origin = dead.origin;
+  dead.close();
+  assert.equal((await deleteAgent(KEY, { uid: UID, origin })).kind, "unavailable");
+  // Negative: without a well-formed uid nothing is sent (the broker would delete whatever pod the key has).
+  const broker = await startBroker({ del: { body: "" } });
+  try {
+    assert.equal((await deleteAgent(KEY, { uid: "", origin: broker.origin })).kind, "unavailable");
+    assert.equal(broker.seen.length, 0);
+  } finally {
+    broker.close();
+  }
 });

@@ -648,24 +648,49 @@ test("agent_unreachable with no Ready time known (a pod that already existed, AP
   assert.equal(error.reason, "agent_unreachable");
 });
 
-test("agent_unreachable right after this call's own broker `ready` is inside the bound (counted from that line)", async () => {
+test("agent_unreachable: the bound is counted from the API server's Ready time (A-1), never from the broker's `ready` line", async () => {
+  // The broker's ready line is fresh (this call saw it), but the API server says the pod became Ready
+  // two minutes ago: past the bound, so not_run — the broker line does not extend it.
   const broker = await startBroker({ lines: ["scheduling", READY] });
   try {
+    let asked = 0;
+    const lookup: AgentPodLookup = async () =>
+      asked++ === 0
+        ? { state: "absent" }
+        : { state: "exists", uid: UID, ready: true, readyAtMs: Date.now() - 120_000 };
     const stub = makeStub(UNREACHABLE);
-    const refusal = await expectRefusal(
-      runRoutedCall(
-        baseOptions(stub, {
-          class: "owner-ensure",
-          lookup: ABSENT,
-          releases: { ok: true, releases: { acpx: "r1" } },
-          broker: { origin: broker.origin },
-        }),
-      ),
-    );
-    assert.match(refusal.stderrLine, /reason=pod_starting .* phase=starting wake=/);
+    const options = ensureOptions(stub, broker.origin, { lookup });
+    const error = await expectRouted(runRoutedCall(options));
+    assert.equal(error.reason, "agent_unreachable");
+    assert.equal(asked, 2, "the pod's Ready time was read from the API server after the refusal");
   } finally {
     broker.close();
   }
+  // And inside the bound by the API server's time → held as pod_starting phase=starting.
+  const broker2 = await startBroker({ lines: [READY] });
+  try {
+    let asked = 0;
+    const lookup: AgentPodLookup = async () =>
+      asked++ === 0
+        ? { state: "absent" }
+        : { state: "exists", uid: UID, ready: true, readyAtMs: Date.now() - 5_000 };
+    const refusal = await expectRefusal(
+      runRoutedCall(ensureOptions(makeStub(UNREACHABLE), broker2.origin, { lookup })),
+    );
+    assert.match(refusal.stderrLine, /reason=pod_starting .* phase=starting wake=/);
+  } finally {
+    broker2.close();
+  }
+});
+
+test("agent_unreachable: an API server that does not answer the Ready-time read counts as past the bound (never held for ever)", async () => {
+  let asked = 0;
+  const lookup: AgentPodLookup = async () =>
+    asked++ === 0
+      ? { state: "exists", uid: UID, ready: true, readyAtMs: Date.now() }
+      : { state: "unknown" };
+  const error = await expectRouted(runRoutedCall(baseOptions(makeStub(UNREACHABLE), { lookup })));
+  assert.equal(error.reason, "agent_unreachable");
 });
 
 test("an unlisted reason on 64/69/75 stays `ROUTED outcome=not_run reason=<as given>` (interim for every other unknown reason)", async () => {
@@ -1002,15 +1027,7 @@ test("brokerClassOf: a person (interactive, or undeclared) is interactive; an ag
 
 test("releases (C9): the directory name each tool's link points to now; a missing or malformed required link is named", () => {
   const dir = fs.mkdtempSync(path.join(TMP_ROOT, "runtime-"));
-  const required = [
-    "acpx",
-    "acpx-ui",
-    "claude-agent-acp",
-    "codex-acp",
-    "claude-pty-acp",
-    "pi",
-    "pi-acp",
-  ];
+  const required = ["acpx", "acpx-ui", "claude-agent-acp", "codex-acp", "claude-pty-acp", "pi-acp"];
   for (const tool of required) {
     fs.mkdirSync(path.join(dir, ".releases", tool, `${tool}-rel`), { recursive: true });
     fs.symlinkSync(`.releases/${tool}/${tool}-rel`, path.join(dir, tool));
@@ -1033,7 +1050,7 @@ test("releases (C9): the directory name each tool's link points to now; a missin
   assert.deepEqual(resolveReleases(dir), { ok: false, tool: "codex-acp" });
   // Negative: a link that points into another tool's releases.
   fs.rmSync(path.join(dir, "codex-acp"), { recursive: true });
-  fs.symlinkSync(".releases/pi/pi-rel", path.join(dir, "codex-acp"));
+  fs.symlinkSync(".releases/pi-acp/pi-acp-rel", path.join(dir, "codex-acp"));
   assert.deepEqual(resolveReleases(dir), { ok: false, tool: "codex-acp" });
   // Negative: a missing required link.
   fs.rmSync(path.join(dir, "codex-acp"));
@@ -1154,5 +1171,40 @@ test("transport lines beyond the table (T1): bad_request → not_run; 124 DEADLI
     );
     assert.equal(unknown.outcome, "unknown");
     assert.equal(unknown.reason, "deadline");
+  }
+});
+
+test("C9: `pi` and `pi-home` are not in `releases` until IM4 moves pi into the release layout, even when linked", () => {
+  const dir = fs.mkdtempSync(path.join(TMP_ROOT, "runtime-pi-"));
+  for (const tool of [...RELEASE_TOOLS_REQUIRED, "pi", "pi-home"]) {
+    fs.mkdirSync(path.join(dir, ".releases", tool, "r"), { recursive: true });
+    fs.symlinkSync(`.releases/${tool}/r`, path.join(dir, tool));
+  }
+  const result = resolveReleases(dir);
+  assert.equal(result.ok, true);
+  const names = Object.keys((result as { releases: Record<string, string> }).releases);
+  assert.equal(names.includes("pi"), false);
+  assert.equal(names.includes("pi-home"), false);
+});
+
+test("A-10: a utility pod's POST carries neither seat nor sessionId; a session's carries both", async () => {
+  const broker = await startBroker({ lines: [READY] });
+  try {
+    await runRoutedCall(
+      ensureOptions(makeStub(), broker.origin, {
+        key: "util-pool",
+        target: { sessionId: SESSION, seat: SEAT, harness: "utility" },
+      }),
+    );
+    const utility = JSON.parse(broker.seen[0]?.body ?? "{}") as Record<string, unknown>;
+    assert.equal("seat" in utility, false);
+    assert.equal("sessionId" in utility, false);
+    assert.equal(utility.harness, "utility");
+    await runRoutedCall(ensureOptions(makeStub(), broker.origin, { lookup: ABSENT }));
+    const session = JSON.parse(broker.seen[1]?.body ?? "{}") as Record<string, unknown>;
+    assert.equal(session.seat, SEAT);
+    assert.equal(session.sessionId, SESSION);
+  } finally {
+    broker.close();
   }
 });

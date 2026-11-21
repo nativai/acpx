@@ -76,7 +76,11 @@ export type AgentPodLookup = (key: string) => Promise<
       state: "exists";
       uid: string;
       ready: boolean;
-      /** When the API server says the pod became Ready (epoch ms). Absent = unknown. */
+      /**
+       * The Ready condition's `lastTransitionTime` as the API server reports it (epoch ms); absent =
+       * unknown. C2 amendment A-1: the `agent_unreachable` bound is counted from THIS, in every case
+       * — a later call never saw the broker's `ready` line.
+       */
       readyAtMs?: number;
       /** The pod's IP, when the API server gave it: the transport connects to it (`--address`). */
       ip?: string;
@@ -375,17 +379,19 @@ function isRefusalCandidate(firstLine: string): boolean {
   return REFUSAL_LINE_RE.test(firstLine);
 }
 
-type EnsuredPod = { uid: string; readyAtMs: number | undefined; ip?: string };
+type EnsuredPod = { uid: string; ip?: string };
 
 function brokerRequestOf(
   options: RoutedCallOptions,
   releases: Record<string, string>,
 ): BrokerAgentRequest {
   const { target } = options;
+  // A-10: a utility pod belongs to no session and no seat — neither field is sent.
+  const owner =
+    target.harness === "utility" ? {} : { sessionId: target.sessionId, seat: target.seat };
   return {
     contract: AGENT_BROKER_CONTRACT,
-    sessionId: target.sessionId,
-    seat: target.seat,
+    ...owner,
     harness: target.harness,
     placement: target.placement ?? "auto",
     class: brokerClassOf(target.admissionClass, options.class),
@@ -440,10 +446,9 @@ function brokerRefusal(
 async function brokerAnswerOutcome(
   answer: BrokerEnsureResult,
   ctx: BrokerContext,
-  now: () => number,
 ): Promise<EnsuredPod> {
   if (answer.kind === "ready") {
-    return { uid: answer.uid, readyAtMs: now(), ip: answer.ip };
+    return { uid: answer.uid, ip: answer.ip };
   }
   if (answer.kind === "refused") {
     throw brokerRefusal(answer, ctx);
@@ -472,11 +477,7 @@ function releasesOrFail(options: RoutedCallOptions, callId: string): Record<stri
   return releases.releases;
 }
 
-async function askBroker(
-  options: RoutedCallOptions,
-  callId: string,
-  now: () => number,
-): Promise<EnsuredPod> {
+async function askBroker(options: RoutedCallOptions, callId: string): Promise<EnsuredPod> {
   const releases = releasesOrFail(options, callId);
   const sources = readAgentBrokerOriginSources();
   const origin = options.broker?.origin ?? resolveAgentBrokerOrigin(options.env, sources);
@@ -499,18 +500,14 @@ async function askBroker(
     wake: options.target.sessionId,
     callId,
   };
-  return await brokerAnswerOutcome(answer, ctx, now);
+  return await brokerAnswerOutcome(answer, ctx);
 }
 
 /**
  * `owner-ensure` (C4): ask the broker only when the API server does not show a READY pod for the
  * key. Returns the pod's uid and when it became Ready, or throws the refusal the caller exits with.
  */
-async function ensureOwnerPod(
-  options: RoutedCallOptions,
-  callId: string,
-  now: () => number,
-): Promise<EnsuredPod> {
+async function ensureOwnerPod(options: RoutedCallOptions, callId: string): Promise<EnsuredPod> {
   if (!options.lookup) {
     throw new Error("routed owner-ensure needs a pod lookup");
   }
@@ -519,25 +516,24 @@ async function ensureOwnerPod(
     throw admissionBusyRefusal();
   }
   if (found.state === "exists" && found.ready) {
-    return { uid: found.uid, readyAtMs: found.readyAtMs, ip: found.ip };
+    return { uid: found.uid, ip: found.ip };
   }
-  return await askBroker(options, callId, now);
+  return await askBroker(options, callId);
 }
 
 /** The pod the call goes to, by class — or `no_pod` for `owner-if-pod` with none. */
 async function resolvePod(
   options: RoutedCallOptions,
   callId: string,
-  now: () => number,
 ): Promise<EnsuredPod | "no_pod"> {
   if (options.class === "owner-ensure") {
-    return await ensureOwnerPod(options, callId, now);
+    return await ensureOwnerPod(options, callId);
   }
   if (options.class === "one-shot") {
     if (!options.expectUid) {
       throw new Error("a routed one-shot needs the pod's uid");
     }
-    return { uid: options.expectUid, readyAtMs: undefined };
+    return { uid: options.expectUid };
   }
   if (!options.lookup) {
     throw new Error("routed owner-if-pod needs a pod lookup");
@@ -549,7 +545,7 @@ async function resolvePod(
   if (found.state === "unknown") {
     throw admissionBusyRefusal();
   }
-  return { uid: found.uid, readyAtMs: found.readyAtMs, ip: found.ip };
+  return { uid: found.uid, ip: found.ip };
 }
 
 function deadlineFor(options: RoutedCallOptions): number {
@@ -630,12 +626,15 @@ async function dispatch(
     stderr,
     holdAllStderr: options.class !== "one-shot",
   });
-  return settle(run, {
+  return await settle(run, {
     callId: ctx.callId,
     wake: options.target.sessionId,
     stderr,
-    readyAtMs: pod.readyAtMs,
-    nowMs: ctx.now(),
+    readyAt: async () => {
+      const found = await options.lookup?.(options.key);
+      return found?.state === "exists" ? found.readyAtMs : undefined;
+    },
+    now: ctx.now,
     debug: ctx.debug,
   });
 }
@@ -654,7 +653,7 @@ export async function runRoutedCall(options: RoutedCallOptions): Promise<RoutedC
   if (!isUnderSharedRoot(options.cwd)) {
     throw new RoutedCallError({ outcome: "not_run", reason: "cwd_not_shared", callId });
   }
-  const pod = await resolvePod(options, callId, now);
+  const pod = await resolvePod(options, callId);
   if (pod === "no_pod") {
     return { kind: "no_pod" };
   }
@@ -712,9 +711,12 @@ type SettleContext = {
   callId: string;
   wake: string;
   stderr: NodeJS.WritableStream;
-  /** When this pod became Ready, if known; unknown counts as past the unreachable bound. */
-  readyAtMs: number | undefined;
-  nowMs: number;
+  /**
+   * When this pod became Ready, read from the API server on demand (only a transport
+   * `agent_unreachable` asks); unknown counts as past the unreachable bound.
+   */
+  readyAt: () => Promise<number | undefined>;
+  now: () => number;
   debug: NonNullable<RoutedCallOptions["debug"]>;
 };
 
@@ -726,15 +728,21 @@ function isTurnover(exitCode: number, reason: string): boolean {
 }
 
 /** The transport refused before anything was sent: what C2's table makes of each reason. */
-function refusalOutcome(exitCode: number, reason: string, ctx: SettleContext): Error {
+async function refusalOutcome(
+  exitCode: number,
+  reason: string,
+  ctx: SettleContext,
+): Promise<Error> {
   if (isTurnover(exitCode, reason)) {
     return podStartingRefusal({ phase: "turnover", wake: ctx.wake });
   }
-  // C2 amendment: only within the bound counted from the pod's Ready; unknown Ready = past it.
-  const insideBound =
-    ctx.readyAtMs !== undefined && ctx.nowMs - ctx.readyAtMs <= AGENT_UNREACHABLE_BOUND_MS;
-  if (exitCode === 75 && reason === "agent_unreachable" && insideBound) {
-    return podStartingRefusal({ phase: "starting", wake: ctx.wake });
+  // C2 amendment A-1: only within the bound counted from the pod's Ready condition; unknown = past it.
+  // No pod is ever deleted because it cannot be reached.
+  if (exitCode === 75 && reason === "agent_unreachable") {
+    const readyAtMs = await ctx.readyAt();
+    if (readyAtMs !== undefined && ctx.now() - readyAtMs <= AGENT_UNREACHABLE_BOUND_MS) {
+      return podStartingRefusal({ phase: "starting", wake: ctx.wake });
+    }
   }
   // 64 / 69 otherwise, and any reason C2 does not list: nothing ran, exit 1.
   return new RoutedCallError({ outcome: "not_run", reason, callId: ctx.callId });
@@ -753,7 +761,7 @@ function unknownOutcome(run: TransportRun, exitCode: number, ctx: SettleContext)
  * C2's outcome table. For an unknown outcome the command's partial stderr is dropped from the
  * output, not relayed: the ROUTED line must be the first stderr line, which the atrium server reads.
  */
-function settle(run: TransportRun, ctx: SettleContext): RoutedCallResult {
+async function settle(run: TransportRun, ctx: SettleContext): Promise<RoutedCallResult> {
   if (run.spawnError !== undefined) {
     throw new RoutedCallError({
       outcome: "not_run",
@@ -765,7 +773,7 @@ function settle(run: TransportRun, ctx: SettleContext): RoutedCallResult {
   const exitCode = run.exitCode ?? 255;
   const refusal = transportRefusalReason(exitCode, run.firstStderrLine);
   if (refusal !== undefined) {
-    throw refusalOutcome(exitCode, refusal, ctx);
+    throw await refusalOutcome(exitCode, refusal, ctx);
   }
   if (exitCode === 124 || exitCode === 255) {
     throw unknownOutcome(run, exitCode, ctx);
@@ -788,9 +796,11 @@ export const RELEASE_TOOLS_REQUIRED = [
   "claude-agent-acp",
   "codex-acp",
   "claude-pty-acp",
-  "pi",
   "pi-acp",
 ] as const;
+// ⚠️ `pi` and `pi-home` are NOT in `releases` until IM4 moves pi into the release layout (today it is
+// installed in place at $RUNTIME_DIR/pi and the agent entrypoint links both in place; stream HoD,
+// 2026-11-21). Add `pi` here, and to the required list of the test, when infra says it moved.
 export const RELEASE_TOOLS_OPTIONAL = ["pi-extensions"] as const;
 
 export type ResolveReleasesResult =

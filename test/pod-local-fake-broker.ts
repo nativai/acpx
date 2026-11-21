@@ -14,6 +14,8 @@ export type Script = {
   json?: unknown;
   /** The answer to `GET /v1/agents` when the same broker is also asked for it. */
   agents?: unknown;
+  /** The answer to `DELETE /v1/agents/<key>?uid=…`. */
+  del?: { status?: number; body?: string };
 };
 
 export type Seen = { method?: string; url?: string; body: string; closedEarly: boolean }[];
@@ -34,6 +36,11 @@ export async function startBroker(
       }
     });
     req.on("end", () => {
+      if (req.method === "DELETE" && script.del !== undefined) {
+        res.writeHead(script.del.status ?? 200, { "content-type": "text/plain" });
+        res.end(script.del.body ?? "");
+        return;
+      }
       if (req.method === "GET" && script.agents !== undefined) {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(script.agents));

@@ -37,8 +37,9 @@ export type BrokerAgentClass = "interactive" | "spawn" | "automation" | "utility
 /** The C4 request body of `POST /v1/agents/<key>`. */
 export type BrokerAgentRequest = {
   contract: typeof AGENT_BROKER_CONTRACT;
-  sessionId: string;
-  seat: string;
+  /** Both omitted for `harness: utility` (A-10): a utility pod belongs to no session and no seat. */
+  sessionId?: string;
+  seat?: string;
   harness: AgentHarness;
   placement: AgentPlacement;
   class: BrokerAgentClass;
@@ -469,5 +470,54 @@ export async function getAgents(
     return agents ? { ok: true, agents } : { ok: false, detail: "malformed answer" };
   } catch {
     return { ok: false, detail: "no answer" };
+  }
+}
+
+export type BrokerDeleteResult =
+  /** 200, empty body: the Job is gone — or there was no pod at all. */
+  | { kind: "deleted" }
+  /** 200 with `refused reason=<…>`: nothing was deleted (`uid_mismatch`: the key's pod is another one). */
+  | { kind: "refused"; reason: string }
+  /** No answer, or an answer that is none (→ the caller treats the pod as still there). */
+  | { kind: "unavailable"; detail: string };
+
+/** DELETE bounded by the broker's own foreground wait (terminationGracePeriod 30 s) plus a margin. */
+export const DELETE_BOUND_MS = 45_000;
+
+function deleteOutcome(status: number, ok: boolean, text: string): BrokerDeleteResult {
+  const body = text.trim();
+  if (!ok) {
+    return { kind: "unavailable", detail: `http ${status}` };
+  }
+  if (body === "") {
+    return { kind: "deleted" };
+  }
+  const parsed = parseLine(body.split("\n")[0] ?? "");
+  const reason = parsed?.event === "refused" ? parsed.tokens.get("reason") : undefined;
+  return reason
+    ? { kind: "refused", reason: cleanText(reason) }
+    : { kind: "unavailable", detail: "malformed answer" };
+}
+
+/**
+ * `DELETE /v1/agents/<key>?uid=<pod uid>` (C4): the broker deletes only when the key's pod has that
+ * uid. `recover` and `close` send it when they delete a pod they could not reach (A4 wires them).
+ * Never throws.
+ */
+export async function deleteAgent(
+  key: string,
+  options: { uid: string; origin: string; fetchImpl?: typeof fetch; boundMs?: number },
+): Promise<BrokerDeleteResult> {
+  if (!AGENT_KEY_RE.test(key) || !/^[0-9a-f-]{36}$/.test(options.uid)) {
+    return { kind: "unavailable", detail: "not a key and uid" };
+  }
+  try {
+    const response = await (options.fetchImpl ?? fetch)(
+      `${options.origin}/v1/agents/${key}?uid=${options.uid}`,
+      { method: "DELETE", signal: AbortSignal.timeout(options.boundMs ?? DELETE_BOUND_MS) },
+    );
+    return deleteOutcome(response.status, response.ok, await response.text());
+  } catch {
+    return { kind: "unavailable", detail: "no answer" };
   }
 }
