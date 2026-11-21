@@ -122,6 +122,10 @@ export const TOP_LEVEL_VERBS = new Set([
   // (it runs `dist/capacity/governor/main.js`); without this entry `acpx governor status` would be a
   // prompt delivery to the cwd's session.
   "governor",
+  // `box` — `box refresh`, the control-store verb that releases this box from an agent pod too (A-17,
+  // brick f2fde405), registered by `registerBoxCommand`. Second half of the two registrations: without
+  // it `acpx box refresh` is a prompt delivery to the cwd's session.
+  "box",
   // `output-styles` is registered top-level by `registerSharedAgentSubcommands`
   // (command-registration.ts, called with `program` from `registerDefaultCommands`)
   // and was MISSING here — brick https://acpx.devbox.nativai.de/?brick=eb9c1d1e.
