@@ -1,4 +1,4 @@
-import { parseSleepingPlan } from "../../pod/create-plan.js";
+import { damagedSleepingPlan, parseSleepingPlan } from "../../pod/create-plan.js";
 import { parseRecordPidIdentity } from "../../process-identity.js";
 import type {
   SessionAcpxState,
@@ -311,7 +311,7 @@ function hasValidConversationCore(record: Record<string, unknown>): record is Re
   );
 }
 
-function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
+function parseAcpxState(raw: unknown, neverRan: boolean): SessionAcpxState | undefined {
   const record = asRecord(raw);
   if (!record) {
     return undefined;
@@ -320,7 +320,7 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
   const state: SessionAcpxState = {};
 
   assignBooleanTrue(state, "reset_on_next_ensure", record.reset_on_next_ensure);
-  assignSleeping(state, record.sleeping);
+  assignSleeping(state, record.sleeping, neverRan);
   assignStringState(state, "current_mode_id", record.current_mode_id);
   assignStringState(state, "desired_mode_id", record.desired_mode_id);
 
@@ -831,11 +831,16 @@ function assignLastTurnProvider(state: SessionAcpxState, value: unknown): void {
  */
 // UMQ K7 — `acpx.sleeping`: kept only when well-formed, so a damaged value reads as "not sleeping"
 // (a record that does carry a real `acpSessionId` must never be mistaken for one that never ran).
-function assignSleeping(state: SessionAcpxState, value: unknown): void {
+// C1.3 / R3-F1 — except on a record that NEVER RAN (`acp_session_id ""`): there a PRESENT value that is not
+// a valid mark is a damaged plan (`plan -1`, the raw value kept), refused at the wake by name, never "not
+// sleeping" (which fails with a misleading reconnect error and erases the value).
+function assignSleeping(state: SessionAcpxState, value: unknown, neverRan: boolean): void {
   // C1.3 — the whole plan (version, cut, by-the-way), never just `since` + `fork.from`.
   const sleeping = parseSleepingPlan(value);
   if (sleeping) {
     state.sleeping = sleeping;
+  } else if (neverRan && value !== undefined) {
+    state.sleeping = damagedSleepingPlan(value);
   }
 }
 
@@ -1591,7 +1596,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
       updated_at: conversation.updated_at,
       cumulative_token_usage: conversation.cumulative_token_usage,
       request_token_usage: conversation.request_token_usage,
-      acpx: parseAcpxState(record.acpx),
+      acpx: parseAcpxState(record.acpx, record.acp_session_id === ""),
       kind,
       parentSessionId: parentSessionId ?? undefined,
       parentSessionUrl: parentSessionUrl ?? undefined,
