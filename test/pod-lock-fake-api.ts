@@ -15,6 +15,8 @@ export type FakeApiState = {
   nodes: Map<string, string>;
   /** "stall" never answers; "500" answers 500 to everything. */
   failure?: "stall" | "500";
+  /** A non-Kubernetes 404 (`text/plain`, no Status body) — to every path, or only to nodes (F1). */
+  bare404?: "all" | "nodes";
   requests: string[];
 };
 
@@ -49,11 +51,20 @@ export async function startFakeApi(namespace: string): Promise<FakeApi> {
       return;
     }
     const url = request.url ?? "";
-    const pod = new RegExp(`^/api/v1/namespaces/${namespace}/pods/([^/?]+)$`).exec(url);
+    if (
+      state.bare404 === "all" ||
+      (state.bare404 === "nodes" && url.startsWith("/api/v1/nodes/"))
+    ) {
+      response.writeHead(404, { "content-type": "text/plain" });
+      response.end("404 page not found\n");
+      return;
+    }
+    const pod = /^\/api\/v1\/namespaces\/([^/]+)\/pods\/([^/?]+)$/.exec(url);
     const node = /^\/api\/v1\/nodes\/([^/?]+)$/.exec(url);
     if (pod) {
-      const name = decodeURIComponent(pod[1]);
-      const found = state.pods.get(name);
+      const name = decodeURIComponent(pod[2]);
+      // Pods live in `namespace`; any other namespace has none (a real NotFound, as the API answers).
+      const found = decodeURIComponent(pod[1]) === namespace ? state.pods.get(name) : undefined;
       if (!found) {
         notFound(response, "pods", name);
         return;
