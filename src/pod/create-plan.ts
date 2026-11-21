@@ -219,6 +219,18 @@ export function parseSleepingPlan(value: unknown): SleepingPlanState | undefined
   };
 }
 
+/**
+ * R3-F1 — an `acpx.sleeping` that is PRESENT on a record that NEVER RAN (`acp_session_id ""`) but is not a
+ * valid mark at all (`since` invalid, or not an object): a damaged plan like every other, not "not
+ * sleeping". Read as "not sleeping" the record fails at the wake with a misleading reconnect error and
+ * the refused wake erases the value. `since` is only a display time here, so an invalid one reads `""`.
+ * On a record with a real session id the old K7 reading stays (`parse.ts` `assignSleeping`).
+ */
+export function damagedSleepingPlan(raw: unknown): SleepingPlanState {
+  const since = asRecord(raw) ? nonEmptyString(asRecord(raw)?.since) : undefined;
+  return { since: since ?? "", plan: -1, unreadable: { raw: structuredClone(raw) } };
+}
+
 const DAMAGED = Symbol("damaged");
 
 /** Absent, an integer, or DAMAGED (a non-integer, `null`, …). */
