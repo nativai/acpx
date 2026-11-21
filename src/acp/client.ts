@@ -2788,6 +2788,57 @@ export class AcpClient {
   }
 
   /**
+   * C1.3 — a pinned Claude cut, executed at the first wake by the FILE-LEVEL fork only: the SDK's
+   * `forkSession(source, {upToMessageId})` writes a new transcript holding exactly the source's chain
+   * up to the anchor, and the caller then RESUMES that durable id (same session only).
+   *
+   * ⚠️ DO NOT ROUTE THIS THROUGH `forkSession` (the adapter's `unstable_forkSession` +
+   * `resumeSessionAt`). Claude Code's live resume-at refuses an anchor that a LATER compaction of the
+   * source has put behind a boundary (`No message found with message.uuid of: …`), while the file-level
+   * fork at that same uuid gives the exact inherited context — measured on a real source
+   * (`reports/CUT-PINNING.md` §2, brick 569497cb). A pinned cut is pinned precisely so that what
+   * happens to the source between create and wake cannot move it.
+   *
+   * Staging is the one `forkSession` uses: the source is copied under THIS session's cwd and config
+   * dir first when it lives under another folder or another subscription (brick 765510a3).
+   * Returns the durable session id, or undefined when the SDK cannot be loaded.
+   */
+  /** Whether this client's agent is Claude ACP — the one harness a `claude-uuid` anchor can be executed by. */
+  supportsClaudeFileFork(): boolean {
+    const { command, args } = splitCommandLine(this.options.agentCommand);
+    return isClaudeAcpCommand(command, args);
+  }
+
+  async materializeClaudeCutFork(
+    sourceAcpSessionId: string,
+    cwd: string,
+    options: { sourceCwd: string; upToMessageId: string },
+  ): Promise<string | undefined> {
+    const sessionCwd = await resolveAgentSessionCwd(cwd, this.options.agentCommand);
+    const sourceCwd = await resolveAgentSessionCwd(options.sourceCwd, this.options.agentCommand);
+    const forkContext: ForkRequestContext = {
+      claudeFork: true,
+      sourceCwd,
+      claudeResumeSessionAt: options.upToMessageId,
+    };
+    return await this.withCrossCwdForkSource(
+      forkContext,
+      sourceAcpSessionId,
+      sessionCwd,
+      async (sourceStaged) =>
+        await materializeClaudeForkSession({
+          agentCommand: this.options.agentCommand,
+          cwd: sessionCwd,
+          sourceCwd,
+          sourceAcpSessionId,
+          subscriptionId: this.claudeCopySubscriptionSelection(),
+          upToMessageId: options.upToMessageId,
+          sourceStaged,
+        }),
+    );
+  }
+
+  /**
    * One staging scope around a cross-cwd fork (brick 45917618 §5.5 D6/D7): the source transcript is
    * copied under the DESTINATION's key — Claude's `projects/<slug(dest)>/<id>.jsonl`, pi's
    * `sessions/--<dest>--/<file>` — before the fork, kept until the fork AND the durable

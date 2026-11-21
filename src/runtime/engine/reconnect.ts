@@ -1,5 +1,5 @@
 import { sessionUsesClaudeCredentials } from "../../acp/agent-command.js";
-import type { AcpClient } from "../../acp/client.js";
+import type { AcpClient, SessionCreateResult, SessionForkResult } from "../../acp/client.js";
 import {
   extractAcpError,
   extractAcpErrorDetails,
@@ -30,6 +30,7 @@ import {
   SessionResumeRequiredError,
 } from "../../errors.js";
 import { incrementPerfCounter } from "../../perf-metrics.js";
+import { assertKnownPlanVersion, type SleepingFork } from "../../pod/create-plan.js";
 import { isRecordedPidPossiblyAlive } from "../../process-identity.js";
 import { normalizeEffortLevelForModel } from "../../session/config-option-application.js";
 import { applyConfigOptionsToRecord } from "../../session/config-options.js";
@@ -55,6 +56,7 @@ import {
 } from "./lifecycle.js";
 import {
   finishSleepingMaterialisation,
+  forkCutForSleepingSession,
   forkTemplateForSleepingSession,
   type SleepingForkInherited,
 } from "./sleeping-materialisation.js";
@@ -790,16 +792,16 @@ async function materialiseSleepingRuntimeSession(params: {
   timeoutMs?: number;
   verbose?: boolean;
 }): Promise<RuntimeSessionLoadState> {
-  const templateId = params.record.acpx?.sleeping?.fork?.from;
-  if (templateId === undefined) {
+  const plan = params.record.acpx?.sleeping;
+  if (plan) {
+    // C1.3 / CONTRACTS rule 1: a plan version this build does not know is refused, never guessed.
+    assertKnownPlanVersion(plan, params.record.acpxRecordId);
+  }
+  const fork = plan?.fork;
+  if (fork === undefined) {
     return await createFreshRuntimeSession(params.client, params.record, params.timeoutMs);
   }
-  const { forked, inherited, durableClaudeFork } = await forkTemplateForSleepingSession({
-    client: params.client,
-    record: params.record,
-    templateId,
-    timeoutMs: params.timeoutMs,
-  });
+  const { forked, inherited, durableClaudeFork } = await forkForSleepingPlan(params, fork);
   if (durableClaudeFork) {
     // The durable id is not registered with the adapter: resume it (the model is then applied once,
     // by the preference replay — the fork skips its own eager apply, as `sessions copy` does).
@@ -823,6 +825,36 @@ async function materialiseSleepingRuntimeSession(params: {
     shouldReplayPreferences: true,
     sleepingFork: inherited,
   };
+}
+
+/**
+ * The fork a sleeping record's plan asks for: at a pinned cut (C1.3 — the record already holds its
+ * inherited messages, so nothing is taken now), or the whole template, read now (UMQ K7).
+ */
+async function forkForSleepingPlan(
+  params: { client: AcpClient; record: SessionRecord; timeoutMs?: number },
+  fork: SleepingFork,
+): Promise<{
+  forked: SessionCreateResult | SessionForkResult;
+  inherited: SleepingForkInherited | undefined;
+  durableClaudeFork: boolean;
+}> {
+  if (fork.cut) {
+    const cutFork = await forkCutForSleepingSession({
+      client: params.client,
+      record: params.record,
+      sourceId: fork.from,
+      cut: fork.cut,
+      timeoutMs: params.timeoutMs,
+    });
+    return { ...cutFork, inherited: undefined };
+  }
+  return await forkTemplateForSleepingSession({
+    client: params.client,
+    record: params.record,
+    templateId: fork.from,
+    timeoutMs: params.timeoutMs,
+  });
 }
 
 async function resumeRuntimeSession(params: {

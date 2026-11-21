@@ -144,6 +144,8 @@ export type SessionsNewFlags = {
   favorite?: boolean;
   /** Hidden `--sleeping` (UMQ K7): create the record only; the first message wakes it. Automation class only. */
   sleeping?: boolean;
+  /** Hidden `--created-by-call <uuid>` (C6.2): the pass-through call that makes this create; needs `--record-id`. */
+  createdByCall?: string;
 };
 
 export type SessionsCopyFlags = {
@@ -172,6 +174,8 @@ export type SessionsCopyFlags = {
   favorite?: boolean;
   /** Hidden `--sleeping` (UMQ K7): create the record only; the first wake forks the source. Automation class only. */
   sleeping?: boolean;
+  /** Hidden `--created-by-call <uuid>` (C6.2): the pass-through call that makes this create; needs `--record-id`. */
+  createdByCall?: string;
 };
 
 export type SessionsTemplateFlags = {
@@ -381,6 +385,15 @@ export function parseMessageId(value: string): string {
     throw new InvalidArgumentError("--message-id must be a UUID");
   }
   return parsed;
+}
+
+/** C6.2 — `--created-by-call <uuid>`: the call id atrium's pass-through minted (any UUID version). */
+export function parseCreatedByCall(value: string): string {
+  const parsed = parseNonEmptyValue("Call id", value);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(parsed)) {
+    throw new InvalidArgumentError("--created-by-call must be a UUID");
+  }
+  return parsed.toLowerCase();
 }
 
 export function parseHistoryLimit(value: string): number {
