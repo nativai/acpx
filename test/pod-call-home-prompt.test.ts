@@ -91,7 +91,12 @@ test("wait mode (the default) is routed too — never the direct stream a runnin
     );
     assert.equal(r.status, 0, r.stderr);
     assert.equal(messages(atrium).length, 1);
-    assert.match(r.stderr, /went to atrium's message queue and was not waited for/u);
+    // O-2: the reason is that the prompt CROSSES PODS — never "the recipient had no running agent".
+    assert.match(
+      r.stderr,
+      /this prompt crosses pods, so it went to atrium's message queue and was not waited for/u,
+    );
+    assert.doesNotMatch(r.stderr, /had no running agent/u);
   });
 });
 
@@ -291,4 +296,35 @@ test("readAtriumJson answers nothing in an agent pod — and answers in the cont
     /"internalUrl":"http:\/\/127\.0\.0\.1:3456"/u,
     "control pod: it is read",
   );
+});
+
+test("O-4: a prompt's call-home wait prints progress lines on stderr — and none under --json-strict", async () => {
+  const { home } = await podWithOther();
+  await withAtrium({ phases: [{ mode: "away" }] }, async (atrium) => {
+    const env = agentPodEnv(home, atrium.url, {
+      ...FAST,
+      ACPX_CALL_HOME_PROGRESS_MS: "300",
+    });
+    const text = await runCli(["prompt", "--session-id", OTHER_SESSION, "--no-wait", "hi"], env);
+    assert.equal(text.status, 75, text.stderr);
+    assert.match(
+      text.stderr,
+      /^acpx: still waiting for atrium \(attempt \d+, \d+ s of the \d+ s call-home budget left\)/mu,
+    );
+    const strict = await runCli(
+      [
+        "--json-strict",
+        "--format",
+        "json",
+        "prompt",
+        "--session-id",
+        OTHER_SESSION,
+        "--no-wait",
+        "hi",
+      ],
+      env,
+    );
+    assert.equal(strict.status, 75, strict.stderr);
+    assert.doesNotMatch(strict.stderr, /still waiting/u);
+  });
 });

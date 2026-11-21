@@ -384,6 +384,11 @@ export type Classification =
        * such a line. Two values of the SAME flag are not a conflict (the last wins, in both readers).
        */
       targetConflict: boolean;
+      /**
+       * Where the command's own operands sit in the argv (indexes, in operand order) — the pass-through
+       * rewrites a file-valued operand (`sessions import <archive>`) in place (brick 7eb9686f, F-4).
+       */
+      operandIndexes: number[];
       /** `one-shot`: this invocation is the from-records form. */
       fromRecords: boolean;
       /** This invocation is control-pod maintenance (A-7): it refuses in an agent pod. */
@@ -399,6 +404,10 @@ export type Classification =
 
 type Scan = {
   operands: string[];
+  /** Index of each operand in the tokens this level scanned (parallel to `operands`). */
+  operandAt: number[];
+  /** How many tokens this level scanned: with `operandAt`, an operand's place in the whole argv. */
+  tokenCount: number;
   values: Map<string, string>;
   /** Flags that took no value here (booleans, and flags this level does not declare). */
   booleans: Set<string>;
@@ -407,7 +416,15 @@ type Scan = {
 };
 
 function emptyScan(): Scan {
-  return { operands: [], values: new Map(), booleans: new Set(), help: false, rest: [] };
+  return {
+    operands: [],
+    operandAt: [],
+    tokenCount: 0,
+    values: new Map(),
+    booleans: new Set(),
+    help: false,
+    rest: [],
+  };
 }
 
 const HELP_FLAGS = new Set(["--help", "-h"]);
@@ -483,6 +500,7 @@ type LevelMode = "subcommands" | "positional" | "leaf";
 function scanLevel(tokens: readonly string[], node: GrammarNode, mode: LevelMode): Scan {
   const valueFlags = new Set(node.valueFlags);
   const scan = emptyScan();
+  scan.tokenCount = tokens.length;
   for (let i = 0; i < tokens.length; i += 1) {
     const step = scanStep(tokens, i, mode, valueFlags, scan);
     if (step === "stop") {
@@ -504,7 +522,9 @@ function scanStep(
   const token = tokens[i];
   const operandSeen = scan.operands.length > 0;
   if (token === "--" || (operandSeen && mode === "positional")) {
-    scan.operands.push(...tokens.slice(token === "--" ? i + 1 : i));
+    const from = token === "--" ? i + 1 : i;
+    scan.operands.push(...tokens.slice(from));
+    scan.operandAt.push(...tokens.slice(from).map((_, k) => from + k));
     return "stop";
   }
   if (isOperand(token)) {
@@ -513,6 +533,7 @@ function scanStep(
       return "stop";
     }
     scan.operands.push(token);
+    scan.operandAt.push(i);
     return 0;
   }
   const helpBefore = scan.help;
@@ -707,6 +728,7 @@ export function classifyArgv(
     const flags = {
       help: false,
       targetConflict: false,
+      operandIndexes: [],
       fromRecords: false,
       controlPodOnly: false,
     };
@@ -715,7 +737,7 @@ export function classifyArgv(
   const walk = walkArgv(argv, options.builtInAgents);
   return typeof walk === "string"
     ? unclassified(walk, outputMode(top))
-    : finish(walk, outputMode(top, walk.scan));
+    : finish(walk, outputMode(top, walk.scan), argv.length);
 }
 
 /**
@@ -765,7 +787,7 @@ function isControlPodOnly(entry: CommandEntry, scan: Scan): boolean {
   return rule === true || (rule !== undefined && !scanHas(scan, rule.unless));
 }
 
-function finish(walk: Walk, output: OutputMode): Classification {
+function finish(walk: Walk, output: OutputMode, argvLength: number): Classification {
   const entry = COMMAND_TABLE[walk.path];
   if (!entry) {
     return unclassified(walk.path, output);
@@ -783,6 +805,7 @@ function finish(walk: Walk, output: OutputMode): Classification {
     help: walk.help,
     ...(target ? { target } : {}),
     targetConflict: selectorCount(entry, walk.scan) > 1,
+    operandIndexes: walk.scan.operandAt.map((at) => argvLength - walk.scan.tokenCount + at),
     fromRecords,
     controlPodOnly: isControlPodOnly(entry, walk.scan),
     output,

@@ -45,6 +45,24 @@ export function callHomeBudgetMs(env: NodeJS.ProcessEnv = process.env): number {
   return testOverride(env, "ACPX_CALL_HOME_BUDGET_MS") ?? CALL_HOME_BUDGET_MS;
 }
 
+/** `Retry-After` is honoured within these bounds (F-2): never a hot loop, never a long stall. */
+const RETRY_AFTER_MIN_S = 1;
+const RETRY_AFTER_MAX_S = 30;
+/** What 0, a negative or garbage becomes: C6.1's own default, the forwarder's `Retry-After: 5`. */
+const RETRY_AFTER_DEFAULT_S = 5;
+
+/**
+ * ⚠️ `Retry-After: 0` made the client hot-loop (TE F-2: 1112 requests in 3 s). The header is a hint
+ * from whoever answered the 503, so it is clamped to [1, 30] s, and a value that is not a positive
+ * number is the default 5 s. Held by `test/pod-call-home.test.ts` ("Retry-After …").
+ */
+export function clampRetryAfterS(seconds: number): number {
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return RETRY_AFTER_DEFAULT_S;
+  }
+  return Math.min(Math.max(seconds, RETRY_AFTER_MIN_S), RETRY_AFTER_MAX_S);
+}
+
 /** The pause between attempts, test-compressible the same way. */
 function retryIntervalMs(env: NodeJS.ProcessEnv, attempt: number, retryAfterS?: number): number {
   const fixed = testOverride(env, "ACPX_CALL_HOME_RETRY_MS");
@@ -53,7 +71,7 @@ function retryIntervalMs(env: NodeJS.ProcessEnv, attempt: number, retryAfterS?: 
   }
   return retryAfterS === undefined
     ? Math.min(RETRY_START_MS * 2 ** Math.min(attempt, 8), RETRY_CAP_MS)
-    : retryAfterS * 1000;
+    : clampRetryAfterS(retryAfterS) * 1000;
 }
 
 export function callHomeAnswerTimeoutMs(
@@ -74,6 +92,15 @@ export type CallHomeOutcome =
 /** What `settle` says about a send whose answer never came. */
 export type Settled = { kind: "answered"; status: number; body: unknown } | { kind: "retry" };
 
+export type WaitInfo = { attempts: number; elapsedMs: number; remainingMs: number };
+
+const PROGRESS_EVERY_MS = 30_000;
+
+/** The progress line (stderr): the attempt count and the seconds left of the budget. */
+export function waitingLine(info: WaitInfo): string {
+  return `acpx: still waiting for atrium (attempt ${info.attempts}, ${Math.round(info.remainingMs / 1000)} s of the ${Math.round((info.elapsedMs + info.remainingMs) / 1000)} s call-home budget left); the command is not lost — it is retried until atrium answers.`;
+}
+
 export type CallHomeParams = {
   /** One attempt: the POST (or whatever this call is). */
   send: () => Promise<AtriumExchange>;
@@ -84,6 +111,13 @@ export type CallHomeParams = {
    */
   settle?: () => Promise<Settled>;
   budgetMs?: number;
+  /**
+   * Called at most every `progressEveryMs` while the call waits for atrium (O-4): a caller's own tool
+   * timeout (2 min in Claude Code's Bash) fires long before the 600 s budget ends, so the wait must say
+   * what it is doing. Absent: silent.
+   */
+  onWait?: (info: WaitInfo) => void;
+  progressEveryMs?: number;
   /** Injectable clock and sleeper: a unit test compresses 600 s to nothing without touching env. */
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -123,12 +157,31 @@ async function stepOf(
   return settled.kind === "answered" ? answered(settled.status, settled.body) : { kind: "retry" };
 }
 
+/** Reports a wait at most every `progressEveryMs` (O-4); a no-op without `onWait`. */
+function progressReporter(
+  params: CallHomeParams,
+  env: NodeJS.ProcessEnv,
+  now: () => number,
+  startedAt: number,
+): (attempts: number, elapsedMs: number, budgetMs: number) => void {
+  const everyMs =
+    params.progressEveryMs ?? testOverride(env, "ACPX_CALL_HOME_PROGRESS_MS") ?? PROGRESS_EVERY_MS;
+  let lastAt = startedAt;
+  return (attempts, elapsedMs, budgetMs) => {
+    if (params.onWait && now() - lastAt >= everyMs) {
+      lastAt = now();
+      params.onWait({ attempts, elapsedMs, remainingMs: budgetMs - elapsedMs });
+    }
+  };
+}
+
 export async function callHome(params: CallHomeParams): Promise<CallHomeOutcome> {
   const env = params.env ?? process.env;
   const now = params.now ?? Date.now;
   const sleep = params.sleep ?? realSleep;
   const budgetMs = params.budgetMs ?? callHomeBudgetMs(env);
   const startedAt = now();
+  const progress = progressReporter(params, env, now, startedAt);
   for (let attempts = 1; ; attempts += 1) {
     const step = await stepOf(await params.send(), params, attempts);
     if (step.kind === "done") {
@@ -138,6 +191,7 @@ export async function callHome(params: CallHomeParams): Promise<CallHomeOutcome>
     if (elapsed >= budgetMs) {
       return { kind: "away", waitedMs: elapsed, attempts };
     }
+    progress(attempts, elapsed, budgetMs);
     await sleep(Math.min(retryIntervalMs(env, attempts - 1, step.retryAfterS), budgetMs - elapsed));
   }
 }
@@ -249,17 +303,34 @@ export function doorRefusedFailure(
   };
 }
 
-/** `acpx: CALL_HOME outcome=unknown …` — exit 1; the caller repeats it with the same ids. */
+/**
+ * What a caller may do after `CALL_HOME outcome=unknown` — decided per command class (F-1, F-1b):
+ *  - `retry`: the control pod DE-DUPLICATES this command (a create under its `--record-id` and
+ *    `--created-by-call`), so the printed command is an IDENTICAL request that answers with the first
+ *    attempt's record and creates nothing twice;
+ *  - `check`: nothing de-duplicates a repeat, so none is advised; the text says how to find out
+ *    whether the command ran.
+ */
+export type UnknownAdvice =
+  | { kind: "retry"; command: string; recordId: string }
+  | { kind: "check"; how: string };
+
+const UNKNOWN_PREFIX = "the call was sent to atrium and its answer never came, so ";
+
+function unknownSentence(advice: UnknownAdvice): string {
+  return advice.kind === "retry"
+    ? `${UNKNOWN_PREFIX}it may or may not have run. Repeat exactly this command — the control pod finds what the first attempt made and answers with it, creating nothing twice: ${advice.command}`
+    : `${UNKNOWN_PREFIX}it is unknown whether the command ran. Nothing de-duplicates a repeat of this command, so do not simply run it again: ${advice.how}`;
+}
+
+/** `acpx: CALL_HOME outcome=unknown …` — exit 1. */
 export function callHomeUnknownFailure(
   reason: "deadline" | "connection",
   callId: string,
-  /** The record id a create was sent under (the client minted it): a repeat names it. */
-  recordId?: string,
+  advice: UnknownAdvice,
 ): CallHomeFailure {
   const tokenLine = `acpx: CALL_HOME outcome=unknown reason=${reason} call_id=${callId}`;
-  const sentence =
-    "the call was sent to atrium and its answer never came, so it may or may not have run; repeat the command with the same record id or call id and atrium finds what the first attempt made" +
-    (recordId === undefined ? "." : ` (this call created under --record-id ${recordId}).`);
+  const sentence = unknownSentence(advice);
   return {
     exitCode: UNKNOWN_EXIT_CODE,
     lines: [tokenLine, sentence],
@@ -272,7 +343,9 @@ export function callHomeUnknownFailure(
         outcome: "unknown",
         reason,
         call_id: callId,
-        ...(recordId === undefined ? {} : { record_id: recordId }),
+        ...(advice.kind === "retry"
+          ? { record_id: advice.recordId, retry_command: advice.command }
+          : { check: advice.how }),
       },
       "call-home-unknown",
     ),

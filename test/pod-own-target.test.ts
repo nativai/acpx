@@ -138,3 +138,10 @@ test("R2-a: the classifier counts selectors by name, so a repeated flag is not a
   assert.equal(same.kind === "classified" && same.targetConflict, false);
   assert.equal(two.kind === "classified" && two.targetConflict, true);
 });
+
+test("N-1: --seat carrying a ?session= URL is not exact evidence — not own, passed through (the near-miss: ?seat= is own)", () => {
+  const dir = sessionsDir();
+  assert.equal(ownOf(["status", "--seat", url(`session=${OWN}`)], dir), null);
+  assert.equal(ownOf(["status", "--seat", url(`seat=${OWN_SEAT}`)], dir), OWN);
+  assert.equal(ownOf(["status", "--seat", OWN_SEAT], dir), OWN);
+});

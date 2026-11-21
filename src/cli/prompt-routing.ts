@@ -280,6 +280,13 @@ export function deliveredDirectlyLine(deliveryId: string): string {
   return `acpx: atrium's message queue did not answer; delivered directly (delivery ${deliveryId})`;
 }
 
+/**
+ * Wait mode in call-home mode (an agent pod's prompt for another session). The recipient's agent may
+ * well be running — the prompt is routed because it CROSSES PODS, never because nothing runs (O-2).
+ */
+export const CALL_HOME_WAIT_MODE_LINE =
+  "acpx: this prompt crosses pods, so it went to atrium's message queue and was not waited for; its reply arrives as a message.";
+
 /** Wait mode, recipient not running: the routed send does not stream a reply. */
 export const ROUTED_WAIT_MODE_LINE =
   "acpx: the recipient had no running agent, so this prompt went to atrium's message queue and was not waited for; its reply arrives as a message.";

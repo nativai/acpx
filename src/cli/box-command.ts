@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type { Command } from "commander";
+import { BOX_RUNTIME_STATUS_FILE } from "../pod/pass-through-args.js";
 import { acpxStateRoot } from "../session/persistence/session-base-dir.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import { parseOutputFormat, resolveGlobalFlags } from "./flags.js";
@@ -27,7 +28,6 @@ import { emitJsonResult } from "./output/json-output.js";
  */
 
 const RELEASE_SCRIPT = "/opt/bootstrap/refresh.sh";
-const RUNTIME_STATUS_FILE = "/data/runtime/runtime-status.v1";
 /** How long the verb waits for a fast refusal before it calls the release started. */
 const GRACE_MS = 2_000;
 const FIRST_LINES = 5;
@@ -51,8 +51,8 @@ export function boxRefreshSettings(env: NodeJS.ProcessEnv): {
     script: testOverride(env, "ACPX_BOX_REFRESH_SCRIPT") ?? RELEASE_SCRIPT,
     runtimeStatus:
       testOverride(env, "ACPX_BOX_REFRESH_STATUS_FILE") ??
-      env.NV_RUNTIME_STATUS_FILE ??
-      RUNTIME_STATUS_FILE,
+      env.NV_BOX_RUNTIME_STATUS_FILE ??
+      BOX_RUNTIME_STATUS_FILE,
     graceMs: Number(testOverride(env, "ACPX_BOX_REFRESH_GRACE_MS")) || GRACE_MS,
   };
 }

@@ -17,6 +17,7 @@ import { agentPodName } from "./placement.js";
  *   - several selectors (two different selector flags, a flag and the operand: `conflict`) → not own;
  *   - a URL carrying BOTH `?session=` and `?seat=` → not own;
  *   - a URL as the value of `--session-id` → not own (a URL is for `--session-url` and `--seat`);
+ *   - a `?session=` URL as the value of `--seat` → not own (`--seat` takes a seat id or `?seat=`; N-1);
  *   - `-s` and `--session` → not own, except `--session <id|url>` of the `people` commands, where it
  *     is the id flag (on every other command it is a session NAME, which acpx refuses);
  *   - a CLOSED seat (`closed_at` set) names no holder → not own.
@@ -54,6 +55,8 @@ const EXACT_FORM_BY_FLAG: Readonly<
   "-s": () => false,
   "--session": (_url, commandPath) => commandPath?.startsWith("people ") === true,
   "--session-id": (url) => url === undefined,
+  // `--seat` takes a seat id or a URL carrying ?seat=; a ?session= URL is refused by the resolver (N-1).
+  "--seat": (url) => url?.session === undefined,
 };
 
 /** The forms acpx's resolver accepts for this flag (see the docstring above). */

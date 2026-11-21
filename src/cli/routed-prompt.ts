@@ -2,6 +2,7 @@ import { AcpxOperationalError, SessionClosedError } from "../errors.js";
 import {
   atriumAwayFailure,
   callHome,
+  waitingLine,
   callHomeUnknownFailure,
   type CallHomeFailure,
 } from "../pod/call-home.js";
@@ -53,6 +54,8 @@ type RoutedPromptParams = {
   prompt: PromptInput;
   taskOptions: MemberTaskOptions | undefined;
   ownerInputs: SendOwnerOptionInputs;
+  /** `--json-strict`: stderr stays machine-clean, so a call-home wait prints no progress line. */
+  jsonStrict?: boolean;
   env?: NodeJS.ProcessEnv;
 };
 
@@ -121,12 +124,24 @@ async function runCallHomePrompt(
         : { kind: "retry" };
     },
     env,
+    ...(params.jsonStrict === true
+      ? {}
+      : {
+          onWait: (info: Parameters<typeof waitingLine>[0]) =>
+            void process.stderr.write(`${waitingLine(info)}\n`),
+        }),
   });
   if (outcome.kind === "away") {
     return { kind: "failed", failure: atriumAwayFailure(outcome.waitedMs) };
   }
   if (outcome.kind === "unknown") {
-    return { kind: "failed", failure: callHomeUnknownFailure(outcome.reason, deliveryId) };
+    return {
+      kind: "failed",
+      failure: callHomeUnknownFailure(outcome.reason, deliveryId, {
+        kind: "check",
+        how: "a prompt is re-sent with its delivery id until atrium answers, so this should not occur; ask `acpx sessions history` of the recipient whether the message arrived before repeating it.",
+      }),
+    };
   }
   if (outcome.status < 200 || outcome.status >= 300) {
     // Not a 503: a refusal (a 403 is FINAL — never retried), reported as the direct path would.

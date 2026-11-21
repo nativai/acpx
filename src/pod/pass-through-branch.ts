@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import path from "node:path";
 import { atriumRequest } from "./atrium-exchange.js";
 import {
   callHome,
@@ -11,9 +10,15 @@ import {
   emitCallHomeFailure,
   enterCallHomeMode,
   PASS_THROUGH_DEADLINE_MS,
+  waitingLine,
   type CallHomeOutcome,
 } from "./call-home.js";
-import { PASS_THROUGH_INHERIT, type CommandClass, type OutputMode } from "./command-classes.js";
+import type { OutputMode } from "./command-classes.js";
+import {
+  buildPassThroughCall,
+  PassThroughUsageError,
+  type PassThroughCall,
+} from "./pass-through-args.js";
 import {
   registerBranchHandler,
   type BranchContext,
@@ -39,260 +44,18 @@ import {
  * `test/pod-pass-through.test.ts` ("sends no cwd").
  */
 
-/** C6.2: `stdin_b64` is at most 8 MiB. */
-export const MAX_STDIN_BYTES = 8 * 1024 * 1024;
-
-/**
- * Value flags whose FILE the caller reads in its own pod and the pass-through carries as bytes: the
- * argument becomes `-` and `stdin_b64` holds the content (C6.2). `--prompt-file -` in the caller's
- * argv already means "the caller's stdin" and travels the same way.
- */
-export const STDIN_FILE_FLAGS: readonly string[] = Object.freeze(["--prompt-file"]);
-
-/**
- * Value flags whose path the SUCCESSOR or the control pod reads BY PATH: made absolute against the
- * caller's cwd (a relative path would otherwise resolve against the server's `/workspace`), never
- * turned into bytes. `handover --brief` is the case that decides it: the successor is sent a prompt
- * pointing at the brief's path (`sessions handover`), so the path must survive. A path outside the
- * shared roots does not exist on the control pod and fails there, loudly, as it would anywhere.
- */
-export const ABSOLUTIZED_PATH_FLAGS: readonly string[] = Object.freeze(["--brief"]);
-
-/**
- * Create paths that take `--record-id <uuid>`: the pass-through mints one when the caller gave none,
- * so a retry after a lost answer finds the record by its `created_by_call` (C6.2 "at most once").
- */
-export const RECORD_ID_CREATE_PATHS: readonly string[] = Object.freeze([
-  "sessions new",
-  "sessions copy",
-  "sessions import",
-]);
-
-/**
- * Create paths with NO `--record-id` today — named so the discovering test in
- * `test/pod-pass-through.test.ts` fails on a NEW create path nobody sorted into one list or the other.
- * `sessions handover` is the one: its successor is `new --from` inside the verb, and the verb has no
- * flag for the record id (a retry after an unknown answer can duplicate it — reported to the stream).
- */
-export const NO_RECORD_ID_CREATE_PATHS: readonly string[] = Object.freeze(["sessions handover"]);
-
-/** A request the client cannot build: nothing was sent. Printed as a usage refusal (exit 2). */
-export class PassThroughUsageError extends Error {
-  constructor(
-    message: string,
-    readonly reason: string = "pass_through_unbuildable",
-  ) {
-    super(message);
-  }
-}
-
-/**
- * Roots the control pod can read a `--brief` path under (the ruling on checkpoint 1): a pod-local
- * path would reach the successor as a dead pointer, so it is refused, nothing started.
- */
-export const BRIEF_SHARED_ROOTS: readonly string[] = Object.freeze(["/wisdom", "/workspace"]);
-
-function underSharedRoot(file: string): boolean {
-  return BRIEF_SHARED_ROOTS.some((root) => file === root || file.startsWith(`${root}/`));
-}
-
-export type PassThroughInput = {
-  argv: readonly string[];
-  commandPath: string;
-  commandClass: CommandClass;
-  env: NodeJS.ProcessEnv;
-  /** The caller's cwd — used ONLY to make `ABSOLUTIZED_PATH_FLAGS` absolute; never sent. */
-  cwd: string;
-  readFile: (file: string) => Buffer;
-  readStdin: () => Buffer;
-  mintId: () => string;
-};
-
-export type PassThroughCall = {
-  callId: string;
-  /** The record id this call creates under, when it is a create that takes one. */
-  recordId: string | undefined;
-  body: Record<string, unknown>;
-};
-
-type Rewritten = { argv: string[]; stdin: Buffer | undefined };
-
-function flagMatch(
-  token: string,
-  flags: readonly string[],
-): { flag: string; inline?: string } | undefined {
-  for (const flag of flags) {
-    if (token === flag) {
-      return { flag };
-    }
-    if (token.startsWith(`${flag}=`)) {
-      return { flag, inline: token.slice(flag.length + 1) };
-    }
-  }
-  return undefined;
-}
-
-/** The bytes a stdin-carried file argument stands for, read in the CALLER's pod; refused when unreadable or too big. */
-function loadStdin(value: string, input: PassThroughInput): Buffer {
-  const label = value === "-" ? "stdin" : value;
-  let bytes: Buffer;
-  try {
-    bytes = value === "-" ? input.readStdin() : input.readFile(path.resolve(input.cwd, value));
-  } catch (error) {
-    throw new PassThroughUsageError(`could not read ${label}: ${(error as Error).message}`);
-  }
-  if (bytes.length > MAX_STDIN_BYTES) {
-    throw new PassThroughUsageError(
-      `${label} is ${bytes.length} bytes; the pass-through carries at most ${MAX_STDIN_BYTES}`,
-    );
-  }
-  return bytes;
-}
-
-type FileFlagHit = { flag: string; inline?: string; carry: "stdin" | "path" };
-
-function fileFlagOf(token: string): FileFlagHit | undefined {
-  const stdin = flagMatch(token, STDIN_FILE_FLAGS);
-  if (stdin) {
-    return { ...stdin, carry: "stdin" };
-  }
-  const absolutized = flagMatch(token, ABSOLUTIZED_PATH_FLAGS);
-  return absolutized ? { ...absolutized, carry: "path" } : undefined;
-}
-
-type RewriteState = { out: string[]; stdin: Buffer | undefined };
-
-/** One recognised file flag with its value: stdin-carried (`-` + bytes) or made absolute. */
-function rewriteFileFlag(
-  hit: FileFlagHit,
-  value: string,
-  state: RewriteState,
-  input: PassThroughInput,
-): void {
-  if (hit.carry === "path") {
-    const absolute = path.resolve(input.cwd, value);
-    if (!underSharedRoot(absolute)) {
-      throw new PassThroughUsageError(
-        `${hit.flag} ${absolute} is not under ${BRIEF_SHARED_ROOTS.join(" or ")}, so the control pod and the successor cannot read it`,
-        "brief_not_shared",
-      );
-    }
-    state.out.push(hit.flag, absolute);
-    return;
-  }
-  if (state.stdin !== undefined) {
-    throw new PassThroughUsageError(
-      "more than one argument names a file the pass-through would carry as stdin; only one can travel",
-    );
-  }
-  state.stdin = loadStdin(value, input);
-  state.out.push(hit.flag, "-");
-}
-
-/** The argv split at a `--` terminator: file flags are looked for before it only. */
-function splitAtTerminator(args: readonly string[]): { head: string[]; tail: string[] } {
-  const end = args.indexOf("--");
-  return end === -1
-    ? { head: [...args], tail: [] }
-    : { head: args.slice(0, end), tail: args.slice(end) };
-}
-
-function rewriteFileArguments(input: PassThroughInput): Rewritten {
-  const state: RewriteState = { out: [], stdin: undefined };
-  const { head, tail } = splitAtTerminator(input.argv);
-  for (let i = 0; i < head.length; i += 1) {
-    const token = head[i] ?? "";
-    const hit = fileFlagOf(token);
-    const value = hit?.inline ?? head[i + 1];
-    if (hit === undefined || value === undefined) {
-      state.out.push(token);
-      continue;
-    }
-    i += hit.inline === undefined ? 1 : 0;
-    rewriteFileFlag(hit, value, state, input);
-  }
-  return { argv: [...state.out, ...tail], stdin: state.stdin };
-}
-
-function hasRecordId(argv: readonly string[]): boolean {
-  const end = argv.indexOf("--");
-  return argv
-    .slice(0, end === -1 ? undefined : end)
-    .some((token) => token === "--record-id" || token.startsWith("--record-id="));
-}
-
-/** `--record-id <uuid>` goes before a `--` terminator, if there is one. */
-function withRecordId(argv: string[], recordId: string): string[] {
-  const end = argv.indexOf("--");
-  const at = end === -1 ? argv.length : end;
-  return [...argv.slice(0, at), "--record-id", recordId, ...argv.slice(at)];
-}
-
-function nonEmpty(value: string | undefined): string | undefined {
-  const trimmed = value?.trim();
-  return trimmed ? trimmed : undefined;
-}
-
-function sessionOfUrl(url: string | undefined): string | undefined {
-  if (!url) {
-    return undefined;
-  }
-  try {
-    return nonEmpty(new URL(url).searchParams.get("session") ?? undefined);
-  } catch {
-    return undefined;
-  }
-}
-
-/** C6.2 `caller`: only what the caller's own environment names — nothing fabricated, nothing else travels. */
-function callerOf(env: NodeJS.ProcessEnv): Record<string, string> {
-  const sessionUrl = nonEmpty(env.ACPX_SESSION_URL);
-  const entries: Array<[string, string | undefined]> = [
-    ["session_url", sessionUrl],
-    ["seat_url", nonEmpty(env.ACPX_SEAT_URL)],
-    ["record_id", nonEmpty(env.ACPX_SESSION_RECORD_ID) ?? sessionOfUrl(sessionUrl)],
-    ["parent_session_url", nonEmpty(env.ACPX_PARENT_SESSION_URL)],
-    ["parent_seat_url", nonEmpty(env.ACPX_PARENT_SEAT_URL)],
-  ];
-  return Object.fromEntries(
-    entries.filter((entry): entry is [string, string] => entry[1] !== undefined),
-  );
-}
-
-/** C6.2 `inherit`: only names of acpx's closed list, only when the caller's environment has them. */
-function inheritOf(env: NodeJS.ProcessEnv): Record<string, string> {
-  const entries = PASS_THROUGH_INHERIT.flatMap((name) => {
-    const value = nonEmpty(env[name]);
-    return value === undefined ? [] : [[name, value] as const];
-  });
-  return Object.fromEntries(entries);
-}
-
-export function buildPassThroughCall(input: PassThroughInput): PassThroughCall {
-  const { argv, stdin } = rewriteFileArguments(input);
-  const callId = input.mintId();
-  const mintsRecordId =
-    input.commandClass === "create" &&
-    RECORD_ID_CREATE_PATHS.includes(input.commandPath) &&
-    !hasRecordId(argv);
-  const recordId = mintsRecordId ? input.mintId() : undefined;
-  const finalArgv = recordId === undefined ? argv : withRecordId(argv, recordId);
-  return {
-    callId,
-    recordId,
-    // ⚠️ NO `cwd` KEY (A-9). `test/pod-pass-through.test.ts` asserts the request has none.
-    body: {
-      contract: 1,
-      call_id: callId,
-      argv: finalArgv,
-      ...(stdin === undefined ? {} : { stdin_b64: stdin.toString("base64") }),
-      caller: callerOf(input.env),
-      admission_class: "spawn",
-      inherit: inheritOf(input.env),
-      deadline_ms: PASS_THROUGH_DEADLINE_MS,
-    },
-  };
-}
+export {
+  ABSOLUTIZED_PATH_FLAGS,
+  BRIEF_SHARED_ROOTS,
+  buildPassThroughCall,
+  MAX_STDIN_BYTES,
+  NO_RECORD_ID_CREATE_PATHS,
+  PassThroughUsageError,
+  RECORD_ID_CREATE_PATHS,
+  STDIN_FILE_FLAGS,
+  type PassThroughCall,
+  type PassThroughInput,
+} from "./pass-through-args.js";
 
 // ─── the marker: a routed command is never routed twice (A-8) ─────────────────────────────────
 
@@ -355,7 +118,7 @@ function finishAnswered(
   const failure =
     outcome.status >= 400 && outcome.status < 500
       ? doorRefusedFailure(outcome.status, body.error, body.reason)
-      : callHomeUnknownFailure("connection", call.callId, call.recordId);
+      : callHomeUnknownFailure("connection", call.callId, call.advice);
   emitCallHomeFailure(failure, deps.output, deps.context.write, deps.context.writeStdout);
   return failure.exitCode;
 }
@@ -410,6 +173,7 @@ function buildCallOrRefuse(run: PassThroughRun, env: NodeJS.ProcessEnv): PassThr
       argv: context.argv,
       commandPath: classification.path,
       commandClass: classification.class,
+      operandIndexes: classification.operandIndexes,
       env,
       cwd: run.cwd ?? process.cwd(),
       readFile: (file) => fs.readFileSync(file),
@@ -437,6 +201,7 @@ async function sendCall(
   run: PassThroughRun,
   env: NodeJS.ProcessEnv,
   call: PassThroughCall,
+  output: OutputMode,
 ): Promise<CallHomeOutcome> {
   const url = `${run.origin ?? (await atriumBase(env))}/api/acpx/call`;
   const send = run.send ?? atriumRequest;
@@ -445,12 +210,18 @@ async function sendCall(
       send({
         method: "POST",
         url,
-        headers: { "x-source-session": nonEmpty(env.ACPX_SESSION_URL) ?? "anonymous" },
+        headers: { "x-source-session": env.ACPX_SESSION_URL?.trim() || "anonymous" },
         body: call.body,
         env,
         answerTimeoutMs: callHomeAnswerTimeoutMs(PASS_THROUGH_DEADLINE_MS, env),
       }),
     env,
+    // O-4: a caller's own tool timeout fires long before the budget ends; say what the wait is doing.
+    ...(output === "json-strict"
+      ? {}
+      : {
+          onWait: (info: Parameters<typeof waitingLine>[0]) => run.context.write(waitingLine(info)),
+        }),
     ...(run.now ? { now: run.now } : {}),
     ...(run.sleep ? { sleep: run.sleep } : {}),
   });
@@ -471,7 +242,7 @@ export async function runPassThrough(run: PassThroughRun): Promise<number> {
   if (typeof call === "number") {
     return call;
   }
-  const outcome = await sendCall(run, env, call);
+  const outcome = await sendCall(run, env, call, decision.output);
   if (outcome.kind === "answered") {
     return finishAnswered(outcome, call, {
       output: decision.output,
@@ -482,7 +253,7 @@ export async function runPassThrough(run: PassThroughRun): Promise<number> {
   const failure =
     outcome.kind === "away"
       ? atriumAwayFailure(outcome.waitedMs)
-      : callHomeUnknownFailure(outcome.reason, call.callId, call.recordId);
+      : callHomeUnknownFailure(outcome.reason, call.callId, call.advice);
   emitCallHomeFailure(failure, decision.output, context.write, context.writeStdout);
   return failure.exitCode;
 }

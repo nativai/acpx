@@ -28,10 +28,13 @@ function answerTimeoutMs(env: NodeJS.ProcessEnv): number {
   return Number.isFinite(raw) && raw > 0 ? raw : ANSWER_TIMEOUT_MS;
 }
 
+/**
+ * The `Retry-After` header as a number, UNJUDGED: absent → undefined; present → its value, `NaN` for
+ * garbage. `call-home.ts` clamps it (F-2): this reader must not decide that a bad header is no header.
+ */
 function retryAfterSeconds(header: string | string[] | undefined): number | undefined {
   const raw = Array.isArray(header) ? header[0] : header;
-  const seconds = raw === undefined ? Number.NaN : Number(raw);
-  return Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined;
+  return raw === undefined ? undefined : Number(raw);
 }
 
 export function atriumRequest(params: {

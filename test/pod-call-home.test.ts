@@ -185,13 +185,23 @@ test("C7.2 wording: atrium_away is exit 75 with the contract's token line; unkno
     a.lines[0],
     "acpx: REFUSED reason=atrium_away nothing_started=true protocol=1 retry_after_s=60 waited_s=601",
   );
-  const u = callHomeUnknownFailure("deadline", "call-1");
+  const check = { kind: "check", how: "look first" } as const;
+  const u = callHomeUnknownFailure("deadline", "call-1", check);
   assert.equal(u.exitCode, 1);
   assert.equal(u.lines[0], "acpx: CALL_HOME outcome=unknown reason=deadline call_id=call-1");
   assert.equal(
-    callHomeUnknownFailure("connection", "c2", "rec-9").lines[1].includes("--record-id rec-9"),
+    callHomeUnknownFailure("connection", "c2", {
+      kind: "retry",
+      command: "acpx sessions new --record-id rec-9 --created-by-call c2",
+      recordId: "rec-9",
+    }).lines[1].includes("acpx sessions new --record-id rec-9 --created-by-call c2"),
     true,
-    "a minted record id is named, so a repeat can use it",
+    "a create names the identical retry command",
+  );
+  assert.doesNotMatch(
+    u.lines[1],
+    /Repeat exactly/u,
+    "a non-deduplicated class gets no repeat advice",
   );
   const json = JSON.parse(a.json) as { error: { data: Record<string, unknown> } };
   assert.equal(json.error.data.reason, "atrium_away");

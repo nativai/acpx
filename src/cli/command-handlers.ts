@@ -57,6 +57,7 @@ import {
 import { warmCatalogueInBackground } from "../models/catalogue-warm.js";
 import { validateSessionModelFlags } from "../models/model-slug-validation.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
+import { inCallHomeMode } from "../pod/call-home.js";
 import {
   admitRecordOnlyCreate,
   createReplayMismatchError,
@@ -203,6 +204,7 @@ import {
   deliveredDirectlyLine,
   type MessageRouteAnswer,
   readAtriumJson,
+  CALL_HOME_WAIT_MODE_LINE,
   ROUTED_WAIT_MODE_LINE,
   routedPromptLine,
 } from "./prompt-routing.js";
@@ -1978,6 +1980,7 @@ async function maybeRouteAgentPrompt(
     addressedSeat: context.addressedSeat,
     prompt: context.prompt,
     taskOptions: routedTaskOptions(context.command, globalFlags, context.permissionMode),
+    jsonStrict: globalFlags.jsonStrict === true,
     ownerInputs: {
       sessionId: record.acpxRecordId,
       permissionMode: context.permissionMode,
@@ -2093,7 +2096,9 @@ async function printRoutedSend(
     outputPolicy.format,
   );
   if (flags.wait !== false && outputPolicy.format === "text") {
-    process.stderr.write(`${ROUTED_WAIT_MODE_LINE}\n`);
+    process.stderr.write(
+      `${inCallHomeMode() ? CALL_HOME_WAIT_MODE_LINE : ROUTED_WAIT_MODE_LINE}\n`,
+    );
   }
 }
 

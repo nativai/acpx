@@ -241,8 +241,8 @@ test("A-8 CALL_HOME outcome=unknown: a sent call whose answer never comes is exi
     );
     assert.match(
       r.stderr,
-      /--record-id [0-9a-f-]{36}/u,
-      "the minted record id is named for the repeat",
+      /--record-id [0-9a-f-]{36} --created-by-call [0-9a-f-]{36}/u,
+      "the printed retry carries both ids",
     );
   });
 });
@@ -338,7 +338,7 @@ function input(argv: string[], over: Partial<PassThroughInput> = {}): PassThroug
     cwd: "/workspace/projects/x",
     readFile: (file) => Buffer.from(`file:${file}`),
     readStdin: () => Buffer.from("from-stdin"),
-    mintId: () => `id-${(n += 1)}`,
+    mintId: () => `00000000-0000-4000-8000-${String((n += 1)).padStart(12, "0")}`,
     ...over,
   };
 }
@@ -351,8 +351,15 @@ test("a prompt file is read in the CALLER's pod relative to its cwd, and becomes
     "--prompt-file",
     "-",
     "--record-id",
-    "id-2",
+    "00000000-0000-4000-8000-000000000001",
+    "--created-by-call",
+    "00000000-0000-4000-8000-000000000002",
   ]);
+  assert.equal(
+    call.body.call_id,
+    "00000000-0000-4000-8000-000000000002",
+    "the request's call_id IS the created-by call (F-1)",
+  );
   assert.equal(
     Buffer.from(call.body.stdin_b64 as string, "base64").toString(),
     "file:/workspace/projects/x/b.md",
@@ -361,7 +368,7 @@ test("a prompt file is read in the CALLER's pod relative to its cwd, and becomes
   assert.deepEqual((inline.body.argv as string[]).slice(0, 3), [
     "sessions",
     "new",
-    "--prompt-file",
+    "--prompt-file=-",
   ]);
   const fromStdin = buildPassThroughCall(input(["sessions", "new", "--prompt-file", "-"]));
   assert.equal(
@@ -466,7 +473,16 @@ test("--brief outside /wisdom and /workspace is refused as brief_not_shared — 
 
 test("--record-id goes BEFORE a `--` terminator, and only creates that take one get it", () => {
   const call = buildPassThroughCall(input(["sessions", "new", "--", "--weird"]));
-  assert.deepEqual(call.body.argv, ["sessions", "new", "--record-id", "id-2", "--", "--weird"]);
+  assert.deepEqual(call.body.argv, [
+    "sessions",
+    "new",
+    "--record-id",
+    "00000000-0000-4000-8000-000000000001",
+    "--created-by-call",
+    "00000000-0000-4000-8000-000000000002",
+    "--",
+    "--weird",
+  ]);
   const store = buildPassThroughCall(
     input(["seats", "rename", "s", "n"], {
       commandPath: "seats rename",
