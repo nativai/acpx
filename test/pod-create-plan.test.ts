@@ -15,6 +15,7 @@ import {
   type SleepingPlanState,
 } from "../src/pod/create-plan.js";
 import { cloneSessionAcpxState } from "../src/session/conversation-model.js";
+import { parseSessionRecord } from "../src/session/persistence.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence/serialize.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
 import {
@@ -271,6 +272,144 @@ test("R2-F2: a damaged plan keeps its RAW value in memory and the record seriali
     }),
   ) as { acpx: { sleeping: unknown } };
   assert.deepEqual(valid.acpx.sleeping, CUT);
+});
+
+/** The values of a PRESENT `acpx.sleeping` that are not a valid mark: the K7 shape's `since`, and the value itself (R3-F1). */
+const INVALID_MARK: Array<{ name: string; value: unknown }> = [
+  {
+    name: "since: 42",
+    value: { since: 42, plan: 1, fork: { from: "s", cut: { message_index: 2 } } },
+  },
+  {
+    name: 'since: ""',
+    value: { since: "", plan: 1, fork: { from: "s", cut: { message_index: 2 } } },
+  },
+  { name: "since absent", value: { plan: 1, fork: { from: "s", cut: { message_index: 2 } } } },
+  { name: "acpx.sleeping: true", value: true },
+  { name: "acpx.sleeping: 42", value: 42 },
+  { name: 'acpx.sleeping: "x"', value: "x" },
+  { name: "acpx.sleeping: null", value: null },
+  { name: "acpx.sleeping: [ … ]", value: [{ since: "t" }] },
+];
+
+/** A persisted-shape record, as parseSessionRecord reads it: a never-woken copy, or one with a real session id. */
+function persistedRecord(acpSessionId: string, sleeping: unknown): Record<string, unknown> {
+  return {
+    schema: "acpx.session.v1",
+    acpx_record_id: "r3-record",
+    acp_session_id: acpSessionId,
+    agent_command: "agent",
+    cwd: "/tmp",
+    created_at: "2026-11-21T00:00:00.000Z",
+    last_used_at: "2026-11-21T00:00:00.000Z",
+    last_seq: 0,
+    event_log: {
+      active_path: "/tmp/r3.stream.ndjson",
+      segment_count: 1,
+      max_segment_bytes: 1024,
+      max_segments: 1,
+      last_write_at: null,
+      last_write_error: null,
+    },
+    closed: false,
+    messages: [],
+    updated_at: "2026-11-21T00:00:00.000Z",
+    cumulative_token_usage: {},
+    request_token_usage: {},
+    acpx: { sleeping },
+  };
+}
+
+test("R3-F1: on a record that NEVER RAN (acp_session_id \"\"), a PRESENT acpx.sleeping that is not a valid mark is a damaged plan — plan -1, the raw value kept and written back unchanged — not 'not sleeping'", () => {
+  for (const { name, value } of INVALID_MARK) {
+    const parsed = parseSessionRecord(persistedRecord("", value));
+    assert.ok(parsed, `${name}: the record still parses`);
+    const sleeping = parsed.acpx?.sleeping;
+    assert.ok(sleeping, `${name}: it reads as a (damaged) plan, never as 'not sleeping'`);
+    assert.equal(sleeping.plan, -1, `${name}: plan -1`);
+    assert.equal(sleeping.fork, undefined, `${name}: nothing executable`);
+    assert.throws(
+      () => assertKnownPlanVersion(sleeping, "r3-record"),
+      (error: Error) => error.message.startsWith(CREATE_PLAN_UNSUPPORTED),
+      `${name}: the wake refuses by name`,
+    );
+    const persisted = serializeSessionRecordForDisk(parsed) as { acpx: { sleeping: unknown } };
+    assert.deepEqual(
+      persisted.acpx.sleeping,
+      value,
+      `${name}: the raw value is what reaches the disk`,
+    );
+  }
+  // The control: an ABSENT acpx.sleeping on a never-run record is untouched (nothing is "present").
+  const absent = parseSessionRecord({ ...persistedRecord("", undefined), acpx: {} });
+  assert.equal(absent?.acpx?.sleeping, undefined);
+});
+
+test("R3-F1 control: a record with a REAL acp_session_id keeps today's K7 reading — the same invalid values read as 'not sleeping', so behaviour outside the record-only shape does not change", () => {
+  for (const { name, value } of INVALID_MARK) {
+    const parsed = parseSessionRecord(persistedRecord("real-provider-session", value));
+    assert.ok(parsed, `${name}: the record parses`);
+    assert.equal(parsed.acpx?.sleeping, undefined, `${name}: not sleeping, exactly as before`);
+  }
+  // And a valid K7-shape mark on a real session id is kept (the stray-flag path the wake already handles).
+  const stray = parseSessionRecord(
+    persistedRecord("real-provider-session", { since: "2026-11-21T00:00:00.000Z" }),
+  );
+  assert.equal(stray?.acpx?.sleeping?.since, "2026-11-21T00:00:00.000Z");
+});
+
+test('R3-F1 through a real wake: a cut record whose acpx.sleeping is damaged (since 42, since "", sleeping: true) is refused CREATE_PLAN_UNSUPPORTED — no misleading reconnect error — and the record is unchanged except the four stream counters, the damaged value included', async () => {
+  const f = makeBox({ requestMib: 4000 });
+  const source = await warmTarget(f, 2);
+  const edits: Array<{ name: string; edit: (acpx: Record<string, unknown>) => void }> = [
+    {
+      name: "since: 42",
+      edit: (acpx) => {
+        (acpx.sleeping as Record<string, unknown>).since = 42;
+      },
+    },
+    {
+      name: 'since: ""',
+      edit: (acpx) => {
+        (acpx.sleeping as Record<string, unknown>).since = "";
+      },
+    },
+    {
+      name: "acpx.sleeping: true",
+      edit: (acpx) => {
+        acpx.sleeping = true;
+      },
+    },
+  ];
+  for (const { name, edit } of edits) {
+    const created = await withAtrium(f, async (env) =>
+      runCli(
+        [...base(f), "sessions", "copy", "--from", source, "--at-log-index", "2"],
+        env,
+        f.root,
+      ),
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const id = lastJson(created.stdout).acpxRecordId;
+    const file = recordPath(f, id);
+    const record = JSON.parse(fs.readFileSync(file, "utf8")) as { acpx: Record<string, unknown> };
+    edit(record.acpx);
+    fs.writeFileSync(file, JSON.stringify(record));
+    const before = JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
+    const wake = await runCli([...base(f), "prompt", "--session-id", id, "x"], f.env, f.root);
+    assert.notEqual(wake.code, 0, name);
+    assert.match(
+      wake.stdout + wake.stderr,
+      /CREATE_PLAN_UNSUPPORTED/u,
+      `${name}: refused by name, not a model-replay error`,
+    );
+    assert.deepEqual(
+      withoutStreamBookkeeping(readRecord(f, id)),
+      withoutStreamBookkeeping(before),
+      `${name}: acpx.sleeping (the damaged value) and everything else is as it was before the wake`,
+    );
+    assert.equal((readRecord(f, id) as PlanRecord).acp_session_id, "", `${name}: still never run`);
+  }
 });
 
 test("M-1 / R2-F1 / R2-F2 through a real wake: a record with ANY damaged plan field is refused by name, stays sleeping, is not cut by position and does not become a fresh agent — and its plan on disk is exactly what was there before the wake", async () => {
