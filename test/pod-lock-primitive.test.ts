@@ -406,6 +406,8 @@ test("NG-K7.2e negative: with no own pod identity the sweep removes no lock", as
 test("NFS: a tombstone link that fails with ESTALE (another client unlinked the lock) is a retry, never a crash", async () => {
   // Measured across the control pod and a workbench (verification/cross-machine, run 20261121T115728Z):
   // errno 116 from link(lock, tomb) crashed 8 of 80 racers before this was handled.
+  // ⚠️ KEEP THE MOCK'S SHAPE REAL (below): the first version threw `code: "ESTALE"`, which Node never
+  // produces, and stayed green while 12 of 160 racers still crashed on the real thing.
   useDeps("gone");
   const dir = tmpDir();
   const lock = path.join(dir, "x.json.lock");
@@ -415,10 +417,14 @@ test("NFS: a tombstone link that fails with ESTALE (another client unlinked the 
   const link = mock.method(fsp, "link", async (from: string, to: string) => {
     if (to.includes(".tomb.") && staleThrown === 0) {
       staleThrown += 1;
-      throw Object.assign(new Error("ESTALE: stale file handle, link"), {
-        code: "ESTALE",
-        errno: -116,
-      });
+      // The REAL shape (measured on NFS, run 20261121T120254Z): libuv has no name for 116, so `code`
+      // is NOT "ESTALE" — a mock with code "ESTALE" passed while the product still crashed.
+      throw Object.assign(
+        new Error(
+          `Unknown system error -116: Unknown system error -116, link '${from}' -> '${to}'`,
+        ),
+        { code: "Unknown system error -116", errno: -116, syscall: "link" },
+      );
     }
     return await realLink(from, to);
   });

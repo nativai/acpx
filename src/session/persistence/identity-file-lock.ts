@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { proveDeath, DEATH_PROOF_TIMEOUT_MS, type DeathProof } from "../../pod/death-proof.js";
 import {
@@ -94,6 +95,8 @@ const DEATH_PROOF_RETRY_MS = 1_000;
  * (`describeWedge`). ⚠️ DO NOT "FIX" THE WEDGE BY AGE — `test/pod-lock-primitive.test.ts` "wedge".
  */
 export const TOMBSTONE_STALE_MS = 60_000;
+/** Linux `ESTALE` (116): an NFS file handle whose file another client removed. */
+const ESTALE_ERRNO = os.constants.errno.ESTALE ?? 116;
 const TOMBSTONE_PATTERN = /\.tomb\.[0-9a-f]{16}$/;
 
 /** Everything the cross-pod rules read from outside. Swappable ONLY by tests. */
@@ -246,8 +249,10 @@ async function lockAgeMs(lockPath: string): Promise<number> {
  * "the lock changed under us": retry.
  */
 function isGoneError(error: unknown): boolean {
-  const code = (error as NodeJS.ErrnoException)?.code;
-  return code === "ENOENT" || code === "ESTALE";
+  const { code, errno } = (error ?? {}) as NodeJS.ErrnoException;
+  // ⚠️ MATCH ESTALE BY ERRNO, NOT BY `code`: libuv has no name for it, so Node reports
+  // `code: "Unknown system error -116"` (measured) — a `code === "ESTALE"` check never fires.
+  return code === "ENOENT" || code === "ESTALE" || errno === -ESTALE_ERRNO;
 }
 
 /**
