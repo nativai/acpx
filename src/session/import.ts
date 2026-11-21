@@ -54,6 +54,10 @@ export type ImportSessionOptions = {
   newCwd?: string;
   expectedAgentName?: string;
   expectedAgentCommand?: string;
+  /** `--record-id`: the new record's id, chosen by the caller (C6.2); refused when it exists. */
+  recordId?: string;
+  /** Written into the new record's metadata in the import's own write (`created_by_call`, C6.2). */
+  metadata?: Record<string, string>;
 };
 
 class SessionImportError extends AcpxOperationalError {
@@ -107,6 +111,42 @@ function parseArchive(raw: string): ParsedExportedSession {
         `Invalid session export archive: ${error.issues[0]?.message}`,
         "invalid-archive",
       );
+    }
+    throw error;
+  }
+}
+
+/** The caller's `--record-id` (C6.2), refused when a record already has it — else a fresh one. */
+async function importRecordId(sessionsDir: string, requested: string | undefined): Promise<string> {
+  if (requested === undefined) {
+    return await generateRecordId(sessionsDir);
+  }
+  if (await recordFileExists(sessionsDir, requested)) {
+    throw importError(
+      "record-id destination already exists; refusing to import another session",
+      "record-exists",
+    );
+  }
+  return requested;
+}
+
+/** `created_by_call` (C6.2) rides the import's own write. */
+function withCallerMetadata(
+  record: SessionRecord,
+  metadata: Record<string, string> | undefined,
+): void {
+  if (metadata && Object.keys(metadata).length > 0) {
+    record.metadata = { ...record.metadata, ...metadata };
+  }
+}
+
+async function recordFileExists(sessionsDir: string, recordId: string): Promise<boolean> {
+  try {
+    await fs.access(path.join(sessionsDir, `${encodeURIComponent(recordId)}.json`));
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
     }
     throw error;
   }
@@ -358,11 +398,12 @@ export async function importSession(
   // brick 45917618 §5.2 E3: an imported session is a new agent session — it starts at the session
   // root; `importedFrom.cwdOriginal` keeps where it came from.
   const cwd = effectiveCreateCwd(resolveImportedCwd(parsed.session.cwd_relative, options.newCwd));
-  const newRecordId = await generateRecordId(sessionsDir);
+  const newRecordId = await importRecordId(sessionsDir, options.recordId);
   const newRecord = buildImportedRecord(parsed, sourceRecord, {
     newRecordId,
     cwd,
   });
+  withCallerMetadata(newRecord, options.metadata);
 
   await assertProviderSessionAvailable(newRecord);
   if (parsed.messages_log) {

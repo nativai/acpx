@@ -203,6 +203,12 @@ export type SessionCreateOptions = {
    * `forkFromSessionId` the first wake forks that template; without it, a fresh session.
    */
   sleeping?: boolean;
+  /**
+   * C1.3 — pod mode (on the control pod): EVERY create form is record-only and writes the create plan
+   * into `acpx.sleeping` (`src/pod/create-plan.ts`); a resume writes its `acpSessionId` and is not
+   * sleeping. Nothing is started. `byway` marks a by-the-way fork in the plan.
+   */
+  recordOnly?: { byway?: boolean };
 } & TimedRunOptions;
 
 export type SessionSendOptions = {

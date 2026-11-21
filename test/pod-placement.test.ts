@@ -435,13 +435,24 @@ function startedAnything(home: string): string[] {
 test("CLI: EVERY bridge-capable path refuses on the control pod in pod mode, nothing started", () => {
   const home = podHome();
   const env = podEnv(home);
+  // Class `create` is built (block A2, `record-only-create`): on the control pod it writes the record
+  // only — asserted below as "nothing started, never the unbuilt-branch refusal"; the record-only
+  // behaviour itself is held by `test/pod-create-plan.test.ts`.
   const bridgeCapable = Object.entries(COMMAND_TABLE).filter(
     ([p, e]) =>
-      p !== "" &&
-      p !== "<agent>" &&
-      ["owner-ensure", "owner-if-pod", "create", "one-shot"].includes(e.class),
+      p !== "" && p !== "<agent>" && ["owner-ensure", "owner-if-pod", "one-shot"].includes(e.class),
   );
-  assert.ok(bridgeCapable.length >= 15, "vacuous");
+  assert.ok(bridgeCapable.length >= 11, "vacuous");
+  const creates = Object.entries(COMMAND_TABLE).filter(([, e]) => e.class === "create");
+  assert.ok(creates.length >= 4, "vacuous");
+  // In a home of their own: a create WRITES a record (that is its job), so "started" there means a
+  // queue lease — never one.
+  const createHome = podHome();
+  for (const [p] of creates) {
+    const r = run(p.split(" "), podEnv(createHome));
+    assert.doesNotMatch(r.stderr, /pod_branch_unbuilt/u, p);
+  }
+  assert.ok(!startedAnything(createHome).includes("queues"), "a create started no owner");
   for (const [p] of bridgeCapable) {
     // No operands: the placement step refuses before commander would ask for them.
     const r = run(p.split(" "), env);
