@@ -3983,7 +3983,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   let connecting = false;
   // C1.3 / L-1 — TRUE once a SLEEPING record's first wake was REFUSED (a cut it cannot execute, a
   // plan it does not know): no agent ran, so the closing legs below must not write the dead adapter's
-  // lifecycle (pid, birth identity, start time, OS observation) onto the record that "stays as created".
+  // lifecycle (pid, birth identity, start time, OS observation) onto the record that stays as created (except the
+  // event-stream counters, which describe the events really appended — see `connectAndLoadSession`).
   let wakeRefused = false;
   const mergeLatestDurablePreferences = (
     persisted: PersistedSessionLifecycle | undefined,

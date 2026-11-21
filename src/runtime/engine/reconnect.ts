@@ -479,7 +479,10 @@ function restoreOriginalSessionState(params: {
  * it: ONE ordered step before the batch's `session/prompt`, in which a fresh `session/new` (or the
  * template fork) is followed by the requested model, effort, mode and config exactly once
  * (the preference replay below IS that step; the prompt path never applies the model again), and
- * only then is `acpx.sleeping` deleted. Any failure leaves the record sleeping, byte for byte.
+ * only then is `acpx.sleeping` deleted. Any failure leaves the record sleeping and unchanged except the event-stream counters `last_seq`, `last_request_id`, `last_used_at` and `event_log.last_write_at`: those four
+ * are the stream's own bookkeeping for the refused attempt's turn log (and a failed delivery's terminal,
+ * C1.3), which really is appended to the stream, so rewinding them would desync the sequence from the file.
+ * Test: `test/pod-create-plan.test.ts` → "L-1".
  */
 export async function connectAndLoadSession(
   options: ConnectAndLoadSessionOptions,
@@ -520,7 +523,7 @@ export async function connectAndLoadSession(
  * C1.3 / L-1 — what a first wake writes about the AGENT RUN it starts: the adapter's pid and birth
  * identity, its start time, the prompt time `onConnectedRecord` stamps, and the OS-observation keys
  * `applyLifecycleSnapshotToRecord` puts in the metadata. A REFUSED wake (a cut that cannot be executed)
- * never ran an agent, so none of it may stay on a sleeping record: "the record stays as created".
+ * never ran an agent, so none of it may stay on a sleeping record: the record stays as created, unchanged except the event-stream counters `last_seq`, `last_request_id`, `last_used_at` and `event_log.last_write_at`.
  *
  * ⚠️ DELIBERATELY NOT HERE: `last_seq`, `last_request_id`, `last_used_at`, `event_log.last_write_at`.
  * They are the stream's own bookkeeping, and the refused attempt's turn log (and a failed delivery's

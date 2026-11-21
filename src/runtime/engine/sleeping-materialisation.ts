@@ -75,7 +75,7 @@ export async function forkTemplateForSleepingSession(params: {
   // The first wake is the moment this session is created, so its cwd goes through the session-root
   // helper like every other create site. The sleeping create already rooted `record.cwd`, so on an
   // unchanged box this is the same path (the record is left untouched, so a failed wake stays
-  // byte for byte as the sleeping create wrote it).
+  // as the sleeping create wrote it, except the event-stream counters: see `connectAndLoadSession`).
   const cwd = effectiveCreateCwd(params.record.cwd);
   const forked =
     forkAtMessageIndex === 0
@@ -109,7 +109,7 @@ export async function forkTemplateForSleepingSession(params: {
  * - **Unanchored** (Pi, Codex): `expect_entry` is re-checked against the source on disk
  *   (`FORK_CUT_MOVED` when it moved), then the adapter forks at the absolute index.
  *
- * Every refusal is named and leaves the record sleeping (the caller restores it byte for byte).
+ * Every refusal is named and leaves the record sleeping, unchanged except the event-stream counters `last_seq`, `last_request_id`, `last_used_at` and `event_log.last_write_at` (the caller restores it).
  */
 export async function forkCutForSleepingSession(params: {
   client: AcpClient;
