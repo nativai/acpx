@@ -49,6 +49,8 @@ export type BranchDeps = {
   harnessOf: (agentCommand: string) => string | undefined;
   lookup: AgentPodLookup;
   releases: () => ResolveReleasesResult;
+  /** The target session's URL for the broker's Job annotation (C4 `sessionUrl`); may read the box's base URL. */
+  sessionUrl?: (sessionId: string) => string | undefined;
   /** Where payload files go; absent = the production directory. A test seam, see `liveDeps`. */
   payloadDir?: string;
   admissionClass: () => string | undefined;
@@ -155,10 +157,20 @@ export async function planPayload(
   return { text: await deps.readStdin(), argvFor: (p) => appendFileFlag(argv, p) };
 }
 
+/**
+ * C2 (A-24): the routed `argv` is the WHOLE command — `argv[0]` is the string `acpx`, which the pod's
+ * entry executes and resolves on the pod's PATH to the release C9 pinned; `argv[1…]` are acpx's own
+ * arguments, unchanged. Never a path of our own. ⚠️ Sending the arguments alone made the pod run
+ * `claude …` / `prompt …` / `cancel …` as a program (TE F-1).
+ */
+export const ROUTED_PROGRAM = "acpx";
+
 function sessionTarget(record: RoutedRecord, deps: BranchDeps) {
   const admissionClass = deps.admissionClass();
+  const sessionUrl = deps.sessionUrl;
   return {
     sessionId: record.acpxRecordId,
+    ...(sessionUrl ? { sessionUrl: () => sessionUrl(record.acpxRecordId) } : {}),
     seat: record.seatId ?? record.acpxRecordId,
     harness: deps.harnessOf(record.agentCommand) as AgentHarness,
     ...(admissionClass ? { admissionClass } : {}),
@@ -228,7 +240,9 @@ function runOptions(
     class: routedClass,
     key,
     target: sessionTarget(ready.record, deps),
-    argv: plan ? plan.argvFor : ready.argv,
+    argv: plan
+      ? (payloadPath: string | undefined) => [ROUTED_PROGRAM, ...plan.argvFor(payloadPath)]
+      : [ROUTED_PROGRAM, ...ready.argv],
     cwd: deps.cwd(),
     env: deps.env,
     lookup: deps.lookup,
@@ -243,6 +257,11 @@ async function dispatchRouted(
   deps: BranchDeps,
   routedClass: "owner-ensure" | "owner-if-pod",
 ): Promise<number | "proceed"> {
+  if (deps.env.ACPX_ROUTED === "1") {
+    // A command that arrived in a pod already routed is never routed again (A-8 `routed_twice`).
+    const { RoutedTwiceRefusal } = await import("./pod-refusal.js");
+    return await deps.fail(new RoutedTwiceRefusal(), decision.classification.output);
+  }
   const ready = await readyOrFail(decision, deps, routedClass);
   if (typeof ready === "number") {
     return ready;
@@ -313,6 +332,7 @@ function testPayloadDir(env: NodeJS.ProcessEnv): string | undefined {
 }
 
 async function liveDeps(): Promise<BranchDeps> {
+  const authEnv = await import("../acp/auth-env.js");
   const [
     { createAgentPodLookup },
     routed,
@@ -355,6 +375,10 @@ async function liveDeps(): Promise<BranchDeps> {
     lookup: createAgentPodLookup(process.env),
     releases: () => routed.resolveReleases(testRuntimeDir(process.env)),
     payloadDir: testPayloadDir(process.env),
+    sessionUrl: (id) => {
+      const base = authEnv.resolveAcpxUiBaseUrl(process.env);
+      return base ? `${base}/?session=${encodeURIComponent(id)}` : undefined;
+    },
     admissionClass: () => admission.declaredAdmissionClass(),
     run: routed.runRoutedCall,
     fail: failLikeAcpx,

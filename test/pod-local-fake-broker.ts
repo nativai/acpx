@@ -16,6 +16,8 @@ export type Script = {
   perPost?: string[][];
   /** The answer to `GET /v1/agents` when the same broker is also asked for it. */
   agents?: unknown;
+  /** `GET /v1/agents` never answers. */
+  agentsHang?: boolean;
   /** The answer to `DELETE /v1/agents/<key>?uid=…`. */
   del?: { status?: number; body?: string };
 };
@@ -42,6 +44,9 @@ export async function startBroker(
       if (req.method === "DELETE" && script.del !== undefined) {
         res.writeHead(script.del.status ?? 200, { "content-type": "text/plain" });
         res.end(script.del.body ?? "");
+        return;
+      }
+      if (req.method === "GET" && script.agentsHang) {
         return;
       }
       if (req.method === "GET" && script.agents !== undefined) {

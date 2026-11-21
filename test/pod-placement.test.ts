@@ -766,6 +766,16 @@ test("F1 CLI: `acpx help …` on the control pod is a prompt — refused at the 
     [],
     "no index, no ledger — a help prompt that names no session writes nothing",
   );
+  // The form that NAMES a session resolves it on the control pod (its own store): at most its own
+  // session index may appear — never a ledger, a lease, a queue or any started owner (TE L-1).
+  const named = podHome();
+  const third = run(["claude", "--session-id", "X", "help", "me"], podEnv(named));
+  assert.equal(third.status, 1);
+  assert.deepEqual(
+    tree(named).filter((f) => f !== ".acpx/sessions/index.json"),
+    [],
+    "a help prompt naming a session writes at most the control pod's own index",
+  );
   // And under pod_identity_missing a `help` prompt is NOT "diagnosable": it refuses.
   const r = run(["help", "me"], podEnv(podHome(), { NV_POD_UID: undefined }));
   assert.equal(r.status, 2);

@@ -11,13 +11,16 @@
  * The loopback is materialised from the local `.bare` at ONE pin (below) with `git archive`;
  * nothing of infra's is vendored. When infra moves the pin, only ARGOCD_PIN changes.
  */
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { CapacityRefusedError } from "../src/errors.js";
 import { RoutedCallError } from "../src/pod/pod-refusal.js";
-import { type RoutedCallOptions, runRoutedCall } from "../src/pod/routed-call.js";
+import { agentPodKey, type RoutedCallOptions, runRoutedCall } from "../src/pod/routed-call.js";
+import { makeSessionRecord, writeSessionRecordFile } from "../test/runtime-test-helpers.js";
 
 const ARGOCD_PIN = "7c7e34e4";
 const ARGOCD_BARE = "/workspace/projects/argocd-master-application/.bare";
@@ -68,9 +71,12 @@ function loopback(script: string, args: string[]): string {
   return sh(script, args);
 }
 
+/** The session the CLI rows are about; the loopback pod is started under ITS key. */
+const CLI_SESSION = "11111111-1111-4111-8111-111111111111";
+
 function startLoopback(script: string, root: string): Loopback {
   const kv = Object.fromEntries(
-    loopback(script, ["start"])
+    loopback(script, ["start", "--key", agentPodKey(CLI_SESSION)])
       .split("\n")
       .filter((line) => line.includes("="))
       .map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]),
@@ -107,7 +113,9 @@ async function observe(lb: Loopback, overrides: Partial<RoutedCallOptions>): Pro
       target: { sessionId: "gate-session", seat: "gate-seat", harness: "claude" },
       argv: ["true"],
       cwd: "/workspace",
-      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: os.homedir() },
+      // The WHOLE caller environment, canaries included, as production hands it over: acpx's own wall
+      // (`buildTransportEnv`) has to keep them out, not a pre-scrubbed copy (TE I-1).
+      env: process.env,
       lookup: async () => ({
         state: "exists",
         uid: lb.uid,
@@ -256,6 +264,154 @@ async function runCase(lb: Loopback, script: string, testCase: Case): Promise<st
   }
 }
 
+// ───────────── the REAL CLI → REAL agent-exec → REAL pod entry → an `acpx` in the pod (TE F-1) ─────────────
+
+const POD_STUB_ACPX = `#!/usr/bin/env bash
+printf 'STUB-ACPX routed=%s canary=%s\\n' "$ACPX_ROUTED" "\${GATE_SECRET_TOKEN:-none}"
+printf '%s\\n' "$@"
+`;
+
+type PodApi = { url: string; close(): void };
+
+/** A fake API server that says the loopback pod is Ready (the lookup's one question). */
+async function startFakeApi(lb: Loopback): Promise<PodApi> {
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        items: [
+          {
+            metadata: { uid: lb.uid },
+            status: {
+              phase: "Running",
+              podIP: "127.0.0.1",
+              conditions: [
+                { type: "Ready", status: "True", lastTransitionTime: new Date().toISOString() },
+              ],
+            },
+          },
+        ],
+      }),
+    );
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  return { url: `http://127.0.0.1:${port}`, close: () => server.close() };
+}
+
+type CliCase = { label: string; argv: string[]; want: string[] };
+
+const CLI_CASES: CliCase[] = [
+  {
+    label: "CLI `claude prompt` → the pod runs `acpx claude prompt …` (the verb arrives)",
+    argv: ["claude", "prompt", "--session-id", CLI_SESSION, "hello"],
+    want: ["claude", "prompt", "--session-id", CLI_SESSION, "hello"],
+  },
+  {
+    label: "CLI `prompt` → the pod runs `acpx prompt …`",
+    argv: ["prompt", "--session-id", CLI_SESSION, "hello"],
+    want: ["prompt", "--session-id", CLI_SESSION, "hello"],
+  },
+  {
+    label: "CLI `cancel` (owner-if-pod) → the pod runs `acpx cancel …`",
+    argv: ["cancel", "--session-id", CLI_SESSION],
+    want: ["cancel", "--session-id", CLI_SESSION],
+  },
+];
+
+function runChild(
+  command: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, {
+      env,
+      cwd: process.cwd(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+    const timer = setTimeout(() => child.kill("SIGKILL"), 120_000);
+    child.on("close", (status) => {
+      clearTimeout(timer);
+      resolve({ status, stdout, stderr });
+    });
+  });
+}
+
+async function runCliCase(
+  lb: Loopback,
+  api: PodApi,
+  home: string,
+  saDir: string,
+  testCase: CliCase,
+): Promise<string | undefined> {
+  const tsx = path.join(process.cwd(), "node_modules", ".bin", "tsx");
+  // ASYNC spawn: the fake API server lives in THIS process, so a blocking spawn would starve it.
+  const result = await runChild(tsx, ["src/cli.ts", ...testCase.argv], {
+    PATH: process.env.PATH ?? "/usr/bin:/bin",
+    HOME: home,
+    // The seams of A1's pod mode, honoured only under node --test: the CLI is run as a test child.
+    NODE_TEST_CONTEXT: "child",
+    ACPX_OWNER_PLACEMENT: "pod",
+    ACPX_POD_TEST_HOME: home,
+    NV_POD_NAME: "dev-server-gate",
+    NV_POD_UID: "ctl-uid-gate",
+    NV_NODE_NAME: "node-gate",
+    ACPX_POD_SA_DIR: saDir,
+    ACPX_POD_API_URL: api.url,
+    ACPX_AGENT_EXEC: lb.wrapper,
+    ACPX_UI_BASE_URL: "https://atrium.gate.invalid",
+    // A canary handed to the CLI: acpx's own wall must keep it out of the pod.
+    GATE_SECRET_TOKEN: "must-not-travel",
+  });
+  const wantOut = `STUB-ACPX routed=1 canary=none\n${testCase.want.join("\n")}\n`;
+  if (result.status !== 0) {
+    return `exit ${result.status}: ${result.stderr.slice(0, 300)}`;
+  }
+  return result.stdout === wantOut ? undefined : `stdout ${JSON.stringify(result.stdout)}`;
+}
+
+async function runCliCases(lb: Loopback, script: string, root: string): Promise<number> {
+  const stubDir = path.join(root, "pod-bin");
+  fs.mkdirSync(stubDir, { recursive: true });
+  fs.writeFileSync(path.join(stubDir, "acpx"), POD_STUB_ACPX, { mode: 0o755 });
+  // The pod resolves `acpx` on its PATH (C2/C8): put the stub first — through the pod's environment file.
+  loopback(script, ["set", lb.dir, "env-add", `PATH=${stubDir}:/usr/local/bin:/usr/bin:/bin`]);
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pod-loopback-gate-home-"));
+  const saDir = fs.mkdtempSync(path.join(os.tmpdir(), "pod-loopback-gate-sa-"));
+  fs.writeFileSync(path.join(saDir, "namespace"), "dev-gate\n");
+  fs.writeFileSync(path.join(saDir, "token"), "gate-token\n");
+  await writeSessionRecordFile(
+    home,
+    makeSessionRecord({
+      acpxRecordId: CLI_SESSION,
+      acpSessionId: CLI_SESSION,
+      agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+      cwd: "/workspace",
+    }),
+  );
+  const api = await startFakeApi(lb);
+  let failures = 0;
+  try {
+    for (const testCase of CLI_CASES) {
+      const problem = await runCliCase(lb, api, home, saDir, testCase);
+      process.stdout.write(
+        `${problem === undefined ? "ok     " : "FAILED "} ${testCase.label}${problem ? ` — ${problem}` : ""}\n`,
+      );
+      failures += problem === undefined ? 0 : 1;
+    }
+  } finally {
+    api.close();
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(saDir, { recursive: true, force: true });
+  }
+  return failures;
+}
+
 async function main(): Promise<void> {
   process.env.GATE_SECRET_TOKEN = "must-not-travel";
   process.env.ACPX_STATE_HOME = "/tmp/must-not-travel";
@@ -272,12 +428,14 @@ async function main(): Promise<void> {
       );
       failures += problem === undefined ? 0 : 1;
     }
+    failures += await runCliCases(lb, script, root);
   } finally {
     loopback(script, ["stop", lb.dir]);
     fs.rmSync(root, { recursive: true, force: true });
   }
+  const total = CASES.length + CLI_CASES.length;
   process.stdout.write(
-    `pod-loopback-gate: ${CASES.length - failures}/${CASES.length} cases matched (argocd pin ${ARGOCD_PIN})\n`,
+    `pod-loopback-gate: ${total - failures}/${total} cases matched (argocd pin ${ARGOCD_PIN})\n`,
   );
   process.exit(failures === 0 ? 0 : 1);
 }

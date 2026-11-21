@@ -8,9 +8,13 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import {
+  exitCodeForOutputErrorCode,
+  normalizeOutputError,
+} from "../src/acp/error-normalization.js";
 import { createAgentPodLookup, podFacts } from "../src/pod/agent-pod-lookup.js";
 import { classifyArgv } from "../src/pod/command-classes.js";
-import { RoutedCallError } from "../src/pod/pod-refusal.js";
+import { RoutedCallError, RoutedTwiceRefusal } from "../src/pod/pod-refusal.js";
 import {
   planPayload,
   PROMPT_REQUIRED_MESSAGE,
@@ -121,7 +125,11 @@ test("routed-ensure: the call goes to the session's key as class owner-ensure, w
   assert.ok(run);
   assert.equal(run.class, "owner-ensure");
   assert.equal(run.key, KEY);
-  assert.deepEqual(run.argv, argv);
+  assert.deepEqual(
+    run.argv,
+    ["acpx", ...argv],
+    "argv[0] is the string acpx, never a path (C2 A-24)",
+  );
   assert.deepEqual(run.releases, { ok: true, releases: { acpx: "r1" } });
   assert.deepEqual(run.target, {
     sessionId: SESSION,
@@ -474,6 +482,7 @@ type Pod = {
   calls(): Array<{ argv: string[]; payload?: string }>;
   closeAll(): void;
   brokerSeen: () => number;
+  brokerBodies: () => Array<Record<string, unknown>>;
 };
 
 async function podFixture(opts: {
@@ -492,6 +501,7 @@ async function podFixture(opts: {
     "claude-agent-acp",
     "codex-acp",
     "claude-pty-acp",
+    "pi",
     "pi-acp",
   ]) {
     fs.mkdirSync(path.join(runtime, ".releases", tool, "r"), { recursive: true });
@@ -550,6 +560,10 @@ async function podFixture(opts: {
       broker.close();
     },
     brokerSeen: () => broker.seen.length,
+    brokerBodies: () =>
+      broker.seen
+        .filter((r) => r.method === "POST")
+        .map((r) => JSON.parse(r.body) as Record<string, unknown>),
   };
 }
 
@@ -586,7 +600,10 @@ test("CLI pod mode: a prompt with no pod → the broker is asked, the call goes 
     assert.equal(pod.brokerSeen(), 1);
     const [call] = pod.calls();
     assert.ok(call);
+    // C2 (A-24): the routed argv is the WHOLE command — `acpx` (the string, never a path) and then
+    // acpx's own arguments unchanged. Without the program the pod ran `claude …` as a program (TE F-1).
     assert.deepEqual(call.argv.slice(call.argv.indexOf("--") + 1), [
+      "acpx",
       "claude",
       "prompt",
       "--session-id",
@@ -615,6 +632,7 @@ test("CLI pod mode: a READY pod never touches the broker; `--file -` travels as 
     assert.ok(call);
     assert.equal(call.payload, "text from stdin");
     const tail = call.argv.slice(call.argv.indexOf("--") + 1);
+    assert.equal(tail[0], "acpx");
     assert.equal(
       tail[tail.length - 1],
       call.argv[call.argv.indexOf("--payload") + 1],
@@ -677,6 +695,14 @@ test("CLI pod mode: owner-if-pod with a pod goes to it (cancel); with NO pod it 
     const routed = await cli(["cancel", "--session-id", SESSION], withPod.env);
     assert.equal(routed.code, 0, routed.stderr);
     assert.equal(routed.stdout, "cancelled-in-pod\n");
+    const cancelCall = withPod.calls()[0];
+    assert.ok(cancelCall);
+    assert.deepEqual(cancelCall.argv.slice(cancelCall.argv.indexOf("--") + 1), [
+      "acpx",
+      "cancel",
+      "--session-id",
+      SESSION,
+    ]);
     assert.equal(withPod.brokerSeen(), 0, "owner-if-pod never asks the broker");
   } finally {
     withPod.closeAll();
@@ -756,6 +782,71 @@ test("CLI pod mode: the failure keeps the command's output mode — json: error 
     assert.equal(strict.code, 1);
     assert.equal(strict.stderr, "");
     assert.ok(JSON.parse(strict.stdout.trim().split("\n")[0] ?? "{}").error);
+  } finally {
+    pod.closeAll();
+  }
+});
+
+// ───────────────────────── G-2: routed_twice ─────────────────────────
+
+test("routed_twice (A-8): a command that arrives ROUTED (ACPX_ROUTED=1) is never routed again — refused before anything is resolved or run", async () => {
+  const twice = harness({ env: { PATH: "/usr/bin", ACPX_ROUTED: "1" } });
+  const argv = ["claude", "prompt", "--session-id", SESSION, "hello"];
+  for (const branch of ["routed-ensure", "routed-if-pod"] as const) {
+    const exit = await routedBranchHandlers(twice.deps)[branch](decisionFor(argv));
+    assert.equal(exit, 1, "the stub printer returns 1");
+  }
+  assert.equal(twice.runs.length, 0);
+  const refusal = twice.failures[0];
+  assert.ok(refusal instanceof RoutedTwiceRefusal);
+  assert.equal(refusal.stderrLine, "acpx: REFUSED reason=routed_twice");
+  assert.equal(refusal.message.split("\n")[0], "acpx: REFUSED reason=routed_twice");
+  assert.equal(
+    exitCodeForOutputErrorCode(normalizeOutputError(refusal).code),
+    2,
+    "exit 2, like unclassified_command",
+  );
+  // The negative: the same command WITHOUT the marker is routed as usual (and ACPX_ROUTED=0 is no marker).
+  for (const env of [{ PATH: "/usr/bin" }, { PATH: "/usr/bin", ACPX_ROUTED: "0" }]) {
+    const normal = harness({ env });
+    await routedBranchHandlers(normal.deps)["routed-ensure"](decisionFor(argv));
+    assert.equal(normal.runs.length, 1, JSON.stringify(env));
+  }
+});
+
+test("CLI pod mode: ACPX_ROUTED=1 → `acpx: REFUSED reason=routed_twice` first line, exit 2, nothing asked, nothing sent", async () => {
+  const pod = await podFixture({ api: { items: [POD()] }, broker: { lines: [READY] } });
+  try {
+    const result = await cli(["claude", "prompt", "--session-id", SESSION, "hello"], {
+      ...pod.env,
+      ACPX_ROUTED: "1",
+    });
+    assert.equal(result.code, 2);
+    assert.equal(result.stderr.split("\n")[0], "acpx: REFUSED reason=routed_twice");
+    assert.equal(pod.brokerSeen(), 0);
+    assert.equal(pod.calls().length, 0);
+    // Control: without the marker the same command is routed.
+    const routed = await cli(["claude", "prompt", "--session-id", SESSION, "hello"], pod.env);
+    assert.equal(routed.code, 0, routed.stderr);
+    assert.equal(pod.calls().length, 1);
+  } finally {
+    pod.closeAll();
+  }
+});
+
+test("C4 request: sessionUrl (the target's URL on the box's base URL) is sent; `seat` and `sessionId` too", async () => {
+  const pod = await podFixture({
+    api: { items: [] },
+    broker: { lines: ["scheduling", READY] },
+    stub: { exit: 0 },
+  });
+  try {
+    const env = { ...pod.env, ACPX_UI_BASE_URL: "https://atrium.test.invalid" };
+    const result = await cli(["claude", "prompt", "--session-id", SESSION, "hello"], env);
+    assert.equal(result.code, 0, result.stderr);
+    const body = pod.brokerBodies()[0];
+    assert.equal(body?.sessionUrl, `https://atrium.test.invalid/?session=${SESSION}`);
+    assert.equal(body?.sessionId, SESSION);
   } finally {
     pod.closeAll();
   }

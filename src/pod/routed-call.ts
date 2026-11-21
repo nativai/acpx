@@ -17,6 +17,7 @@ import {
   namespaceFromSources,
   readAgentBrokerOriginSources,
   resolveAgentBrokerOrigin,
+  type BrokerAgentsResult,
   type BrokerClientOptions,
   WAKE_BOUND_MS,
 } from "./broker-client.js";
@@ -97,7 +98,8 @@ export type RoutedCallTarget = {
   placement?: AgentPlacement;
   /** The caller's admission class, as declared (`declaredAdmissionClass()`); absent = a person. */
   admissionClass?: string;
-  sessionUrl?: string;
+  /** A function is evaluated only when the broker is about to be asked (it may read the box's base URL). */
+  sessionUrl?: string | (() => string | undefined);
   sessionName?: string;
   brick?: string;
 };
@@ -381,6 +383,11 @@ function isRefusalCandidate(firstLine: string): boolean {
 
 type EnsuredPod = { uid: string; ip?: string };
 
+function sessionUrlField(value: RoutedCallTarget["sessionUrl"]): { sessionUrl?: string } {
+  const url = typeof value === "function" ? value() : value;
+  return url ? { sessionUrl: url } : {};
+}
+
 function brokerRequestOf(
   options: RoutedCallOptions,
   releases: Record<string, string>,
@@ -396,26 +403,36 @@ function brokerRequestOf(
     placement: target.placement ?? "auto",
     class: brokerClassOf(target.admissionClass, options.class),
     releases,
-    ...(target.sessionUrl ? { sessionUrl: target.sessionUrl } : {}),
+    ...sessionUrlField(target.sessionUrl),
     ...(target.sessionName ? { sessionName: target.sessionName } : {}),
     ...(target.brick ? { brick: target.brick } : {}),
   };
 }
 
 type BrokerContext = {
+  /** The figures read started at `pool-at-maximum`, when it has settled; else undefined. */
+  agents: () => BrokerAgentsResult | undefined;
   brokerOptions: { origin: string; fetchImpl?: typeof fetch; wakeBoundMs: number };
   box: string;
   wake: string;
   callId: string;
 };
 
-/** The wake bound passed with the Job still on its way (C2 table: pod_starting, or agent_cap at the maximum). */
-async function wakeBoundRefusal(phase: BrokerStep | undefined, ctx: BrokerContext): Promise<Error> {
+/**
+ * The wake bound passed with the Job still on its way (C2 table: pod_starting, or agent_cap at the
+ * maximum). `agents` is the `GET /v1/agents` read that was started when the broker first said
+ * `pool-at-maximum` — it runs INSIDE the wake bound, so this path answers within the bound; an answer
+ * that has not arrived by now counts as no answer.
+ */
+function wakeBoundRefusal(
+  phase: BrokerStep | undefined,
+  ctx: BrokerContext,
+  agents: BrokerAgentsResult | undefined,
+): Error {
   if (phase !== "pool-at-maximum") {
     return podStartingRefusal({ phase: phase ?? "scheduling", wake: ctx.wake });
   }
-  const agents = await getAgents(ctx.brokerOptions);
-  if (!agents.ok) {
+  if (!agents?.ok) {
     return admissionBusyRefusal();
   }
   return agentCapRefusal({
@@ -466,7 +483,7 @@ async function brokerAnswerOutcome(
   if (answer.kind === "unavailable") {
     throw admissionBusyRefusal();
   }
-  throw await wakeBoundRefusal(answer.phase, ctx);
+  throw wakeBoundRefusal(answer.phase, ctx, ctx.agents());
 }
 
 /**
@@ -505,12 +522,21 @@ async function askBroker(options: RoutedCallOptions, callId: string): Promise<En
     fetchImpl: options.broker?.fetchImpl,
     wakeBoundMs: options.broker?.wakeBoundMs ?? testWakeBoundMs(options.env) ?? WAKE_BOUND_MS,
   };
-  const answer = await ensureAgentPod(
-    options.key,
-    brokerRequestOf(options, releases),
-    brokerOptions,
-  );
+  let agentsRead: BrokerAgentsResult | undefined;
+  const answer = await ensureAgentPod(options.key, brokerRequestOf(options, releases), {
+    ...brokerOptions,
+    // Started WHEN the pool is at its maximum, in parallel with the rest of the wait: it must not
+    // run after the wake bound (L-3).
+    onStep: (step) => {
+      if (step === "pool-at-maximum") {
+        void getAgents(brokerOptions).then((result) => {
+          agentsRead = result;
+        });
+      }
+    },
+  });
   const ctx: BrokerContext = {
+    agents: () => agentsRead,
     brokerOptions,
     box: boxOfNamespace(namespaceFromSources(sources)),
     wake: options.target.sessionId,
@@ -812,11 +838,11 @@ export const RELEASE_TOOLS_REQUIRED = [
   "claude-agent-acp",
   "codex-acp",
   "claude-pty-acp",
+  "pi",
   "pi-acp",
 ] as const;
-// ⚠️ `pi` and `pi-home` are NOT in `releases` until IM4 moves pi into the release layout (today it is
-// installed in place at $RUNTIME_DIR/pi and the agent entrypoint links both in place; stream HoD,
-// 2026-11-21). Add `pi` here, and to the required list of the test, when infra says it moved.
+// C9: `pi` IS required (stream HoD, 2026-11-22: the interim omission is withdrawn; only `pi-extensions`
+// is optional, A-12). `pi-home` is not a release tool and is never sent.
 export const RELEASE_TOOLS_OPTIONAL = ["pi-extensions"] as const;
 
 export type ResolveReleasesResult =

@@ -1033,7 +1033,15 @@ test("brokerClassOf: a person (interactive, or undeclared) is interactive; an ag
 
 test("releases (C9): the directory name each tool's link points to now; a missing or malformed required link is named", () => {
   const dir = fs.mkdtempSync(path.join(TMP_ROOT, "runtime-"));
-  const required = ["acpx", "acpx-ui", "claude-agent-acp", "codex-acp", "claude-pty-acp", "pi-acp"];
+  const required = [
+    "acpx",
+    "acpx-ui",
+    "claude-agent-acp",
+    "codex-acp",
+    "claude-pty-acp",
+    "pi",
+    "pi-acp",
+  ];
   for (const tool of required) {
     fs.mkdirSync(path.join(dir, ".releases", tool, `${tool}-rel`), { recursive: true });
     fs.symlinkSync(`.releases/${tool}/${tool}-rel`, path.join(dir, tool));
@@ -1180,17 +1188,38 @@ test("transport lines beyond the table (T1): bad_request → not_run; 124 DEADLI
   }
 });
 
-test("C9: `pi` and `pi-home` are not in `releases` until IM4 moves pi into the release layout, even when linked", () => {
+test("C9: `pi` is a REQUIRED tool and is sent in `releases`; `pi-home` is not a release tool and is never sent", () => {
+  assert.ok((RELEASE_TOOLS_REQUIRED as readonly string[]).includes("pi"));
   const dir = fs.mkdtempSync(path.join(TMP_ROOT, "runtime-pi-"));
-  for (const tool of [...RELEASE_TOOLS_REQUIRED, "pi", "pi-home"]) {
+  for (const tool of [...RELEASE_TOOLS_REQUIRED, "pi-home"]) {
     fs.mkdirSync(path.join(dir, ".releases", tool, "r"), { recursive: true });
     fs.symlinkSync(`.releases/${tool}/r`, path.join(dir, tool));
   }
   const result = resolveReleases(dir);
   assert.equal(result.ok, true);
   const names = Object.keys((result as { releases: Record<string, string> }).releases);
-  assert.equal(names.includes("pi"), false);
+  assert.equal(names.includes("pi"), true);
   assert.equal(names.includes("pi-home"), false);
+  // Negative: a `pi` that cannot be resolved fails — named, before the broker is asked.
+  fs.rmSync(path.join(dir, "pi"));
+  assert.deepEqual(resolveReleases(dir), { ok: false, tool: "pi" });
+});
+
+test("a required tool that cannot be resolved (pi) fails the call BEFORE the broker is asked, naming it", async () => {
+  const broker = await startBroker({ lines: [READY] });
+  try {
+    const options = ensureOptions(makeStub(), broker.origin, {
+      releases: { ok: false, tool: "pi" },
+    });
+    const error = await expectRouted(runRoutedCall(options));
+    assert.equal(
+      error.stderrLine,
+      `acpx: ROUTED outcome=not_run reason=release_unresolved tool=pi call_id=${options.callId}`,
+    );
+    assert.equal(broker.seen.length, 0);
+  } finally {
+    broker.close();
+  }
 });
 
 test("A-10: a utility pod's POST carries neither seat nor sessionId; a session's carries both", async () => {
@@ -1245,4 +1274,40 @@ test("C4 `error deleted`: the pod was deleted by a concurrent DELETE → pod_sta
   } finally {
     broker.close();
   }
+});
+
+test("L-3: the wake bound covers the WHOLE ensure — pool-at-maximum with a `GET /v1/agents` that never answers is admission_busy WITHIN the bound, not after it", async () => {
+  const broker = await startBroker({ lines: ["pool-at-maximum"], stall: true, agentsHang: true });
+  try {
+    const started = Date.now();
+    const refusal = await expectRefusal(
+      runRoutedCall(
+        ensureOptions(makeStub(), broker.origin, {
+          broker: { origin: broker.origin, wakeBoundMs: 1000 },
+        }),
+      ),
+    );
+    const elapsed = Date.now() - started;
+    assert.match(refusal.stderrLine, /^acpx: REFUSED reason=admission_busy /);
+    assert.ok(
+      elapsed < 1000 + 600,
+      `answered at ${elapsed} ms, the bound is 1000 ms (the figures read used to run AFTER it)`,
+    );
+  } finally {
+    broker.close();
+  }
+});
+
+test("L-2: the admission_busy sentence of the pod plane names the broker and the API server — not the admission lock, never `nothing queued`", async () => {
+  const refusal = await expectRefusal(
+    runRoutedCall(baseOptions(makeStub(), { lookup: async () => ({ state: "unknown" }) })),
+  );
+  const [token, sentence] = refusal.message.split("\n");
+  assert.match(
+    token ?? "",
+    /^acpx: REFUSED reason=admission_busy nothing_started=true protocol=1 /,
+  );
+  assert.match(sentence ?? "", /broker or the Kubernetes API server did not answer/);
+  assert.doesNotMatch(sentence ?? "", /admission lock|creations|nothing was started or queued/i);
+  assert.equal(refusal.message.split("\n").length, 2);
 });

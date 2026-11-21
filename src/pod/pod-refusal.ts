@@ -105,9 +105,39 @@ export function agentCapRefusal(input: {
   });
 }
 
-/** The existing line, for "the broker or the API server did not answer" (C2 table). */
+/**
+ * The existing token line — byte for byte — for "the broker or the API server did not answer" (C2
+ * table), with a sentence that says so: the shared builder's sentence blames the admission lock and
+ * says "nothing queued", neither of which is true in the pod plane (TE L-2).
+ */
 export function admissionBusyRefusal(): CapacityRefusedError {
-  return capacityRefusal("admission_busy");
+  const base = capacityRefusal("admission_busy");
+  const sentence =
+    "acpx: the broker or the Kubernetes API server did not answer, so the session's agent pod could not be checked or started. " +
+    "Nothing was started; the message stays queued and is delivered when they answer.";
+  return new CapacityRefusedError({
+    tokenLine: base.stderrLine,
+    sentence,
+    detail: { ...base.capacityRefusal, message: sentence },
+  });
+}
+
+/**
+ * `acpx: REFUSED reason=routed_twice` (exit 2, A-8): a command that arrived in a pod already routed
+ * (`ACPX_ROUTED=1`) was about to be routed again. Nothing was started. Usage-level: exit 2 by its
+ * output code, like `unclassified_command`.
+ */
+export class RoutedTwiceRefusal extends AcpxOperationalError {
+  readonly stderrLine = "acpx: REFUSED reason=routed_twice";
+
+  constructor() {
+    super(
+      "acpx: REFUSED reason=routed_twice\n" +
+        "This command was already routed to a pod and would be routed again; nothing was started. " +
+        "Run it in the pod that owns the session.",
+      { outputCode: "USAGE", detailCode: "routed-twice", origin: "cli" },
+    );
+  }
 }
 
 /**
