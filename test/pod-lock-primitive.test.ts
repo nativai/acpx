@@ -5,11 +5,14 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test, { mock } from "node:test";
+import { fileURLToPath } from "node:url";
 import { withStageLock, stageLockPath } from "../src/acp/fork-source-staging.js";
 import { queueLeaseGuardPath, withQueueLeaseMutation } from "../src/cli/queue/lease-mutation.js";
 import type { DeathProofDetail } from "../src/pod/death-proof.js";
 import type { LockHostPlace, PodIdentity } from "../src/pod/identity.js";
 import {
+  BREAK_MUTEX_NAME,
+  breakMutexNameFor,
   acquireIdentityFileLock,
   identityLockBody,
   lockBreakLedgerPath,
@@ -20,6 +23,9 @@ import {
   type IdentityLockPolicy,
 } from "../src/session/persistence/identity-file-lock.js";
 import { withRecordFileLock } from "../src/session/persistence/record-file-lock.js";
+import { makeServiceAccountDir, makeTestHome, runInPod } from "./pod-kit/two-pods.js";
+
+const CHILD = fileURLToPath(new URL("./fixtures/pod-lock-child.js", import.meta.url));
 
 // C3.2 as amended (A-3, A-4, A-5) — the lock primitive across pods (brick 8d85cb47; TEST-PLAN
 // NG-K7.2a/b/c/e/f). One committed negative case per "never" of the contract. The two-process rows
@@ -517,4 +523,106 @@ test("NG-K7.2e negative: a process with no own pod identity removes no lock that
   plant(lock, bodyIn(OWN));
   assert.deepEqual((await sweepOwnPodLocks({ dirs: [dir] })).removed, []);
   assert.equal(fs.existsSync(lock), true);
+});
+
+// ---- F2 (test-engineer, 175aa1cc): one break mutex per pod; no identity, no break of a `pod` body ----
+
+test("F2 NEVER: a process without its own identity never breaks a lock that carries `pod` — even on the control pod with proof gone", async () => {
+  asPod("control", GONE, { ownPod: () => undefined, lockPod: () => undefined });
+  const lock = path.join(tmpDir(), "x.json.lock");
+  const raw = bodyIn(OTHER);
+  plant(lock, raw);
+  await expectNotBroken(lock, raw, 600);
+  assert.equal(proofCalls, 0, "it does not even ask");
+});
+
+test("F2: the PRODUCTION break-mutex name is one fixed string, whatever the environment; only node --test appends the uid", () => {
+  assert.equal(breakMutexNameFor({}, OWN), BREAK_MUTEX_NAME);
+  assert.equal(breakMutexNameFor({}, undefined), BREAK_MUTEX_NAME);
+  assert.equal(breakMutexNameFor({ NV_POD_UID: "x", HOSTNAME: "h" }, OTHER), BREAK_MUTEX_NAME);
+  assert.equal(
+    breakMutexNameFor({ NODE_TEST_CONTEXT: "child" }, OWN),
+    `${BREAK_MUTEX_NAME}.${OWN.uid}`,
+  );
+  assert.notEqual(
+    breakMutexNameFor({ NODE_TEST_CONTEXT: "child" }, OWN),
+    breakMutexNameFor({ NODE_TEST_CONTEXT: "child" }, OTHER),
+    "two test pods in one network namespace stay apart",
+  );
+});
+
+test("F2 NEVER: a breaker stalled AFTER its re-read — no identity-less process, and no second breaker of its pod, can take the lock meanwhile; one holder, one line", async () => {
+  const dir = tmpDir();
+  const lock = path.join(dir, "x.json.lock");
+  const judged = bodyIn(OTHER);
+  plant(lock, judged);
+  let reachedUnlink!: () => void;
+  const atUnlink = new Promise<void>((resolve) => (reachedUnlink = resolve));
+  let resume!: () => void;
+  const stall = new Promise<void>((resolve) => (resume = resolve));
+  let stalls = 0;
+  asPod("control", (uid) => (uid === OTHER.uid ? GONE : EXISTS), {
+    beforeUnlink: async () => {
+      stalls += 1;
+      if (stalls === 1) {
+        reachedUnlink();
+        await stall; // c1 holds the mutex, past its re-read, before its unlink
+      }
+    },
+  });
+  let holding = 0;
+  let overlap = 0;
+  const holdBriefly = async (content: string) => {
+    holding += 1;
+    overlap += holding > 1 ? 1 : 0;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    holding -= 1;
+    await releaseIdentityFileLock(lock, content);
+  };
+  const c1 = acquireIdentityFileLock(lock, policy(15_000)).then(holdBriefly);
+  await atUnlink;
+
+  // (a) a control-pod process WITHOUT NV_POD_* (a scrubbed env, an ssh shell) — another process.
+  const saDir = makeServiceAccountDir(dir);
+  const run = await runInPod(undefined, CHILD, ["acquire", lock, "1500"], {
+    saDir,
+    testHome: makeTestHome(dir, "control"),
+    stateHome: dir,
+    timeoutMs: 20_000,
+  });
+  assert.equal(JSON.parse(run.stdout).timeout, true, run.stdout + run.stderr);
+  assert.equal(fs.readFileSync(lock, "utf8"), judged, "still the judged lock while c1 stalls");
+  // (b) a second breaker of the SAME pod, in this process: it waits on the one mutex.
+  const c2 = acquireIdentityFileLock(lock, policy(15_000)).then(holdBriefly);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(fs.readFileSync(lock, "utf8"), judged, "c2 could not interleave");
+
+  resume();
+  await Promise.all([c1, c2]);
+  assert.equal(overlap, 0, "never two holders");
+  assert.equal(ledgerLines().length, 1, "exactly one break, recorded");
+  assert.equal((ledgerLines()[0].holder as { token: string }).token, JSON.parse(judged).token);
+  assert.equal(
+    fs.existsSync(path.join(dir, ".acpx", "lock-breaks")),
+    false,
+    "the child broke nothing",
+  );
+});
+
+test("F2: on the control pod WITHOUT an identity the sweep keeps every `pod` body and removes no-pod leftovers by today's rules", async () => {
+  asPod("control", goneIsOther, { ownPod: () => undefined, lockPod: () => undefined });
+  const f = sweepFixture();
+  const result = await sweepOwnPodLocks({ dirs: [f.dir] });
+  assert.deepEqual(result.removed, [f.noPodDead]);
+  for (const kept of [
+    f.ownDead,
+    f.ownDeadGuard,
+    f.ownLive,
+    f.foreignGone,
+    f.foreignLive,
+    f.lease,
+  ]) {
+    assert.equal(fs.existsSync(kept), true, `${kept} kept`);
+  }
+  assert.equal(proofCalls, 0);
 });

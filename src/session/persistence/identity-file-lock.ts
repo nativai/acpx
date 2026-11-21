@@ -135,6 +135,8 @@ type PodLockDeps = {
   nowMs: () => number;
   /** Runs inside the break mutex, after the proof and before the re-read — a test's stall point. */
   insideBreakMutex: () => Promise<void>;
+  /** Runs after the re-read matched the judged token, right before `unlink` — the F2 stall point. */
+  beforeUnlink: () => Promise<void>;
 };
 
 const realDeps: PodLockDeps = {
@@ -145,6 +147,7 @@ const realDeps: PodLockDeps = {
   proveDeath: (pod, timeoutMs) => proveDeathDetailed(pod, { timeoutMs }),
   nowMs: () => Date.now(),
   insideBreakMutex: async () => {},
+  beforeUnlink: async () => {},
 };
 let deps: PodLockDeps = realDeps;
 
@@ -338,13 +341,26 @@ export async function removeLockIfUnchanged(lockPath: string, raw: string): Prom
 }
 
 // ---------------------------------------------------------------------------------------------
-// The break mutex (C3.2 A-4): one per pod, not on the shared volume, released by the kernel when
-// its holder dies — the bind of an abstract-namespace socket whose name carries the pod's uid (two
-// test "pods" in one network namespace stay apart; two real pods have two network namespaces).
+// The break mutex (C3.2 A-4): ONE per pod, not on the shared volume, released by the kernel when
+// its holder dies — the bind of an abstract-namespace socket. An abstract socket is already scoped
+// to its network namespace, which IS the pod, so in production the name is ONE FIXED STRING.
+// ⚠️ DO NOT PUT THE POD UID, THE HOSTNAME OR ANYTHING FROM THE ENVIRONMENT INTO THE PRODUCTION NAME.
+// It looks like harmless disambiguation and it is the F2 bug (test-engineer, 175aa1cc): a control-pod
+// process with `NV_POD_*` and one without bound two different names, so they never serialized; a
+// breaker stalled between its re-read and its unlink then deleted the fresh lock the other had just
+// taken — two holders of one lock. `test/pod-lock-primitive.test.ts` "F2" rows pin it.
+// Only under `node --test` (`NODE_TEST_CONTEXT`) is the uid appended, so two test "pods" that share
+// one network namespace stay apart (test/pod-kit/two-pods.ts).
 // ---------------------------------------------------------------------------------------------
 
-function breakMutexName(own: PodIdentity | undefined): string {
-  return `\0acpx-lock-break.${own ? own.uid : `host.${os.hostname()}`}`;
+export const BREAK_MUTEX_NAME = "\0acpx-lock-break";
+
+/** The break mutex's socket name for this process (see above). */
+export function breakMutexNameFor(env: NodeJS.ProcessEnv, own: PodIdentity | undefined): string {
+  if (env.NODE_TEST_CONTEXT === undefined) {
+    return BREAK_MUTEX_NAME;
+  }
+  return `${BREAK_MUTEX_NAME}.${own ? own.uid : "no-identity"}`;
 }
 
 function tryBind(name: string): Promise<net.Server | "busy" | "unavailable"> {
@@ -381,7 +397,7 @@ export async function withBreakMutex<T>(
   if (process.platform !== "linux") {
     return await fn();
   }
-  const name = breakMutexName(deps.ownPod());
+  const name = breakMutexNameFor(process.env, deps.ownPod());
   const deadline = Date.now() + Math.max(0, waitMs);
   for (;;) {
     const bound = await tryBind(name);
@@ -477,6 +493,11 @@ async function planBreak(
   if (holder.kind === "no-pod") {
     return deps.place() === "agent-pod" ? { kind: "none" } : planNoPod(current, policy);
   }
+  // A process that cannot name its own pod cannot place itself: it never breaks a body that carries
+  // `pod` — not as "the same pod", not as the control pod (HoD ruling on F2, 2026-11-21).
+  if (!deps.ownPod()) {
+    return { kind: "none" };
+  }
   if (holder.kind === "same-pod") {
     // pid and start time only — no age rule for a body that carries `pod` (C3.2 A-4).
     return judgeByPid(current.body, policy.judgeLegacy) === "breakable"
@@ -570,6 +591,7 @@ async function removeJudgedHolder(
   if (!sameHolder(again, judged.raw, judged.body)) {
     return "changed";
   }
+  await deps.beforeUnlink();
   try {
     await fs.unlink(lockPath);
   } catch (error) {

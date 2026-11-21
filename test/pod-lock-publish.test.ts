@@ -11,6 +11,7 @@ import {
   LockLostError,
   setPodLockDepsForTests,
 } from "../src/session/persistence/identity-file-lock.js";
+import { parseSessionRecord } from "../src/session/persistence/parse.js";
 import {
   isRecordLockLost,
   isRecordLockTimeout,
@@ -252,5 +253,114 @@ test(`NEVER: acpx's own record writer, its lock stolen at every attempt → reco
     assert.equal(isRecordLockLost(error), true, String(error));
     assert.equal(steal.stolen(), RECORD_LOCK_LOST_ATTEMPTS);
     assert.equal((JSON.parse(fs.readFileSync(file, "utf8")) as { last_seq: number }).last_seq, 1);
+  });
+});
+
+// T1 (test-engineer, 175aa1cc): acpx's own writer on a SPAWN-OWNED record, where the rename happens
+// inside the spawn ledger (`ledger.saveRecordAsync(raw, { beforePublish: lock.assertHeldSync })`).
+// Ported from the test-engineer's probe te-ledger-publish.mjs. The steal lands right after the LEDGER
+// opened its temp file (`fs.openSync(<record>.<pid>.….tmp, "wx")`), i.e. while the writer holds the
+// record lock and before the ledger's check + rename. Drop `beforePublish` from that call and the
+// "every attempt" half goes red (the stolen-lock write would land).
+
+test("T1: acpx's writer on a SPAWN-OWNED record — a lock stolen before the ledger's rename retries; stolen every time → record-lock-lost, disk unchanged", async () => {
+  await withTempHome("acpx-ledger-publish-", async (home) => {
+    const recordId = "11111111-1111-4111-8111-111111111111";
+    fs.mkdirSync(path.join(home, ".acpx", "sessions"), { recursive: true });
+    fs.writeFileSync(
+      path.join(home, ".acpx", "instance.json"),
+      JSON.stringify({ instance_id: "i-111111111111", home }),
+    );
+    const ledger = new SpawnLedger();
+    ledger.bindIdentity({ instance_id: "i-111111111111" });
+    const attempt = ledger.reserveSpawn({
+      run_id: "run-1",
+      fence: 1,
+      trigger_id: "t-1",
+      parent_brick_id: "22222222-2222-4222-8222-222222222222",
+      child_brick_id: "33333333-3333-4333-8333-333333333333",
+      target_record_id: recordId,
+    });
+    const file = ledger.recordPath(recordId);
+    const disk = (seq: number): DiskRecord =>
+      ({
+        schema: "acpx.session.v1",
+        kind: "session",
+        acpx_record_id: recordId,
+        acp_session_id: "adapter-independent-id",
+        agent_command: "node /opt/codex-acp/dist/index.js",
+        agent_name: "codex",
+        cwd: home,
+        created_at: new Date().toISOString(),
+        last_used_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        last_seq: seq,
+        messages: [],
+        metadata: { spawn_key: attempt.idempotency_key, spawn_state: "pending" },
+        closed: false,
+      }) as unknown as DiskRecord;
+    // Seed through the ledger, so the writer's metadata baseline equals disk and it takes the
+    // ledger branch (a baseline mismatch would drop spawn_key).
+    ledger.recordSpawnChild("run-1", 1, process.pid);
+    ledger.saveRecord(disk(0));
+    ledger.close();
+    const onDiskSeq = () =>
+      (JSON.parse(fs.readFileSync(file, "utf8")) as { last_seq: number }).last_seq;
+
+    const realOpenSync = fs.openSync.bind(fs);
+    let steals = 0;
+    let maxSteals = 0;
+    const heldWhenStolen: boolean[] = [];
+    const openSync = mock.method(
+      fs,
+      "openSync",
+      (target: fs.PathLike, flags: fs.OpenMode, mode?: fs.Mode) => {
+        const fd = realOpenSync(target, flags, mode);
+        if (
+          typeof target === "string" &&
+          target.startsWith(`${file}.${process.pid}.`) &&
+          target.endsWith(".tmp") &&
+          flags === "wx" &&
+          steals < maxSteals
+        ) {
+          heldWhenStolen.push(fs.existsSync(`${file}.lock`));
+          steals += 1;
+          stealLock(file);
+        }
+        return fd;
+      },
+    );
+    const write = async (seq: number, times: number) => {
+      steals = 0;
+      maxSteals = times;
+      heldWhenStolen.length = 0;
+      try {
+        await writeSessionRecord(parseSessionRecord(disk(seq))!);
+        return undefined;
+      } catch (error) {
+        return error;
+      }
+    };
+    try {
+      assert.equal(await write(1, 0), undefined, "positive control: no steal");
+      assert.equal(onDiskSeq(), 1);
+      assert.equal(steals, 0);
+
+      assert.equal(await write(2, 1), undefined, "stolen once: the write starts again and lands");
+      assert.equal(steals, 1, "the steal happened on the ledger branch");
+      assert.deepEqual(heldWhenStolen, [true]);
+      assert.equal(onDiskSeq(), 2);
+
+      const lost = await write(3, Number.POSITIVE_INFINITY);
+      assert.equal(isRecordLockLost(lost), true, String(lost));
+      assert.equal(steals, RECORD_LOCK_LOST_ATTEMPTS);
+      assert.equal(onDiskSeq(), 2, "nothing published");
+      assert.deepEqual(
+        fs.readdirSync(path.dirname(file)).filter((name) => name.endsWith(".tmp")),
+        [],
+      );
+    } finally {
+      openSync.mock.restore();
+    }
   });
 });
