@@ -1,7 +1,8 @@
-import { readFileSync, realpathSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { isControlPod } from "../config/control-pod.js";
+import { agentPodFilePath, podModeVerdict, readAgentPodFile, TEST_HOME_ENV } from "./placement.js";
 
 /**
  * This process's pod (C3.1 `pod` field sources, C3.2 lock body) — brick 8d85cb47.
@@ -69,54 +70,35 @@ export function ownPodIdentity(env: NodeJS.ProcessEnv = process.env): PodIdentit
  * WHERE AM I, for the lock rules (C1.1, C3.2 A-4). `control`: a control-role host without the agent
  * pod's place file `.nv-agent`; `agent-pod`: a control-role host WITH it (an unreadable file counts
  * as an agent pod — the fail-safe side); `elsewhere`: anything else (a workbench, a suite, a rig).
- * Mirrors A1's `src/pod/placement.ts` (ap/a1-classes) behind this one function — on integration it
- * delegates there. Test seam `ACPX_POD_TEST_HOME` (C1.1 A-6, under `NODE_TEST_CONTEXT` only):
- * `<dir>` stands in for `/home/node` and the host counts as control-role.
+ * The place file and the seam are A1's (`src/pod/placement.ts`): one reading of "where am I". Test
+ * seam `ACPX_POD_TEST_HOME` (C1.1 A-6, under `NODE_TEST_CONTEXT` only): `<dir>` stands in for
+ * `/home/node` and the host counts as control-role.
  */
 export type LockHostPlace = "control" | "agent-pod" | "elsewhere";
-export const POD_TEST_HOME_ENV = "ACPX_POD_TEST_HOME";
-export const CANONICAL_HOME = "/home/node";
 
-function testHome(env: NodeJS.ProcessEnv): string | undefined {
-  return env.NODE_TEST_CONTEXT ? nonEmpty(env[POD_TEST_HOME_ENV]) : undefined;
+function testHomeSet(env: NodeJS.ProcessEnv): boolean {
+  return env.NODE_TEST_CONTEXT !== undefined && nonEmpty(env[TEST_HOME_ENV]) !== undefined;
 }
 
 export function lockHostPlace(env: NodeJS.ProcessEnv = process.env): LockHostPlace {
-  const seam = testHome(env);
-  if (!seam && !isControlPod(env)) {
+  if (!testHomeSet(env) && !isControlPod(env)) {
     return "elsewhere";
   }
-  try {
-    readFileSync(path.join(seam ?? CANONICAL_HOME, ".nv-agent"));
-    return "agent-pod";
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "control" : "agent-pod";
-  }
-}
-
-function resolved(p: string): string {
-  try {
-    return realpathSync(p);
-  } catch {
-    return path.resolve(p);
-  }
+  return readAgentPodFile(agentPodFilePath(env)).kind === "absent" ? "control" : "agent-pod";
 }
 
 /**
- * C1.1 A-5: pod mode is REQUESTED here (the switch, a control-role host, the state home resolving
- * to the canonical one) — whether or not the identity is there. The lock module refuses to write a
- * body without `pod` in that state (`PodIdentityMissingError`).
+ * C1.1 A-5: pod mode is REQUESTED here — A1's verdict is `pod` or `refuse` (the switch, a
+ * control-role host, the state home resolving to the canonical one). The lock module refuses to
+ * write a body without `pod` in that state (`PodIdentityMissingError`).
  */
 export function podModeRequested(env: NodeJS.ProcessEnv = process.env): boolean {
   if (env[OWNER_PLACEMENT_ENV] !== "pod") {
     return false;
   }
-  const seam = testHome(env);
-  if (!seam && !isControlPod(env)) {
-    return false;
-  }
-  const home = path.join(env.ACPX_STATE_HOME || os.homedir(), ".acpx");
-  return resolved(home) === resolved(path.join(seam ?? CANONICAL_HOME, ".acpx"));
+  return (
+    podModeVerdict({ env, controlRole: isControlPod(env), homedir: os.homedir() }).mode !== "off"
+  );
 }
 
 /** The pod a lock body names: this process's pod whenever it knows it (C1.1 A-5). */

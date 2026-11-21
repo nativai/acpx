@@ -143,12 +143,24 @@ export const OS_COMPAT_LINK_ENV = "ACPX_OS_COMPAT_LINK";
 export const NO_OS_COMPAT_LINK_PATH = "/nonexistent/acpx-test/operating-system-compat-link";
 
 /**
- * brick 8d85cb47 — THE POD IDENTITY IS BOX STATE. A process with `NV_POD_NAME`/`NV_POD_UID` (the
- * downward API — agent pods, workbenches, a switched control pod) stamps its pod into every lock
- * body in pod mode, and the death proof reads the real service account. So the suite starts with no
- * pod and a service-account directory that does not exist (every proof `unknown`, no API call ever
- * leaves the box); a row that wants a pod sets its own (`test/pod-kit/two-pods.ts`).
+ * brick b479441f — pod mode (`ACPX_OWNER_PLACEMENT=pod`, C1.1) is BOX state: a box that sets it in
+ * its control Deployment would hand it to every suite started there, and the pod identity with it.
+ * The suite removes them, so "pod mode off" is a property of the repo; a row that needs pod mode
+ * sets them in its own child env through the product's seam (`ACPX_POD_TEST_HOME`, C1.1 A-6).
+ *
+ * brick 8d85cb47 — and THE POD IDENTITY IS BOX STATE: a process that knows its pod stamps it into
+ * every lock body (C1.1 A-5), and the death proof reads the real service account. After the removal
+ * the service-account seam points at a directory that does not exist, so every proof is `unknown`
+ * and no API call ever leaves the box; a row that wants a pod sets its own (`test/pod-kit/two-pods.ts`).
  */
+export const POD_PLACEMENT_ENV = [
+  "ACPX_OWNER_PLACEMENT",
+  "ACPX_POD_TEST_HOME",
+  "ACPX_POD_SA_DIR",
+  "NV_POD_NAME",
+  "NV_POD_UID",
+  "NV_NODE_NAME",
+] as const;
 export const POD_IDENTITY_ENV = ["NV_POD_NAME", "NV_POD_UID", "NV_NODE_NAME"] as const;
 export const POD_SA_DIR_ENV = "ACPX_POD_SA_DIR";
 export const NO_POD_SA_DIR = "/nonexistent/acpx-test/serviceaccount";
@@ -161,8 +173,8 @@ export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env
       (SESSION_IDENTITY_ENV as readonly string[]).includes(name) ||
       (OS_ROOT_ENV as readonly string[]).includes(name) ||
       name === DEFAULT_OWNER_ENV ||
-      (POD_IDENTITY_ENV as readonly string[]).includes(name) ||
-      name === SESSION_ROOT_ENV
+      name === SESSION_ROOT_ENV ||
+      (POD_PLACEMENT_ENV as readonly string[]).includes(name)
     ) {
       delete env[name];
       removed.push(name);
