@@ -2,6 +2,24 @@ import { listBuiltInAgents } from "../agent-registry.js";
 import { COMMAND_GRAMMAR, type GrammarNode } from "./command-grammar.js";
 
 /**
+ * C6.2's closed `inherit` list: what a passed-through create may inherit from its creator's
+ * environment, by name. atrium validates every `inherit` name against THIS constant (`400
+ * inherit-not-allowed` otherwise) and keeps no copy; A3's pass-through client sends only these.
+ */
+export const PASS_THROUGH_INHERIT: readonly string[] = Object.freeze([
+  "ACPX_SUBSCRIPTION",
+  "ATRIUM_OS",
+]);
+
+// C1.1's predicate travels with the table: atrium loads both from this one module (EXPORT-class-table.md).
+export {
+  podModeVerdict,
+  podModeVerdictNow,
+  type HostFacts,
+  type PodModeVerdict,
+} from "./placement.js";
+
+/**
  * C1.2 — every command path acpx registers has exactly one class (CONTRACTS-r4 C1.2, CONCEPTION r4
  * K2, brick b479441f). The assignment is DATA, exported: the atrium server validates a passed-through
  * call (C6.2) against this same table, by loading this module (see the brick's

@@ -1,3 +1,4 @@
+import "./install-owner-reaper.js";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -116,6 +117,55 @@ test("C1.1 A-5: the state home is compared RESOLVED — an override that resolve
   assert.equal(
     mode(podModeVerdict(facts({ homedir: "/x", env: { ...seam, ACPX_STATE_HOME: link } }))),
     "pod",
+  );
+});
+
+test("the predicate judges the state home acpx ACTUALLY uses — the realpath of its `.acpx` directory", () => {
+  const seamHome = tmpDir();
+  fs.mkdirSync(path.join(seamHome, ".acpx"));
+  const seam = { ACPX_POD_TEST_HOME: seamHome };
+  // `<ASH>/.acpx` is a symlink to the canonical `.acpx` (ASH itself is elsewhere) → ON.
+  const ash = tmpDir();
+  fs.symlinkSync(path.join(seamHome, ".acpx"), path.join(ash, ".acpx"));
+  assert.equal(
+    mode(podModeVerdict(facts({ homedir: "/x", env: { ...seam, ACPX_STATE_HOME: ash } }))),
+    "pod",
+  );
+  // The same ASH whose `.acpx` is a plain directory → it is not the canonical one.
+  const other = tmpDir();
+  fs.mkdirSync(path.join(other, ".acpx"));
+  assert.equal(
+    mode(podModeVerdict(facts({ homedir: "/x", env: { ...seam, ACPX_STATE_HOME: other } }))),
+    "refuse:test_seam_outside_sandbox",
+  );
+});
+
+test("whitespace-only ACPX_STATE_HOME: the predicate does what acpx's resolver does (a relative path → not canonical)", async () => {
+  const { acpxStateRoot, sessionBaseDir } =
+    await import("../src/session/persistence/session-base-dir.js");
+  // Agreement by construction: the session store's directory sits in the root the predicate judges.
+  const saved = process.env.ACPX_STATE_HOME;
+  try {
+    for (const value of [" ", "", "/home/node", "/tmp/x"]) {
+      process.env.ACPX_STATE_HOME = value;
+      assert.equal(path.dirname(sessionBaseDir()), acpxStateRoot(), JSON.stringify(value));
+    }
+  } finally {
+    if (saved === undefined) {
+      delete process.env.ACPX_STATE_HOME;
+    } else {
+      process.env.ACPX_STATE_HOME = saved;
+    }
+  }
+  assert.equal(
+    acpxStateRoot({ ACPX_STATE_HOME: " " }, "/home/node"),
+    path.join(" ", ".acpx"),
+    "used as a path, not ignored",
+  );
+  assert.equal(
+    mode(podModeVerdict(facts({ env: { ACPX_STATE_HOME: " " } }))),
+    "off:non-canonical-state-home",
+    "acpx would use `<cwd>/ /.acpx`, so pod mode is off — even though HOME is canonical",
   );
 });
 
@@ -524,4 +574,63 @@ test("the spawn tripwire: on the control pod in pod mode the adapter/owner spawn
   assert.match(probe(podEnv(podHome(), { NV_POD_UID: undefined })), /bridge_on_control_pod/u);
   assert.equal(probe(podEnv(podHome({ podFile: agentPodName("r") }))), "ALLOWED", "agent pod");
   assert.equal(probe(podEnv(podHome(), { ACPX_OWNER_PLACEMENT: undefined })), "ALLOWED", "off");
+});
+
+// ─── The tripwire AT EACH SITE (not only the predicate) ─────────────────────────────────────────
+
+/** Run an ESM snippet in a child with `env`; it prints one line. */
+function probeSite(code: string, env: NodeJS.ProcessEnv): string {
+  return spawnSync(process.execPath, ["--input-type=module", "-e", code], {
+    env,
+    encoding: "utf8",
+    timeout: 30_000,
+  }).stdout.trim();
+}
+
+test("tripwire site 1 — the adapter spawn: AcpClient.start() refuses on the control pod in pod mode, and nothing is spawned", () => {
+  const client = fileURLToPath(new URL("../src/acp/client.js", import.meta.url));
+  const dir = tmpDir();
+  const marker = path.join(dir, "adapter-started");
+  const adapter = path.join(dir, "adapter.mjs");
+  // A stand-in adapter whose only act is to prove it was spawned.
+  fs.writeFileSync(
+    adapter,
+    `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(marker)}, "x");\n`,
+  );
+  const code = `
+    const { AcpClient } = await import(${JSON.stringify(client)});
+    const c = new AcpClient({ agentCommand: ${JSON.stringify(`${process.execPath} ${adapter}`)}, cwd: ${JSON.stringify(dir)}, permissionMode: "approve-all" });
+    try { await c.start(); console.log("STARTED"); } catch (e) { console.log(e?.stderrLine ?? "OTHER " + String(e?.message).split("\\n")[0]); }
+    finally { await c.close().catch(() => {}); }`;
+  assert.equal(
+    probeSite(code, podEnv(podHome())),
+    "acpx: REFUSED reason=bridge_on_control_pod nothing_started=true protocol=1 what=adapter",
+  );
+  assert.equal(fs.existsSync(marker), false, "the adapter was spawned on the control pod");
+  // Positive control: pod mode off, the same call DOES spawn the adapter — so the check above can fail.
+  probeSite(code, podEnv(podHome(), { ACPX_OWNER_PLACEMENT: undefined }));
+  const deadline = Date.now() + 10_000;
+  while (!fs.existsSync(marker) && Date.now() < deadline) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+  }
+  assert.equal(fs.existsSync(marker), true, "control: with pod mode off the adapter is spawned");
+});
+
+test("tripwire site 2 — the owner spawn: spawnQueueOwnerProcess refuses on the control pod in pod mode", () => {
+  const owner = fileURLToPath(
+    new URL("../src/cli/session/queue-owner-process.js", import.meta.url),
+  );
+  const code = `
+    const { spawnQueueOwnerProcess } = await import(${JSON.stringify(owner)});
+    try { spawnQueueOwnerProcess({ sessionId: "never-spawned" }); console.log("SPAWNED"); }
+    catch (e) { console.log(e?.stderrLine ?? "OTHER " + String(e?.message).split("\\n")[0]); }`;
+  assert.equal(
+    probeSite(code, podEnv(podHome())),
+    "acpx: REFUSED reason=bridge_on_control_pod nothing_started=true protocol=1 what=owner",
+  );
+  assert.equal(
+    probeSite(code, podEnv(podHome(), { NV_POD_UID: undefined })),
+    "acpx: REFUSED reason=bridge_on_control_pod nothing_started=true protocol=1 what=owner",
+    "identity missing is fail-closed too",
+  );
 });

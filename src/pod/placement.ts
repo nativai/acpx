@@ -3,12 +3,14 @@ import os from "node:os";
 import path from "node:path";
 import { queueKeyForSession } from "../cli/queue/paths.js";
 import { isControlPod } from "../config/control-pod.js";
+import { acpxStateRoot } from "../session/persistence/session-base-dir.js";
 
 /**
  * C1.1 — the switch and "where am I" (CONTRACTS-r4 C1.1, brick b479441f).
  *
  * ⚠️ THIS MODULE IS LOADED BEFORE THE REST OF ACPX (`src/cli.ts`), so its import graph must stay
- * light: node builtins, `config/control-pod.ts`, `cli/queue/paths.ts`. A heavy import here is paid by
+ * light: node builtins, `config/control-pod.ts`, `cli/queue/paths.ts`,
+ * `session/persistence/session-base-dir.ts`. A heavy import here is paid by
  * every acpx invocation on the box and defeats "route before loading the world" (CONCEPTION r4 §12).
  * Held by `test/pod-command-classes.test.ts` ("the light graph").
  */
@@ -73,18 +75,33 @@ export function canonicalHome(env: NodeJS.ProcessEnv = process.env): string {
   return testHome(env) ?? CANONICAL_HOME;
 }
 
-/** A path with symlinks resolved where it exists (C1.1 A-5 compares the state home "resolved"). */
+/**
+ * A path with its symlinks resolved (C1.1 A-5 compares the state home "resolved"): the realpath of
+ * its deepest existing ancestor, plus the rest — so a not-yet-created `.acpx` under a symlinked home
+ * still resolves through the link.
+ */
 function resolvedPath(p: string): string {
-  try {
-    return fs.realpathSync(p);
-  } catch {
-    return path.resolve(p);
+  const absolute = path.resolve(p);
+  const rest: string[] = [];
+  for (let dir = absolute; ; dir = path.dirname(dir)) {
+    try {
+      return path.join(fs.realpathSync(dir), ...rest);
+    } catch {
+      if (dir === path.dirname(dir)) {
+        return absolute;
+      }
+      rest.unshift(path.basename(dir));
+    }
   }
 }
 
-/** The home acpx's state lives under — exactly how every state-path resolver reads it. */
-export function stateHome(facts: HostFacts): string {
-  return facts.env.ACPX_STATE_HOME || facts.homedir;
+/**
+ * The `.acpx` directory acpx will actually use, from acpx's own resolver — CALLED, not re-derived
+ * (ruled by the stream HoD after atrium S7's finding, 2026-11-21): an empty `ACPX_STATE_HOME` is
+ * ignored, a whitespace-only one is a relative path (so never the canonical home).
+ */
+export function stateRoot(facts: HostFacts): string {
+  return acpxStateRoot(facts.env, facts.homedir);
 }
 
 /**
@@ -102,8 +119,9 @@ export function podModeVerdict(facts: HostFacts): PodModeVerdict {
   if (!facts.controlRole && seam === undefined) {
     return { mode: "off", why: "not-control-role" };
   }
-  const home = resolvedPath(stateHome(facts));
-  if (home !== resolvedPath(canonicalHome(facts.env))) {
+  // A-5 "resolved": the realpath of the `.acpx` directory in use against the canonical one's.
+  const root = resolvedPath(stateRoot(facts));
+  if (root !== resolvedPath(path.join(canonicalHome(facts.env), ".acpx"))) {
     // Under the seam a state home outside the sandbox refuses: the seam leads only into it.
     return seam === undefined
       ? { mode: "off", why: "non-canonical-state-home" }
@@ -151,16 +169,24 @@ function liveHostFacts(env: NodeJS.ProcessEnv): HostFacts {
   return { env, controlRole: isControlPod(env), homedir: os.homedir() };
 }
 
+/**
+ * The verdict for this host and `env`, decided now (not memoised) — the in-process export atrium
+ * loads with the class table (`dist/pod/command-classes.js`), so its spawn-state, stream and lock
+ * gates use acpx's predicate rather than a twin (brick b479441f reports/EXPORT-class-table.md).
+ */
+export function podModeVerdictNow(env: NodeJS.ProcessEnv = process.env): PodModeVerdict {
+  return env[OWNER_PLACEMENT_ENV] === OWNER_PLACEMENT_POD
+    ? podModeVerdict(liveHostFacts(env))
+    : { mode: "off", why: "switch-unset" };
+}
+
 let memoVerdict: PodModeVerdict | undefined;
 
 /** Decided once per process (C1.1). The switch is read first, so pod-off reads nothing else. */
 export function podMode(): PodModeVerdict {
   if (memoVerdict === undefined) {
     const env = process.env;
-    memoVerdict =
-      env[OWNER_PLACEMENT_ENV] === OWNER_PLACEMENT_POD
-        ? podModeVerdict(liveHostFacts(env))
-        : { mode: "off", why: "switch-unset" };
+    memoVerdict = podModeVerdictNow(env);
   }
   return memoVerdict;
 }

@@ -495,7 +495,13 @@ test("the light graph: the CLI entry and the class table reach no commander and 
     const heavy = graph.files.filter(
       (f) =>
         !f.startsWith("pod/") &&
-        !["cli.ts", "agent-registry.ts", "config/control-pod.ts", "cli/queue/paths.ts"].includes(f),
+        ![
+          "cli.ts",
+          "agent-registry.ts",
+          "config/control-pod.ts",
+          "cli/queue/paths.ts",
+          "session/persistence/session-base-dir.ts",
+        ].includes(f),
     );
     assert.deepEqual(heavy, [], `${entry} statically reaches heavy modules`);
     assert.deepEqual(
@@ -631,4 +637,111 @@ test("the SHIPPED bundle: dist/cli.js and dist/pod/command-classes.js statically
       `${entry} statically reaches ${seen.size} chunks — the world crept in`,
     );
   }
+});
+
+// TODO(A8, brick 88112988): when A8's `pod_foreign_write` guard lands at the box-wide writers (C1.2
+// A-8), add the row "every classified command, run in an agent pod, trips no foreign-write guard" —
+// the conformance proof A-8 asks of this test. Agreed with the stream HoD 2026-11-21.
+
+test("C6.2's inherit list is exported, closed, and exactly the contract's start", async () => {
+  const { PASS_THROUGH_INHERIT } = await import("../src/pod/command-classes.js");
+  assert.deepEqual([...PASS_THROUGH_INHERIT], ["ACPX_SUBSCRIPTION", "ATRIUM_OS"]);
+  assert.ok(!PASS_THROUGH_INHERIT.includes("ACPX_SESSION_URL"), "identity never inherits");
+});
+
+test("the class-table module exports C1.1's predicate itself — no twin to drift", async () => {
+  const exported = await import("../src/pod/command-classes.js");
+  const placement = await import("../src/pod/placement.js");
+  assert.equal(exported.podModeVerdict, placement.podModeVerdict, "the same function, not a copy");
+  assert.equal(exported.podModeVerdictNow, placement.podModeVerdictNow);
+  assert.deepEqual(exported.podModeVerdictNow({}), { mode: "off", why: "switch-unset" });
+  // Live facts: this test host is not the canonical home under a temp HOME → off, never pod.
+  assert.notEqual(exported.podModeVerdictNow({ ACPX_OWNER_PLACEMENT: "pod" }).mode, "pod");
+});
+
+test("the argv shapes atrium really sends classify as expected (acpx-ui origin/master)", () => {
+  // Copied from acpx-ui server code, not invented: the production shape, not the convenient one.
+  const cases: Array<[string[], string, CommandClass]> = [
+    // server/promptInvocation.ts:131
+    [
+      [
+        "--approve-all",
+        "--cwd",
+        "/workspace",
+        "claude",
+        "prompt",
+        "--no-wait",
+        "--session-id",
+        "S",
+        "--batch-file",
+        "-",
+      ],
+      "prompt",
+      "owner-ensure",
+    ],
+    // server/promptInvocation.ts:138
+    [
+      ["--approve-all", "--cwd", "/workspace", "codex", "prompt", "--no-wait"],
+      "prompt",
+      "owner-ensure",
+    ],
+    // server/admitWake.ts:191
+    [
+      ["--format", "json", "capacity", "admit-wake", "--session-id", "S", "--class", "delivery"],
+      "capacity admit-wake",
+      "control-store",
+    ],
+    // server/capacityQueue.ts:582
+    [
+      ["--format", "json", "capacity", "--class", "automation", "--agent", "claude", "--need", "1"],
+      "capacity",
+      "control-store",
+    ],
+    // server/index.ts:15008
+    [
+      [
+        "--approve-all",
+        "--cwd",
+        "/w",
+        "--format",
+        "json",
+        "claude",
+        "set",
+        "model",
+        "opus",
+        "--session-id",
+        "S",
+      ],
+      "set",
+      "owner-if-pod",
+    ],
+    // server/sessionTemplateMark.ts:77
+    [["--format", "json", "sessions", "template", "S", "--enable"], "sessions template", "record"],
+    // server/sessionArchiveRetention.ts:493
+    [
+      ["sessions", "archive", "--compress", "--apply", "--max-bytes", "1", "--json"],
+      "sessions archive",
+      "control-store",
+    ],
+    // server/acpxSubscriptionsUsage.ts:258
+    [["--format", "json", "claude", "subscriptions", "usage"], "subscriptions usage", "read"],
+    // server/sessionCreate.ts:1817 (+ telegram's template fork)
+    [["--cwd", "/workspace", "claude", "sessions", "new", "--name", "x"], "sessions new", "create"],
+    [
+      ["claude", "sessions", "new", "--from-template", "T", "--name", "n", "--no-prompt"],
+      "sessions new",
+      "create",
+    ],
+  ];
+  for (const [argv, expectedPath, expectedClass] of cases) {
+    const c = classified(argv);
+    assert.equal(c.path, expectedPath, JSON.stringify(argv));
+    assert.equal(c.class, expectedClass, JSON.stringify(argv));
+  }
+  assert.equal(
+    classified(["sessions", "template", "--help"]).help,
+    true,
+    "sessionTemplateMark.ts:56's probe",
+  );
+  assert.equal(classified(cases[0][0]).target?.value, "S");
 });
