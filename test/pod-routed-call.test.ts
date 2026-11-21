@@ -500,6 +500,8 @@ test("outcome: transport 64 / 69 → exit 1, `acpx: ROUTED outcome=not_run reaso
     [69, "host_key"],
     [69, "identity"],
     [69, "uid_mismatch"],
+    // T1 fix round F-4: the pod cannot write its in-flight mark — a broken pod, so 69 (not 75): visible, not held.
+    [69, "agent_state_unwritable"],
   ];
   for (const [exit, reason] of cases) {
     const stub = makeStub({
