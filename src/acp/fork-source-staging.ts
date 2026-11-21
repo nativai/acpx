@@ -1,6 +1,10 @@
-import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import {
+  acquireIdentityFileLockDetailed,
+  releaseIdentityFileLock,
+  type IdentityLockPolicy,
+} from "../session/persistence/identity-file-lock.js";
 
 /**
  * Cross-cwd copies under the fixed session root (brick 45917618, CONCEPTION c53cbd97 §5.5 D6/D7).
@@ -13,13 +17,19 @@ import path from "node:path";
  * Two concurrent copies of one source would interleave stage/cleanup (the second cleanup restoring
  * the first's staged bytes leaves a stray copy behind), so every stage runs under an exclusive lock
  * file beside the staged path.
+ *
+ * THE LOCK IS THE ONE PRIMITIVE (C3.2 / K7 rule 2 [C91], brick 8d85cb47) — it used to be its own
+ * `O_EXCL` file broken by mtime alone, which a live copy in another pod would lose after 120 s. Now a
+ * holder in this pod is judged by pid (a dead one is broken at once), a holder in another pod only by
+ * the death proof, and a body without a pod (or unidentified) by the 120 s age as before — which is
+ * why the holder still touches its lock.
  */
 
 /** A lock whose mtime is older than this belongs to a dead copy (the holder touches it). */
 export const STAGE_LOCK_STALE_MS = 120_000;
 const STAGE_LOCK_HEARTBEAT_MS = 20_000;
 const STAGE_LOCK_POLL_MS = 250;
-/** A waiter gives up after this long behind a LIVE holder. */
+/** The stage lock waiter's budget — ONE named constant (C3.2): it gives up after this long. */
 export const STAGE_LOCK_MAX_WAIT_MS = 15 * 60_000;
 
 export type StageLockOptions = { staleMs?: number; maxWaitMs?: number; pollMs?: number };
@@ -33,59 +43,23 @@ export function stageLockPath(stagedPath: string): string {
   return `${stagedPath}.acpx-stage.lock`;
 }
 
-async function tryCreateLock(lockPath: string): Promise<boolean> {
-  try {
-    await fs.writeFile(
-      lockPath,
-      `${JSON.stringify({ pid: process.pid, token: randomUUID(), at: new Date().toISOString() })}\n`,
-      { flag: "wx" },
-    );
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      return false;
-    }
-    throw error;
-  }
-}
-
-/** Create the lock (`O_EXCL`), taking over a stale one; returns whether a stale one was taken. */
-async function acquireStageLock(
-  lockPath: string,
-  staleMs: number,
-  options: StageLockOptions,
-): Promise<boolean> {
-  const deadline = Date.now() + (options.maxWaitMs ?? STAGE_LOCK_MAX_WAIT_MS);
-  let tookOverStale = false;
-  await fs.mkdir(path.dirname(lockPath), { recursive: true });
-  while (!(await tryCreateLock(lockPath))) {
-    if (await lockIsStale(lockPath, staleMs)) {
-      await fs.rm(lockPath, { force: true });
-      tookOverStale = true;
-      continue;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(
-        `Timed out waiting for another copy of the same source session to finish (lock ${lockPath})`,
-      );
-    }
-    await new Promise((resolve) => setTimeout(resolve, options.pollMs ?? STAGE_LOCK_POLL_MS));
-  }
-  return tookOverStale;
-}
-
-async function lockIsStale(lockPath: string, staleMs: number): Promise<boolean> {
-  try {
-    const stat = await fs.stat(lockPath);
-    return Date.now() - stat.mtimeMs > staleMs;
-  } catch {
-    return false; // vanished meanwhile: just retry the create
-  }
+function stageLockPolicy(staleMs: number, options: StageLockOptions): IdentityLockPolicy {
+  return {
+    label: "fork-source stage lock",
+    budgetMs: options.maxWaitMs ?? STAGE_LOCK_MAX_WAIT_MS,
+    staleMs,
+    pollMaxMs: options.pollMs ?? STAGE_LOCK_POLL_MS,
+    legacyBody: () => ({ pid: process.pid, at: new Date().toISOString() }),
+    makeTimeoutError: (lockPath, holder) =>
+      new Error(
+        `Timed out waiting for another copy of the same source session to finish (lock ${lockPath}; holder ${holder})`,
+      ),
+  };
 }
 
 /**
- * Run `run` holding the exclusive stage lock for `stagedPath` (`O_EXCL` create). A stale lock (no
- * heartbeat for `staleMs`) is removed and taken over.
+ * Run `run` holding the exclusive stage lock for `stagedPath`. A holder proven dead (or, without a
+ * pod, silent for `staleMs`) is broken and taken over.
  */
 export async function withStageLock<T>(
   stagedPath: string,
@@ -94,7 +68,11 @@ export async function withStageLock<T>(
 ): Promise<T> {
   const lockPath = stageLockPath(stagedPath);
   const staleMs = options.staleMs ?? STAGE_LOCK_STALE_MS;
-  const tookOverStale = await acquireStageLock(lockPath, staleMs, options);
+  await fs.mkdir(path.dirname(lockPath), { recursive: true });
+  const { content, tookOver } = await acquireIdentityFileLockDetailed(
+    lockPath,
+    stageLockPolicy(staleMs, options),
+  );
   const heartbeat = setInterval(
     () => {
       const now = new Date();
@@ -104,10 +82,10 @@ export async function withStageLock<T>(
   );
   heartbeat.unref();
   try {
-    return await run({ tookOverStale });
+    return await run({ tookOverStale: tookOver });
   } finally {
     clearInterval(heartbeat);
-    await fs.rm(lockPath, { force: true });
+    await releaseIdentityFileLock(lockPath, content);
   }
 }
 

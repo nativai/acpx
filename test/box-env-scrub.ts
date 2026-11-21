@@ -142,6 +142,17 @@ export const NO_RUNTIME_INFO_PATH = "/nonexistent/acpx-test/runtime-info.json";
 export const OS_COMPAT_LINK_ENV = "ACPX_OS_COMPAT_LINK";
 export const NO_OS_COMPAT_LINK_PATH = "/nonexistent/acpx-test/operating-system-compat-link";
 
+/**
+ * brick 8d85cb47 — THE POD IDENTITY IS BOX STATE. A process with `NV_POD_NAME`/`NV_POD_UID` (the
+ * downward API — agent pods, workbenches, a switched control pod) stamps its pod into every lock
+ * body in pod mode, and the death proof reads the real service account. So the suite starts with no
+ * pod and a service-account directory that does not exist (every proof `unknown`, no API call ever
+ * leaves the box); a row that wants a pod sets its own (`test/pod-kit/two-pods.ts`).
+ */
+export const POD_IDENTITY_ENV = ["NV_POD_NAME", "NV_POD_UID", "NV_NODE_NAME"] as const;
+export const POD_SA_DIR_ENV = "ACPX_POD_SA_DIR";
+export const NO_POD_SA_DIR = "/nonexistent/acpx-test/serviceaccount";
+
 export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env): string[] {
   const removed: string[] = [];
   for (const name of Object.keys(env)) {
@@ -150,6 +161,7 @@ export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env
       (SESSION_IDENTITY_ENV as readonly string[]).includes(name) ||
       (OS_ROOT_ENV as readonly string[]).includes(name) ||
       name === DEFAULT_OWNER_ENV ||
+      (POD_IDENTITY_ENV as readonly string[]).includes(name) ||
       name === SESSION_ROOT_ENV
     ) {
       delete env[name];
@@ -160,5 +172,6 @@ export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env
   env.ACPX_UI_INTERNAL_URL = NOTICE_DELIVERY_DEAD_ORIGIN;
   env[RUNTIME_INFO_PATH_ENV] = NO_RUNTIME_INFO_PATH;
   env[OS_COMPAT_LINK_ENV] = NO_OS_COMPAT_LINK_PATH;
+  env[POD_SA_DIR_ENV] = NO_POD_SA_DIR;
   return removed.toSorted();
 }

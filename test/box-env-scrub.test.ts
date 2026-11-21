@@ -29,7 +29,10 @@ import {
   NO_ENTITLEMENT_FETCH_ENV,
   NOTICE_DELIVERY_DEAD_ORIGIN,
   NO_OS_COMPAT_LINK_PATH,
+  NO_POD_SA_DIR,
   OS_COMPAT_LINK_ENV,
+  POD_IDENTITY_ENV,
+  POD_SA_DIR_ENV,
   NO_RUNTIME_INFO_PATH,
   RUNTIME_INFO_PATH_ENV,
   scrubBoxHarnessEnvOverrides,
@@ -53,6 +56,7 @@ test("3b1ec678: the scrub removes every ACPX_PI_* override and leaves the rest a
   assert.deepEqual(Object.keys(env).toSorted(), [
     NO_ENTITLEMENT_FETCH_ENV,
     OS_COMPAT_LINK_ENV,
+    POD_SA_DIR_ENV,
     RUNTIME_INFO_PATH_ENV,
     "ACPX_SESSION_URL",
     "ACPX_UI_INTERNAL_URL",
@@ -73,6 +77,7 @@ test("c2df657e: the scrub removes ACPX_SESSION_RECORD_ID (product-set session id
   assert.deepEqual(Object.keys(env).toSorted(), [
     NO_ENTITLEMENT_FETCH_ENV,
     OS_COMPAT_LINK_ENV,
+    POD_SA_DIR_ENV,
     RUNTIME_INFO_PATH_ENV,
     "ACPX_SESSION_URL",
     "ACPX_UI_INTERNAL_URL",
@@ -118,6 +123,7 @@ test("45917618: the scrub removes ACPX_SESSION_ROOT (a rig's session-root seam),
     assert.deepEqual(Object.keys(env).toSorted(), [
       NO_ENTITLEMENT_FETCH_ENV,
       OS_COMPAT_LINK_ENV,
+      POD_SA_DIR_ENV,
       RUNTIME_INFO_PATH_ENV,
       "ACPX_SESSION_URL",
       "ACPX_UI_INTERNAL_URL",
@@ -268,4 +274,24 @@ test("78623030: the compat-link seam is ignored outside node --test, so it canno
     process.env[OS_COMPAT_LINK_ENV] = savedLink;
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("8d85cb47: the scrub removes the pod identity (NV_POD_*) and points the service-account seam at nothing", () => {
+  const env: NodeJS.ProcessEnv = {
+    NV_POD_NAME: "wb-x",
+    NV_POD_UID: "uid-x",
+    NV_NODE_NAME: "node-x",
+    NV_DEV_SERVER_ROLE: "control",
+  };
+  assert.deepEqual(scrubBoxHarnessEnvOverrides(env), [...POD_IDENTITY_ENV].toSorted());
+  assert.equal(env.NV_DEV_SERVER_ROLE, "control", "negative control: the role is not pod identity");
+  assert.equal(env[POD_SA_DIR_ENV], NO_POD_SA_DIR);
+  assert.equal(fs.existsSync(NO_POD_SA_DIR), false, "the seam must point at NOTHING");
+});
+
+test("8d85cb47: the suite starts with no pod identity in process.env, so no lock body names a real pod", () => {
+  for (const name of POD_IDENTITY_ENV) {
+    assert.equal(process.env[name], undefined, name);
+  }
+  assert.equal(process.env[POD_SA_DIR_ENV], NO_POD_SA_DIR);
 });

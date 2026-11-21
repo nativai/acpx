@@ -3,6 +3,7 @@
 import { realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { main } from "./cli-core.js";
+import { runPodLockSweep } from "./cli/pod-lock-sweep.js";
 import { buildQueueOwnerArgOverride } from "./cli/session/queue-owner-process.js";
 
 export { classifyConnectionStatus, formatPromptSessionBannerLine } from "./cli-core.js";
@@ -45,6 +46,12 @@ if (isCliEntrypoint(process.argv)) {
 
   if (process.argv.length === 3 && process.argv[2] === "__spawn-ledger-module") {
     process.stdout.write(`${new URL("./spawn-ledger.js", import.meta.url).href}\n`);
+  } else if (process.argv.length === 3 && process.argv[2] === "__pod-lock-module") {
+    // The atrium server's loader for the lock module (pod-lock.ts; EXPORT-lock-module.md, brick 8d85cb47).
+    process.stdout.write(`${new URL("./pod-lock.js", import.meta.url).href}\n`);
+  } else if (process.argv.length === 3 && process.argv[2] === "__pod-lock-sweep") {
+    // One pass of the own-pod lock sweep over this state home, for the agent pod's idle loop (C3.2).
+    void runPodLockSweep();
   } else {
     void main(process.argv);
   }
