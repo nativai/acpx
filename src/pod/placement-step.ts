@@ -246,9 +246,11 @@ export function refusalFor(decision: PlacementDecision): Refusal | undefined {
 
 /**
  * The branch implementations later blocks plug in. Until a block registers its branch, the branch
- * refuses with `pod_branch_unbuilt`. A handler returns the process exit code.
+ * refuses with `pod_branch_unbuilt`. A handler returns the process exit code, or `"proceed"` to run the command locally.
  */
-export type BranchHandler = (decision: PlacementDecision & { kind: "branch" }) => Promise<number>;
+export type BranchHandler = (
+  decision: PlacementDecision & { kind: "branch" },
+) => Promise<number | "proceed">;
 
 const branchHandlers = new Map<PodBranch, BranchHandler>();
 
@@ -298,6 +300,15 @@ export async function runPlacementStep(params: {
   return await act(decision, params.write);
 }
 
+/** A registered handler's outcome: `"proceed"` (A6, C1.2 "answered from the record") runs today's local path. */
+async function runHandler(
+  decision: PlacementDecision & { kind: "branch" },
+  handler: BranchHandler,
+): Promise<"proceed" | { exitCode: number }> {
+  const outcome = await handler(decision);
+  return outcome === "proceed" ? "proceed" : { exitCode: outcome };
+}
+
 async function act(
   decision: PlacementDecision,
   write: (line: string) => void,
@@ -307,7 +318,7 @@ async function act(
   }
   const handler = decision.kind === "branch" ? branchHandler(decision.branch) : undefined;
   if (handler && decision.kind === "branch") {
-    return { exitCode: await handler(decision) };
+    return await runHandler(decision, handler);
   }
   // A decision with no refusal is unreachable by the type; fail closed rather than proceed.
   const refusal = refusalFor(decision) ?? {

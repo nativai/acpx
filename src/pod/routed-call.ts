@@ -453,6 +453,12 @@ async function brokerAnswerOutcome(
   if (answer.kind === "refused") {
     throw brokerRefusal(answer, ctx);
   }
+  if (answer.kind === "error" && answer.reason === "deleted") {
+    // C4: the pod this POST was following was deleted by a concurrent DELETE (a close, a recover, the
+    // A-16 rollback). NEVER retried here: atrium holds the delivery and re-drives it as a NEW call,
+    // which meets the session as it then is.
+    throw podStartingRefusal({ phase: "turnover", wake: ctx.wake });
+  }
   if (answer.kind === "error") {
     const reason = `broker_${answer.reason.replace(/[^\w-]/g, "_")}`;
     throw new RoutedCallError({ outcome: "not_run", reason, callId: ctx.callId });
@@ -461,6 +467,16 @@ async function brokerAnswerOutcome(
     throw admissionBusyRefusal();
   }
   throw await wakeBoundRefusal(answer.phase, ctx);
+}
+
+/**
+ * TEST SEAM, honoured ONLY under `node --test` (`NODE_TEST_CONTEXT`): a shorter wake bound for the
+ * rows that hold a call at it. In production the bound is `WAKE_BOUND_MS` and nothing in the
+ * environment moves it (held by test/pod-routed-branches.test.ts "seams…").
+ */
+function testWakeBoundMs(env: NodeJS.ProcessEnv): number | undefined {
+  const raw = env.NODE_TEST_CONTEXT ? Number(env.ACPX_TEST_WAKE_BOUND_MS) : Number.NaN;
+  return Number.isFinite(raw) && raw > 0 ? raw : undefined;
 }
 
 /** C9: the names to send, or the named failure that stops the call BEFORE the broker is called. */
@@ -487,7 +503,7 @@ async function askBroker(options: RoutedCallOptions, callId: string): Promise<En
   const brokerOptions = {
     origin,
     fetchImpl: options.broker?.fetchImpl,
-    wakeBoundMs: options.broker?.wakeBoundMs ?? WAKE_BOUND_MS,
+    wakeBoundMs: options.broker?.wakeBoundMs ?? testWakeBoundMs(options.env) ?? WAKE_BOUND_MS,
   };
   const answer = await ensureAgentPod(
     options.key,

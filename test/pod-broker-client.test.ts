@@ -118,7 +118,7 @@ test("ensure: a bound reached before any step names no phase", async () => {
   const broker = await startBroker({ lines: [], stall: true });
   try {
     assert.deepEqual(
-      await ensureAgentPod(KEY, REQUEST, { origin: broker.origin, wakeBoundMs: 200 }),
+      await ensureAgentPod(KEY, REQUEST, { origin: broker.origin, wakeBoundMs: 1500 }),
       {
         kind: "wake_bound",
         phase: undefined,

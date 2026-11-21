@@ -353,6 +353,11 @@ export type Classification =
       target?: TargetSelector;
       /** `one-shot`: this invocation is the from-records form. */
       fromRecords: boolean;
+      /**
+       * How many operands the command carries after its path: for a prompt, its text words. A6 reads
+       * it to tell "no text" (the prompt then comes from `--file` or piped stdin) from text.
+       */
+      operandCount: number;
     }
   | { kind: "unclassified"; contract: typeof COMMAND_CLASSES_CONTRACT; path: string };
 
@@ -644,7 +649,7 @@ export function classifyArgv(
   if (pre !== undefined) {
     const entry = PRE_COMMANDER_PATHS[pre];
     const base = { contract: COMMAND_CLASSES_CONTRACT, path: pre, class: entry.class, entry };
-    return { kind: "classified", ...base, help: false, fromRecords: false };
+    return { kind: "classified", ...base, help: false, fromRecords: false, operandCount: 0 };
   }
   const walk = walkArgv(argv, options.builtInAgents);
   return typeof walk === "string" ? unclassified(walk) : finish(walk, options.env ?? process.env);
@@ -688,6 +693,7 @@ function finish(walk: Walk, env: NodeJS.ProcessEnv): Classification {
     help: walk.help,
     ...(target ? { target } : {}),
     fromRecords,
+    operandCount: walk.scan.operands.length,
   };
 }
 

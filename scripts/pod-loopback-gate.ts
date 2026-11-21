@@ -24,7 +24,7 @@ const ARGOCD_BARE = "/workspace/projects/argocd-master-application/.bare";
 const LOOPBACK_PATH = "tool-containers/dev-server-common";
 const NOT_RUNNABLE = 3;
 
-type Loopback = { dir: string; wrapper: string; key: string; uid: string };
+type Loopback = { dir: string; wrapper: string; key: string; uid: string; payloadDir: string };
 
 function sh(command: string, args: string[], cwd?: string): string {
   const r = spawnSync(command, args, { encoding: "utf8", cwd });
@@ -68,7 +68,7 @@ function loopback(script: string, args: string[]): string {
   return sh(script, args);
 }
 
-function startLoopback(script: string): Loopback {
+function startLoopback(script: string, root: string): Loopback {
   const kv = Object.fromEntries(
     loopback(script, ["start"])
       .split("\n")
@@ -80,6 +80,8 @@ function startLoopback(script: string): Loopback {
     wrapper: kv.ACPX_AGENT_EXEC ?? "",
     key: kv.AGENT_KEY ?? "",
     uid: kv.AGENT_POD_UID ?? "",
+    // Never the box's real ~/.acpx/routed: this gate runs with its own state (COMMON.md "Live state").
+    payloadDir: path.join(root, "routed"),
   };
 }
 
@@ -114,6 +116,7 @@ async function observe(lb: Loopback, overrides: Partial<RoutedCallOptions>): Pro
         ip: "127.0.0.1",
       }),
       transportPath: lb.wrapper,
+      payloadDir: lb.payloadDir,
       stdout: out as unknown as NodeJS.WritableStream,
       stderr: err as unknown as NodeJS.WritableStream,
       ...overrides,
@@ -246,7 +249,7 @@ async function main(): Promise<void> {
   process.env.ACPX_ROUTED_PAYLOAD_FORGED = "must-not-travel";
   const root = materialise();
   const script = path.join(root, LOOPBACK_PATH, "tests", "agent-loopback");
-  const lb = startLoopback(script);
+  const lb = startLoopback(script, root);
   let failures = 0;
   try {
     for (const testCase of CASES) {

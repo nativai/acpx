@@ -817,7 +817,7 @@ test("owner-ensure: the pod is not ready within the wake bound → pod_starting 
       const refusal = await expectRefusal(
         runRoutedCall(
           ensureOptions(stub, broker.origin, {
-            broker: { origin: broker.origin, wakeBoundMs: 250 },
+            broker: { origin: broker.origin, wakeBoundMs: 1000 },
           }),
         ),
       );
@@ -839,7 +839,9 @@ test("owner-ensure: the bound before any step → pod_starting phase=scheduling"
     const stub = makeStub();
     const refusal = await expectRefusal(
       runRoutedCall(
-        ensureOptions(stub, broker.origin, { broker: { origin: broker.origin, wakeBoundMs: 250 } }),
+        ensureOptions(stub, broker.origin, {
+          broker: { origin: broker.origin, wakeBoundMs: 1000 },
+        }),
       ),
     );
     assert.match(refusal.stderrLine, /phase=scheduling wake=/);
@@ -890,7 +892,9 @@ test("owner-ensure: the bound with the pool at its maximum → agent_cap why=poo
     const stub = makeStub();
     const refusal = await expectRefusal(
       runRoutedCall(
-        ensureOptions(stub, broker.origin, { broker: { origin: broker.origin, wakeBoundMs: 250 } }),
+        ensureOptions(stub, broker.origin, {
+          broker: { origin: broker.origin, wakeBoundMs: 1000 },
+        }),
       ),
     );
     assert.match(
@@ -909,7 +913,7 @@ test("owner-ensure: the bound with the pool at its maximum → agent_cap why=poo
     const refusal = await expectRefusal(
       runRoutedCall(
         ensureOptions(makeStub(), noFigures.origin, {
-          broker: { origin: noFigures.origin, wakeBoundMs: 250 },
+          broker: { origin: noFigures.origin, wakeBoundMs: 1000 },
         }),
       ),
     );
@@ -1204,6 +1208,38 @@ test("A-10: a utility pod's POST carries neither seat nor sessionId; a session's
     const session = JSON.parse(broker.seen[1]?.body ?? "{}") as Record<string, unknown>;
     assert.equal(session.seat, SEAT);
     assert.equal(session.sessionId, SESSION);
+  } finally {
+    broker.close();
+  }
+});
+
+test("C4 `error deleted`: the pod was deleted by a concurrent DELETE → pod_starting phase=turnover (exit 75), never retried inside acpx; a NEW call after the DELETE wakes a fresh pod", async () => {
+  const broker = await startBroker({
+    perPost: [
+      ["scheduling", "error deleted"],
+      ["scheduling", READY],
+    ],
+  });
+  try {
+    const stub = makeStub({ exit: 0, stdout: "woken\n" });
+    const refusal = await expectRefusal(runRoutedCall(ensureOptions(stub, broker.origin)));
+    assert.equal(
+      refusal.stderrLine,
+      `acpx: REFUSED reason=pod_starting nothing_started=true protocol=1 retry_after_s=3 phase=turnover wake=${SESSION}`,
+    );
+    assert.equal(exitCodeForOutputErrorCode(normalizeOutputError(refusal).code), 75);
+    assert.equal(
+      broker.seen.filter((r) => r.method === "POST").length,
+      1,
+      "the request was not retried",
+    );
+    assert.equal(stub.calls().length, 0, "nothing was sent to a pod");
+    // Atrium re-drives it as a NEW call (recover: DELETE answered, then a new POST): a fresh pod is woken.
+    const options = ensureOptions(stub, broker.origin);
+    assert.equal((await runRoutedCall(options)).kind, "completed");
+    assert.equal(broker.seen.filter((r) => r.method === "POST").length, 2);
+    assert.equal(stub.calls().length, 1);
+    assert.equal(options.out.text, "woken\n");
   } finally {
     broker.close();
   }

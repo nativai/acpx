@@ -12,6 +12,8 @@ export type Script = {
   stall?: boolean;
   noHeaders?: boolean;
   json?: unknown;
+  /** POST answers consumed in order (one list of lines per POST); the last one repeats. Wins over `lines`. */
+  perPost?: string[][];
   /** The answer to `GET /v1/agents` when the same broker is also asked for it. */
   agents?: unknown;
   /** The answer to `DELETE /v1/agents/<key>?uid=…`. */
@@ -24,6 +26,7 @@ export async function startBroker(
   script: Script,
 ): Promise<{ origin: string; seen: Seen; close(): void }> {
   const seen: Seen = [];
+  let posts = 0;
   const server = http.createServer((req, res) => {
     const record = { method: req.method, url: req.url, body: "", closedEarly: false };
     seen.push(record);
@@ -56,7 +59,11 @@ export async function startBroker(
       }
       res.writeHead(script.status ?? 200, { "content-type": "text/plain" });
       res.flushHeaders();
-      const lines = [...(script.lines ?? [])];
+      let postIndex = 0;
+      if (req.method === "POST" && script.perPost) {
+        postIndex = Math.min(posts++, script.perPost.length - 1);
+      }
+      const lines = [...(script.perPost?.[postIndex] ?? script.lines ?? [])];
       const send = () => {
         const line = lines.shift();
         if (line === undefined) {

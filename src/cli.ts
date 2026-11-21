@@ -4,6 +4,7 @@ import { realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { listBuiltInAgents } from "./agent-registry.js";
 import { runPlacementStep } from "./pod/placement-step.js";
+import { registerRoutedBranches } from "./pod/routed-branches.js";
 
 // ⚠️ THIS ENTRY STAYS LIGHT, AND ITS RE-EXPORTS OF `cli-core` WERE REMOVED FOR IT (brick b479441f).
 // Pod mode decides where a command runs BEFORE acpx loads the world (CONTRACTS-r4 C1.2, CONCEPTION r4
@@ -49,6 +50,7 @@ function placementArgv(argv: string[]): string[] {
 }
 
 async function start(): Promise<void> {
+  registerRoutedBranches();
   const outcome = await runPlacementStep({
     argv: placementArgv(process.argv),
     builtInAgents: () => listBuiltInAgents(),

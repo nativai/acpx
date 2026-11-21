@@ -442,21 +442,33 @@ test("CLI: EVERY bridge-capable path refuses on the control pod in pod mode, not
       ["owner-ensure", "owner-if-pod", "create", "one-shot"].includes(e.class),
   );
   assert.ok(bridgeCapable.length >= 15, "vacuous");
-  for (const [p] of bridgeCapable) {
+  for (const [p, entry] of bridgeCapable) {
     // No operands: the placement step refuses before commander would ask for them.
     const r = run(p.split(" "), env);
-    assert.equal(r.status, 2, `${p}: ${r.stderr}`);
-    assert.match(
-      r.stderr.split("\n")[0],
-      /^acpx: REFUSED reason=pod_branch_unbuilt nothing_started=true protocol=1 branch=/u,
-      p,
-    );
+    const first = r.stderr.split("\n")[0];
+    if (entry.class === "owner-ensure" || entry.class === "owner-if-pod") {
+      // A6 builds these branches (routed-ensure / routed-if-pod): with no session named there is
+      // nothing to route to, and the call is refused by name — still nothing started.
+      assert.equal(r.status, 1, `${p}: ${r.stderr}`);
+      assert.match(
+        first,
+        /^acpx: ROUTED outcome=not_run reason=target_unresolved call_id=\S+$/u,
+        p,
+      );
+    } else {
+      assert.equal(r.status, 2, `${p}: ${r.stderr}`);
+      assert.match(
+        first,
+        /^acpx: REFUSED reason=pod_branch_unbuilt nothing_started=true protocol=1 branch=/u,
+        p,
+      );
+    }
   }
   const prompt = run(["claude", "fix", "it"], env);
-  assert.equal(prompt.status, 2);
+  assert.equal(prompt.status, 1);
   assert.match(
-    prompt.stderr,
-    /branch=routed-ensure class=owner-ensure place=control path=<agent>/u,
+    prompt.stderr.split("\n")[0],
+    /^acpx: ROUTED outcome=not_run reason=target_unresolved call_id=\S+$/u,
   );
   assert.deepEqual(startedAnything(home), []);
 });
