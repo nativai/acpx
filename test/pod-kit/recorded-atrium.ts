@@ -654,4 +654,6 @@ if (entry !== undefined && realpathSync(entry) === fileURLToPath(import.meta.url
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.on(signal, () => {
       void atrium.close().finally(() => process.exit(0));
-    
+    });
+  }
+}

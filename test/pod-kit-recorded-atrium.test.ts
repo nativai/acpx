@@ -475,4 +475,15 @@ test("run as a process from its TypeScript source: prints its port, honours --sc
     assert.equal(await call(), 503);
     await fetch(`${base}/_kit/mode`, { method: "POST", body: JSON.stringify({ mode: "normal" }) });
     assert.equal(await call(), 200);
-    const reco
+    const record = (await (await fetch(`${base}/_kit/record`)).json()) as {
+      requests: Array<{ mode: string; outcome: string }>;
+    };
+    assert.deepEqual(
+      record.requests.map((entry) => entry.outcome),
+      ["answered", "away", "answered"],
+    );
+  } finally {
+    child.kill("SIGTERM");
+    await new Promise((resolve) => child.once("exit", resolve));
+  }
+});
