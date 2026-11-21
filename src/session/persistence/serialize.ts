@@ -35,6 +35,16 @@ export type SerializeSessionRecordForDiskOptions = {
  * sites to remember: producing the persisted shape AT ALL is what is checked,
  * so a new writer — test or production — cannot be added without it.
  */
+/**
+ * C1.3 / TE R2-F2 — a DAMAGED `acpx.sleeping` plan is kept in memory as an unusable view that carries the
+ * raw value (`unreadable.raw`, `create-plan.ts`); what reaches the disk is that RAW value, never the view,
+ * so no write — a refused wake's included — changes or erases a plan a person may need to diagnose.
+ */
+function acpxForDisk(acpx: SessionRecord["acpx"]): SessionRecord["acpx"] | Record<string, unknown> {
+  const unreadable = acpx?.sleeping?.unreadable;
+  return unreadable === undefined ? acpx : { ...acpx, sleeping: unreadable.raw };
+}
+
 export function serializeSessionRecordForDisk(
   record: SessionRecord,
   options: SerializeSessionRecordForDiskOptions = {},
@@ -83,7 +93,7 @@ export function serializeSessionRecordForDisk(
     updated_at: canonical.updated_at,
     cumulative_token_usage: canonical.cumulative_token_usage,
     request_token_usage: canonical.request_token_usage,
-    acpx: canonical.acpx,
+    acpx: acpxForDisk(canonical.acpx),
     kind: canonical.kind,
     parent_session_id: canonical.parentSessionId,
     parent_session_url: canonical.parentSessionUrl,

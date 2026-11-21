@@ -572,6 +572,10 @@ function waitingField(queue: WaitingQueue): CapacitySnapshot["waiting"] {
  * `prompt-batch`: `prompt --batch-file` + the owner's `submit_prompt_batch`.
  * `sessions-new-sleeping`: `sessions new|copy --sleeping` (a build without it answers exit 2).
  * `cpu-guard`: the snapshot's `cpu` object and G5 (an agent's create refused `cpu_pressure`).
+ * `fork-cut`: this build EXECUTES C1.3's create plan at the first wake — a fork at a cut, pinned or
+ * computed — and refuses by name a plan version or an anchor kind it does not know (amendment A-21,
+ * brick db8fe858). atrium never delivers a fork at a cut to an acpx that does not list it: an older build
+ * ignores `fork.cut` and would wake the copy as a whole copy. Listed in and out of pod mode.
  */
 export const ACPX_FEATURES: readonly string[] = [
   "prompt-batch",
@@ -580,6 +584,7 @@ export const ACPX_FEATURES: readonly string[] = [
   // The capability probe the deploy recipe and refresh.sh read before wrapping a refresh (R4).
   "run-build",
   "cpu-guard",
+  "fork-cut",
 ];
 
 function buildFigureOf(

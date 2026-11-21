@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { AcpxOperationalError } from "../errors.js";
 import { podMode, thisPodFile } from "./placement.js";
 
@@ -41,6 +42,12 @@ export type SleepingPlanState = {
   /** Version of this shape; absent = the pre-plan shape (`{since, fork?: {from}}`). */
   plan?: number;
   fork?: SleepingFork;
+  /**
+   * Set ONLY on a DAMAGED plan (`plan: -1`): the value exactly as it was on disk. The record serializer
+   * writes THIS back instead of the (deliberately empty) parsed view, so a refused wake never rewrites a
+   * damaged plan — the evidence of what was wrong survives, valid fields included (TE R2-F2).
+   */
+  unreadable?: { raw: unknown };
 };
 
 // ─── the anchor ────────────────────────────────────────────────────────────────────────────────
@@ -183,8 +190,16 @@ function parseOptionalCutFields(
 
 /**
  * `acpx.sleeping` as read from disk: kept only when well-formed (a damaged value reads as "not
- * sleeping", as before). ⚠️ A `fork.cut` that is present but malformed must NOT degrade to "no cut"
- * — that would fork the whole source. It is kept as an unusable plan (version -1) so the wake refuses.
+ * sleeping", as before).
+ *
+ * ⚠️ ONE RULE FOR EVERY FIELD THE PLAN KNOWS — PRESENT AND INVALID MEANS DAMAGED, never dropped (TE
+ * findings M-1, R2-F1). The fields: `plan`, `fork`, `fork.from`, `fork.cut`, `fork.byway`,
+ * `cut.message_index`, `cut.log_index`, `cut.expect_entry`, `cut.harness_anchor`. Dropping one reads the
+ * record as something it is not — a cut without its anchor wakes BY POSITION, a fork without its `from`
+ * wakes as a FRESH agent with no context. A damaged plan is kept as an unusable one (`plan: -1`, nothing
+ * executable) so the wake refuses it by name, and it carries its raw value so it is never written back
+ * changed. Unknown EXTRA fields are ignored (CONTRACTS rule 2). `since` is the one required field of the
+ * K7 shape: without it the value is not a sleeping mark at all.
  */
 export function parseSleepingPlan(value: unknown): SleepingPlanState | undefined {
   const raw = asRecord(value);
@@ -192,41 +207,58 @@ export function parseSleepingPlan(value: unknown): SleepingPlanState | undefined
   if (!raw || since === undefined) {
     return undefined;
   }
+  const plan = parsePlanVersion(raw.plan);
   const fork = parseFork(raw.fork);
-  const plan = parsePlanVersion(raw.plan, fork?.cutDamaged === true);
+  if (plan === DAMAGED || fork === DAMAGED) {
+    return { since, plan: -1, unreadable: { raw: structuredClone(raw) } };
+  }
   return {
     since,
     ...(plan === undefined ? {} : { plan }),
-    ...(fork ? { fork: fork.fork } : {}),
+    ...(fork === undefined ? {} : { fork }),
   };
 }
 
-/** The version as written; -1 (unknown to every reader) for a non-integer or a damaged cut. */
-function parsePlanVersion(value: unknown, cutDamaged: boolean): number | undefined {
-  if (cutDamaged) {
-    return -1;
-  }
+const DAMAGED = Symbol("damaged");
+
+/** Absent, an integer, or DAMAGED (a non-integer, `null`, …). */
+function parsePlanVersion(value: unknown): number | undefined | typeof DAMAGED {
   if (value === undefined) {
     return undefined;
   }
-  return typeof value === "number" && Number.isInteger(value) ? value : -1;
+  return typeof value === "number" && Number.isInteger(value) ? value : DAMAGED;
 }
 
-function parseFork(value: unknown): { fork: SleepingFork; cutDamaged: boolean } | undefined {
-  const fork = asRecord(value);
-  const from = fork ? nonEmptyString(fork.from) : undefined;
-  if (!fork || from === undefined) {
+/** Absent, a valid fork, or DAMAGED: a non-object, a missing/invalid `from`, a damaged `cut`, a `byway` that is not `true`. */
+function parseFork(value: unknown): SleepingFork | undefined | typeof DAMAGED {
+  if (value === undefined) {
     return undefined;
   }
-  const cut = fork.cut === undefined ? undefined : parseCut(fork.cut);
+  const fork = asRecord(value);
+  const from = fork ? nonEmptyString(fork.from) : undefined;
+  if (!fork || from === undefined || !validByway(fork.byway)) {
+    return DAMAGED;
+  }
+  const cut = parseForkCut(fork.cut);
+  return cut === DAMAGED ? DAMAGED : forkOf(from, cut, fork.byway === true);
+}
+
+function forkOf(from: string, cut: SleepingForkCut | undefined, byway: boolean): SleepingFork {
   return {
-    fork: {
-      from,
-      ...(cut ? { cut } : {}),
-      ...(fork.byway === true ? { byway: true as const } : {}),
-    },
-    cutDamaged: fork.cut !== undefined && cut === undefined,
+    from,
+    ...(cut ? { cut } : {}),
+    ...(byway ? { byway: true as const } : {}),
   };
+}
+
+/** `fork.byway` is written only as `true`: absent or `true` is valid, anything else is damage. */
+function validByway(value: unknown): boolean {
+  return value === undefined || value === true;
+}
+
+/** Absent, a valid cut, or DAMAGED (present but not a well-formed cut). */
+function parseForkCut(value: unknown): SleepingForkCut | undefined | typeof DAMAGED {
+  return value === undefined ? undefined : (parseCut(value) ?? DAMAGED);
 }
 
 /** A deep copy of every field — the turn path's re-base must keep the whole plan. */
@@ -239,6 +271,7 @@ export function cloneSleepingPlan(
   return {
     since: plan.since,
     ...(plan.plan === undefined ? {} : { plan: plan.plan }),
+    ...(plan.unreadable ? { unreadable: { raw: structuredClone(plan.unreadable.raw) } } : {}),
     ...(plan.fork
       ? {
           fork: {
@@ -331,9 +364,34 @@ export async function admitRecordOnlyCreate(): Promise<void> {
  * every replay. A replay is a retry of the SAME call, so its argv is identical by construction (atrium
  * re-runs the argv it first ran); anything else — another cut, an added `--prompt`, another template or
  * source — is a different request that must not be answered with the first record.
+ *
+ * ⚠️ A FILE-VALUED ARGUMENT IS ITS BYTES, NOT ITS PATH (TE R2-F4). `fileDigests` maps each such argument's
+ * path to the sha256 of its content AT REQUEST TIME, and the fingerprint hashes that instead of the path:
+ * the same bytes at another path (a pass-through writes a per-attempt temp file) are an identical request,
+ * different bytes behind the same path are not. Today the only such argument of a create is
+ * `sessions import <archive>`; the rule is for every file-valued argument a create takes.
  */
-export function createRequestFingerprint(argv: readonly string[]): string {
-  return createHash("sha256").update(JSON.stringify(argv)).digest("hex").slice(0, 32);
+export function createRequestFingerprint(
+  argv: readonly string[],
+  fileDigests: Readonly<Record<string, string>> = {},
+): string {
+  const request = argv.map((arg) =>
+    Object.hasOwn(fileDigests, arg) ? `file-sha256:${fileDigests[arg]}` : arg,
+  );
+  return createHash("sha256").update(JSON.stringify(request)).digest("hex").slice(0, 32);
+}
+
+/** The sha256 of each named file's bytes, keyed by the path as it appears in the argv. */
+export async function fileArgumentDigests(
+  paths: readonly string[],
+): Promise<Record<string, string>> {
+  const digests: Record<string, string> = {};
+  for (const filePath of paths) {
+    digests[filePath] = createHash("sha256")
+      .update(await readFile(filePath))
+      .digest("hex");
+  }
+  return digests;
 }
 
 /** A replay (same `--record-id`, same `--created-by-call`) whose request is not the one the record holds. */

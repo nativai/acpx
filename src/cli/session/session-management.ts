@@ -42,6 +42,7 @@ import { withDefaultModelForNewSession } from "../../session/default-model.js";
 import { defaultSessionEventLog } from "../../session/event-log.js";
 import { getLoggedMessageCount } from "../../session/messages-log-bookkeeping.js";
 import {
+  getDesiredModelId,
   setCurrentModelId,
   setDesiredConfigOption,
   setDesiredModelId,
@@ -1072,6 +1073,14 @@ function persistSleepingPins(
 ): void {
   persistSessionOptions(record, sessionOptions);
   persistSessionOwnerOptions(record, options);
+  // ⚠️ A pinned model is also the record's CURRENT model from its first write: the record write funnel
+  // (`mergeRecordPinnedModelForPersist`) realigns `current_model_id` to a pin on the first write of any
+  // record that has none, so leaving it out here made a REFUSED first wake add it to a record whose agent
+  // never ran (TE R2-F3, Claude only — a Pi session pins no model). Test: "L-1 … (model pinned)".
+  const pinnedModel = getDesiredModelId(record.acpx);
+  if (pinnedModel !== undefined) {
+    setCurrentModelId(record, pinnedModel);
+  }
   if (sessionOptions?.reasoningEffort) {
     setDesiredConfigOption(record, "effort", sessionOptions.reasoningEffort);
   }
