@@ -735,3 +735,29 @@ test("seams: the release directory and payload directory seams are honoured only
     pod.closeAll();
   }
 });
+
+test("CLI pod mode: the failure keeps the command's output mode — json: error object on stdout AND the ROUTED line first on stderr; --json-strict: stderr empty", async () => {
+  const pod = await podFixture({ api: { items: [] } });
+  try {
+    const target = ["--session-id", "00000000-0000-4000-8000-00000000dead"];
+    const json = await cli(["--format", "json", "claude", "prompt", ...target, "hi"], pod.env);
+    assert.equal(json.code, 1);
+    assert.match(
+      json.stderr.split("\n")[0] ?? "",
+      /^acpx: ROUTED outcome=not_run reason=target_unresolved call_id=\S+$/,
+    );
+    assert.ok(
+      JSON.parse(json.stdout.trim().split("\n")[0] ?? "{}").error,
+      "an error object on stdout",
+    );
+    const strict = await cli(
+      ["--format", "json", "--json-strict", "claude", "prompt", ...target, "hi"],
+      pod.env,
+    );
+    assert.equal(strict.code, 1);
+    assert.equal(strict.stderr, "");
+    assert.ok(JSON.parse(strict.stdout.trim().split("\n")[0] ?? "{}").error);
+  } finally {
+    pod.closeAll();
+  }
+});

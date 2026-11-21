@@ -739,16 +739,33 @@ test("F1 CLI: `help` in a prompt, in ANOTHER agent pod, is routed (message-route
 
 test("F1 CLI: `acpx help …` on the control pod is a prompt — refused at the step, before any write", () => {
   const home = podHome();
+  // `help` words with NO session named: refused by name in A6's branch before any read or write.
   for (const argv of [
     ["help"],
     ["help", "sessions"],
     ["claude", "--session-id", "X", "help", "me"],
   ]) {
     const r = run(argv, podEnv(home));
-    assert.equal(r.status, 2, JSON.stringify(argv));
-    assert.match(r.stderr.split("\n")[0], /branch=routed-ensure class=owner-ensure place=control/u);
+    // A6 builds routed-ensure: a `help` prompt names no session, so it is refused by name there —
+    // before any write, as before (it is a PROMPT, not help).
+    assert.equal(r.status, 1, JSON.stringify(argv));
+    assert.match(
+      r.stderr.split("\n")[0],
+      /^acpx: ROUTED outcome=not_run reason=target_unresolved call_id=\S+$/u,
+      JSON.stringify(argv),
+    );
   }
-  assert.deepEqual(tree(home), [], "no index, no ledger — the step refused before acpx loaded");
+  // A6: the third form NAMES a session, so the control pod resolves it (its own session store, which
+  // may rebuild its own index); the first two name none and write nothing. Run them in a fresh home.
+  const fresh = podHome();
+  for (const argv of [["help"], ["help", "sessions"]]) {
+    run(argv, podEnv(fresh));
+  }
+  assert.deepEqual(
+    tree(fresh),
+    [],
+    "no index, no ledger — a help prompt that names no session writes nothing",
+  );
   // And under pod_identity_missing a `help` prompt is NOT "diagnosable": it refuses.
   const r = run(["help", "me"], podEnv(podHome(), { NV_POD_UID: undefined }));
   assert.equal(r.status, 2);
@@ -840,14 +857,15 @@ test("F2: the own-session check answers OWN only on exact evidence, read-only", 
 
 test("F3 CLI: --format json carries the placement refusal in error.data (C7.2)", () => {
   const home = podHome();
-  const r = run(["--format", "json", "prompt", "--session-id", "x", "hi"], podEnv(home));
+  const r = run(["--format", "json", "exec", "hi"], podEnv(home));
   assert.equal(r.status, 2);
   const out = JSON.parse(r.stdout.trim()) as {
     error: { code: number; data: Record<string, unknown> };
   };
   assert.equal(out.error.code, -32602);
   assert.equal(out.error.data.reason, "pod_branch_unbuilt");
-  assert.equal(out.error.data.branch, "routed-ensure");
+  // `exec` (utility-pod) stands for "a branch not built yet": routed-ensure is A6's now.
+  assert.equal(out.error.data.branch, "utility-pod");
   assert.equal(out.error.data.nothing_started, true);
   assert.equal(out.error.data.tokenLine, r.stderr.split("\n")[0], "line 1 stays on stderr too");
   const u = run(["--format", "json", "seats", "zzz"], podEnv(home));
@@ -862,14 +880,14 @@ test("F3 CLI: --format json carries the placement refusal in error.data (C7.2)",
     "control_pod_only",
   );
   // --json-strict: JSON on stdout, nothing on stderr.
-  const strict = run(["--format", "json", "--json-strict", "prompt", "hi"], podEnv(home));
+  const strict = run(["--format", "json", "--json-strict", "exec", "hi"], podEnv(home));
   assert.equal(strict.stderr, "");
   assert.equal(
     (JSON.parse(strict.stdout) as { error: { data: { reason: string } } }).error.data.reason,
     "pod_branch_unbuilt",
   );
   // Text mode: nothing on stdout.
-  assert.equal(run(["prompt", "hi"], podEnv(home)).stdout, "");
+  assert.equal(run(["exec", "hi"], podEnv(home)).stdout, "");
 });
 
 test('F5: NODE_TEST_CONTEXT="" honours NEITHER seam (home and service account agree)', () => {
