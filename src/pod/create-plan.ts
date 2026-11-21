@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { AcpxOperationalError } from "../errors.js";
 import { podMode, thisPodFile } from "./placement.js";
 
@@ -61,6 +62,7 @@ export const FORK_SOURCE_SLEEPING = "FORK_SOURCE_SLEEPING";
 export const FORK_SOURCE_GONE = "FORK_SOURCE_GONE";
 export const FORK_ANCHOR_MISSING = "FORK_ANCHOR_MISSING";
 export const CREATE_PLAN_UNSUPPORTED = "CREATE_PLAN_UNSUPPORTED";
+export const CREATE_REPLAY_MISMATCH = "CREATE_REPLAY_MISMATCH";
 
 export function encodeHarnessAnchor(anchor: HarnessAnchor): string {
   return `${anchor.kind}:${anchor.value}`;
@@ -82,8 +84,12 @@ export function decodeHarnessAnchor(raw: string): HarnessAnchor {
 
 /** A named refusal of the plan — its message starts with the code, so a reader of any wrapper finds it. */
 export class CreatePlanError extends AcpxOperationalError {
-  constructor(code: string, message: string) {
-    super(`${code}: ${message}`, { outputCode: "RUNTIME", detailCode: code, origin: "runtime" });
+  constructor(code: string, message: string, outputCode: "RUNTIME" | "USAGE" = "RUNTIME") {
+    super(`${code}: ${message}`, {
+      outputCode,
+      detailCode: code,
+      origin: outputCode === "USAGE" ? "cli" : "runtime",
+    });
     this.name = "CreatePlanError";
   }
 }
@@ -125,20 +131,53 @@ function nonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+/** An optional field: absent is fine, PRESENT but invalid is `undefined` — the whole cut is then damaged. */
+type Optional<T> = { value?: T } | undefined;
+
+function optionalField<T>(
+  raw: Record<string, unknown>,
+  key: string,
+  parse: (value: unknown) => T | undefined,
+): Optional<T> {
+  if (raw[key] === undefined) {
+    return {};
+  }
+  const value = parse(raw[key]);
+  return value === undefined ? undefined : { value };
+}
+
+/**
+ * ⚠️ FAIL CLOSED (TE finding M-1). A `log_index`, `expect_entry` or `harness_anchor` that is present but
+ * not a valid value — a number where a string belongs, an empty string — must damage the WHOLE cut, never
+ * be dropped: dropping `harness_anchor` made a Claude cut read as unanchored and wake BY POSITION (the wrong
+ * cut after a later compaction), and dropping `expect_entry` silently disabled the only check a moved Pi
+ * cut has. A damaged cut makes the plan unknown (`parseSleepingPlan`), and the wake refuses it by name.
+ * Test: `test/pod-create-plan.test.ts` → "a DAMAGED cut".
+ */
 function parseCut(value: unknown): SleepingForkCut | undefined {
   const raw = asRecord(value);
   const messageIndex = raw ? nonNegativeInteger(raw.message_index) : undefined;
   if (!raw || messageIndex === undefined) {
     return undefined;
   }
-  const logIndex = nonNegativeInteger(raw.log_index);
-  const expectEntry = nonEmptyString(raw.expect_entry);
-  const anchor = nonEmptyString(raw.harness_anchor);
+  const optional = parseOptionalCutFields(raw);
+  return optional ? { message_index: messageIndex, ...optional } : undefined;
+}
+
+/** `log_index`, `expect_entry`, `harness_anchor`: each absent or valid; any present-but-invalid → undefined. */
+function parseOptionalCutFields(
+  raw: Record<string, unknown>,
+): Omit<SleepingForkCut, "message_index"> | undefined {
+  const logIndex = optionalField(raw, "log_index", nonNegativeInteger);
+  const expectEntry = optionalField(raw, "expect_entry", nonEmptyString);
+  const anchor = optionalField(raw, "harness_anchor", nonEmptyString);
+  if (!logIndex || !expectEntry || !anchor) {
+    return undefined;
+  }
   return {
-    message_index: messageIndex,
-    ...(logIndex === undefined ? {} : { log_index: logIndex }),
-    ...(expectEntry === undefined ? {} : { expect_entry: expectEntry }),
-    ...(anchor === undefined ? {} : { harness_anchor: anchor }),
+    ...(logIndex.value === undefined ? {} : { log_index: logIndex.value }),
+    ...(expectEntry.value === undefined ? {} : { expect_entry: expectEntry.value }),
+    ...(anchor.value === undefined ? {} : { harness_anchor: anchor.value }),
   };
 }
 
@@ -282,4 +321,27 @@ export async function admitRecordOnlyCreate(): Promise<void> {
   if (refusal) {
     throw waitingLineRefusalError(refusal);
   }
+}
+
+// ─── C6.2 at most once: a replay must be the identical request (TE finding M-2) ───────────────
+
+/**
+ * The fingerprint of a create's request — its whole argv, hashed. It is written into the record's
+ * metadata (`created_by_request`) in the create's own write, beside `created_by_call`, and compared on
+ * every replay. A replay is a retry of the SAME call, so its argv is identical by construction (atrium
+ * re-runs the argv it first ran); anything else — another cut, an added `--prompt`, another template or
+ * source — is a different request that must not be answered with the first record.
+ */
+export function createRequestFingerprint(argv: readonly string[]): string {
+  return createHash("sha256").update(JSON.stringify(argv)).digest("hex").slice(0, 32);
+}
+
+/** A replay (same `--record-id`, same `--created-by-call`) whose request is not the one the record holds. */
+export function createReplayMismatchError(recordId: string): AcpxOperationalError {
+  return new CreatePlanError(
+    CREATE_REPLAY_MISMATCH,
+    `record ${recordId} was created by this call id with a different request; a replay must be the ` +
+      "identical request, so nothing was written and the first answer is not returned for it",
+    "USAGE",
+  );
 }

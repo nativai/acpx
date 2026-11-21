@@ -77,6 +77,80 @@ test("C1.3 negative: a DAMAGED cut never degrades to a whole-source fork — the
   );
 });
 
+test("M-1 / C1.3 negative: a cut field that is PRESENT but not a valid value damages the whole cut — never dropped (a dropped anchor wakes the cut BY POSITION)", () => {
+  const damagedFields: Array<[string, unknown]> = [
+    ["harness_anchor", 42],
+    ["harness_anchor", ""],
+    ["harness_anchor", null],
+    ["harness_anchor", { kind: "claude-uuid" }],
+    ["expect_entry", 42],
+    ["expect_entry", ""],
+    ["log_index", "5"],
+    ["log_index", -1],
+    ["log_index", 1.5],
+  ];
+  for (const [field, bad] of damagedFields) {
+    const raw = JSON.parse(JSON.stringify(CUT)) as { fork: { cut: Record<string, unknown> } };
+    raw.fork.cut[field] = bad;
+    const parsed = parseSleepingPlan(raw);
+    assert.equal(parsed?.plan, -1, `${field}=${JSON.stringify(bad)}: the plan becomes unknown`);
+    assert.equal(
+      parsed?.fork?.cut,
+      undefined,
+      `${field}=${JSON.stringify(bad)}: no half-read cut survives`,
+    );
+    assert.ok(parsed);
+    assert.throws(
+      () => assertKnownPlanVersion(parsed, "r1"),
+      (error: Error) => error.message.startsWith(CREATE_PLAN_UNSUPPORTED),
+      `${field}=${JSON.stringify(bad)}: the wake refuses by name`,
+    );
+  }
+  // The control: the same cut with every field valid, and with the optional ones absent, is read whole.
+  assert.deepEqual(parseSleepingPlan(JSON.parse(JSON.stringify(CUT))), CUT);
+  const bare = { since: CUT.since, plan: 1, fork: { from: "s", cut: { message_index: 2 } } };
+  assert.deepEqual(parseSleepingPlan(bare)?.fork?.cut, { message_index: 2 });
+});
+
+test("M-1 through a real wake: a record whose harness_anchor is damaged is refused by name and stays sleeping — it is not cut by position", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  const source = await warmTarget(f, 2);
+  for (const [field, bad] of [
+    ["harness_anchor", 42],
+    ["harness_anchor", ""],
+    ["expect_entry", 42],
+  ] as const) {
+    const created = await withAtrium(f, async (env) =>
+      runCli(
+        [...base(f), "sessions", "copy", "--from", source, "--at-log-index", "2"],
+        env,
+        f.root,
+      ),
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const id = lastJson(created.stdout).acpxRecordId;
+    const file = recordPath(f, id);
+    const record = JSON.parse(fs.readFileSync(file, "utf8")) as PlanRecord;
+    const cut = record.acpx.sleeping?.fork?.cut as Record<string, unknown> | undefined;
+    assert.ok(cut);
+    cut[field] = bad;
+    fs.writeFileSync(file, JSON.stringify(record));
+    const wake = await runCli([...base(f), "prompt", "--session-id", id, "x"], f.env, f.root);
+    assert.notEqual(wake.code, 0, `${field}=${JSON.stringify(bad)}`);
+    assert.match(
+      wake.stdout + wake.stderr,
+      /CREATE_PLAN_UNSUPPORTED/u,
+      `${field}=${JSON.stringify(bad)}`,
+    );
+    assert.equal((readRecord(f, id) as PlanRecord).acp_session_id, "", "still never run");
+    assert.equal(
+      methods(f).filter((m) => m === "session/fork").length,
+      0,
+      "no fork was made by position",
+    );
+  }
+});
+
 test("C1.3 / rule 1 negative: a plan version this build does not know is refused; absent and 1 are known", () => {
   assert.doesNotThrow(() => assertKnownPlanVersion({ since: "x" }, "r"));
   assert.doesNotThrow(() => assertKnownPlanVersion({ since: "x", plan: 1 }, "r"));
@@ -330,6 +404,99 @@ test("A-15 negative: an anchor kind the wake cannot execute (unknown, or claude-
     assert.notEqual(wake.code, 0, anchor);
     assert.match(wake.stdout + wake.stderr, /FORK_ANCHOR_UNSUPPORTED/u, anchor);
     assert.equal((readRecord(f, id) as PlanRecord).acp_session_id, "", anchor);
+  }
+});
+
+/** A record without the four fields that describe the stream's appended events (see the L-1 row). */
+function withoutStreamBookkeeping(record: unknown): unknown {
+  const copy = structuredClone(record) as Record<string, unknown> & {
+    event_log?: Record<string, unknown>;
+  };
+  for (const key of ["last_seq", "last_request_id", "last_used_at"]) {
+    delete copy[key];
+  }
+  if (copy.event_log) {
+    delete copy.event_log.last_write_at;
+  }
+  return copy;
+}
+
+/** The session's stream file, or undefined when no event was ever appended (a refused wake appends none). */
+function streamBytes(f: Fixture, id: string): string | undefined {
+  try {
+    return fs.readFileSync(
+      path.join(path.dirname(recordPath(f, id)), `${id}.stream.ndjson`),
+      "utf8",
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+test("L-1 / C1.3: a REFUSED first wake leaves the record exactly as it was before the wake — no dead adapter pid, no agent_started_at, no last_seq, no stream events (anchor refusal and FORK_CUT_MOVED)", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  const source = await warmTarget(f, 2);
+  const tampers: Array<{
+    name: string;
+    code: RegExp;
+    edit: (cut: NonNullable<SleepingPlanState["fork"]>["cut"]) => void;
+  }> = [
+    {
+      name: "unknown anchor kind",
+      code: /FORK_ANCHOR_UNSUPPORTED/u,
+      edit: (cut) => {
+        if (cut) {
+          cut.harness_anchor = "pi-entry:8112d380";
+        }
+      },
+    },
+    {
+      name: "moved unanchored cut",
+      code: /FORK_CUT_MOVED/u,
+      edit: (cut) => {
+        if (cut) {
+          cut.expect_entry = `agent:${"0".repeat(40)}`;
+        }
+      },
+    },
+  ];
+  for (const tamper of tampers) {
+    const created = await withAtrium(f, async (env) =>
+      runCli(
+        [...base(f), "sessions", "copy", "--from", source, "--at-log-index", "2"],
+        env,
+        f.root,
+      ),
+    );
+    assert.equal(created.code, 0, created.stderr);
+    const id = lastJson(created.stdout).acpxRecordId;
+    const file = recordPath(f, id);
+    const record = JSON.parse(fs.readFileSync(file, "utf8")) as PlanRecord;
+    tamper.edit(record.acpx.sleeping?.fork?.cut);
+    fs.writeFileSync(file, JSON.stringify(record));
+    const recordBefore = JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
+    const streamBefore = streamBytes(f, id);
+    const wake = await runCli([...base(f), "prompt", "--session-id", id, "x"], f.env, f.root);
+    assert.notEqual(wake.code, 0, tamper.name);
+    assert.match(wake.stdout + wake.stderr, tamper.code, tamper.name);
+    // The record equals what it was before the wake EXCEPT the stream's own bookkeeping — the refused
+    // attempt's turn log is really appended to the stream (and a failed delivery's terminal must be, C1.3),
+    // so `last_seq`, `last_request_id`, `last_used_at` and `event_log.last_write_at` describe those events.
+    assert.deepEqual(
+      withoutStreamBookkeeping(readRecord(f, id)),
+      withoutStreamBookkeeping(recordBefore),
+      `${tamper.name}: the record is as it was before the wake (no dead adapter pid, start time, prompt time, OS observation)`,
+    );
+    const after = readRecord(f, id) as { last_seq: number };
+    const lines = (streamBytes(f, id) ?? "").split("\n").filter(Boolean).length;
+    assert.ok(
+      after.last_seq > 0 && lines >= after.last_seq,
+      `${tamper.name}: last_seq (${after.last_seq}) counts events really in the stream (${lines})`,
+    );
+    assert.ok(
+      (streamBytes(f, id) ?? "").startsWith(streamBefore ?? ""),
+      `${tamper.name}: the stream only grew`,
+    );
   }
 });
 
@@ -696,4 +863,99 @@ test("C6.2: a replay prints byte for byte what the first answer printed — ever
       `${form.name}: the replay's answer is the first answer`,
     );
   }
+});
+
+test("M-2 / C6.2 negative: a replay (same --record-id + --created-by-call) whose REQUEST differs from what the record holds is refused CREATE_REPLAY_MISMATCH and writes nothing — another cut, an added --prompt, another source, another template; only the identical request returns the first answer", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  const source = await warmTarget(f, 3); // 6 entries: cuts at 6 and at 4 differ
+  const other = await warmTarget(f, 1);
+  const template = await warmTarget(f, 1);
+  const marked = await runCli(
+    [...base(f), "sessions", "template", template, "--enable", "--auto-prompt", "do the thing"],
+    f.env,
+    f.root,
+  );
+  assert.equal(marked.code, 0, marked.stderr);
+  const ids = (n: number) => ({
+    record: `4d4d4d4d-0000-4000-8000-00000000000${n}`,
+    call: `d0d0d0d0-0000-4000-8000-00000000000${n}`,
+  });
+  const cases: Array<{ name: string; first: string[]; changed: string[][] }> = [
+    {
+      name: "cut",
+      first: ["sessions", "copy", "--from", source, "--at-log-index", "6"],
+      changed: [
+        ["sessions", "copy", "--from", source, "--at-log-index", "4"],
+        ["sessions", "copy", "--from", source, "--at-log-index", "6", "--ephemeral"],
+        ["sessions", "copy", "--from", source, "--at-log-index", "6", "--prompt", "hello"],
+        ["sessions", "copy", "--from", other, "--at-log-index", "2"],
+      ],
+    },
+    {
+      name: "new",
+      first: ["sessions", "new"],
+      changed: [
+        ["sessions", "new", "--prompt", "hello"],
+        ["sessions", "new", "--name", "another"],
+      ],
+    },
+    {
+      name: "template",
+      first: ["sessions", "new", "--from-template", template],
+      changed: [["sessions", "new", "--from-template", other]],
+    },
+  ];
+  for (const [index, scenario] of cases.entries()) {
+    const { record, call } = ids(index);
+    const tail = ["--record-id", record, "--created-by-call", call];
+    const first = await runCli([...base(f), ...scenario.first, ...tail], pod(f), f.root);
+    assert.equal(first.code, 0, `${scenario.name}: ${first.stderr}`);
+    const bytes = fs.readFileSync(recordPath(f, record), "utf8");
+    const known = createdRecordIds(f).length;
+    for (const changed of scenario.changed) {
+      const run = await runCli([...base(f), ...changed, ...tail], pod(f), f.root);
+      assert.notEqual(run.code, 0, `${scenario.name}: ${changed.join(" ")} must be refused`);
+      assert.match(run.stdout + run.stderr, /CREATE_REPLAY_MISMATCH/u, changed.join(" "));
+      assert.equal(
+        fs.readFileSync(recordPath(f, record), "utf8"),
+        bytes,
+        `${changed.join(" ")}: the record is unchanged`,
+      );
+      assert.equal(createdRecordIds(f).length, known, `${changed.join(" ")}: nothing was created`);
+    }
+    const again = await runCli([...base(f), ...scenario.first, ...tail], pod(f), f.root);
+    assert.equal(again.code, 0, `${scenario.name}: the identical request is still a replay`);
+    assert.equal(again.stdout, first.stdout, `${scenario.name}: ... and gets the first answer`);
+  }
+});
+
+test("L-2 / C6.2 (as built): after the first wake a replay returns the CURRENT record with exit 0 — the answer is rebuilt from the record, so it is no longer the first answer's bytes (the contract's byte-for-byte window is 'still sleeping')", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  const source = await warmTarget(f, 2);
+  const argv = [
+    ...base(f),
+    "sessions",
+    "copy",
+    "--from",
+    source,
+    "--record-id",
+    RECORD_ID,
+    "--created-by-call",
+    CALL_ID,
+  ];
+  const first = await runCli(argv, pod(f), f.root);
+  assert.equal(first.code, 0, first.stderr);
+  const firstAnswer = lastJson(first.stdout);
+  assert.equal(firstAnswer.acpxSessionId, "", "the first answer: sleeping, no conversation yet");
+  const sleepingReplay = await runCli(argv, pod(f), f.root);
+  assert.equal(sleepingReplay.stdout, first.stdout, "while the record still sleeps: byte for byte");
+
+  const wake = await runCli([...base(f), "prompt", "--session-id", RECORD_ID, "x"], f.env, f.root);
+  assert.equal(wake.code, 0, wake.stderr);
+  const woken = await runCli(argv, pod(f), f.root);
+  assert.equal(woken.code, 0, woken.stderr);
+  const replay = lastJson(woken.stdout);
+  assert.equal(replay.acpxRecordId, RECORD_ID, "the same record");
+  assert.notEqual(replay.acpxSessionId, "", "the CURRENT record: it has a conversation now");
+  assert.deepEqual(createdRecordIds(f).includes(RECORD_ID), true);
 });
