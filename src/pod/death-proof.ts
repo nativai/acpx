@@ -134,17 +134,37 @@ function answerBody(answer: ApiAnswer): Record<string, unknown> | undefined {
   return answer?.status === 200 ? record(answer.body) : undefined;
 }
 
+/**
+ * A 404 that IS the API server's "no such object": `kind: Status`, `reason: NotFound`, and `details`
+ * naming exactly the object asked (measured shape, pods and nodes, devbox 2026-11-21). ⚠️ DO NOT
+ * RELAX THIS TO `status === 404`: a proxy, a wrong base path or any non-Kubernetes listener answers
+ * 404 to every path, and that would prove every holder `gone` (test-engineer F1). Anything else is
+ * `unknown`. `test/pod-death-proof.test.ts` "F1" rows pin it.
+ */
+function isNotFound(answer: ApiAnswer, kind: "pods" | "nodes", name: string): boolean {
+  const body = answer?.status === 404 ? record(answer.body) : undefined;
+  return isStatusNotFound(body) && namesObject(record(body?.details), kind, name);
+}
+
+function isStatusNotFound(body: Record<string, unknown> | undefined): boolean {
+  return body?.kind === "Status" && body.reason === "NotFound";
+}
+
+function namesObject(details: Record<string, unknown> | undefined, kind: string, name: string) {
+  return details?.kind === kind && details.name === name;
+}
+
 /** Step 1's verdict; `absent` = no pod with that uid, so the node decides; `terminal` = gone. */
-function judgePod(answer: ApiAnswer, uid: string): "exists" | "unknown" | "terminal" | "absent" {
-  if (answer?.status === 404) {
+function judgePod(answer: ApiAnswer, pod: PodRef): "exists" | "unknown" | "terminal" | "absent" {
+  if (isNotFound(answer, "pods", pod.name)) {
     return "absent";
   }
-  const pod = answerBody(answer);
-  const podUid = fieldOf(pod, "metadata", "uid");
-  if (typeof podUid !== "string") {
+  const found = answerBody(answer);
+  const foundUid = fieldOf(found, "metadata", "uid");
+  if (typeof foundUid !== "string") {
     return "unknown";
   }
-  return podUid === uid ? judgePhase(fieldOf(pod, "status", "phase")) : "absent";
+  return foundUid === pod.uid ? judgePhase(fieldOf(found, "status", "phase")) : "absent";
 }
 
 function fieldOf(
@@ -168,8 +188,8 @@ function readyStatus(node: Record<string, unknown> | undefined): unknown {
 }
 
 /** Step 2's verdict: the holder's node Ready or gone ⇒ `gone`; anything else ⇒ `unknown`. */
-function judgeNode(answer: ApiAnswer): DeathProof {
-  if (answer?.status === 404) {
+function judgeNode(answer: ApiAnswer, node: string): DeathProof {
+  if (isNotFound(answer, "nodes", node)) {
     return "gone";
   }
   return readyStatus(answerBody(answer)) === "True" ? "gone" : "unknown";
@@ -228,7 +248,7 @@ async function askApi(
   pod: PodRef,
   signal: AbortSignal,
 ): Promise<DeathProofDetail> {
-  const podVerdict = judgePod(await apiGet(config, podPath(namespace, pod.name), signal), pod.uid);
+  const podVerdict = judgePod(await apiGet(config, podPath(namespace, pod.name), signal), pod);
   if (podVerdict === "terminal") {
     return { answer: "gone", proof: "pod-terminal" };
   }
@@ -239,6 +259,6 @@ async function askApi(
     return { answer: "unknown" };
   }
   const nodePath = `/api/v1/nodes/${encodeURIComponent(pod.node)}`;
-  const node = judgeNode(await apiGet(config, nodePath, signal));
+  const node = judgeNode(await apiGet(config, nodePath, signal), pod.node);
   return node === "gone" ? { answer: "gone", proof: "pod-gone" } : { answer: node };
 }

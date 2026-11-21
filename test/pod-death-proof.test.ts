@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -30,6 +32,7 @@ test.beforeEach(() => {
   api.state.pods.clear();
   api.state.nodes.clear();
   api.state.failure = undefined;
+  api.state.bare404 = undefined;
   api.state.requests.length = 0;
 });
 
@@ -157,4 +160,49 @@ test("unknown (negative): a ref without a name proves nothing — no request (a 
   >[0];
   assert.equal(await proveDeath(nameless, { env }), "unknown");
   assert.deepEqual(api.state.requests, []);
+});
+
+// F1 (test-engineer, 175aa1cc): a 404 proves "no such object" ONLY as the API server's own
+// `Status NotFound` naming that object. A proxy, a wrong base path or a non-Kubernetes listener
+// answers 404 to every path — read as absence, it would prove every holder gone.
+
+test("F1 NEVER: a bare (non-Kubernetes) 404 for the pod is no answer → unknown, never gone", async () => {
+  api.state.bare404 = "all";
+  api.state.nodes.set("node-a", "True");
+  assert.equal(await proveDeath(HOLDER, { env }), "unknown");
+  assert.deepEqual(api.state.requests, [POD_PATH], "the node is not even asked");
+});
+
+test("F1 NEVER: the pod's real NotFound but a bare 404 for the node → unknown, never gone", async () => {
+  api.state.bare404 = "nodes";
+  assert.equal(await proveDeath(HOLDER, { env }), "unknown");
+  assert.deepEqual(api.state.requests, [POD_PATH, NODE_PATH]);
+});
+
+test("F1 NEVER: a Status NotFound naming ANOTHER object is no answer about this one → unknown", async () => {
+  // A server whose every 404 is a well-formed NotFound — but for `ag-holder`, while we ask about
+  // `ag-someone-else`.
+  const shim = http.createServer((_request, response) => {
+    response.writeHead(404, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify({
+        kind: "Status",
+        apiVersion: "v1",
+        status: "Failure",
+        reason: "NotFound",
+        details: { name: "ag-holder", kind: "pods" },
+        code: 404,
+      }),
+    );
+  });
+  await new Promise<void>((resolve) => shim.listen(0, "127.0.0.1", resolve));
+  const { port } = shim.address() as AddressInfo;
+  try {
+    const asked = { ...HOLDER, name: "ag-someone-else" };
+    const shimEnv = { ...env, ACPX_POD_API_URL: `http://127.0.0.1:${port}` };
+    assert.equal(await proveDeath(asked, { env: shimEnv }), "unknown");
+  } finally {
+    shim.closeAllConnections();
+    await new Promise<void>((resolve) => shim.close(() => resolve()));
+  }
 });

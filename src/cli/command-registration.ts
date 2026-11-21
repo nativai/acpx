@@ -8,6 +8,7 @@ import {
   handleSessionsRestore,
   type SessionsArchiveFlags,
 } from "./archive-command.js";
+import { registerBoxCommand } from "./box-command.js";
 import { registerCapacityCommand } from "./capacity-command.js";
 import {
   handleCancel,
@@ -1339,6 +1340,8 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
   registerPeopleCommand(program, config);
   // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS` (`"governor"`, brick 5d7a23b6).
   registerGovernorCommand(program, config);
+  // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS` (`"box"`, A-17, brick f2fde405).
+  registerBoxCommand(program, config);
   registerConfigCommand(program, config);
   registerFlowCommand(program, config);
 }

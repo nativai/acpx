@@ -334,6 +334,11 @@ export const COMMAND_TABLE: Readonly<Record<string, CommandEntry>> = {
     reason: "control-pod maintenance (K2 `local`)",
     controlPodOnly: true,
   },
+  box: { class: "local", reason: "group: help only" },
+  "box refresh": {
+    class: "control-store",
+    reason: "A-17: starts the box release on the control pod; an agent pod passes it through",
+  },
   config: { class: "read", reason: "`config` = show" },
   "config show": { class: "read", reason: "reads config files" },
   "config init": { class: "control-store", reason: "writes the box's config file" },
@@ -372,16 +377,23 @@ export type Classification =
       /** `--help` / `-h` given: commander prints help and runs nothing. */
       help: boolean;
       target?: TargetSelector;
+      /**
+       * More than one selector names the session — two different selector flags, or a flag and the
+       * operand (brick 7eb9686f, R2-a). The chosen `target` is then only the FIRST of them: the
+       * placement step never calls that "this pod's own" (`own-target.ts`), and acpx's resolver refuses
+       * such a line. Two values of the SAME flag are not a conflict (the last wins, in both readers).
+       */
+      targetConflict: boolean;
+      /**
+       * Where the command's own operands sit in the argv (indexes, in operand order) — the pass-through
+       * rewrites a file-valued operand (`sessions import <archive>`) in place (brick 7eb9686f, F-4).
+       */
+      operandIndexes: number[];
       /** `one-shot`: this invocation is the from-records form. */
       fromRecords: boolean;
       /** This invocation is control-pod maintenance (A-7): it refuses in an agent pod. */
       controlPodOnly: boolean;
       output: OutputMode;
-      /**
-       * How many operands the command carries after its path: for a prompt, its text words. A6 reads
-       * it to tell "no text" (the prompt then comes from `--file` or piped stdin) from text.
-       */
-      operandCount: number;
     }
   | {
       kind: "unclassified";
@@ -392,6 +404,10 @@ export type Classification =
 
 type Scan = {
   operands: string[];
+  /** Index of each operand in the tokens this level scanned (parallel to `operands`). */
+  operandAt: number[];
+  /** How many tokens this level scanned: with `operandAt`, an operand's place in the whole argv. */
+  tokenCount: number;
   values: Map<string, string>;
   /** Flags that took no value here (booleans, and flags this level does not declare). */
   booleans: Set<string>;
@@ -400,7 +416,15 @@ type Scan = {
 };
 
 function emptyScan(): Scan {
-  return { operands: [], values: new Map(), booleans: new Set(), help: false, rest: [] };
+  return {
+    operands: [],
+    operandAt: [],
+    tokenCount: 0,
+    values: new Map(),
+    booleans: new Set(),
+    help: false,
+    rest: [],
+  };
 }
 
 const HELP_FLAGS = new Set(["--help", "-h"]);
@@ -476,6 +500,7 @@ type LevelMode = "subcommands" | "positional" | "leaf";
 function scanLevel(tokens: readonly string[], node: GrammarNode, mode: LevelMode): Scan {
   const valueFlags = new Set(node.valueFlags);
   const scan = emptyScan();
+  scan.tokenCount = tokens.length;
   for (let i = 0; i < tokens.length; i += 1) {
     const step = scanStep(tokens, i, mode, valueFlags, scan);
     if (step === "stop") {
@@ -497,7 +522,9 @@ function scanStep(
   const token = tokens[i];
   const operandSeen = scan.operands.length > 0;
   if (token === "--" || (operandSeen && mode === "positional")) {
-    scan.operands.push(...tokens.slice(token === "--" ? i + 1 : i));
+    const from = token === "--" ? i + 1 : i;
+    scan.operands.push(...tokens.slice(from));
+    scan.operandAt.push(...tokens.slice(from).map((_, k) => from + k));
     return "stop";
   }
   if (isOperand(token)) {
@@ -506,6 +533,7 @@ function scanStep(
       return "stop";
     }
     scan.operands.push(token);
+    scan.operandAt.push(i);
     return 0;
   }
   const helpBefore = scan.help;
@@ -543,6 +571,17 @@ function targetFromFlags(spec: TargetSpec, scan: Scan): TargetSelector | undefin
     }
   }
   return undefined;
+}
+
+/** How many DIFFERENT selectors (flags with a value, the operand) name the session. */
+function selectorCount(entry: CommandEntry, scan: Scan): number {
+  const spec = entry.target;
+  if (!spec) {
+    return 0;
+  }
+  const flags = spec.flags.filter((flag) => Boolean(scan.values.get(flag))).length;
+  const operand = spec.operand !== undefined && scan.operands[spec.operand] ? 1 : 0;
+  return flags + operand;
 }
 
 function targetOf(entry: CommandEntry, scan: Scan): TargetSelector | undefined {
@@ -686,13 +725,19 @@ export function classifyArgv(
   if (pre !== undefined) {
     const entry = PRE_COMMANDER_PATHS[pre];
     const base = { contract: COMMAND_CLASSES_CONTRACT, path: pre, class: entry.class, entry };
-    const flags = { help: false, fromRecords: false, controlPodOnly: false, operandCount: 0 };
+    const flags = {
+      help: false,
+      targetConflict: false,
+      operandIndexes: [],
+      fromRecords: false,
+      controlPodOnly: false,
+    };
     return { kind: "classified", ...base, ...flags, output: outputMode(top) };
   }
   const walk = walkArgv(argv, options.builtInAgents);
   return typeof walk === "string"
     ? unclassified(walk, outputMode(top))
-    : finish(walk, outputMode(top, walk.scan));
+    : finish(walk, outputMode(top, walk.scan), argv.length);
 }
 
 /**
@@ -742,7 +787,7 @@ function isControlPodOnly(entry: CommandEntry, scan: Scan): boolean {
   return rule === true || (rule !== undefined && !scanHas(scan, rule.unless));
 }
 
-function finish(walk: Walk, output: OutputMode): Classification {
+function finish(walk: Walk, output: OutputMode, argvLength: number): Classification {
   const entry = COMMAND_TABLE[walk.path];
   if (!entry) {
     return unclassified(walk.path, output);
@@ -759,10 +804,11 @@ function finish(walk: Walk, output: OutputMode): Classification {
     entry,
     help: walk.help,
     ...(target ? { target } : {}),
+    targetConflict: selectorCount(entry, walk.scan) > 1,
+    operandIndexes: walk.scan.operandAt.map((at) => argvLength - walk.scan.tokenCount + at),
     fromRecords,
     controlPodOnly: isControlPodOnly(entry, walk.scan),
     output,
-    operandCount: walk.scan.operands.length,
   };
 }
 

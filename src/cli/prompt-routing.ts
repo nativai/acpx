@@ -1,10 +1,14 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import http from "node:http";
 import path from "node:path";
+import {
+  readAcpxUiInternalOriginSources,
+  resolveAtriumLocalOrigin,
+} from "../acp/acpx-ui-internal-origin.js";
 import { CAPACITY_CONSTANTS } from "../capacity/constants.js";
 import { readerIsInsideLiveOwnerTree } from "../capacity/leases.js";
 import { capacitySourcesFromEnv } from "../capacity/reading.js";
+import { inAgentPod, inCallHomeMode } from "../pod/call-home.js";
 import { sessionBaseDir } from "../session/persistence.js";
 import type { PromptInput } from "../types.js";
 import type { MessageLedgerCaller } from "./message-ledger.js";
@@ -54,6 +58,12 @@ export function atriumJsonPath(): string {
  * them — an older atrium must get today's direct path.
  */
 export function readAtriumJson(nowMs: number = Date.now()): AtriumJsonV1 | undefined {
+  // ⚠️ `atrium.json` ROUTES NOTHING IN AN AGENT POD (CONTRACTS-r4 C6, brick 7eb9686f): a pod's prompt
+  // for another session reaches atrium by the origin ladder in call-home mode (`callHomeRoute`), and
+  // a prompt for its own session is local. Held by `test/pod-call-home-prompt.test.ts`.
+  if (inAgentPod()) {
+    return undefined;
+  }
   try {
     const file = atriumJsonPath();
     const ageMs = nowMs - fs.statSync(file).mtimeMs;
@@ -133,7 +143,28 @@ export function shouldRouteAgentPrompt(input: RouteInput): boolean {
   );
 }
 
-export type AgentPromptRoute = { atrium: AtriumJsonV1; caller: MessageLedgerCaller };
+export type AgentPromptRoute = {
+  /** `internalUrl` is all a routed send reads of it. */
+  atrium: Pick<AtriumJsonV1, "internalUrl">;
+  /** Absent in call-home mode: a person at a pod's shell has no agent identity (`x-source-session: anonymous`). */
+  caller: MessageLedgerCaller | undefined;
+  /** Call-home mode (an agent pod's prompt for another session): the budget, no direct path. */
+  callHome?: true;
+};
+
+/**
+ * The route of a prompt in call-home mode: atrium's door by the origin ladder (the Service name, or
+ * the in-pod forwarder on loopback — C6.1), whatever the caller, the owner tree, `atrium.json` or the
+ * recipient's state say. There is no `undefined` here: a prompt for another session from an agent
+ * pod has no direct path to fall back to.
+ */
+export function callHomeRoute(
+  caller: MessageLedgerCaller | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): AgentPromptRoute {
+  const internalUrl = resolveAtriumLocalOrigin(env, readAcpxUiInternalOriginSources());
+  return { atrium: { internalUrl }, caller, callHome: true };
+}
 
 /**
  * Gathers {@link shouldRouteAgentPrompt}'s inputs cheapest-first: the identity and the file are
@@ -148,6 +179,9 @@ export function decideAgentPromptRoute(params: {
   nowMs?: number;
   insideOwnerTree?: () => boolean;
 }): AgentPromptRoute | undefined {
+  if (inCallHomeMode()) {
+    return callHomeRoute(params.caller);
+  }
   const atrium = readAtriumJson(params.nowMs);
   const base = {
     caller: params.caller,
@@ -219,112 +253,7 @@ export function mintDeliveryId(): string {
   return randomUUID();
 }
 
-/** What an HTTP exchange with atrium came to. Only `connect-failure` may fall back to the direct path. */
-export type AtriumExchange =
-  /** An answer, whatever its status. */
-  | { kind: "response"; status: number; body: unknown }
-  /** No connection was ever made: nothing was sent, the direct path is safe. */
-  | { kind: "connect-failure"; reason: string }
-  /** Connected, but no complete answer in time (or the connection broke): indeterminate — ask atrium. */
-  | { kind: "no-answer"; reason: string };
-
-/** Seconds the CLI waits for atrium's answer once connected (CONCEPTION §7.2). */
-const ANSWER_TIMEOUT_MS = 60_000;
-const CONNECT_TIMEOUT_MS = 5_000;
-
-/** A seam for rigs and tests only: the answer timeout in ms. */
-function answerTimeoutMs(env: NodeJS.ProcessEnv): number {
-  const raw = Number(env.ACPX_ROUTED_PROMPT_ANSWER_TIMEOUT_MS);
-  return Number.isFinite(raw) && raw > 0 ? raw : ANSWER_TIMEOUT_MS;
-}
-
-export function atriumRequest(params: {
-  method: "GET" | "POST";
-  url: string;
-  headers?: Record<string, string>;
-  body?: unknown;
-  env?: NodeJS.ProcessEnv;
-}): Promise<AtriumExchange> {
-  const env = params.env ?? process.env;
-  const payload = params.body === undefined ? undefined : JSON.stringify(params.body);
-  return new Promise((resolve) => {
-    let connected = false;
-    let settled = false;
-    const finish = (exchange: AtriumExchange) => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(connectTimer);
-        clearTimeout(answerTimer);
-        request.destroy();
-        resolve(exchange);
-      }
-    };
-    let request: http.ClientRequest;
-    try {
-      request = http.request(
-        params.url,
-        {
-          method: params.method,
-          headers: {
-            ...(payload === undefined
-              ? {}
-              : {
-                  "content-type": "application/json",
-                  "content-length": Buffer.byteLength(payload),
-                }),
-            ...params.headers,
-          },
-        },
-        (response) => {
-          const chunks: Buffer[] = [];
-          response.on("data", (chunk: Buffer) => chunks.push(chunk));
-          response.on("end", () => {
-            const text = Buffer.concat(chunks).toString("utf8");
-            let body: unknown = text;
-            try {
-              body = text.length > 0 ? (JSON.parse(text) as unknown) : undefined;
-            } catch {
-              // a non-JSON body is reported as text
-            }
-            finish({ kind: "response", status: response.statusCode ?? 0, body });
-          });
-          response.on("error", (error) => finish({ kind: "no-answer", reason: error.message }));
-        },
-      );
-    } catch (error) {
-      resolve({
-        kind: "connect-failure",
-        reason: error instanceof Error ? error.message : String(error),
-      });
-      return;
-    }
-    const connectTimer = setTimeout(
-      () => !connected && finish({ kind: "connect-failure", reason: "connect timed out" }),
-      CONNECT_TIMEOUT_MS,
-    );
-    const answerTimer = setTimeout(
-      () => finish({ kind: "no-answer", reason: "no answer in time" }),
-      answerTimeoutMs(env),
-    );
-    request.on("socket", (socket) => {
-      if (!socket.connecting) {
-        connected = true;
-        return;
-      }
-      socket.once("connect", () => {
-        connected = true;
-      });
-    });
-    request.on("error", (error) =>
-      finish(
-        connected
-          ? { kind: "no-answer", reason: error.message }
-          : { kind: "connect-failure", reason: error.message },
-      ),
-    );
-    request.end(payload);
-  });
-}
+export { atriumRequest, type AtriumExchange } from "../pod/atrium-exchange.js";
 
 // ─── the words ─────────────────────────────────────────────────────────────────────────────────
 
@@ -350,6 +279,13 @@ export function atriumDownRefusalLine(who: string): string {
 export function deliveredDirectlyLine(deliveryId: string): string {
   return `acpx: atrium's message queue did not answer; delivered directly (delivery ${deliveryId})`;
 }
+
+/**
+ * Wait mode in call-home mode (an agent pod's prompt for another session). The recipient's agent may
+ * well be running — the prompt is routed because it CROSSES PODS, never because nothing runs (O-2).
+ */
+export const CALL_HOME_WAIT_MODE_LINE =
+  "acpx: this prompt crosses pods, so it went to atrium's message queue and was not waited for; its reply arrives as a message.";
 
 /** Wait mode, recipient not running: the routed send does not stream a reply. */
 export const ROUTED_WAIT_MODE_LINE =

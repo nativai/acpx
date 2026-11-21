@@ -2,7 +2,13 @@ import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { isControlPod } from "../config/control-pod.js";
-import { agentPodFilePath, podModeVerdict, readAgentPodFile, TEST_HOME_ENV } from "./placement.js";
+import {
+  AGENT_POD_FILE_NAME,
+  CANONICAL_HOME,
+  podModeVerdict,
+  readAgentPodFile,
+  TEST_HOME_ENV,
+} from "./placement.js";
 
 /**
  * This process's pod (C3.1 `pod` field sources, C3.2 lock body) — brick 8d85cb47.
@@ -76,15 +82,24 @@ export function ownPodIdentity(env: NodeJS.ProcessEnv = process.env): PodIdentit
  */
 export type LockHostPlace = "control" | "agent-pod" | "elsewhere";
 
-function testHomeSet(env: NodeJS.ProcessEnv): boolean {
-  return env.NODE_TEST_CONTEXT !== undefined && nonEmpty(env[TEST_HOME_ENV]) !== undefined;
+/**
+ * The seam's directory, or undefined. ⚠️ TRUTHINESS, NOT `!== undefined`: an EMPTY
+ * `NODE_TEST_CONTEXT` honours no seam anywhere (stream HoD ruling, A1's F5 class) — the same test as
+ * `serviceAccountDir` and the death proof's `ACPX_POD_API_URL`. Pinned by
+ * `test/pod-lock-primitive.test.ts` "an EMPTY NODE_TEST_CONTEXT honours no seam".
+ */
+function testHome(env: NodeJS.ProcessEnv): string | undefined {
+  return env.NODE_TEST_CONTEXT ? nonEmpty(env[TEST_HOME_ENV]) : undefined;
 }
 
 export function lockHostPlace(env: NodeJS.ProcessEnv = process.env): LockHostPlace {
-  if (!testHomeSet(env) && !isControlPod(env)) {
+  const seam = testHome(env);
+  if (!seam && !isControlPod(env)) {
     return "elsewhere";
   }
-  return readAgentPodFile(agentPodFilePath(env)).kind === "absent" ? "control" : "agent-pod";
+  // The path is built here, under the rule above, rather than through `agentPodFilePath`.
+  const file = path.join(seam ?? CANONICAL_HOME, AGENT_POD_FILE_NAME);
+  return readAgentPodFile(file).kind === "absent" ? "control" : "agent-pod";
 }
 
 /**

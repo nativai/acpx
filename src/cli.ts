@@ -7,6 +7,8 @@ import { runPlacementStep } from "./pod/placement-step.js";
 import { registerRoutedBranches } from "./pod/routed-branches.js";
 // Block A2 registers the `record-only-create` branch (C1.3); a light module, see its header.
 import "./pod/record-only-create-branch.js";
+// Block A3 registers the `pass-through` and `message-route` branches (C6); a light module too.
+import "./pod/pass-through-branch.js";
 
 // ⚠️ THIS ENTRY STAYS LIGHT, AND ITS RE-EXPORTS OF `cli-core` WERE REMOVED FOR IT (brick b479441f).
 // Pod mode decides where a command runs BEFORE acpx loads the world (CONTRACTS-r4 C1.2, CONCEPTION r4

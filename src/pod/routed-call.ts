@@ -21,6 +21,7 @@ import {
   type BrokerClientOptions,
   WAKE_BOUND_MS,
 } from "./broker-client.js";
+import { CALLER_IDENTITY_VARS, type CallerIdentity } from "./caller-identity.js";
 import {
   admissionBusyRefusal,
   agentCapRefusal,
@@ -60,14 +61,7 @@ export const SHARED_ROOTS = [
 
 export const AGENT_EXEC_COMMAND = "agent-exec";
 
-/** The caller-identity variables C2 lets travel — and only when an agent caused the call. */
-export const CALLER_IDENTITY_VARS = [
-  "ACPX_SESSION_URL",
-  "ACPX_SEAT_URL",
-  "ACPX_SESSION_RECORD_ID",
-  "ACPX_PARENT_SESSION_URL",
-  "ACPX_PARENT_SEAT_URL",
-] as const;
+export { CALLER_IDENTITY_VARS };
 
 export type RoutedClass = "owner-ensure" | "owner-if-pod" | "one-shot";
 
@@ -117,7 +111,7 @@ export type RoutedCallOptions = {
   /** The caller's own deadline — `one-shot` only. */
   deadlineMs?: number;
   /** Caller identity — set ONLY when an agent caused the call through the pass-through (C2). */
-  callerIdentity?: Partial<Record<(typeof CALLER_IDENTITY_VARS)[number], string>>;
+  callerIdentity?: CallerIdentity;
   /** The caller's environment: read for `ACPX_LOCKED_BY`, `PATH`, `HOME`; nothing else is forwarded. */
   env: NodeJS.ProcessEnv;
   /**

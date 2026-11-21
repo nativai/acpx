@@ -123,24 +123,6 @@ export function admissionBusyRefusal(): CapacityRefusedError {
 }
 
 /**
- * `acpx: REFUSED reason=routed_twice` (exit 2, A-8): a command that arrived in a pod already routed
- * (`ACPX_ROUTED=1`) was about to be routed again. Nothing was started. Usage-level: exit 2 by its
- * output code, like `unclassified_command`.
- */
-export class RoutedTwiceRefusal extends AcpxOperationalError {
-  readonly stderrLine = "acpx: REFUSED reason=routed_twice";
-
-  constructor() {
-    super(
-      "acpx: REFUSED reason=routed_twice\n" +
-        "This command was already routed to a pod and would be routed again; nothing was started. " +
-        "Run it in the pod that owns the session.",
-      { outputCode: "USAGE", detailCode: "routed-twice", origin: "cli" },
-    );
-  }
-}
-
-/**
  * Exit 1; the FIRST stderr line is `acpx: ROUTED outcome=… call_id=…` (C2) — the atrium server
  * reads `outcome=unknown` as "retry with the same message id". `stderrLine` keeps it on stderr in
  * json mode too, as `CapacityRefusedError` does.

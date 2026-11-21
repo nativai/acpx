@@ -8,13 +8,9 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import {
-  exitCodeForOutputErrorCode,
-  normalizeOutputError,
-} from "../src/acp/error-normalization.js";
 import { createAgentPodLookup, podFacts } from "../src/pod/agent-pod-lookup.js";
 import { classifyArgv } from "../src/pod/command-classes.js";
-import { RoutedCallError, RoutedTwiceRefusal } from "../src/pod/pod-refusal.js";
+import { RoutedCallError } from "../src/pod/pod-refusal.js";
 import {
   planPayload,
   PROMPT_REQUIRED_MESSAGE,
@@ -24,6 +20,7 @@ import {
   type RoutedRecord,
 } from "../src/pod/routed-branches.js";
 import { agentPodKey, type RoutedCallOptions } from "../src/pod/routed-call.js";
+import { refuseRoutedTwice, ROUTED_TWICE_REFUSAL } from "../src/pod/routed-twice.js";
 import { startBroker } from "./pod-local-fake-broker.js";
 import { makeSessionRecord, writeSessionRecordFile } from "./runtime-test-helpers.js";
 
@@ -100,6 +97,14 @@ function harness(
   return h;
 }
 
+const ctx = (writes: string[] = []) => ({
+  argv: [] as string[],
+  write: (line: string) => {
+    writes.push(line);
+  },
+  writeStdout: () => undefined,
+});
+
 function decisionFor(argv: string[]) {
   const classification = classifyArgv(argv, { builtInAgents: ["claude", "pi", "codex"] });
   assert.equal(classification.kind, "classified");
@@ -117,7 +122,7 @@ test("routed-ensure: the call goes to the session's key as class owner-ensure, w
   const handlers = routedBranchHandlers(h.deps);
   const argv = ["claude", "prompt", "--session-id", SESSION, "hello"];
   assert.equal(
-    await handlers["routed-ensure"](decisionFor(argv)),
+    await handlers["routed-ensure"](decisionFor(argv), ctx()),
     7,
     "the pod command's exit code",
   );
@@ -143,7 +148,10 @@ test("routed-ensure: the call goes to the session's key as class owner-ensure, w
 test('routed-if-pod: class owner-if-pod, never asks for releases, `no_pod` → "proceed" (answered from the record)', async () => {
   const h = harness({ outcome: "no_pod", argv: () => ["cancel", "--session-id", SESSION] });
   const handlers = routedBranchHandlers(h.deps);
-  const result = await handlers["routed-if-pod"](decisionFor(["cancel", "--session-id", SESSION]));
+  const result = await handlers["routed-if-pod"](
+    decisionFor(["cancel", "--session-id", SESSION]),
+    ctx(),
+  );
   assert.equal(result, "proceed");
   assert.equal(h.runs[0]?.class, "owner-if-pod");
   assert.equal(
@@ -156,6 +164,7 @@ test('routed-if-pod: class owner-if-pod, never asks for releases, `no_pod` → "
   assert.equal(
     await routedBranchHandlers(h2.deps)["routed-if-pod"](
       decisionFor(["cancel", "--session-id", SESSION]),
+      ctx(),
     ),
     5,
   );
@@ -167,6 +176,7 @@ test("a refusal or failure thrown by the call goes to acpx's own failure printin
   assert.equal(
     await routedBranchHandlers(h.deps)["routed-ensure"](
       decisionFor(["claude", "prompt", "--session-id", SESSION, "x"]),
+      ctx(),
     ),
     1,
   );
@@ -178,6 +188,7 @@ test("a target acpx cannot resolve → `ROUTED outcome=not_run reason=target_unr
     assert.equal(
       await routedBranchHandlers(h.deps)["routed-ensure"](
         decisionFor(["claude", "prompt", "--session-id", "nope", "x"]),
+        ctx(),
       ),
       1,
     );
@@ -197,6 +208,7 @@ test("a session on an adapter the broker has no harness for is refused before an
   });
   await routedBranchHandlers(h.deps)["routed-ensure"](
     decisionFor(["claude", "prompt", "--session-id", SESSION, "x"]),
+    ctx(),
   );
   assert.equal(h.runs.length, 0);
   const failure = h.failures[0];
@@ -273,7 +285,7 @@ test("stdin: no text and a terminal → acpx's own usage line, said HERE (exit 2
   const h = harness({ isTty: () => true });
   const argv = ["claude", "prompt", "--session-id", SESSION];
   h.deps.argv = () => argv;
-  const exit = await routedBranchHandlers(h.deps)["routed-ensure"](decisionFor(argv));
+  const exit = await routedBranchHandlers(h.deps)["routed-ensure"](decisionFor(argv), ctx());
   assert.equal(exit, 2);
   assert.deepEqual(h.stderr, [`${PROMPT_REQUIRED_MESSAGE}\n`]);
   assert.equal(h.runs.length, 0);
@@ -284,7 +296,7 @@ test("stdin: no text and a terminal in JSON mode → acpx's usage error through 
   const h = harness({ isTty: () => true });
   const argv = ["claude", "prompt", "--session-id", SESSION, "--json-strict"];
   h.deps.argv = () => argv;
-  const exit = await routedBranchHandlers(h.deps)["routed-ensure"](decisionFor(argv));
+  const exit = await routedBranchHandlers(h.deps)["routed-ensure"](decisionFor(argv), ctx());
   assert.equal(exit, 1, "the stub printer returns 1; the real one maps USAGE to 2");
   assert.equal(h.runs.length, 0);
   assert.equal(h.stderr.length, 0, "json-strict keeps stderr clean: the printer owns the output");
@@ -294,7 +306,7 @@ test("stdin: no text and a terminal in JSON mode → acpx's usage error through 
 test("classifyArgv carries the operand count the stdin rule reads", () => {
   const count = (argv: string[]) => {
     const c = classifyArgv(argv, { builtInAgents: ["claude"] });
-    return c.kind === "classified" ? c.operandCount : -1;
+    return c.kind === "classified" ? c.operandIndexes.length : -1;
   };
   assert.equal(count(["claude", "prompt", "--session-id", "x"]), 0);
   assert.equal(count(["claude", "prompt", "--session-id", "x", "hi", "there"]), 2);
@@ -417,6 +429,14 @@ test("lookup NEGATIVES — any failure is `unknown`, NEVER `absent` (an API outa
     { status: 200, raw: "not json" },
     { status: 200, raw: JSON.stringify({ kind: "PodList" }) }, // 200 but no items list
     { status: 200, raw: JSON.stringify({ items: "nope" }) },
+    // A5 round 1 (death-proof's 404 rule): a 404 — even a well-formed Status NotFound — is never `absent`
+    // for a LIST (only a 200 with an items list can say so); a proxy answering 404 to every path would
+    // otherwise send every prompt to the broker.
+    {
+      status: 404,
+      raw: JSON.stringify({ kind: "Status", reason: "NotFound", details: { kind: "pods" } }),
+    },
+    { status: 404, raw: "404 page not found" },
   ];
   for (const script of scripts) {
     const api = await startApi(script);
@@ -471,7 +491,7 @@ const argv = process.argv.slice(2);
 const at = argv.indexOf("--payload");
 const payload = at >= 0 && fs.existsSync(argv[at + 1]) ? fs.readFileSync(argv[at + 1], "utf8") : undefined;
 const calls = path.join(dir, "calls.jsonl");
-fs.appendFileSync(calls, JSON.stringify({ argv, payload }) + "\\n");
+fs.appendFileSync(calls, JSON.stringify({ argv, payload, env: process.env }) + "\\n");
 if (script.stdout) process.stdout.write(script.stdout);
 process.exitCode = script.exit ?? 0;
 `;
@@ -479,7 +499,7 @@ process.exitCode = script.exit ?? 0;
 type Pod = {
   home: string;
   env: NodeJS.ProcessEnv;
-  calls(): Array<{ argv: string[]; payload?: string }>;
+  calls(): Array<{ argv: string[]; payload?: string; env: Record<string, string> }>;
   closeAll(): void;
   brokerSeen: () => number;
   brokerBodies: () => Array<Record<string, unknown>>;
@@ -536,8 +556,12 @@ async function podFixture(opts: {
   for (const name of [
     "ACPX_SESSION_URL",
     "ACPX_SESSION_NAME",
+    "ACPX_SEAT_URL",
+    "ACPX_SESSION_RECORD_ID",
     "ACPX_PARENT_SESSION_URL",
+    "ACPX_PARENT_SEAT_URL",
     "ACPX_STATE_HOME",
+    "ACPX_ROUTED",
     "ACPX_ADMISSION_CLASS",
   ]) {
     delete env[name];
@@ -552,7 +576,10 @@ async function podFixture(opts: {
             .readFileSync(file, "utf8")
             .trim()
             .split("\n")
-            .map((l) => JSON.parse(l) as { argv: string[]; payload?: string })
+            .map(
+              (l) =>
+                JSON.parse(l) as { argv: string[]; payload?: string; env: Record<string, string> },
+            )
         : [];
     },
     closeAll: () => {
@@ -789,27 +816,31 @@ test("CLI pod mode: the failure keeps the command's output mode — json: error 
 
 // ───────────────────────── G-2: routed_twice ─────────────────────────
 
-test("routed_twice (A-8): a command that arrives ROUTED (ACPX_ROUTED=1) is never routed again — refused before anything is resolved or run", async () => {
-  const twice = harness({ env: { PATH: "/usr/bin", ACPX_ROUTED: "1" } });
+test("routed_twice (A-8): a command that arrives ROUTED (ACPX_ROUTED=1) is never routed again — refused before anything is resolved or run, by the helper block A3 shares", async () => {
   const argv = ["claude", "prompt", "--session-id", SESSION, "hello"];
   for (const branch of ["routed-ensure", "routed-if-pod"] as const) {
-    const exit = await routedBranchHandlers(twice.deps)[branch](decisionFor(argv));
-    assert.equal(exit, 1, "the stub printer returns 1");
+    const twice = harness({ env: { PATH: "/usr/bin", ACPX_ROUTED: "1" } });
+    const lines: string[] = [];
+    const exit = await routedBranchHandlers(twice.deps)[branch](decisionFor(argv), ctx(lines));
+    assert.equal(exit, 2, "exit 2, like unclassified_command");
+    assert.equal(lines[0], "acpx: REFUSED reason=routed_twice");
+    assert.equal(lines.length, 2, "both lines in text mode");
+    assert.equal(twice.runs.length, 0);
+    assert.equal(twice.stdinReads, 0);
   }
-  assert.equal(twice.runs.length, 0);
-  const refusal = twice.failures[0];
-  assert.ok(refusal instanceof RoutedTwiceRefusal);
-  assert.equal(refusal.stderrLine, "acpx: REFUSED reason=routed_twice");
-  assert.equal(refusal.message.split("\n")[0], "acpx: REFUSED reason=routed_twice");
+  // ONE helper: the lines are exactly the ones A3's pass-through prints.
+  assert.deepEqual(ROUTED_TWICE_REFUSAL.lines[0], "acpx: REFUSED reason=routed_twice");
   assert.equal(
-    exitCodeForOutputErrorCode(normalizeOutputError(refusal).code),
+    refuseRoutedTwice("json", () => undefined),
     2,
-    "exit 2, like unclassified_command",
   );
+  const jsonLines: string[] = [];
+  refuseRoutedTwice("json", (line) => jsonLines.push(line));
+  assert.deepEqual(jsonLines, [ROUTED_TWICE_REFUSAL.lines[0]], "json: line 1 only");
   // The negative: the same command WITHOUT the marker is routed as usual (and ACPX_ROUTED=0 is no marker).
   for (const env of [{ PATH: "/usr/bin" }, { PATH: "/usr/bin", ACPX_ROUTED: "0" }]) {
     const normal = harness({ env });
-    await routedBranchHandlers(normal.deps)["routed-ensure"](decisionFor(argv));
+    await routedBranchHandlers(normal.deps)["routed-ensure"](decisionFor(argv), ctx());
     assert.equal(normal.runs.length, 1, JSON.stringify(env));
   }
 });
@@ -847,6 +878,64 @@ test("C4 request: sessionUrl (the target's URL on the box's base URL) is sent; `
     const body = pod.brokerBodies()[0];
     assert.equal(body?.sessionUrl, `https://atrium.test.invalid/?session=${SESSION}`);
     assert.equal(body?.sessionId, SESSION);
+  } finally {
+    pod.closeAll();
+  }
+});
+
+// ───────────────────────── G-1: caller identity (C2) ─────────────────────────
+
+const IDENTITY_ENV = {
+  ACPX_SESSION_URL: "https://h/?session=caller-s",
+  ACPX_SEAT_URL: "https://h/?seat=caller-t",
+  ACPX_SESSION_RECORD_ID: "caller-record",
+  ACPX_PARENT_SESSION_URL: "https://h/?session=parent-s",
+  ACPX_PARENT_SEAT_URL: "https://h/?seat=parent-t",
+};
+
+test("caller identity (C2): handed to the call exactly when the environment carries it (an agent caused the call through the pass-through) — and only those five names", async () => {
+  const argv = ["claude", "prompt", "--session-id", SESSION, "hello"];
+  const agent = harness({
+    env: { PATH: "/usr/bin", ...IDENTITY_ENV, ANTHROPIC_API_KEY: "k", ACPX_SOMETHING_ELSE: "x" },
+  });
+  await routedBranchHandlers(agent.deps)["routed-ensure"](decisionFor(argv), ctx());
+  assert.deepEqual(agent.runs[0]?.callerIdentity, IDENTITY_ENV);
+  // Negative: no identity in the environment (a person, a delivery atrium spawned) → none is handed over.
+  const person = harness({ env: { PATH: "/usr/bin", ANTHROPIC_API_KEY: "k" } });
+  await routedBranchHandlers(person.deps)["routed-ensure"](decisionFor(argv), ctx());
+  assert.deepEqual(person.runs[0]?.callerIdentity, {});
+  // Empty values are no identity.
+  const empty = harness({ env: { PATH: "/usr/bin", ACPX_SESSION_URL: "  ", ACPX_SEAT_URL: "" } });
+  await routedBranchHandlers(empty.deps)["routed-if-pod"](decisionFor(argv), ctx());
+  assert.deepEqual(empty.runs[0]?.callerIdentity, {});
+});
+
+test("CLI pod mode, identity each way: an agent-caused call (identity in the environment) carries it into the pod; a call without it carries none", async () => {
+  const pod = await podFixture({ api: { items: [POD()] }, stub: { exit: 0 } });
+  try {
+    const withIdentity = await cli(["cancel", "--session-id", SESSION], {
+      ...pod.env,
+      ...IDENTITY_ENV,
+      ANTHROPIC_API_KEY: "must-not-travel",
+    });
+    assert.equal(withIdentity.code, 0, withIdentity.stderr);
+    const first = pod.calls()[0];
+    assert.ok(first);
+    for (const [name, value] of Object.entries(IDENTITY_ENV)) {
+      assert.equal(first.env[name], value, name);
+    }
+    assert.equal(
+      "ANTHROPIC_API_KEY" in first.env,
+      false,
+      "nothing else of the environment travels",
+    );
+    const without = await cli(["cancel", "--session-id", SESSION], pod.env);
+    assert.equal(without.code, 0, without.stderr);
+    const second = pod.calls()[1];
+    assert.ok(second);
+    for (const name of Object.keys(IDENTITY_ENV)) {
+      assert.equal(name in second.env, false, `${name} must not travel without an agent cause`);
+    }
   } finally {
     pod.closeAll();
   }

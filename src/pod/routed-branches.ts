@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
+import { callerIdentityFrom } from "./caller-identity.js";
 import type { Classification, OutputMode } from "./command-classes.js";
 import {
   registerBranchHandler,
+  type BranchContext,
   type BranchHandler,
   type PlacementDecision,
 } from "./placement-step.js";
+import { isRoutedCall, refuseRoutedTwice } from "./routed-twice.js";
 
 // ⚠️ NO static import — not even a type-only one — of `routed-call.ts` / `broker-client.ts` here:
 // `test/pod-command-classes.test.ts` ("the light graph") counts type imports, and those modules reach
@@ -148,7 +151,7 @@ export async function planPayload(
   if (flagAt >= 0) {
     return { text: await deps.readStdin(), argvFor: (p) => replaceStdinFlag(argv, flagAt, p) };
   }
-  if (hasFileFlag(argv) || classification.operandCount > 0) {
+  if (hasFileFlag(argv) || classification.operandIndexes.length > 0) {
     return undefined;
   }
   if (deps.isTty()) {
@@ -246,6 +249,9 @@ function runOptions(
     cwd: deps.cwd(),
     env: deps.env,
     lookup: deps.lookup,
+    // C2: the caller's identity travels ONLY when an agent caused the call through the pass-through
+    // — which is exactly when the server put it in this process's environment (caller-identity.ts).
+    callerIdentity: callerIdentityFrom(deps.env),
     ...(plan ? { payload: plan.text } : {}),
     ...(deps.payloadDir ? { payloadDir: deps.payloadDir } : {}),
     ...(routedClass === "owner-ensure" ? { releases: deps.releases() } : {}),
@@ -254,13 +260,14 @@ function runOptions(
 
 async function dispatchRouted(
   decision: Branch,
+  context: BranchContext,
   deps: BranchDeps,
   routedClass: "owner-ensure" | "owner-if-pod",
 ): Promise<number | "proceed"> {
-  if (deps.env.ACPX_ROUTED === "1") {
-    // A command that arrived in a pod already routed is never routed again (A-8 `routed_twice`).
-    const { RoutedTwiceRefusal } = await import("./pod-refusal.js");
-    return await deps.fail(new RoutedTwiceRefusal(), decision.classification.output);
+  if (isRoutedCall(deps.env)) {
+    // A command that arrived in a pod already routed is never routed again (A-8 `routed_twice`) —
+    // the same helper block A3's pass-through uses.
+    return refuseRoutedTwice(decision.classification.output, context.write);
   }
   const ready = await readyOrFail(decision, deps, routedClass);
   if (typeof ready === "number") {
@@ -288,8 +295,10 @@ export function routedBranchHandlers(
   deps: BranchDeps,
 ): Record<"routed-ensure" | "routed-if-pod", BranchHandler> {
   return {
-    "routed-ensure": async (decision) => await dispatchRouted(decision, deps, "owner-ensure"),
-    "routed-if-pod": async (decision) => await dispatchRouted(decision, deps, "owner-if-pod"),
+    "routed-ensure": async (decision, context) =>
+      await dispatchRouted(decision, context, deps, "owner-ensure"),
+    "routed-if-pod": async (decision, context) =>
+      await dispatchRouted(decision, context, deps, "owner-if-pod"),
   };
 }
 
@@ -389,9 +398,9 @@ async function liveDeps(): Promise<BranchDeps> {
 /** Called by `src/cli.ts` before the placement step; loads nothing heavy. */
 export function registerRoutedBranches(): void {
   for (const name of ["routed-ensure", "routed-if-pod"] as const) {
-    registerBranchHandler(name, async (decision) => {
+    registerBranchHandler(name, async (decision, context) => {
       const handlers = routedBranchHandlers(await liveDeps());
-      return await handlers[name](decision);
+      return await handlers[name](decision, context);
     });
   }
 }
