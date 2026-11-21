@@ -689,3 +689,41 @@ test("O-4: the CLI prints the progress line on stderr during the wait — and no
     assert.equal(strict.stderr, "", "json-strict: machine-clean stderr");
   });
 });
+
+// ─── A-24: the client owns the ids; atrium answers 400 call-id-mismatch when they differ ─────────
+
+test("A-24: every create sends call_id == its --created-by-call, with --record-id, in argv (atrium passes argv unchanged)", () => {
+  for (const argv of [
+    ["sessions", "new", "--name", "x"],
+    ["sessions", "copy", "--from", "S"],
+    ["sessions", "import", "a.tar"],
+  ]) {
+    const call = buildPassThroughCall(input(argv));
+    const wire = call.body.argv as string[];
+    assert.equal(wire[wire.indexOf("--created-by-call") + 1], call.body.call_id, argv.join(" "));
+    assert.match(wire[wire.indexOf("--record-id") + 1] ?? "", UUID, argv.join(" "));
+  }
+  // A caller-given created-by call is the call_id too (not a second, different id).
+  const given = "eeeeeeee-0000-4000-8000-0000000000e1";
+  const call = buildPassThroughCall(input(["sessions", "new", "--created-by-call", given]));
+  assert.equal(call.body.call_id, given);
+});
+
+test("A-24: a 400 call-id-mismatch is pass_through_refused, exit 2, ONE request — never retried", async () => {
+  const { home } = agentPodHome();
+  await withAtrium(
+    { calls: [{ answer: { status: 400, body: { error: "call-id-mismatch" } } }] },
+    async (atrium) => {
+      const r = await runCli(
+        ["sessions", "new", "--name", "c"],
+        agentPodEnv(home, atrium.url, FAST),
+      );
+      assert.equal(r.status, 2, r.stderr);
+      assert.match(
+        r.stderr.split("\n")[0] ?? "",
+        /^acpx: REFUSED reason=pass_through_refused nothing_started=true protocol=1 status=400 error=call-id-mismatch$/u,
+      );
+      assert.equal(atrium.requests.filter((q) => q.route === "call").length, 1, "not retried");
+    },
+  );
+});
