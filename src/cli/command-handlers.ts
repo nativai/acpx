@@ -4719,6 +4719,9 @@ async function deliverHandoffPrompt(
  * notice uses. Never a direct fallback: atrium unreachable is a first message NOT queued (the record
  * stays), which the caller reports as `promptQueued: false`.
  */
+/** The sender of a person's pod-mode first message — not the activation verb's tag (it is not one). */
+const FIRST_MESSAGE_SENDER = "acpx:first-message";
+
 async function postFirstMessageToAtrium(
   created: SessionRecord,
   prompt: PromptInput,
@@ -4759,6 +4762,7 @@ async function postFirstMessageToAtrium(
   const delivery = await deliverActivationNotice({
     successorId: created.acpxRecordId,
     notice: promptToDisplayText(prompt),
+    from: FIRST_MESSAGE_SENDER,
   });
   if (!delivery.delivered) {
     throw new AcpxOperationalError(

@@ -428,6 +428,9 @@ test("C1.3: the first message of a pod-mode create goes into atrium's queue — 
     const personId = lastJson(person.stdout).acpxRecordId;
     const personPost = stub.requests.find((r) => r.url === `/api/sessions/${personId}/message`);
     assert.equal((personPost?.body as { text?: string } | undefined)?.text, "hello from a person");
+    assert.equal((personPost?.body as { from?: string } | undefined)?.from, "acpx:first-message");
+    assert.equal(lastJson(person.stdout).promptQueued, true, "queued, and the answer says so");
+    assert.equal(lastJson(person.stdout).sleeping, true);
 
     writeAtriumJson(f, { internalUrl: stub.url });
     const agent = await runCli(

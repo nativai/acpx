@@ -445,8 +445,10 @@ export function printNewSessionByFormat(
       sessionUrl: composeSessionUrl(record),
       ...newSessionSeatJson(record, seatUrl),
       ...(subscriptionSelection ? { subscriptionSelection } : {}),
-      ...firstTurn,
+      // The first message's delivery state wins over the sleeping defaults (C1.3: a pod-mode create
+      // whose first message atrium queued is sleeping AND queued).
       ...sleepingJson(record),
+      ...firstTurn,
     })
   ) {
     return;
@@ -520,8 +522,8 @@ export function printCopiedSessionByFormat(
       // F6 — a copy/fork mints a NEW seat; its address is that seat, not the source's.
       ...newSessionSeatJson(record, resolveSeatUrl(record.seatId)),
       ...(subscriptionSelection ? { subscriptionSelection } : {}),
-      ...firstTurn,
       ...sleepingJson(record, forkNotice, templatePrompt),
+      ...firstTurn,
     })
   ) {
     return;
