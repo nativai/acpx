@@ -39,6 +39,7 @@ import {
   PermissionPromptUnavailableError,
   SessionClosedError,
   SessionCwdMissingError,
+  SessionMaterialisationError,
 } from "../../errors.js";
 import {
   attemptFailoverAndRetry,
@@ -3980,6 +3981,10 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   // MODEL_NOT_ADVERTISED (~10 % of first wakes under load) and the woken record kept `sleeping`.
   // The record write funnel still merges the durable options from disk, so skipping here loses none.
   let connecting = false;
+  // C1.3 / L-1 — TRUE once a SLEEPING record's first wake was REFUSED (a cut it cannot execute, a
+  // plan it does not know): no agent ran, so the closing legs below must not write the dead adapter's
+  // lifecycle (pid, birth identity, start time, OS observation) onto the record that "stays as created".
+  let wakeRefused = false;
   const mergeLatestDurablePreferences = (
     persisted: PersistedSessionLifecycle | undefined,
   ): void => {
@@ -4446,6 +4451,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       emitConnectPerfMetric(connectStartedAt, options.verbose);
       return connected;
     } catch (error) {
+      wakeRefused = error instanceof SessionMaterialisationError;
       flushConnectOutput();
       throw error;
     }
@@ -5235,7 +5241,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     if (ownClient) {
       await client.close();
     }
-    applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
+    if (!wakeRefused) {
+      applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
+    }
     applyConversation(record, conversation);
     await mergeLatestDurablePreferencesFromDisk().catch(() => {
       record.acpx = acpxState;
