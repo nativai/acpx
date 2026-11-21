@@ -59,6 +59,9 @@ import { validateSessionModelFlags } from "../models/model-slug-validation.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
 import {
   admitRecordOnlyCreate,
+  createReplayMismatchError,
+  createRequestFingerprint,
+  fileArgumentDigests,
   forkSourceSleepingError,
   isRecordOnlyCreate,
 } from "../pod/create-plan.js";
@@ -4042,15 +4045,18 @@ function noteTemplateAutoPromptReplaced(fromTemplate: string, globalFlags: Globa
 // same write as the rest of the record. A retry after a lost answer finds that record and is
 // answered with it, exactly as the first create answered; nothing is written twice.
 const CREATED_BY_CALL_KEY = "created_by_call";
+const CREATED_BY_REQUEST_KEY = "created_by_request";
 
 /** The flags with `metadata.created_by_call` set — or a usage refusal (exit 2, nothing created). */
 function withCreatedByCall<
   F extends { createdByCall?: string; recordId?: string; metadata?: Record<string, string> },
->(flags: F): F {
-  if (flags.metadata && CREATED_BY_CALL_KEY in flags.metadata) {
-    throw new InvalidArgumentError(
-      `--metadata ${CREATED_BY_CALL_KEY}=… is reserved: it is written only by --created-by-call`,
-    );
+>(flags: F, fileDigests?: Readonly<Record<string, string>>): F {
+  for (const key of [CREATED_BY_CALL_KEY, CREATED_BY_REQUEST_KEY]) {
+    if (flags.metadata && key in flags.metadata) {
+      throw new InvalidArgumentError(
+        `--metadata ${key}=… is reserved: it is written only by --created-by-call`,
+      );
+    }
   }
   if (flags.createdByCall === undefined) {
     return flags;
@@ -4058,14 +4064,24 @@ function withCreatedByCall<
   if (flags.recordId === undefined) {
     throw new InvalidArgumentError("--created-by-call requires --record-id");
   }
-  return { ...flags, metadata: { ...flags.metadata, [CREATED_BY_CALL_KEY]: flags.createdByCall } };
+  return {
+    ...flags,
+    metadata: {
+      ...flags.metadata,
+      [CREATED_BY_CALL_KEY]: flags.createdByCall,
+      [CREATED_BY_REQUEST_KEY]: createRequestFingerprint(process.argv.slice(2), fileDigests),
+    },
+  };
 }
 
 /** The record this very call already created, when `--record-id` names one with the same call id. */
-async function createdByThisCall(flags: {
-  createdByCall?: string;
-  recordId?: string;
-}): Promise<SessionRecord | undefined> {
+async function createdByThisCall(
+  flags: {
+    createdByCall?: string;
+    recordId?: string;
+  },
+  fileDigests?: Readonly<Record<string, string>>,
+): Promise<SessionRecord | undefined> {
   if (flags.createdByCall === undefined || flags.recordId === undefined) {
     return undefined;
   }
@@ -4075,10 +4091,37 @@ async function createdByThisCall(flags: {
   } catch {
     return undefined;
   }
-  return existing.acpxRecordId === flags.recordId &&
-    existing.metadata?.[CREATED_BY_CALL_KEY] === flags.createdByCall
-    ? existing
-    : undefined;
+  if (!isThisCallsRecord(existing, flags)) {
+    return undefined;
+  }
+  assertSameRequest(existing, fileDigests);
+  return existing;
+}
+
+function isThisCallsRecord(
+  record: SessionRecord,
+  flags: { createdByCall?: string; recordId?: string },
+): boolean {
+  return (
+    record.acpxRecordId === flags.recordId &&
+    record.metadata?.[CREATED_BY_CALL_KEY] === flags.createdByCall
+  );
+}
+
+/**
+ * M-2: only an IDENTICAL request gets the first answer. A record without a fingerprint (made before
+ * this check existed) cannot prove it, so it is refused too — never a silent "close enough".
+ */
+function assertSameRequest(
+  record: SessionRecord,
+  fileDigests?: Readonly<Record<string, string>>,
+): void {
+  if (
+    record.metadata?.[CREATED_BY_REQUEST_KEY] !==
+    createRequestFingerprint(process.argv.slice(2), fileDigests)
+  ) {
+    throw createReplayMismatchError(record.acpxRecordId);
+  }
 }
 
 /**
@@ -5510,8 +5553,11 @@ export async function handleSessionsImport(
   });
   // C6.2 — an import is a create (C1.3 "resume of an existing conversation"): the same at-most-once
   // rules as every create verb — fresh, replay (answered with the record this call made), collision.
-  flags = withCreatedByCall(flags);
-  const replay = await createdByThisCall(flags);
+  // R2-F4: the archive is a FILE-valued argument — the request is its bytes, not its path.
+  const fileDigests =
+    flags.createdByCall === undefined ? undefined : await fileArgumentDigests([archivePath]);
+  flags = withCreatedByCall(flags, fileDigests);
+  const replay = await createdByThisCall(flags, fileDigests);
   if (replay) {
     printImportResult(
       globalFlags.format,

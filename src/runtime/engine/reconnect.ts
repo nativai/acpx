@@ -1,4 +1,9 @@
 import { sessionUsesClaudeCredentials } from "../../acp/agent-command.js";
+import {
+  ATRIUM_OS_FALLBACK_KEY,
+  ATRIUM_OS_PRIMER_ERROR_KEY,
+  ATRIUM_OS_REVISION_KEY,
+} from "../../acp/atrium-os.js";
 import type { AcpClient, SessionCreateResult, SessionForkResult } from "../../acp/client.js";
 import {
   extractAcpError,
@@ -474,7 +479,10 @@ function restoreOriginalSessionState(params: {
  * it: ONE ordered step before the batch's `session/prompt`, in which a fresh `session/new` (or the
  * template fork) is followed by the requested model, effort, mode and config exactly once
  * (the preference replay below IS that step; the prompt path never applies the model again), and
- * only then is `acpx.sleeping` deleted. Any failure leaves the record sleeping, byte for byte.
+ * only then is `acpx.sleeping` deleted. Any failure leaves the record sleeping and unchanged except the event-stream counters `last_seq`, `last_request_id`, `last_used_at` and `event_log.last_write_at`: those four
+ * are the stream's own bookkeeping for the refused attempt's turn log (and a failed delivery's terminal,
+ * C1.3), which really is appended to the stream, so rewinding them would desync the sequence from the file.
+ * Test: `test/pod-create-plan.test.ts` → "L-1".
  */
 export async function connectAndLoadSession(
   options: ConnectAndLoadSessionOptions,
@@ -496,17 +504,74 @@ export async function connectAndLoadSession(
     return await connectAndLoadSessionInner(options);
   }
   const before = structuredClone(options.record.acpx);
+  const wakeRun = takeWakeRunState(options.record);
   try {
     return await connectAndLoadSessionInner(options);
   } catch (error) {
     options.record.acpSessionId = "";
     options.record.agentSessionId = undefined;
     options.record.acpx = before;
+    restoreWakeRunState(options.record, wakeRun);
     // An interrupt is the turn being cancelled, not a failed start; everything else is ONE code.
     throw error instanceof InterruptedError
       ? error
       : new SessionMaterialisationError(options.record.acpxRecordId, error);
   }
+}
+
+/**
+ * C1.3 / L-1 — what a first wake writes about the AGENT RUN it starts: the adapter's pid and birth
+ * identity, its start time, the prompt time `onConnectedRecord` stamps, and the OS-observation keys
+ * `applyLifecycleSnapshotToRecord` puts in the metadata. A REFUSED wake (a cut that cannot be executed)
+ * never ran an agent, so none of it may stay on a sleeping record: the record stays as created, unchanged except the event-stream counters `last_seq`, `last_request_id`, `last_used_at` and `event_log.last_write_at`.
+ *
+ * ⚠️ DELIBERATELY NOT HERE: `last_seq`, `last_request_id`, `last_used_at`, `event_log.last_write_at`.
+ * They are the stream's own bookkeeping, and the refused attempt's turn log (and a failed delivery's
+ * terminal, C1.3 "a first wake that fails is a failed delivery") really is appended to the stream —
+ * resetting the counters would desync the sequence from the file. Test: `test/pod-create-plan.test.ts`
+ * → "L-1".
+ */
+type WakeRunState = {
+  pid: SessionRecord["pid"];
+  pidIdentity: SessionRecord["pidIdentity"];
+  agentStartedAt: SessionRecord["agentStartedAt"];
+  lastPromptAt: SessionRecord["lastPromptAt"];
+  osObservation: Record<string, string | undefined>;
+};
+
+const OS_OBSERVATION_KEYS = [
+  ATRIUM_OS_REVISION_KEY,
+  ATRIUM_OS_FALLBACK_KEY,
+  ATRIUM_OS_PRIMER_ERROR_KEY,
+] as const;
+
+function takeWakeRunState(record: SessionRecord): WakeRunState {
+  return {
+    pid: record.pid,
+    pidIdentity: record.pidIdentity === undefined ? undefined : structuredClone(record.pidIdentity),
+    agentStartedAt: record.agentStartedAt,
+    lastPromptAt: record.lastPromptAt,
+    osObservation: Object.fromEntries(
+      OS_OBSERVATION_KEYS.map((key) => [key, record.metadata?.[key]]),
+    ),
+  };
+}
+
+function restoreWakeRunState(record: SessionRecord, saved: WakeRunState): void {
+  record.pid = saved.pid;
+  record.pidIdentity = saved.pidIdentity;
+  record.agentStartedAt = saved.agentStartedAt;
+  record.lastPromptAt = saved.lastPromptAt;
+  const metadata: Record<string, string> = { ...record.metadata };
+  for (const key of OS_OBSERVATION_KEYS) {
+    const value = saved.osObservation[key];
+    if (value === undefined) {
+      delete metadata[key];
+    } else {
+      metadata[key] = value;
+    }
+  }
+  record.metadata = Object.keys(metadata).length > 0 ? metadata : undefined;
 }
 
 async function connectAndLoadSessionInner(
