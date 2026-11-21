@@ -63,6 +63,7 @@ import {
   inferToolKind,
   resolvePermissionRequestWithDetails,
 } from "../permissions.js";
+import { assertBridgeMayStartHere } from "../pod/placement.js";
 import { captureRecordPidIdentity, type RecordPidIdentity } from "../process-identity.js";
 import { getUnsupportedPromptContentMessage, textPrompt } from "../prompt-content.js";
 import { ACTIVITY_NEUTRAL_EVENT_METHOD } from "../session/events.js";
@@ -2045,6 +2046,7 @@ export class AcpClient {
   ): Promise<ChildProcessByStdio<Writable, Readable, Readable>> {
     // The single adapter spawn site: every spawn for a record — create, prompt, owner turn start,
     // recover, keepwarm, config ops — comes through here (brick 45917618 §5.6).
+    assertBridgeMayStartHere("adapter");
     assertSessionCwdExists({
       cwd: this.options.cwd,
       sessionId: this.options.sessionContext?.acpxRecordId,

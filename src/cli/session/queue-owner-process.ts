@@ -12,6 +12,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { resolveSessionRoot } from "../../config/session-root.js";
+import { assertBridgeMayStartHere } from "../../pod/placement.js";
 import type { SessionAgentOptions } from "../../runtime/engine/session-options.js";
 import type {
   AuthPolicy,
@@ -307,6 +308,7 @@ export function buildQueueOwnerSpawnOptions(
 }
 
 export function spawnQueueOwnerProcess(options: QueueOwnerRuntimeOptions): SpawnedQueueOwner {
+  assertBridgeMayStartHere("owner");
   const payload = JSON.stringify(options);
   const logFd = openQueueOwnerLogFd(options.sessionId);
   const child = spawn(
