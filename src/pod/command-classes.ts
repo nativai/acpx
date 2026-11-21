@@ -1,3 +1,4 @@
+import { listBuiltInAgents } from "../agent-registry.js";
 import { COMMAND_GRAMMAR, type GrammarNode } from "./command-grammar.js";
 
 /**
@@ -670,4 +671,64 @@ function finish(walk: Walk, env: NodeJS.ProcessEnv): Classification {
     ...(target ? { target } : {}),
     fromRecords,
   };
+}
+
+/** The classes whose pass-through acceptance depends on WHICH session the call is about (C6.2). */
+const TARGET_CLASSES: ReadonlySet<CommandClass> = new Set([
+  "record",
+  "owner-if-pod",
+  "owner-ensure",
+]);
+
+export type CallClassification =
+  | {
+      kind: "classified";
+      contract: typeof COMMAND_CLASSES_CONTRACT;
+      path: string;
+      class: CommandClass;
+      agent?: string;
+      help: boolean;
+      target?: TargetSelector;
+      /**
+       * The RECORD id of the session the call is about, resolved with acpx's own resolver (record
+       * id, ACP id or unique suffix; a seat to its active holder) — what the command itself will
+       * act on. `null`: it names no session acpx can resolve. Absent: not resolved, because the
+       * class does not depend on it.
+       */
+      targetSessionId?: string | null;
+    }
+  | { kind: "unclassified"; contract: typeof COMMAND_CLASSES_CONTRACT; path: string };
+
+/**
+ * The atrium server's entry (C6.2, brick b479441f reports/EXPORT-class-table.md): classify a
+ * passed-through `argv` and, for `record` / `owner-if-pod` / `owner-ensure`, resolve its target.
+ * `env` carries the CALLER's `ACPX_SESSION_URL` for commands that default to the caller's own
+ * session. The resolver is acpx's session store code, loaded on first need by dynamic import.
+ */
+export async function classifyCall(
+  argv: readonly string[],
+  options: { env?: NodeJS.ProcessEnv; builtInAgents?: readonly string[] } = {},
+): Promise<CallClassification> {
+  const env = options.env ?? {};
+  const c = classifyArgv(argv, {
+    builtInAgents: options.builtInAgents ?? listBuiltInAgents(),
+    env,
+  });
+  if (c.kind === "unclassified") {
+    return c;
+  }
+  const base = {
+    kind: c.kind,
+    contract: c.contract,
+    path: c.path,
+    class: c.class,
+    ...(c.agent !== undefined ? { agent: c.agent } : {}),
+    help: c.help,
+    ...(c.target ? { target: c.target } : {}),
+  };
+  if (!TARGET_CLASSES.has(c.class)) {
+    return base;
+  }
+  const { resolveTargetRecordId } = await import("./target-resolver.js");
+  return { ...base, targetSessionId: await resolveTargetRecordId(c.target) };
 }

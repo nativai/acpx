@@ -19,6 +19,8 @@ import {
 } from "../src/pod/command-classes.js";
 import { COMMAND_GRAMMAR, type GrammarNode } from "../src/pod/command-grammar.js";
 import { POD_STARTING_BRANCH, ROUTE_TABLE, routeFor } from "../src/pod/placement-step.js";
+import { agentPodName, placeOf } from "../src/pod/placement.js";
+import { makeSessionRecord, withTempHome, writeSessionRecordFile } from "./runtime-test-helpers.js";
 
 // brick b479441f — C1.2's conformance test (CONCEPTION r4 K2 "conformance test (gate)").
 //
@@ -516,5 +518,117 @@ test("the light-graph check FLAGS a heavy import — negative case", () => {
     assert.equal(graph.files.length, 2);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ─── The export atrium loads (C6.2) ──────────────────────────────────────────────────────────────
+
+test("classifyCall: class + target for the server; target resolved only where the class needs it", async () => {
+  const { classifyCall } = await import("../src/pod/command-classes.js");
+  const create = await classifyCall(["sessions", "new", "--name", "x"]);
+  assert.equal(create.kind, "classified");
+  assert.equal(create.kind === "classified" && create.class, "create");
+  assert.ok(
+    create.kind === "classified" && !("targetSessionId" in create),
+    "create needs no target",
+  );
+  const record = await classifyCall([
+    "sessions",
+    "set-metadata",
+    "k",
+    "v",
+    "--session-id",
+    "no-such-session",
+  ]);
+  assert.ok(record.kind === "classified" && record.class === "record");
+  assert.equal(
+    record.kind === "classified" && record.targetSessionId,
+    null,
+    "an unresolvable target is null, never guessed",
+  );
+  const none = await classifyCall(["cancel"]);
+  assert.equal(none.kind === "classified" && none.targetSessionId, null);
+  assert.equal((await classifyCall(["seats", "zzz"])).kind, "unclassified");
+});
+
+test("classifyCall resolves a REAL record — by record id, by ACP id, and the own-pod check on it", async () => {
+  const { classifyCall } = await import("../src/pod/command-classes.js");
+  await withTempHome("acpx-pod-classify-", async (home) => {
+    const recordId = "9b1e6a52-6a0f-4c3e-9f55-2f1d3f0c7a11";
+    const acpId = "3c2d1e0f-1111-4222-8333-444455556666";
+    await writeSessionRecordFile(
+      home,
+      makeSessionRecord({
+        acpxRecordId: recordId,
+        acpSessionId: acpId,
+        agentCommand: "agent",
+        cwd: home,
+      }),
+    );
+    for (const selector of [recordId, acpId]) {
+      const c = await classifyCall([
+        "sessions",
+        "set-metadata",
+        "k",
+        "v",
+        "--session-id",
+        selector,
+      ]);
+      assert.equal(c.kind === "classified" && c.targetSessionId, recordId, selector);
+    }
+    const viaUrl = await classifyCall([
+      "cancel",
+      "--session-url",
+      `https://atrium.example/?session=${recordId}`,
+    ]);
+    assert.equal(viaUrl.kind === "classified" && viaUrl.targetSessionId, recordId);
+    const caller = await classifyCall(["people", "set-owner", "laatz"], {
+      env: { ACPX_SESSION_URL: `https://atrium.example/?session=${recordId}` },
+    });
+    assert.equal(
+      caller.kind === "classified" && caller.targetSessionId,
+      recordId,
+      "caller default",
+    );
+    // The resolved id is what decides "own pod": the pod named for it, and no other.
+    assert.equal(placeOf({ kind: "pod", name: agentPodName(recordId) }, recordId), "own-pod");
+    assert.equal(placeOf({ kind: "pod", name: agentPodName(acpId) }, recordId), "other-pod");
+  });
+});
+
+test("the SHIPPED bundle: dist/cli.js and dist/pod/command-classes.js statically reach node builtins only", () => {
+  // `pnpm test` builds dist/ first (as test/governor-import-graph.test.ts relies on). The bundler
+  // chunks by which entries reach a module, so this walks what actually ships, not the sources.
+  const dist = fileURLToPath(new URL("../../dist/", import.meta.url));
+  for (const entry of ["cli.js", "pod/command-classes.js"]) {
+    const file = path.join(dist, entry);
+    assert.ok(fs.existsSync(file), `${entry} not built`);
+    const seen = new Set<string>();
+    const externals = new Set<string>();
+    const stack = [file];
+    for (let f = stack.pop(); f !== undefined; f = stack.pop()) {
+      if (seen.has(f)) {
+        continue;
+      }
+      seen.add(f);
+      for (const match of fs.readFileSync(f, "utf8").matchAll(STATIC_IMPORT)) {
+        const spec = match[1] ?? match[2];
+        if (spec.startsWith(".")) {
+          stack.push(path.resolve(path.dirname(f), spec));
+        } else {
+          externals.add(spec);
+        }
+      }
+    }
+    assert.ok(seen.size >= 2, `${entry}: walked nothing — vacuous`);
+    assert.deepEqual(
+      [...externals].filter((e) => !e.startsWith("node:")),
+      [],
+      entry,
+    );
+    assert.ok(
+      seen.size <= 10,
+      `${entry} statically reaches ${seen.size} chunks — the world crept in`,
+    );
   }
 });
