@@ -142,6 +142,18 @@ export const NO_RUNTIME_INFO_PATH = "/nonexistent/acpx-test/runtime-info.json";
 export const OS_COMPAT_LINK_ENV = "ACPX_OS_COMPAT_LINK";
 export const NO_OS_COMPAT_LINK_PATH = "/nonexistent/acpx-test/operating-system-compat-link";
 
+/**
+ * brick b479441f — pod mode (`ACPX_OWNER_PLACEMENT=pod`, C1.1) is BOX state: a box that sets it in
+ * its control Deployment would hand it to every suite started there, and the pod identity with it.
+ * The suite removes them, so "pod mode off" is a property of the repo; a row that needs pod mode
+ * sets them in its own child env through the product's seam (`ACPX_TEST_POD_CANONICAL_HOME`).
+ */
+export const POD_PLACEMENT_ENV = [
+  "ACPX_OWNER_PLACEMENT",
+  "ACPX_TEST_POD_CANONICAL_HOME",
+  "NV_POD_UID",
+] as const;
+
 export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env): string[] {
   const removed: string[] = [];
   for (const name of Object.keys(env)) {
@@ -150,7 +162,8 @@ export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env
       (SESSION_IDENTITY_ENV as readonly string[]).includes(name) ||
       (OS_ROOT_ENV as readonly string[]).includes(name) ||
       name === DEFAULT_OWNER_ENV ||
-      name === SESSION_ROOT_ENV
+      name === SESSION_ROOT_ENV ||
+      (POD_PLACEMENT_ENV as readonly string[]).includes(name)
     ) {
       delete env[name];
       removed.push(name);
