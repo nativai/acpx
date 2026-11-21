@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { withStageLock, stageLockPath } from "../src/acp/fork-source-staging.js";
 import { queueLeaseGuardPath, withQueueLeaseMutation } from "../src/cli/queue/lease-mutation.js";
 import type { DeathProofDetail } from "../src/pod/death-proof.js";
-import type { LockHostPlace, PodIdentity } from "../src/pod/identity.js";
+import { lockHostPlace, type LockHostPlace, type PodIdentity } from "../src/pod/identity.js";
 import {
   BREAK_MUTEX_NAME,
   breakMutexNameFor,
@@ -625,4 +625,17 @@ test("F2: on the control pod WITHOUT an identity the sweep keeps every `pod` bod
     assert.equal(fs.existsSync(kept), true, `${kept} kept`);
   }
   assert.equal(proofCalls, 0);
+});
+
+test("an EMPTY NODE_TEST_CONTEXT honours no seam: neither the place seam nor the mutex-name suffix", () => {
+  const home = tmpDir();
+  fs.writeFileSync(path.join(home, ".nv-agent"), "ag-x\n"); // the seam would make this an agent pod
+  const base = { ACPX_POD_TEST_HOME: home, NV_DEV_SERVER_ROLE: "workbench" };
+  assert.equal(
+    lockHostPlace({ ...base, NODE_TEST_CONTEXT: "child" }),
+    "agent-pod",
+    "positive control",
+  );
+  assert.notEqual(lockHostPlace({ ...base, NODE_TEST_CONTEXT: "" }), "agent-pod");
+  assert.equal(breakMutexNameFor({ NODE_TEST_CONTEXT: "" }, OWN), BREAK_MUTEX_NAME);
 });

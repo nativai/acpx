@@ -357,7 +357,8 @@ export const BREAK_MUTEX_NAME = "\0acpx-lock-break";
 
 /** The break mutex's socket name for this process (see above). */
 export function breakMutexNameFor(env: NodeJS.ProcessEnv, own: PodIdentity | undefined): string {
-  if (env.NODE_TEST_CONTEXT === undefined) {
+  // Truthiness: an EMPTY NODE_TEST_CONTEXT honours no seam (stream HoD ruling, A1's F5 class).
+  if (!env.NODE_TEST_CONTEXT) {
     return BREAK_MUTEX_NAME;
   }
   return `${BREAK_MUTEX_NAME}.${own ? own.uid : "no-identity"}`;
