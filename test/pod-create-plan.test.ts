@@ -605,3 +605,91 @@ test("C6.2 for `sessions import` (a create form): --record-id + --created-by-cal
   assert.equal(withoutId.code, 2, "--created-by-call needs --record-id");
   assert.deepEqual(createdRecordIds(f), [RECORD_ID]);
 });
+
+// ─── A-18: a cut never ends inside the source's in-progress agent entry (Pi, Codex) ─────────────
+
+/** The source as the running turn leaves it mid-way (measured, `verification/real-agent/p3-*`, `p8-*`):
+ *  the turn's User and its growing Agent entry are in the record's INLINE tail, not yet in the log. */
+function putTurnInProgress(f: Fixture, sourceId: string, userId: string, partial: string): void {
+  const file = recordPath(f, sourceId);
+  const record = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+  record.messages = [
+    { User: { id: userId, content: [{ Text: "a question still being answered" }] } },
+    { Agent: { content: [{ Text: partial }], tool_results: {} } },
+  ];
+  fs.writeFileSync(file, JSON.stringify(record));
+}
+
+test("A-18 (Pi, Codex): a by-the-way cut at the end of a RUNNING turn is moved to before the in-progress agent entry; it survives the entry growing and wakes", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  const source = await warmTarget(f, 1); // 2 entries, both at a turn boundary (in the log)
+  const userId = "a18a18a1-0000-4000-8000-000000000001";
+  putTurnInProgress(f, source, userId, "1\n2\n3");
+  const run = await runCli(
+    [
+      ...base(f),
+      "sessions",
+      "copy",
+      "--from",
+      source,
+      "--at-log-index",
+      "4",
+      "--ephemeral",
+      "--record-id",
+      RECORD_ID,
+      "--created-by-call",
+      CALL_ID,
+    ],
+    pod(f),
+    f.root,
+  );
+  assert.equal(run.code, 0, run.stderr);
+  const record = readRecord(f, RECORD_ID) as PlanRecord & {
+    forked_at_message_index_requested?: number;
+  };
+  assert.equal(record.forked_at_message_index, 3, "moved down past the in-progress agent entry");
+  assert.equal(record.forked_at_message_index_requested, 4, "the move is recorded");
+  const cut = record.acpx.sleeping?.fork?.cut;
+  assert.equal(cut?.message_index, 3);
+  assert.equal(cut?.log_index, 3);
+  assert.equal(
+    cut?.expect_entry,
+    `user:${userId}`,
+    "the last inherited entry is the turn's user message",
+  );
+
+  putTurnInProgress(f, source, userId, "1\n2\n3\n4\n5\n6 — the reply kept growing after create");
+  const wake = await runCli([...base(f), "prompt", "--session-id", RECORD_ID, "x"], f.env, f.root);
+  assert.equal(wake.code, 0, `the grown entry is not part of the cut: ${wake.stderr}`);
+  assert.notEqual((readRecord(f, RECORD_ID) as PlanRecord).acp_session_id, "");
+});
+
+test("A-18 negative: a cut whose last entry is a COMPLETED agent entry (the turn is over) is not moved", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  const source = await warmTarget(f, 2); // 4 entries, all at turn boundaries
+  const run = await runCli(
+    [
+      ...base(f),
+      "sessions",
+      "copy",
+      "--from",
+      source,
+      "--at-log-index",
+      "4",
+      "--ephemeral",
+      "--record-id",
+      RECORD_ID,
+      "--created-by-call",
+      CALL_ID,
+    ],
+    pod(f),
+    f.root,
+  );
+  assert.equal(run.code, 0, run.stderr);
+  const record = readRecord(f, RECORD_ID) as PlanRecord & {
+    forked_at_message_index_requested?: number;
+  };
+  assert.equal(record.forked_at_message_index, 4);
+  assert.equal(record.forked_at_message_index_requested, undefined);
+  assert.equal(record.acpx.sleeping?.fork?.cut?.message_index, 4);
+});

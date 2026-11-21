@@ -40,6 +40,7 @@ import { applyConfigOptionsToRecord } from "../../session/config-options.js";
 import { createSessionConversation } from "../../session/conversation-model.js";
 import { withDefaultModelForNewSession } from "../../session/default-model.js";
 import { defaultSessionEventLog } from "../../session/event-log.js";
+import { getLoggedMessageCount } from "../../session/messages-log-bookkeeping.js";
 import {
   setCurrentModelId,
   setDesiredConfigOption,
@@ -1702,7 +1703,10 @@ async function createCutRecordOnly(inputOptions: SessionCreateOptions): Promise<
   if (source.acpx?.sleeping || source.acpSessionId === "") {
     throw forkSourceSleepingError(source.acpxRecordId);
   }
-  const context = await resolveForkSourceContext(inputOptions);
+  const context = await movedOffInProgressEntry(
+    inputOptions,
+    await resolveForkSourceContext(inputOptions),
+  );
   const pinned =
     context.forkAtMessageIndex === 0 ? undefined : await pinForkCut(inputOptions, context);
   const record = await createSleepingSession(
@@ -1738,6 +1742,58 @@ async function createCutRecordOnly(inputOptions: SessionCreateOptions): Promise<
     },
   );
   return record;
+}
+
+/**
+ * C1.3 amendment A-18 — for a harness WITHOUT an anchor (Pi, Codex) a cut never ends inside the
+ * source's in-progress agent entry: when the cut's last entry is the source's last entry, an agent
+ * entry still in the record's inline tail (written by the running turn's checkpoints, not yet at a
+ * turn boundary), the cut moves down to just before it; `forkedAtMessageIndexRequested` records the
+ * move. Without it the entry grows after create and the wake's `expect_entry` re-check refuses the
+ * copy (measured: Pi by-the-way, `verification/real-agent/p8-*`), while dropping the re-check would
+ * hand the fork the FINISHED reply — more than the record inherited.
+ *
+ * ⚠️ DO NOT APPLY THIS TO CLAUDE. Its anchor keeps the running turn's finished tool calls and
+ * completed text blocks; moving the cut would lose them (A-18 as recorded, program HoD 2026-11-21).
+ * Test: `test/pod-create-plan.test.ts` → "A-18".
+ */
+async function movedOffInProgressEntry(
+  options: SessionCreateOptions,
+  context: ForkSourceContext,
+): Promise<ForkSourceContext> {
+  if (
+    acpAdapterKind(options.agentCommand) === "claude" ||
+    !(await endsInProgressAgentEntry(context))
+  ) {
+    return context;
+  }
+  const full = await readFullSourceHistory(context.sourceRecord);
+  const moved = await resolveForkSourceContext({
+    ...options,
+    forkAtMessageIndex: undefined,
+    forkAtLogIndex: full.baseIndex + full.messages.length - 1,
+    forkExpectEntry: undefined,
+  });
+  return {
+    ...moved,
+    requestedForkAtMessageIndex: context.requestedForkAtMessageIndex ?? context.forkAtMessageIndex,
+  };
+}
+
+/** The cut takes the source's LAST entry, and that entry is an agent entry not yet at a turn boundary. */
+async function endsInProgressAgentEntry(context: ForkSourceContext): Promise<boolean> {
+  const { sourceRecord, inheritedMessages } = context;
+  const full = await readFullSourceHistory(sourceRecord);
+  const last = full.messages.at(-1);
+  const inlineCount = sourceRecord.messages.length - getLoggedMessageCount(sourceRecord);
+  return (
+    inheritedMessages.length > 0 &&
+    inheritedMessages.length === full.messages.length &&
+    inlineCount > 0 &&
+    last !== undefined &&
+    last !== "Resume" &&
+    "Agent" in last
+  );
 }
 
 /**
