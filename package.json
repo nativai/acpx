@@ -62,6 +62,7 @@
     "lint:persisted-key-casing": "tsx scripts/lint-persisted-key-casing.ts",
     "mutate": "stryker run",
     "perf:report": "tsx scripts/perf-report.ts",
+    "pod:loopback-gate": "tsx scripts/pod-loopback-gate.ts",
     "precommit": "pnpm exec lint-staged && pnpm run -s build",
     "prepack": "tsdown --logLevel silent src/cli.ts src/flows.ts src/runtime.ts src/spawn-ledger.ts src/capacity/governor/main.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension",
     "prepare": "husky",
