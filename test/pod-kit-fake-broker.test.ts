@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { startFakeBroker, wellFormedAgentRequest } from "./pod-kit/fake-broker.js";
+import {
+  startFakeBroker,
+  wellFormedAgentRequest,
+  wellFormedUtilityRequest,
+} from "./pod-kit/fake-broker.js";
 import type { BrokerScript, FakeBroker } from "./pod-kit/fake-broker.js";
 
 // Self-test of the X1 fake broker (CONTRACTS-r4.md C4). Each test proves a shape the contract
@@ -324,6 +328,122 @@ test("DELETE removes the Job; the next POST for the key creates a fresh one", as
     assert.equal(posts[1]?.joinedExistingJob, false);
     assert.notEqual(posts[1]?.jobSeq, posts[0]?.jobSeq);
     assert.equal(broker.requestsFor("DELETE", key)[0]?.outcome, "deleted");
+  });
+});
+
+async function deleteAgent(broker: FakeBroker, key: string, uid?: string) {
+  const query = uid === undefined ? "" : `?uid=${uid}`;
+  const response = await fetch(`${broker.url}/v1/agents/${key}${query}`, { method: "DELETE" });
+  return { status: response.status, text: await response.text() };
+}
+
+test("DELETE ?uid=: a wrong uid deletes nothing and answers 200 `refused reason=uid_mismatch`; the matching uid deletes", async () => {
+  await withBroker({}, async (broker) => {
+    const { key, body } = wellFormedAgentRequest("session-uid");
+    const ready = (await postAgent(broker, key, body)).lines.at(-1) ?? "";
+    const uid = /uid=(\S+)/.exec(ready)?.[1] ?? "";
+    assert.match(uid, /^[0-9a-f-]{36}$/);
+    const wrong = await deleteAgent(broker, key, "00000000-0000-4000-8000-000000000000");
+    assert.deepEqual(wrong, { status: 200, text: "refused reason=uid_mismatch\n" });
+    assert.equal((await getAgents(broker)).live, 1, "nothing was deleted");
+    assert.equal(broker.requestsFor("DELETE", key)[0]?.outcome, "uid_mismatch");
+    assert.equal(
+      broker.requestsFor("DELETE", key)[0]?.query,
+      "uid=00000000-0000-4000-8000-000000000000",
+    );
+    const joined = await postAgent(broker, key, body);
+    assert.equal(
+      broker.requestsFor("POST", key)[1]?.joinedExistingJob,
+      true,
+      "the Job is still there to follow",
+    );
+    assert.match(joined.lines.at(-1) ?? "", READY_LINE);
+    const right = await deleteAgent(broker, key, uid);
+    assert.deepEqual(right, { status: 200, text: "" });
+    assert.equal((await getAgents(broker)).live, 0);
+    assert.equal(broker.requestsFor("DELETE", key)[1]?.outcome, "deleted");
+  });
+});
+
+test("DELETE ?uid= on a scripted uid, before the pod is ready, and with no uid at all", async () => {
+  await withBroker(
+    { default: { steps: ["scheduling"], hang: true, final: { ready: { uid: "scripted-uid-1" } } } },
+    async (broker) => {
+      const { key, body } = wellFormedAgentRequest("session-uid2");
+      const controller = new AbortController();
+      const pending = postAgent(broker, key, body, { signal: controller.signal });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(
+        (await deleteAgent(broker, key, "scripted-uid-1x")).text,
+        "refused reason=uid_mismatch\n",
+      );
+      assert.equal((await deleteAgent(broker, key, "scripted-uid-1")).text, "");
+      await pending;
+      await postAgent(broker, key, body, { stopAfterLines: 1 });
+      assert.equal((await deleteAgent(broker, key)).text, "", "no uid: deletes unconditionally");
+    },
+  );
+});
+
+test("DELETE ?uid= on a terminating pod: the matching uid still matches, a wrong one is still refused", async () => {
+  await withBroker({ delete: { delayMs: 300 } }, async (broker) => {
+    const { key, body } = wellFormedAgentRequest("session-terminating");
+    const ready = (await postAgent(broker, key, body)).lines.at(-1) ?? "";
+    const uid = /uid=(\S+)/.exec(ready)?.[1] ?? "";
+    const first = deleteAgent(broker, key, uid);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const startedWrong = Date.now();
+    assert.equal(
+      (await deleteAgent(broker, key, "other-uid")).text,
+      "refused reason=uid_mismatch\n",
+    );
+    assert.ok(Date.now() - startedWrong < 200, "a refusal does not wait for the termination");
+    const second = await deleteAgent(broker, key, uid);
+    assert.deepEqual(second, { status: 200, text: "" });
+    assert.equal(broker.requestsFor("DELETE", key)[2]?.outcome, "deleted_terminating");
+    assert.deepEqual(await first, { status: 200, text: "" });
+  });
+});
+
+test("DELETE of a key with no pod answers 200 with an empty body, with or without a uid", async () => {
+  await withBroker({}, async (broker) => {
+    assert.deepEqual(await deleteAgent(broker, "abcdef012345abcdef012345"), {
+      status: 200,
+      text: "",
+    });
+    assert.deepEqual(await deleteAgent(broker, "abcdef012345abcdef012345", "some-uid"), {
+      status: 200,
+      text: "",
+    });
+  });
+});
+
+test("a utility request carries no seat and no sessionId: their absence is fine, their presence is flagged", async () => {
+  await withBroker({}, async (broker) => {
+    for (const placement of ["pool", "home"] as const) {
+      const { key, body } = wellFormedUtilityRequest(placement);
+      assert.equal(key, `util-${placement}`);
+      const answer = await postAgent(broker, key, body);
+      assert.match(answer.lines.at(-1) ?? "", /^ready /);
+      assert.deepEqual(broker.requests.at(-1)?.problems, [], `utility ${placement}`);
+    }
+    const { key, body } = wellFormedUtilityRequest("pool");
+    await deleteAgent(broker, key);
+    await postAgent(broker, key, { ...body, seat: "seat-0001" });
+    assert.deepEqual(broker.requests.at(-1)?.problems, ["field_present:seat"]);
+    await deleteAgent(broker, key);
+    await postAgent(broker, key, { ...body, sessionId: "s-1", seat: "x" });
+    assert.deepEqual(broker.requests.at(-1)?.problems, [
+      "field_present:seat",
+      "field_present:sessionId",
+    ]);
+    const agent = wellFormedAgentRequest("session-needs-both");
+    await postAgent(broker, agent.key, { ...agent.body, seat: undefined, sessionId: undefined });
+    assert.ok(
+      broker.requests.at(-1)?.problems.includes("field_missing:seat"),
+      "an ordinary request still needs both",
+    );
+    assert.ok(broker.requests.at(-1)?.problems.includes("field_missing:sessionId"));
   });
 });
 

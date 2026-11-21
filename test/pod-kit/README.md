@@ -44,6 +44,13 @@ assert it is empty): `field_missing:<f>`, `field_invalid:<f>`, `releases_missing
 absent), `releases_invalid:<tool>`, `key_mismatch` (key ≠ SHA-256(sessionId)[:24]), `invalid_json`, `contract_missing`.
 `wellFormedAgentRequest(sessionId, overrides)` builds a correct body and its key.
 
+`DELETE /v1/agents/<key>?uid=<pod uid>`: a wrong uid deletes nothing and answers 200 with the body exactly
+`refused reason=uid_mismatch\n`; a matching uid (also on a pod terminating during the scripted `delete.delayMs`) deletes and answers
+200 empty; no pod of the key, with or without a uid, answers 200 empty. A Job's pod uid is the one its `ready` line carries
+(`final.ready.uid`, or generated). A utility request (`harness: "utility"`, key `util-pool` / `util-home`,
+`wellFormedUtilityRequest(placement)`) carries no `seat` and no `sessionId`: their absence is right, their presence is
+`field_present:<f>`.
+
 Assumptions C4 does not settle (agreed with the stream HoD and infra, 2026-11-21): every `POST` stream is HTTP 200 with
 `refused` / `error` as the final line; `DELETE` answers 200, empty; `pool.state` is a free string (default `"ready"`); a body
 that is not JSON gets `error invalid_request`.

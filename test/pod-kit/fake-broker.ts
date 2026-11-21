@@ -96,6 +96,8 @@ export interface BrokerRequestRecord {
   atMs: number;
   method: string;
   path: string;
+  /** The raw query string (DELETE carries `uid=<pod uid>`). */
+  query: string;
   key: string | null;
   headers: Record<string, string>;
   bodyText: string;
@@ -118,6 +120,8 @@ export interface BrokerRequestRecord {
 interface Job {
   seq: number;
   key: string;
+  /** The uid of this Job's pod — what `ready` announces, and what DELETE ?uid= is checked against. */
+  uid: string;
   behavior: BrokerBehavior;
   lines: string[];
   done: boolean;
@@ -170,6 +174,21 @@ export function wellFormedAgentRequest(
   };
 }
 
+/** A utility request (`ag-util-pool` / `ag-util-home`): no seat, no sessionId; the key is `util-<placement>`. */
+export function wellFormedUtilityRequest(
+  placement: "pool" | "home",
+  overrides: Record<string, unknown> = {},
+): { key: string; body: Record<string, unknown> } {
+  const releases: Record<string, string> = {};
+  for (const tool of RELEASE_TOOLS) {
+    releases[tool] = `${tool}-r1`;
+  }
+  return {
+    key: `util-${placement}`,
+    body: { contract: 1, harness: "utility", placement, class: "utility", releases, ...overrides },
+  };
+}
+
 function readBody(request: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -193,9 +212,20 @@ function validateRequest(body: Record<string, unknown>, key: string): string[] {
     }
     return value;
   };
-  const sessionId = stringField("sessionId");
-  stringField("seat");
   const harness = stringField("harness");
+  // C4: a utility request (harness `utility`) carries no `seat` and no `sessionId` — their absence is
+  // right and their PRESENCE is the problem; every other harness must carry both.
+  let sessionId: string | null = null;
+  if (harness === "utility") {
+    for (const name of ["seat", "sessionId"]) {
+      if (body[name] !== undefined) {
+        problems.push(`field_present:${name}`);
+      }
+    }
+  } else {
+    sessionId = stringField("sessionId");
+    stringField("seat");
+  }
   const placement = stringField("placement");
   const klass = stringField("class");
   if (harness !== null && !(HARNESSES as readonly string[]).includes(harness)) {
@@ -230,7 +260,7 @@ function validateRequest(body: Record<string, unknown>, key: string): string[] {
     }
   }
   // C2: <key> = SHA-256 of the session id in hex, first 24 characters. A utility pod's key is its own.
-  if (sessionId !== null && harness !== "utility" && sessionKey(sessionId) !== key) {
+  if (sessionId !== null && sessionKey(sessionId) !== key) {
     problems.push("key_mismatch");
   }
   return problems;
@@ -242,6 +272,8 @@ export class FakeBroker {
   private readonly server: Server;
   private readonly sockets = new Set<Socket>();
   private readonly jobs = new Map<string, Job>();
+  /** Jobs being deleted (the scripted DELETE delay): the pod is terminating — still there, still addressable by uid. */
+  private readonly terminating = new Map<string, { job: Job; done: Promise<void> }>();
   private readonly startedAt = Date.now();
   private jobCounter = 0;
   private nextScripted = 0;
@@ -303,6 +335,7 @@ export class FakeBroker {
       this.cancelJob(job);
     }
     this.jobs.clear();
+    this.terminating.clear();
     this.requests.length = 0;
     this.jobCounter = 0;
     this.nextScripted = 0;
@@ -328,6 +361,17 @@ export class FakeBroker {
       }
     }
     return this.script.default ?? {};
+  }
+
+  private podUidFor(behavior: BrokerBehavior, key: string, seq: number): string {
+    const final = behavior.final;
+    if (typeof final === "string") {
+      return /\buid=(\S+)/.exec(final)?.[1] ?? uuidFrom(`${key}:${String(seq)}`);
+    }
+    if (final !== undefined && "ready" in final && final.ready.uid !== undefined) {
+      return final.ready.uid;
+    }
+    return uuidFrom(`${key}:${String(seq)}`);
   }
 
   private cancelJob(job: Job): void {
@@ -375,7 +419,7 @@ export class FakeBroker {
     const placement = given.placement ?? (asked === "home" ? "home" : "pool");
     const ip = given.ip ?? `10.244.${String(job.seq % 250)}.10`;
     const pod = given.pod ?? `ag-${key}`;
-    const uid = given.uid ?? uuidFrom(`${key}:${String(job.seq)}`);
+    const uid = job.uid;
     const node = given.node ?? "node-a";
     return `ready ip=${ip} pod=${pod} uid=${uid} node=${node} placement=${placement}`;
   }
@@ -423,6 +467,7 @@ export class FakeBroker {
       atMs: Date.now() - this.startedAt,
       method,
       path,
+      query: url.search.slice(1),
       key,
       headers,
       bodyText,
@@ -441,7 +486,7 @@ export class FakeBroker {
       return;
     }
     if (key !== null && KEY_PATTERN.test(key) && method === "DELETE") {
-      await this.handleDelete(key, record, response);
+      await this.handleDelete(key, url.searchParams.get("uid"), record, response);
       return;
     }
     if (key !== null && KEY_PATTERN.test(key) && method === "POST") {
@@ -477,20 +522,47 @@ export class FakeBroker {
 
   private async handleDelete(
     key: string,
+    uid: string | null,
     record: BrokerRequestRecord,
     response: ServerResponse,
   ): Promise<void> {
-    const job = this.jobs.get(key);
-    record.jobSeq = job?.seq ?? null;
-    if (job !== undefined) {
-      this.jobs.delete(key);
-      this.cancelJob(job);
+    const live = this.jobs.get(key);
+    const dying = this.terminating.get(key);
+    const target = live ?? dying?.job;
+    record.jobSeq = target?.seq ?? null;
+    const answer = (outcome: string, body: string): void => {
+      record.outcome = outcome;
+      response.writeHead(this.script.delete?.status ?? 200, { "content-type": "text/plain" });
+      response.end(body);
+    };
+    if (target === undefined) {
+      // No pod of the key — with or without a uid — is a plain empty 200.
+      answer("deleted_nothing", "");
+      return;
     }
-    // The broker "answers when no pod of the key remains" — the fake answers after the scripted delay.
-    await new Promise<void>((resolve) => setTimeout(resolve, this.script.delete?.delayMs ?? 0));
-    record.outcome = job === undefined ? "deleted_nothing" : "deleted";
-    response.writeHead(this.script.delete?.status ?? 200, { "content-type": "text/plain" });
-    response.end("");
+    if (uid !== null && uid !== target.uid) {
+      // A wrong uid deletes nothing and says so in the one line C4 defines, still HTTP 200.
+      answer("uid_mismatch", "refused reason=uid_mismatch\n");
+      return;
+    }
+    if (live !== undefined) {
+      this.jobs.delete(key);
+      this.cancelJob(live);
+      // The broker "answers when no pod of the key remains" — the fake answers after the scripted delay;
+      // until then the pod is terminating: still there, and a DELETE with its uid still matches.
+      const done = new Promise<void>((resolve) =>
+        setTimeout(resolve, this.script.delete?.delayMs ?? 0),
+      );
+      this.terminating.set(key, { job: live, done });
+      await done;
+      if (this.terminating.get(key)?.job === live) {
+        this.terminating.delete(key);
+      }
+      answer("deleted", "");
+      return;
+    }
+    await dying?.done;
+    answer("deleted_terminating", "");
   }
 
   private async handlePost(
@@ -550,6 +622,7 @@ export class FakeBroker {
       job = {
         seq: this.jobCounter,
         key,
+        uid: this.podUidFor(behavior, key, this.jobCounter),
         behavior,
         lines: [],
         done: false,
