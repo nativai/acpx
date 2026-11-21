@@ -219,6 +219,11 @@ export type SessionsExportFlags = SessionSelectorFlags & {
 
 export type SessionsImportFlags = {
   destinationCwd?: string;
+  /** `--record-id <uuid>` (C6.2): the imported record's id, chosen by the caller. */
+  recordId?: string;
+  /** Hidden `--created-by-call <uuid>` (C6.2): needs `--record-id`. */
+  createdByCall?: string;
+  metadata?: Record<string, string>;
 };
 
 export type StatusFlags = SessionSelectorFlags;

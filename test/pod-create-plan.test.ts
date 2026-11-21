@@ -554,3 +554,51 @@ test("C6.2: a pass-through copy returns its fork notice for atrium to queue, pos
     await stub.close();
   }
 });
+
+test("C6.2 for `sessions import` (a create form): --record-id + --created-by-call — fresh writes the call id, a replay answers with the same record and writes nothing, another call on that id is refused", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  const source = await makeTarget(f);
+  const archive = path.join(f.root, "archive.json");
+  const exported = await runCli(
+    [...base(f), "sessions", "export", "--session-id", source, "--output", archive],
+    f.env,
+    f.root,
+  );
+  assert.equal(exported.code, 0, exported.stderr);
+  fs.rmSync(recordPath(f, source)); // one record per provider session, as the import test does
+
+  const args = [
+    ...base(f),
+    "sessions",
+    "import",
+    archive,
+    "--record-id",
+    RECORD_ID,
+    "--created-by-call",
+    CALL_ID,
+  ];
+  const first = await runCli(args, f.env, f.root);
+  assert.equal(first.code, 0, first.stderr);
+  assert.equal((JSON.parse(first.stdout) as { record_id?: string }).record_id, RECORD_ID);
+  assert.equal((readRecord(f, RECORD_ID) as PlanRecord).metadata?.created_by_call, CALL_ID);
+  const bytes = fs.readFileSync(recordPath(f, RECORD_ID), "utf8");
+
+  const replay = await runCli(args, f.env, f.root);
+  assert.equal(replay.code, 0, replay.stderr);
+  assert.deepEqual(JSON.parse(replay.stdout), JSON.parse(first.stdout), "the same answer");
+  assert.equal(fs.readFileSync(recordPath(f, RECORD_ID), "utf8"), bytes, "nothing written");
+
+  const other = await runCli(
+    args.map((arg) => (arg === CALL_ID ? "11111111-2222-4333-8444-555555555555" : arg)),
+    f.env,
+    f.root,
+  );
+  assert.notEqual(other.code, 0, "a different call never adopts the record");
+  const withoutId = await runCli(
+    [...base(f), "sessions", "import", archive, "--created-by-call", CALL_ID],
+    f.env,
+    f.root,
+  );
+  assert.equal(withoutId.code, 2, "--created-by-call needs --record-id");
+  assert.deepEqual(createdRecordIds(f), [RECORD_ID]);
+});

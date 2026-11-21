@@ -1050,6 +1050,17 @@ DISPLAY LABEL and never a key — nothing resolves a holder by it.
         "destinationCwd",
       ).argParser((value: string) => parseNonEmptyValue("Imported session cwd", value)),
     )
+    .option(
+      "--record-id <uuid>",
+      "Use this local record UUID for the imported session",
+      (value: string) => parseCreatedByCall(value),
+    )
+    // C6.2 — hidden: atrium's pass-through creates (at most once; needs --record-id).
+    .addOption(
+      new Option("--created-by-call <uuid>")
+        .hideHelp()
+        .argParser((value: string) => parseCreatedByCall(value)),
+    )
     .action(async function (this: Command, archivePath: string, flags: SessionsImportFlags) {
       await handleSessionsImport(explicitAgentName, archivePath, flags, this, config);
     });

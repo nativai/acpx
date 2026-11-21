@@ -5454,14 +5454,35 @@ export async function handleSessionsImport(
     jsonStrict: globalFlags.jsonStrict,
     flagLabel: "sessions import --cwd",
   });
+  // C6.2 — an import is a create (C1.3 "resume of an existing conversation"): the same at-most-once
+  // rules as every create verb — fresh, replay (answered with the record this call made), collision.
+  flags = withCreatedByCall(flags);
+  const replay = await createdByThisCall(flags);
+  if (replay) {
+    printImportResult(
+      globalFlags.format,
+      { record_id: replay.acpxRecordId, cwd: replay.cwd },
+      requestedCwd,
+    );
+    return;
+  }
   const result = await importSession(archivePath, {
     newCwd,
     expectedAgentName: globalFlags.agent ? undefined : agent.agentName,
     expectedAgentCommand: agent.agentCommand,
+    recordId: flags.recordId,
+    metadata: flags.metadata,
   });
+  printImportResult(globalFlags.format, result, requestedCwd);
+}
 
+function printImportResult(
+  format: OutputFormat,
+  result: { record_id: string; cwd: string },
+  requestedCwd: string | undefined,
+): void {
   if (
-    emitJsonResult(globalFlags.format, {
+    emitJsonResult(format, {
       action: "session_imported",
       record_id: result.record_id,
       cwd: result.cwd,
@@ -5471,7 +5492,7 @@ export async function handleSessionsImport(
     return;
   }
 
-  if (globalFlags.format === "quiet") {
+  if (format === "quiet") {
     process.stdout.write(`${result.record_id}\n`);
     return;
   }
