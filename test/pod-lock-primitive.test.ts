@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { mock } from "node:test";
 import { withStageLock, stageLockPath } from "../src/acp/fork-source-staging.js";
 import { queueLeaseGuardPath, withQueueLeaseMutation } from "../src/cli/queue/lease-mutation.js";
 import type { DeathProof } from "../src/pod/death-proof.js";
@@ -400,4 +401,33 @@ test("NG-K7.2e negative: with no own pod identity the sweep removes no lock", as
   plant(lock, bodyIn(OWN));
   assert.deepEqual((await sweepOwnPodLocks({ dirs: [dir] })).removed, []);
   assert.equal(fs.existsSync(lock), true);
+});
+
+test("NFS: a tombstone link that fails with ESTALE (another client unlinked the lock) is a retry, never a crash", async () => {
+  // Measured across the control pod and a workbench (verification/cross-machine, run 20261121T115728Z):
+  // errno 116 from link(lock, tomb) crashed 8 of 80 racers before this was handled.
+  useDeps("gone");
+  const dir = tmpDir();
+  const lock = path.join(dir, "x.json.lock");
+  plant(lock, bodyIn(OTHER));
+  const realLink = fsp.link.bind(fsp);
+  let staleThrown = 0;
+  const link = mock.method(fsp, "link", async (from: string, to: string) => {
+    if (to.includes(".tomb.") && staleThrown === 0) {
+      staleThrown += 1;
+      throw Object.assign(new Error("ESTALE: stale file handle, link"), {
+        code: "ESTALE",
+        errno: -116,
+      });
+    }
+    return await realLink(from, to);
+  });
+  try {
+    const content = await acquireIdentityFileLock(lock, policy(5_000));
+    assert.equal(staleThrown, 1, "the ESTALE path was taken");
+    assert.equal(fs.readFileSync(lock, "utf8"), content, "and the acquire still succeeded");
+    await releaseIdentityFileLock(lock, content);
+  } finally {
+    link.mock.restore();
+  }
 });

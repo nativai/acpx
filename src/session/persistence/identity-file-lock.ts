@@ -240,7 +240,18 @@ async function lockAgeMs(lockPath: string): Promise<number> {
 }
 
 /**
- * The current holder, or null ONLY when the lock file is gone (ENOENT). Any other read failure — a
+ * The file is gone — `ENOENT`, or on NFS `ESTALE`: another client unlinked it while this one still
+ * held its file handle (measured across the control pod and a workbench, brick 8d85cb47: `link`
+ * failed with errno 116 in 2 of 10 cross-machine race rounds, and the breaker crashed). Both mean
+ * "the lock changed under us": retry.
+ */
+function isGoneError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException)?.code;
+  return code === "ENOENT" || code === "ESTALE";
+}
+
+/**
+ * The current holder, or null ONLY when the lock file is gone (ENOENT / ESTALE). Any other read failure — a
  * directory squatting the path, an unreadable file — is an UNIDENTIFIED holder (raw ""), judged by
  * age like any unjudgeable one. ⚠️ Do not fold those into "gone": the caller retries the create at
  * once on null, so that would be a busy spin.
@@ -250,7 +261,7 @@ async function readHolder(lockPath: string): Promise<ReadHolder | null> {
   try {
     raw = await fs.readFile(lockPath, "utf8");
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+    if (isGoneError(error)) {
       return null;
     }
     raw = "";
@@ -386,7 +397,7 @@ export async function breakByTombstone(
       await removeTombstoneIfStale(tomb);
       return "busy";
     }
-    if (code === "ENOENT") {
+    if (isGoneError(error)) {
       return "changed";
     }
     throw error;
