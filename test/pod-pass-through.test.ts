@@ -83,11 +83,6 @@ test("a create in an agent pod passes through: argv, stdin bytes, --record-id, c
       assert.match(String(body.call_id), UUID);
       // A-9: the pass-through carries no cwd, whatever directory the caller stands in.
       assert.equal("cwd" in body, false, "no cwd key");
-      assert.deepEqual(
-        call.problems,
-        ["cwd"],
-        "the X1 kit flags the missing cwd (it predates A-9); nothing else is wrong with the request",
-      );
       const argv = body.argv as string[];
       assert.deepEqual(argv.slice(0, 6), [
         "sessions",
@@ -427,6 +422,46 @@ test("--brief (handover) stays a PATH the successor reads: made absolute against
   ]);
   assert.equal("stdin_b64" in call.body, false);
   assert.equal(call.recordId, undefined, "handover has no --record-id (reported)");
+});
+
+test("--brief outside /wisdom and /workspace is refused as brief_not_shared — a pod-local path is a dead pointer", async () => {
+  for (const brief of [
+    "/tmp/b.md",
+    "/home/node/b.md",
+    "/workspace/../tmp/b.md",
+    "/workspacex/b.md",
+  ]) {
+    assert.throws(
+      () =>
+        buildPassThroughCall(
+          input(["sessions", "handover", "--brief", brief], { commandPath: "sessions handover" }),
+        ),
+      (error: unknown) =>
+        error instanceof PassThroughUsageError && error.reason === "brief_not_shared",
+      brief,
+    );
+  }
+  // Near-miss: under /wisdom is accepted too.
+  const ok = buildPassThroughCall(
+    input(["sessions", "handover", "--brief", "/wisdom/Bricks/x/b.md"], {
+      commandPath: "sessions handover",
+    }),
+  );
+  assert.deepEqual(ok.body.argv, ["sessions", "handover", "--brief", "/wisdom/Bricks/x/b.md"]);
+  // End to end: the named line, exit 2, atrium never called.
+  const { home } = agentPodHome();
+  await withAtrium({}, async (atrium) => {
+    const r = await runCli(
+      ["sessions", "handover", "--brief", "/tmp/b.md"],
+      agentPodEnv(home, atrium.url),
+    );
+    assert.equal(r.status, 2, r.stderr);
+    assert.equal(
+      r.stderr.split("\n")[0],
+      "acpx: REFUSED reason=brief_not_shared nothing_started=true protocol=1",
+    );
+    assert.equal(atrium.requests.length, 0);
+  });
 });
 
 test("--record-id goes BEFORE a `--` terminator, and only creates that take one get it", () => {

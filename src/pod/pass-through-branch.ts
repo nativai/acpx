@@ -77,7 +77,24 @@ export const RECORD_ID_CREATE_PATHS: readonly string[] = Object.freeze([
 export const NO_RECORD_ID_CREATE_PATHS: readonly string[] = Object.freeze(["sessions handover"]);
 
 /** A request the client cannot build: nothing was sent. Printed as a usage refusal (exit 2). */
-export class PassThroughUsageError extends Error {}
+export class PassThroughUsageError extends Error {
+  constructor(
+    message: string,
+    readonly reason: string = "pass_through_unbuildable",
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * Roots the control pod can read a `--brief` path under (the ruling on checkpoint 1): a pod-local
+ * path would reach the successor as a dead pointer, so it is refused, nothing started.
+ */
+export const BRIEF_SHARED_ROOTS: readonly string[] = Object.freeze(["/wisdom", "/workspace"]);
+
+function underSharedRoot(file: string): boolean {
+  return BRIEF_SHARED_ROOTS.some((root) => file === root || file.startsWith(`${root}/`));
+}
 
 export type PassThroughInput = {
   argv: readonly string[];
@@ -153,7 +170,14 @@ function rewriteFileFlag(
   input: PassThroughInput,
 ): void {
   if (hit.carry === "path") {
-    state.out.push(hit.flag, path.resolve(input.cwd, value));
+    const absolute = path.resolve(input.cwd, value);
+    if (!underSharedRoot(absolute)) {
+      throw new PassThroughUsageError(
+        `${hit.flag} ${absolute} is not under ${BRIEF_SHARED_ROOTS.join(" or ")}, so the control pod and the successor cannot read it`,
+        "brief_not_shared",
+      );
+    }
+    state.out.push(hit.flag, absolute);
     return;
   }
   if (state.stdin !== undefined) {
@@ -400,7 +424,7 @@ function buildCallOrRefuse(run: PassThroughRun, env: NodeJS.ProcessEnv): PassThr
       decision,
       context,
       [
-        "acpx: REFUSED reason=pass_through_unbuildable nothing_started=true protocol=1",
+        `acpx: REFUSED reason=${error.reason} nothing_started=true protocol=1`,
         `${error.message}; nothing was started.`,
       ],
       2,

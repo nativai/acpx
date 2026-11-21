@@ -1,8 +1,17 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
-import { addRecord, agentPodEnv, agentPodHome, OTHER_SESSION, runCli } from "./pod-a3-helpers.js";
+import { fileURLToPath } from "node:url";
+import {
+  addRecord,
+  agentPodEnv,
+  agentPodHome,
+  OTHER_SESSION,
+  runCli,
+  tmpDir,
+} from "./pod-a3-helpers.js";
 import { startRecordedAtrium } from "./pod-kit/recorded-atrium.js";
 import type { AtriumScript, RecordedAtrium } from "./pod-kit/recorded-atrium.js";
 
@@ -249,4 +258,37 @@ test("atrium's own delivery options (--message-id, --batch-file) are not routabl
     }
     assert.equal(atrium.requests.length, 0);
   });
+});
+
+test("readAtriumJson answers nothing in an agent pod — and answers in the control pod (the positive control)", () => {
+  const routing = fileURLToPath(new URL("../src/cli/prompt-routing.js", import.meta.url));
+  const probe = (home: string, podFile: boolean) => {
+    const acpx = path.join(home, ".acpx");
+    fs.mkdirSync(acpx, { recursive: true });
+    fs.writeFileSync(
+      path.join(acpx, "atrium.json"),
+      JSON.stringify({
+        schema: 1,
+        internalUrl: "http://127.0.0.1:3456",
+        writer: "w",
+        features: ["message-content", "message-delivery-id", "message-task-options"],
+        writtenAt: new Date().toISOString(),
+      }),
+    );
+    if (podFile) {
+      fs.writeFileSync(path.join(home, ".nv-agent"), "ag-0123456789abcdef01234567\n");
+    }
+    const code = `const m = await import(${JSON.stringify(routing)}); console.log(JSON.stringify(m.readAtriumJson() ?? null));`;
+    return spawnSync(process.execPath, ["--input-type=module", "-e", code], {
+      env: agentPodEnv(home, "http://127.0.0.1:1"),
+      encoding: "utf8",
+      timeout: 30_000,
+    }).stdout.trim();
+  };
+  assert.equal(probe(tmpDir(), true), "null", "agent pod: atrium.json routes nothing");
+  assert.match(
+    probe(tmpDir(), false),
+    /"internalUrl":"http:\/\/127\.0\.0\.1:3456"/u,
+    "control pod: it is read",
+  );
 });
