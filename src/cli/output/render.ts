@@ -414,10 +414,16 @@ function sleepingSuffix(record: SessionRecord): string {
 function sleepingJson(
   record: SessionRecord,
   forkNotice?: string,
-): { promptQueued: false; sleeping: true; forkNotice?: string } | Record<string, never> {
-  return record.acpx?.sleeping
-    ? { promptQueued: false, sleeping: true, ...(forkNotice ? { forkNotice } : {}) }
-    : {};
+  templatePrompt?: string,
+): { promptQueued?: false; sleeping?: true; forkNotice?: string; templatePrompt?: string } {
+  // C1.3 / C6.2 — the notice (and a template's stored auto-prompt) travel whenever the caller hands
+  // them in: atrium queues them, and a replay after the session woke must carry the same text so
+  // atrium's idempotent queueing produces the same items.
+  return {
+    ...(record.acpx?.sleeping ? { promptQueued: false as const, sleeping: true as const } : {}),
+    ...(forkNotice ? { forkNotice } : {}),
+    ...(templatePrompt ? { templatePrompt } : {}),
+  };
 }
 
 export function printNewSessionByFormat(
@@ -439,8 +445,10 @@ export function printNewSessionByFormat(
       sessionUrl: composeSessionUrl(record),
       ...newSessionSeatJson(record, seatUrl),
       ...(subscriptionSelection ? { subscriptionSelection } : {}),
-      ...firstTurn,
+      // The first message's delivery state wins over the sleeping defaults (C1.3: a pod-mode create
+      // whose first message atrium queued is sleeping AND queued).
       ...sleepingJson(record),
+      ...firstTurn,
     })
   ) {
     return;
@@ -488,6 +496,8 @@ export function printCopiedSessionByFormat(
   requestedCwd?: string,
   /** A sleeping copy's fork notice, composed at once and returned instead of delivered (K7). */
   forkNotice?: string,
+  /** C1.3 — a `--from-template` create whose first turn atrium queues: the stored auto-prompt. */
+  templatePrompt?: string,
 ): void {
   const subscriptionSelection = consumeAutoSubscriptionSelection();
   if (
@@ -512,8 +522,8 @@ export function printCopiedSessionByFormat(
       // F6 — a copy/fork mints a NEW seat; its address is that seat, not the source's.
       ...newSessionSeatJson(record, resolveSeatUrl(record.seatId)),
       ...(subscriptionSelection ? { subscriptionSelection } : {}),
+      ...sleepingJson(record, forkNotice, templatePrompt),
       ...firstTurn,
-      ...sleepingJson(record, forkNotice),
     })
   ) {
     return;

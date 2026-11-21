@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Classification } from "./command-classes.js";
+import type { Classification, OutputMode } from "./command-classes.js";
 import {
   registerBranchHandler,
   type BranchHandler,
@@ -54,8 +54,8 @@ export type BranchDeps = {
   payloadDir?: string;
   admissionClass: () => string | undefined;
   run: (options: RoutedCallOptions) => Promise<RoutedCallResult>;
-  /** Prints a failure the way acpx prints one, and returns the exit code. */
-  fail: (error: unknown, argv: string[]) => Promise<number>;
+  /** Prints a failure the way acpx prints one (`output`: text, json, json-strict), and returns the exit code. */
+  fail: (error: unknown, output: OutputMode) => Promise<number>;
   stderr: (text: string) => void;
 };
 
@@ -176,11 +176,11 @@ async function resolveRecord(
 }
 
 /** acpx's own kind of failure for a call that never started: named, exit 1 (C2 table's `not_run`). */
-async function notRun(reason: string, argv: string[], deps: BranchDeps): Promise<number> {
+async function notRun(reason: string, output: OutputMode, deps: BranchDeps): Promise<number> {
   const { RoutedCallError } = await import("./pod-refusal.js");
   return await deps.fail(
     new RoutedCallError({ outcome: "not_run", reason, callId: randomUUID() }),
-    argv,
+    output,
   );
 }
 
@@ -197,13 +197,26 @@ async function readyOrFail(
   const record =
     classification.kind === "classified" ? await resolveRecord(classification, deps) : undefined;
   if (classification.kind !== "classified" || !record) {
-    return await notRun("target_unresolved", argv, deps);
+    return await notRun("target_unresolved", decision.classification.output, deps);
   }
   const harness = deps.harnessOf(record.agentCommand);
   if (routedClass === "owner-ensure" && (harness === undefined || !HARNESSES.has(harness))) {
-    return await notRun("harness_unsupported", argv, deps);
+    return await notRun("harness_unsupported", decision.classification.output, deps);
   }
   return { record, classification, argv };
+}
+
+/** acpx's own usage failure (exit 2), printed in the command's output mode. */
+async function usageError(message: string, output: OutputMode, deps: BranchDeps): Promise<number> {
+  if (output === "text") {
+    deps.stderr(`${message}\n`);
+    return 2;
+  }
+  const { AcpxOperationalError } = await import("../errors.js");
+  return await deps.fail(
+    new AcpxOperationalError(message, { outputCode: "USAGE", origin: "cli" }),
+    output,
+  );
 }
 
 function runOptions(
@@ -241,8 +254,7 @@ async function dispatchRouted(
       ? await planPayload(ready.classification, ready.argv, deps)
       : undefined;
   if (plan === "prompt_required") {
-    deps.stderr(`${PROMPT_REQUIRED_MESSAGE}\n`);
-    return 2;
+    return await usageError(PROMPT_REQUIRED_MESSAGE, ready.classification.output, deps);
   }
   const { agentPodKey } = await import("./routed-call.js");
   try {
@@ -251,7 +263,7 @@ async function dispatchRouted(
     );
     return result.kind === "no_pod" ? "proceed" : result.exitCode;
   } catch (error) {
-    return await deps.fail(error, ready.argv);
+    return await deps.fail(error, ready.classification.output);
   }
 }
 
@@ -264,32 +276,14 @@ export function routedBranchHandlers(
   };
 }
 
-function wantsJson(argv: readonly string[]): boolean {
-  for (let i = 0; i < argv.length; i += 1) {
-    const token = argv[i];
-    if (token === "--") {
-      return false;
-    }
-    if (
-      token === "--json-strict" ||
-      token.startsWith("--json-strict=") ||
-      token === "--format=json"
-    ) {
-      return true;
-    }
-    if (token === "--format" && argv[i + 1] === "json") {
-      return true;
-    }
-  }
-  return false;
-}
-
-async function failLikeAcpx(error: unknown, argv: string[]): Promise<number> {
+async function failLikeAcpx(error: unknown, output: OutputMode): Promise<number> {
   const { normalizeOutputError, exitCodeForOutputErrorCode } =
     await import("../acp/error-normalization.js");
   const normalized = normalizeOutputError(error, { origin: "cli" });
   const stderrLine = (error as { stderrLine?: unknown } | null)?.stderrLine;
-  if (wantsJson(argv)) {
+  if (output === "text") {
+    process.stderr.write(`${normalized.message}\n`);
+  } else {
     const { createOutputFormatter } = await import("../cli/output/output.js");
     const formatter = createOutputFormatter("json", {
       jsonContext: { sessionId: "unknown" },
@@ -297,11 +291,10 @@ async function failLikeAcpx(error: unknown, argv: string[]): Promise<number> {
     });
     formatter.onError(normalized);
     formatter.flush();
-    if (typeof stderrLine === "string") {
+    // `--json-strict` keeps stderr machine-clean; plain json keeps line 1 for a stderr-only reader.
+    if (output === "json" && typeof stderrLine === "string") {
       process.stderr.write(`${stderrLine}\n`);
     }
-  } else {
-    process.stderr.write(`${normalized.message}\n`);
   }
   return exitCodeForOutputErrorCode(normalized.code);
 }
@@ -325,7 +318,7 @@ async function liveDeps(): Promise<BranchDeps> {
   const [
     { createAgentPodLookup },
     routed,
-    { targetResolver },
+    { resolveTargetRecordId },
     persistence,
     agentCommand,
     admission,
@@ -352,7 +345,7 @@ async function liveDeps(): Promise<BranchDeps> {
       }
       return data;
     },
-    resolveTarget: targetResolver,
+    resolveTarget: (classification) => resolveTargetRecordId(classification.target),
     loadRecord: async (id) => {
       try {
         return await persistence.resolveSessionRecord(id);

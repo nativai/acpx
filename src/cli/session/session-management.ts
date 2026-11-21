@@ -1,10 +1,13 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
+import { acpAdapterKind } from "../../acp/agent-command.js";
 import { isOsCompatLinkInPlace } from "../../acp/atrium-os.js";
 import { ForkCutUnresolvedError } from "../../acp/claude-fork-anchor.js";
 import {
   AcpClient,
+  resolveClaudeForkResumeAt,
+  resolveLogIndexClaudeCut,
   type SessionCreateResult,
   type SessionForkResult,
   type SessionLoadResult,
@@ -20,6 +23,12 @@ import {
   SessionCwdMissingError,
   SourceTranscriptMissingError,
 } from "../../errors.js";
+import {
+  buildSleepingPlan,
+  encodeHarnessAnchor,
+  forkSourceSleepingError,
+  type SleepingForkCut,
+} from "../../pod/create-plan.js";
 import { bindDefaultAccountToSessionOptionsAsync } from "../../runtime/engine/default-account-binding.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
 import { persistSessionOptions } from "../../runtime/engine/session-options.js";
@@ -31,7 +40,9 @@ import { applyConfigOptionsToRecord } from "../../session/config-options.js";
 import { createSessionConversation } from "../../session/conversation-model.js";
 import { withDefaultModelForNewSession } from "../../session/default-model.js";
 import { defaultSessionEventLog } from "../../session/event-log.js";
+import { getLoggedMessageCount } from "../../session/messages-log-bookkeeping.js";
 import {
+  getDesiredModelId,
   setCurrentModelId,
   setDesiredConfigOption,
   setDesiredModelId,
@@ -92,6 +103,7 @@ import type {
   SessionListResult,
 } from "./contracts.js";
 import {
+  forkEntryFingerprint,
   type LogIndexForkWindow,
   readFullSourceHistory,
   resolveForkCutIndex,
@@ -965,6 +977,8 @@ async function createSessionRecordWithClient(
  */
 export async function createSleepingSession(
   inputOptions: SessionCreateOptions,
+  /** C1.3 — a record-only cut / resume finishes the draft and writes it itself (one write). */
+  writeRecord: (draft: SessionRecord) => Promise<void> = writeSessionRecord,
 ): Promise<SessionRecord> {
   inputOptions = { ...inputOptions, metadata: await withDefaultOwner(inputOptions.metadata) };
   const bound: SessionCreateOptions = {
@@ -988,7 +1002,7 @@ export async function createSleepingSession(
   if (guardForced) {
     stampModelGuardBreadcrumb(record, { ...guardForced, source: "inherited", at: now });
   }
-  await writeSessionRecord(record);
+  await writeRecord(record);
   await mintSeatRowForNewRecord(record, options, seatFields, now);
   if (guardForced) {
     await mirrorModelGuardToMessages(record, guardForced).catch(() => {});
@@ -1022,7 +1036,7 @@ function sleepingRecordOf(
     ...createSessionConversation(now),
     acpx: {
       ...(desired ? { desired_config_options: desired } : {}),
-      sleeping: sleepingMark(now, options.forkFromSessionId),
+      sleeping: sleepingStateFor(options, now),
     },
     ...seatFields,
     ...(options.forkFromSessionId
@@ -1039,6 +1053,13 @@ function sleepingRecordOf(
   return record;
 }
 
+/** C1.3 — in pod mode the plan (`plan: 1`); otherwise today's mark. */
+function sleepingStateFor(options: SessionCreateOptions, now: string): SessionSleepingState {
+  return options.recordOnly
+    ? buildSleepingPlan({ since: now, forkFrom: options.forkFromSessionId })
+    : sleepingMark(now, options.forkFromSessionId);
+}
+
 /** `acpx.sleeping` — and, for a copy, the template its first wake forks. */
 function sleepingMark(since: string, templateId: string | undefined): SessionSleepingState {
   return { since, ...(templateId ? { fork: { from: templateId } } : {}) };
@@ -1052,6 +1073,14 @@ function persistSleepingPins(
 ): void {
   persistSessionOptions(record, sessionOptions);
   persistSessionOwnerOptions(record, options);
+  // ⚠️ A pinned model is also the record's CURRENT model from its first write: the record write funnel
+  // (`mergeRecordPinnedModelForPersist`) realigns `current_model_id` to a pin on the first write of any
+  // record that has none, so leaving it out here made a REFUSED first wake add it to a record whose agent
+  // never ran (TE R2-F3, Claude only — a Pi session pins no model). Test: "L-1 … (model pinned)".
+  const pinnedModel = getDesiredModelId(record.acpx);
+  if (pinnedModel !== undefined) {
+    setCurrentModelId(record, pinnedModel);
+  }
   if (sessionOptions?.reasoningEffort) {
     setDesiredConfigOption(record, "effort", sessionOptions.reasoningEffort);
   }
@@ -1553,6 +1582,9 @@ function outputStyleListFromAdvertised(
 }
 
 export async function createSession(options: SessionCreateOptions): Promise<SessionRecord> {
+  if (options.recordOnly) {
+    return await createRecordOnlySession(options);
+  }
   if (options.sleeping) {
     return await createSleepingSession(options);
   }
@@ -1616,3 +1648,243 @@ export async function listAgentSessions(options: SessionListOptions): Promise<Se
 }
 
 export { DEFAULT_QUEUE_OWNER_TTL_MS };
+
+// ─── C1.3 — record-only creates (pod mode, on the control pod) ────────────────────────────────
+
+/**
+ * C1.3 — every create form in pod mode writes a record and nothing else (no `AcpClient`, no adapter,
+ * no owner): new / successor / template / full copy → the sleeping record (`createSleepingSession`)
+ * with `plan: 1`; a fork at a cut or a by-the-way → the inherited messages copied NOW and the cut
+ * pinned in the plan; a resume → the record bound to the existing conversation, not sleeping. The
+ * first wake, in the session's pod, executes the plan (`runtime/engine/reconnect.ts`).
+ */
+export async function createRecordOnlySession(
+  options: SessionCreateOptions,
+): Promise<SessionRecord> {
+  if (options.resumeSessionId) {
+    return await createResumeRecordOnly(options);
+  }
+  const isCut =
+    options.forkFromSessionId !== undefined &&
+    (options.forkAtLogIndex !== undefined || options.forkAtMessageIndex !== undefined);
+  if (isCut || options.recordOnly?.byway) {
+    return await createCutRecordOnly(options);
+  }
+  return await createSleepingSession(options);
+}
+
+/**
+ * A resume in pod mode: the conversation's file is checked here (the same pre-check the live resume
+ * runs before it spawns anything) and the record gets its `acpSessionId`; the first wake's ordinary
+ * resume/load binds it. ⚠️ Codex has no file check today (`refuseUnresumableConversation` covers
+ * Claude and Pi) — a missing Codex thread fails at the first wake instead.
+ */
+async function createResumeRecordOnly(inputOptions: SessionCreateOptions): Promise<SessionRecord> {
+  const resumeSessionId = inputOptions.resumeSessionId as string;
+  const cwd = absolutePath(inputOptions.cwd);
+  const recordId = inputOptions.recordId ?? resumeSessionId;
+  await refuseUnresumableConversation({
+    resumeSessionId,
+    recordId,
+    cwd,
+    agentCommand: inputOptions.agentCommand,
+  });
+  return await createSleepingSession(
+    { ...inputOptions, cwd, recordId, recordOnly: { ...inputOptions.recordOnly } },
+    async (draft) => {
+      draft.acpSessionId = resumeSessionId;
+      if (draft.acpx) {
+        delete draft.acpx.sleeping;
+      }
+      await writeSessionRecord(draft);
+    },
+  );
+}
+
+/**
+ * A fork at a cut (or a by-the-way) in pod mode. Everything the live copy would refuse is refused
+ * here, before anything exists — the range, the harness, `--expect-entry` (`FORK_CUT_MOVED`, which
+ * atrium's retry-once keys on), an unprovable Claude cut, a cut before the last compaction — plus a
+ * sleeping source (`FORK_SOURCE_SLEEPING`, amendment A-15).
+ */
+async function createCutRecordOnly(inputOptions: SessionCreateOptions): Promise<SessionRecord> {
+  const source = await loadForkSourceRecord(inputOptions);
+  if (source.acpx?.sleeping || source.acpSessionId === "") {
+    throw forkSourceSleepingError(source.acpxRecordId);
+  }
+  const context = await movedOffInProgressEntry(
+    inputOptions,
+    await resolveForkSourceContext(inputOptions),
+  );
+  const pinned =
+    context.forkAtMessageIndex === 0 ? undefined : await pinForkCut(inputOptions, context);
+  const record = await createSleepingSession(
+    {
+      ...inputOptions,
+      // A cut at 0 is a fresh session (the live copy's `createSession` branch): no fork to run.
+      ...(pinned ? {} : { forkFromSessionId: undefined }),
+      recordOnly: { ...inputOptions.recordOnly },
+      metadata: {
+        ...inputOptions.metadata,
+        ...(pinned?.contextEndLogIndex === undefined
+          ? {}
+          : { fork_context_end_log_index: String(pinned.contextEndLogIndex) }),
+      },
+    },
+    async (draft) => {
+      draft.kind = "session";
+      draft.forkedFromSessionId = source.acpxRecordId;
+      draft.forkedAtMessageIndex = context.forkAtMessageIndex;
+      if (context.requestedForkAtMessageIndex !== undefined) {
+        draft.forkedAtMessageIndexRequested = context.requestedForkAtMessageIndex;
+      }
+      draft.messages = structuredClone(context.inheritedMessages);
+      if (draft.acpx) {
+        draft.acpx.sleeping = buildSleepingPlan({
+          since: draft.acpx.sleeping?.since ?? isoNow(),
+          ...(pinned ? { forkFrom: source.acpxRecordId, cut: pinned.cut } : {}),
+          byway: inputOptions.recordOnly?.byway,
+        });
+      }
+      // Through the boundary writer, as the live copy stores a fork: the messages sidecar must exist.
+      await writeSessionRecordAtBoundary(draft);
+    },
+  );
+  return record;
+}
+
+/**
+ * C1.3 amendment A-18 — for a harness WITHOUT an anchor (Pi, Codex) a cut never ends inside the
+ * source's in-progress agent entry: when the cut's last entry is the source's last entry, an agent
+ * entry still in the record's inline tail (written by the running turn's checkpoints, not yet at a
+ * turn boundary), the cut moves down to just before it; `forkedAtMessageIndexRequested` records the
+ * move. Without it the entry grows after create and the wake's `expect_entry` re-check refuses the
+ * copy (measured: Pi by-the-way, `verification/real-agent/p8-*`), while dropping the re-check would
+ * hand the fork the FINISHED reply — more than the record inherited.
+ *
+ * ⚠️ DO NOT APPLY THIS TO CLAUDE. Its anchor keeps the running turn's finished tool calls and
+ * completed text blocks; moving the cut would lose them (A-18 as recorded, program HoD 2026-11-21).
+ * Test: `test/pod-create-plan.test.ts` → "A-18".
+ */
+async function movedOffInProgressEntry(
+  options: SessionCreateOptions,
+  context: ForkSourceContext,
+): Promise<ForkSourceContext> {
+  if (
+    acpAdapterKind(options.agentCommand) === "claude" ||
+    !(await endsInProgressAgentEntry(context))
+  ) {
+    return context;
+  }
+  const full = await readFullSourceHistory(context.sourceRecord);
+  const moved = await resolveForkSourceContext({
+    ...options,
+    forkAtMessageIndex: undefined,
+    forkAtLogIndex: full.baseIndex + full.messages.length - 1,
+    forkExpectEntry: undefined,
+  });
+  return {
+    ...moved,
+    requestedForkAtMessageIndex: context.requestedForkAtMessageIndex ?? context.forkAtMessageIndex,
+  };
+}
+
+/** The cut takes the source's LAST entry, and that entry is an agent entry not yet at a turn boundary. */
+async function endsInProgressAgentEntry(context: ForkSourceContext): Promise<boolean> {
+  const { sourceRecord, inheritedMessages } = context;
+  const full = await readFullSourceHistory(sourceRecord);
+  const last = full.messages.at(-1);
+  const inlineCount = sourceRecord.messages.length - getLoggedMessageCount(sourceRecord);
+  return (
+    inheritedMessages.length > 0 &&
+    inheritedMessages.length === full.messages.length &&
+    inlineCount > 0 &&
+    last !== undefined &&
+    last !== "Resume" &&
+    "Agent" in last
+  );
+}
+
+/**
+ * What the wake needs to cut the harness, computed from FILES now (`reports/CUT-PINNING.md`): the
+ * absolute position, the fingerprint of the last inherited entry, and — for Claude — the transcript
+ * uuid (`claude-uuid:<uuid>`). Pi and Codex fork by index, so they carry no anchor (A2.0 verdict).
+ */
+async function pinForkCut(
+  options: SessionCreateOptions,
+  context: ForkSourceContext,
+): Promise<{ cut: SleepingForkCut; contextEndLogIndex?: number }> {
+  const { logIndex, lastEntry } = await absoluteCut(context);
+  const expectEntry = options.forkExpectEntry ?? lastEntry;
+  const anchor =
+    acpAdapterKind(options.agentCommand) === "claude"
+      ? await claudeCutAnchor(options, context)
+      : undefined;
+  const harnessAnchor = anchor
+    ? encodeHarnessAnchor({ kind: "claude-uuid", value: anchor.uuid })
+    : undefined;
+  return {
+    cut: {
+      message_index: context.forkAtMessageIndex,
+      log_index: logIndex,
+      ...(expectEntry === undefined ? {} : { expect_entry: expectEntry }),
+      ...(harnessAnchor === undefined ? {} : { harness_anchor: harnessAnchor }),
+    },
+    ...(anchor?.contextEndLogIndex === undefined
+      ? {}
+      : { contextEndLogIndex: anchor.contextEndLogIndex }),
+  };
+}
+
+/**
+ * The cut's ABSOLUTE position over the source's full history, and the fingerprint of the entry before
+ * it. `--at-log-index` already is absolute; legacy `--at-index k` counts in the hydrated window, which
+ * is the tail of the full history.
+ */
+async function absoluteCut(
+  context: ForkSourceContext,
+): Promise<{ logIndex: number; lastEntry: string | undefined }> {
+  const { sourceRecord, logWindow, forkAtMessageIndex } = context;
+  const full = await readFullSourceHistory(sourceRecord);
+  const logIndex =
+    logWindow?.logIndex ??
+    full.baseIndex + full.messages.length - sourceRecord.messages.length + forkAtMessageIndex;
+  const at = logIndex - 1 - full.baseIndex;
+  const inRange = at >= 0 && at < full.messages.length;
+  return {
+    logIndex,
+    lastEntry: inRange ? forkEntryFingerprint(full.messages[at], full.rawLines[at]) : undefined,
+  };
+}
+
+/** The same resolvers the live copy runs inside `AcpClient.forkSession` — files only, no adapter. */
+async function claudeCutAnchor(
+  options: SessionCreateOptions,
+  context: ForkSourceContext,
+): Promise<{ uuid: string; contextEndLogIndex?: number }> {
+  const { sourceRecord, logWindow, forkAtMessageIndex } = context;
+  const subscriptionId = options.sessionOptions?.profile ?? options.sessionOptions?.subscription;
+  if (logWindow) {
+    return await resolveLogIndexClaudeCut({
+      cwd: sourceRecord.cwd,
+      acpSessionId: sourceRecord.acpSessionId,
+      atIndex: logWindow.logIndex,
+      sourceMessages: logWindow.messages,
+      subscriptionId,
+      history: logWindow.history,
+    });
+  }
+  const uuid = await resolveClaudeForkResumeAt({
+    cwd: sourceRecord.cwd,
+    acpSessionId: sourceRecord.acpSessionId,
+    atIndex: forkAtMessageIndex,
+    sourceMessages: sourceRecord.messages,
+    subscriptionId,
+  });
+  if (!uuid) {
+    throw new Error(
+      `Cannot copy Claude session at --at-index ${forkAtMessageIndex}: no Claude transcript UUID could be resolved for that acpx message index`,
+    );
+  }
+  return { uuid };
+}

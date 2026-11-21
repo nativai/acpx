@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { Command } from "commander";
+import { Command, Help } from "commander";
 import { listBuiltInAgents } from "../src/agent-registry.js";
 import { TOP_LEVEL_VERBS } from "../src/cli-core.js";
 import { configurePublicCli } from "../src/cli-public.js";
@@ -58,18 +58,54 @@ function valueFlags(command: Command): string[] {
 }
 
 /** The grammar commander actually registers, in `COMMAND_GRAMMAR`'s shape. */
+/** Commander's own answer: does this command list an implicit `help` subcommand? (F1) */
+function helpCommandOf(command: Command): { helpCommand?: true } {
+  const listed = new Help()
+    .visibleCommands(command)
+    .some((c) => c.name() === "help" && !command.commands.includes(c));
+  return listed ? { helpCommand: true } : {};
+}
+
+/** The program as `main` builds it — its `[prompt...]` action included, which decides its help. */
+function realProgram(): Command {
+  const program = new Command().enablePositionalOptions();
+  addGlobalFlags(program);
+  configurePublicCli({
+    program,
+    argv: [],
+    config: fakeConfig(),
+    requestedJsonStrict: false,
+    topLevelVerbs: TOP_LEVEL_VERBS,
+    listBuiltInAgents: () => [],
+    detectAgentToken: () => ({ hasAgentOverride: false }),
+    registerAgentCommand,
+    registerDefaultCommands,
+    handlePromptAction: async () => {},
+  });
+  return program;
+}
+
 function grammarFromCommander(extra?: (program: Command) => void): Record<string, GrammarNode> {
   const program = new Command();
   addGlobalFlags(program);
   registerDefaultCommands(program, fakeConfig());
   extra?.(program);
-  const grammar: Record<string, GrammarNode> = { "": { valueFlags: valueFlags(program) } };
+  const registered = new Set(program.commands.map((c) => c.name()));
+  const claimed = [...TOP_LEVEL_VERBS].filter((v) => !registered.has(v)).toSorted();
+  const grammar: Record<string, GrammarNode> = {
+    "": {
+      valueFlags: valueFlags(program),
+      ...helpCommandOf(realProgram()),
+      ...(claimed.length > 0 ? { claimed } : {}),
+    },
+  };
   const walk = (command: Command, prefix: string[]) => {
     for (const child of command.commands) {
       const p = [...prefix, child.name()];
       grammar[p.join(" ")] = {
         ...(child.aliases().length > 0 ? { aliases: child.aliases() } : {}),
         valueFlags: valueFlags(child),
+        ...helpCommandOf(child),
       };
       walk(child, p);
     }
@@ -81,6 +117,7 @@ function grammarFromCommander(extra?: (program: Command) => void): Record<string
   grammar["<agent>"] = {
     valueFlags: valueFlags(agent),
     children: agent.commands.map((command) => command.name()),
+    ...helpCommandOf(agent),
   };
   return grammar;
 }
@@ -93,9 +130,11 @@ function tableDrift(grammar: Record<string, GrammarNode>): {
   const paths = Object.keys(grammar);
   return {
     unclassified: paths.filter((p) => !(p in COMMAND_TABLE)).toSorted(),
-    // `help` is answered by commander itself (see `top-level-verbs.test.ts` `isAnswered`).
+    // `help` is commander's implicit help command: live only while some group has one (F1).
     dead: Object.keys(COMMAND_TABLE)
-      .filter((p) => p !== "help" && !(p in grammar))
+      .filter((p) =>
+        p === "help" ? !Object.values(grammar).some((n) => n.helpCommand) : !(p in grammar),
+      )
       .toSorted(),
   };
 }
@@ -194,6 +233,11 @@ function commanderPathOf(argv: string[]): { path: string; opts: Record<string, u
   try {
     program.parse(argv, { from: "user" });
   } catch (error) {
+    // Commander's implicit help command / help option prints help and runs no action: path `help`.
+    const code = (error as { code?: string }).code;
+    if (code === "commander.help" || code === "commander.helpDisplayed") {
+      return { path: "help", opts: {} };
+    }
     if (!(error instanceof Stop)) {
       throw error;
     }
@@ -259,7 +303,7 @@ function withValidOperands(p: string): string[] {
 }
 
 function classified(argv: string[]): Classification & { kind: "classified" } {
-  const result = classifyArgv(argv, { builtInAgents: listBuiltInAgents({}), env: {} });
+  const result = classifyArgv(argv, { builtInAgents: listBuiltInAgents({}) });
   assert.equal(result.kind, "classified", `${JSON.stringify(argv)} → ${JSON.stringify(result)}`);
   return result as Classification & { kind: "classified" };
 }
@@ -273,13 +317,17 @@ function runnablePaths(): string[] {
   const runnable = Object.keys(COMMAND_GRAMMAR)
     .filter((p) => p !== "" && p !== "<agent>")
     .filter((p) => {
+      // A bare group (no action) makes commander print help: the oracle reports `help`.
+      let runs = false;
       try {
-        withValidOperands(p);
-        return true;
+        runs = commanderPathOf(withValidOperands(p)).path !== "help";
       } catch {
-        groups.push(p);
-        return false;
+        runs = false;
       }
+      if (!runs) {
+        groups.push(p);
+      }
+      return runs;
     });
   for (const p of groups) {
     assert.equal(
@@ -372,15 +420,14 @@ test("an operand that names no subcommand at a level with subcommands is UNCLASS
     ["sessions", "templates", "zzz"],
     ["claude", "sessions", "zzz"],
   ]) {
-    const result = classifyArgv(argv, { builtInAgents: listBuiltInAgents({}), env: {} });
+    const result = classifyArgv(argv, { builtInAgents: listBuiltInAgents({}) });
     assert.equal(result.kind, "unclassified", JSON.stringify(argv));
   }
 });
 
 test("help, version and the owner entry are `local`; a `-h` among prompt words is NOT help", () => {
   assert.equal(classified(["sessions", "new", "--help"]).help, true);
-  assert.equal(classified(["help"]).class, "local");
-  assert.equal(classified(["seats", "help"]).class, "local");
+  assert.equal(classified(["seats", "help"]).class, "local", "a group's implicit help command");
   assert.equal(classified(["--version"]).class, "local");
   assert.equal(classified(["-V"]).class, "local");
   assert.equal(classified(["__queue-owner"]).class, "local");
@@ -389,6 +436,51 @@ test("help, version and the owner entry are `local`; a `-h` among prompt words i
   assert.equal(words.path, "<agent>");
   assert.equal(words.help, false);
   assert.equal(classified(["prompt", "explain", "--version"]).class, "owner-ensure");
+});
+
+// ─── F1 (test-engineer, 045b3d71): `help` is a PROMPT word wherever commander has no help command ─
+
+const HELP_PROMPTS: Array<[string[], string]> = [
+  [["help"], ""],
+  [["help", "sessions"], ""],
+  [["--format", "json", "help"], ""],
+  [["claude", "help"], "<agent>"],
+  [["claude", "help", "me"], "<agent>"],
+  [["claude", "--session-id", "X", "help", "me"], "<agent>"],
+  [["--approve-all", "claude", "--session-id", "X", "help", "me"], "<agent>"],
+  [
+    ["--approve-all", "--cwd", "/w", "claude", "--session-id", "X", "--no-wait", "help", "me"],
+    "<agent>",
+  ],
+];
+
+test("F1: `help` among a prompt's words is a PROMPT (owner-ensure, not help) — as commander parses it", () => {
+  for (const [argv, path] of HELP_PROMPTS) {
+    assert.equal(commanderPathOf(argv).path, path, `commander: ${JSON.stringify(argv)}`);
+    const c = classified(argv);
+    assert.equal(c.path, path, JSON.stringify(argv));
+    assert.equal(c.class, "owner-ensure", JSON.stringify(argv));
+    assert.equal(c.help, false, JSON.stringify(argv));
+  }
+  // Where commander DOES have a help command (a group with no action), `help` is help.
+  for (const argv of [
+    ["seats", "help"],
+    ["people", "help"],
+    ["subscriptions", "ceiling", "help"],
+  ]) {
+    assert.equal(commanderPathOf(argv).path, "help", JSON.stringify(argv));
+    assert.equal(classified(argv).path, "help", JSON.stringify(argv));
+  }
+  // A group WITH an action has no help command: `sessions help` is an operand naming nothing.
+  assert.equal(classifyArgv(["sessions", "help"], { builtInAgents: [] }).kind, "unclassified");
+});
+
+test("F1: the grammar says which commands have a help command — the program and agents have none", () => {
+  assert.equal(COMMAND_GRAMMAR[""].helpCommand, undefined, "the program has a [prompt...] action");
+  assert.equal(COMMAND_GRAMMAR["<agent>"].helpCommand, undefined, "an agent has a prompt action");
+  assert.equal(COMMAND_GRAMMAR.seats.helpCommand, true);
+  assert.equal(COMMAND_GRAMMAR.sessions.helpCommand, undefined, "sessions lists by itself");
+  assert.deepEqual(COMMAND_GRAMMAR[""].claimed, ["help"], "TOP_LEVEL_VERBS' unregistered token");
 });
 
 test("one-shot's from-records form: `sessions list --local` runs from records, without it not", () => {
@@ -517,7 +609,7 @@ test("the light-graph check FLAGS a heavy import — negative case", () => {
   const dir = fs.mkdtempSync(path.join(SRC, "..", ".pod-graph-probe-"));
   try {
     const entry = path.join(dir, "entry.ts");
-    fs.writeFileSync(entry, 'import { Command } from "commander";\nimport "./next.js";\n');
+    fs.writeFileSync(entry, 'import { Command, Help } from "commander";\nimport "./next.js";\n');
     fs.writeFileSync(path.join(dir, "next.ts"), "export const x = 1;\n");
     const graph = staticGraph(entry);
     assert.deepEqual(graph.externals, ["commander"]);
@@ -588,13 +680,20 @@ test("classifyCall resolves a REAL record — by record id, by ACP id, and the o
       `https://atrium.example/?session=${recordId}`,
     ]);
     assert.equal(viaUrl.kind === "classified" && viaUrl.targetSessionId, recordId);
-    const caller = await classifyCall(["people", "set-owner", "laatz"], {
-      env: { ACPX_SESSION_URL: `https://atrium.example/?session=${recordId}` },
-    });
+    // F4: `people set-owner` names its session by the REQUIRED `--session <id|url>`; no default.
+    const owner = await classifyCall([
+      "people",
+      "set-owner",
+      "laatz",
+      "--session",
+      `https://atrium.example/?session=${recordId}`,
+    ]);
+    assert.equal(owner.kind === "classified" && owner.targetSessionId, recordId, "--session url");
+    const noSelector = await classifyCall(["people", "set-owner", "laatz"]);
     assert.equal(
-      caller.kind === "classified" && caller.targetSessionId,
-      recordId,
-      "caller default",
+      noSelector.kind === "classified" && noSelector.targetSessionId,
+      null,
+      "no caller default: commander refuses this argv, so it names no session",
     );
     // The resolved id is what decides "own pod": the pod named for it, and no other.
     assert.equal(placeOf({ kind: "pod", name: agentPodName(recordId) }, recordId), "own-pod");

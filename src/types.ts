@@ -17,6 +17,7 @@ export type { McpServer, SessionNotification } from "@agentclientprotocol/sdk";
 import type { AgentSessionContext, EffectiveAccountMetadata } from "./acp/auth-env.js";
 import type { LastTurnProviderBreadcrumb } from "./acp/openrouter-attribution.js";
 import type { RoutingPolicyWarningBreadcrumb } from "./acp/openrouter-provider-policy.js";
+import type { SleepingPlanState } from "./pod/create-plan.js";
 import type { RecordPidIdentity } from "./process-identity.js";
 import type { PromptInput } from "./prompt-content.js";
 
@@ -681,12 +682,10 @@ export type SessionContextFill = {
 /**
  * `acpx.sleeping` (UMQ K7, CONCEPTION §6) — the session exists but no agent has ever run: the record
  * carries `acpSessionId: ""` until the first wake materialises it (`runtime/engine/reconnect.ts`)
- * and deletes this field. `fork.from` = the template record the first wake forks.
+ * and deletes this field. `fork.from` = the template record the first wake forks. In pod mode it
+ * carries the whole create plan (C1.3, `src/pod/create-plan.ts`).
  */
-export type SessionSleepingState = {
-  since: string;
-  fork?: { from: string };
-};
+export type SessionSleepingState = SleepingPlanState;
 
 export type SessionAcpxState = {
   /** See {@link SessionSleepingState}. Present only until the first wake. */

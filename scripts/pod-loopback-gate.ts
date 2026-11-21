@@ -19,7 +19,7 @@ import { CapacityRefusedError } from "../src/errors.js";
 import { RoutedCallError } from "../src/pod/pod-refusal.js";
 import { type RoutedCallOptions, runRoutedCall } from "../src/pod/routed-call.js";
 
-const ARGOCD_PIN = "c0446c4c";
+const ARGOCD_PIN = "7c7e34e4";
 const ARGOCD_BARE = "/workspace/projects/argocd-master-application/.bare";
 const LOOPBACK_PATH = "tool-containers/dev-server-common";
 const NOT_RUNNABLE = 3;
@@ -174,6 +174,19 @@ const CASES: Case[] = [
     set: () => [["contract", "0"]],
     restore: () => [["contract", "1"]],
     expect: re(TURNOVER),
+  },
+  {
+    // rc 69 `identity` (infra 831a7a93): an authenticated pod whose identity marker is not its own.
+    label: "a pod whose identity marker is wrong → not_run identity",
+    set: () => [["marker", "not-this-pod"]],
+    restore: (lb) => [["marker", `ag-${lb.key}`]],
+    expect: re(/^acpx: ROUTED outcome=not_run reason=identity call_id=\S+$/),
+  },
+  {
+    label: "a pod whose role is not control → not_run identity",
+    set: () => [["role", "workbench"]],
+    restore: () => [["role", "control"]],
+    expect: re(/^acpx: ROUTED outcome=not_run reason=identity call_id=\S+$/),
   },
   {
     label: "a pod with another uid → not_run uid_mismatch",

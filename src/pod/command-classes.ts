@@ -56,8 +56,6 @@ export type TargetSpec = {
   readonly flags: readonly string[];
   /** Index of the operand that names the session, when one does. */
   readonly operand?: number;
-  /** With no selector the command is about the CALLER's own session (`$ACPX_SESSION_URL`). */
-  readonly callerByDefault?: true;
 };
 
 export type CommandEntry = {
@@ -74,8 +72,12 @@ export type CommandEntry = {
   readonly fromRecordsWhen?: string;
   /** `owner-if-pod` only: a setting — on a session without a pod it is a record write (C1.2). */
   readonly setting?: true;
-  /** `local` only: control-pod maintenance — refuses in an agent pod (`control_pod_only`, A-7). */
-  readonly controlPodOnly?: true;
+  /**
+   * Control-pod maintenance — refuses in an agent pod (`control_pod_only`, A-7). `{ unless }`: only
+   * the invocations WITHOUT that flag are maintenance (`sessions archive --ids` archives named
+   * sessions and is passed through — stream HoD ruling Q, 2026-11-21).
+   */
+  readonly controlPodOnly?: true | { readonly unless: string };
 };
 
 const SELECT = ["--session-id", "--session-url", "-s", "--session"] as const;
@@ -166,7 +168,15 @@ export const COMMAND_TABLE: Readonly<Record<string, CommandEntry>> = {
     reason: "bulk maintenance rewrite of records",
     judgment: "maintenance, but it rewrites shared records, so control-store rather than local",
   },
-  "sessions archive": { class: "control-store", reason: "the archive (C1.2 control-store list)" },
+  "sessions archive": {
+    class: "control-store",
+    reason: "the archive (C1.2 control-store list)",
+    controlPodOnly: { unless: "--ids" },
+    judgment:
+      "ruling Q: archiving named sessions (`--ids`) is passed through from a pod; every other form " +
+      "(retention sweep, --compress, --decompress --all, --status/--verify/--repair/--reindex, " +
+      "--thaw, --cat) is maintenance — control_pod_only in an agent pod",
+  },
   "sessions restore": { class: "control-store", reason: "the archive" },
   "sessions template": {
     class: "record",
@@ -220,7 +230,12 @@ export const COMMAND_TABLE: Readonly<Record<string, CommandEntry>> = {
     reason: "imports an archive as a new record",
     judgment: "a create form C1.3's table does not list",
   },
-  "sessions prune": { class: "control-store", reason: "deletes records and index entries" },
+  "sessions prune": {
+    class: "control-store",
+    reason: "deletes records and index entries",
+    controlPodOnly: true,
+    judgment: "ruling Q: prune is an archive maintenance job — control_pod_only in an agent pod",
+  },
   seats: { class: "local", reason: "group: help only" },
   "seats reconcile-archive": { class: "control-store", reason: "the seat store" },
   "seats set-brick": { class: "control-store", reason: "the seat store" },
@@ -304,7 +319,8 @@ export const COMMAND_TABLE: Readonly<Record<string, CommandEntry>> = {
   "people set-owner": {
     class: "record",
     reason: "the principal fields of one record",
-    target: { flags: ["--session"], callerByDefault: true },
+    // `--session` is a REQUIRED option there (commander refuses without it): no caller default (F4).
+    target: { flags: ["--session"] },
   },
   "people principal": { class: "read", reason: "reads a record" },
   governor: { class: "local", reason: "group: help only" },
@@ -323,7 +339,10 @@ export const COMMAND_TABLE: Readonly<Record<string, CommandEntry>> = {
   "config init": { class: "control-store", reason: "writes the box's config file" },
   flow: { class: "local", reason: "group: help only" },
   "flow run": { class: "one-shot", reason: "runs ACP nodes without a session (C1.2 example)" },
-  help: { class: "local", reason: "help" },
+  // commander's IMPLICIT help command, which exists only on a command that has subcommands and no
+  // action of its own (`acpx seats help`). ⚠️ NOT `acpx help …` nor `acpx <agent> help …`: the
+  // program and every agent have an action, so there `help` is PROMPT TEXT (F1).
+  help: { class: "local", reason: "commander's implicit help command of a group" },
 };
 
 /** Entry points handled before commander, by `src/cli.ts` / `src/cli-core.ts`. All `local`. */
@@ -337,8 +356,10 @@ export const PRE_COMMANDER_PATHS: Readonly<Record<string, CommandEntry>> = {
 
 export type TargetSelector =
   | { via: "flag"; flag: string; value: string }
-  | { via: "operand"; value: string }
-  | { via: "caller"; value: string };
+  | { via: "operand"; value: string };
+
+/** How the command will print: C7.2 "JSON mode carries the same in `error.data`". */
+export type OutputMode = "text" | "json" | "json-strict";
 
 export type Classification =
   | {
@@ -353,13 +374,21 @@ export type Classification =
       target?: TargetSelector;
       /** `one-shot`: this invocation is the from-records form. */
       fromRecords: boolean;
+      /** This invocation is control-pod maintenance (A-7): it refuses in an agent pod. */
+      controlPodOnly: boolean;
+      output: OutputMode;
       /**
        * How many operands the command carries after its path: for a prompt, its text words. A6 reads
        * it to tell "no text" (the prompt then comes from `--file` or piped stdin) from text.
        */
       operandCount: number;
     }
-  | { kind: "unclassified"; contract: typeof COMMAND_CLASSES_CONTRACT; path: string };
+  | {
+      kind: "unclassified";
+      contract: typeof COMMAND_CLASSES_CONTRACT;
+      path: string;
+      output: OutputMode;
+    };
 
 type Scan = {
   operands: string[];
@@ -516,41 +545,39 @@ function targetFromFlags(spec: TargetSpec, scan: Scan): TargetSelector | undefin
   return undefined;
 }
 
-function targetOf(
-  entry: CommandEntry,
-  scan: Scan,
-  env: NodeJS.ProcessEnv,
-): TargetSelector | undefined {
+function targetOf(entry: CommandEntry, scan: Scan): TargetSelector | undefined {
   const spec = entry.target;
   if (!spec) {
     return undefined;
   }
-  const fromFlags = targetFromFlags(spec, scan);
-  if (fromFlags) {
-    return fromFlags;
-  }
   const operand = spec.operand === undefined ? undefined : scan.operands[spec.operand];
-  if (operand) {
-    return { via: "operand", value: operand };
-  }
-  const caller = env.ACPX_SESSION_URL?.trim();
-  return spec.callerByDefault && caller ? { via: "caller", value: caller } : undefined;
+  return targetFromFlags(spec, scan) ?? (operand ? { via: "operand", value: operand } : undefined);
 }
 
 type Walk = { path: string; agent?: string; scan: Scan; help: boolean };
 
-const unclassified = (path: string): Classification => ({
+const unclassified = (path: string, output: OutputMode): Classification => ({
   kind: "unclassified",
   contract: COMMAND_CLASSES_CONTRACT,
   path,
+  output,
 });
 
-/** `acpx <agent> …`: an agent subcommand, `help`, or the agent's own prompt action. */
+/** Does commander give this command an implicit `help` subcommand? (Grammar data, F1.) */
+function hasHelpCommand(path: string): boolean {
+  return COMMAND_GRAMMAR[path]?.helpCommand === true;
+}
+
+/**
+ * `acpx <agent> …`: an agent subcommand or the agent's own prompt action. ⚠️ NO `help` CASE: an
+ * agent command has an action, so commander gives it no help command — `acpx claude help me` is a
+ * prompt (F1). `hasHelpCommand("<agent>")` is false by the grammar, which the test pins.
+ */
 function walkAgent(agent: string, tokens: readonly string[], help: boolean): Walk | string {
   const agentNode = COMMAND_GRAMMAR["<agent>"];
   const level = scanLevel(tokens, agentNode, "subcommands");
   const sub = level.rest[0];
-  if (sub === "help") {
+  if (sub === "help" && hasHelpCommand("<agent>")) {
     return { path: "help", agent, scan: level, help: true };
   }
   if (sub !== undefined && agentNode.children?.includes(sub)) {
@@ -582,6 +609,17 @@ function walkCommand(
   }
 }
 
+function leafWalk(
+  path: string,
+  node: GrammarNode,
+  tokens: readonly string[],
+  help: boolean,
+  agent: string | undefined,
+): Walk {
+  const scan = scanLevel(tokens, node, "leaf");
+  return { path, agent, scan, help: help || scan.help };
+}
+
 type WalkStep =
   | { kind: "done"; result: Walk | string }
   | { kind: "descend"; path: string; tokens: readonly string[]; help: boolean };
@@ -594,15 +632,14 @@ function walkStep(
 ): WalkStep {
   const node = COMMAND_GRAMMAR[path];
   if (childPaths(path).length === 0) {
-    const scan = scanLevel(tokens, node, "leaf");
-    return { kind: "done", result: { path, agent, scan, help: help || scan.help } };
+    return { kind: "done", result: leafWalk(path, node, tokens, help, agent) };
   }
   const level = scanLevel(tokens, node, "subcommands");
   const next = level.rest[0];
   if (next === undefined) {
     return { kind: "done", result: { path, agent, scan: level, help: help || level.help } };
   }
-  if (next === "help") {
+  if (next === "help" && hasHelpCommand(path)) {
     return { kind: "done", result: { path: "help", agent, scan: level, help: true } };
   }
   const child = childOf(path, next);
@@ -617,16 +654,15 @@ function walkArgv(argv: readonly string[], builtInAgents: readonly string[]): Wa
   if (first === undefined) {
     return { path: "", scan: top, help: top.help };
   }
-  if (first === "help") {
-    return { path: "help", scan: top, help: true };
-  }
   const verb = childOf("", first);
   if (verb) {
     return walkCommand(verb, top.rest.slice(1), top.help);
   }
-  // `configurePublicCli`: a non-verb token is an agent command unless `--agent` was given, in
-  // which case only a built-in agent still is; otherwise the words are the program's prompt.
-  if (!top.values.has("--agent") || builtInAgents.includes(first)) {
+  // `configurePublicCli`: a token that is not a registered verb is an agent command — unless
+  // TOP_LEVEL_VERBS claims it (no agent of that name is registered: `help`), or `--agent` was given
+  // and it is not a built-in agent. Then the words are the PROGRAM's prompt (F1: `acpx help`).
+  const claimed = COMMAND_GRAMMAR[""].claimed?.includes(first) === true;
+  if (!claimed && (!top.values.has("--agent") || builtInAgents.includes(first))) {
     return walkAgent(first, top.rest.slice(1), top.help);
   }
   return { path: "", scan: scanLevel(argv, COMMAND_GRAMMAR[""], "positional"), help: top.help };
@@ -643,16 +679,39 @@ function walkArgv(argv: readonly string[], builtInAgents: readonly string[]): Wa
  */
 export function classifyArgv(
   argv: readonly string[],
-  options: { builtInAgents: readonly string[]; env?: NodeJS.ProcessEnv },
+  options: { builtInAgents: readonly string[] },
 ): Classification {
   const pre = preCommanderPath(argv);
+  const top = scanLevel(argv, COMMAND_GRAMMAR[""], "subcommands");
   if (pre !== undefined) {
     const entry = PRE_COMMANDER_PATHS[pre];
     const base = { contract: COMMAND_CLASSES_CONTRACT, path: pre, class: entry.class, entry };
-    return { kind: "classified", ...base, help: false, fromRecords: false, operandCount: 0 };
+    const flags = { help: false, fromRecords: false, controlPodOnly: false, operandCount: 0 };
+    return { kind: "classified", ...base, ...flags, output: outputMode(top) };
   }
   const walk = walkArgv(argv, options.builtInAgents);
-  return typeof walk === "string" ? unclassified(walk) : finish(walk, options.env ?? process.env);
+  return typeof walk === "string"
+    ? unclassified(walk, outputMode(top))
+    : finish(walk, outputMode(top, walk.scan));
+}
+
+/**
+ * The output mode commander's handlers will use: `--json-strict`, or `--format json` among the
+ * program's options or the leaf's own (`governor status --format json`), or a leaf's `--json`
+ * (`sessions archive --json`). ⚠️ A config file's default format is NOT read here (loading the
+ * config is the heavy graph); a refusal then prints text, as a pre-config error would.
+ */
+function outputMode(top: Scan, leaf?: Scan): OutputMode {
+  const flagged = (scan: Scan | undefined, name: string) =>
+    scan !== undefined && (scan.booleans.has(name) || scan.values.has(name));
+  if (flagged(top, "--json-strict") || flagged(leaf, "--json-strict")) {
+    return "json-strict";
+  }
+  const json =
+    top.values.get("--format") === "json" ||
+    leaf?.values.get("--format") === "json" ||
+    flagged(leaf, "--json");
+  return json ? "json" : "text";
 }
 
 /**
@@ -674,15 +733,23 @@ function preCommanderPath(argv: readonly string[]): string | undefined {
   return has("--skill") ? "--skill" : undefined;
 }
 
-function finish(walk: Walk, env: NodeJS.ProcessEnv): Classification {
+function scanHas(scan: Scan, flag: string): boolean {
+  return scan.values.has(flag) || scan.booleans.has(flag);
+}
+
+function isControlPodOnly(entry: CommandEntry, scan: Scan): boolean {
+  const rule = entry.controlPodOnly;
+  return rule === true || (rule !== undefined && !scanHas(scan, rule.unless));
+}
+
+function finish(walk: Walk, output: OutputMode): Classification {
   const entry = COMMAND_TABLE[walk.path];
   if (!entry) {
-    return unclassified(walk.path);
+    return unclassified(walk.path, output);
   }
   const flag = entry.fromRecordsWhen;
-  const fromRecords =
-    flag !== undefined && (walk.scan.values.has(flag) || walk.scan.booleans.has(flag));
-  const target = targetOf(entry, walk.scan, env);
+  const fromRecords = flag !== undefined && scanHas(walk.scan, flag);
+  const target = targetOf(entry, walk.scan);
   return {
     kind: "classified",
     contract: COMMAND_CLASSES_CONTRACT,
@@ -693,6 +760,8 @@ function finish(walk: Walk, env: NodeJS.ProcessEnv): Classification {
     help: walk.help,
     ...(target ? { target } : {}),
     fromRecords,
+    controlPodOnly: isControlPodOnly(entry, walk.scan),
+    output,
     operandCount: walk.scan.operands.length,
   };
 }
@@ -726,20 +795,16 @@ export type CallClassification =
 /**
  * The atrium server's entry (C6.2, brick b479441f reports/EXPORT-class-table.md): classify a
  * passed-through `argv` and, for `record` / `owner-if-pod` / `owner-ensure`, resolve its target.
- * `env` carries the CALLER's `ACPX_SESSION_URL` for commands that default to the caller's own
- * session. The resolver is acpx's session store code, loaded on first need by dynamic import.
+ * The resolver is acpx's session store code, loaded on first need by dynamic import. (No command
+ * defaults its target to the caller's own session — F4 — so the caller's identity is not needed.)
  */
 export async function classifyCall(
   argv: readonly string[],
-  options: { env?: NodeJS.ProcessEnv; builtInAgents?: readonly string[] } = {},
+  options: { builtInAgents?: readonly string[] } = {},
 ): Promise<CallClassification> {
-  const env = options.env ?? {};
-  const c = classifyArgv(argv, {
-    builtInAgents: options.builtInAgents ?? listBuiltInAgents(),
-    env,
-  });
+  const c = classifyArgv(argv, { builtInAgents: options.builtInAgents ?? listBuiltInAgents() });
   if (c.kind === "unclassified") {
-    return c;
+    return { kind: c.kind, contract: c.contract, path: c.path };
   }
   const base = {
     kind: c.kind,

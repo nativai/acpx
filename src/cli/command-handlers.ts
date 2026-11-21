@@ -57,6 +57,14 @@ import {
 import { warmCatalogueInBackground } from "../models/catalogue-warm.js";
 import { validateSessionModelFlags } from "../models/model-slug-validation.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
+import {
+  admitRecordOnlyCreate,
+  createReplayMismatchError,
+  createRequestFingerprint,
+  fileArgumentDigests,
+  forkSourceSleepingError,
+  isRecordOnlyCreate,
+} from "../pod/create-plan.js";
 import { publicReap, type ReapReport } from "../process-tree-reap.js";
 import {
   mergePromptSourceWithText,
@@ -194,6 +202,7 @@ import {
   decideAgentPromptRoute,
   deliveredDirectlyLine,
   type MessageRouteAnswer,
+  readAtriumJson,
   ROUTED_WAIT_MODE_LINE,
   routedPromptLine,
 } from "./prompt-routing.js";
@@ -3926,7 +3935,28 @@ async function handleSessionsNewFromTemplate(
     config,
   );
   const { printCopiedSessionByFormat } = await loadOutputRenderModule();
-  printCopiedSessionByFormat(created, source, globalFlags.format, outcome, requestedCwd);
+  printCopiedSessionByFormat(
+    created,
+    source,
+    globalFlags.format,
+    outcome,
+    requestedCwd,
+    undefined,
+    atriumsTemplatePrompt(flags, firstTurn, source),
+  );
+}
+
+/** C1.3 — the template's first turn as text, when atrium (not acpx) queues it. */
+function atriumsTemplatePrompt(
+  flags: SessionsNewFlags,
+  firstTurn: HandoffPrompt | undefined,
+  source: SessionRecord,
+): string | undefined {
+  if (!firstMessageIsAtriums(flags)) {
+    return undefined;
+  }
+  const prompt = resolveTemplateFirstTurn(flags, firstTurn, source);
+  return prompt ? promptToDisplayText(prompt.prompt) : undefined;
 }
 
 function templateCopyFlags(flags: SessionsNewFlags, templateId: string): SessionsCopyFlags {
@@ -3970,10 +4000,18 @@ async function queueTemplateFirstTurn(
   if (spawn.firstTurn && spawn.source.template?.auto_prompt?.trim()) {
     noteTemplateAutoPromptReplaced(spawn.fromTemplate, resolveGlobalFlags(command, config));
   }
-  if (!prompt || spawn.created.metadata?.spawn_state === "pending") {
+  if (!prompt || templateFirstTurnIsNotOurs(spawn)) {
     return undefined;
   }
   return await queueFirstTurn(spawn.created, prompt, "template-prompt", command, config);
+}
+
+/** A `spawn_key` reservation's publisher, or atrium (C1.3), queues this spawn's first turn itself. */
+function templateFirstTurnIsNotOurs(spawn: {
+  created: SessionRecord;
+  flags: SessionsNewFlags;
+}): boolean {
+  return spawn.created.metadata?.spawn_state === "pending" || firstMessageIsAtriums(spawn.flags);
 }
 
 // HoD ruling R2 (brick b40a9a5d): replacing is the contract, but a discarded stored prompt may
@@ -3986,6 +4024,99 @@ function noteTemplateAutoPromptReplaced(fromTemplate: string, globalFlags: Globa
     `[acpx] --from-template ${fromTemplate}: its stored auto-prompt was REPLACED by ` +
       `--prompt/--prompt-file and is not sent\n`,
   );
+}
+
+// C6.2 — at most once. atrium's pass-through sends every create with a record id it chose
+// (`--record-id`) and its call id (`--created-by-call`), stored as `metadata.created_by_call` in the
+// same write as the rest of the record. A retry after a lost answer finds that record and is
+// answered with it, exactly as the first create answered; nothing is written twice.
+const CREATED_BY_CALL_KEY = "created_by_call";
+const CREATED_BY_REQUEST_KEY = "created_by_request";
+
+/** The flags with `metadata.created_by_call` set — or a usage refusal (exit 2, nothing created). */
+function withCreatedByCall<
+  F extends { createdByCall?: string; recordId?: string; metadata?: Record<string, string> },
+>(flags: F, fileDigests?: Readonly<Record<string, string>>): F {
+  for (const key of [CREATED_BY_CALL_KEY, CREATED_BY_REQUEST_KEY]) {
+    if (flags.metadata && key in flags.metadata) {
+      throw new InvalidArgumentError(
+        `--metadata ${key}=… is reserved: it is written only by --created-by-call`,
+      );
+    }
+  }
+  if (flags.createdByCall === undefined) {
+    return flags;
+  }
+  if (flags.recordId === undefined) {
+    throw new InvalidArgumentError("--created-by-call requires --record-id");
+  }
+  return {
+    ...flags,
+    metadata: {
+      ...flags.metadata,
+      [CREATED_BY_CALL_KEY]: flags.createdByCall,
+      [CREATED_BY_REQUEST_KEY]: createRequestFingerprint(process.argv.slice(2), fileDigests),
+    },
+  };
+}
+
+/** The record this very call already created, when `--record-id` names one with the same call id. */
+async function createdByThisCall(
+  flags: {
+    createdByCall?: string;
+    recordId?: string;
+  },
+  fileDigests?: Readonly<Record<string, string>>,
+): Promise<SessionRecord | undefined> {
+  if (flags.createdByCall === undefined || flags.recordId === undefined) {
+    return undefined;
+  }
+  let existing: SessionRecord;
+  try {
+    existing = await resolveSessionRecord(flags.recordId);
+  } catch {
+    return undefined;
+  }
+  if (!isThisCallsRecord(existing, flags)) {
+    return undefined;
+  }
+  assertSameRequest(existing, fileDigests);
+  return existing;
+}
+
+function isThisCallsRecord(
+  record: SessionRecord,
+  flags: { createdByCall?: string; recordId?: string },
+): boolean {
+  return (
+    record.acpxRecordId === flags.recordId &&
+    record.metadata?.[CREATED_BY_CALL_KEY] === flags.createdByCall
+  );
+}
+
+/**
+ * M-2: only an IDENTICAL request gets the first answer. A record without a fingerprint (made before
+ * this check existed) cannot prove it, so it is refused too — never a silent "close enough".
+ */
+function assertSameRequest(
+  record: SessionRecord,
+  fileDigests?: Readonly<Record<string, string>>,
+): void {
+  if (
+    record.metadata?.[CREATED_BY_REQUEST_KEY] !==
+    createRequestFingerprint(process.argv.slice(2), fileDigests)
+  ) {
+    throw createReplayMismatchError(record.acpxRecordId);
+  }
+}
+
+/**
+ * A create whose first message atrium queues itself (C1.3, C6.2): an automated start (`--sleeping`)
+ * or a pass-through (`--created-by-call`). acpx returns the fork notice in its answer and posts
+ * nothing; a `--prompt` on such a create is refused — atrium has taken the message out of the command.
+ */
+function firstMessageIsAtriums(flags: { sleeping?: boolean; createdByCall?: string }): boolean {
+  return flags.sleeping === true || flags.createdByCall !== undefined;
 }
 
 // UMQ K7 (CONCEPTION §6.1) — hidden `sessions new|copy --sleeping`. It allocates nothing (no adapter,
@@ -4014,7 +4145,12 @@ export async function handleSessionsNew(
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
-  if (flags.sleeping === true) {
+  flags = withCreatedByCall(flags);
+  if (await answeredAsReplay(flags, command, config)) {
+    return;
+  }
+  // C1.3 — in pod mode every create is record-only, so `--sleeping` is what every form already is.
+  if (flags.sleeping === true && !isRecordOnlyCreate()) {
     refuseSleepingMisuse({
       "--prompt": flags.promptTextGiven === true,
       "--prompt-file": flags.promptFile !== undefined,
@@ -4143,15 +4279,13 @@ async function createSessionFromNewFlags(
   // record, no seat and no transient adapter. A live `--from` predecessor is a succession and is
   // never gated; that is also the `sessions handover` successor, which comes through here.
   // A SLEEPING create allocates nothing, so it takes no ticket (UMQ K7, G6).
-  const admission =
-    flags.sleeping === true
-      ? undefined
-      : await admitCreate({
-          verb: flags.from === undefined ? "sessions new" : "sessions new --from",
-          agentCommand: effectiveAgent.agentCommand,
-          recordId: flags.recordId,
-          successorOf: from?.acpxRecordId,
-        });
+  const recordOnly = isRecordOnlyCreate();
+  const admission = await admitNewSessionCreate({
+    flags,
+    recordOnly,
+    agentCommand: effectiveAgent.agentCommand,
+    successorOf: from?.acpxRecordId,
+  });
   // brick://7a2d5c60 — a cold or stale cache makes the validation above stand
   // aside, which is why it was a production no-op on a box nobody had run
   // `acpx models` on. This kicks a refresh off and RETURNS IMMEDIATELY (detached
@@ -4159,14 +4293,15 @@ async function createSessionFromNewFlags(
   // one validates. It must stay after validation and before the spawn: awaiting
   // it, here or anywhere, would trade a silent no-op for a latency regression on
   // every first create (C4 §7.1).
-  if (flags.sleeping !== true) {
+  if (flags.sleeping !== true && !recordOnly) {
     warmCatalogueInBackground();
   }
   const { createSession } = await loadSessionModule();
 
   const created = await createAdmitted(admission, () =>
-    createSession(
-      buildSessionStartOptions({
+    createSession({
+      ...(recordOnly ? { recordOnly: {} } : {}),
+      ...buildSessionStartOptions({
         agent: effectiveAgent,
         flags,
         globalFlags: spawnGlobalFlags,
@@ -4182,7 +4317,7 @@ async function createSessionFromNewFlags(
         seatJoin,
         osMetadata,
       }),
-    ),
+    }),
   );
   await maybeStampBrickLink(created);
   return {
@@ -4191,6 +4326,31 @@ async function createSessionFromNewFlags(
     globalFlags,
     requestedCwd: effectiveAgent.requestedCwd,
   };
+}
+
+/**
+ * The create gate of `sessions new`. C1.3 — a record-only create (pod mode) is never refused for room;
+ * only the waiting line refuses. A sleeping create allocates nothing and takes no ticket (UMQ K7).
+ */
+async function admitNewSessionCreate(params: {
+  flags: SessionsNewFlags;
+  recordOnly: boolean;
+  agentCommand: string;
+  successorOf: string | undefined;
+}): Promise<AdmissionTicket | undefined> {
+  if (params.recordOnly) {
+    await admitRecordOnlyCreate();
+    return undefined;
+  }
+  if (params.flags.sleeping === true) {
+    return undefined;
+  }
+  return await admitCreate({
+    verb: params.flags.from === undefined ? "sessions new" : "sessions new --from",
+    agentCommand: params.agentCommand,
+    recordId: params.flags.recordId,
+    successorOf: params.successorOf,
+  });
 }
 
 /**
@@ -4219,10 +4379,22 @@ export async function handleSessionsCopy(
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
-  if (flags.sleeping === true) {
+  flags = withCreatedByCall(flags);
+  const replay = await createdByThisCall(flags);
+  if (replay) {
+    await printCopyReplay(replay, command, config, { withNotice: copyAnswerCarriesNotice(flags) });
+    return;
+  }
+  if (flags.sleeping === true && !isRecordOnlyCreate()) {
     await handleSleepingSessionsCopy(explicitAgentName, flags, command, config);
     return;
   }
+  if (isRecordOnlyCreate() && firstMessageIsAtriums(flags)) {
+    await handleAtriumQueuedRecordOnlyCopy(explicitAgentName, flags, command, config);
+    return;
+  }
+  // C1.3 — in pod mode the same handler writes the record only (`runSessionCopy` → record-only) and
+  // its first message (the fork notice, the prompt) goes into atrium's queue (`deliverHandoffPrompt`).
   await handleLiveSessionsCopy(explicitAgentName, flags, command, config);
 }
 
@@ -4309,6 +4481,154 @@ async function handleSleepingSessionsCopy(
     undefined,
     requestedCwd,
     composeForkDivergenceNotice(created, source.acpxRecordId, source.seatId),
+  );
+}
+
+/**
+ * C1.3 — a pod-mode copy whose first message atrium queues (`--sleeping`, `--created-by-call`): the
+ * record only, every form (full copy, cut, by-the-way), and the fork notice in the answer for atrium
+ * to queue. A by-the-way carries no notice, as a live one does not.
+ */
+async function handleAtriumQueuedRecordOnlyCopy(
+  explicitAgentName: string | undefined,
+  flags: SessionsCopyFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  if (flags.sleeping === true && declaredAdmissionClass() !== "automation") {
+    throw new InvalidArgumentError(SLEEPING_NEEDS_AUTOMATION_MESSAGE);
+  }
+  if (flags.prompt !== undefined || flags.promptFile !== undefined) {
+    throw new InvalidArgumentError(
+      "this create's first message is atrium's: --prompt/--prompt-file cannot be combined with --sleeping or --created-by-call",
+    );
+  }
+  const { created, source, requestedCwd } = await runSessionCopy(
+    explicitAgentName,
+    flags,
+    command,
+    config,
+    false,
+  );
+  const { printCopiedSessionByFormat } = await loadOutputRenderModule();
+  printCopiedSessionByFormat(
+    created,
+    source,
+    resolveGlobalFlags(command, config).format,
+    undefined,
+    requestedCwd,
+    flags.ephemeral
+      ? undefined
+      : composeForkDivergenceNotice(created, source.acpxRecordId, source.seatId),
+  );
+}
+
+/**
+ * C6.2 for `sessions new`: true when this call's record already exists and was printed again. A
+ * pass-through create carries no first message (atrium queues it), so `--prompt` is refused with it.
+ */
+async function answeredAsReplay(
+  flags: SessionsNewFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<boolean> {
+  const replay = await createdByThisCall(flags);
+  if (replay && flags.fromTemplate !== undefined) {
+    const template = await resolveSessionRecord(replay.forkedFromSessionId ?? flags.fromTemplate);
+    await printCopyReplay(replay, command, config, {
+      withNotice: false,
+      templatePrompt: atriumsTemplatePrompt(flags, undefined, template),
+    });
+    return true;
+  }
+  if (replay) {
+    await printNewSessionReplay(replay, flags, command, config);
+    return true;
+  }
+  if (
+    flags.createdByCall !== undefined &&
+    (flags.promptTextGiven === true || flags.promptFile !== undefined)
+  ) {
+    throw new InvalidArgumentError(
+      "--created-by-call cannot be combined with --prompt/--prompt-file: atrium queues the first message",
+    );
+  }
+  return false;
+}
+
+/**
+ * C6.2 replays print EXACTLY what the first answer printed (the same argv comes back): every field is
+ * derived from the record and the SAME flags, by the same rules the create used — never from what
+ * the record happens to carry (`--metadata byway=1` on a plain copy made the two differ; S2 tester,
+ * N-A2-1). Test: `test/pod-create-plan.test.ts` → "byte for byte".
+ */
+async function printNewSessionReplay(
+  record: SessionRecord,
+  flags: SessionsNewFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const { printCreatedSessionBanner, printNewSessionByFormat } = await loadOutputRenderModule();
+  printCreatedSessionBanner(
+    record,
+    record.agentName ?? record.agentCommand,
+    globalFlags.format,
+    globalFlags.jsonStrict,
+  );
+  printNewSessionByFormat(
+    record,
+    globalFlags.format,
+    undefined,
+    await newSessionRequestedCwd(flags, command, globalFlags),
+  );
+}
+
+/** The `requestedCwd` the create reported — `resolveNewSessionAgent`'s rule, from the same flags. */
+async function newSessionRequestedCwd(
+  flags: SessionsNewFlags,
+  command: Command,
+  globalFlags: GlobalFlags,
+): Promise<string | undefined> {
+  if (flags.resumeSession !== undefined && cwdFlagIsExplicit(command)) {
+    return undefined;
+  }
+  const from = flags.from === undefined ? undefined : await resolveSessionRecord(flags.from);
+  return resolveCreateCwdFromFlags({
+    command,
+    cwdFlag: globalFlags.cwd,
+    fallback: from?.cwd,
+    jsonStrict: globalFlags.jsonStrict,
+  }).requestedCwd;
+}
+
+/** Whether a copy's FIRST answer carried the fork notice — the handlers' own rule, from the flags. */
+function copyAnswerCarriesNotice(flags: SessionsCopyFlags): boolean {
+  if (!isRecordOnlyCreate()) {
+    return flags.sleeping === true; // today's `--sleeping` copy returns it; a live copy delivers it
+  }
+  return firstMessageIsAtriums(flags) && flags.ephemeral !== true;
+}
+
+async function printCopyReplay(
+  record: SessionRecord,
+  command: Command,
+  config: ResolvedAcpxConfig,
+  answer: { withNotice: boolean; templatePrompt?: string },
+): Promise<void> {
+  const globalFlags = resolveGlobalFlags(command, config);
+  const source = await resolveSessionRecord(record.forkedFromSessionId ?? record.acpxRecordId);
+  const { printCopiedSessionByFormat } = await loadOutputRenderModule();
+  printCopiedSessionByFormat(
+    record,
+    source,
+    globalFlags.format,
+    undefined,
+    resolveCopyDestinationCwd(command, globalFlags, source).requestedCwd,
+    answer.withNotice
+      ? composeForkDivergenceNotice(record, source.acpxRecordId, source.seatId)
+      : undefined,
+    answer.templatePrompt,
   );
 }
 
@@ -4405,6 +4725,16 @@ async function deliverHandoffPrompt(
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const outputPolicy = resolveRequestedOutputPolicy(globalFlags);
+  if (isRecordOnlyCreate()) {
+    // C1.3 — in pod mode the first message ALWAYS goes into atrium's queue, never to an owner the
+    // create starts: there is no owner, and none may be started on the control pod.
+    await postFirstMessageToAtrium(created, prompt, {
+      command,
+      globalFlags,
+      permissionMode,
+    });
+    return;
+  }
   // Initial sends belong in the sender transcript too. Use the ordinary agent-send
   // route so atrium owns its marker and receiver attribution (07799b69 regression).
   // Do not print a prompt result here: sessions new/copy owns the single create result.
@@ -4453,6 +4783,66 @@ async function deliverHandoffPrompt(
   noteDeliveredDirectly(fallback, outputPolicy.format);
 }
 
+/**
+ * C1.3 — a record-only create's first message (brief, fork notice) into atrium's queue. An agent
+ * caller goes through the ordinary agent-send route (its sender attribution and ledger, as every
+ * routed prompt); a person — no agent identity — through the session message route the activation
+ * notice uses. Never a direct fallback: atrium unreachable is a first message NOT queued (the record
+ * stays), which the caller reports as `promptQueued: false`.
+ */
+/** The sender of a person's pod-mode first message — not the activation verb's tag (it is not one). */
+const FIRST_MESSAGE_SENDER = "acpx:first-message";
+
+async function postFirstMessageToAtrium(
+  created: SessionRecord,
+  prompt: PromptInput,
+  ctx: {
+    command: Command;
+    globalFlags: GlobalFlags;
+    permissionMode: ReturnType<typeof resolvePermissionMode>;
+  },
+): Promise<void> {
+  const caller = resolveLedgerCaller();
+  const atrium = readAtriumJson();
+  if (caller && atrium) {
+    const routed = await runRoutedPrompt({
+      route: { atrium, caller },
+      record: created,
+      addressedSeat: undefined,
+      prompt,
+      taskOptions: routedTaskOptions(ctx.command, ctx.globalFlags, ctx.permissionMode),
+      ownerInputs: {
+        sessionId: created.acpxRecordId,
+        permissionMode: ctx.permissionMode,
+        permissionModeExplicit: hasExplicitPermissionModeFlag(ctx.globalFlags),
+        nonInteractivePermissions: ctx.globalFlags.nonInteractivePermissions,
+        authPolicy: ctx.globalFlags.authPolicy,
+        terminal: ctx.globalFlags.terminal,
+      },
+    });
+    if (routed.kind === "sent") {
+      return;
+    }
+    throw new AcpxOperationalError(
+      `the first message for ${created.acpxRecordId} could not be queued in atrium (${routed.why}); ` +
+        "in pod mode nothing is delivered directly",
+      { outputCode: "RUNTIME", detailCode: "ATRIUM_AWAY", origin: "cli" },
+    );
+  }
+  const { deliverActivationNotice } = await import("./session/notice-delivery.js");
+  const delivery = await deliverActivationNotice({
+    successorId: created.acpxRecordId,
+    notice: promptToDisplayText(prompt),
+    from: FIRST_MESSAGE_SENDER,
+  });
+  if (!delivery.delivered) {
+    throw new AcpxOperationalError(
+      `the first message for ${created.acpxRecordId} could not be queued in atrium: ${delivery.reason}`,
+      { outputCode: "RUNTIME", detailCode: "ATRIUM_AWAY", origin: "cli" },
+    );
+  }
+}
+
 // Shared core for `sessions copy`/`fork` and `sessions new --from-template`.
 // `requireTemplate` gates the source to acpx-ui-marked templates; everything else
 // (native deep-copy, agent-type lock, cwd/lineage handling, output) is identical.
@@ -4472,14 +4862,11 @@ async function runSessionCopy(
   const permissionMode = resolvePermissionMode(globalFlags, config.defaultPermissions);
   const permissionPolicy = await resolvePermissionPolicyFromFlags(globalFlags);
   const pathAgent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
-  const source = await resolveSessionRecord(flags.from);
-  assertCopyableSource(source);
-  if (requireTemplate) {
-    assertTemplateSource(source);
-  }
+  const recordOnly = isRecordOnlyCreate();
+  const source = await loadCopySource(flags, requireTemplate, recordOnly);
   // A sleeping copy forks at its first wake, always the whole template: no cut to resolve now.
   const { forkAtMessageIndex, forkAtLogIndex } =
-    flags.sleeping === true
+    flags.sleeping === true && !recordOnly
       ? { forkAtMessageIndex: 0, forkAtLogIndex: undefined }
       : await resolveCopyCut(source, flags);
   assertCopyAgentLock({ explicitAgentName, globalFlags, pathAgent, source, config });
@@ -4502,14 +4889,7 @@ async function runSessionCopy(
   );
   // The create gate (§6.1 A2) — copy, fork, by-the-way and `--from-template` all come through
   // here; see `createSessionFromNewFlags` for why it sits after validation and before the create.
-  const admission =
-    flags.sleeping === true
-      ? undefined
-      : await admitCreate({
-          verb: requireTemplate ? "sessions new --from-template" : "sessions copy",
-          agentCommand: source.agentCommand,
-          recordId: flags.recordId,
-        });
+  const admission = await admitCopyCreate(flags, recordOnly, requireTemplate, source);
 
   const [{ createSession }, { printCreatedSessionBanner }] = await Promise.all([
     loadSessionModule(),
@@ -4550,7 +4930,7 @@ async function runSessionCopy(
       forkAtMessageIndex: flags.atIndex,
       forkAtLogIndex: flags.atLogIndex,
       forkExpectEntry: flags.expectEntry,
-      ...(flags.sleeping === true ? { sleeping: true } : {}),
+      ...copyCreateMode(flags, recordOnly),
       seatFavorite: flags.favorite,
       mcpServers: config.mcpServers,
       permissionMode,
@@ -4575,6 +4955,57 @@ async function runSessionCopy(
   // The result line is the CALLER's: `sessions new --from-template` prints it only after the
   // first turn is queued, so it can carry `promptQueued`.
   return { created, source, requestedCwd: destination.requestedCwd };
+}
+
+/** The copy's source, refused before anything exists when it cannot be copied (or cut). */
+async function loadCopySource(
+  flags: SessionsCopyFlags,
+  requireTemplate: boolean,
+  recordOnly: boolean,
+): Promise<SessionRecord> {
+  const source = await resolveSessionRecord(flags.from);
+  const isCut = flags.atIndex !== undefined || flags.atLogIndex !== undefined;
+  if (recordOnly && isCut && (source.acpx?.sleeping || source.acpSessionId === "")) {
+    // C1.3 amendment A-15: named, before the generic "never run" refusal below.
+    throw forkSourceSleepingError(source.acpxRecordId);
+  }
+  assertCopyableSource(source);
+  if (requireTemplate) {
+    assertTemplateSource(source);
+  }
+  return source;
+}
+
+/** The create gate of copy / fork / by-the-way / `--from-template` — see `admitNewSessionCreate`. */
+async function admitCopyCreate(
+  flags: SessionsCopyFlags,
+  recordOnly: boolean,
+  requireTemplate: boolean,
+  source: SessionRecord,
+): Promise<AdmissionTicket | undefined> {
+  if (recordOnly) {
+    await admitRecordOnlyCreate();
+    return undefined;
+  }
+  if (flags.sleeping === true) {
+    return undefined;
+  }
+  return await admitCreate({
+    verb: requireTemplate ? "sessions new --from-template" : "sessions copy",
+    agentCommand: source.agentCommand,
+    recordId: flags.recordId,
+  });
+}
+
+/** Today's `--sleeping` copy, or C1.3's record-only create (pod mode) with its by-the-way mark. */
+function copyCreateMode(
+  flags: SessionsCopyFlags,
+  recordOnly: boolean,
+): { sleeping?: true; recordOnly?: { byway: boolean } } {
+  if (recordOnly) {
+    return { recordOnly: { byway: flags.ephemeral === true } };
+  }
+  return flags.sleeping === true ? { sleeping: true } : {};
 }
 
 /**
@@ -5098,14 +5529,38 @@ export async function handleSessionsImport(
     jsonStrict: globalFlags.jsonStrict,
     flagLabel: "sessions import --cwd",
   });
+  // C6.2 — an import is a create (C1.3 "resume of an existing conversation"): the same at-most-once
+  // rules as every create verb — fresh, replay (answered with the record this call made), collision.
+  // R2-F4: the archive is a FILE-valued argument — the request is its bytes, not its path.
+  const fileDigests =
+    flags.createdByCall === undefined ? undefined : await fileArgumentDigests([archivePath]);
+  flags = withCreatedByCall(flags, fileDigests);
+  const replay = await createdByThisCall(flags, fileDigests);
+  if (replay) {
+    printImportResult(
+      globalFlags.format,
+      { record_id: replay.acpxRecordId, cwd: replay.cwd },
+      requestedCwd,
+    );
+    return;
+  }
   const result = await importSession(archivePath, {
     newCwd,
     expectedAgentName: globalFlags.agent ? undefined : agent.agentName,
     expectedAgentCommand: agent.agentCommand,
+    recordId: flags.recordId,
+    metadata: flags.metadata,
   });
+  printImportResult(globalFlags.format, result, requestedCwd);
+}
 
+function printImportResult(
+  format: OutputFormat,
+  result: { record_id: string; cwd: string },
+  requestedCwd: string | undefined,
+): void {
   if (
-    emitJsonResult(globalFlags.format, {
+    emitJsonResult(format, {
       action: "session_imported",
       record_id: result.record_id,
       cwd: result.cwd,
@@ -5115,7 +5570,7 @@ export async function handleSessionsImport(
     return;
   }
 
-  if (globalFlags.format === "quiet") {
+  if (format === "quiet") {
     process.stdout.write(`${result.record_id}\n`);
     return;
   }

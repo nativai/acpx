@@ -1,7 +1,6 @@
 import { parseSessionIdFromUrl, resolveExplicitSessionRecord } from "../cli/session-selector.js";
 import { resolveSessionRecord } from "../session/persistence.js";
 import type { TargetSelector } from "./command-classes.js";
-import type { TargetResolver } from "./placement-step.js";
 
 /**
  * Resolve a command's target selector to the session's RECORD id with acpx's own resolver — the same
@@ -27,10 +26,6 @@ async function resolveSelector(target: TargetSelector) {
   if (target.via === "operand") {
     return await resolveSessionRecord(target.value);
   }
-  if (target.via === "caller") {
-    const id = parseSessionIdFromUrl(target.value);
-    return id ? await resolveSessionRecord(id) : undefined;
-  }
   switch (target.flag) {
     case "--seat":
       return await resolveExplicitSessionRecord({ seat: target.value });
@@ -45,6 +40,3 @@ async function resolveSelector(target: TargetSelector) {
       return await resolveExplicitSessionRecord({ sessionId: target.value });
   }
 }
-
-export const targetResolver: TargetResolver = async (classification) =>
-  await resolveTargetRecordId(classification.target);

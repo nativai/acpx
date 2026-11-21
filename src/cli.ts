@@ -5,6 +5,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { listBuiltInAgents } from "./agent-registry.js";
 import { runPlacementStep } from "./pod/placement-step.js";
 import { registerRoutedBranches } from "./pod/routed-branches.js";
+// Block A2 registers the `record-only-create` branch (C1.3); a light module, see its header.
+import "./pod/record-only-create-branch.js";
 
 // ⚠️ THIS ENTRY STAYS LIGHT, AND ITS RE-EXPORTS OF `cli-core` WERE REMOVED FOR IT (brick b479441f).
 // Pod mode decides where a command runs BEFORE acpx loads the world (CONTRACTS-r4 C1.2, CONCEPTION r4
@@ -54,8 +56,8 @@ async function start(): Promise<void> {
   const outcome = await runPlacementStep({
     argv: placementArgv(process.argv),
     builtInAgents: () => listBuiltInAgents(),
-    loadTargetResolver: async () => (await import("./pod/target-resolver.js")).targetResolver,
     write: (line) => process.stderr.write(`${line}\n`),
+    writeStdout: (line) => process.stdout.write(`${line}\n`),
   });
   if (outcome !== "proceed") {
     process.exitCode = outcome.exitCode;
@@ -82,6 +84,15 @@ if (isCliEntrypoint(process.argv)) {
     // atrium loads the class table in-process from the acpx it runs (C6.2; brick b479441f
     // reports/EXPORT-class-table.md) — the spawn-ledger pattern.
     process.stdout.write(`${new URL("./pod/command-classes.js", import.meta.url).href}\n`);
+  } else if (process.argv.length === 3 && process.argv[2] === "__pod-lock-module") {
+    // The atrium server's loader for the lock module (pod-lock.ts; EXPORT-lock-module.md, brick 8d85cb47).
+    process.stdout.write(`${new URL("./pod-lock.js", import.meta.url).href}\n`);
+  } else if (process.argv[2] === "__pod-lock-sweep") {
+    // One pass of the pod lock sweep over this state home (+ named dirs), for the idle loop (C3.2).
+    // A DYNAMIC import: this entry's static graph stays light (see the ⚠️ above).
+    void import("./cli/pod-lock-sweep.js").then(({ runPodLockSweep }) =>
+      runPodLockSweep(process.argv.slice(3)),
+    );
   } else {
     void start();
   }

@@ -104,6 +104,7 @@ function decisionFor(argv: string[]) {
     branch: "routed-ensure" as const,
     classification,
     place: "control" as const,
+    output: classification.output,
   };
 }
 
@@ -270,6 +271,17 @@ test("stdin: no text and a terminal → acpx's own usage line, said HERE (exit 2
   assert.deepEqual(h.stderr, [`${PROMPT_REQUIRED_MESSAGE}\n`]);
   assert.equal(h.runs.length, 0);
   assert.equal(h.stdinReads, 0);
+});
+
+test("stdin: no text and a terminal in JSON mode → acpx's usage error through the failure printer (exit 2 by its code), nothing run", async () => {
+  const h = harness({ isTty: () => true });
+  const argv = ["claude", "prompt", "--session-id", SESSION, "--json-strict"];
+  h.deps.argv = () => argv;
+  const exit = await routedBranchHandlers(h.deps)["routed-ensure"](decisionFor(argv));
+  assert.equal(exit, 1, "the stub printer returns 1; the real one maps USAGE to 2");
+  assert.equal(h.runs.length, 0);
+  assert.equal(h.stderr.length, 0, "json-strict keeps stderr clean: the printer owns the output");
+  assert.equal((h.failures[0] as { outputCode?: string }).outputCode, "USAGE");
 });
 
 test("classifyArgv carries the operand count the stdin rule reads", () => {

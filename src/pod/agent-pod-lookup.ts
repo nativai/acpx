@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
 import path from "node:path";
+import { POD_API_URL_ENV } from "./death-proof.js";
+import { readServiceAccountFile, serviceAccountDir } from "./identity.js";
 import type { AgentPodLookup } from "./routed-call.js";
 
 /**
@@ -15,36 +17,20 @@ import type { AgentPodLookup } from "./routed-call.js";
  *   absent                                 no non-terminal pod of the key
  *   unknown                                the API server did not answer, or answered something else
  *
- * ⚠️ TEMPORARY TRANSPORT. Block A5's client helpers (`src/pod/death-proof.ts`, `identity.ts`) are not
- * on `agent-pods` yet; this file reads the API with the same seam variables and the same ambient
- * service account. When A5's helpers land, replace `apiGet` with theirs — do not keep two clients.
+ * ⚠️ ONE REMAINING DUPLICATE. The seam variable (`POD_API_URL_ENV`), the service-account directory and
+ * its files come from A5's `death-proof.ts` / `identity.ts`. Its HTTP GET (`apiGet` / `apiConfig`) is
+ * private there, so a small copy stays here until A5 exports it — then delete `apiGet` below and call
+ * theirs: do not keep two clients.
  *
  * The pods are listed by the label `workbench.nativai.de/session-key=<key>` (C4): the Job's pod
  * name has a generated suffix, so the name cannot be derived from the key.
  */
 
-/** Test seam: base URL of a (fake) API server; honoured ONLY under `NODE_TEST_CONTEXT`. */
-export const POD_API_URL_ENV = "ACPX_POD_API_URL";
-export const POD_SA_DIR_ENV = "ACPX_POD_SA_DIR";
-const SERVICE_ACCOUNT_DIR = "/var/run/secrets/kubernetes.io/serviceaccount";
 const API_TIMEOUT_MS = 3_000;
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 const TERMINAL_PHASES = new Set(["Succeeded", "Failed"]);
 
 type ApiConfig = { base: URL; token: string; ca?: Buffer; namespace: string };
-
-function saDir(env: NodeJS.ProcessEnv): string {
-  const override = env.NODE_TEST_CONTEXT ? env[POD_SA_DIR_ENV]?.trim() : undefined;
-  return override || SERVICE_ACCOUNT_DIR;
-}
-
-function readSa(file: string, env: NodeJS.ProcessEnv): string | undefined {
-  try {
-    return readFileSync(path.join(saDir(env), file), "utf8").trim() || undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 function ipHost(host: string): string {
   return host.includes(":") ? `[${host}]` : host;
@@ -67,14 +53,14 @@ function apiConfig(env: NodeJS.ProcessEnv): ApiConfig | undefined {
   } catch {
     return undefined;
   }
-  const token = readSa("token", env);
-  const namespace = readSa("namespace", env);
+  const token = readServiceAccountFile("token", env);
+  const namespace = readServiceAccountFile("namespace", env);
   if (!base || !token || !namespace) {
     return undefined;
   }
   let ca: Buffer | undefined;
   try {
-    ca = readFileSync(path.join(saDir(env), "ca.crt"));
+    ca = readFileSync(path.join(serviceAccountDir(env), "ca.crt"));
   } catch {
     ca = undefined;
   }
