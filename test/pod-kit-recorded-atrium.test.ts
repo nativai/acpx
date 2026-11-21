@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { startRecordedAtrium } from "./pod-kit/recorded-atrium.js";
+import { INHERIT_ALLOWED, startRecordedAtrium } from "./pod-kit/recorded-atrium.js";
 import type { AtriumScript, RecordedAtrium } from "./pod-kit/recorded-atrium.js";
 
 // Self-test of the X1 recorded atrium (CONTRACTS-r4.md C6): the wire shapes it answers, what it
@@ -201,10 +201,101 @@ test("message routes record their target and body; default answer is a queued de
         ["seat_message", "seat-1", "yo"],
       ],
     );
-    atrium.setScript({ messages: { status: 409, body: { error: "gone" } } });
+    atrium.setScript({ messages: { default: { status: 409, body: { error: "gone" } } } });
     const scripted = await post(atrium, "/api/sessions/sess-2/message", {});
     assert.equal(scripted.status, 409);
     assert.deepEqual(JSON.parse(scripted.text), { error: "gone" });
+  });
+});
+
+test("message routes: both answers — 200 queued when accepted, 202 held when queued for room — in the scripted order", async () => {
+  await withAtrium(
+    {
+      messages: {
+        answers: ["queued", "held", { held: { reason: "agent_cap" } }],
+        default: "queued",
+      },
+    },
+    async (atrium) => {
+      const answers: Array<{ status: number; body: Record<string, unknown> }> = [];
+      for (const path of [
+        "/api/sessions/a/message",
+        "/api/seats/b/message",
+        "/api/sessions/c/message",
+        "/api/seats/d/message",
+      ]) {
+        const answer = await post(atrium, path, { message: "m" });
+        answers.push({
+          status: answer.status,
+          body: JSON.parse(answer.text) as Record<string, unknown>,
+        });
+      }
+      assert.deepEqual(
+        answers.map((entry) => [entry.status, entry.body.status]),
+        [
+          [200, "queued"],
+          [202, "held"],
+          [202, "held"],
+          [200, "queued"],
+        ],
+      );
+      assert.deepEqual(answers[1]?.body.held, { reason: "pod_starting" });
+      assert.deepEqual(answers[2]?.body.held, { reason: "agent_cap" });
+      for (const entry of answers) {
+        assert.match(String(entry.body.delivery_id), /^[0-9a-f-]{36}$/);
+      }
+      assert.deepEqual(
+        atrium.requests.map((entry) => entry.outcome),
+        ["answered", "held", "held", "answered"],
+      );
+    },
+  );
+});
+
+test("inherit is validated: a name outside the closed list is 400 inherit-not-allowed and NOTHING runs", async () => {
+  await withAtrium(
+    { calls: [{ times: 1, answer: { exit: 0, stdout: "ran\n" } }, { answer: { exit: 9 } }] },
+    async (atrium) => {
+      assert.deepEqual([...INHERIT_ALLOWED], ["ACPX_SUBSCRIPTION", "ATRIUM_OS"]);
+      const callId = randomUUID();
+      const refused = await post(
+        atrium,
+        "/api/acpx/call",
+        callBody({ call_id: callId, inherit: { ACPX_SUBSCRIPTION: "s", PATH: "/evil" } }),
+      );
+      assert.equal(refused.status, 400);
+      assert.deepEqual(JSON.parse(refused.text), { error: "inherit-not-allowed", name: "PATH" });
+      assert.equal(atrium.requests[0]?.outcome, "inherit_not_allowed");
+      assert.deepEqual(
+        atrium.requests[0]?.problems,
+        [],
+        "a disallowed name is the server's refusal, not a shape problem",
+      );
+      // nothing ran: the first rule is unspent and the call id was not remembered
+      const ok = await post(
+        atrium,
+        "/api/acpx/call",
+        callBody({ call_id: callId, inherit: { ATRIUM_OS: "/os", ACPX_SUBSCRIPTION: "s" } }),
+      );
+      assert.equal(ok.status, 200);
+      assert.equal(
+        JSON.parse(ok.text).stdout,
+        "ran\n",
+        "the first call that ran still got the first rule",
+      );
+      assert.equal(atrium.requests[1]?.replayed, false);
+      const none = await post(atrium, "/api/acpx/call", callBody({ inherit: undefined }));
+      assert.equal(none.status, 200, "no inherit at all is fine");
+    },
+  );
+});
+
+test("inherit shape: not an object, or a non-string value, is a recorded problem", async () => {
+  await withAtrium({}, async (atrium) => {
+    await post(atrium, "/api/acpx/call", callBody({ inherit: ["ACPX_SUBSCRIPTION"] }));
+    assert.deepEqual(atrium.requests.at(-1)?.problems, ["inherit"]);
+    await post(atrium, "/api/acpx/call", callBody({ inherit: { ACPX_SUBSCRIPTION: 7 } }));
+    assert.deepEqual(atrium.requests.at(-1)?.problems, ["inherit.ACPX_SUBSCRIPTION"]);
   });
 });
 
@@ -384,15 +475,4 @@ test("run as a process from its TypeScript source: prints its port, honours --sc
     assert.equal(await call(), 503);
     await fetch(`${base}/_kit/mode`, { method: "POST", body: JSON.stringify({ mode: "normal" }) });
     assert.equal(await call(), 200);
-    const record = (await (await fetch(`${base}/_kit/record`)).json()) as {
-      requests: Array<{ mode: string; outcome: string }>;
-    };
-    assert.deepEqual(
-      record.requests.map((entry) => entry.outcome),
-      ["answered", "away", "answered"],
-    );
-  } finally {
-    child.kill("SIGTERM");
-    await new Promise((resolve) => child.once("exit", resolve));
-  }
-});
+    const reco

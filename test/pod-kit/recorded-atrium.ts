@@ -57,11 +57,34 @@ export interface AtriumScript {
   phases?: AtriumPhase[];
   /** Rules for /api/acpx/call, first matching unspent rule wins. Default answer: exit 0, empty. */
   calls?: CallRule[];
-  /** Answer of the two message routes. Default 200 `{"delivery_id":<uuid>,"status":"queued"}`. */
-  messages?: { status?: number; body?: unknown };
-  /** Answer of the two hints. Default 200 `{"ok":true}`. */
+  /**
+   * Answers of the two message routes: `answers` are used in order (one per message), then `default`
+   * (itself default `"queued"`).
+   */
+  messages?: { answers?: MessageAnswer[]; default?: MessageAnswer };
+  /** Answer of the two hints. Default 200 `{"ok":true}` (atrium may add fields such as `redriven`; a reader ignores them). */
   hints?: { status?: number; body?: unknown };
 }
+
+/**
+ * `"queued"` — accepted: 200 `{"delivery_id", "status":"queued"}`.
+ * `"held"` / `{held:{reason}}` — queued for room: 202 `{"delivery_id", "status":"held", "held":{"reason"}}`
+ * (reason default `pod_starting`; the shape inside `held` is the kit's assumption, see README).
+ * `{status, body}` — any other answer, verbatim.
+ */
+export type MessageAnswer =
+  | "queued"
+  | "held"
+  | { held: { reason: string } }
+  | { status: number; body: unknown };
+
+/**
+ * The names a create may inherit from its creator's environment (C6.2 `inherit`): a closed list kept in
+ * acpx. Source: A1's export on the command-classes surface (branch `ap/a1-classes`, src/pod/command-classes.ts) —
+ * until that is on `agent-pods` this is a copy, start `ACPX_SUBSCRIPTION`, `ATRIUM_OS`. Replace it by the
+ * import when the export lands.
+ */
+export const INHERIT_ALLOWED: readonly string[] = ["ACPX_SUBSCRIPTION", "ATRIUM_OS"];
 
 export type AtriumRoute =
   | "call"
@@ -150,6 +173,19 @@ function validateCall(body: Record<string, unknown>): string[] {
   if (!isString(body.admission_class)) {
     problems.push("admission_class");
   }
+  // `inherit`: what a create inherits, by name -> value (the server puts the values in the child's
+  // environment). Absent is fine. Whether a NAME is allowed is the server's answer, not a shape problem.
+  if (body.inherit !== undefined) {
+    if (!isRecord(body.inherit)) {
+      problems.push("inherit");
+    } else {
+      for (const [name, value] of Object.entries(body.inherit)) {
+        if (typeof value !== "string") {
+          problems.push(`inherit.${name}`);
+        }
+      }
+    }
+  }
   if (
     typeof body.deadline_ms !== "number" ||
     !(body.deadline_ms > 0) ||
@@ -205,6 +241,7 @@ export class RecordedAtrium {
   private readonly callAnswers = new Map<string, StoredCall>();
   private readonly rulesLeft = new Map<CallRule, number>();
   private phases: AtriumPhase[] = [{ mode: "normal" }];
+  private messagesAnswered = 0;
   private phaseIndex = 0;
   private answeredInPhase = 0;
   private phaseTimer: NodeJS.Timeout | undefined;
@@ -274,6 +311,7 @@ export class RecordedAtrium {
   reset(): void {
     this.requests.length = 0;
     this.callAnswers.clear();
+    this.messagesAnswered = 0;
   }
 
   requestsFor(route: AtriumRoute): AtriumRequestRecord[] {
@@ -282,6 +320,7 @@ export class RecordedAtrium {
 
   private applyScript(script: AtriumScript): void {
     this.rulesLeft.clear();
+    this.messagesAnswered = 0;
     for (const rule of script.calls ?? []) {
       if (rule.times !== undefined) {
         this.rulesLeft.set(rule, rule.times);
@@ -436,13 +475,23 @@ export class RecordedAtrium {
       this.handleCall(record, request, response);
     } else if (record.route === "session_message" || record.route === "seat_message") {
       record.outcome = "answered";
-      const answer = this.script.messages ?? {};
-      this.sendJson(
-        response,
-        record,
-        answer.status ?? 200,
-        answer.body ?? { delivery_id: randomUUID(), status: "queued" },
-      );
+      const messages = this.script.messages ?? {};
+      const answer = messages.answers?.[this.messagesAnswered] ?? messages.default ?? "queued";
+      this.messagesAnswered += 1;
+      const deliveryId = randomUUID();
+      if (answer === "queued") {
+        this.sendJson(response, record, 200, { delivery_id: deliveryId, status: "queued" });
+      } else if (answer === "held" || "held" in answer) {
+        const reason = answer === "held" ? "pod_starting" : answer.held.reason;
+        record.outcome = "held";
+        this.sendJson(response, record, 202, {
+          delivery_id: deliveryId,
+          status: "held",
+          held: { reason },
+        });
+      } else {
+        this.sendJson(response, record, answer.status, answer.body);
+      }
     } else if (record.route === "hint_ready" || record.route === "hint_ended") {
       record.problems =
         record.body === null
@@ -475,6 +524,16 @@ export class RecordedAtrium {
     }
     const callId = typeof body.call_id === "string" ? body.call_id : null;
     record.callId = callId;
+    // C6.2: a name outside acpx's closed list is refused, and nothing runs — no rule is consumed, no
+    // answer is remembered for the call id.
+    const notAllowed = isRecord(body.inherit)
+      ? Object.keys(body.inherit).find((name) => !INHERIT_ALLOWED.includes(name))
+      : undefined;
+    if (notAllowed !== undefined) {
+      record.outcome = "inherit_not_allowed";
+      this.sendJson(response, record, 400, { error: "inherit-not-allowed", name: notAllowed });
+      return;
+    }
     // C6.2 "at most once": the same call_id finds what the first one made and returns it.
     const stored = callId === null ? undefined : this.callAnswers.get(callId);
     if (stored !== undefined) {
@@ -595,6 +654,4 @@ if (entry !== undefined && realpathSync(entry) === fileURLToPath(import.meta.url
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.on(signal, () => {
       void atrium.close().finally(() => process.exit(0));
-    });
-  }
-}
+    

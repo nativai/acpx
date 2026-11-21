@@ -80,7 +80,13 @@ Move the cluster between two asks: `addPod`, `setPodPhase`, `removePod`, `addNod
 ## recorded-atrium.ts — C6, atrium's port 3456
 
 `POST /api/acpx/call` (C6.2) · `POST /api/sessions/<id>/message` · `POST /api/seats/<id>/message` · `POST /api/agent-pods/<key>/ready|ended` (C6.3).
-Script (`AtriumScript`): `phases[]` · `calls[{argvPrefix?, answer, times?, loseAnswer?}]` · `messages{status?,body?}` · `hints{status?,body?}`.
+Script (`AtriumScript`): `phases[]` · `calls[{argvPrefix?, answer, times?, loseAnswer?}]` · `messages{answers?[], default?}` · `hints{status?,body?}`.
+Message answers: `"queued"` → 200 `{delivery_id, status:"queued"}`; `"held"` / `{held:{reason}}` → **202** `{delivery_id, status:"held", held:{reason}}`
+(reason default `pod_starting`; the shape inside `held` is the kit's assumption — only "202 with `held`" was given); `{status, body}` verbatim.
+`answers` are used one per message in order, then `default` (`"queued"`). Hints answer 200 `{"ok":true}` (atrium may add fields, e.g. `redriven`).
+`inherit` of a call is validated: a name outside `INHERIT_ALLOWED` (`ACPX_SUBSCRIPTION`, `ATRIUM_OS` — a copy of A1's closed list in
+`src/pod/command-classes.ts`, to be replaced by the import) is `400 {"error":"inherit-not-allowed","name":"<name>"}` and nothing runs (no rule consumed,
+call id not remembered); the shape is a name→string-value object, anything else is the recorded problem `inherit` / `inherit.<name>`.
 A call answer is `{exit, stdout?, stderr?, delivery?}` (HTTP 200) or `{status, body}` (e.g. `400 {"error":"class-not-passable"}`).
 The same `call_id` returns the answer the first one made (`replayed` in the record); `loseAnswer` runs the call and cuts the connection
 before answering — the lost-answer retry.
