@@ -8,6 +8,7 @@ import type {
   UsageUpdate,
 } from "@agentclientprotocol/sdk";
 import type { TurnAttribution } from "../acp/openrouter-attribution.js";
+import { cloneSleepingPlan } from "../pod/create-plan.js";
 import { textPrompt } from "../prompt-content.js";
 import type {
   AgentProgress,
@@ -718,13 +719,10 @@ export function cloneSessionConversation(
   return cloned;
 }
 
+// C1.3 — the WHOLE plan (`plan`, `fork.cut`, `fork.byway`): copying only `since` + `fork.from` here
+// turned a pinned cut into a whole-source fork on the first re-base.
 function cloneSleeping(sleeping: SessionAcpxState["sleeping"]): SessionAcpxState["sleeping"] {
-  return sleeping
-    ? {
-        since: sleeping.since,
-        ...(sleeping.fork ? { fork: { from: sleeping.fork.from } } : {}),
-      }
-    : undefined;
+  return cloneSleepingPlan(sleeping);
 }
 
 export function cloneSessionAcpxState(

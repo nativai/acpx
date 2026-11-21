@@ -1,8 +1,20 @@
 import type { AcpClient, SessionCreateResult, SessionForkResult } from "../../acp/client.js";
 import { withTimeout } from "../../async-control.js";
-import { readFullSourceHistory } from "../../cli/session/fork-at-log-index.js";
+import {
+  readFullSourceHistory,
+  resolveLogIndexForkWindow,
+} from "../../cli/session/fork-at-log-index.js";
 import { effectiveCreateCwd } from "../../config/session-root.js";
 import { AcpxOperationalError } from "../../errors.js";
+import {
+  CreatePlanError,
+  decodeHarnessAnchor,
+  FORK_ANCHOR_MISSING,
+  FORK_ANCHOR_UNSUPPORTED,
+  FORK_SOURCE_GONE,
+  forkSourceSleepingError,
+  type SleepingForkCut,
+} from "../../pod/create-plan.js";
 import {
   resolveSessionRecord,
   writeSessionRecordAtBoundaryNow,
@@ -83,6 +95,119 @@ export async function forkTemplateForSleepingSession(params: {
     durableClaudeFork:
       "durableClaudeForkApplied" in forked && forked.durableClaudeForkApplied === true,
   };
+}
+
+/**
+ * C1.3 — the first wake of a record created as a fork AT A CUT (or a by-the-way): the record already
+ * holds the inherited messages (copied at create), so only the HARNESS is cut here.
+ *
+ * - **Anchored** (`harness_anchor`, Claude): the file-level fork at the anchor, then a resume of the
+ *   durable id — never the adapter's fork (see `AcpClient.materializeClaudeCutFork`). The anchor is
+ *   the check (amendment A-15): `expect_entry` is NOT re-read, because the source's last inherited
+ *   entry may legitimately have grown since create (a by-the-way taken mid-turn) while the anchor
+ *   still names exactly what the copy inherited.
+ * - **Unanchored** (Pi, Codex): `expect_entry` is re-checked against the source on disk
+ *   (`FORK_CUT_MOVED` when it moved), then the adapter forks at the absolute index.
+ *
+ * Every refusal is named and leaves the record sleeping (the caller restores it byte for byte).
+ */
+export async function forkCutForSleepingSession(params: {
+  client: AcpClient;
+  record: SessionRecord;
+  sourceId: string;
+  cut: SleepingForkCut;
+  timeoutMs?: number;
+}): Promise<{ forked: SessionForkResult; durableClaudeFork: boolean }> {
+  const source = await loadCutSource(params.sourceId, params.record);
+  const cwd = effectiveCreateCwd(params.record.cwd);
+  if (params.cut.harness_anchor !== undefined) {
+    const anchor = decodeHarnessAnchor(params.cut.harness_anchor);
+    if (anchor.kind !== "claude-uuid" || !params.client.supportsClaudeFileFork()) {
+      throw new CreatePlanError(
+        FORK_ANCHOR_UNSUPPORTED,
+        `anchor kind ${anchor.kind} cannot be executed by agent "${params.record.agentCommand}"`,
+      );
+    }
+    const durableId = await withTimeout(
+      materializeAnchoredFork(params.client, source, cwd, anchor.value),
+      params.timeoutMs,
+    );
+    return { forked: { sessionId: durableId, agentSessionId: durableId }, durableClaudeFork: true };
+  }
+  if (!params.client.supportsForkSession()) {
+    throw new AcpxOperationalError(
+      `Agent command "${params.record.agentCommand}" does not advertise sessionCapabilities.fork; ` +
+        `cannot fork ${source.acpxRecordId}`,
+      { outputCode: "RUNTIME", origin: "runtime" },
+    );
+  }
+  const window = await resolveLogIndexForkWindow({
+    source,
+    agentCommand: params.record.agentCommand,
+    atLogIndex: params.cut.log_index ?? params.cut.message_index,
+    expectEntry: params.cut.expect_entry,
+  });
+  const forked = await withTimeout(
+    params.client.forkSession(source.acpSessionId, cwd, {
+      atIndex: window.logIndex,
+      logIndexHistory: window.history,
+      sourceMessages: window.messages,
+      sourceCwd: source.cwd,
+      suppressReplayUpdates: true,
+    }),
+    params.timeoutMs,
+  );
+  return {
+    forked,
+    durableClaudeFork:
+      "durableClaudeForkApplied" in forked && forked.durableClaudeForkApplied === true,
+  };
+}
+
+async function materializeAnchoredFork(
+  client: AcpClient,
+  source: SessionRecord,
+  cwd: string,
+  uuid: string,
+): Promise<string> {
+  let durableId: string | undefined;
+  try {
+    durableId = await client.materializeClaudeCutFork(source.acpSessionId, cwd, {
+      sourceCwd: source.cwd,
+      upToMessageId: uuid,
+    });
+  } catch (error) {
+    throw new CreatePlanError(
+      FORK_ANCHOR_MISSING,
+      `the fork point ${uuid} could not be found in the conversation of ${source.acpxRecordId}: ` +
+        (error instanceof Error ? error.message : String(error)),
+    );
+  }
+  if (!durableId) {
+    throw new CreatePlanError(
+      FORK_ANCHOR_MISSING,
+      `the Claude SDK that forks at ${uuid} could not be loaded for ${source.acpxRecordId}`,
+    );
+  }
+  return durableId;
+}
+
+/** The cut's source, or a named refusal: gone (`FORK_SOURCE_GONE`), or it has never run. */
+async function loadCutSource(sourceId: string, record: SessionRecord): Promise<SessionRecord> {
+  let source: SessionRecord;
+  try {
+    source = await resolveSessionRecord(sourceId);
+  } catch (error) {
+    throw new CreatePlanError(
+      FORK_SOURCE_GONE,
+      `the session ${record.acpxRecordId} was cut from is gone: ${sourceId} — ` +
+        (error instanceof Error ? error.message : String(error)),
+    );
+  }
+  if (source.acpx?.sleeping || source.acpSessionId === "") {
+    throw forkSourceSleepingError(sourceId);
+  }
+  return source;
 }
 
 async function loadTemplateOrExplain(

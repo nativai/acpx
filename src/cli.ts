@@ -4,6 +4,8 @@ import { realpathSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { listBuiltInAgents } from "./agent-registry.js";
 import { runPlacementStep } from "./pod/placement-step.js";
+// Block A2 registers the `record-only-create` branch (C1.3); a light module, see its header.
+import "./pod/record-only-create-branch.js";
 
 // ⚠️ THIS ENTRY STAYS LIGHT, AND ITS RE-EXPORTS OF `cli-core` WERE REMOVED FOR IT (brick b479441f).
 // Pod mode decides where a command runs BEFORE acpx loads the world (CONTRACTS-r4 C1.2, CONCEPTION r4

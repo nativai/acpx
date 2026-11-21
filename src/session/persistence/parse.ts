@@ -1,3 +1,4 @@
+import { parseSleepingPlan } from "../../pod/create-plan.js";
 import { parseRecordPidIdentity } from "../../process-identity.js";
 import type {
   SessionAcpxState,
@@ -831,17 +832,11 @@ function assignLastTurnProvider(state: SessionAcpxState, value: unknown): void {
 // UMQ K7 — `acpx.sleeping`: kept only when well-formed, so a damaged value reads as "not sleeping"
 // (a record that does carry a real `acpSessionId` must never be mistaken for one that never ran).
 function assignSleeping(state: SessionAcpxState, value: unknown): void {
-  const record = asRecord(value);
-  if (!record || typeof record.since !== "string" || record.since.length === 0) {
-    return;
+  // C1.3 — the whole plan (version, cut, by-the-way), never just `since` + `fork.from`.
+  const sleeping = parseSleepingPlan(value);
+  if (sleeping) {
+    state.sleeping = sleeping;
   }
-  const fork = asRecord(record.fork);
-  state.sleeping = {
-    since: record.since,
-    ...(fork && typeof fork.from === "string" && fork.from.length > 0
-      ? { fork: { from: fork.from } }
-      : {}),
-  };
 }
 
 function assignLastTurnSubscription(state: SessionAcpxState, value: unknown): void {
