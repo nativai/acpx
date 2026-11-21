@@ -1,7 +1,6 @@
 import "./install-owner-reaper.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { readLedgerFile } from "../src/capacity/ledger.js";
@@ -12,7 +11,6 @@ import {
   decodeHarnessAnchor,
   encodeHarnessAnchor,
   FORK_ANCHOR_UNSUPPORTED,
-  isRecordOnlyCreate,
   parseSleepingPlan,
   type SleepingPlanState,
 } from "../src/pod/create-plan.js";
@@ -100,54 +98,23 @@ test("A-15: harness_anchor names its kind; an unknown kind, or a bare value, is 
   }
 });
 
-// ─── the switch ────────────────────────────────────────────────────────────────────────────────
+// ─── creates through the real CLI (the UMQ rig: a mock agent that logs every start and op) ──────
 
-function podEnv(home: string, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+/** Pod mode through A1's seams (`ACPX_POD_TEST_HOME`, `ACPX_POD_SA_DIR` — honoured under `node --test` only). */
+const pod = (f: Fixture, env: NodeJS.ProcessEnv = f.env): NodeJS.ProcessEnv => {
+  const sa = path.join(f.root, "serviceaccount");
+  fs.mkdirSync(sa, { recursive: true });
+  fs.writeFileSync(path.join(sa, "namespace"), "dev-devbox\n");
   return {
-    ...process.env,
-    HOME: home,
-    ACPX_STATE_HOME: home,
+    ...env,
     ACPX_OWNER_PLACEMENT: "pod",
-    ACPX_POD_TEST_HOME: home,
+    ACPX_POD_TEST_HOME: f.root,
+    ACPX_POD_SA_DIR: sa,
     NV_POD_NAME: "dev-server-0",
     NV_POD_UID: "00000000-0000-0000-0000-000000000001",
     NV_NODE_NAME: "node-a",
-    ...extra,
   };
-}
-
-test("C1.1: a create is record-only exactly in pod mode on the CONTROL pod — the switch, the canonical home, the pod's identity, no .nv-agent", () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-a2-switch-"));
-  try {
-    assert.equal(isRecordOnlyCreate(podEnv(home)), true);
-    assert.equal(isRecordOnlyCreate(podEnv(home, { ACPX_OWNER_PLACEMENT: undefined })), false);
-    assert.equal(
-      isRecordOnlyCreate(podEnv(home, { ACPX_STATE_HOME: path.join(home, "elsewhere") })),
-      false,
-      "a non-canonical state home is today's behaviour",
-    );
-    assert.throws(
-      () => isRecordOnlyCreate(podEnv(home, { NV_POD_UID: "" })),
-      /pod_identity_missing/u,
-      "switched on without a pod identity: refused, neither mode",
-    );
-    fs.writeFileSync(path.join(home, ".nv-agent"), "ag-0123456789abcdef01234567\n");
-    assert.equal(isRecordOnlyCreate(podEnv(home)), false, "an agent pod never writes a new record");
-  } finally {
-    fs.rmSync(home, { recursive: true, force: true });
-  }
-});
-
-// ─── creates through the real CLI (the UMQ rig: a mock agent that logs every start and op) ──────
-
-const pod = (f: Fixture, env: NodeJS.ProcessEnv = f.env): NodeJS.ProcessEnv => ({
-  ...env,
-  ACPX_OWNER_PLACEMENT: "pod",
-  ACPX_POD_TEST_HOME: f.root,
-  NV_POD_NAME: "dev-server-0",
-  NV_POD_UID: "00000000-0000-0000-0000-000000000001",
-  NV_NODE_NAME: "node-a",
-});
+};
 
 const base = (f: Fixture): string[] => [
   "--agent",
@@ -692,4 +659,41 @@ test("A-18 negative: a cut whose last entry is a COMPLETED agent entry (the turn
   assert.equal(record.forked_at_message_index, 4);
   assert.equal(record.forked_at_message_index_requested, undefined);
   assert.equal(record.acpx.sleeping?.fork?.cut?.message_index, 4);
+});
+
+test("C6.2: a replay prints byte for byte what the first answer printed — every create form that can carry a fork notice (S2 tester N-A2-1: a plain copy with --metadata byway=1 lost its notice on replay)", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  const source = await warmTarget(f, 2);
+  const template = await warmTarget(f, 1);
+  const marked = await runCli(
+    [...base(f), "sessions", "template", template, "--enable", "--auto-prompt", "do the thing"],
+    f.env,
+    f.root,
+  );
+  assert.equal(marked.code, 0, marked.stderr);
+  const forms: Array<{ name: string; argv: string[] }> = [
+    { name: "new", argv: ["sessions", "new"] },
+    { name: "plain copy", argv: ["sessions", "copy", "--from", source] },
+    {
+      name: "plain copy with --metadata byway=1",
+      argv: ["sessions", "copy", "--from", source, "--metadata", "byway=1"],
+    },
+    { name: "by-the-way", argv: ["sessions", "copy", "--from", source, "--ephemeral"] },
+    { name: "cut", argv: ["sessions", "copy", "--from", source, "--at-log-index", "2"] },
+    { name: "from a template", argv: ["sessions", "new", "--from-template", template] },
+  ];
+  for (const [index, form] of forms.entries()) {
+    const recordId = `5a5a5a5a-0000-4000-8000-00000000000${index}`;
+    const callId = `c0c0c0c0-0000-4000-8000-00000000000${index}`;
+    const argv = [...base(f), ...form.argv, "--record-id", recordId, "--created-by-call", callId];
+    const first = await runCli(argv, pod(f), f.root);
+    assert.equal(first.code, 0, `${form.name}: ${first.stderr}`);
+    const replay = await runCli(argv, pod(f), f.root);
+    assert.equal(replay.code, 0, `${form.name} replay: ${replay.stderr}`);
+    assert.equal(
+      replay.stdout,
+      first.stdout,
+      `${form.name}: the replay's answer is the first answer`,
+    );
+  }
 });

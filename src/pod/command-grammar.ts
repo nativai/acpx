@@ -100,6 +100,7 @@ export const COMMAND_GRAMMAR: Readonly<Record<string, GrammarNode>> = {
   "sessions new": {
     valueFlags: [
       "--brick",
+      "--created-by-call",
       "--from",
       "--from-template",
       "--metadata",
@@ -123,6 +124,7 @@ export const COMMAND_GRAMMAR: Readonly<Record<string, GrammarNode>> = {
       "--at-index",
       "--at-log-index",
       "--brick",
+      "--created-by-call",
       "--expect-entry",
       "--from",
       "--metadata",
@@ -158,7 +160,7 @@ export const COMMAND_GRAMMAR: Readonly<Record<string, GrammarNode>> = {
   "sessions history": { valueFlags: ["--limit", "--session-id", "--session-url"] },
   "sessions read": { valueFlags: ["--session-id", "--session-url", "--tail"] },
   "sessions export": { valueFlags: ["--output", "--session-id", "--session-url"] },
-  "sessions import": { valueFlags: ["--cwd"] },
+  "sessions import": { valueFlags: ["--created-by-call", "--cwd", "--record-id"] },
   "sessions prune": { valueFlags: ["--before", "--older-than"] },
   seats: { valueFlags: [] },
   "seats reconcile-archive": { valueFlags: ["--format"] },

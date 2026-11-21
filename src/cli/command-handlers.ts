@@ -4339,7 +4339,7 @@ export async function handleSessionsCopy(
   flags = withCreatedByCall(flags);
   const replay = await createdByThisCall(flags);
   if (replay) {
-    await printCopyReplay(replay, command, config);
+    await printCopyReplay(replay, command, config, { withNotice: copyAnswerCarriesNotice(flags) });
     return;
   }
   if (flags.sleeping === true && !isRecordOnlyCreate()) {
@@ -4492,16 +4492,14 @@ async function answeredAsReplay(
   const replay = await createdByThisCall(flags);
   if (replay && flags.fromTemplate !== undefined) {
     const template = await resolveSessionRecord(replay.forkedFromSessionId ?? flags.fromTemplate);
-    await printCopyReplay(
-      replay,
-      command,
-      config,
-      atriumsTemplatePrompt(flags, undefined, template),
-    );
+    await printCopyReplay(replay, command, config, {
+      withNotice: false,
+      templatePrompt: atriumsTemplatePrompt(flags, undefined, template),
+    });
     return true;
   }
   if (replay) {
-    await printNewSessionReplay(replay, command, config);
+    await printNewSessionReplay(replay, flags, command, config);
     return true;
   }
   if (
@@ -4515,9 +4513,15 @@ async function answeredAsReplay(
   return false;
 }
 
-/** C6.2 replay of `sessions new`: the record this call created, printed as the create printed it. */
+/**
+ * C6.2 replays print EXACTLY what the first answer printed (the same argv comes back): every field is
+ * derived from the record and the SAME flags, by the same rules the create used — never from what
+ * the record happens to carry (`--metadata byway=1` on a plain copy made the two differ; S2 tester,
+ * N-A2-1). Test: `test/pod-create-plan.test.ts` → "byte for byte".
+ */
 async function printNewSessionReplay(
   record: SessionRecord,
+  flags: SessionsNewFlags,
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
@@ -4529,15 +4533,45 @@ async function printNewSessionReplay(
     globalFlags.format,
     globalFlags.jsonStrict,
   );
-  printNewSessionByFormat(record, globalFlags.format, undefined, undefined);
+  printNewSessionByFormat(
+    record,
+    globalFlags.format,
+    undefined,
+    await newSessionRequestedCwd(flags, command, globalFlags),
+  );
 }
 
-/** C6.2 replay of `sessions copy`: the same answer, the fork notice included (it is a pure function of the ids). */
+/** The `requestedCwd` the create reported — `resolveNewSessionAgent`'s rule, from the same flags. */
+async function newSessionRequestedCwd(
+  flags: SessionsNewFlags,
+  command: Command,
+  globalFlags: GlobalFlags,
+): Promise<string | undefined> {
+  if (flags.resumeSession !== undefined && cwdFlagIsExplicit(command)) {
+    return undefined;
+  }
+  const from = flags.from === undefined ? undefined : await resolveSessionRecord(flags.from);
+  return resolveCreateCwdFromFlags({
+    command,
+    cwdFlag: globalFlags.cwd,
+    fallback: from?.cwd,
+    jsonStrict: globalFlags.jsonStrict,
+  }).requestedCwd;
+}
+
+/** Whether a copy's FIRST answer carried the fork notice — the handlers' own rule, from the flags. */
+function copyAnswerCarriesNotice(flags: SessionsCopyFlags): boolean {
+  if (!isRecordOnlyCreate()) {
+    return flags.sleeping === true; // today's `--sleeping` copy returns it; a live copy delivers it
+  }
+  return firstMessageIsAtriums(flags) && flags.ephemeral !== true;
+}
+
 async function printCopyReplay(
   record: SessionRecord,
   command: Command,
   config: ResolvedAcpxConfig,
-  templatePrompt?: string,
+  answer: { withNotice: boolean; templatePrompt?: string },
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const source = await resolveSessionRecord(record.forkedFromSessionId ?? record.acpxRecordId);
@@ -4547,18 +4581,12 @@ async function printCopyReplay(
     source,
     globalFlags.format,
     undefined,
-    undefined,
-    carriesForkNotice(record)
+    resolveCopyDestinationCwd(command, globalFlags, source).requestedCwd,
+    answer.withNotice
       ? composeForkDivergenceNotice(record, source.acpxRecordId, source.seatId)
       : undefined,
-    templatePrompt,
+    answer.templatePrompt,
   );
-}
-
-/** A plain copy / fork gets the notice; a by-the-way and a template spawn never do (as live). */
-function carriesForkNotice(record: SessionRecord): boolean {
-  const byway = record.acpx?.sleeping?.fork?.byway === true || record.metadata?.byway === "1";
-  return !byway && record.metadata?.template_source === undefined;
 }
 
 /** A validated first turn, and where it was read from (`--prompt-file`'s resolved path,

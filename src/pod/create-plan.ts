@@ -1,8 +1,5 @@
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { isControlPod } from "../config/control-pod.js";
 import { AcpxOperationalError } from "../errors.js";
+import { podMode, thisPodFile } from "./placement.js";
 
 /**
  * C1.3 — the create plan (CONTRACTS-r4 C1.3, block A2, brick 569497cb).
@@ -237,77 +234,17 @@ export function buildSleepingPlan(params: {
   };
 }
 
-// ─── where creates are record-only (C1.1, through A1's placement) ─────────────────────────────
+// ─── where creates are record-only (C1.1, A1's placement) ─────────────────────────────────────
 
 /**
- * Is this create record-only? — pod mode (C1.1), on the CONTROL pod. A create passed through from an
+ * Is this create record-only? — pod mode (C1.1), on the CONTROL pod: A1's own answer
+ * (`src/pod/placement.ts`), never a second reading of the switch. A create passed through from an
  * agent pod arrives here on the control pod too (C6.2), so the control pod is the only place that
- * writes a new record.
- *
- * ⚠️ INTERIM: A1 owns the switch (`src/pod/placement.ts`, lane A1, not yet on `agent-pods`). Until it
- * lands this mirrors A1's published rules (`isPodMode()` + `thisPodFile()` at `ap/a1-classes`
- * d7065d8e) with the same names and the same test seam, and the merge replaces the body with a call
- * to `isPodMode() && thisPodFile().kind === "absent"`. Do not grow it.
+ * writes a new record; in an agent pod A1's placement step passes every create through before acpx
+ * gets this far.
  */
-export function isRecordOnlyCreate(env: NodeJS.ProcessEnv = process.env): boolean {
-  const home = podSwitchHome(env);
-  if (home === undefined) {
-    return false;
-  }
-  if (!["NV_POD_NAME", "NV_POD_UID", "NV_NODE_NAME"].every((name) => env[name]?.trim())) {
-    throw new AcpxOperationalError(
-      "acpx: REFUSED reason=pod_identity_missing — pod mode is switched on but this process cannot name its pod",
-      { outputCode: "RUNTIME", detailCode: "POD_IDENTITY_MISSING", origin: "cli" },
-    );
-  }
-  return agentPodFileAbsent(home);
-}
-
-/**
- * The canonical home when the switch is honoured here — set, a control-role host (or A1's test seam,
- * under `node --test` only), and the canonical state home in use — else undefined (today's behaviour).
- */
-function podSwitchHome(env: NodeJS.ProcessEnv): string | undefined {
-  if (env.ACPX_OWNER_PLACEMENT !== "pod") {
-    return undefined;
-  }
-  const seam = testSeamHome(env);
-  if (seam === undefined && !isControlPod(env)) {
-    return undefined;
-  }
-  const home = seam ?? "/home/node";
-  return resolvedPath(stateHomeInUse(env)) === resolvedPath(home) ? home : undefined;
-}
-
-/** A1's seam (`ACPX_POD_TEST_HOME`), honoured ONLY under `node --test` — never on a box. */
-function testSeamHome(env: NodeJS.ProcessEnv): string | undefined {
-  if (env.NODE_TEST_CONTEXT === undefined) {
-    return undefined;
-  }
-  return env.ACPX_POD_TEST_HOME?.trim() || undefined;
-}
-
-/** The home acpx's state lives under (`<it>/.acpx`) — exactly how every state-path resolver reads it. */
-function stateHomeInUse(env: NodeJS.ProcessEnv): string {
-  return env.ACPX_STATE_HOME?.trim() || os.homedir();
-}
-
-function resolvedPath(p: string): string {
-  try {
-    return fs.realpathSync(p);
-  } catch {
-    return path.resolve(p);
-  }
-}
-
-/** ⚠️ Only ENOENT is "the control pod": an unreadable `.nv-agent` is an agent pod (A1's fail-safe side). */
-function agentPodFileAbsent(home: string): boolean {
-  try {
-    fs.readFileSync(path.join(home, ".nv-agent"));
-    return false; // an agent pod: creates are passed through (C6.2), never written here
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT";
-  }
+export function isRecordOnlyCreate(): boolean {
+  return podMode().mode === "pod" && thisPodFile().kind === "absent";
 }
 
 // ─── capacity at create (C1.3, C7.2) ──────────────────────────────────────────────────────────
