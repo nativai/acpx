@@ -22,7 +22,7 @@ import {
   parseAllowedTools,
   parseMaxTurns,
   parseTtlSeconds,
-} from "../src/cli.js";
+} from "../src/cli-core.js";
 import { drainQueueOwnerForSession, tryCloseSessionOnRunningOwner } from "../src/cli/queue/ipc.js";
 import { FORK_NOTICE_MARKER } from "../src/cli/session/fork-handoff.js";
 import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
