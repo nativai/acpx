@@ -49,9 +49,9 @@ if (isCliEntrypoint(process.argv)) {
   } else if (process.argv.length === 3 && process.argv[2] === "__pod-lock-module") {
     // The atrium server's loader for the lock module (pod-lock.ts; EXPORT-lock-module.md, brick 8d85cb47).
     process.stdout.write(`${new URL("./pod-lock.js", import.meta.url).href}\n`);
-  } else if (process.argv.length === 3 && process.argv[2] === "__pod-lock-sweep") {
-    // One pass of the own-pod lock sweep over this state home, for the agent pod's idle loop (C3.2).
-    void runPodLockSweep();
+  } else if (process.argv[2] === "__pod-lock-sweep") {
+    // One pass of the pod lock sweep over this state home (+ named dirs), for the idle loop (C3.2).
+    void runPodLockSweep(process.argv.slice(3));
   } else {
     void main(process.argv);
   }

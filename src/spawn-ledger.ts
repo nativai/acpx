@@ -68,6 +68,9 @@ function requireSqlite(): SqliteModule {
 
 export const SPAWN_LEDGER_API_VERSION = 2;
 
+/** `saveRecord` options — additive (an older caller passes none). */
+export type SaveRecordOptions = { beforePublish?: () => void };
+
 export type SpawnAttemptState =
   | "reserved"
   | "launched"
@@ -398,7 +401,7 @@ const SPAWN_TRANSITIONS: Record<string, (context: TransitionContext) => boolean>
 };
 
 /** Atomic file replacement with the directory entry persisted before SQLite commits. */
-function writeRecordAtomic(file: string, record: DiskRecord): void {
+function writeRecordAtomic(file: string, record: DiskRecord, beforePublish?: () => void): void {
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
   const fd = fs.openSync(temporary, "wx", 0o600);
   try {
@@ -406,6 +409,14 @@ function writeRecordAtomic(file: string, record: DiskRecord): void {
     fs.fsyncSync(fd);
   } finally {
     fs.closeSync(fd);
+  }
+  // C3.2 A-4: the record lock's holder checks its token immediately before this rename; a throw
+  // publishes nothing (and rolls back the caller's transaction).
+  try {
+    beforePublish?.();
+  } catch (error) {
+    fs.rmSync(temporary, { force: true });
+    throw error;
   }
   fs.renameSync(temporary, file);
   const directory = fs.openSync(path.dirname(file), "r");
@@ -880,15 +891,19 @@ export class SpawnLedger {
     });
   }
 
-  /** Persists a spawn-owned session record under the ledger's write lock and ownership guard. */
-  saveRecord(record: DiskRecord): DiskRecord {
-    return this.locked(() => this.saveRecordLocked(record));
+  /**
+   * Persists a spawn-owned session record under the ledger's write lock and ownership guard.
+   * `beforePublish` runs immediately before the record's rename — the record lock's "check before
+   * publish" (C3.2 A-4; pass the held lock's `assertHeldSync`); a throw publishes nothing.
+   */
+  saveRecord(record: DiskRecord, options: SaveRecordOptions = {}): DiskRecord {
+    return this.locked(() => this.saveRecordLocked(record, options));
   }
   /** `saveRecord` for async callers — identical, but waits for the lock without blocking the loop. */
-  async saveRecordAsync(record: DiskRecord): Promise<DiskRecord> {
-    return await this.lockedAsync(() => this.saveRecordLocked(record));
+  async saveRecordAsync(record: DiskRecord, options: SaveRecordOptions = {}): Promise<DiskRecord> {
+    return await this.lockedAsync(() => this.saveRecordLocked(record, options));
   }
-  private saveRecordLocked(record: DiskRecord): DiskRecord {
+  private saveRecordLocked(record: DiskRecord, options: SaveRecordOptions): DiskRecord {
     if (metadataValue(record, "spawn_key")) {
       this.assertBoundToThisInstance();
     }
@@ -896,7 +911,7 @@ export class SpawnLedger {
     const current = this.readRecord(id);
     this.assertSpawnOwnership(id, record, current);
     preserveSpawnState(record, current);
-    writeRecordAtomic(this.recordPath(id), record);
+    writeRecordAtomic(this.recordPath(id), record, options.beforePublish);
     return record;
   }
 

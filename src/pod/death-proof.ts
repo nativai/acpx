@@ -13,7 +13,8 @@ import { readServiceAccountFile, serviceAccountDir, type PodRef } from "./identi
  *   exists  — a pod with that uid exists and is not terminal
  *   unknown — no answer, any unexpected answer, or the pod is gone but its node is not Ready
  *
- * `unknown` is ALIVE everywhere. It never throws. The exact requests and the decision table are
+ * `unknown` is ALIVE everywhere. It never throws. Asked ON THE CONTROL POD ONLY (C3.3 A-4): an agent
+ * pod never asks the API about a lock holder — the lock primitive enforces that, not this function. The exact requests and the decision table are
  * published for the fake API server (lane X1): reports/DEATH-PROOF-QUERIES.md on brick 8d85cb47 —
  * change a request here and that file in the same breath.
  *
@@ -133,8 +134,8 @@ function answerBody(answer: ApiAnswer): Record<string, unknown> | undefined {
   return answer?.status === 200 ? record(answer.body) : undefined;
 }
 
-/** Step 1's verdict; `absent` = no pod with that uid, so the node decides. */
-function judgePod(answer: ApiAnswer, uid: string): DeathProof | "absent" {
+/** Step 1's verdict; `absent` = no pod with that uid, so the node decides; `terminal` = gone. */
+function judgePod(answer: ApiAnswer, uid: string): "exists" | "unknown" | "terminal" | "absent" {
   if (answer?.status === 404) {
     return "absent";
   }
@@ -154,8 +155,8 @@ function fieldOf(
   return record(object?.[outer])?.[inner];
 }
 
-function judgePhase(phase: unknown): DeathProof {
-  return typeof phase === "string" && TERMINAL_PHASES.has(phase) ? "gone" : "exists";
+function judgePhase(phase: unknown): "terminal" | "exists" {
+  return typeof phase === "string" && TERMINAL_PHASES.has(phase) ? "terminal" : "exists";
 }
 
 function readyStatus(node: Record<string, unknown> | undefined): unknown {
@@ -195,15 +196,28 @@ function podPath(namespace: string, name: string): string {
   return `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods/${encodeURIComponent(name)}`;
 }
 
+/** The proof with its reason — what a break line records (C3.2 A-4: `pod-gone` | `pod-terminal`). */
+export type DeathProofDetail =
+  | { answer: "gone"; proof: "pod-gone" | "pod-terminal" }
+  | { answer: "exists" | "unknown" };
+
 /** C3.3. Configured from the process's in-cluster service account; at most two GETs. */
 export async function proveDeath(
   pod: PodRef,
   options: DeathProofOptions = {},
 ): Promise<DeathProof> {
+  return (await proveDeathDetailed(pod, options)).answer;
+}
+
+/** `proveDeath`, saying which branch of C3.3 proved a death. */
+export async function proveDeathDetailed(
+  pod: PodRef,
+  options: DeathProofOptions = {},
+): Promise<DeathProofDetail> {
   const config = apiConfig(options.env ?? process.env);
   const namespace = config && isNamedPod(pod) ? (pod.namespace ?? config.namespace) : undefined;
   if (!config || !namespace) {
-    return "unknown";
+    return { answer: "unknown" };
   }
   return await askApi(config, namespace, pod, proofDeadline(options));
 }
@@ -213,14 +227,18 @@ async function askApi(
   namespace: string,
   pod: PodRef,
   signal: AbortSignal,
-): Promise<DeathProof> {
+): Promise<DeathProofDetail> {
   const podVerdict = judgePod(await apiGet(config, podPath(namespace, pod.name), signal), pod.uid);
+  if (podVerdict === "terminal") {
+    return { answer: "gone", proof: "pod-terminal" };
+  }
   if (podVerdict !== "absent") {
-    return podVerdict;
+    return { answer: podVerdict };
   }
   if (!pod.node) {
-    return "unknown";
+    return { answer: "unknown" };
   }
   const nodePath = `/api/v1/nodes/${encodeURIComponent(pod.node)}`;
-  return judgeNode(await apiGet(config, nodePath, signal));
+  const node = judgeNode(await apiGet(config, nodePath, signal));
+  return node === "gone" ? { answer: "gone", proof: "pod-gone" } : { answer: node };
 }

@@ -1,7 +1,14 @@
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import fs from "node:fs/promises";
 import os from "node:os";
 import { isProcessDefinitelyDead } from "../../process-liveness.js";
-import { withIdentityFileLock, type LockHolderVerdict } from "./identity-file-lock.js";
+import {
+  LOCK_LOST_CODE,
+  withIdentityFileLock,
+  type HeldLock,
+  type LockHolderVerdict,
+} from "./identity-file-lock.js";
 
 /**
  * A per-record lock file, `<record>.json.lock`, held ONLY across a record write's
@@ -112,9 +119,14 @@ function judgeLiveLegacyStart(pid: number, start: unknown): LockHolderVerdict {
   return current !== null && current !== start ? "breakable" : "live";
 }
 
+/**
+ * Holds `<recordFile>.lock` across `action`. `action` gets the held lock: call `lock.assertHeld()`
+ * (or `assertHeldSync`) IMMEDIATELY before the rename that publishes the record — C3.2 A-4 "the
+ * holder checks before it publishes". Prefer `updateRecordFile`, which does that by construction.
+ */
 export async function withRecordFileLock<T>(
   recordFile: string,
-  action: () => Promise<T>,
+  action: (lock: HeldLock) => Promise<T>,
 ): Promise<T> {
   return await withIdentityFileLock(
     `${recordFile}.lock`,
@@ -133,4 +145,84 @@ export async function withRecordFileLock<T>(
     },
     action,
   );
+}
+
+/** How often a publish that found its lock broken starts again before it gives up. */
+export const RECORD_LOCK_LOST_ATTEMPTS = 3;
+export const RECORD_LOCK_LOST_CODE = "record-lock-lost";
+
+export class RecordLockLostError extends Error {
+  readonly code = RECORD_LOCK_LOST_CODE;
+  constructor(recordFile: string, attempts: number) {
+    super(
+      `session record lock for ${recordFile} was broken under its holder ${attempts} times; ` +
+        "nothing published",
+    );
+  }
+}
+
+/** True for a publish refused because the lock was no longer ours (`code`, not `instanceof`). */
+export function isRecordLockLost(error: unknown): boolean {
+  return (
+    !!error &&
+    typeof error === "object" &&
+    (error as { code?: unknown }).code === RECORD_LOCK_LOST_CODE
+  );
+}
+
+function isLockLost(error: unknown): boolean {
+  return (
+    !!error && typeof error === "object" && (error as { code?: unknown }).code === LOCK_LOST_CODE
+  );
+}
+
+async function readOptional(file: string): Promise<string | undefined> {
+  try {
+    return await fs.readFile(file, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+/**
+ * THE record-write entry (C3.2 A-4; shape agreed with atrium lane T, 2026-11-21). Under the record
+ * lock: read the record's bytes (`undefined` = no file), let `change` return the new bytes
+ * (`undefined` = write nothing), write them to a temp file beside it (mode 0600), check the lock
+ * still carries our token, rename. "Re-read inside the lock" and "check before publish" hold by
+ * construction. A lock found broken at the check: the temp file is removed and the whole write
+ * starts again, up to RECORD_LOCK_LOST_ATTEMPTS times, then `record-lock-lost`. A waiter out of
+ * budget throws `record-lock-timeout`. There is no unlocked path.
+ */
+export async function updateRecordFile(
+  recordFile: string,
+  change: (current: string | undefined) => Promise<string | undefined> | string | undefined,
+): Promise<{ written: boolean }> {
+  for (let attempt = 1; attempt <= RECORD_LOCK_LOST_ATTEMPTS; attempt += 1) {
+    try {
+      return await withRecordFileLock(recordFile, async (lock) => {
+        const next = await change(await readOptional(recordFile));
+        if (next === undefined) {
+          return { written: false };
+        }
+        const temporary = `${recordFile}.${process.pid}.${randomUUID()}.tmp`;
+        await fs.writeFile(temporary, next, { encoding: "utf8", mode: 0o600 });
+        try {
+          await lock.assertHeld();
+          await fs.rename(temporary, recordFile);
+        } catch (error) {
+          await fs.rm(temporary, { force: true });
+          throw error;
+        }
+        return { written: true };
+      });
+    } catch (error) {
+      if (!isLockLost(error)) {
+        throw error;
+      }
+    }
+  }
+  throw new RecordLockLostError(recordFile, RECORD_LOCK_LOST_ATTEMPTS);
 }

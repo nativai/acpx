@@ -1,12 +1,21 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { proveDeath, DEATH_PROOF_TIMEOUT_MS, type DeathProof } from "../../pod/death-proof.js";
 import {
+  DEATH_PROOF_TIMEOUT_MS,
+  proveDeathDetailed,
+  type DeathProofDetail,
+} from "../../pod/death-proof.js";
+import {
+  lockHostPlace,
   lockPodIdentity,
   ownPodIdentity,
   parsePodRef,
+  podModeRequested,
+  type LockHostPlace,
   type PodIdentity,
   type PodRef,
 } from "../../pod/identity.js";
@@ -37,24 +46,28 @@ import { isProcessDefinitelyDead } from "../../process-liveness.js";
  *   unverified own scope) ⇒ unjudgeable. A legacy body (no identity — pre-0a code, which CONCEPT
  *   §4.5 places in the reader's own container) is breakable on ESRCH, and otherwise unjudgeable
  *   unless the policy keeps an older, stronger rule (the record lock does).
- * - An unjudgeable holder is broken only once the lock is older than `staleMs`, with a stderr
- *   warning naming the file, holder and age. Legitimate holds are milliseconds.
- * - BREAKING is compare-and-delete on the raw content, then a retry of the atomic create — never a
- *   write without the lock.
+ * - An unjudgeable holder WITHOUT `pod` is broken only once the lock is older than `staleMs`, with
+ *   a stderr warning naming the file, holder and age. Legitimate holds are milliseconds.
  *
- * ACROSS PODS (C3.2, brick 8d85cb47). In pod mode the body also names the holder's POD. Judging:
+ * ACROSS PODS (C3.2 as amended by A-3/A-4, brick 8d85cb47). A process that knows its pod writes
+ * `pod` (name, uid, node, namespace) and a random `token` into every body. Judging and breaking:
  *
- *   | holder is…                               | judged by                  | broken when                 |
- *   | in the reader's own pod (same pod uid)   | pid, as above              | as above                    |
- *   | in another pod — on ANY machine          | never pid, NEVER AGE       | the death proof says `gone` |
- *   | without a `pod` field                    | the rules above, unchanged | the rules above             |
+ *   | holder is…                  | judged by            | broken when — and by whom                         |
+ *   | in the reader's own pod     | pid and start time   | the process is gone — by any process of that pod  |
+ *   | in another pod, any machine | never pid, NEVER AGE | its pod is gone (C3.3) — ONLY by the CONTROL POD   |
+ *   | without a `pod` field       | control pod / elsewhere: today's rules · an AGENT POD: never judged/broken |
  *
- * A body WITH a `pod` field is broken by TOMBSTONE, one winner (`breakByTombstone`); a body without
- * one keeps today's compare-and-delete byte for byte (program HoD, 2026-11-21: a control pod without
- * `NV_POD_*` must behave exactly as today — `test/pod-lock-no-pod.test.ts`).
- * ⚠️ DO NOT "UNIFY" THE FOREIGN ROW WITH THE AGE RULE. The spike measured what age does to a live
- * holder in another pod: broken after 10 s while alive and holding, two writers believing they hold
- * the lock (SPIKE-REPORT §(d)). `test/pod-lock-primitive.test.ts` "NG-K7.2a" pins it.
+ * HOW A LOCK IS BROKEN: proof first; then, inside this pod's BREAK MUTEX (a kernel-released abstract
+ * socket, `withBreakMutex`), the lock is read again by open-and-read and unlinked only if it still
+ * carries the judged `token`; then one line goes to the break ledger. Nothing is left behind — no
+ * tombstone, no marker (the first cut's tombstone is withdrawn, A-4). And the HOLDER checks its own
+ * token immediately before it publishes (`assertLockHeld`; `updateRecordFile` in record-file-lock.ts).
+ *
+ * ⚠️ DO NOT LET AN AGENT POD BREAK A FOREIGN HOLDER, EVEN ONE WHOSE POD IS GONE, AND DO NOT GIVE THE
+ * FOREIGN ROW AN AGE RULE. Only one place may break a given lock — that is what makes the token
+ * re-read sufficient without a tombstone. The spike measured what age does to a live holder in
+ * another pod: broken after 10 s while alive and holding (SPIKE-REPORT §(d)).
+ * `test/pod-lock-primitive.test.ts` pins every "never" here.
  *
  * 🛑 THERE IS NO PROCEED-UNLOCKED PATH. A waiter whose budget runs out THROWS the policy's typed
  * timeout. The index lock's old "give up after ~2 s and write anyway" re-admitted exactly the lost
@@ -68,7 +81,7 @@ export type IdentityLockPolicy = {
   label: string;
   /** How long a waiter tries before it throws. Must exceed `staleMs` so a waiter clears an orphan. */
   budgetMs: number;
-  /** Age (lock-file mtime) past which an UNJUDGEABLE holder may be broken. Never a foreign pod's. */
+  /** Age (lock-file mtime) past which an UNJUDGEABLE holder WITHOUT `pod` may be broken. */
   staleMs: number;
   /** Longest pause between two attempts (default 50 ms). Long-held locks poll less. */
   pollMaxMs?: number;
@@ -84,39 +97,54 @@ type ReadHolder = { raw: string; ageMs: number; body: Record<string, unknown> | 
 const MAX_BACKOFF_MS = 50;
 /** A waiter asks the death proof about one judged body at most this often. */
 const DEATH_PROOF_RETRY_MS = 1_000;
-/**
- * A tombstone older than this (by ctime — the moment it was linked) WHOSE LOCK IS GONE (C3.2) is
- * removed by whoever sees it. "Gone" = the lock path is absent or names another file.
- * 🛑 A TOMBSTONE THAT IS STILL THE LOCK'S OWN FILE IS NEVER REMOVED BY AGE (program HoD ruling
- * 2026-11-21, referred to the architect). It means a breaker stopped between `link` and
- * `unlink(lock)` — and a breaker in a FROZEN pod (state-server stall, 60 s) is alive, not dead: its
- * already-decided `unlink(lock)` could land after a new holder took the lock and silently delete a
- * live lock. So that wedge stays, and every waiter reports it by name after its budget
- * (`describeWedge`). ⚠️ DO NOT "FIX" THE WEDGE BY AGE — `test/pod-lock-primitive.test.ts` "wedge".
- */
-export const TOMBSTONE_STALE_MS = 60_000;
-/** Linux `ESTALE` (116): an NFS file handle whose file another client removed. */
-const ESTALE_ERRNO = os.constants.errno.ESTALE ?? 116;
-const TOMBSTONE_PATTERN = /\.tomb\.[0-9a-f]{16}$/;
+
+/** C1.1 A-5: in pod mode the module throws rather than write a body without `pod`. */
+export const POD_IDENTITY_MISSING_CODE = "pod_identity_missing";
+export class PodIdentityMissingError extends Error {
+  readonly code = POD_IDENTITY_MISSING_CODE;
+  constructor() {
+    super(
+      "acpx: REFUSED reason=pod_identity_missing — pod mode is on but this process cannot name its " +
+        "pod (NV_POD_NAME, NV_POD_UID, NV_NODE_NAME, service-account namespace); no lock is written " +
+        "without `pod` (C1.1 A-5)",
+    );
+  }
+}
+
+/** The holder found its lock no longer carries its own token: it must not publish (C3.2 A-4). */
+export const LOCK_LOST_CODE = "lock-lost";
+export class LockLostError extends Error {
+  readonly code: string = LOCK_LOST_CODE;
+  constructor(lockPath: string, found: string) {
+    super(
+      `lock ${lockPath} no longer carries this holder's token (now: ${found || "absent"}); not publishing`,
+    );
+  }
+}
 
 /** Everything the cross-pod rules read from outside. Swappable ONLY by tests. */
 type PodLockDeps = {
-  /** This process's pod, for "same pod?" (raw read — any mode). */
+  /** This process's pod (same pod? the mutex name, the ledger file). */
   ownPod: () => PodIdentity | undefined;
-  /** The pod a NEW body names (pod mode only). */
+  /** The pod a NEW body names. */
   lockPod: () => PodIdentity | undefined;
-  proveDeath: (pod: PodRef, timeoutMs: number) => Promise<DeathProof>;
+  /** Pod mode requested without identity ⇒ refuse (C1.1 A-5). */
+  podModeRequested: () => boolean;
+  place: () => LockHostPlace;
+  proveDeath: (pod: PodRef, timeoutMs: number) => Promise<DeathProofDetail>;
   nowMs: () => number;
-  /** Runs right after a breaker's `link(lock, tomb)` — a test's stand-in for a stalled breaker. */
-  afterTombstoneLinked: () => Promise<void>;
+  /** Runs inside the break mutex, after the proof and before the re-read — a test's stall point. */
+  insideBreakMutex: () => Promise<void>;
 };
 
 const realDeps: PodLockDeps = {
   ownPod: () => ownPodIdentity(),
   lockPod: () => lockPodIdentity(),
-  proveDeath: (pod, timeoutMs) => proveDeath(pod, { timeoutMs }),
+  podModeRequested: () => podModeRequested(),
+  place: () => lockHostPlace(),
+  proveDeath: (pod, timeoutMs) => proveDeathDetailed(pod, { timeoutMs }),
   nowMs: () => Date.now(),
-  afterTombstoneLinked: async () => {},
+  insideBreakMutex: async () => {},
 };
 let deps: PodLockDeps = realDeps;
 
@@ -139,6 +167,10 @@ function parseBody(raw: string): Record<string, unknown> | undefined {
 function holderPid(body: Record<string, unknown>): number | undefined {
   const pid = body.pid;
   return typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+}
+
+function bodyToken(body: Record<string, unknown> | undefined): string | undefined {
+  return typeof body?.token === "string" && body.token !== "" ? body.token : undefined;
 }
 
 function verdictForIncarnation(pid: number, birth: ProcessBirthIdentity): LockHolderVerdict {
@@ -206,8 +238,8 @@ function holderPlace(body: Record<string, unknown> | undefined): HolderPlace {
 /**
  * Judges a lock body SYNCHRONOUSLY. Shared by every lock — including the stream lock, which applies
  * its own age rule on top (events.ts) — so "same machine" is decided in exactly one place. A holder
- * in another pod cannot be judged without the death proof (async), so it is `unjudgeable` here; the
- * primitive itself never age-breaks it (`planBreak`).
+ * in another pod cannot be judged without the death proof (async, control pod only), so it is
+ * `unjudgeable` here; the primitive itself never age-breaks it (`planBreak`).
  */
 export function judgeLockHolder(
   body: Record<string, unknown> | undefined,
@@ -217,15 +249,16 @@ export function judgeLockHolder(
 }
 
 /**
- * The full body: the lock's old fields, then the holder's `host` and birth identity — and in pod
- * mode its `pod` plus a random `token`, so no two acquisitions ever write the same bytes (the
- * tombstone name is a hash of the judged body). Without a pod the body is exactly today's.
+ * The full body: the lock's old fields, then the holder's `host` and birth identity — and, when this
+ * process knows its pod, `pod` plus a random `token` (C3.2 A-3), so no two acquisitions ever write
+ * the same bytes. Without a pod the body is exactly today's — except in pod mode, where it throws.
  */
 export function identityLockBody(legacyBody: Record<string, unknown>): Record<string, unknown> {
   const identity = getOwnProcessIdentity();
-  // C3.2 amendment (pending record): `pod` carries `node` and `namespace` beside `name` and `uid` —
-  // C3.3's "gone" needs the holder's node once its pod has left the API — and the body a `token`.
   const pod = deps.lockPod();
+  if (!pod && deps.podModeRequested()) {
+    throw new PodIdentityMissingError();
+  }
   return {
     ...legacyBody,
     host: processHostName(),
@@ -244,22 +277,21 @@ async function lockAgeMs(lockPath: string): Promise<number> {
 
 /**
  * The file is gone — `ENOENT`, or on NFS `ESTALE`: another client unlinked it while this one still
- * held its file handle (measured across the control pod and a workbench, brick 8d85cb47: `link`
- * failed with errno 116 in 2 of 10 cross-machine race rounds, and the breaker crashed). Both mean
- * "the lock changed under us": retry.
+ * held its file handle (measured across the control pod and a workbench, brick 8d85cb47).
+ * ⚠️ MATCH ESTALE BY ERRNO, NOT BY `code`: libuv has no name for it, so Node reports
+ * `code: "Unknown system error -116"` (measured) — a `code === "ESTALE"` check never fires.
  */
+const ESTALE_ERRNO = os.constants.errno.ESTALE ?? 116;
 function isGoneError(error: unknown): boolean {
   const { code, errno } = (error ?? {}) as NodeJS.ErrnoException;
-  // ⚠️ MATCH ESTALE BY ERRNO, NOT BY `code`: libuv has no name for it, so Node reports
-  // `code: "Unknown system error -116"` (measured) — a `code === "ESTALE"` check never fires.
   return code === "ENOENT" || code === "ESTALE" || errno === -ESTALE_ERRNO;
 }
 
 /**
- * The current holder, or null ONLY when the lock file is gone (ENOENT / ESTALE). Any other read failure — a
- * directory squatting the path, an unreadable file — is an UNIDENTIFIED holder (raw ""), judged by
- * age like any unjudgeable one. ⚠️ Do not fold those into "gone": the caller retries the create at
- * once on null, so that would be a busy spin.
+ * The current holder, or null ONLY when the lock file is gone (ENOENT / ESTALE). Any other read
+ * failure — a directory squatting the path, an unreadable file — is an UNIDENTIFIED holder (raw ""),
+ * judged by age like any unjudgeable one. ⚠️ Do not fold those into "gone": the caller retries the
+ * create at once on null, so that would be a busy spin.
  */
 async function readHolder(lockPath: string): Promise<ReadHolder | null> {
   let raw: string;
@@ -291,18 +323,6 @@ export async function tryCreateLockFile(lockPath: string, content: string): Prom
   }
 }
 
-/** Today's reason to break a pid-judged holder, or null. */
-function pidBreakReason(current: ReadHolder, policy: IdentityLockPolicy): string | null {
-  const verdict = judgeByPid(current.body, policy.judgeLegacy);
-  if (verdict === "breakable") {
-    return "holder is dead";
-  }
-  if (verdict === "unjudgeable" && current.ageMs > policy.staleMs) {
-    return `holder cannot be judged from here (another pid namespace, legacy or unidentified), lock is ${Math.round(current.ageMs)} ms old`;
-  }
-  return null;
-}
-
 /** Compare-and-delete: removes the lock only if it still holds exactly `raw`. False if it did not. */
 export async function removeLockIfUnchanged(lockPath: string, raw: string): Promise<boolean> {
   const again = await readHolder(lockPath);
@@ -317,126 +337,86 @@ export async function removeLockIfUnchanged(lockPath: string, raw: string): Prom
   }
 }
 
-/** `<lock>.tomb.<first 16 hex of SHA-256 of the judged body>` (C3.2). */
-export function tombstonePath(lockPath: string, judgedRaw: string): string {
-  const digest = createHash("sha256").update(judgedRaw, "utf8").digest("hex").slice(0, 16);
-  return `${lockPath}.tomb.${digest}`;
+// ---------------------------------------------------------------------------------------------
+// The break mutex (C3.2 A-4): one per pod, not on the shared volume, released by the kernel when
+// its holder dies — the bind of an abstract-namespace socket whose name carries the pod's uid (two
+// test "pods" in one network namespace stay apart; two real pods have two network namespaces).
+// ---------------------------------------------------------------------------------------------
+
+function breakMutexName(own: PodIdentity | undefined): string {
+  return `\0acpx-lock-break.${own ? own.uid : `host.${os.hostname()}`}`;
 }
 
-async function unlinkQuietly(file: string): Promise<void> {
-  await fs.unlink(file).catch(() => {});
+function tryBind(name: string): Promise<net.Server | "busy" | "unavailable"> {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.once("error", (error: NodeJS.ErrnoException) =>
+      resolve(error.code === "EADDRINUSE" ? "busy" : "unavailable"),
+    );
+    server.listen({ path: name, exclusive: true }, () => {
+      server.unref();
+      resolve(server);
+    });
+  });
 }
 
-async function statOrUndefined(file: string) {
-  try {
-    return await fs.stat(file);
-  } catch {
-    return undefined;
+let mutexUnavailableWarned = false;
+
+function warnMutexUnavailable(): void {
+  if (!mutexUnavailableWarned) {
+    mutexUnavailableWarned = true;
+    process.stderr.write("[acpx] WARNING: lock break mutex unavailable; breaking without it\n");
   }
-}
-
-/** Two stats name the same file (same device and inode). */
-function sameFile(
-  a: { ino: number; dev: number } | undefined,
-  b: { ino: number; dev: number } | undefined,
-) {
-  return !!a && !!b && a.ino === b.ino && a.dev === b.dev;
-}
-
-/** `<lock>` for `<lock>.tomb.<hex>`. */
-function lockOfTombstone(tomb: string): string {
-  return tomb.replace(TOMBSTONE_PATTERN, "");
-}
-
-/** Removes `tomb` when it is older than TOMBSTONE_STALE_MS AND its lock is gone. True when removed. */
-async function removeTombstoneIfStale(tomb: string): Promise<boolean> {
-  const stat = await statOrUndefined(tomb);
-  if (!stat || deps.nowMs() - stat.ctimeMs <= TOMBSTONE_STALE_MS) {
-    return false;
-  }
-  if (sameFile(stat, await statOrUndefined(lockOfTombstone(tomb)))) {
-    return false; // still the lock's own file: a wedge, never removed by age (see TOMBSTONE_STALE_MS)
-  }
-  await unlinkQuietly(tomb);
-  return true;
 }
 
 /**
- * When the lock is held by a tombstone of its own judged body that is still the lock's own file —
- * a breaker stopped between `link` and `unlink(lock)` — the wedge in words, for the timeout.
+ * Runs `fn` holding this pod's break mutex; undefined when it could not be had within `waitMs`.
+ * Off Linux (no abstract sockets) or where the bind is refused for another reason, it runs `fn`
+ * alone — the in-pod break is then as racy as before this block, never wedged.
  */
-async function describeWedge(lockPath: string, holderRaw: string): Promise<string | null> {
-  const tomb = tombstonePath(lockPath, holderRaw);
-  const [tombStat, lockStat] = await Promise.all([
-    statOrUndefined(tomb),
-    statOrUndefined(lockPath),
-  ]);
-  if (!tombStat || !sameFile(tombStat, lockStat)) {
-    return null;
+export async function withBreakMutex<T>(
+  waitMs: number,
+  fn: () => Promise<T>,
+): Promise<T | undefined> {
+  if (process.platform !== "linux") {
+    return await fn();
   }
-  const ageMs = Math.round(deps.nowMs() - tombStat.ctimeMs);
-  return (
-    `WEDGED: lock ${lockPath} is held open by tombstone ${tomb} (age ${ageMs} ms) — a breaker ` +
-    `stopped between link and unlink; it is never removed by age, remove it by hand once that ` +
-    `breaker is known dead`
-  );
+  const name = breakMutexName(deps.ownPod());
+  const deadline = Date.now() + Math.max(0, waitMs);
+  for (;;) {
+    const bound = await tryBind(name);
+    if (bound === "unavailable") {
+      warnMutexUnavailable();
+      return await fn();
+    }
+    if (bound !== "busy") {
+      try {
+        return await fn();
+      } finally {
+        await new Promise<void>((resolve) => bound.close(() => resolve()));
+      }
+    }
+    if (Date.now() >= deadline) {
+      return undefined;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2 + Math.floor(Math.random() * 4)));
+  }
 }
 
-/**
- * C3.2's one-winner break. `link(lock, tomb)` succeeds for exactly one breaker of a given judged
- * body; the others get EEXIST and only retry their acquire. The winner checks the tombstone holds
- * the judged body (else: unlink the tombstone, stop), then RE-CHECKS that the lock path still names
- * the tombstone's own file before unlinking it — C3.2 amendment (pending record) — so a breaker can
- * never delete a lock that a faster breaker already replaced with a fresh one.
- */
-export async function breakByTombstone(
-  lockPath: string,
-  judgedRaw: string,
-): Promise<"broken" | "busy" | "changed"> {
-  const tomb = tombstonePath(lockPath, judgedRaw);
-  try {
-    await fs.link(lockPath, tomb);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "EEXIST") {
-      await removeTombstoneIfStale(tomb);
-      return "busy";
-    }
-    if (isGoneError(error)) {
-      return "changed";
-    }
-    throw error;
-  }
-  await deps.afterTombstoneLinked();
-  const linked = await fs.readFile(tomb, "utf8").catch(() => undefined);
-  if (linked !== judgedRaw) {
-    await unlinkQuietly(tomb);
-    return "changed";
-  }
-  // C3.2 amendment (pending record): the re-check before the unlink.
-  const [lockStat, tombStat] = await Promise.all([
-    statOrUndefined(lockPath),
-    statOrUndefined(tomb),
-  ]);
-  if (!sameFile(lockStat, tombStat)) {
-    await unlinkQuietly(tomb);
-    return "changed";
-  }
-  await unlinkQuietly(lockPath);
-  await unlinkQuietly(tomb);
-  return "broken";
-}
+// ---------------------------------------------------------------------------------------------
+// Judging and breaking
+// ---------------------------------------------------------------------------------------------
 
-type BreakPlan =
-  | { kind: "none" }
-  | { kind: "compare-and-delete"; reason: string }
-  | { kind: "tombstone"; reason: string; notice: string | null };
+export type BreakProof = "pid" | "pod-gone" | "pod-terminal" | "age";
+
+type BreakPlan = { kind: "none" } | { kind: "break"; proof: BreakProof; reason: string };
+type DecidedBreak = Extract<BreakPlan, { kind: "break" }>;
 
 /** The death-proof answer about one judged body, asked at most once per DEATH_PROOF_RETRY_MS. */
-type ProofMemo = { raw?: string; at?: number; answer?: DeathProof };
+type ProofMemo = { raw?: string; at?: number; detail?: DeathProofDetail };
 
 function describePod(pod: PodRef | undefined): string {
-  return pod ? `${pod.name} (uid ${pod.uid}${pod.node ? `, node ${pod.node}` : ""})` : "unknown";
+  return pod ? `${pod.name} (uid ${pod.uid}${pod.node ? `, node ${pod.node}` : ""})` : "none";
 }
 
 async function foreignProof(
@@ -444,15 +424,47 @@ async function foreignProof(
   pod: PodRef,
   memo: ProofMemo,
   remainingMs: number,
-): Promise<DeathProof> {
+): Promise<DeathProofDetail> {
   const now = deps.nowMs();
   if (memo.raw === current.raw && memo.at !== undefined && now - memo.at < DEATH_PROOF_RETRY_MS) {
-    return memo.answer ?? "unknown";
+    return memo.detail ?? { answer: "unknown" };
   }
   const timeoutMs = Math.max(1, Math.min(DEATH_PROOF_TIMEOUT_MS, remainingMs));
-  const answer = await deps.proveDeath(pod, timeoutMs).catch((): DeathProof => "unknown");
-  Object.assign(memo, { raw: current.raw, at: deps.nowMs(), answer });
-  return answer;
+  const detail = await deps
+    .proveDeath(pod, timeoutMs)
+    .catch((): DeathProofDetail => ({ answer: "unknown" }));
+  Object.assign(memo, { raw: current.raw, at: deps.nowMs(), detail });
+  return detail;
+}
+
+/** Today's rules for a body without `pod` (control pod and elsewhere; never in an agent pod). */
+function planNoPod(current: ReadHolder, policy: IdentityLockPolicy): BreakPlan {
+  const verdict = judgeByPid(current.body, policy.judgeLegacy);
+  if (verdict === "breakable") {
+    return { kind: "break", proof: "pid", reason: "holder is dead" };
+  }
+  if (verdict === "unjudgeable" && current.ageMs > policy.staleMs) {
+    const reason = `holder cannot be judged from here (another pid namespace, legacy or unidentified), lock is ${Math.round(current.ageMs)} ms old`;
+    return { kind: "break", proof: "age", reason };
+  }
+  return { kind: "none" };
+}
+
+async function planForeign(
+  current: ReadHolder,
+  pod: PodRef | undefined,
+  memo: ProofMemo,
+  remainingMs: number,
+): Promise<BreakPlan> {
+  // Another pod: only the control pod may break it, only on proof, and nobody else ever asks.
+  if (deps.place() !== "control" || !pod) {
+    return { kind: "none" };
+  }
+  const detail = await foreignProof(current, pod, memo, remainingMs);
+  if (detail.answer !== "gone") {
+    return { kind: "none" };
+  }
+  return { kind: "break", proof: detail.proof, reason: `holder pod ${describePod(pod)} is gone` };
 }
 
 async function planBreak(
@@ -461,30 +473,143 @@ async function planBreak(
   memo: ProofMemo,
   remainingMs: number,
 ): Promise<BreakPlan> {
-  const place = holderPlace(current.body);
-  if (place.kind === "no-pod") {
-    const reason = pidBreakReason(current, policy);
-    return reason ? { kind: "compare-and-delete", reason } : { kind: "none" };
+  const holder = holderPlace(current.body);
+  if (holder.kind === "no-pod") {
+    return deps.place() === "agent-pod" ? { kind: "none" } : planNoPod(current, policy);
   }
-  if (place.kind === "same-pod") {
-    const reason = pidBreakReason(current, policy);
-    return reason ? { kind: "tombstone", reason, notice: null } : { kind: "none" };
+  if (holder.kind === "same-pod") {
+    // pid and start time only — no age rule for a body that carries `pod` (C3.2 A-4).
+    return judgeByPid(current.body, policy.judgeLegacy) === "breakable"
+      ? { kind: "break", proof: "pid", reason: "holder is dead" }
+      : { kind: "none" };
   }
-  // Another pod, any machine: never by pid, never by age — only on proof that its pod is gone.
-  if (!place.pod || (await foreignProof(current, place.pod, memo, remainingMs)) !== "gone") {
-    return { kind: "none" };
-  }
-  const own = deps.ownPod();
-  const notice =
-    `holder pod ${describePod(place.pod)} proven gone by the API server (C3.3); ` +
-    `breaker pod ${describePod(own)} pid ${process.pid}`;
-  return { kind: "tombstone", reason: "holder pod is gone", notice };
+  return await planForeign(current, holder.pod, memo, remainingMs);
 }
 
-function warnBreak(policy: IdentityLockPolicy, lockPath: string, reason: string, raw: string) {
-  process.stderr.write(
-    `[acpx] WARNING: broke stale ${policy.label} ${lockPath} (${reason}); holder ${raw}\n`,
-  );
+function stateHomeDir(): string {
+  return path.join(process.env.ACPX_STATE_HOME || os.homedir(), ".acpx");
+}
+
+/** `<state home>/lock-breaks/<breaker's pod uid>.ndjson` — one file per writing pod (C3.2 A-4). */
+export function lockBreakLedgerPath(podUid: string): string {
+  return path.join(stateHomeDir(), "lock-breaks", `${podUid}.ndjson`);
+}
+
+function breakLine(
+  lockPath: string,
+  body: Record<string, unknown> | undefined,
+  proof: BreakProof,
+  own: PodIdentity,
+) {
+  return {
+    v: 1,
+    ts: new Date(deps.nowMs()).toISOString(),
+    lock: lockPath,
+    holder: {
+      pod: parsePodRef(body?.pod) ?? null,
+      pid: (body && holderPid(body)) ?? null,
+      token: bodyToken(body) ?? null,
+    },
+    breaker: { pod: own, pid: process.pid },
+    proof,
+  };
+}
+
+/**
+ * One line per break (C3.2 A-4). Only a breaker that knows its pod writes one — the file is named
+ * by its uid; a box whose control pod has no identity yet keeps today's behaviour exactly (no new
+ * file). A failed ledger write is reported on stderr and never undoes or blocks the break.
+ */
+async function writeBreakLine(
+  lockPath: string,
+  body: Record<string, unknown> | undefined,
+  proof: BreakProof,
+): Promise<void> {
+  const own = deps.ownPod();
+  if (!own) {
+    return;
+  }
+  const file = lockBreakLedgerPath(own.uid);
+  try {
+    await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+    await fs.appendFile(file, `${JSON.stringify(breakLine(lockPath, body, proof, own))}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+  } catch (error) {
+    process.stderr.write(
+      `[acpx] WARNING: lock break ledger ${file} not written: ${(error as Error).message}\n`,
+    );
+  }
+}
+
+/** Does `raw` (read again, by open-and-read) still carry the judged holder? Token, else bytes. */
+function sameHolder(
+  raw: string,
+  judgedRaw: string,
+  judgedBody: Record<string, unknown> | undefined,
+): boolean {
+  const token = bodyToken(judgedBody);
+  return token ? bodyToken(parseBody(raw)) === token : raw === judgedRaw;
+}
+
+/** Inside the mutex: read again (open-and-read, never `stat`), unlink only the judged holder. */
+async function removeJudgedHolder(
+  lockPath: string,
+  plan: DecidedBreak,
+  judged: ReadHolder,
+): Promise<"broken" | "gone" | "changed"> {
+  await deps.insideBreakMutex();
+  // The same read as the judgement (open and read — never `stat`): an unreadable lock reads as the
+  // unidentified holder "" there and here, so today's age rule still clears it (T15 "unreadable").
+  const current = await readHolder(lockPath);
+  if (!current) {
+    return "gone";
+  }
+  const again = current.raw;
+  if (!sameHolder(again, judged.raw, judged.body)) {
+    return "changed";
+  }
+  try {
+    await fs.unlink(lockPath);
+  } catch (error) {
+    return isGoneError(error) ? "gone" : "changed";
+  }
+  await writeBreakLine(lockPath, judged.body, plan.proof);
+  return "broken";
+}
+
+/** Carries out a decided break inside the break mutex. True when the lock is gone after it. */
+async function executeBreak(
+  lockPath: string,
+  policy: IdentityLockPolicy,
+  plan: DecidedBreak,
+  judged: ReadHolder,
+  waitMs: number,
+): Promise<boolean> {
+  const outcome = await withBreakMutex(waitMs, () => removeJudgedHolder(lockPath, plan, judged));
+  if (outcome === "broken") {
+    reportBreak(policy, lockPath, plan, judged.raw);
+  }
+  return outcome === "broken" || outcome === "gone";
+}
+
+function reportBreak(
+  policy: IdentityLockPolicy,
+  lockPath: string,
+  plan: DecidedBreak,
+  raw: string,
+): void {
+  if (plan.proof === "age") {
+    process.stderr.write(
+      `[acpx] WARNING: broke stale ${policy.label} ${lockPath} (${plan.reason}); holder ${raw}\n`,
+    );
+  } else if (plan.proof !== "pid") {
+    process.stderr.write(
+      `[acpx] broke ${policy.label} ${lockPath}: ${plan.reason} — proven by the API server ` +
+        `(${plan.proof}, C3.3); breaker pod ${describePod(deps.ownPod())} pid ${process.pid}; holder ${raw}\n`,
+    );
+  }
 }
 
 async function breakHolder(
@@ -502,28 +627,8 @@ async function breakHolder(
   if (plan.kind === "none") {
     return { broken: false, tookOver: false, holder: current.raw };
   }
-  const broken = await executeBreak(lockPath, policy, plan, current.raw);
+  const broken = await executeBreak(lockPath, policy, plan, current, remainingMs);
   return { broken, tookOver: broken, holder: current.raw };
-}
-
-/** Carries out a decided break: compare-and-delete for a body without `pod`, else the tombstone. */
-async function executeBreak(
-  lockPath: string,
-  policy: IdentityLockPolicy,
-  plan: Exclude<BreakPlan, { kind: "none" }>,
-  raw: string,
-): Promise<boolean> {
-  const broken =
-    plan.kind === "compare-and-delete"
-      ? await removeLockIfUnchanged(lockPath, raw)
-      : (await breakByTombstone(lockPath, raw)) === "broken";
-  const notice = plan.kind === "tombstone" ? plan.notice : null;
-  if (broken && notice) {
-    process.stderr.write(`[acpx] broke ${policy.label} ${lockPath}: ${notice}; holder ${raw}\n`);
-  } else if (broken && plan.reason !== "holder is dead") {
-    warnBreak(policy, lockPath, plan.reason, raw);
-  }
-  return broken;
 }
 
 export type AcquiredLock = { content: string; tookOver: boolean };
@@ -547,11 +652,7 @@ export async function acquireIdentityFileLockDetailed(
       continue;
     }
     if (Date.now() - started >= policy.budgetMs) {
-      const wedge = await describeWedge(lockPath, outcome.holder);
-      throw policy.makeTimeoutError(
-        lockPath,
-        wedge ? `${outcome.holder} — ${wedge}` : outcome.holder,
-      );
+      throw policy.makeTimeoutError(lockPath, outcome.holder);
     }
     await new Promise((resolve) => setTimeout(resolve, delay));
     delay = Math.min(maxBackoff, delay * 2 + Math.floor(Math.random() * 3));
@@ -574,65 +675,109 @@ export async function releaseIdentityFileLock(lockPath: string, content: string)
   });
 }
 
+function heldBy(raw: string | undefined, content: string): boolean {
+  return raw !== undefined && sameHolder(raw, content, parseBody(content));
+}
+
+/**
+ * C3.2 A-4 "the holder checks before it publishes": read the lock again (open and read) and throw
+ * LockLostError unless it still carries this holder's token. Call it IMMEDIATELY before the rename.
+ */
+export async function assertLockHeld(lockPath: string, content: string): Promise<void> {
+  const raw = await fs.readFile(lockPath, "utf8").catch(() => undefined);
+  if (!heldBy(raw, content)) {
+    throw new LockLostError(lockPath, raw ?? "");
+  }
+}
+
+/** `assertLockHeld` for a synchronous publisher (the spawn ledger's rename). */
+export function assertLockHeldSync(lockPath: string, content: string): void {
+  let raw: string | undefined;
+  try {
+    raw = readFileSync(lockPath, "utf8");
+  } catch {
+    raw = undefined;
+  }
+  if (!heldBy(raw, content)) {
+    throw new LockLostError(lockPath, raw ?? "");
+  }
+}
+
+/** What a holder may do with its lock while it holds it. */
+export type HeldLock = {
+  /** Throws LockLostError unless the lock still carries this holder's token. */
+  assertHeld: () => Promise<void>;
+  assertHeldSync: () => void;
+};
+
 export async function withIdentityFileLock<T>(
   lockPath: string,
   policy: IdentityLockPolicy,
-  action: () => Promise<T>,
+  action: (lock: HeldLock) => Promise<T>,
 ): Promise<T> {
   const content = await acquireIdentityFileLock(lockPath, policy);
   try {
-    return await action();
+    return await action({
+      assertHeld: () => assertLockHeld(lockPath, content),
+      assertHeldSync: () => assertLockHeldSync(lockPath, content),
+    });
   } finally {
     await releaseIdentityFileLock(lockPath, content);
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The sweep (C3.2 "Sweeps, every 5 s")
+// ---------------------------------------------------------------------------------------------
+
 /**
- * The file names the sweep treats as locks of this primitive. ⚠️ NOT a bare `.lock`: the queue
- * LEASE is `queues/<key>.lock` — a different file with its own rules, removed only under its guard
- * (C3.1). Sweeping it here would delete a lease behind the lease store's back.
+ * The file names the sweep treats as locks of this primitive, with each one's age bound for a
+ * leftover without `pod` (the bound its own policy uses). ⚠️ NOT a bare `.lock`: the queue LEASE is
+ * `queues/<key>.lock` — a different file with its own rules, removed only under its guard (C3.1).
  */
-const SWEPT_LOCK_SUFFIXES = [".json.lock", ".lock.guard", ".acpx-stage.lock"];
+const SWEPT_LOCKS: ReadonlyArray<{ suffix: string; staleMs: number }> = [
+  { suffix: ".json.lock", staleMs: 15_000 }, // record, index, seats
+  { suffix: ".lock.guard", staleMs: 10_000 }, // lease guard
+  { suffix: ".acpx-stage.lock", staleMs: 120_000 }, // fork-source stage lock
+];
 
-export type PodLockSweepResult = { removed: string[]; tombstonesRemoved: string[] };
+export type PodLockSweepResult = { removed: string[] };
 
 /**
- * C3.2 "each pod removes the locks of its own dead processes, with local proof, every 5 s" — one
- * pass. Removes a lock only when its body names THIS pod and its pid is proven dead in this pid
- * namespace; removal is the tombstone break. Also removes tombstones older than TOMBSTONE_STALE_MS.
- * Callers: the atrium server every 5 s on the control pod (EXPORT-lock-module.md), the agent pod's
- * idle loop through `acpx __pod-lock-sweep`. With no own pod identity it removes no lock.
+ * One pass of C3.2's sweep, by the same rules a waiter uses — so in an AGENT POD it removes only
+ * locks of this pod's dead processes; on the CONTROL POD also locks whose holder's pod is gone
+ * (C3.3) and leftovers without `pod`, by today's rules. Callers: the atrium server every 5 s on the
+ * control pod (EXPORT-lock-module.md), the agent pod's idle loop through `acpx __pod-lock-sweep`.
  */
 export async function sweepOwnPodLocks(options: { dirs: string[] }): Promise<PodLockSweepResult> {
-  const result: PodLockSweepResult = { removed: [], tombstonesRemoved: [] };
-  const own = deps.ownPod();
+  const result: PodLockSweepResult = { removed: [] };
   for (const dir of options.dirs) {
     const names = await fs.readdir(dir).catch((): string[] => []);
     for (const name of names) {
-      const file = path.join(dir, name);
-      if (TOMBSTONE_PATTERN.test(name)) {
-        if (await removeTombstoneIfStale(file)) {
-          result.tombstonesRemoved.push(file);
-        }
-        continue;
-      }
-      if (own && SWEPT_LOCK_SUFFIXES.some((suffix) => name.endsWith(suffix))) {
-        if (await removeOwnDeadLock(file, own)) {
-          result.removed.push(file);
-        }
+      const kind = SWEPT_LOCKS.find((entry) => name.endsWith(entry.suffix));
+      if (kind && (await sweepOne(path.join(dir, name), kind.staleMs))) {
+        result.removed.push(path.join(dir, name));
       }
     }
   }
   return result;
 }
 
-async function removeOwnDeadLock(lockPath: string, own: PodIdentity): Promise<boolean> {
+async function sweepOne(lockPath: string, staleMs: number): Promise<boolean> {
   const current = await readHolder(lockPath);
-  if (!current?.body || parsePodRef(current.body.pod)?.uid !== own.uid) {
+  if (!current) {
     return false;
   }
-  if (judgeByPid(current.body) !== "breakable") {
+  const policy: IdentityLockPolicy = {
+    label: "lock (sweep)",
+    budgetMs: DEATH_PROOF_TIMEOUT_MS,
+    staleMs,
+    legacyBody: () => ({}),
+    makeTimeoutError: (file) => new Error(`sweep ${file}`),
+  };
+  const plan = await planBreak(current, policy, {}, DEATH_PROOF_TIMEOUT_MS);
+  if (plan.kind === "none") {
     return false;
   }
-  return (await breakByTombstone(lockPath, current.raw)) === "broken";
+  return await executeBreak(lockPath, policy, plan, current, 1_000);
 }

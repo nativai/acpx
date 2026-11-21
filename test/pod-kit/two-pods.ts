@@ -14,6 +14,11 @@ import path from "node:path";
  * spawned here inherits. Point `apiUrl` at a fake API server (lane X1's `test/pod-kit/fake-apiserver`)
  * to answer the death proof; without one every proof is `unknown`.
  *
+ * WHERE a pod is (C3.2 A-4 lets only the control pod break across pods) is the C1.1 test seam
+ * `ACPX_POD_TEST_HOME=<dir>` (A-6, under `NODE_TEST_CONTEXT` only): `<dir>` stands in for
+ * `/home/node`, the host counts as control-role, and `<dir>/.nv-agent` present makes it an agent pod
+ * (`makeTestHome`).
+ *
  * Over the shared `/workspace` NFS the same environments make two MACHINES: one process on the
  * control pod, one through `workbench-exec` (A5's cross-machine run).
  */
@@ -37,11 +42,24 @@ export function makeServiceAccountDir(root: string, namespace = KIT_NAMESPACE): 
   return dir;
 }
 
+export type KitPlace = "control" | "agent-pod";
+
+/** A stand-in `/home/node` for `ACPX_POD_TEST_HOME`: with `.nv-agent` for an agent pod. */
+export function makeTestHome(root: string, place: KitPlace, pod?: KitPod): string {
+  const dir = fs.mkdtempSync(path.join(root, `home-${place}-`));
+  if (place === "agent-pod") {
+    fs.writeFileSync(path.join(dir, ".nv-agent"), `${pod?.name ?? "ag-kit"}\n`);
+  }
+  return dir;
+}
+
 export type PodEnvOptions = {
+  /** `ACPX_POD_TEST_HOME` — from `makeTestHome`; decides control pod vs agent pod. */
+  testHome?: string;
   saDir: string;
   /** Base URL of a fake API server (`ACPX_POD_API_URL`). */
   apiUrl?: string;
-  /** Default true: `ACPX_OWNER_PLACEMENT=pod`, so lock bodies name the pod. */
+  /** Default true: `ACPX_OWNER_PLACEMENT=pod`. (A body names the pod whenever the identity is set.) */
   podMode?: boolean;
   /** State home shared by both pods (`ACPX_STATE_HOME`). */
   stateHome?: string;
@@ -50,7 +68,13 @@ export type PodEnvOptions = {
 /** The environment of a process in `pod` — the parent's env with the pod's variables on top. */
 export function podEnv(pod: KitPod | undefined, options: PodEnvOptions): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
-  for (const name of ["NV_POD_NAME", "NV_POD_UID", "NV_NODE_NAME", "ACPX_OWNER_PLACEMENT"]) {
+  for (const name of [
+    "NV_POD_NAME",
+    "NV_POD_UID",
+    "NV_NODE_NAME",
+    "ACPX_OWNER_PLACEMENT",
+    "ACPX_POD_TEST_HOME",
+  ]) {
     delete env[name];
   }
   env.NODE_TEST_CONTEXT ??= "child-v8";
@@ -62,6 +86,9 @@ export function podEnv(pod: KitPod | undefined, options: PodEnvOptions): NodeJS.
   }
   if (options.stateHome) {
     env.ACPX_STATE_HOME = options.stateHome;
+  }
+  if (options.testHome) {
+    env.ACPX_POD_TEST_HOME = options.testHome;
   }
   if (pod) {
     env.NV_POD_NAME = pod.name;

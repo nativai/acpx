@@ -1,19 +1,22 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { isControlPod } from "../config/control-pod.js";
 
 /**
  * This process's pod (C3.1 `pod` field sources, C3.2 lock body) — brick 8d85cb47.
  *
  * Read from the downward API (`NV_POD_NAME`, `NV_POD_UID`, `NV_NODE_NAME`) and the service-account
- * namespace file. Absent outside a pod — and absent on a control pod whose Deployment does not yet
- * carry those variables (every box until its switch commit): there the lock body has no `pod` field
- * and today's rules apply unchanged (C3.2 row 3; program HoD constraint 2026-11-21).
+ * namespace file — ALL FOUR, or there is no identity (C1.1 A-5). Absent outside a pod — and absent
+ * on a control pod whose Deployment does not yet carry those variables (every box until the commit
+ * that pins the pod-mode image): there a lock body has no `pod` field and today's rules apply
+ * unchanged (C3.2 row 3; program HoD constraint 2026-11-21).
  *
- * 🛑 THE IDENTITY GOES INTO A LOCK BODY ONLY IN POD MODE (`ACPX_OWNER_PLACEMENT=pod`, C1.1). A
- * workbench or rig is a pod too, but C1.1 says acpx behaves there as today; stamping its pod into
- * a lock would change how the control pod judges its holders on a box that was never switched.
- * `lockPodIdentity` is that gate; `ownPodIdentity` is the raw read (for the death proof's namespace
- * and the sweep).
+ * A PROCESS THAT KNOWS ITS POD WRITES `pod` INTO EVERY LOCK BODY, IN OR OUT OF POD MODE (C1.1 A-5):
+ * so the rollback window — agent pods alive beside a control pod back in local mode — keeps the
+ * cross-pod rules. ⚠️ A pod's HOSTNAME IS NOT ITS NAME: the workbench template sets `spec.hostname`
+ * (`wb-<seat>` for the pod `wb-<seat>-fjkrd`, measured 2026-11-21), so the name comes only from
+ * `NV_POD_NAME`, never from `os.hostname()`.
  *
  * TEST SEAM: two pod identities over one state directory are two processes with different
  * `NV_POD_*` (test/pod-kit/two-pods.ts). The service-account directory is overridable by
@@ -22,7 +25,7 @@ import path from "node:path";
  */
 
 export type PodRef = { name: string; uid: string; node?: string; namespace?: string };
-export type PodIdentity = PodRef;
+export type PodIdentity = { name: string; uid: string; node: string; namespace: string };
 
 export const POD_NAME_ENV = "NV_POD_NAME";
 export const POD_UID_ENV = "NV_POD_UID";
@@ -53,21 +56,72 @@ export function readServiceAccountFile(
   }
 }
 
-/** This process's pod from `env`, or undefined when name or uid is missing. Never throws. */
+/** This process's pod from `env` — all four sources, else undefined. Never throws. */
 export function ownPodIdentity(env: NodeJS.ProcessEnv = process.env): PodIdentity | undefined {
   const name = nonEmpty(env[POD_NAME_ENV]);
   const uid = nonEmpty(env[POD_UID_ENV]);
-  if (!name || !uid) {
-    return undefined;
-  }
   const node = nonEmpty(env[NODE_NAME_ENV]);
   const namespace = readServiceAccountFile("namespace", env);
-  return { name, uid, ...(node ? { node } : {}), ...(namespace ? { namespace } : {}) };
+  return name && uid && node && namespace ? { name, uid, node, namespace } : undefined;
 }
 
-/** The pod a lock body names: this process's pod, in pod mode only (see the 🛑 above). */
+/**
+ * WHERE AM I, for the lock rules (C1.1, C3.2 A-4). `control`: a control-role host without the agent
+ * pod's place file `.nv-agent`; `agent-pod`: a control-role host WITH it (an unreadable file counts
+ * as an agent pod — the fail-safe side); `elsewhere`: anything else (a workbench, a suite, a rig).
+ * Mirrors A1's `src/pod/placement.ts` (ap/a1-classes) behind this one function — on integration it
+ * delegates there. Test seam `ACPX_POD_TEST_HOME` (C1.1 A-6, under `NODE_TEST_CONTEXT` only):
+ * `<dir>` stands in for `/home/node` and the host counts as control-role.
+ */
+export type LockHostPlace = "control" | "agent-pod" | "elsewhere";
+export const POD_TEST_HOME_ENV = "ACPX_POD_TEST_HOME";
+export const CANONICAL_HOME = "/home/node";
+
+function testHome(env: NodeJS.ProcessEnv): string | undefined {
+  return env.NODE_TEST_CONTEXT ? nonEmpty(env[POD_TEST_HOME_ENV]) : undefined;
+}
+
+export function lockHostPlace(env: NodeJS.ProcessEnv = process.env): LockHostPlace {
+  const seam = testHome(env);
+  if (!seam && !isControlPod(env)) {
+    return "elsewhere";
+  }
+  try {
+    readFileSync(path.join(seam ?? CANONICAL_HOME, ".nv-agent"));
+    return "agent-pod";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "control" : "agent-pod";
+  }
+}
+
+function resolved(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+/**
+ * C1.1 A-5: pod mode is REQUESTED here (the switch, a control-role host, the state home resolving
+ * to the canonical one) — whether or not the identity is there. The lock module refuses to write a
+ * body without `pod` in that state (`PodIdentityMissingError`).
+ */
+export function podModeRequested(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (env[OWNER_PLACEMENT_ENV] !== "pod") {
+    return false;
+  }
+  const seam = testHome(env);
+  if (!seam && !isControlPod(env)) {
+    return false;
+  }
+  const home = path.join(env.ACPX_STATE_HOME || os.homedir(), ".acpx");
+  return resolved(home) === resolved(path.join(seam ?? CANONICAL_HOME, ".acpx"));
+}
+
+/** The pod a lock body names: this process's pod whenever it knows it (C1.1 A-5). */
 export function lockPodIdentity(env: NodeJS.ProcessEnv = process.env): PodIdentity | undefined {
-  return env[OWNER_PLACEMENT_ENV] === "pod" ? ownPodIdentity(env) : undefined;
+  return ownPodIdentity(env);
 }
 
 /** A `pod` field as read from a lock body or lease: name and uid required, the rest optional. */

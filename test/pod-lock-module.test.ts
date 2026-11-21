@@ -96,17 +96,19 @@ test("positive control: the fresh-process probe does see node:sqlite when someth
   assert.notDeepEqual(probe("control").control, []);
 });
 
-test("the agreed surface, exactly (EXPORT-lock-module.md v1) — change it only with both stream sub-HoDs", () => {
+test("the agreed surface, exactly (EXPORT-lock-module.md v2, additive to v1) — change it only with both stream sub-HoDs", () => {
   const result = probe();
   assert.equal(result.version, 1);
   assert.deepEqual(result.keys, [
     "DEATH_PROOF_TIMEOUT_MS",
     "POD_LOCK_API_VERSION",
     "RECORD_LOCK_BUDGET_MS",
+    "isRecordLockLost",
     "isRecordLockTimeout",
     "ownPodIdentity",
     "proveDeath",
     "sweepOwnPodLocks",
+    "updateRecordFile",
     "withRecordFileLock",
   ]);
 });

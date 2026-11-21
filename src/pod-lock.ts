@@ -13,9 +13,12 @@ export const POD_LOCK_API_VERSION = 1 as const;
 
 export {
   withRecordFileLock,
+  updateRecordFile,
   RECORD_LOCK_BUDGET_MS,
   isRecordLockTimeout,
+  isRecordLockLost,
 } from "./session/persistence/record-file-lock.js";
+export { type HeldLock } from "./session/persistence/identity-file-lock.js";
 export { proveDeath, DEATH_PROOF_TIMEOUT_MS, type DeathProof } from "./pod/death-proof.js";
 export { ownPodIdentity, type PodIdentity, type PodRef } from "./pod/identity.js";
 export {

@@ -9,25 +9,32 @@ import {
   KIT_NAMESPACE,
   makePod,
   makeServiceAccountDir,
+  makeTestHome,
   podEnv,
   runInPod,
   type KitPod,
+  type PodEnvOptions,
 } from "./pod-kit/two-pods.js";
 import { startFakeApi, type FakeApi } from "./pod-lock-fake-api.js";
 
-// C3.2 across two REAL processes with two pod identities over one directory (brick 8d85cb47,
-// TEST-PLAN NG-K7.2a/b/c at U). The cross-MACHINE run (control pod ↔ workbench over NFS) is the
-// evidence script under the brick's verification/ folder; the same kit drives it.
+// C3.2 as amended (A-4) across REAL processes with pod identities over one directory (brick
+// 8d85cb47, TEST-PLAN NG-K7.2a/b/c at U). A control pod and agent pods are told apart by the C1.1
+// test seam (`ACPX_POD_TEST_HOME`, `.nv-agent`). The cross-MACHINE run (control pod ↔ workbench over
+// NFS) is the evidence script under the brick's verification/ folder; the same kit drives it.
 
 const CHILD = fileURLToPath(new URL("./fixtures/pod-lock-child.js", import.meta.url));
 
 let api: FakeApi;
-let saDir: string;
 let root: string;
+let saDir: string;
+let control: KitPod;
+let controlHome: string;
 test.before(async () => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-twopods-"));
   saDir = makeServiceAccountDir(root);
   api = await startFakeApi(KIT_NAMESPACE);
+  control = makePod("control");
+  controlHome = makeTestHome(root, "control");
 });
 test.after(async () => {
   await api.close();
@@ -36,8 +43,26 @@ test.beforeEach(() => {
   api.state.pods.clear();
   api.state.nodes.clear();
   api.state.failure = undefined;
+  api.state.requests.length = 0;
 });
 
+function asControl(): PodEnvOptions {
+  return { saDir, apiUrl: api.url, testHome: controlHome, stateHome: root };
+}
+function asAgentPod(pod: KitPod): PodEnvOptions {
+  return {
+    saDir,
+    apiUrl: api.url,
+    testHome: makeTestHome(root, "agent-pod", pod),
+    stateHome: root,
+  };
+}
+function registerLive(...pods: KitPod[]): void {
+  for (const pod of pods) {
+    api.state.pods.set(pod.name, { uid: pod.uid, phase: "Running" });
+    api.state.nodes.set(pod.node, "True");
+  }
+}
 function deadBodyOf(pod: KitPod): string {
   return JSON.stringify({
     pid: 2_147_483_000,
@@ -46,14 +71,23 @@ function deadBodyOf(pod: KitPod): string {
     token: `t-${Math.random()}`,
   });
 }
+function ledger(pod: KitPod): Record<string, unknown>[] {
+  const file = path.join(root, ".acpx", "lock-breaks", `${pod.uid}.ndjson`);
+  return fs.existsSync(file)
+    ? fs
+        .readFileSync(file, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+    : [];
+}
 
-test("NG-K7.2a: a LIVE holder in pod A, its lock aged 10 min, is not broken by a waiter in pod B (proof: exists)", async () => {
+test("NG-K7.2a: a LIVE holder in agent pod A, its lock aged 10 min, is not broken by the control pod (proof: exists)", async () => {
   const a = makePod("a");
-  const b = makePod("b");
-  api.state.pods.set(a.name, { uid: a.uid, phase: "Running" });
+  registerLive(a, control);
   const lock = path.join(fs.mkdtempSync(path.join(root, "live-")), "x.json.lock");
   const holder = spawn(process.execPath, [CHILD, "hold", lock, "6000"], {
-    env: podEnv(a, { saDir, apiUrl: api.url }),
+    env: podEnv(a, asAgentPod(a)),
     stdio: ["ignore", "pipe", "pipe"],
   });
   let holderOut = "";
@@ -67,37 +101,47 @@ test("NG-K7.2a: a LIVE holder in pod A, its lock aged 10 min, is not broken by a
   const old = new Date(Date.now() - 10 * 60_000);
   fs.utimesSync(lock, old, old);
 
-  const waiter = await runInPod(b, CHILD, ["acquire", lock, "2500"], { saDir, apiUrl: api.url });
+  const waiter = await runInPod(control, CHILD, ["acquire", lock, "2500"], asControl());
   assert.equal(JSON.parse(waiter.stdout).timeout, true, waiter.stdout + waiter.stderr);
   assert.equal(waiter.stderr.includes("broke"), false);
   assert.equal(fs.readFileSync(lock, "utf8"), held, "still pod A's lock, byte for byte");
   assert.equal(await holderDone, 0);
   assert.equal(fs.existsSync(lock), false, "pod A released its own lock (it was never replaced)");
+  assert.deepEqual(ledger(control), []);
 });
 
-test("NG-K7.2b: pod A gone but its node NotReady → a waiter in pod B does not break (unknown is alive)", async () => {
+test("NEVER: a waiter in agent pod B does not break pod A's lock although A is proven gone — and never asks the API", async () => {
+  const a = makePod("a");
+  const b = makePod("b");
+  api.state.nodes.set(a.node, "True"); // A absent, its node Ready ⇒ gone, if anyone asked
+  const lock = path.join(fs.mkdtempSync(path.join(root, "agent-never-")), "x.json.lock");
+  const raw = deadBodyOf(a);
+  fs.writeFileSync(lock, raw);
+  const run = await runInPod(b, CHILD, ["acquire", lock, "1500"], asAgentPod(b));
+  assert.equal(JSON.parse(run.stdout).timeout, true, run.stdout + run.stderr);
+  assert.equal(fs.readFileSync(lock, "utf8"), raw);
+  assert.deepEqual(api.state.requests, [], "no request from an agent pod");
+  assert.deepEqual(ledger(b), []);
+});
+
+test("NG-K7.2b: pod A gone but its node NotReady → the control pod does not break (unknown is alive)", async () => {
   const a = makePod("a");
   api.state.nodes.set(a.node, "False");
   const lock = path.join(fs.mkdtempSync(path.join(root, "notready-")), "x.json.lock");
   const raw = deadBodyOf(a);
   fs.writeFileSync(lock, raw);
-  const run = await runInPod(makePod("b"), CHILD, ["acquire", lock, "1500"], {
-    saDir,
-    apiUrl: api.url,
-  });
+  const run = await runInPod(control, CHILD, ["acquire", lock, "1500"], asControl());
   assert.equal(JSON.parse(run.stdout).timeout, true);
   assert.equal(fs.readFileSync(lock, "utf8"), raw);
+  assert.ok(api.state.requests.length >= 2, "the control pod asked");
 });
 
-test("NG-K7.2c: 20 rounds × 12 breakers in two pods on a proven-dead pod-A holder — one break per round, never two inside", async () => {
+test("NG-K7.2c: 20 rounds × (6 control-pod + 6 agent-pod-B racers) on a proven-dead pod-A holder — one break per round, by the control pod, never two inside", async () => {
   const a = makePod("a");
-  const pods = [makePod("b"), makePod("c")];
+  const b = makePod("b");
   api.state.nodes.set(a.node, "True"); // pod A absent from the API, its node Ready ⇒ gone
-  for (const pod of pods) {
-    // The racers' own pods exist: a racer holding the lock is a LIVE foreign holder to the other pod.
-    api.state.pods.set(pod.name, { uid: pod.uid, phase: "Running" });
-    api.state.nodes.set(pod.node, "True");
-  }
+  registerLive(b, control); // the racers' own pods exist: a racer holding the lock is a LIVE holder
+  const bOptions = asAgentPod(b);
   for (let round = 0; round < 20; round += 1) {
     const dir = fs.mkdtempSync(path.join(root, `race-${round}-`));
     const markers = path.join(dir, "markers");
@@ -106,27 +150,19 @@ test("NG-K7.2c: 20 rounds × 12 breakers in two pods on a proven-dead pod-A hold
     fs.writeFileSync(lock, deadBodyOf(a));
     const runs = await Promise.all(
       Array.from({ length: 12 }, (_, i) =>
-        runInPod(pods[i % 2], CHILD, ["race", lock, markers, String(i), "20000"], {
-          saDir,
-          apiUrl: api.url,
-        }),
+        i % 2 === 0
+          ? runInPod(control, CHILD, ["race", lock, markers, `ctl${i}`, "20000"], asControl())
+          : runInPod(b, CHILD, ["race", lock, markers, `b${i}`, "20000"], bOptions),
       ),
     );
     for (const run of runs) {
       assert.equal(run.code, 0, run.stderr);
       assert.equal(JSON.parse(run.stdout).overlap, 0, `round ${round}: two racers inside`);
     }
-    const breaks = runs.map((run) => run.stderr.match(/proven gone/g)?.length ?? 0);
-    assert.equal(
-      breaks.reduce((x, y) => x + y, 0),
-      1,
-      `round ${round}: exactly one breaker broke the dead holder`,
-    );
-    assert.deepEqual(
-      fs.readdirSync(dir).filter((n) => n.includes(".tomb.")),
-      [],
-      `round ${round}`,
-    );
     assert.equal(fs.existsSync(lock), false, "the last racer released");
   }
+  const breaks = ledger(control);
+  assert.equal(breaks.length, 20, "exactly one break per round, all in the control pod's ledger");
+  assert.deepEqual([...new Set(breaks.map((line) => line.proof))], ["pod-gone"]);
+  assert.deepEqual(ledger(b), [], "agent pod B never broke anything");
 });
