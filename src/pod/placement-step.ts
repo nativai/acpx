@@ -94,6 +94,8 @@ export type PlacementDecision =
   | { kind: "branch"; branch: PodBranch; classification: Classification; place: Place }
   | { kind: "refuse-unclassified"; path: string }
   | { kind: "refuse-pod-identity" }
+  | { kind: "refuse-seam-sandbox" }
+  | { kind: "refuse-control-pod-only"; path: string }
   /** An agent pod, a target-dependent class: the session must be resolved before deciding. */
   | { kind: "resolve-target"; classification: Classification & { kind: "classified" } };
 
@@ -118,7 +120,9 @@ export function decidePlacement(params: {
     env: params.env,
   });
   if (params.verdict.mode === "refuse") {
-    return decideWithoutIdentity(classification);
+    return params.verdict.reason === "pod_identity_missing"
+      ? decideWithoutIdentity(classification)
+      : { kind: "refuse-seam-sandbox" };
   }
   if (classification.kind === "unclassified") {
     return { kind: "refuse-unclassified", path: classification.path };
@@ -139,13 +143,27 @@ function decideWithoutIdentity(classification: Classification): PlacementDecisio
     : { kind: "refuse-pod-identity" };
 }
 
+/** Help runs nothing; control-pod maintenance refuses in an agent pod (A-7). */
+function earlyDecision(
+  classification: Classification & { kind: "classified" },
+  podFile: AgentPodFile,
+): PlacementDecision | undefined {
+  if (classification.help) {
+    return { kind: "local", classification, place: placeOf(podFile, undefined) };
+  }
+  return classification.entry.controlPodOnly && podFile.kind !== "absent"
+    ? { kind: "refuse-control-pod-only", path: classification.path }
+    : undefined;
+}
+
 function decideClassified(
   classification: Classification & { kind: "classified" },
   podFile: AgentPodFile,
   resolvedTarget: string | null | undefined,
 ): PlacementDecision {
-  if (classification.help) {
-    return { kind: "local", classification, place: placeOf(podFile, undefined) };
+  const early = earlyDecision(classification, podFile);
+  if (early) {
+    return early;
   }
   const needsTarget = podFile.kind !== "absent" && routeDependsOnTarget(classification.class);
   if (needsTarget && resolvedTarget === undefined) {
@@ -161,11 +179,41 @@ function decideClassified(
 /** Exit code and stderr of a refusal, in the C7.2 wire format. */
 export type Refusal = { exitCode: number; lines: [string, string] };
 
+/** C7.2: the guards that fail closed exit 2 — none is a hold reason. */
 export const UNCLASSIFIED_EXIT_CODE = 2;
-/** `pod_identity_missing`: 75, the code agents and atrium read as "refused, nothing started". */
-export const POD_IDENTITY_EXIT_CODE = 75;
+export const POD_IDENTITY_EXIT_CODE = 2;
+export const CONTROL_POD_ONLY_EXIT_CODE = 2;
 /** A branch a later block builds: 2, like `unclassified_command` — a usage-level refusal. */
 export const UNBUILT_BRANCH_EXIT_CODE = 2;
+
+const POD_IDENTITY_REFUSAL: Refusal = {
+  exitCode: POD_IDENTITY_EXIT_CODE,
+  lines: [
+    "acpx: REFUSED reason=pod_identity_missing",
+    "ACPX_OWNER_PLACEMENT=pod is set on this control-role host but the pod identity (NV_POD_NAME, NV_POD_UID, NV_NODE_NAME, the service-account namespace) is incomplete; acpx refuses rather than run in either mode.",
+  ],
+};
+
+const SEAM_SANDBOX_REFUSAL: Refusal = {
+  exitCode: UNCLASSIFIED_EXIT_CODE,
+  lines: [
+    "acpx: REFUSED reason=test_seam_outside_sandbox",
+    "ACPX_POD_TEST_HOME is set but the state home in use is outside it; the test seam leads only into its sandbox.",
+  ],
+};
+
+function branchRefusal(decision: PlacementDecision & { kind: "branch" }): Refusal {
+  const c = decision.classification;
+  const path = c.kind === "classified" ? c.path : "";
+  const cls = c.kind === "classified" ? c.class : "unclassified";
+  return {
+    exitCode: UNBUILT_BRANCH_EXIT_CODE,
+    lines: [
+      `acpx: REFUSED reason=pod_branch_unbuilt nothing_started=true protocol=1 branch=${decision.branch} class=${cls} place=${decision.place} path=${path === "" ? "-" : path.replaceAll(" ", ".")}`,
+      `In pod mode this command takes the ${decision.branch} branch, which is not built yet (block ${BRANCH_OWNER[decision.branch]}); nothing was started.`,
+    ],
+  };
+}
 
 export function refusalFor(decision: PlacementDecision): Refusal | undefined {
   switch (decision.kind) {
@@ -177,26 +225,20 @@ export function refusalFor(decision: PlacementDecision): Refusal | undefined {
           `The command \`${decision.path}\` has no class in acpx's command table, so it does not run in pod mode.`,
         ],
       };
+    case "refuse-control-pod-only":
+      return {
+        exitCode: CONTROL_POD_ONLY_EXIT_CODE,
+        lines: [
+          "acpx: REFUSED reason=control_pod_only",
+          `\`${decision.path}\` is control-pod maintenance and does not run in an agent pod.`,
+        ],
+      };
     case "refuse-pod-identity":
-      return {
-        exitCode: POD_IDENTITY_EXIT_CODE,
-        lines: [
-          "acpx: REFUSED reason=pod_identity_missing nothing_started=true protocol=1",
-          "ACPX_OWNER_PLACEMENT=pod is set on this control-role host but NV_POD_UID is not; acpx refuses rather than run without a pod identity.",
-        ],
-      };
-    case "branch": {
-      const c = decision.classification;
-      const path = c.kind === "classified" ? c.path : "";
-      const cls = c.kind === "classified" ? c.class : "unclassified";
-      return {
-        exitCode: UNBUILT_BRANCH_EXIT_CODE,
-        lines: [
-          `acpx: REFUSED reason=pod_branch_unbuilt nothing_started=true protocol=1 branch=${decision.branch} class=${cls} place=${decision.place} path=${path === "" ? "-" : path.replaceAll(" ", ".")}`,
-          `In pod mode this command takes the ${decision.branch} branch, which is not built yet (block ${BRANCH_OWNER[decision.branch]}); nothing was started.`,
-        ],
-      };
-    }
+      return POD_IDENTITY_REFUSAL;
+    case "refuse-seam-sandbox":
+      return SEAM_SANDBOX_REFUSAL;
+    case "branch":
+      return branchRefusal(decision);
     default:
       return undefined;
   }

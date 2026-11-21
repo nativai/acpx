@@ -55,6 +55,8 @@ export type CommandEntry = {
   readonly fromRecordsWhen?: string;
   /** `owner-if-pod` only: a setting — on a session without a pod it is a record write (C1.2). */
   readonly setting?: true;
+  /** `local` only: control-pod maintenance — refuses in an agent pod (`control_pod_only`, A-7). */
+  readonly controlPodOnly?: true;
 };
 
 const SELECT = ["--session-id", "--session-url", "-s", "--session"] as const;
@@ -275,6 +277,7 @@ export const COMMAND_TABLE: Readonly<Record<string, CommandEntry>> = {
   "capacity run-build": {
     class: "local",
     reason: "control-pod maintenance — release builds (K2 `local`)",
+    controlPodOnly: true,
   },
   people: { class: "local", reason: "group: help only" },
   "people list": { class: "read", reason: "reads people.json" },
@@ -286,8 +289,16 @@ export const COMMAND_TABLE: Readonly<Record<string, CommandEntry>> = {
   },
   "people principal": { class: "read", reason: "reads a record" },
   governor: { class: "local", reason: "group: help only" },
-  "governor status": { class: "local", reason: "control-pod maintenance (K2 `local`)" },
-  "governor scan": { class: "local", reason: "control-pod maintenance (K2 `local`)" },
+  "governor status": {
+    class: "local",
+    reason: "control-pod maintenance (K2 `local`)",
+    controlPodOnly: true,
+  },
+  "governor scan": {
+    class: "local",
+    reason: "control-pod maintenance (K2 `local`)",
+    controlPodOnly: true,
+  },
   config: { class: "read", reason: "`config` = show" },
   "config show": { class: "read", reason: "reads config files" },
   "config init": { class: "control-store", reason: "writes the box's config file" },

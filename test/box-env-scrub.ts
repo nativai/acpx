@@ -146,12 +146,15 @@ export const NO_OS_COMPAT_LINK_PATH = "/nonexistent/acpx-test/operating-system-c
  * brick b479441f — pod mode (`ACPX_OWNER_PLACEMENT=pod`, C1.1) is BOX state: a box that sets it in
  * its control Deployment would hand it to every suite started there, and the pod identity with it.
  * The suite removes them, so "pod mode off" is a property of the repo; a row that needs pod mode
- * sets them in its own child env through the product's seam (`ACPX_TEST_POD_CANONICAL_HOME`).
+ * sets them in its own child env through the product's seam (`ACPX_POD_TEST_HOME`, C1.1 A-6).
  */
 export const POD_PLACEMENT_ENV = [
   "ACPX_OWNER_PLACEMENT",
-  "ACPX_TEST_POD_CANONICAL_HOME",
+  "ACPX_POD_TEST_HOME",
+  "ACPX_POD_SA_DIR",
+  "NV_POD_NAME",
   "NV_POD_UID",
+  "NV_NODE_NAME",
 ] as const;
 
 export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env): string[] {
