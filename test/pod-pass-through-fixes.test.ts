@@ -585,9 +585,6 @@ const VERBATIM_FLAGS: Readonly<Record<string, string>> = {
   "sessions archive --exclude-ids":
     "sessions archive: the scheduler's file on the control pod (control-pod only)",
   "sessions archive --manifest-out": "sessions archive: control-pod only",
-  "transcripts restore --to":
-    "operator maintenance of the control pod's own transcript store: the path as given (found by R2-N3: a sessions-archive exemption used to hide it)",
-  "sessions archive --to": "sessions archive: control-pod only",
   "sessions archive --cat": "sessions archive: control-pod only",
   "agent-folders migrate --pool":
     "agent-folders migrate: an operator's pool directory on the control pod",
@@ -613,15 +610,14 @@ test("the discovery bites: a fresh path-valued operand and flag, registered here
   );
 });
 
-test("R2-N3: a verbatim exemption is per command — `sessions archive --to` does not decide another command's `--to`", () => {
-  assert.ok("sessions archive --to" in VERBATIM_FLAGS);
+test("R2-N3: a verbatim exemption is per command — `sessions archive --manifest-out` does not decide another command's", () => {
+  assert.ok("sessions archive --manifest-out" in VERBATIM_FLAGS);
+  assert.ok("--to" in PATH_FLAG_RULES, "--to is a decided path flag, not an exemption");
   const program = new Command();
-  const other = program.command("restore").option("--to <path>", "write here");
-  assert.deepEqual(undecidedFlags("fresh-command", other), ["fresh-command --to"]);
+  const other = program.command("restore").option("--manifest-out <path>", "write here");
+  assert.deepEqual(undecidedFlags("fresh-command", other), ["fresh-command --manifest-out"]);
   assert.deepEqual(undecidedFlags("sessions archive", other), []);
 });
-
-// ─── O-4: progress during the wait; N-1 and O-2 live in their own files ──────────────────────────
 
 test("O-4: a 600 s wait prints a progress line every 30 s (attempt count, seconds left), never more often", async () => {
   let t = 0;
@@ -810,5 +806,40 @@ test("O-1: the --batch-file / --message-id scan stops at `--`: words after it ar
     );
     assert.equal(refused.status, 2);
     assert.match(refused.stderr, /prompt_option_not_routable/u);
+  });
+});
+
+// ─── --to: a write destination the caller must not choose on the control pod ─────────────────────
+
+test("a pod-side `transcripts restore --to /tmp/x` is refused path_not_shared, NOTHING sent; `sessions archive --to` likewise", async () => {
+  const { home } = agentPodHome();
+  await withAtrium({}, async (atrium) => {
+    const env = agentPodEnv(home, atrium.url, FAST);
+    for (const argv of [
+      ["transcripts", "restore", "x.exit-tail-2026.acpx", "--to", "/tmp/x"],
+      ["transcripts", "restore", "x.exit-tail-2026.acpx", "--to=/tmp/x"],
+      ["transcripts", "restore", "x.exit-tail-2026.acpx", "--to", "/workspace/../tmp/x"],
+      ["sessions", "archive", "--ids", "a", "--apply", "--to", "/tmp/x"],
+    ]) {
+      const r = await runCli(argv, env);
+      assert.equal(r.status, 2, `${argv.join(" ")}: ${r.stderr}`);
+      assert.equal(
+        r.stderr.split("\n")[0],
+        "acpx: REFUSED reason=path_not_shared nothing_started=true protocol=1",
+        argv.join(" "),
+      );
+    }
+    assert.equal(atrium.requests.length, 0, "not one request");
+    // Near-miss: under /workspace it is made absolute and passes through.
+    const ok = await runCli(
+      ["transcripts", "restore", "x.exit-tail-2026.acpx", "--to", "/workspace/out/x"],
+      env,
+    );
+    assert.equal(ok.status, 0, ok.stderr);
+    const call = atrium.requests.find((q) => q.route === "call");
+    assert.deepEqual((call?.body?.argv as string[] | undefined)?.slice(-2), [
+      "--to",
+      "/workspace/out/x",
+    ]);
   });
 });

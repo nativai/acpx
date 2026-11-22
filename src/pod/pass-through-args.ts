@@ -66,6 +66,13 @@ export const PATH_FLAG_RULES: Readonly<Record<string, PathRule>> = Object.freeze
   "--prompt-file": { carry: "stdin" },
   "--brief": { carry: "path", roots: BRIEF_SHARED_ROOTS, reason: "brief_not_shared" },
   "--os": OS_RULE,
+  /**
+   * ⚠️ A WRITE DESTINATION chosen by the caller (`transcripts restore --to`, `sessions archive --to`):
+   * through the pass-through an agent in a pod would choose where the CONTROL pod writes. So it is a
+   * path flag — absolute, real-path-checked, refused outside the shared roots. An operator who needs
+   * another place runs the command on the control pod directly; the pass-through is never the way.
+   */
+  "--to": { carry: "path", roots: BRIEF_SHARED_ROOTS, reason: "path_not_shared" },
 });
 
 /**
