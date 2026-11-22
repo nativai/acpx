@@ -6,6 +6,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { queueLockFilePath } from "./cli/queue/paths.js";
 import { isBoxWideFileInAgentPod } from "./pod/foreign-write-guard.js";
 import {
+  isTransientReadError,
   judgeSpawnState,
   readSpawnStateFile,
   spawnStatePath,
@@ -285,6 +286,25 @@ export function spawnIdempotencyKey(runId: string, fence: number): string {
  * admitted, so nothing may bind a ledger under it (brick 42b4fb28). Production never reaches this
  * state, because acpx-ui mints the record before it starts the trigger owner.
  */
+/**
+ * The RETRIED refusal for a read that failed transiently (see `isTransientReadError`), or undefined for any
+ * other error. It is `spawn-state-missing` — the code a caller already retries — on every read of the pod
+ * write path, whatever file it was (the spawn-state file, `instance.json`, the record).
+ */
+function transientReadRefusal(
+  error: unknown,
+  what: string,
+  file: string,
+): SpawnLedgerError | undefined {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return isTransientReadError(code)
+    ? new SpawnLedgerError(
+        "spawn-state-missing",
+        `${what} at ${file} could not be read just now (${String(code)}): retry`,
+      )
+    : undefined;
+}
+
 function admittedInstanceId(): string {
   const home = os.homedir();
   const file = path.join(home, ".acpx", "instance.json");
@@ -292,9 +312,14 @@ function admittedInstanceId(): string {
   try {
     identity = JSON.parse(fs.readFileSync(file, "utf8")) as typeof identity;
   } catch (error) {
-    throw new SpawnLedgerError(
-      "outbox-home-unadmitted",
-      `this HOME has no admitted instance identity at ${file}, so nothing may bind a spawn ledger under it: ${error instanceof Error ? error.message : String(error)}`,
+    // A transient read (a mount's hiccup, descriptors for a moment) says nothing about the identity: it
+    // is the RETRIED refusal, not the final "this HOME was never admitted" (O2-b).
+    throw (
+      transientReadRefusal(error, "instance.json", file) ??
+      new SpawnLedgerError(
+        "outbox-home-unadmitted",
+        `this HOME has no admitted instance identity at ${file}, so nothing may bind a spawn ledger under it: ${error instanceof Error ? error.message : String(error)}`,
+      )
     );
   }
   if (
@@ -431,7 +456,8 @@ function readRecordFile(file: string): DiskRecord | undefined {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return undefined;
     }
-    throw error;
+    // O2-b: a transient read of the record is the retried refusal too, not a raw errno.
+    throw transientReadRefusal(error, "the session record", file) ?? error;
   }
 }
 

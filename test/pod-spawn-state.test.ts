@@ -415,12 +415,17 @@ test("O-2: a transient read error (EIO, ESTALE, …) is the RETRIED spawn-state-
     "EAGAIN",
     "EBUSY",
     "EINTR",
-    "ENOTCONN",
+    // O2-a: resource pressure that passes is retried, not "fix the deploy"
+    "EMFILE",
+    "ENFILE",
+    "ENOMEM",
   ]) {
     const read = readSpawnStateFile("/x/id.spawn-state", failing(code));
     assert.ok(!read.ok && read.refusal.code === "spawn-state-missing", code);
   }
-  for (const code of ["EACCES", "EISDIR", "EMFILE", ""]) {
+  // O2-a: ENOTCONN on Linux is a dead FUSE/socket mount — it does NOT clear by itself, so "retry" would be
+  // the wrong advice; it is the not-retried refusal an operator reads.
+  for (const code of ["ENOTCONN", "EACCES", "EISDIR", ""]) {
     const read = readSpawnStateFile("/x/id.spawn-state", failing(code));
     assert.ok(!read.ok && read.refusal.code === "spawn-state-unsupported", `not retried: ${code}`);
   }
@@ -446,4 +451,69 @@ test("O-3: a HOME with no instance.json refuses outbox-home-unadmitted; one that
   fs.writeFileSync(instanceFile, JSON.stringify({ instance_id: INSTANCE, home: f.home }));
   f.writeState(f.published);
   await podWrite(f);
+});
+
+// ---- O2-b: the same transient mapping on EVERY read of the pod write path ------------------------------------
+
+/** Runs `run` with `fs.readFileSync` failing with `code` for paths ending in `suffix` (the writer's own reads). */
+async function withReadFailure<T>(suffix: string, code: string, run: () => Promise<T>): Promise<T> {
+  const real = fs.readFileSync;
+  fs.readFileSync = ((target: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+    if (typeof target === "string" && target.endsWith(suffix)) {
+      throw Object.assign(new Error(`${code}: read failed`), { code });
+    }
+    return (real as (...args: unknown[]) => unknown)(target, ...rest);
+  }) as typeof fs.readFileSync;
+  try {
+    return await run();
+  } finally {
+    fs.readFileSync = real;
+  }
+}
+
+const TRANSIENT = [
+  "EIO",
+  "ESTALE",
+  "ETIMEDOUT",
+  "EAGAIN",
+  "EBUSY",
+  "EINTR",
+  "EMFILE",
+  "ENFILE",
+  "ENOMEM",
+];
+
+for (const [what, suffix] of [
+  ["the spawn-state file", ".spawn-state"],
+  ["instance.json", "instance.json"],
+  ["the session record", `${ID}.json`],
+] as const) {
+  test(`O2-b: a transient read error on ${what} is the RETRIED spawn-state-missing, never final or a raw errno — and a permanent one is not`, async () => {
+    const f = adoptedAgentPod();
+    const before = f.recordBytes();
+    for (const code of TRANSIENT) {
+      await withReadFailure(suffix, code, async () => {
+        await assert.rejects(podWrite(f), refusedWith("spawn-state-missing"), code);
+      });
+    }
+    assert.equal(f.recordBytes(), before, "a refused write leaves the record as it was");
+    // negative: an error that does not heal is NOT relabelled retried. instance.json: the final refusal it
+    // always was; the spawn-state file: unsupported; the record: the raw error, as before.
+    const permanent: Record<string, (error: unknown) => boolean> = {
+      ".spawn-state": refusedWith("spawn-state-unsupported"),
+      "instance.json": refusedWith("outbox-home-unadmitted"),
+      [`${ID}.json`]: (error) => (error as { code?: string }).code === "EACCES",
+    };
+    await withReadFailure(suffix, "EACCES", async () => {
+      await assert.rejects(podWrite(f), permanent[suffix]);
+    });
+    // twin: with no failure injected the same write goes through
+    await podWrite(f);
+  });
+}
+
+test("O2-b: ENOENT keeps its meaning on each read — no instance.json is the FINAL outbox-home-unadmitted, no record is a first write", async () => {
+  const f = adoptedAgentPod();
+  fs.rmSync(path.join(f.home, ".acpx", "instance.json"));
+  await refuses(f, "outbox-home-unadmitted");
 });

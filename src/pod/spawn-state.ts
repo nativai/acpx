@@ -127,10 +127,16 @@ export function parseSpawnState(raw: string): SpawnStateRead {
 }
 
 /**
- * Read errors a network mount raises and then stops raising (NFS: a stale handle, an I/O error, a
- * timeout). They say nothing about the file, so — like "no file yet" — they refuse as the RETRIED
- * `spawn-state-missing` (O-2); any other error (a permission, a directory in its place) is not going
- * to heal and stays `spawn-state-unsupported`.
+ * Read errors that say nothing about the file and stop on their own — so, like "no file yet", they are
+ * the RETRIED `spawn-state-missing`, on EVERY read of the pod write path (this file, `instance.json`, the
+ * record). Two families: a network mount's hiccups (NFS: `ESTALE`, `EIO`, `ETIMEDOUT`, `EAGAIN`, `EBUSY`,
+ * `EINTR`) and resource pressure that passes (`EMFILE`, `ENFILE`, `ENOMEM` — descriptors or memory run out
+ * for a moment; acpx retries at the next checkpoint anyway).
+ *
+ * ⚠️ `ENOTCONN` IS NOT ON THIS LIST: on Linux it is a dead FUSE/socket mount, which does NOT clear by
+ * itself — "retry" would be the wrong advice. It stays `spawn-state-unsupported` (not retried; an
+ * operator looks at the mount). Any other error (a permission, a directory in its place) is not going to
+ * heal either. Held by `test/pod-spawn-state.test.ts` ("O2-a").
  */
 const TRANSIENT_READ_ERRORS: ReadonlySet<string> = new Set([
   "EIO",
@@ -139,8 +145,14 @@ const TRANSIENT_READ_ERRORS: ReadonlySet<string> = new Set([
   "EAGAIN",
   "EBUSY",
   "EINTR",
-  "ENOTCONN",
+  "EMFILE",
+  "ENFILE",
+  "ENOMEM",
 ]);
+
+export function isTransientReadError(code: string | undefined): boolean {
+  return code !== undefined && TRANSIENT_READ_ERRORS.has(code);
+}
 
 /**
  * Reads `<id>.spawn-state`. Absent, or a transient read error ⇒ `spawn-state-missing` (retried); any
@@ -155,7 +167,7 @@ export function readSpawnStateFile(
     raw = read(file);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code ?? "";
-    if (code === "ENOENT" || TRANSIENT_READ_ERRORS.has(code)) {
+    if (code === "ENOENT" || isTransientReadError(code)) {
       return {
         ok: false,
         refusal: {
