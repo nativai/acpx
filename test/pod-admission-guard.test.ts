@@ -940,7 +940,7 @@ test("K4-2 / FN-3: the unfollowable SITES in src/ today are exactly the register
       );
     }
     // and a duplicate of an existing registered call text raises its count
-    const [firstKey] = Object.keys(KNOWN_NON_LEDGER_UNFOLLOWABLE).filter((key) =>
+    const firstKey = Object.keys(KNOWN_NON_LEDGER_UNFOLLOWABLE).find((key) =>
       key.startsWith(`${rel} | `),
     );
     const written = (firstKey ?? "").split(" | ").slice(2).join(" | ");

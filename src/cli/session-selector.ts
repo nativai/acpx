@@ -1,4 +1,5 @@
 import { InvalidArgumentError, type Command } from "commander";
+import { DEFAULT_AGENT_NAME, listKnownAgentSelectorNames } from "../agent-registry.js";
 import {
   normalizeName,
   parseSeatRefOrThrow,
@@ -231,22 +232,46 @@ export class NoSessionError extends Error {
 // one thing they may actually want (AC-ID2). The ADVISED form is one that runs: `acpx <agent> --session-id <id> <text>`
 // (measured; `test/no-session-hint.test.ts` runs it). The root takes no `--session-id` — `acpx --session-id X <text>` is
 // `unknown option` — so the hint must never advise the flag before the agent (brick 56f5d869).
-export function noSessionIdMessage(agentName: string): string {
+export type NoSessionAgentContext = {
+  /** `config.agents`: agents the user configured beyond the built-in registry. */
+  agents?: Record<string, string>;
+  /** `config.defaultAgent`: the agent a bare `acpx <text>` resolves to. */
+  defaultAgent?: string;
+};
+
+// The bare form `acpx hello` reads its first word as the agent. When that word is no agent at all (not built in, not an
+// alias, not configured) the create line must not advise `acpx hello sessions new` — that is `Failed to spawn agent
+// command: hello` and writes nothing (lows-r2 TE FN-1, measured) — it names a REAL agent: the configured default, else the
+// built-in default.
+function adviseableAgentName(agentName: string, context: NoSessionAgentContext): string {
+  const known = new Set([
+    ...listKnownAgentSelectorNames(context.agents),
+    ...Object.keys(context.agents ?? {}),
+  ]);
+  if (known.has(agentName)) {
+    return agentName;
+  }
+  const fallback = context.defaultAgent ?? DEFAULT_AGENT_NAME;
+  return known.has(fallback) ? fallback : DEFAULT_AGENT_NAME;
+}
+
+export function noSessionIdMessage(agentName: string, context: NoSessionAgentContext = {}): string {
   return (
     `⚠ No acpx session found: no session id was given. Every acpx call names its session by id — ` +
     `pass --session-id <id> (or --session-url <url>) AFTER the agent name, as in ` +
     `acpx <agent> --session-id <id> <text> (the bare form takes no such flag: it reads its first word as the agent).` +
-    `\nNo session yet? Create one: acpx ${agentName} sessions new`
+    `\nNo session yet? Create one: acpx ${adviseableAgentName(agentName, context)} sessions new`
   );
 }
 
 export async function requireExplicitSessionRecord(
   selector: SessionTargetSelector,
   agentName: string,
+  context: NoSessionAgentContext = {},
 ): Promise<SessionRecord> {
   const record = await resolveExplicitSessionRecord(selector);
   if (!record) {
-    throw new NoSessionError(noSessionIdMessage(agentName));
+    throw new NoSessionError(noSessionIdMessage(agentName, context));
   }
   return record;
 }
