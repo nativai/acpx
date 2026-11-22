@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import { isAcpJsonRpcMessage } from "../acp/jsonrpc.js";
 import { incrementPerfCounter, measurePerf } from "../perf-metrics.js";
+import { lockHostPlace } from "../pod/identity.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
 import { DELIVERY_EVENT_METHOD } from "./delivery-events.js";
 import {
@@ -17,14 +18,23 @@ import {
   writeSessionRecordAtBoundary,
 } from "./persistence.js";
 import {
-  identityLockBody,
+  acquireIdentityFileLock,
+  assertLockHeld,
   judgeLockHolder,
+  releaseIdentityFileLock,
   removeLockIfUnchanged,
-  tryCreateLockFile,
+  type IdentityLockPolicy,
 } from "./persistence/identity-file-lock.js";
 
-const LOCK_RETRY_MS = 15;
 const EVENT_LOCK_STALE_MS = 15_000;
+/** The waiter's budget on the stream lock (A5's primitive; no unbounded wait, no proceed-unlocked). */
+export const STREAM_LOCK_BUDGET_MS = 20_000;
+/**
+ * C10: the largest single write to a stream file. A larger flush is cut into parts of at most this
+ * many bytes with a data sync between them, so a reader on another machine sees a growing partial
+ * line, never a hole (the spike: a 4 MiB append arrived as four requests, out of order).
+ */
+export const STREAM_WRITE_PART_BYTES = 1024 * 1024;
 
 // Adapter heartbeats, delivery notifications, and ACPX status chrome are
 // persisted to the stream (so the live per-session transcript + debug see them),
@@ -175,7 +185,35 @@ async function rotateSegments(sessionId: string, maxSegments: number): Promise<v
   await renameTolerantOfMissingSource(active, segmentEventPath(sessionId, 1));
 }
 
-type LockHandle = {
+/**
+ * C10's writer rule, one open-append-close: the buffer goes out in ONE write when it fits
+ * STREAM_WRITE_PART_BYTES, otherwise in parts of at most that size with a data sync after each part but
+ * the last — so a large flush shows on another machine as a growing partial line, never a hole.
+ */
+export async function appendInParts(
+  filePath: string,
+  data: Buffer,
+  partBytes: number = STREAM_WRITE_PART_BYTES,
+): Promise<void> {
+  const handle = await fs.open(filePath, "a");
+  try {
+    for (let from = 0; from < data.length; ) {
+      const to = Math.min(data.length, from + partBytes);
+      let at = from;
+      while (at < to) {
+        at += (await handle.write(data, at, to - at, null)).bytesWritten;
+      }
+      from = to;
+      if (from < data.length) {
+        await handle.datasync();
+      }
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+export type LockHandle = {
   filePath: string;
   content: string;
 };
@@ -202,24 +240,58 @@ function parseEventLockPayload(raw: string): EventLockPayload {
 }
 
 /**
- * May this stream lock be taken over now? (brick ae547131 §6.4)
- * - a holder the shared identity rules prove GONE (dead in the reader's own pid namespace) — at
- *   once, as before;
- * - ANY holder older than EVENT_LOCK_STALE_MS by its `created_at` — including a LIVE local one.
- *   That is a deliberate non-change: the lock is held for a writer's lifetime, and making it strict
- *   would block the CLI direct path behind a long turn (CONCEPT R11, a separate follow-up).
- * What changed: a holder in ANOTHER pid namespace is no longer stolen because its pid reads ESRCH
- * here — it is judged by age only. `created_at` must stay in the body: without it a pre-0a reader
- * computes an infinite age and steals at once.
+ * May this stream lock be taken over by the local, age-based rule? (brick ae547131 §6.4; G1 of block A8)
+ * - a body WITHOUT `pod` (a process that cannot name its pod — never in an agent pod, A-25) keeps
+ *   today's rules: a holder the shared identity rules prove GONE at once, and ANY holder older than
+ *   EVENT_LOCK_STALE_MS by its `created_at` — a deliberate non-change (R11);
+ * - a body WITH `pod` is NEVER broken by age, in any pod (C3.2 A-4): the same pod's holder only when
+ *   its process is gone; another pod's holder is `unjudgeable` here, and is broken only by the
+ *   primitive's proof of its pod's death, by the control pod (`acquireEventsLock`).
+ * `created_at` must stay in the body: without it a pre-0a reader computes an infinite age and steals
+ * at once.
  */
 export function isStreamLockStealable(raw: string, nowMs: number = Date.now()): boolean {
   const parsed = parseEventLockPayload(raw);
+  if (parsed.body && Object.hasOwn(parsed.body, "pod")) {
+    return judgeLockHolder(parsed.body) === "breakable";
+  }
   const createdAtMs = parsed.created_at ? Date.parse(parsed.created_at) : Number.NaN;
   const lockAgeMs = Number.isFinite(createdAtMs) ? nowMs - createdAtMs : Number.POSITIVE_INFINITY;
   return lockAgeMs > EVENT_LOCK_STALE_MS || judgeLockHolder(parsed.body) === "breakable";
 }
 
-async function removeStaleEventLock(lockPath: string): Promise<boolean> {
+export const STREAM_LOCK_TIMEOUT_CODE = "stream-lock-timeout";
+class StreamLockTimeoutError extends Error {
+  readonly code = STREAM_LOCK_TIMEOUT_CODE;
+  constructor(
+    lockPath: string,
+    readonly holder: string,
+  ) {
+    super(
+      `stream lock ${lockPath} is held for over ${STREAM_LOCK_BUDGET_MS} ms by ${holder}; ` +
+        `refusing to write the stream without it`,
+    );
+  }
+}
+
+const STREAM_LOCK_POLICY: IdentityLockPolicy = {
+  label: "session stream lock",
+  budgetMs: STREAM_LOCK_BUDGET_MS,
+  staleMs: EVENT_LOCK_STALE_MS,
+  pollMaxMs: 100,
+  legacyBody: () => ({ pid: process.pid, created_at: new Date().toISOString() }),
+  makeTimeoutError: (lockPath, holder) => new StreamLockTimeoutError(lockPath, holder),
+};
+
+/**
+ * Today's age rule for a holder WITHOUT `pod`, applied after the primitive's budget ran out: the
+ * primitive never breaks a LIVE local holder, the stream lock always did after 15 s (R11). Not in an
+ * agent pod (nothing there breaks a body without `pod`, A-25), and never for a body that carries `pod`.
+ */
+async function breakAgedLocalStreamLock(lockPath: string): Promise<boolean> {
+  if (lockHostPlace() === "agent-pod") {
+    return false;
+  }
   try {
     const payload = await fs.readFile(lockPath, "utf8");
     if (!isStreamLockStealable(payload)) {
@@ -229,44 +301,37 @@ async function removeStaleEventLock(lockPath: string): Promise<boolean> {
     incrementPerfCounter("session.events.stale_lock_recovered");
     return true;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return true;
-    }
-    return false;
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
   }
 }
 
-async function acquireEventsLock(sessionId: string): Promise<LockHandle> {
+/** The stream lock is A5's primitive (brick 8d85cb47) under the stream policy: pod-aware judging, a bounded wait. */
+export async function acquireEventsLock(
+  sessionId: string,
+  budgetMs: number = STREAM_LOCK_BUDGET_MS,
+): Promise<LockHandle> {
   await ensureSessionDir();
   const lockPath = eventsLockPath(sessionId);
-  const payload = JSON.stringify(
-    identityLockBody({
-      pid: process.pid,
-      created_at: new Date().toISOString(),
-    }),
-    null,
-    2,
-  );
-
   for (;;) {
-    // Created atomically WITH its body (temp + link): a pre-0a reader that caught a `writeFile(wx)`
-    // lock mid-write parsed an empty body as a dead holder and stole it.
-    if (await tryCreateLockFile(lockPath, `${payload}\n`)) {
-      return { filePath: lockPath, content: `${payload}\n` };
+    try {
+      return {
+        filePath: lockPath,
+        content: await acquireIdentityFileLock(lockPath, { ...STREAM_LOCK_POLICY, budgetMs }),
+      };
+    } catch (error) {
+      if (
+        !(error instanceof StreamLockTimeoutError) ||
+        !(await breakAgedLocalStreamLock(lockPath))
+      ) {
+        throw error;
+      }
     }
-    const recovered = await removeStaleEventLock(lockPath);
-    if (recovered) {
-      continue;
-    }
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, LOCK_RETRY_MS);
-    });
   }
 }
 
 async function releaseEventsLock(lock: LockHandle): Promise<void> {
-  // Compare-and-delete: a writer whose lock was taken over after 15 s must not delete its successor's.
-  await removeLockIfUnchanged(lock.filePath, lock.content);
+  // Compare-and-delete: a writer whose lock was taken over must not delete its successor's.
+  await releaseIdentityFileLock(lock.filePath, lock.content);
 }
 
 type SessionEventWriterOptions = {
@@ -355,56 +420,77 @@ export class SessionEventWriter {
 
     await ensureSessionDir();
 
-    // eslint-disable-next-line complexity -- the activity-neutral marker guard adds a branch to the per-message write; keeping the batch write inline avoids hot-path indirection
     await measurePerf("session.events.append_batch", async () => {
+      // Validate the whole batch BEFORE the first byte is written: a bad frame fails the flush, never half of it.
       for (const message of messages) {
         if (!isAcpJsonRpcMessage(message)) {
           throw new Error("Attempted to persist invalid ACP JSON-RPC payload");
         }
+      }
 
-        const line = `${JSON.stringify(message)}\n`;
-        const lineBytes = Buffer.byteLength(line);
-        if (this.activeSizeBytes > 0 && this.activeSizeBytes + lineBytes > this.maxSegmentBytes) {
+      // C10 / A-14: ONE write per flush. The lines bound for the active file are gathered and written
+      // together; only a rotation (a different file) ends a group early.
+      let group: { message: AcpJsonRpcMessage; line: Buffer }[] = [];
+      const writeGroup = async (): Promise<void> => {
+        if (group.length === 0) {
+          return;
+        }
+        const written = group;
+        group = [];
+        // C3.2 A-4: the holder checks its lock immediately before it publishes.
+        await assertLockHeld(this.lock.filePath, this.lock.content);
+        await appendInParts(this.activePath, Buffer.concat(written.map((entry) => entry.line)));
+        for (const entry of written) {
+          this.noteWritten(entry.message);
+        }
+      };
+
+      for (const message of messages) {
+        const line = Buffer.from(`${JSON.stringify(message)}\n`, "utf8");
+        if (this.activeSizeBytes > 0 && this.activeSizeBytes + line.length > this.maxSegmentBytes) {
+          await writeGroup();
           await rotateSegments(this.record.acpxRecordId, this.maxSegments);
           this.activePath = activeEventPath(this.record.acpxRecordId);
           this.activeSizeBytes = 0;
           this.segmentCount = Math.min(this.segmentCount + 1, this.maxSegments);
           incrementPerfCounter("session.events.rotate");
         }
-
-        await fs.appendFile(this.activePath, line, "utf8");
-        this.activeSizeBytes += lineBytes;
-
-        this.record.lastSeq += 1;
-        if (Object.hasOwn(message, "id")) {
-          const id = (message as { id?: unknown }).id;
-          if (typeof id === "string" || typeof id === "number") {
-            this.record.lastRequestId = String(id);
-          }
-        }
-        // Activity-neutral markers (adapter heartbeats) are persisted above for the
-        // live transcript + debug, but advance neither last_write_at nor lastUsedAt
-        // — so a heartbeat during a silent turn can't reset acpx-ui's wedge clock.
-        // Structural eventLog fields still track any rotation done while writing it.
-        const neutral = isActivityNeutralEventMessage(message);
-        const writeTs = new Date().toISOString();
-        if (!neutral) {
-          this.record.lastUsedAt = writeTs;
-        }
-        this.record.eventLog = {
-          active_path: this.activePath,
-          segment_count: this.segmentCount,
-          max_segment_bytes: this.maxSegmentBytes,
-          max_segments: this.maxSegments,
-          last_write_at: neutral ? this.record.eventLog.last_write_at : writeTs,
-          last_write_error: null,
-        };
+        group.push({ message, line });
+        this.activeSizeBytes += line.length;
       }
+      await writeGroup();
     });
 
     if (options.checkpoint === true) {
       await writeSessionRecord(this.record);
     }
+  }
+
+  /** The record's bookkeeping for one frame that is now on disk. */
+  private noteWritten(message: AcpJsonRpcMessage): void {
+    this.record.lastSeq += 1;
+    if (Object.hasOwn(message, "id")) {
+      const id = (message as { id?: unknown }).id;
+      if (typeof id === "string" || typeof id === "number") {
+        this.record.lastRequestId = String(id);
+      }
+    }
+    // Activity-neutral markers (adapter heartbeats) are persisted for the live transcript + debug,
+    // but advance neither last_write_at nor lastUsedAt — so a heartbeat during a silent turn can't
+    // reset acpx-ui's wedge clock. Structural eventLog fields still track any rotation.
+    const neutral = isActivityNeutralEventMessage(message);
+    const writeTs = new Date().toISOString();
+    if (!neutral) {
+      this.record.lastUsedAt = writeTs;
+    }
+    this.record.eventLog = {
+      active_path: this.activePath,
+      segment_count: this.segmentCount,
+      max_segment_bytes: this.maxSegmentBytes,
+      max_segments: this.maxSegments,
+      last_write_at: neutral ? this.record.eventLog.last_write_at : writeTs,
+      last_write_error: null,
+    };
   }
 
   /** Persist the record. The write merges against the disk image it reads right before its rename. */

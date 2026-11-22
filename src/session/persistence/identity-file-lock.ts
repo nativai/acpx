@@ -802,6 +802,7 @@ const SWEPT_LOCKS: ReadonlyArray<{ suffix: string; staleMs: number }> = [
   { suffix: ".json.lock", staleMs: 15_000 }, // record, index, seats
   { suffix: ".lock.guard", staleMs: 10_000 }, // lease guard
   { suffix: ".acpx-stage.lock", staleMs: 120_000 }, // fork-source stage lock
+  { suffix: ".stream.lock", staleMs: 15_000 }, // session stream writer lock (A8, G1)
 ];
 
 export type PodLockSweepResult = { removed: string[] };
