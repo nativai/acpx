@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { callerIdentityFrom } from "./caller-identity.js";
 import type { Classification, OutputMode } from "./command-classes.js";
+import { isClaudePtyCommand } from "./harness-support.js";
 import {
   registerBranchHandler,
   type BranchContext,
@@ -195,6 +196,18 @@ export async function dispatchUtility(
   }
   const argv = deps.argv();
   const agentCommand = await deps.agentCommandOf(classification, argv);
+  // A-39: the terminal harness has no pod — neither a utility pod nor a record's answer stands in for one.
+  if (isClaudePtyCommand(agentCommand)) {
+    const { RoutedCallError } = await import("./pod-refusal.js");
+    return await deps.fail(
+      new RoutedCallError({
+        outcome: "not_run",
+        reason: "harness_unsupported",
+        callId: randomUUID(),
+      }),
+      classification.output,
+    );
+  }
   if (await answerableFromRecords(classification, argv, agentCommand, deps)) {
     return "proceed";
   }

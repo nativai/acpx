@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { callerIdentityFrom } from "./caller-identity.js";
 import type { Classification, OutputMode } from "./command-classes.js";
+import { isClaudePtyCommand } from "./harness-support.js";
 import {
   registerBranchHandler,
   type BranchContext,
@@ -235,7 +236,10 @@ async function readyOrFail(
     return await notRun("target_unresolved", decision.classification.output, deps);
   }
   const harness = deps.harnessOf(record.agentCommand);
-  if (routedClass === "owner-ensure" && (harness === undefined || !HARNESSES.has(harness))) {
+  if (
+    routedClass === "owner-ensure" &&
+    (isClaudePtyCommand(record.agentCommand) || harness === undefined || !HARNESSES.has(harness))
+  ) {
     return await notRun("harness_unsupported", decision.classification.output, deps);
   }
   return { record, classification, argv };
