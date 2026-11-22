@@ -8,7 +8,13 @@ import { KIT_TOKEN } from "./pod-kit/two-pods.js";
  * the smallest thing that serves the C3.3 table until it lands.
  */
 
-export type FakePod = { uid: string; phase: string };
+export type FakePod = {
+  uid: string;
+  phase: string;
+  /** Optional status detail, for the terminal-reason rows (A4): container states and the pod's own reason. */
+  containerStatuses?: unknown[];
+  reason?: string;
+};
 export type FakeApiState = {
   pods: Map<string, FakePod>;
   /** node name → its Ready condition status ("True" / "False" / "Unknown"). Missing ⇒ 404. */
@@ -76,7 +82,11 @@ export async function startFakeApi(namespace: string): Promise<FakeApi> {
           apiVersion: "v1",
           metadata: { name, namespace, uid: found.uid },
           spec: { nodeName: "some-node" },
-          status: { phase: found.phase },
+          status: {
+            phase: found.phase,
+            ...(found.reason ? { reason: found.reason } : {}),
+            ...(found.containerStatuses ? { containerStatuses: found.containerStatuses } : {}),
+          },
         }),
       );
       return;

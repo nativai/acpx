@@ -1,6 +1,19 @@
 import { randomInt, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import {
+  proveDeathDetailed,
+  type DeathProofDetail,
+  type PodTerminal,
+} from "../../pod/death-proof.js";
+import { lockHostPlace, parsePodRef, type PodRef } from "../../pod/identity.js";
+import {
+  isOwnPod,
+  leasePodFields,
+  podSocketDir,
+  podSocketPath,
+  type LeasePodFields,
+} from "../../pod/owner-pod.js";
+import {
   classifyRecordedIdentity,
   getOwnProcessIdentity,
   getOwnProcessScope,
@@ -40,6 +53,7 @@ import { tryCreateLockFile } from "../../session/persistence/identity-file-lock.
 import { pingQueueSocket, type QueueSocketPing } from "./ipc-transport.js";
 import { isQueueLeaseGuardTimeout, withQueueLeaseMutation } from "./lease-mutation.js";
 import {
+  MAX_QUEUE_SOCKET_PATH_BYTES,
   isReapableQueueSocketPath,
   isSharedQueueSocketPath,
   queueBaseDir,
@@ -106,6 +120,14 @@ export type QueueOwnerRecord = {
   settingsRebind?: 1;
   /** See {@link ownerSupportsBatchSubmit}. */
   protocolFeatures?: readonly string[];
+  /** C3.1: the agent pod that wrote this lease. Never absent in an agent pod (A-25). */
+  pod?: PodRef;
+  /** C3.1: `pool` | `home`, from the pod's `NV_AGENT_PLACEMENT`. */
+  placement?: "pool" | "home";
+  /** C3.1: the C2 version the writer's acpx speaks. */
+  routedContract?: number;
+  /** C3.1: the pinned release name of the writer's acpx (C9). */
+  acpxRelease?: string;
 };
 
 export type QueueOwnerLease = {
@@ -118,6 +140,10 @@ export type QueueOwnerLease = {
   host?: string;
   settingsRebind?: 1;
   protocolFeatures?: readonly string[];
+  pod?: LeasePodFields["pod"];
+  placement?: LeasePodFields["placement"];
+  routedContract?: number;
+  acpxRelease?: string;
 };
 
 export type QueueOwnerStatus = {
@@ -165,8 +191,10 @@ export type QueueOwnerLiveness = {
   /** `local` — judged by pid + start ticks; `foreign` — by time; `legacy` — pre-0a lease, today's rule. */
   scope: QueueOwnerScope | null;
   host: string | null;
-  /** Why a foreign owner reads dead: `foreign-stale-no-listener` (row F4). */
+  /** Why a foreign owner reads dead: `foreign-stale-no-listener` (row F4), `pod-gone`, `pod-terminal`. */
   deathReason?: string;
+  /** C3.3 + A4: the pod whose death was proven, and (when its object was still readable) why it ended. */
+  podEnd?: { pod: PodRef; terminal?: PodTerminal };
 };
 
 export type QueueOwnerSkipReason = "foreign-owner" | "identity-unverified";
@@ -251,6 +279,21 @@ function parseQueueOwnerRecord(raw: unknown): QueueOwnerRecord | null {
     ...(typeof record.host === "string" ? { host: record.host } : {}),
     ...(record.settingsRebind === 1 ? { settingsRebind: 1 as const } : {}),
     ...protocolFeaturesField(record.protocolFeatures),
+    ...podFieldsOf(record),
+  };
+}
+
+/** C3.1's four pod fields as read from a lease file; each is kept only when well formed. */
+function podFieldsOf(
+  record: Record<string, unknown>,
+): Pick<QueueOwnerRecord, "pod" | "placement" | "routedContract" | "acpxRelease"> {
+  const pod = parsePodRef(record.pod);
+  const { placement, routedContract, acpxRelease } = record;
+  return {
+    ...(pod ? { pod } : {}),
+    ...(placement === "pool" || placement === "home" ? { placement } : {}),
+    ...(isPositiveInteger(routedContract) ? { routedContract } : {}),
+    ...(typeof acpxRelease === "string" ? { acpxRelease } : {}),
   };
 }
 
@@ -378,14 +421,18 @@ export async function readQueueOwnerRecord(
 
 /** `matchesQueueOwner` (port of openclaw/acpx 92cd5f8d): one tenure of one owner process. */
 export function matchesQueueOwner(
-  lease: Pick<QueueOwnerLease, "sessionId" | "ownerGeneration">,
+  lease: Pick<QueueOwnerLease, "sessionId" | "ownerGeneration" | "pod">,
   record: QueueOwnerRecord,
   pid: number = process.pid,
 ): boolean {
+  // C3.1: a lease is refreshed and released only inside the pod it names — two pods can share a pid.
+  const podUid = lease.pod?.uid;
+  const samePod = podUid === undefined || record.pod === undefined || record.pod.uid === podUid;
   return (
     record.sessionId === lease.sessionId &&
     record.pid === pid &&
-    record.ownerGeneration === lease.ownerGeneration
+    record.ownerGeneration === lease.ownerGeneration &&
+    samePod
   );
 }
 
@@ -409,7 +456,7 @@ async function ensureQueueDir(): Promise<void> {
   const baseDir = queueBaseDir();
   await fs.mkdir(baseDir, { recursive: true, mode: 0o700 });
   await fs.chmod(baseDir, 0o700);
-  const socketDirs = [queueSocketBaseDir(), queueSharedSocketDir()];
+  const socketDirs = [queueSocketBaseDir(), queueSharedSocketDir(), podSocketDir()];
   for (const socketDir of socketDirs) {
     if (socketDir && process.platform !== "win32") {
       await fs.mkdir(socketDir, { recursive: true, mode: 0o700 });
@@ -718,6 +765,66 @@ async function judgeForeignLease(
   };
 }
 
+/**
+ * C3.1 / C3.3: a lease that NAMES A POD, read from outside that pod. Never judged by pid (a pid means
+ * nothing across pods) and never by a socket ping (its socket is pod-local):
+ *
+ *   fresh heartbeat (≤ 15 s)               → alive (no API call needed)
+ *   stale, reader is the control pod       → the death proof: `gone` is dead_owner (the ONLY way a
+ *                                            pod's lease is ever reaped); `exists` is alive;
+ *                                            `unknown` is "cannot be told" — alive everywhere
+ *   stale, reader is anywhere else         → cannot be told: an agent pod, a workbench or a rig never
+ *                                            asks the API server about a lease holder (C3.3 A-4)
+ *
+ * A lease whose `pod.uid` is not the uid of the pod now under that name is dead — the proof's own
+ * rule (a pod of the name with another uid is "no pod with that uid").
+ */
+async function judgePodLease(
+  sessionId: string,
+  owner: QueueOwnerRecord,
+  pod: PodRef,
+): Promise<LeaseJudgement> {
+  const base = baseLiveness(sessionId, owner, "foreign");
+  const fresh = isFresh(base.heartbeatAgeMs, QUEUE_OWNER_STALE_HEARTBEAT_MS);
+  const proof = fresh ? undefined : await proofFromControlPod(pod);
+  if (proof?.answer === "gone") {
+    return { liveness: { ...base, ...podLeaseRow(proof, pod) } };
+  }
+  return {
+    liveness: {
+      ...base,
+      ...NO_LOCAL_FACTS,
+      state: "foreign_owner",
+      recoverable: false,
+      alive: fresh || proof?.answer === "exists" ? true : null,
+    },
+    skipReason: isOwnProcessScopeVerified() ? "foreign-owner" : "identity-unverified",
+  };
+}
+
+/** What a pod lease never has: a pid of this namespace, a pingable socket, a matched identity. */
+const NO_LOCAL_FACTS = {
+  pidAlive: false,
+  socketReachable: null,
+  processIdentityMatched: null,
+} as const;
+
+function podLeaseRow(proof: Extract<DeathProofDetail, { answer: "gone" }>, pod: PodRef) {
+  return {
+    ...NO_LOCAL_FACTS,
+    state: "dead_owner" as const,
+    recoverable: true,
+    alive: false as const,
+    deathReason: proof.proof,
+    podEnd: { pod, ...(proof.terminal ? { terminal: proof.terminal } : {}) },
+  };
+}
+
+/** The API server is asked ONLY on the control pod (C3.3 A-4); anywhere else there is no proof. */
+async function proofFromControlPod(pod: PodRef): Promise<DeathProofDetail | undefined> {
+  return lockHostPlace() === "control" ? await proveDeathDetailed(pod) : undefined;
+}
+
 function leaseScopeFor(recorded: RecordedIdentity): QueueOwnerScope | "scope-only-local" {
   if (!isOwnProcessScopeVerified()) {
     // §3.3: with an unverified own scope every lease takes the foreign rows, legacy included.
@@ -733,6 +840,9 @@ function leaseScopeFor(recorded: RecordedIdentity): QueueOwnerScope | "scope-onl
 }
 
 async function judgeLease(sessionId: string, owner: QueueOwnerRecord): Promise<LeaseJudgement> {
+  if (owner.pod && !isOwnPod(owner.pod)) {
+    return await judgePodLease(sessionId, owner, owner.pod);
+  }
   const recorded = classifyRecordedIdentity(owner.processIdentity);
   const scope = leaseScopeFor(recorded);
   if (scope === "local" && recorded.kind === "birth") {
@@ -894,6 +1004,16 @@ function ownLeaseIdentity(): { processIdentity?: QueueOwnerProcessIdentity } {
   return identity ? { processIdentity: serializeProcessBirthIdentity(identity) } : {};
 }
 
+/** The pod fields a lease writes (C3.1): absent ones are not written, so a podless lease is today's. */
+function podPayloadFields(lease: QueueOwnerLease): Partial<QueueOwnerLease> {
+  return {
+    ...(lease.pod ? { pod: lease.pod } : {}),
+    ...(lease.placement ? { placement: lease.placement } : {}),
+    ...(lease.routedContract ? { routedContract: lease.routedContract } : {}),
+    ...(lease.acpxRelease ? { acpxRelease: lease.acpxRelease } : {}),
+  };
+}
+
 function leasePayload(lease: QueueOwnerLease, heartbeatAt: string, queueDepth: number): string {
   return `${JSON.stringify(
     {
@@ -908,6 +1028,7 @@ function leasePayload(lease: QueueOwnerLease, heartbeatAt: string, queueDepth: n
       ...(lease.host ? { host: lease.host } : {}),
       ...(lease.settingsRebind ? { settingsRebind: lease.settingsRebind } : {}),
       ...(lease.protocolFeatures ? { protocolFeatures: lease.protocolFeatures } : {}),
+      ...podPayloadFields(lease),
     },
     null,
     2,
@@ -952,10 +1073,14 @@ async function acquireUnderGuard(
   nowIsoFactory: () => string,
 ): Promise<QueueOwnerLease | undefined> {
   const createdAt = nowIsoFactory();
+  // A-25: in an agent pod a lease without `pod` is never written — this throws BEFORE the file exists.
+  const podFields = leasePodFields();
   const lease: QueueOwnerLease = {
     sessionId,
     lockPath: queueLockFilePath(sessionId),
-    socketPath: queueSocketPath(sessionId),
+    // C3.1: pod-local `/run/acpx/q/<key>.sock` in every agent pod, today's path elsewhere.
+    socketPath: podSocketPath(sessionId, MAX_QUEUE_SOCKET_PATH_BYTES) ?? queueSocketPath(sessionId),
+    ...podFields,
     createdAt,
     ownerGeneration: createOwnerGeneration(),
     ...ownLeaseIdentity(),

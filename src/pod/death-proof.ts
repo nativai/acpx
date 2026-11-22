@@ -228,8 +228,55 @@ function podPath(namespace: string, name: string): string {
 
 /** The proof with its reason — what a break line records (C3.2 A-4: `pod-gone` | `pod-terminal`). */
 export type DeathProofDetail =
-  | { answer: "gone"; proof: "pod-gone" | "pod-terminal" }
+  | { answer: "gone"; proof: "pod-gone" | "pod-terminal"; terminal?: PodTerminal }
   | { answer: "exists" | "unknown" };
+
+/**
+ * Why a TERMINAL pod ended, read from the pod object the API server still holds (a Job keeps its pod
+ * for `ttlSecondsAfterFinished`, C4): the container's terminated reason (`OOMKilled`, `Error`,
+ * `Completed`), else the pod's own `status.reason` (`Evicted`, …), else its phase. A pod that is
+ * simply absent has no object to read, so a `pod-gone` proof carries none (A4: agent-pod OOMs are
+ * invisible to the control pod's governor, so the reason is recorded on the session when we can read it).
+ */
+export type PodTerminal = { reason: string; exitCode?: number };
+
+function terminatedStates(status: Record<string, unknown> | undefined): Record<string, unknown>[] {
+  const statuses = status?.containerStatuses;
+  if (!Array.isArray(statuses)) {
+    return [];
+  }
+  return statuses.flatMap((entry) => {
+    const container = record(entry);
+    return [
+      record(record(container?.state)?.terminated),
+      record(record(container?.lastState)?.terminated),
+    ].filter((terminated): terminated is Record<string, unknown> => terminated !== undefined);
+  });
+}
+
+function namedReason(entry: Record<string, unknown>): entry is Record<string, unknown> & {
+  reason: string;
+} {
+  return typeof entry.reason === "string" && entry.reason !== "";
+}
+
+/** The pod's own reason (`Evicted`, …), else its phase — when no container says why. */
+function podLevelReason(status: Record<string, unknown> | undefined): string {
+  const reason = status?.reason;
+  if (typeof reason === "string" && reason !== "") {
+    return reason;
+  }
+  return typeof status?.phase === "string" ? status.phase : "terminal";
+}
+
+function terminalOf(pod: Record<string, unknown> | undefined): PodTerminal {
+  const status = record(pod?.status);
+  const named = terminatedStates(status).filter(namedReason);
+  // A failure outranks "Completed": the container that was killed names the cause.
+  const chosen = named.find((entry) => entry.reason !== "Completed") ?? named[0];
+  const reason = chosen?.reason ?? podLevelReason(status);
+  return typeof chosen?.exitCode === "number" ? { reason, exitCode: chosen.exitCode } : { reason };
+}
 
 /** C3.3. Configured from the process's in-cluster service account; at most two GETs. */
 export async function proveDeath(
@@ -258,9 +305,10 @@ async function askApi(
   pod: PodRef,
   signal: AbortSignal,
 ): Promise<DeathProofDetail> {
-  const podVerdict = judgePod(await apiGet(config, podPath(namespace, pod.name), signal), pod);
+  const podAnswer = await apiGet(config, podPath(namespace, pod.name), signal);
+  const podVerdict = judgePod(podAnswer, pod);
   if (podVerdict === "terminal") {
-    return { answer: "gone", proof: "pod-terminal" };
+    return { answer: "gone", proof: "pod-terminal", terminal: terminalOf(answerBody(podAnswer)) };
   }
   if (podVerdict !== "absent") {
     return { answer: podVerdict };
