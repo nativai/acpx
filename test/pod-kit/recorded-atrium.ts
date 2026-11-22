@@ -15,14 +15,15 @@
 //   away     the in-pod forwarder's answer: 503, `Retry-After: 5`, body {"error":"atrium-away"};
 //   refused  the port refuses connections (the listener is closed; open connections are cut);
 //   hang     accepts and never answers;
-//   forbidden the caller gate's final 403 (C6.1: no client retries it) — `{"error":"forbidden"}` on every route.
+//   forbidden the caller gate's final 403 (C6.1: no client retries it) — the real CALLER_NOT_ALLOWED body, on every
+//             route the gate guards (the hints are `public`: they are never refused).
 // A script is a list of phases, each for a time (`forMs`) or a number of answered requests
 // (`forRequests`), the last one for ever — "away for N seconds, then back" is
 // `[{mode:"away", forMs:N}, {mode:"normal"}]`; "away for the first 3 attempts" is
 // `[{mode:"away", forRequests:3}, {mode:"normal"}]`, which needs no clock at all and is how a
 // test compresses the client's 600 s budget (the budget override itself lives in the client).
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
 import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
@@ -39,40 +40,55 @@ export interface AtriumPhase {
   forRequests?: number;
 }
 
-/** What /api/acpx/call answers. */
+/** What a scripted run of acpx answers (the pass-through wraps it: `{exit, stdout, stderr, delivery?}`), or a whole HTTP answer. */
 export type CallAnswer =
-  | { exit: number; stdout?: string; stderr?: string; delivery?: Record<string, unknown> }
+  | { exit: number; stdout?: string; stderr?: string }
   | { status: number; body: unknown };
 
 export interface CallRule {
-  /** The call's argv must start with this. Default: any call. */
+  /** The argv acpx is RUN with (after atrium took a create's first message out) must start with this. Default: any. */
   argvPrefix?: string[];
   answer: CallAnswer;
-  /** The rule serves this many calls, then is spent (default: for ever). */
+  /** The rule serves this many runs, then is spent (default: for ever). */
   times?: number;
-  /** Run the call (record it, remember its answer) but cut the connection before answering. */
+  /** Run the call (its effects are kept: the recorded first message) but cut the connection before answering. */
   loseAnswer?: boolean;
 }
 
 export interface AtriumScript {
   phases?: AtriumPhase[];
-  /** Rules for /api/acpx/call, first matching unspent rule wins. Default answer: exit 0, empty. */
+  /** Rules for the runs of `/api/acpx/call`, first matching unspent rule wins. Default answer: exit 0, empty. */
   calls?: CallRule[];
   /**
    * Answers of the two message routes: `answers` are used in order (one per message), then `default`
-   * (itself default `"queued"`).
+   * (itself default `"queued"`). `seats` maps a seat id to its holder's record id (the answer's `to` on the seat
+   * route; default: a uuid derived from the seat) and `seatOf` a session id to the seat it holds (the session
+   * route's `to_seat`; default: none).
    */
-  messages?: { answers?: MessageAnswer[]; default?: MessageAnswer };
-  /** Answer of the two hints. Default 200 `{"ok":true}` (atrium may add fields such as `redriven`; a reader ignores them). */
-  hints?: { status?: number; body?: unknown };
+  messages?: {
+    answers?: MessageAnswer[];
+    default?: MessageAnswer;
+    seats?: Record<string, string>;
+    seatOf?: Record<string, string>;
+  };
+  /** Answers of the hints; `redriven` is the number the ready hint reports (default 0). Default status 200. */
+  hints?: { status?: number; body?: unknown; redriven?: number };
+  /** The first message of a create is held for room: `delivery.held` (atrium's answer for a held first item). */
+  firstMessageHold?: { reason: string; ahead?: number };
+  /**
+   * Who is calling, as atrium's gate classifies the peer: `local` (default) or `agent-pod`. With `agent-pod`,
+   * `agentPod` names the pod: a session pod (`sessionKey`) may claim only the caller whose record id hashes to
+   * that key; a `utility` pod claims no caller at all — else `403 {"error":"caller-mismatch"}`.
+   */
+  callerClass?: "local" | "agent-pod";
+  agentPod?: { sessionKey?: string; utility?: boolean };
 }
 
 /**
- * Atrium's message answer (acpx-ui `server/message-routes.ts` `messageAnswer`, as the atrium sub-HoD gave it):
- * EVERY accepted message is **202** `{delivery_id, from, to, to_seat?, status:"queued"}` — `status` is always
- * "queued". `"held"` / `{held:{reason, ahead?}}`: the same, ALSO carrying `held:{reason, ahead?}` and
- * `message:"<sentence>"` (reason default `pod_starting`, or `agent_cap`). `{status, body}` — any other
- * answer, verbatim (a 403 `caller-mismatch`, …).
+ * Atrium's message answer (acpx-ui `server/message-routes.ts` `messageAnswer`): EVERY accepted message is
+ * **202** `{delivery_id, from, to, to_seat?, status:"queued"}` — `status` is always "queued". `"held"` /
+ * `{held:{reason, ahead?}}`: the same, ALSO carrying `held:{since, reason, ahead}` and `message:<heldSentence>`
+ * (reason default `pod_starting`, or `agent_cap`). `{status, body}` — any other answer, verbatim.
  */
 export type MessageAnswer =
   | "queued"
@@ -89,15 +105,27 @@ export type MessageAnswer =
 export const INHERIT_ALLOWED: readonly string[] = ["ACPX_SUBSCRIPTION", "ATRIUM_OS"];
 
 /**
- * The create paths that take `--record-id` and `--created-by-call` — `RECORD_ID_CREATE_PATHS` in
- * src/pod/pass-through-args.ts, copied for the same reason and guarded by the same kind of self-test.
- * `sessions handover` is the create form that carries neither flag, by design (C6.2).
+ * Atrium decides what is a create from acpx's CLASS TABLE (`verdict.class === "create"` and not `sessions
+ * handover`, passThrough.ts:563). The kit loads that table's `classifyCall` when it can (compiled, in-process:
+ * `dist-test/src/pod/command-classes.js`) and otherwise — bare `node recorded-atrium.ts` — falls back to this copy
+ * of the create paths. The self-test compares the copy with the class table.
  */
-export const RECORD_ID_CREATE_PATHS: readonly string[] = [
+export const CREATE_PATHS: readonly string[] = [
   "sessions new",
   "sessions copy",
   "sessions import",
+  "sessions handover",
 ];
+
+/** What atrium needs of acpx's `classifyCall` (the shape of its answer, read by `passability`). */
+export interface CallClassification {
+  kind: string;
+  path?: string;
+  class?: string;
+  help?: boolean;
+  targetSessionId?: string | null;
+}
+export type Classify = (argv: readonly string[]) => Promise<CallClassification>;
 
 export type AtriumRoute =
   | "call"
@@ -117,22 +145,28 @@ export interface AtriumRequestRecord {
   target: string | null;
   headers: Record<string, string>;
   bodyText: string;
+  /** The body as atrium's `express.json` sees it: parsed only for `Content-Type: application/json`, else null. */
   body: Record<string, unknown> | null;
   /** The call's stdin_b64, decoded as utf-8; null when absent. */
   stdin: string | null;
-  /** Departures from C6.2 / C6.3's request shapes, by name; the fake answers anyway. */
+  /** The argv acpx was RUN with (a create's first message taken out), null when nothing ran. */
+  ranArgv: string[] | null;
+  /** Departures from C6.2 / C6.3 that atrium itself does not refuse: `cwd_present`, a hint's shape. */
   problems: string[];
   mode: AtriumMode;
-  /** What the fake did: answered | away | cut | replayed | lost_answer | hang … */
+  /** What the fake did: answered | refused:<error> | replayed | lost_answer | away | forbidden | hang … */
   outcome: string;
   status: number | null;
   /** /api/acpx/call only. */
   callId: string | null;
+  /** A create whose first message was already recorded under this call id (answered `delivery.replay:true`). */
   replayed: boolean;
 }
 
-interface StoredCall {
-  answer: CallAnswer;
+interface RecordedItem {
+  /** The sender the item was recorded for (the caller's record id). */
+  sender: string;
+  text: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -145,57 +179,311 @@ function isString(value: unknown): value is string {
 
 const MAX_STDIN_BYTES = 8 * 1024 * 1024;
 const MAX_DEADLINE_MS = 60_000;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DELIVERY_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const ADMISSION_CLASSES: ReadonlySet<string> = new Set([
+  "interactive",
+  "delivery",
+  "automation",
+  "spawn",
+]);
 
-function validateCall(body: Record<string, unknown>): string[] {
-  const problems: string[] = [];
-  if (body.contract !== 1) {
-    problems.push("contract");
+interface Refusal {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+interface CallBody {
+  callId: string;
+  argv: string[];
+  stdin: Buffer | null;
+  caller: { session_url: string; record_id: string; seat_url?: string } | null;
+  inherit: Record<string, string>;
+}
+
+const bad = (error: string, extra: Record<string, unknown> = {}): Refusal => ({
+  status: 400,
+  body: { error, ...extra },
+});
+
+/** acpx-ui `server/acpxCall/passThrough.ts` `parseCallBody` — the same checks in the same order. */
+function parseCallBody(
+  raw: unknown,
+): { ok: true; body: CallBody } | { ok: false; refusal: Refusal } {
+  const b: Record<string, unknown> = isRecord(raw) ? raw : {};
+  const fail = (refusal: Refusal) => ({ ok: false as const, refusal });
+  if (b.contract !== 1) {
+    return fail(bad("unsupported-contract", { contract: b.contract ?? null }));
   }
-  if (!isString(body.call_id)) {
-    problems.push("call_id");
+  const callId = b.call_id;
+  if (typeof callId !== "string" || !UUID_RE.test(callId)) {
+    return fail(bad("bad-call-id"));
   }
-  if (!Array.isArray(body.argv) || !body.argv.every((entry) => typeof entry === "string")) {
-    problems.push("argv");
+  const argv = b.argv;
+  if (!Array.isArray(argv) || argv.length === 0 || !argv.every((a) => typeof a === "string")) {
+    return fail(bad("bad-argv"));
   }
-  if (body.stdin_b64 !== undefined) {
-    if (typeof body.stdin_b64 !== "string" || !/^[A-Za-z0-9+/]*={0,2}$/.test(body.stdin_b64)) {
-      problems.push("stdin_b64");
-    } else if (Buffer.from(body.stdin_b64, "base64").length > MAX_STDIN_BYTES) {
-      problems.push("stdin_b64_too_large");
+  let stdin: Buffer | null = null;
+  if (b.stdin_b64 !== undefined) {
+    const encoded = b.stdin_b64;
+    if (
+      typeof encoded !== "string" ||
+      !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) ||
+      encoded.length % 4 !== 0
+    ) {
+      return fail(bad("bad-stdin"));
     }
-  }
-  // A-9: the pass-through carries NO cwd. Atrium ignores one if sent; the kit still names it, so a
-  // client that sends it is visible to the test.
-  if (body.cwd !== undefined) {
-    problems.push("cwd_present");
-  }
-  const caller = body.caller;
-  if (!isRecord(caller)) {
-    problems.push("caller");
-  } else {
-    for (const field of ["session_url", "record_id"]) {
-      if (!isString(caller[field])) {
-        problems.push(`caller.${field}`);
-      }
+    // the decoded size from the length, before decoding: an oversize body is refused without allocating it
+    const decoded =
+      (encoded.length / 4) * 3 - (encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0);
+    if (decoded > MAX_STDIN_BYTES) {
+      return fail({
+        status: 413,
+        body: { error: "stdin-too-large", limit_bytes: MAX_STDIN_BYTES },
+      });
     }
-    // seat_url, like the parents, is optional (a session without a seat) — as atrium's parser has it.
+    stdin = Buffer.from(encoded, "base64");
+  }
+  const rawCaller = b.caller ?? null;
+  let caller: CallBody["caller"] = null;
+  if (rawCaller !== null) {
+    const c = rawCaller as Record<string, unknown>;
+    const str = (value: unknown): boolean => typeof value === "string" && value.trim() !== "";
+    if (
+      typeof rawCaller !== "object" ||
+      !str(c.session_url) ||
+      typeof c.record_id !== "string" ||
+      !UUID_RE.test(c.record_id)
+    ) {
+      return fail(bad("bad-caller"));
+    }
     for (const field of ["seat_url", "parent_session_url", "parent_seat_url"]) {
-      if (caller[field] !== undefined && !isString(caller[field])) {
-        problems.push(`caller.${field}`);
+      if (c[field] !== undefined && !str(c[field])) {
+        return fail(bad("bad-caller", { field }));
       }
     }
+    caller = {
+      session_url: c.session_url as string,
+      record_id: c.record_id.toLowerCase(),
+      ...(c.seat_url ? { seat_url: c.seat_url as string } : {}),
+    };
   }
-  if (!isString(body.admission_class)) {
-    problems.push("admission_class");
-  }
+  const admission = b.admission_class;
   if (
-    typeof body.deadline_ms !== "number" ||
-    !(body.deadline_ms > 0) ||
-    body.deadline_ms > MAX_DEADLINE_MS
+    admission !== undefined &&
+    (typeof admission !== "string" || !ADMISSION_CLASSES.has(admission))
   ) {
-    problems.push("deadline_ms");
+    return fail(bad("bad-admission-class"));
   }
-  return problems;
+  const rawInherit = b.inherit ?? {};
+  if (typeof rawInherit !== "object" || rawInherit === null || Array.isArray(rawInherit)) {
+    return fail(bad("bad-inherit"));
+  }
+  const inherit: Record<string, string> = {};
+  for (const [name, value] of Object.entries(rawInherit)) {
+    if (typeof value !== "string") {
+      return fail(bad("inherit-not-string", { name }));
+    }
+    inherit[name] = value;
+  }
+  const deadline = b.deadline_ms ?? MAX_DEADLINE_MS;
+  if (
+    typeof deadline !== "number" ||
+    !Number.isInteger(deadline) ||
+    deadline < 1 ||
+    deadline > MAX_DEADLINE_MS
+  ) {
+    return fail(bad("bad-deadline", { max_ms: MAX_DEADLINE_MS }));
+  }
+  // `cwd` (A-9) is deliberately not read.
+  return {
+    ok: true,
+    body: { callId: callId.toLowerCase(), argv, stdin, caller, inherit },
+  };
+}
+
+/** `--flag value` and `--flag=value`: every occurrence with its index span; stops at `--` (passThrough.ts `findFlag`). */
+function findFlag(
+  argv: readonly string[],
+  flag: string,
+): Array<{ index: number; span: number; value: string | undefined }> {
+  const out: Array<{ index: number; span: number; value: string | undefined }> = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index] ?? "";
+    if (arg === "--") {
+      break;
+    }
+    if (arg === flag) {
+      out.push({ index, span: 2, value: argv[index + 1] });
+    } else if (arg.startsWith(`${flag}=`)) {
+      out.push({ index, span: 1, value: arg.slice(flag.length + 1) });
+    }
+  }
+  return out;
+}
+
+type PreparedCreate =
+  | { ok: true; argv: string[]; recordId: string; message: string | null; stdinUsed: boolean }
+  | { ok: false; refusal: Refusal };
+
+/** passThrough.ts `prepareCreate`: the checks of a create's flags, and the first message taken out in place. */
+function prepareCreate(
+  argv: readonly string[],
+  stdin: Buffer | null,
+  callId: string,
+): PreparedCreate {
+  const fail = (refusal: Refusal): PreparedCreate => ({ ok: false, refusal });
+  const ids = findFlag(argv, "--record-id");
+  const first = ids[0];
+  if (ids.length !== 1 || first?.value === undefined || !UUID_RE.test(first.value)) {
+    return fail(bad("record-id-required"));
+  }
+  const recordId = first.value.toLowerCase();
+  // A-27: the client owns both flags; a `--created-by-call` that is not `call_id` is refused.
+  if (findFlag(argv, "--created-by-call").some((f) => f.value?.toLowerCase() !== callId)) {
+    return fail(bad("call-id-mismatch"));
+  }
+  const prompts = findFlag(argv, "--prompt");
+  const promptFiles = findFlag(argv, "--prompt-file");
+  if (prompts.length + promptFiles.length > 1) {
+    return fail(bad("more-than-one-first-message"));
+  }
+  let message: string | null = null;
+  let stdinUsed = false;
+  const prompt = prompts[0];
+  const promptFile = promptFiles[0];
+  if (prompt !== undefined) {
+    if (prompt.value === undefined) {
+      return fail(bad("bad-argv", { flag: "--prompt" }));
+    }
+    message = prompt.value;
+  } else if (promptFile !== undefined) {
+    // the file lives in the caller's pod; the server never reads a caller's path
+    if (promptFile.value !== "-") {
+      return fail(bad("class-not-passable", { reason: "file-argument", flag: "--prompt-file" }));
+    }
+    if (stdin === null) {
+      return fail(bad("stdin-required", { flag: "--prompt-file" }));
+    }
+    message = stdin.toString("utf8");
+    stdinUsed = true;
+  }
+  const drop = new Set<number>();
+  for (const f of [...prompts, ...promptFiles]) {
+    for (let k = 0; k < f.span; k += 1) {
+      drop.add(f.index + k);
+    }
+  }
+  return {
+    ok: true,
+    argv: argv.filter((_, index) => !drop.has(index)),
+    recordId,
+    message,
+    stdinUsed,
+  };
+}
+
+/** Fallback when acpx's class table cannot be loaded (bare process): the create paths, else control-store. */
+const fallbackClassify: Classify = async (argv) => {
+  // acpx's classifier reads a leading `acpx` as an agent name and classifies what follows
+  const rest = argv[0] === "acpx" ? argv.slice(1) : argv;
+  const words = rest.filter((word) => !word.startsWith("-"));
+  const path = `${words[0] ?? ""} ${words[1] ?? ""}`.trim();
+  if (words.length === 0) {
+    return { kind: "unclassified", path };
+  }
+  return {
+    kind: "classified",
+    path,
+    class: CREATE_PATHS.includes(path) ? "create" : "control-store",
+    help: rest.includes("--help") || rest.includes("-h"),
+  };
+};
+
+let loadedClassify: Classify | null | undefined;
+async function defaultClassify(): Promise<Classify> {
+  if (loadedClassify === undefined) {
+    try {
+      // compiled, in acpx's suite: dist-test/src/pod/command-classes.js; from bare source it does not resolve
+      const module = (await import("../../src/pod/command-classes.js")) as {
+        classifyCall: Classify;
+      };
+      loadedClassify = module.classifyCall;
+    } catch {
+      loadedClassify = null;
+    }
+  }
+  return loadedClassify ?? fallbackClassify;
+}
+
+/** commandClasses.ts `passability`. */
+function passability(
+  c: CallClassification,
+  callerRecordId: string,
+): { ok: true; class: string } | { ok: false; reason: string } {
+  if (c.kind !== "classified") {
+    return { ok: false, reason: "unclassified" };
+  }
+  if (c.help === true) {
+    return { ok: false, reason: "help" };
+  }
+  if (c.class === "create" || c.class === "control-store") {
+    return { ok: true, class: c.class };
+  }
+  if (c.class === "record" || c.class === "owner-if-pod") {
+    if (c.targetSessionId === undefined || c.targetSessionId === null || c.targetSessionId === "") {
+      return { ok: false, reason: "target-unresolved" };
+    }
+    if (c.targetSessionId === callerRecordId) {
+      return { ok: false, reason: "own-session" };
+    }
+    return { ok: true, class: c.class };
+  }
+  return { ok: false, reason: "class" };
+}
+
+const SHARED_ROOTS = ["/workspace", "/wisdom", "/spaces", "/opt/atrium-os", "/home/node/.acpx"];
+
+/** A handover's `--brief` is read on the control pod: absolute, under a shared root (passThrough.ts `handoverBriefShared`). */
+function handoverBriefShared(argv: readonly string[]): boolean {
+  for (const f of findFlag(argv, "--brief")) {
+    if (f.value === undefined) {
+      continue;
+    }
+    if (
+      !f.value.startsWith("/") ||
+      !SHARED_ROOTS.some((root) => f.value === root || f.value?.startsWith(`${root}/`) === true)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function uuidFromText(text: string): string {
+  const hex = createHash("sha256").update(text).digest("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+function sessionKeyOfRecord(recordId: string): string {
+  return createHash("sha256").update(recordId).digest("hex").slice(0, 24);
+}
+
+/** capacityHold.ts `heldSentence` (the two reasons a pod hold has; any other reads as "no room"). */
+function heldSentence(
+  reason: string,
+  deliveryId: string,
+  recipient: string,
+  ahead: number,
+): string {
+  const place = ahead <= 0 ? "next in line" : `${String(ahead)} ahead`;
+  if (reason === "pod_starting") {
+    return `Starting (delivery ${deliveryId}): ${recipient}'s agent is starting; the message is stored and is delivered as soon as it is ready. Nothing more to do — it is not a failure.`;
+  }
+  if (reason === "agent_cap") {
+    return `Queued for room (delivery ${deliveryId}): ${recipient} has no running agent and the box cannot start another agent now (${place}). The message is stored, survives restarts, and is delivered when an agent ends, together with everything else waiting for ${recipient}. Nothing more to do — it is not a failure.`;
+  }
+  return `Queued for room (delivery ${deliveryId}): ${recipient} has no running agent and the box has no room to start one now (${place}). The message is stored, survives restarts, and is delivered when room frees, together with everything else waiting for ${recipient}. Nothing more to do — it is not a failure.`;
 }
 
 function validateHint(kind: "ready" | "ended", body: Record<string, unknown>): string[] {
@@ -241,7 +529,9 @@ export class RecordedAtrium {
   private readonly server: Server;
   private readonly sockets = new Set<Socket>();
   private readonly startedAt = Date.now();
-  private readonly callAnswers = new Map<string, StoredCall>();
+  /** The first-message items recorded under a call id (atrium's delivery store): what makes a repeat a replay. */
+  private readonly items = new Map<string, RecordedItem>();
+  private readonly classifyOverride: Classify | undefined;
   private readonly rulesLeft = new Map<CallRule, number>();
   private phases: AtriumPhase[] = [{ mode: "normal" }];
   private messagesAnswered = 0;
@@ -252,8 +542,9 @@ export class RecordedAtrium {
   private boundPort = 0;
   private hostName = "127.0.0.1";
 
-  constructor(script: AtriumScript = {}) {
+  constructor(script: AtriumScript = {}, classify?: Classify) {
     this.script = script;
+    this.classifyOverride = classify;
     this.server = createServer((request, response) => {
       this.handle(request, response).catch((error: unknown) => {
         if (!response.headersSent) {
@@ -313,7 +604,7 @@ export class RecordedAtrium {
 
   reset(): void {
     this.requests.length = 0;
-    this.callAnswers.clear();
+    this.items.clear();
     this.messagesAnswered = 0;
   }
 
@@ -410,6 +701,7 @@ export class RecordedAtrium {
       bodyText: "",
       body: null,
       stdin: null,
+      ranArgv: null,
       problems: [],
       mode: this.mode,
       outcome: "pending",
@@ -421,11 +713,20 @@ export class RecordedAtrium {
       record.headers[name] = Array.isArray(value) ? value.join(", ") : (value ?? "");
     }
     record.bodyText = await readBody(request);
-    try {
-      const parsed: unknown = JSON.parse(record.bodyText);
-      record.body = isRecord(parsed) ? parsed : null;
-    } catch {
-      record.body = null;
+    // `express.json()` (the global parser): only `Content-Type: application/json` is parsed, anything else
+    // leaves `req.body = {}`; a malformed JSON body is the framework's own 400.
+    let malformed = false;
+    if (
+      path.startsWith("/_kit/") ||
+      /^application\/json\b/i.test(record.headers["content-type"] ?? "")
+    ) {
+      try {
+        const parsed: unknown = JSON.parse(record.bodyText);
+        record.body = isRecord(parsed) ? parsed : {};
+      } catch {
+        malformed = record.bodyText.trim().length > 0;
+        record.body = null;
+      }
     }
     this.requests.push(record);
 
@@ -439,19 +740,41 @@ export class RecordedAtrium {
       this.afterAnswer();
       return;
     }
-    if (record.mode === "forbidden") {
-      record.outcome = "forbidden";
-      this.sendJson(response, record, 403, { error: "forbidden" });
-      this.afterAnswer();
-      return;
-    }
+    // the in-pod forwarder answers before atrium is asked; atrium's gate guards every route but the public hints
     if (record.mode === "away") {
       record.outcome = "away";
-      this.sendJson(response, record, 503, { error: "atrium-away" }, { "retry-after": "5" });
+      this.sendJson(
+        response,
+        record,
+        503,
+        { error: "atrium-away" },
+        { "retry-after": "5", connection: "close" },
+      );
       this.afterAnswer();
       return;
     }
-    this.route(record, request, response);
+    const isHint = record.route === "hint_ready" || record.route === "hint_ended";
+    if (record.mode === "forbidden" && !isHint) {
+      record.outcome = "forbidden";
+      this.sendJson(response, record, 403, {
+        error:
+          "This route is not available to this caller. Run the command on the target box itself (ssh-remote), or use the UI.",
+        code: "CALLER_NOT_ALLOWED",
+        caller_class: "remote",
+        route_class: record.route === "call" ? "control" : "messaging",
+      });
+      this.afterAnswer();
+      return;
+    }
+    if (malformed) {
+      record.outcome = "bad_json";
+      record.status = 400;
+      response.writeHead(400, { "content-type": "text/html; charset=utf-8" });
+      response.end("<!DOCTYPE html><html><body><pre>Bad Request</pre></body></html>");
+      this.afterAnswer();
+      return;
+    }
+    await this.route(record, request, response);
     this.afterAnswer();
   }
 
@@ -475,97 +798,237 @@ export class RecordedAtrium {
     }
   }
 
-  private route(
+  private async route(
     record: AtriumRequestRecord,
     request: IncomingMessage,
     response: ServerResponse,
-  ): void {
+  ): Promise<void> {
     if (record.route === "call") {
-      this.handleCall(record, request, response);
+      await this.handleCall(record, request, response);
     } else if (record.route === "session_message" || record.route === "seat_message") {
-      record.outcome = "answered";
-      const messages = this.script.messages ?? {};
-      const answer = messages.answers?.[this.messagesAnswered] ?? messages.default ?? "queued";
-      this.messagesAnswered += 1;
-      const deliveryId = randomUUID();
-      if (answer === "queued" || answer === "held" || "held" in answer) {
-        const sent = record.body ?? {};
-        const seats = record.route === "seat_message";
-        const target = record.target ?? "";
-        const held =
-          answer === "queued"
-            ? undefined
-            : answer === "held"
-              ? { reason: "pod_starting" }
-              : answer.held;
-        if (held !== undefined) {
-          record.outcome = "held";
-        }
-        this.sendJson(response, record, 202, {
-          delivery_id: deliveryId,
-          from: typeof sent.from === "string" ? sent.from : "anonymous",
-          to: seats ? `session-of-${target}` : target,
-          ...(seats ? { to_seat: target } : {}),
-          status: "queued",
-          ...(held === undefined
-            ? {}
-            : {
-                held,
-                message: `Held (${held.reason}): delivery ${deliveryId} waits for room and goes out by itself.`,
-              }),
-        });
-      } else {
-        this.sendJson(response, record, answer.status, answer.body);
-      }
+      this.handleMessage(record, response);
     } else if (record.route === "hint_ready" || record.route === "hint_ended") {
-      record.problems =
-        record.body === null
-          ? ["body"]
-          : validateHint(record.route === "hint_ready" ? "ready" : "ended", record.body);
-      record.outcome = "answered";
-      const answer = this.script.hints ?? {};
-      this.sendJson(response, record, answer.status ?? 200, answer.body ?? { ok: true });
+      this.handleHint(record, response);
     } else {
       record.outcome = "not_found";
       this.sendJson(response, record, 404, { error: "not-found" });
     }
   }
 
-  private handleCall(
+  private handleHint(record: AtriumRequestRecord, response: ServerResponse): void {
+    const kind = record.route === "hint_ready" ? "ready" : "ended";
+    const key = record.target ?? "";
+    if (!/^[0-9a-f]{24}$/.test(key)) {
+      record.outcome = "refused:bad-key";
+      this.sendJson(response, record, 400, {
+        error: "bad-key",
+        expected: "24 lower-case hex characters (the session key, C2)",
+      });
+      return;
+    }
+    const body = record.body ?? {};
+    // Contract rule 1: a version this side does not know is refused by name; an ABSENT contract is not.
+    if (kind === "ready" && body.contract !== undefined && body.contract !== 1) {
+      record.outcome = "refused:unsupported-contract";
+      this.sendJson(response, record, 400, {
+        error: "unsupported-contract",
+        contract: body.contract,
+      });
+      return;
+    }
+    // what a client should have sent (atrium trusts it for nothing but a re-drive): kit-level, not a refusal
+    record.problems = record.body === null ? ["body"] : validateHint(kind, record.body);
+    record.outcome = "answered";
+    const answer = this.script.hints ?? {};
+    this.sendJson(
+      response,
+      record,
+      answer.status ?? 200,
+      answer.body ??
+        (kind === "ready" ? { ok: true, redriven: answer.redriven ?? 0 } : { ok: true }),
+    );
+  }
+
+  /** `POST /api/sessions/:id/message` and `/api/seats/:seat/message` (message-routes.ts). */
+  private handleMessage(record: AtriumRequestRecord, response: ServerResponse): void {
+    const messages = this.script.messages ?? {};
+    const body = record.body ?? {};
+    const refuse = (error: string, extra: Record<string, unknown> = {}): void => {
+      record.outcome = `refused:${typeof extra.code === "string" ? extra.code : error}`;
+      this.sendJson(response, record, 400, { error, ...extra });
+    };
+    // CONTRACTS §5.1 / parseMessageBody: `text` (or content blocks), `delivery_id` a lowercase UUID
+    const blocks = Array.isArray(body.content)
+      ? (body.content as Array<Record<string, unknown>>)
+      : [];
+    const blockText = blocks
+      .filter((block) => block.type === "text")
+      .map((block) => (typeof block.text === "string" ? block.text : ""))
+      .join("\n")
+      .trim();
+    const text = typeof body.text === "string" ? body.text.trim() : "";
+    if (!text && !blockText && !blocks.some((block) => block.type === "image")) {
+      refuse("text is required");
+      return;
+    }
+    let deliveryId: string = randomUUID();
+    if (body.delivery_id !== undefined && body.delivery_id !== null) {
+      if (typeof body.delivery_id !== "string" || !DELIVERY_ID_RE.test(body.delivery_id)) {
+        refuse("delivery_id must be a lowercase UUID", { code: "bad-delivery-id" });
+        return;
+      }
+      deliveryId = body.delivery_id;
+    }
+    const target = record.target ?? "";
+    // resolveSource: body.from, else X-Source-Session, else "anonymous"
+    const bodyFrom = typeof body.from === "string" ? body.from.trim() : "";
+    const headerFrom = (record.headers["x-source-session"] ?? "").trim();
+    const from = bodyFrom || headerFrom || "anonymous";
+    const answer: MessageAnswer =
+      messages.answers?.[this.messagesAnswered] ?? messages.default ?? "queued";
+    this.messagesAnswered += 1;
+    if (typeof answer === "object" && "status" in answer) {
+      record.outcome = "answered";
+      this.sendJson(response, record, answer.status, answer.body);
+      return;
+    }
+    const seats = record.route === "seat_message";
+    const toSeat = seats ? target : messages.seatOf?.[target];
+    const to = seats ? (messages.seats?.[target] ?? uuidFromText(`holder:${target}`)) : target;
+    const held =
+      answer === "queued"
+        ? undefined
+        : answer === "held"
+          ? { reason: "pod_starting", ahead: 0 }
+          : { reason: answer.held.reason, ahead: answer.held.ahead ?? 0 };
+    record.outcome = held === undefined ? "answered" : "held";
+    this.sendJson(response, record, 202, {
+      delivery_id: deliveryId,
+      from,
+      to,
+      ...(toSeat ? { to_seat: toSeat } : {}),
+      status: "queued",
+      ...(held === undefined
+        ? {}
+        : {
+            held: { since: new Date().toISOString(), ...held },
+            message: heldSentence(held.reason, deliveryId, target.slice(0, 8), held.ahead),
+          }),
+    });
+  }
+
+  private async handleCall(
     record: AtriumRequestRecord,
     request: IncomingMessage,
     response: ServerResponse,
-  ): void {
-    const body = record.body;
-    if (body === null) {
-      record.problems = ["body"];
-      record.outcome = "answered";
-      this.sendJson(response, record, 400, { error: "bad-request" });
+  ): Promise<void> {
+    const refuse = (refusal: Refusal): void => {
+      const error =
+        typeof refusal.body.error === "string" ? refusal.body.error : String(refusal.status);
+      record.outcome = `refused:${error}`;
+      this.sendJson(response, record, refusal.status, refusal.body);
+    };
+    if (record.body !== null && record.body.cwd !== undefined) {
+      // A-9: atrium ignores a cwd; the kit names it so a client that sends one is visible to the test.
+      record.problems.push("cwd_present");
+    }
+    const parsed = parseCallBody(record.body);
+    if (!parsed.ok) {
+      refuse(parsed.refusal);
       return;
     }
-    record.problems = validateCall(body);
-    if (typeof body.stdin_b64 === "string" && !record.problems.includes("stdin_b64")) {
-      record.stdin = Buffer.from(body.stdin_b64, "base64").toString("utf8");
+    const body = parsed.body;
+    record.callId = body.callId;
+    if (body.stdin !== null) {
+      record.stdin = body.stdin.toString("utf8");
     }
-    const callId = typeof body.call_id === "string" ? body.call_id : null;
-    record.callId = callId;
-    // atrium's own refusals, before anything runs (no rule consumed, no answer remembered for the call id):
-    // C6.2 `inherit` (a name -> string object, names from the closed list) and the at-most-once flags.
-    const refusal = this.refuseCall(body, callId);
-    if (refusal !== null) {
-      record.outcome = refusal.outcome;
-      this.sendJson(response, record, 400, refusal.body);
+    // The caller is checked against the calling pod (C6.2, atrium S2); a `local` caller is only a claim.
+    const callerClass = this.script.callerClass ?? "local";
+    if (callerClass === "agent-pod") {
+      const pod = this.script.agentPod ?? {};
+      const matches =
+        pod.utility === true
+          ? body.caller === null
+          : body.caller !== null && pod.sessionKey === sessionKeyOfRecord(body.caller.record_id);
+      if (!matches) {
+        refuse({ status: 403, body: { error: "caller-mismatch" } });
+        return;
+      }
+    }
+    if (body.caller === null && callerClass !== "agent-pod") {
+      refuse(bad("bad-caller"));
       return;
     }
-    // C6.2 "at most once": the same call_id finds what the first one made and returns it.
-    const stored = callId === null ? undefined : this.callAnswers.get(callId);
-    if (stored !== undefined) {
-      record.replayed = true;
-      record.outcome = "replayed";
-      this.answerCall(response, record, stored.answer);
+    // C6.2 `inherit`: acpx's closed list, nothing else
+    for (const name of Object.keys(body.inherit)) {
+      if (!INHERIT_ALLOWED.includes(name)) {
+        refuse(bad("inherit-not-allowed", { name }));
+        return;
+      }
+    }
+    const classified = await (this.classifyOverride ?? (await defaultClassify()))(body.argv);
+    const verdict = passability(classified, body.caller?.record_id ?? "");
+    if (!verdict.ok) {
+      refuse(bad("class-not-passable", { reason: verdict.reason }));
       return;
     }
-    const argv = Array.isArray(body.argv) ? (body.argv as unknown[]) : [];
+    const path = classified.path ?? "";
+    const isCreate = verdict.class === "create" && path !== "sessions handover";
+    if (isCreate && body.caller === null) {
+      refuse(bad("class-not-passable", { reason: "no-caller" }));
+      return;
+    }
+    if (path === "sessions handover" && !handoverBriefShared(body.argv)) {
+      refuse(bad("class-not-passable", { reason: "file-argument" }));
+      return;
+    }
+    // At most once, the server's half: `call_id` is the first message's wire id. Recorded for THIS caller =>
+    // a replay (acpx is run again, nothing new queued); recorded for another sender => refused, nothing runs.
+    const recorded = this.items.get(body.callId);
+    if (
+      body.caller !== null &&
+      recorded !== undefined &&
+      recorded.sender !== body.caller.record_id
+    ) {
+      record.outcome = "refused:delivery-id-conflict";
+      this.sendJson(response, record, 409, {
+        error: "delivery-id-conflict",
+        delivery_id: body.callId,
+      });
+      return;
+    }
+    const replayed = recorded !== undefined;
+    let argv = body.argv;
+    let stdinForRun: Buffer | null = body.stdin;
+    let create: { recordId: string; message: string | null } | null = null;
+    if (isCreate) {
+      const prepared = prepareCreate(argv, stdinForRun, body.callId);
+      if (!prepared.ok) {
+        refuse(prepared.refusal);
+        return;
+      }
+      argv = prepared.argv;
+      if (prepared.stdinUsed) {
+        stdinForRun = null;
+      }
+      create = { recordId: prepared.recordId, message: prepared.message };
+      // A replay is the SAME request, first message included: another message is atrium's own refusal, in
+      // acpx's shape (exit 2), before acpx is asked.
+      if (replayed && prepared.message !== null && prepared.message.trim() !== "") {
+        if (recorded.text !== prepared.message) {
+          record.outcome = "refused:create-replay-mismatch";
+          this.sendJson(response, record, 200, {
+            exit: 2,
+            stdout: "",
+            stderr: `CREATE_REPLAY_MISMATCH: record ${prepared.recordId} was created by this call id with a different first message; a replay must be the same request.\n`,
+            error: "create-replay-mismatch",
+          });
+          return;
+        }
+      }
+    }
+    record.ranArgv = argv;
+    // acpx is RUN — for a replay too, and for everything that is not a create: nothing else is replayed.
     const rule = (this.script.calls ?? []).find((candidate) => {
       const prefix = candidate.argvPrefix ?? [];
       const left = this.rulesLeft.get(candidate);
@@ -573,94 +1036,58 @@ export class RecordedAtrium {
         (left === undefined || left > 0) && prefix.every((part, index) => argv[index] === part)
       );
     });
-    const answer: CallAnswer = rule?.answer ?? { exit: 0, stdout: "", stderr: "" };
     if (rule !== undefined && this.rulesLeft.has(rule)) {
       this.rulesLeft.set(rule, (this.rulesLeft.get(rule) ?? 1) - 1);
     }
-    if (callId !== null) {
-      this.callAnswers.set(callId, { answer });
+    const run: CallAnswer = rule?.answer ?? { exit: 0, stdout: "", stderr: "" };
+    // a scripted whole HTTP answer replaces the run's wrapper
+    if ("status" in run) {
+      record.outcome = "answered";
+      this.sendJson(response, record, run.status, run.body);
+      return;
     }
+    const answer: Record<string, unknown> = {
+      exit: run.exit,
+      stdout: run.stdout ?? "",
+      stderr: run.stderr ?? "",
+    };
+    const message = create?.message ?? null;
+    if (create !== null && run.exit === 0 && body.caller !== null) {
+      const hasMessage = message !== null && message.trim() !== "";
+      if (replayed) {
+        answer.delivery = {
+          delivery_id: body.callId,
+          to: create.recordId,
+          status: "queued",
+          replay: true,
+        };
+      } else if (hasMessage) {
+        this.items.set(body.callId, { sender: body.caller.record_id, text: message });
+        const hold = this.script.firstMessageHold;
+        answer.delivery = {
+          delivery_id: body.callId,
+          to: create.recordId,
+          status: "queued",
+          ...(hold === undefined
+            ? {}
+            : {
+                held: {
+                  since: new Date().toISOString(),
+                  reason: hold.reason,
+                  ahead: hold.ahead ?? 0,
+                },
+              }),
+        };
+      }
+    }
+    record.replayed = replayed && answer.delivery !== undefined;
     if (rule?.loseAnswer === true) {
       record.outcome = "lost_answer";
       request.socket.destroy();
       return;
     }
-    record.outcome = "answered";
-    this.answerCall(response, record, answer);
-  }
-
-  private refuseCall(
-    body: Record<string, unknown>,
-    callId: string | null,
-  ): { outcome: string; body: Record<string, unknown> } | null {
-    const refuse = (error: string, extra: Record<string, unknown> = {}) => ({
-      outcome: error.replaceAll("-", "_"),
-      body: { error, ...extra },
-    });
-    if (body.inherit !== undefined) {
-      if (!isRecord(body.inherit)) {
-        return refuse("bad-inherit");
-      }
-      for (const [name, value] of Object.entries(body.inherit)) {
-        if (typeof value !== "string") {
-          return refuse("inherit-not-string", { name });
-        }
-      }
-      const notAllowed = Object.keys(body.inherit).find((name) => !INHERIT_ALLOWED.includes(name));
-      if (notAllowed !== undefined) {
-        return refuse("inherit-not-allowed", { name: notAllowed });
-      }
-    }
-    const argv = Array.isArray(body.argv)
-      ? (body.argv as unknown[]).filter((a) => typeof a === "string")
-      : [];
-    const end = argv.indexOf("--");
-    const words = end < 0 ? argv : argv.slice(0, end);
-    const path = words.findIndex((word, index) => word === "sessions" && index + 1 < words.length);
-    const isCreate =
-      path >= 0 && RECORD_ID_CREATE_PATHS.includes(`sessions ${words[path + 1] ?? ""}`);
-    if (!isCreate) {
-      return null;
-    }
-    const flag = (name: string): Array<string | undefined> =>
-      words.flatMap((word, index) =>
-        word === name
-          ? [words[index + 1]]
-          : word.startsWith(`${name}=`)
-            ? [word.slice(name.length + 1)]
-            : [],
-      );
-    const ids = flag("--record-id");
-    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    if (ids.length !== 1 || ids[0] === undefined || !uuid.test(ids[0])) {
-      return refuse("record-id-required");
-    }
-    // A-27: the client owns both flags; a --created-by-call that is not this call's id is refused.
-    if (flag("--created-by-call").some((value) => value?.toLowerCase() !== callId?.toLowerCase())) {
-      return refuse("call-id-mismatch");
-    }
-    if (flag("--prompt").length + flag("--prompt-file").length > 1) {
-      return refuse("more-than-one-first-message");
-    }
-    return null;
-  }
-
-  private answerCall(
-    response: ServerResponse,
-    record: AtriumRequestRecord,
-    answer: CallAnswer,
-  ): void {
-    if ("status" in answer) {
-      this.sendJson(response, record, answer.status, answer.body);
-      return;
-    }
-    const { exit, stdout, stderr, delivery } = answer;
-    this.sendJson(response, record, 200, {
-      exit,
-      stdout: stdout ?? "",
-      stderr: stderr ?? "",
-      ...(delivery === undefined ? {} : { delivery }),
-    });
+    record.outcome = record.replayed ? "replayed" : "answered";
+    this.sendJson(response, record, 200, answer);
   }
 
   private handleControl(
@@ -692,9 +1119,9 @@ export class RecordedAtrium {
 
 export async function startRecordedAtrium(
   script: AtriumScript = {},
-  options: { port?: number; host?: string } = {},
+  options: { port?: number; host?: string; classify?: Classify } = {},
 ): Promise<RecordedAtrium> {
-  const atrium = new RecordedAtrium(script);
+  const atrium = new RecordedAtrium(script, options.classify);
   await atrium.listen(options.port ?? 0, options.host ?? "127.0.0.1");
   return atrium;
 }
