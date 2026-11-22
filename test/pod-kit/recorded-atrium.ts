@@ -779,8 +779,15 @@ export class RecordedAtrium {
 
   async close(): Promise<void> {
     clearTimeout(this.phaseTimer);
-    this.resolver?.kill("SIGTERM");
+    const resolver = this.resolver;
     this.resolver = null;
+    if (resolver !== null && resolver.exitCode === null) {
+      // wait for it to be gone: a test removing the HOME it was given must not find a process still holding it
+      await new Promise<void>((resolve) => {
+        resolver.once("exit", () => resolve());
+        resolver.kill("SIGTERM");
+      });
+    }
     for (const socket of this.sockets) {
       socket.destroy();
     }
