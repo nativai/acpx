@@ -32,7 +32,7 @@ a seat that is no label value, a sessionId or release name outside its charset, 
 `wellFormedAgentRequest(sessionId, overrides)` / `wellFormedUtilityRequest(placement)` build correct bodies and their keys.
 
 **A Job per key** from its first admitted `POST`. A later `POST` for the key **follows** it — told where the pod is NOW (the last step, or the
-`ready` line; never the history, a step it already sent is not repeated). A Job whose final line was not `ready` (refused, error), or whose pod
+`ready` line; never the history, a step it already sent is not repeated). A Job whose final line was not `ready` (a refusal, an error — `error timeout` / `error kube_api_error` excepted, below), or whose pod
 ended (`endPod(key)` / `POST /_kit/end-pod {key}`), is NOT replayed: the next `POST` is a new request — admission is evaluated again, a
 new Job with a new uid, the next scripted behaviour. **Admission** is `admission_refusal` in order: `live ≥ cap` or (class not `interactive` and
 `live ≥ cap − reserve`) → `refused reason=agent_cap`; quota used ≥ hard → `quota`; target `home` with home live ≥ home cap → `home_full`. `auto` goes to
@@ -44,7 +44,12 @@ the pool while `pool.state` is `ready`, else home. Limits come from the script's
 pod terminating during the scripted `delete.delayMs`) deletes and answers 200 empty; no pod of the key answers 200 empty; **an EMPTY `?uid=` is no uid** —
 it deletes the key's Job unconditionally (the real `uid or None`: A-1's hazard, consumers must never send it empty). While a DELETE of a key runs, and
 for every `POST` that began before its answer, the final line is `error deleted` (never re-created); a `POST` that starts after the answer is a new request.
-`delete.status` 504 / 502 answer the real bodies `error timeout` / `error kube_api_error`.
+`delete.status` 504 / 502 answer the real bodies `error timeout` / `error kube_api_error` and the DELETE REMOVED NOTHING: the pod still counts and the next POST follows it.
+
+**`error timeout` / `error kube_api_error` end the STREAM, not the Job** (broker.py "the Job continues"): the Job keeps its slot and uid. A later POST follows it from the CURRENT phase
+with a wait of its own and can see it ready: script what the Job does afterwards with `afterTimeout:{steps?, final?, finalDelayMs?, hang?, afterTimeout?}`, and a follower's own wait with
+`agentWaitMs` (its stream then ends `error timeout` and the Job goes on; absent: it waits for ever). An explicit `pool` request while `pool.state` is not `ready` is `error template_rejected`
+— checked AFTER admission, so at cap it is the retryable `refused reason=agent_cap`.
 
 Script (`BrokerScript`): `default` · `jobs[]` (the 1st Job CREATED gets `jobs[0]`, the 2nd `jobs[1]`, …; a refused POST consumes none) · `keys{<key>: behaviour}` (wins) ·
 `delete{delayMs,status}` · `status{…}`. A behaviour:
@@ -62,7 +67,7 @@ Record entry: `method, path, query, key, headers, body, problems, jobSeq, joined
 
 Assumptions the real broker confirms (agreed with the stream HoD and infra, 2026-11-21): every `POST` stream is HTTP 200 with `refused` / `error` as the
 final line; `DELETE` answers 200, empty; `pool.state` is a free string; a body that is not JSON gets `error invalid_request`.
-Not modelled (list in TESTER-PLAN): the pool→home overflow, `error timeout`, `error kube_api_error`, HTTP/1.0 close-delimited framing.
+Not modelled (TESTER-PLAN lists them all): the pool→home overflow after the scheduling wait, a persistent `error start_failed` leaving its Job (the kit ends it), `error kube_api_error` without a Job, a replacement pod handed to a follower, HTTP/1.0 close-delimited framing.
 
 ## fake-apiserver.ts — the C3.3 death proof, and the pod list
 
@@ -110,16 +115,15 @@ peer, `inherit-not-allowed` (+`name`; the closed list `INHERIT_ALLOWED`), then *
 `own-session` · `no-caller` · `file-argument` · `table-unavailable`). **The kit never touches a store it was not given**: the test process's own HOME is never read or written.
 A record / owner-if-pod target resolves only against `stateHome` — the HOME (holding `.acpx`) of the control pod's store, which a test seeds with its own sessions (`addRecord`); then a
 long-lived child process runs acpx's own `resolveTargetRecordId` with HOME = `stateHome` (every `ACPX_*` variable removed). Without `stateHome` a target is `target-unresolved`, unless
-`resolveTargetAs` says it exists. In a BARE process (`node recorded-atrium.ts`, where acpx's `.js` specifiers do not resolve) a conservative fallback is used, as the real door is
-for an unloaded table: only the create paths pass (`--format json sessions new …` is read as `sessions new`: global value flags are skipped), `-h` is help, everything else is
-`table-unavailable`. A leading `acpx` is read as an agent name (measured), so the A-24 shape is NOT refused by the table. A **create** (class `create`, not `sessions handover`) then needs `record-id-required` /
+`resolveTargetAs` says it exists. In a BARE process (`node recorded-atrium.ts`, where acpx's `.js` specifiers do not resolve) the class table is UNLOADED, and the kit refuses EVERY call `table-unavailable`, creates
+included — as the real door does for an unloaded table (the shape refusals still come first); use the in-process kit, or an injected `classify`, to see a call through. A leading `acpx` is read as an agent name (measured), so the A-24 shape is NOT refused by the table. A **create** (class `create`, not `sessions handover`) then needs `record-id-required` /
 `call-id-mismatch` (A-27) / `more-than-one-first-message`; its first message (`--prompt <t>`, `--prompt-file -` + stdin) is taken OUT of the argv acpx is run with.
 `cwd` is ignored (A-9); a present one is the recorded problem `cwd_present`. Nothing runs for a refusal (no rule consumed).
 
 **At most once** is atrium's, not the kit's: a create whose first message was recorded under `call_id` is a **replay** — acpx IS run again (the next rule answers) and
 the answer carries `delivery:{delivery_id, to, status:"queued", replay:true}`; another sender reusing the id is `409 delivery-id-conflict`; a replay with another
 first message is `200 {exit:2, error:"create-replay-mismatch"}` and nothing runs. Everything else — a create without a message, a non-create, a changed `--record-id` —
-is run again as sent. Acpx's own at-most-once is modelled: a create whose record id exists is answered from the record only for the SAME `--created-by-call`; a repeat WITHOUT it (or with another call id) is
+is run again as sent. Acpx's own at-most-once is modelled: a create whose record id exists is answered from the record only for the SAME `--created-by-call`; a repeat WITH it but another request (another name, reordered flags — acpx's `created_by_request` fingerprint) is acpx's `CREATE_REPLAY_MISMATCH` (exit 2, no `delivery`); a repeat WITHOUT it (or with another call id) is
 refused by acpx — `exit 1`, `record-id destination already exists; refusing to create another ACP session`, no `delivery`, never `replay:true`. `loseAnswer` runs the call (the first message stays recorded) and cuts the connection before answering. `firstMessageHold` marks the first
 message `delivery.held`; `forkNotice` / `templatePrompt` are what acpx's answer carries for atrium to queue besides the caller's message (the notice's wire id is `uuid5(call_id, "fork-notice")`; `delivery`
 names the message, else the notice; both ids are conflict-checked). With `--format json` a create-replay-mismatch is a JSON-RPC error on STDOUT and stderr is empty.
@@ -128,7 +132,8 @@ A rule: `calls[{argvPrefix?, answer, times?, loseAnswer?}]` matches the argv acp
 or `{status, body}` (a whole HTTP answer).
 
 **Messages**: `text` (or content blocks: `bad-content` for a malformed list / block, `bad-task-options`, `task-options-too-large`) required, `delivery_id` a lowercase uuid (`400 bad-delivery-id`) and echoed — and
-owned by its first sender (`409 delivery-id-conflict` for another, shared with the call route's ids); `from` = the body's, else `X-Source-Session`, else `anonymous`. Every accepted message is **202** `{delivery_id, from, to,
+owned by its first SENDER (`409 delivery-id-conflict` for another, shared with the call route's ids) — compared as atrium's actor, built from `X-Source-Session` ONLY (a session / seat URL is normalised to its ids; the seat is
+compared first, so a successor on the same seat is the same sender; a body `from`, or none, is `unattributed` and never matches anybody, itself included); `from` in the ANSWER = the body's, else the header, else `anonymous`. Every accepted message is **202** `{delivery_id, from, to,
 to_seat?, status:"queued"}`; a held one adds `held:{since, reason, ahead}` and `message` (atrium's `heldSentence`: `pod_starting`, `agent_cap`, `paused`, `held-by-policy`, else "no room"; the recipient's NAME from
 `messages.names`) — `status` stays `queued`. `messages{answers?[], default?, seats?, seatOf?, names?, recipients?}`: `"queued"` · `"held"` / `{held:{reason, ahead?}}` · `{status, body}`; `seats` maps a seat to its holder's record id
 (`to` on the seat route), `seatOf` a session to its seat (`to_seat`); `recipients` scripts what the route refuses about the recipient — seat route: `unknown`/`not-a-seat` (404 `not-a-seat`), `vacant` (409 SEAT_VACANT); session route:
@@ -153,3 +158,28 @@ client under test (honoured only under `NODE_TEST_CONTEXT`). `setMode(mode, forM
 listening): give it a `forMs`.
 Record entry: `route` (`call|session_message|seat_message|hint_ready|hint_ended`), `target`, `body`, `stdin`, `ranArgv`, `problems`, `mode`, `outcome` (`answered`,
 `refused:<error>`, `replayed`, `lost_answer`, `held`, `away`, `forbidden`, `hang`), `callId`, `replayed`. An away call is still recorded as a `call` with the client's `call_id`.
+
+## Known limits — what the kit does NOT model (after round 4; the TE checks nothing beyond this list)
+
+Broker (`fake-broker.ts`)
+
+- The pool→home overflow after the scheduling wait (an `auto` request is routed once, at admission); a scripted `ready placement=home` does keep occupancy and the line in agreement.
+- A persistent `error start_failed` leaves its Job in the real broker; the kit treats it as an ended Job (the next POST is a new request). `error kube_api_error` is only ever the stream-ending line of an existing Job.
+- A follower is not handed the REPLACEMENT pod when its pod ends; there is no pod-less window for `DELETE ?uid=`; a 504 DELETE removes nothing (modelled), but its delete-wait is not.
+- HTTP/1.0 close-delimited framing (the kit streams HTTP/1.1 chunked); `?uid=&uid=X` and `new URL` dot normalisation.
+- A partial `status.quota` derives `used` from `live`; the real default quota hard is 0 (the kit defaults it to the cap).
+
+Recorded atrium (`recorded-atrium.ts`)
+
+- The seat route answers 202 for an id no store knows unless the test scripts `recipients` (real: 404); recipient states are scripted, not derived from a box.
+- The fork notice and template prompt are scripted (`forkNotice`, `templatePrompt`), not derived from acpx's JSON stdout (`createHandOff`).
+- Not modelled refusals: agent-pod `parent-not-caller` (lineage) and `sessions import` archive paths (`importPathsShared`), `reserved-sender`, resend / duplicate-mail paths, the voice namespace.
+- Parse edges: a top-level JSON `1` / `null`, `application/json-seq`, Express's own 404 HTML and case-insensitive routes, the 50 MB global body limit.
+- `held.message` wording is atrium's `heldSentence`, copied; a `reason` outside its five is "no room".
+- A bare process (`node recorded-atrium.ts`) cannot load acpx's class table and refuses every pass-through call; class-table fidelity needs the in-process kit.
+
+API server (`fake-apiserver.ts`)
+
+- `limit` / `continue`; the death proof's TLS path; one watch semantics (replay by resourceVersion, `410 Expired` after `compact()`).
+
+The kit proves a contract as the real code implements it today, not the real services (no file system, scheduler, admission or network policy: tier 1
