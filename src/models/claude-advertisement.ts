@@ -662,18 +662,27 @@ async function viewFromRecords(
     probedAt: found.lastUsedAt,
     source: "records",
   };
+  return { snapshot, status: statusFromRecord(found, snapshot, key) };
+}
+
+/** The envelope of a record-served view. */
+function statusFromRecord(
+  found: RecordAdvertisement,
+  snapshot: ClaudeAdvertisementSnapshot,
+  key: ClaudeAdvertKey,
+): ClaudeAdvertisementStatus {
   return {
-    snapshot,
-    status: {
-      state: found.match === "exact" ? "fresh" : "stale",
-      probedAt: snapshot.probedAt,
-      adapterSha: null,
-      sdkVersion: null,
-      source: "records",
-      deployedAdapterSha: key.adapterSha,
-      deployedSdkVersion: key.sdkVersion,
-      error: null,
-    },
+    // `fresh` needs BOTH: the box's own command AND a known adapter start — a record without
+    // `agent_started_at` cannot say how old its lists are, so it is never fresh.
+    state: found.match === "exact" && found.agentStartedAt !== undefined ? "fresh" : "stale",
+    probedAt: snapshot.probedAt,
+    adapterSha: null,
+    sdkVersion: null,
+    source: "records",
+    deployedAdapterSha: key.adapterSha,
+    deployedSdkVersion: key.sdkVersion,
+    error: null,
+    ...(found.agentStartedAt ? { recordAgentStartedAt: found.agentStartedAt } : {}),
   };
 }
 

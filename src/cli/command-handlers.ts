@@ -489,7 +489,13 @@ async function readModelAdvertisement(
 ): Promise<{
   models: SessionModelState | undefined;
   served:
-    | { source: string; recordId: string; adapterMatch: string; recordLastUsedAt: string }
+    | {
+        source: string;
+        recordId: string;
+        adapterMatch: string;
+        recordLastUsedAt: string;
+        recordAgentStartedAt?: string;
+      }
     | undefined;
 }> {
   const fromRecords = await modelCatalogueFromRecords(agentCommand, globalFlags.profile);
@@ -501,6 +507,7 @@ async function readModelAdvertisement(
         recordId: fromRecords.recordId,
         adapterMatch: fromRecords.adapterMatch,
         recordLastUsedAt: fromRecords.recordLastUsedAt,
+        recordAgentStartedAt: fromRecords.recordAgentStartedAt,
       },
     };
   }
@@ -539,6 +546,7 @@ function recordSourceFields(
         recordId?: string;
         adapterMatch?: string;
         recordLastUsedAt?: string;
+        recordAgentStartedAt?: string;
       }
     | undefined
     | false,
@@ -549,6 +557,9 @@ function recordSourceFields(
         ...(served.recordId ? { record_id: served.recordId } : {}),
         ...(served.adapterMatch ? { adapter_match: served.adapterMatch } : {}),
         ...(served.recordLastUsedAt ? { record_last_used_at: served.recordLastUsedAt } : {}),
+        ...(served.recordAgentStartedAt
+          ? { record_agent_started_at: served.recordAgentStartedAt }
+          : {}),
       }
     : {};
 }
@@ -568,6 +579,7 @@ async function modelCatalogueFromRecords(
       recordId: string;
       adapterMatch: "exact" | "harness";
       recordLastUsedAt: string;
+      recordAgentStartedAt: string | undefined;
     }
   | undefined
 > {
@@ -591,6 +603,7 @@ async function modelCatalogueFromRecords(
     recordId: found.recordId,
     adapterMatch: found.match,
     recordLastUsedAt: found.lastUsedAt,
+    recordAgentStartedAt: found.agentStartedAt,
   };
 }
 

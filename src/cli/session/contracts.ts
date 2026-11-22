@@ -438,6 +438,8 @@ export type AgentOutputStyleListResult = {
   adapterMatch?: "exact" | "harness";
   /** A10, `source: "records"`: when that record was last used (ISO) — the answer's age, for a staleness label. */
   recordLastUsedAt?: string;
+  /** A10 follow-up, `source: "records"`: when that record's adapter STARTED (ISO) — what the lists' age really is; absent when the record has none (it ranks last, never fresh). */
+  recordAgentStartedAt?: string;
 };
 
 /** A10: what served a probe — session records, or the utility pod (a routed call; the pod itself reports `transient`). */

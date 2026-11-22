@@ -282,6 +282,11 @@ export type ClaudeAdvertisementStatus = {
   deployedSdkVersion: string | null;
   /** The last probe failure's message, iff it was for the deployed key. */
   error: string | null;
+  /**
+   * `source: "records"` only (additive; absent otherwise): when the serving record's adapter STARTED —
+   * what the names' age really is (`probedAt` is the record's last use). A record with none is `stale`.
+   */
+  recordAgentStartedAt?: string;
 };
 
 /** How well the catalogue knows what the box's OpenRouter key allows. */

@@ -1572,6 +1572,7 @@ export async function listAgentOutputStyles(
       recordId: found.recordId,
       adapterMatch: found.match,
       recordLastUsedAt: found.lastUsedAt,
+      ...(found.agentStartedAt ? { recordAgentStartedAt: found.agentStartedAt } : {}),
     };
   }
 

@@ -2,8 +2,8 @@ import os from "node:os";
 import path from "node:path";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
 import { acpAdapterKind } from "../acp/agent-command.js";
+import { mapWithConcurrency } from "../async-control.js";
 import { findProfile, loadProfileRegistry } from "../config/profiles.js";
-import { defaultAccountBindingForAgent } from "../runtime/engine/default-account-binding.js";
 import { listSessionIndexEntries, resolveSessionRecord } from "../session/persistence.js";
 import type { SessionIndexEntry } from "../session/persistence/index.js";
 import type { SessionRecord } from "../types.js";
@@ -17,8 +17,10 @@ import { podMode, thisPodFile } from "./placement.js";
  *
  * The rule, one place: of the sessions that have run (an `acpSessionId`), of the SAME harness as the
  * agent asked about, prefer a record started with the very agent command this box launches (`exact`),
- * then any other command of the harness (`harness`), each newest first by `lastUsedAt`; the first
- * whose record carries the advertisement wanted answers. `match`:
+ * then any other command of the harness (`harness`); of the records of the first tier that has one that
+ * carries the advertisement wanted, the one whose ADAPTER STARTED last (`agent_started_at`) answers — a
+ * long-running session that started before an update must not look new — a record with no such time
+ * ranks last, ties by `lastUsedAt`. `match`:
  *   exact    the record's agent command is the SAME COMMAND STRING as this box's deployed one. Real
  *            commands are the stable link `node /opt/<adapter>/dist/index.js`, which a deploy does not
  *            change: `exact` is NOT "the same adapter version" — a record written before a deploy is
@@ -37,6 +39,12 @@ export type RecordAdvertisement = {
   recordId: string;
   agentCommand: string;
   lastUsedAt: string;
+  /**
+   * When the record's adapter started (`agent_started_at`) — the lists were captured then, so this, not
+   * `lastUsedAt`, says how new they are. `undefined` for a record that has none (it ranks LAST in its
+   * tier and is never served as fresh).
+   */
+  agentStartedAt: string | undefined;
   match: "exact" | "harness";
   configOptions: SessionConfigOption[];
   availableModels: string[];
@@ -105,9 +113,8 @@ async function candidateEntries(
 
 /**
  * `--profile P` matches a record started under P — and a record that names NO profile, when P is
- * what "no profile" means on this box: the profile no selection binds to for this agent
- * (`defaultAccountBindingForAgent`, the creation seam), or a profile whose Codex home is the native
- * `~/.codex` a raw login uses. 233 of 236 real Codex records carry no profile (a default-profile
+ * what "no profile" means on this box: a profile whose Codex home is the native `~/.codex` a raw login
+ * uses (see `noProfileMatchesOnThisBox`; NOT the default binding — F-A2). 233 of 236 real Codex records carry no profile (a default-profile
  * session writes none), while atrium always asks for the active one (TE F-A).
  */
 function profileMatches(
@@ -127,11 +134,18 @@ function profileMatches(
 /** Whether a record with no profile ran as the asked profile. Injected in tests; the box's registry otherwise. */
 export type NoProfileMatches = (profile: string, agentCommand: string) => boolean;
 
-export const noProfileMatchesOnThisBox: NoProfileMatches = (profile, agentCommand) => {
+/**
+ * ⚠️ A RECORD WITH NO PROFILE RAN ON THE NATIVE `~/.codex`, AND ONLY THAT PROFILE ANSWERS FOR IT (F-A2).
+ * The control pod's create path binds the default profile when none is selected
+ * (`defaultAccountBindingForAgent`) and WRITES it into `session_options.profile` — so a record that
+ * carries none was written when nothing bound, and its adapter ran the raw login in the native home.
+ * It therefore answers `--profile P` only for a chatgpt profile whose `codexHome` is that native home.
+ * DO NOT add "or P is the default binding" back: in a registry whose default is bound to a non-native
+ * chatgpt profile, that serves one native-home record as two accounts (`exact` for the default, and
+ * for the native profile too). `test/pod-a10-probes.test.ts` carries that shape (S1) as the negative.
+ */
+export const noProfileMatchesOnThisBox: NoProfileMatches = (profile) => {
   try {
-    if (defaultAccountBindingForAgent(agentCommand)?.profile === profile) {
-      return true;
-    }
     const entry = findProfile(profile, loadProfileRegistry());
     return (
       entry?.authMode === "chatgpt" &&
@@ -171,6 +185,7 @@ function advertisementOf(
     recordId: entry.acpxRecordId,
     agentCommand: entry.agentCommand,
     lastUsedAt: entry.lastUsedAt,
+    agentStartedAt: record.agentStartedAt || undefined,
     match: entry.agentCommand === query.agentCommand ? "exact" : "harness",
     configOptions: record.acpx?.config_options ?? [],
     availableModels: record.acpx?.available_models ?? [],
@@ -178,7 +193,28 @@ function advertisementOf(
   };
 }
 
-/** The newest record that can answer, or undefined — "records cannot answer" (the caller routes to the utility pod). */
+/** How many candidate records are read at once. */
+const RECORD_READ_CONCURRENCY = 8;
+
+/** Later adapter start first; a record with no `agent_started_at` last; ties newest `lastUsedAt` first. */
+function startedLastFirst(
+  a: { entry: SessionIndexEntry; record: SessionRecord },
+  b: { entry: SessionIndexEntry; record: SessionRecord },
+): number {
+  const left = a.record.agentStartedAt ?? "";
+  const right = b.record.agentStartedAt ?? "";
+  return (
+    right.localeCompare(left) ||
+    b.entry.lastUsedAt.localeCompare(a.entry.lastUsedAt) ||
+    a.entry.acpxRecordId.localeCompare(b.entry.acpxRecordId)
+  );
+}
+
+/**
+ * The record that can answer and whose adapter started last, or undefined — "records cannot answer"
+ * (the caller routes to the utility pod). At most {@link RECORD_ADVERTISEMENT_MAX_READS} records are
+ * opened, `exact` ones first; the `harness` tier is only ranked when no `exact` record answers.
+ */
 export async function newestRecordAdvertisement(
   query: RecordAdvertisementQuery,
   deps: RecordAdvertisementDeps = {},
@@ -187,10 +223,23 @@ export async function newestRecordAdvertisement(
   if (harness === undefined) {
     return undefined;
   }
-  for (const entry of await candidateEntries(harness, query.agentCommand, deps.entries)) {
-    const record = await loadQuietly(deps.load ?? resolveSessionRecord, entry.acpxRecordId);
-    if (record && answers(record, query, deps.noProfileMatches ?? noProfileMatchesOnThisBox)) {
-      return advertisementOf(entry, record, query);
+  const candidates = await candidateEntries(harness, query.agentCommand, deps.entries);
+  const noProfileMatches = deps.noProfileMatches ?? noProfileMatchesOnThisBox;
+  const load = deps.load ?? resolveSessionRecord;
+  for (const exact of [true, false]) {
+    const tier = candidates.filter(
+      (entry) => (entry.agentCommand === query.agentCommand) === exact,
+    );
+    const hits = (
+      await mapWithConcurrency(tier, RECORD_READ_CONCURRENCY, async (entry) => {
+        const record = await loadQuietly(load, entry.acpxRecordId);
+        return record && answers(record, query, noProfileMatches) ? { entry, record } : undefined;
+      })
+    )
+      .filter((hit) => hit !== undefined)
+      .toSorted(startedLastFirst);
+    if (hits[0]) {
+      return advertisementOf(hits[0].entry, hits[0].record, query);
     }
   }
   return undefined;
