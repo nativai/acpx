@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -51,13 +52,41 @@ function requireSqlite(): SqliteModule {
   }
 }
 
+/** The pointer atrium writes when its databases live outside the state home: `<root>/.db-dir.json`. */
+export const DB_DIR_POINTER_FILE = ".db-dir.json";
+
 /**
- * `<root>/.acpx/wakeups.db`, derived as a sibling of the hot dir THIS PROCESS
- * resolved — the same rule as the archive dir, so an isolated HOME or a rig slot
- * reads its own wakeups rather than the box's.
+ * The directory atrium's SQLite databases are in, resolved as atrium resolves it (atrium S6, brick
+ * 6b93b95e; sub-HoD ruling): `ACPX_UI_DB_DIR` if set, else the `dir` the pointer file
+ * `<root>/.db-dir.json` names, else `<root>` — the state home THIS PROCESS resolved (`dirname(hotDir)`),
+ * so an isolated HOME or a rig slot still reads its own. A pointer that is absent, unparsable or does not
+ * name an absolute directory is as good as none: today's place. Read-only — nothing here creates a file.
  */
-export function wakeupsDbPathFor(hotDir: string): string {
-  return path.join(path.dirname(hotDir), "wakeups.db");
+export function atriumDbDirFor(hotDir: string, env: NodeJS.ProcessEnv = process.env): string {
+  const root = path.dirname(hotDir);
+  const fromEnv = env.ACPX_UI_DB_DIR?.trim();
+  if (fromEnv) {
+    return fromEnv;
+  }
+  try {
+    const pointer = JSON.parse(readFileSync(path.join(root, DB_DIR_POINTER_FILE), "utf8")) as {
+      dir?: unknown;
+    };
+    if (typeof pointer.dir === "string" && path.isAbsolute(pointer.dir.trim())) {
+      return pointer.dir.trim();
+    }
+  } catch {
+    // no pointer, or not readable JSON: the default place
+  }
+  return root;
+}
+
+/**
+ * `<db dir>/wakeups.db` — the file the archive-liveness gate READS. Never created here: `wakeups.db` is a
+ * registered database name, and atrium sets a stray file of that name at the old place aside.
+ */
+export function wakeupsDbPathFor(hotDir: string, env: NodeJS.ProcessEnv = process.env): string {
+  return path.join(atriumDbDirFor(hotDir, env), "wakeups.db");
 }
 
 export type WakeupLiveness =
