@@ -148,4 +148,8 @@ to_seat?, status:"queued"}`; a held one adds `held:{since, reason, ahead}` and `
 | `forbidden` | the gate's final 403 with the REAL body (`code:"CALLER_NOT_ALLOWED"`, `caller_class`, `route_class:"control"`) on the pass-through only — the `messaging` (both message routes) and `public` (the hints) classes are open to every caller, as in `isAllowed` |
 
 "Away for N s, then back": `[{mode:"away",forMs:N*1000},{mode:"normal"}]`. **Compressing the client's 600 s budget:** use
-`[{mode:"away",forRequests:3},{mode:"normal"}]` (no clock at all — back after the 3rd refused attempt), or short `forMs`; the budget override itself belo
+`[{mode:"away",forRequests:3},{mode:"normal"}]` (no clock at all — back after the 3rd refused attempt), or short `forMs`; the budget override itself belongs to the
+client under test (honoured only under `NODE_TEST_CONTEXT`). `setMode(mode, forMs?)` / `POST /_kit/mode` switch at once. `refused` cannot be left over HTTP (nothing is
+listening): give it a `forMs`.
+Record entry: `route` (`call|session_message|seat_message|hint_ready|hint_ended`), `target`, `body`, `stdin`, `ranArgv`, `problems`, `mode`, `outcome` (`answered`,
+`refused:<error>`, `replayed`, `lost_answer`, `held`, `away`, `forbidden`, `hang`), `callId`, `replayed`. An away call is still recorded as a `call` with the client's `call_id`.
