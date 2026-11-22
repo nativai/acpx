@@ -526,12 +526,11 @@ test("CLI: EVERY bridge-capable path refuses on the control pod in pod mode, not
         p,
       );
     } else {
-      assert.equal(r.status, 2, `${p}: ${r.stderr}`);
-      assert.match(
-        first,
-        /^acpx: REFUSED reason=pod_branch_unbuilt nothing_started=true protocol=1 branch=/u,
-        p,
-      );
+      // A10 builds `utility-pod`: a one-shot on the control pod goes to the box's utility pod by one
+      // routed call. This rig has no API server, so the pod cannot be looked up — refused by name
+      // (`admission_busy`, exit 75), still nothing started and never the unbuilt-branch refusal.
+      assert.equal(r.status, 75, `${p}: ${r.stderr}`);
+      assert.match(first, /^acpx: REFUSED reason=admission_busy nothing_started=true /u, p);
     }
   }
   const prompt = run(["claude", "fix", "it"], env);
@@ -919,17 +918,16 @@ test("F2: the own-session check answers OWN only on exact evidence, read-only", 
 
 test("F3 CLI: --format json carries the placement refusal in error.data (C7.2)", () => {
   const home = podHome();
+  // `exec` is built since A10 (utility-pod); `sessions import` stands for no branch left unbuilt, so the
+  // JSON carriage is held on a placement refusal that still exists: the unclassified command below, and
+  // the routed-call refusal here (the same C7.2 wire format, the token line on both streams).
   const r = run(["--format", "json", "exec", "hi"], podEnv(home));
-  assert.equal(r.status, 2);
-  const out = JSON.parse(r.stdout.trim()) as {
-    error: { code: number; data: Record<string, unknown> };
+  assert.equal(r.status, 75);
+  const out = JSON.parse(r.stdout.trim().split("\n")[0] ?? "{}") as {
+    error: { data: Record<string, unknown> };
   };
-  assert.equal(out.error.code, -32602);
-  assert.equal(out.error.data.reason, "pod_branch_unbuilt");
-  // `exec` (utility-pod) stands for "a branch not built yet": routed-ensure is A6's now.
-  assert.equal(out.error.data.branch, "utility-pod");
-  assert.equal(out.error.data.nothing_started, true);
-  assert.equal(out.error.data.tokenLine, r.stderr.split("\n")[0], "line 1 stays on stderr too");
+  assert.equal(out.error.data.reason, "admission_busy");
+  assert.equal(r.stderr.split("\n")[0]?.startsWith("acpx: REFUSED reason=admission_busy"), true);
   const u = run(["--format", "json", "seats", "zzz"], podEnv(home));
   assert.equal(
     (JSON.parse(u.stdout) as { error: { data: { reason: string } } }).error.data.reason,
@@ -945,8 +943,12 @@ test("F3 CLI: --format json carries the placement refusal in error.data (C7.2)",
   const strict = run(["--format", "json", "--json-strict", "exec", "hi"], podEnv(home));
   assert.equal(strict.stderr, "");
   assert.equal(
-    (JSON.parse(strict.stdout) as { error: { data: { reason: string } } }).error.data.reason,
-    "pod_branch_unbuilt",
+    (
+      JSON.parse(strict.stdout.trim().split("\n")[0] ?? "{}") as {
+        error: { data: { reason: string } };
+      }
+    ).error.data.reason,
+    "admission_busy",
   );
   // Text mode: nothing on stdout.
   assert.equal(run(["exec", "hi"], podEnv(home)).stdout, "");
