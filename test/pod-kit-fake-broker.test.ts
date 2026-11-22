@@ -690,10 +690,74 @@ test("F14: a scripted DELETE failure carries the real body — 504 `error timeou
     [502, "error kube_api_error\n"],
   ] as const) {
     await withBroker({ delete: { status } }, async (broker) => {
-      const key = "abcdef012345abcdef012345";
+      const { key, body: request } = wellFormedAgentRequest("session-delete-fails");
+      await postAgent(broker, key, request);
       assert.deepEqual(await deleteAgent(broker, key), { status, text: body });
+      // the scripted failure is the answer of a DELETE that RAN: nothing there, or a uid refusal, is always 200
+      assert.deepEqual(await deleteAgent(broker, "abcdef012345abcdef012345"), {
+        status: 200,
+        text: "",
+      });
     });
   }
+});
+
+test("K-R2-3: `error timeout` ends the STREAM, not the Job — the next POST follows the same Job and uid, which still holds a slot", async () => {
+  await withBroker(
+    {
+      jobs: [{ steps: ["pulling"], final: { error: "timeout" } }],
+      default: { steps: ["starting"] },
+    },
+    async (broker) => {
+      const { key, body } = wellFormedAgentRequest("session-timeout");
+      const first = await postAgent(broker, key, body);
+      assert.deepEqual(first.lines, ["pulling", "error timeout"]);
+      assert.equal((await getAgents(broker)).live, 1, "the Job continues and keeps its slot");
+      const second = await postAgent(broker, key, body);
+      assert.equal(broker.requestsFor("POST", key)[1]?.joinedExistingJob, true);
+      assert.equal(
+        broker.requestsFor("POST", key)[1]?.jobSeq,
+        broker.requestsFor("POST", key)[0]?.jobSeq,
+        "the same Job",
+      );
+      assert.equal(second.lines.at(-1), "error timeout");
+    },
+  );
+  // the contrast: a failed start IS an ended Job — the next POST is a new request
+  await withBroker({ jobs: [{ final: { error: "start_failed" } }] }, async (broker) => {
+    const { key, body } = wellFormedAgentRequest("session-failed");
+    await postAgent(broker, key, body);
+    assert.equal((await getAgents(broker)).live, 0);
+  });
+});
+
+test("K-R2-4: `ready` prints the placement the Job was ROUTED to — an `auto` request with the pool not ready goes home, and home.live counts it", async () => {
+  await withBroker(
+    { status: { pool: { state: "no-template" }, home: { cap: 2 } } },
+    async (broker) => {
+      const { key, body } = wellFormedAgentRequest("session-auto-home", { placement: "auto" });
+      const ready = (await postAgent(broker, key, body)).lines.at(-1) ?? "";
+      assert.match(ready, /placement=home$/);
+      assert.deepEqual((await getAgents(broker)).home, { live: 1, cap: 2 });
+    },
+  );
+  await withBroker({}, async (broker) => {
+    const { key, body } = wellFormedAgentRequest("session-auto-pool", { placement: "auto" });
+    assert.match((await postAgent(broker, key, body)).lines.at(-1) ?? "", /placement=pool$/);
+  });
+});
+
+test("K-R2-8: an explicit pool request while the pool is not usable is `error template_rejected`; a utility request may send null seat / sessionId", async () => {
+  await withBroker({ status: { pool: { state: "no-template" } } }, async (broker) => {
+    const { key, body } = wellFormedAgentRequest("session-pool-rejected", { placement: "pool" });
+    assert.deepEqual((await postAgent(broker, key, body)).lines, ["error template_rejected"]);
+    assert.equal((await getAgents(broker)).live, 0);
+  });
+  await withBroker({}, async (broker) => {
+    const { key, body } = wellFormedUtilityRequest("pool", { seat: null, sessionId: null });
+    assert.match((await postAgent(broker, key, body)).lines.at(-1) ?? "", /^ready /);
+    assert.deepEqual(broker.requests.at(-1)?.problems, []);
+  });
 });
 
 test("DELETE of a key with no pod answers 200 with an empty body, with or without a uid", async () => {

@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { COMMAND_TABLE, PASS_THROUGH_INHERIT } from "../src/pod/command-classes.js";
+import { addRecord } from "./pod-a3-helpers.js";
 import { CREATE_PATHS, INHERIT_ALLOWED, startRecordedAtrium } from "./pod-kit/recorded-atrium.js";
 import type { AtriumScript, Classify, RecordedAtrium } from "./pod-kit/recorded-atrium.js";
 
@@ -15,6 +19,7 @@ import type { AtriumScript, Classify, RecordedAtrium } from "./pod-kit/recorded-
 
 const RECORD = "3f1c1e1a-2b3c-4d5e-8f60-7a8b9c0d1e2f";
 const OTHER_RECORD = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d";
+const THIRD_RECORD = "5d4c3b2a-1f0e-4d9c-8b7a-6a5b4c3d2e1f";
 
 async function withAtrium(
   script: AtriumScript,
@@ -571,10 +576,15 @@ test("the first message is taken out of the argv acpx runs with; rules match the
         callBody({
           call_id: second,
           stdin_b64: Buffer.from("from stdin").toString("base64"),
-          argv: ["sessions", "new", "--record-id", RECORD, "--prompt-file", "-"],
+          argv: ["sessions", "new", "--record-id", OTHER_RECORD, "--prompt-file", "-"],
         }),
       );
-      assert.deepEqual(atrium.requests[1]?.ranArgv, ["sessions", "new", "--record-id", RECORD]);
+      assert.deepEqual(atrium.requests[1]?.ranArgv, [
+        "sessions",
+        "new",
+        "--record-id",
+        OTHER_RECORD,
+      ]);
       assert.equal(viaStdin.json.delivery?.delivery_id, second);
     },
   );
@@ -655,7 +665,7 @@ test("F6: only a RECORDED create is replayed (`delivery.replay:true`, acpx is ru
     );
     // a create with NO message records nothing: its repeat re-runs and is no replay
     const quiet = randomUUID();
-    const quietArgv = ["sessions", "new", "--record-id", RECORD, "--created-by-call", quiet];
+    const quietArgv = ["sessions", "new", "--record-id", THIRD_RECORD, "--created-by-call", quiet];
     const q1 = await call(atrium, callBody({ call_id: quiet, argv: quietArgv }));
     const q2 = await call(atrium, callBody({ call_id: quiet, argv: quietArgv }));
     assert.equal(q1.json.delivery, undefined);
@@ -994,7 +1004,7 @@ test("hints: shape departures the real route does not refuse are named by the ki
   });
 });
 
-test("F8: the gate's final 403 is the REAL CALLER_NOT_ALLOWED body on the guarded routes; the public hints are never refused", async () => {
+test("F8 / K-R2-5: the gate's final 403 is the REAL CALLER_NOT_ALLOWED body on the control route only; the messaging and public routes are open to every caller", async () => {
   await withAtrium({ phases: [{ mode: "forbidden" }] }, async (atrium) => {
     const refusal = (routeClass: string) => ({
       error:
@@ -1006,9 +1016,9 @@ test("F8: the gate's final 403 is the REAL CALLER_NOT_ALLOWED body on the guarde
     const answer = await call(atrium, callBody());
     assert.deepEqual([answer.status, answer.json], [403, refusal("control")]);
     assert.equal(answer.headers.get("retry-after"), null, "a 403 carries no Retry-After");
-    const message = await post(atrium, "/api/sessions/s/message", { text: "a" });
-    assert.deepEqual([message.status, message.json], [403, refusal("messaging")]);
-    assert.equal((await post(atrium, "/api/seats/t/message", { text: "a" })).status, 403);
+    // callerGate `isAllowed`: `messaging` and `public` are open to EVERY caller — a 403 there is one the real gate cannot produce
+    assert.equal((await post(atrium, "/api/sessions/s/message", { text: "a" })).status, 202);
+    assert.equal((await post(atrium, "/api/seats/t/message", { text: "a" })).status, 202);
     assert.equal(
       (await post(atrium, `/api/agent-pods/${KEY}/ready`, readyHint)).status,
       200,
@@ -1020,6 +1030,414 @@ test("F8: the gate's final 403 is the REAL CALLER_NOT_ALLOWED body on the guarde
     );
     assert.equal(atrium.requests.at(0)?.ranArgv, null, "nothing ran");
   });
+});
+
+test("K-R2-1: a create REPLAYED without --created-by-call is refused by acpx (the record id exists): exit 1, no delivery, never replay:true", async () => {
+  await withAtrium({}, async (atrium) => {
+    const callId = randomUUID();
+    const withFlag = [
+      "sessions",
+      "new",
+      "--record-id",
+      RECORD,
+      "--created-by-call",
+      callId,
+      "--prompt",
+      "hello",
+    ];
+    assert.equal((await call(atrium, callBody({ call_id: callId, argv: withFlag }))).json.exit, 0);
+    // the retry that forgot the flag — A-27's whole duty
+    const forgot = await call(
+      atrium,
+      callBody({
+        call_id: callId,
+        argv: ["sessions", "new", "--record-id", RECORD, "--prompt", "hello"],
+      }),
+    );
+    assert.equal(forgot.json.exit, 1);
+    assert.match(
+      String(forgot.json.stderr),
+      /record-id destination already exists; refusing to create another ACP session/,
+    );
+    assert.equal(forgot.json.delivery, undefined, "no delivery, and never replay:true");
+    assert.equal(atrium.requests.at(-1)?.replayed, false);
+    // another call id on the same record id is refused the same way, even with the flag
+    const other = randomUUID();
+    const stolen = await call(
+      atrium,
+      callBody({
+        call_id: other,
+        argv: ["sessions", "new", "--record-id", RECORD, "--created-by-call", other],
+      }),
+    );
+    assert.equal(stolen.json.exit, 1);
+    // with the flag, the identical repeat is answered (replay)
+    const same = await call(atrium, callBody({ call_id: callId, argv: withFlag }));
+    assert.equal(same.json.delivery.replay, true);
+  });
+});
+
+test("K-R2-2: the kit never touches a store it was not given — the test process's HOME is neither read nor written", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pod-kit-hermetic-"));
+  const kit = pathToFileURL(
+    fileURLToPath(new URL("./pod-kit/recorded-atrium.js", import.meta.url)),
+  ).href;
+  const driver = `
+    const { startRecordedAtrium } = await import(${JSON.stringify(kit)});
+    const atrium = await startRecordedAtrium({});
+    const body = { contract: 1, call_id: ${JSON.stringify(randomUUID())}, argv: ["sessions", "set-metadata", "--session-id", "nobody", "--key", "k"],
+      caller: { session_url: "x", record_id: ${JSON.stringify(RECORD)} } };
+    const r = await fetch(atrium.url + "/api/acpx/call", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    console.log(r.status, await r.text());
+    await atrium.close();
+  `;
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: home };
+  for (const name of Object.keys(env)) {
+    if (name.startsWith("ACPX_")) {
+      delete env[name];
+    }
+  }
+  const run = spawnSync(process.execPath, ["--input-type=module", "-e", driver], {
+    env,
+    encoding: "utf8",
+  });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(
+    run.stdout,
+    /^400 .*target-unresolved/,
+    "an unknown target is unresolved, not looked up in the box's store",
+  );
+  assert.deepEqual(
+    fs.readdirSync(home),
+    [],
+    "nothing was created under HOME — no .acpx, no index.json",
+  );
+  fs.rmSync(home, { recursive: true });
+});
+
+test("K-R2-2: with `stateHome` a target resolves against THAT store (acpx's own resolver, in a child), and only that one", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "pod-kit-state-"));
+  const known = "cccccccc-0000-4000-8000-000000000b01";
+  await addRecord(home, known, "acp-known");
+  const before = fs.readdirSync(path.join(home, ".acpx", "sessions")).toSorted();
+  await withAtrium({ stateHome: home }, async (atrium) => {
+    const about = (id: string, as = OTHER_RECORD) =>
+      call(
+        atrium,
+        callBody({
+          argv: ["sessions", "set-metadata", "--session-id", id, "--key", "k"],
+          caller: { session_url: "x", record_id: as },
+        }),
+      );
+    assert.equal((await about(known)).status, 200, "a session in the given store resolves");
+    assert.deepEqual((await about("not-in-the-store")).json, {
+      error: "class-not-passable",
+      reason: "target-unresolved",
+    });
+    assert.equal(
+      (await about(known, known)).json.reason,
+      "own-session",
+      "the caller's own session is still refused",
+    );
+  });
+  assert.ok(
+    before.every((name) => fs.existsSync(path.join(home, ".acpx", "sessions", name))),
+    "the given store was only read",
+  );
+  fs.rmSync(home, { recursive: true });
+});
+
+test("K-R2-7: --format json: the create-replay-mismatch is a JSON-RPC error on STDOUT, stderr empty", async () => {
+  await withAtrium({}, async (atrium) => {
+    const callId = randomUUID();
+    const argv = (message: string, format: string[] = []) => [
+      ...format,
+      "sessions",
+      "new",
+      "--record-id",
+      RECORD,
+      "--created-by-call",
+      callId,
+      "--prompt",
+      message,
+    ];
+    await call(atrium, callBody({ call_id: callId, argv: argv("first") }));
+    const text = await call(atrium, callBody({ call_id: callId, argv: argv("second") }));
+    assert.equal(text.json.exit, 2);
+    assert.match(String(text.json.stderr), /^CREATE_REPLAY_MISMATCH: /);
+    assert.equal(text.json.stdout, "");
+    const json = await call(
+      atrium,
+      callBody({ call_id: callId, argv: argv("second", ["--format", "json"]) }),
+    );
+    assert.equal(json.json.stderr, "");
+    const rpc = JSON.parse(String(json.json.stdout)) as {
+      error: { code: number; data: { detailCode: string } };
+    };
+    assert.equal(rpc.error.code, -32602);
+    assert.equal(rpc.error.data.detailCode, "CREATE_REPLAY_MISMATCH");
+  });
+});
+
+test("K-R2-7: a fork notice / template prompt in acpx's answer is queued — `delivery` names the message, else the notice; both ids are conflict-checked", async () => {
+  await withAtrium({ forkNotice: "copied from X" }, async (atrium) => {
+    const callId = randomUUID();
+    const argv = ["sessions", "copy", "--record-id", RECORD, "--created-by-call", callId];
+    const first = await call(atrium, callBody({ call_id: callId, argv }));
+    const noticeId = String(first.json.delivery.delivery_id);
+    assert.notEqual(
+      noticeId,
+      callId,
+      "a notice-only copy: delivery names the NOTICE (uuid5(call_id, 'fork-notice'))",
+    );
+    assert.match(noticeId, /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    const replay = await call(atrium, callBody({ call_id: callId, argv }));
+    assert.deepEqual(replay.json.delivery, {
+      delivery_id: noticeId,
+      to: RECORD,
+      status: "queued",
+      replay: true,
+    });
+    // another sender's call whose NOTICE id is recorded for someone else: refused, though its call id is fresh? the
+    // derivation is from the call id, so the same call id from another caller hits the notice id
+    const stolen = await call(
+      atrium,
+      callBody({ call_id: callId, argv, caller: { session_url: "x", record_id: OTHER_RECORD } }),
+    );
+    assert.deepEqual([stolen.status, stolen.json.error], [409, "delivery-id-conflict"]);
+    assert.equal(stolen.json.delivery_id, noticeId);
+  });
+  await withAtrium({ templatePrompt: "the template's own prompt" }, async (atrium) => {
+    const callId = randomUUID();
+    const answer = await call(
+      atrium,
+      callBody({
+        call_id: callId,
+        argv: ["sessions", "copy", "--record-id", RECORD, "--created-by-call", callId],
+      }),
+    );
+    assert.equal(
+      answer.json.delivery.delivery_id,
+      callId,
+      "the template prompt is the message (id = call_id)",
+    );
+    // a caller's own message replaces the template's
+    const second = randomUUID();
+    await call(
+      atrium,
+      callBody({
+        call_id: second,
+        argv: [
+          "sessions",
+          "copy",
+          "--record-id",
+          THIRD_RECORD,
+          "--created-by-call",
+          second,
+          "--prompt",
+          "mine",
+        ],
+      }),
+    );
+    const replayMismatch = await call(
+      atrium,
+      callBody({
+        call_id: second,
+        argv: [
+          "sessions",
+          "copy",
+          "--record-id",
+          THIRD_RECORD,
+          "--created-by-call",
+          second,
+          "--prompt",
+          "not mine",
+        ],
+      }),
+    );
+    assert.equal(replayMismatch.json.error, "create-replay-mismatch");
+  });
+});
+
+test("K-R2-7: message content and task_options are validated as the real route does", async () => {
+  await withAtrium({}, async (atrium) => {
+    const to = "/api/sessions/s/message";
+    const codes = async (body: Record<string, unknown>) => {
+      const answer = await post(atrium, to, body);
+      return [answer.status, answer.json.code ?? answer.json.error] as const;
+    };
+    assert.deepEqual(await codes({ content: [] }), [400, "bad-content"]);
+    assert.deepEqual(await codes({ content: "x" }), [400, "bad-content"]);
+    assert.deepEqual(await codes({ content: [{ type: "video" }] }), [400, "bad-content"]);
+    assert.deepEqual(await codes({ content: [{ type: "text", text: 5 }] }), [400, "bad-content"]);
+    assert.deepEqual(await codes({ content: [{ type: "image" }] }), [400, "bad-content"]);
+    assert.deepEqual(await codes({ text: "a", task_options: [] }), [400, "bad-task-options"]);
+    assert.deepEqual(await codes({ text: "a", task_options: { big: "x".repeat(17_000) } }), [
+      400,
+      "task-options-too-large",
+    ]);
+    assert.equal((await post(atrium, to, { text: "a", task_options: { a: 1 } })).status, 202);
+    assert.equal(
+      (
+        await post(atrium, to, {
+          content: [{ type: "image", mimeType: "image/png", data: "AAAA" }],
+        })
+      ).status,
+      202,
+    );
+    assert.equal(
+      (await post(atrium, to, { content: [{ type: "resource_link", uri: "x" }], text: "t" }))
+        .status,
+      202,
+    );
+  });
+});
+
+test("K-R2-7: the recipient's state — seat 404 / 409 vacant, session 404 / archived / template / closing / closed (reopen:true passes) — and the id ownership", async () => {
+  await withAtrium(
+    {
+      messages: {
+        recipients: {
+          ghost: "unknown",
+          "holder-1": "not-a-seat",
+          "seat-vac": "vacant",
+          arch: "archived",
+          tmpl: "template",
+          closing: "closing",
+          closed: "closed",
+        },
+      },
+    },
+    async (atrium) => {
+      const seat = (id: string) => post(atrium, `/api/seats/${id}/message`, { text: "a" });
+      const session = (id: string, extra: Record<string, unknown> = {}) =>
+        post(atrium, `/api/sessions/${id}/message`, { text: "a", ...extra });
+      assert.deepEqual(
+        [(await seat("ghost")).status, (await seat("ghost")).json.code],
+        [404, "not-a-seat"],
+      );
+      assert.equal(
+        (await seat("holder-1")).json.error,
+        "holder-1 is not a seat id known to this box",
+      );
+      const vacant = await seat("seat-vac");
+      assert.deepEqual(
+        [vacant.status, vacant.json.code, vacant.json.seatId],
+        [409, "SEAT_VACANT", "seat-vac"],
+      );
+      const unknown = await session("ghost");
+      assert.deepEqual(
+        [unknown.status, unknown.json],
+        [404, { error: "no session or seat with this id" }],
+      );
+      const archived = await session("arch");
+      assert.deepEqual(
+        [archived.status, archived.json.code, archived.json.archived],
+        [409, "SESSION_ARCHIVED", true],
+      );
+      assert.equal((await session("tmpl")).json.code, "template-session-read-only");
+      assert.equal((await session("closing")).json.code, "SESSION_CLOSING");
+      const closed = await session("closed");
+      assert.deepEqual(
+        [closed.status, closed.json.code, closed.json.closed],
+        [409, "SESSION_CLOSED", true],
+      );
+      assert.equal(
+        (await session("closed", { reopen: true })).status,
+        202,
+        "reopen:true delivers anyway",
+      );
+      // R4: a caller-chosen delivery id belongs to its first sender
+      const id = randomUUID();
+      assert.equal((await session("fine", { delivery_id: id, from: "alice" })).status, 202);
+      assert.equal(
+        (await session("fine", { delivery_id: id, from: "alice" })).status,
+        202,
+        "its own re-send",
+      );
+      const conflict = await session("fine", { delivery_id: id, from: "bob" });
+      assert.deepEqual(
+        [conflict.status, conflict.json.code, conflict.json.delivery_id],
+        [409, "delivery-id-conflict", id],
+      );
+      assert.match(String(conflict.json.error), /already belongs to a message of another sender/);
+    },
+  );
+});
+
+test("K-R2-7: heldSentence names the paused / held-by-policy reasons and the recipient's NAME", async () => {
+  await withAtrium(
+    {
+      messages: {
+        names: { "seat-1": "Atlas" },
+        answers: [
+          { held: { reason: "paused" } },
+          { held: { reason: "held-by-policy" } },
+          { held: { reason: "pod_starting" } },
+        ],
+      },
+    },
+    async (atrium) => {
+      const paused = await post(atrium, "/api/seats/seat-1/message", { text: "a" });
+      assert.match(
+        String(paused.json.message),
+        /^Held \(delivery [0-9a-f-]{36}\): a person paused Atlas's queue;/,
+      );
+      const policy = await post(atrium, "/api/seats/seat-1/message", { text: "a" });
+      assert.match(String(policy.json.message), /Atlas is being held deliberately/);
+      const starting = await post(atrium, "/api/seats/seat-1/message", { text: "a" });
+      assert.match(
+        String(starting.json.message),
+        /^Starting \(delivery .*\): Atlas's agent is starting;/,
+      );
+    },
+  );
+});
+
+test("K-R2-6: in a BARE process the fallback classifier is conservative — only the create paths pass, everything else is table-unavailable, flag values are not path words", async () => {
+  const source = fileURLToPath(new URL("../../test/pod-kit/recorded-atrium.ts", import.meta.url));
+  const child = spawn(process.execPath, [source, "--port", "0", "--script", "{}"], {
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+  try {
+    const hello = await new Promise<string>((resolve, reject) => {
+      let text = "";
+      child.stdout.on("data", (chunk: Buffer) => {
+        text += chunk.toString("utf8");
+        if (text.includes("\n")) {
+          resolve(text.slice(0, text.indexOf("\n")));
+        }
+      });
+      child.once("exit", () => reject(new Error("exited early")));
+    });
+    const base = `http://127.0.0.1:${String((JSON.parse(hello) as { port: number }).port)}`;
+    const callWith = async (argv: string[]) => {
+      const response = await fetch(`${base}/api/acpx/call`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(callBody({ argv })),
+      });
+      return [response.status, (await response.json()) as Record<string, any>] as const;
+    };
+    assert.deepEqual(await callWith(["sessions", "prune", "--dry-run"]), [
+      400,
+      { error: "class-not-passable", reason: "table-unavailable" },
+    ]);
+    assert.deepEqual(await callWith(["prompt", "hi"]), [
+      400,
+      { error: "class-not-passable", reason: "table-unavailable" },
+    ]);
+    assert.equal((await callWith(["sessions", "new", "--record-id", RECORD]))[0], 200);
+    // `--format json sessions new` IS a create: its flags are checked (record id required), not skipped
+    assert.deepEqual(await callWith(["--format", "json", "sessions", "new", "--name", "x"]), [
+      400,
+      { error: "record-id-required" },
+    ]);
+    assert.equal((await callWith(["sessions", "new", "-h"]))[1].reason, "help");
+  } finally {
+    child.kill("SIGTERM");
+    await new Promise((resolve) => child.once("exit", resolve));
+  }
 });
 
 test('away is the forwarder\'s answer exactly: 503, Retry-After 5, Connection: close, {"error":"atrium-away"} — on every route', async () => {
