@@ -9,6 +9,7 @@ import {
 } from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { isBoxWideFileInAgentPod } from "../../pod/foreign-write-guard.js";
+import { SPAWN_STATE_SUFFIX } from "../../pod/spawn-state.js";
 import {
   openSpawnLedgerForRecord,
   type DiskRecord,
@@ -2049,6 +2050,7 @@ async function unlinkHardDeletedFiles(
   safeId: string,
 ): Promise<void> {
   await unlinkIfPresent(path.join(sessionDir, `${safeId}.json`));
+  await unlinkIfPresent(spawnStateFilePath(sessionDir, safeId));
   const logPath = path.join(sessionDir, messagesLogFileName(acpxRecordId));
   await unlinkIfPresent(logPath);
   await unlinkIfPresent(messagesLogStalePath(logPath));
@@ -2858,6 +2860,8 @@ async function unlinkPrunedSessionFiles(
 ): Promise<number> {
   const safeId = encodeURIComponent(record.acpxRecordId);
   let bytesFreed = await unlinkCountingBytes(path.join(sessionDir, `${safeId}.json`));
+  // A7: the spawn-state file goes with its record, RECORD tier — kept under `--no-include-history`.
+  bytesFreed += await unlinkCountingBytes(spawnStateFilePath(sessionDir, safeId));
   const logPath = path.join(sessionDir, messagesLogFileName(record.acpxRecordId));
   bytesFreed += await unlinkCountingBytes(logPath);
   bytesFreed += await unlinkCountingBytes(messagesLogStalePath(logPath));
@@ -2922,6 +2926,11 @@ function ownerLogPaths(sessionDir: string, safeId: string): string[] {
  * history tier and goes wherever the timestamps sidecar goes (counted in the `"timestamps"` class of
  * `deletedFileClasses`). Not a stream segment: `isSessionStreamFile` must not match it.
  */
+/** `<id>.spawn-state` (A7, C3.4) — record-tier machinery of a spawn-owned session; counted in `"record"`. */
+function spawnStateFilePath(sessionDir: string, safeId: string): string {
+  return path.join(sessionDir, `${safeId}${SPAWN_STATE_SUFFIX}`);
+}
+
 function markersSidecarPath(sessionDir: string, safeId: string): string {
   return path.join(sessionDir, `${safeId}.markers.ndjson`);
 }

@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { SPAWN_STATE_SUFFIX } from "../../pod/spawn-state.js";
 import { SEAT_STORE_FILE, seatFromStore, type SeatStore } from "../persistence/seat-store.js";
 import { isNonSessionRecordFile } from "../persistence/session-dir-files.js";
 import {
@@ -112,6 +113,8 @@ export type ArchivePlan = {
   droppedAnchors: DroppedAnchor[];
   /** Files that are not session files at all (reserved names, non-session JSON). */
   ignoredFiles: string[];
+  /** Lone `<id>.spawn-state` files (no record, nothing else): removed on apply, with one line (O1). */
+  loneSpawnStates: string[];
   /** Orphans are reported in AGGREGATE, never listed individually (BRIEF §6.7). */
   orphanAggregate: { ids: number; files: number; bytes: number };
   boundaries: RetentionBoundaries;
@@ -359,6 +362,8 @@ export async function scanSessionDir(hotDir: string): Promise<{
   candidates: ArchiveCandidate[];
   orphans: ArchiveCandidate[];
   ignoredFiles: string[];
+  /** `<id>.spawn-state` files whose id has no record in the hot dir and no other file here (O1). */
+  loneSpawnStates: string[];
 }> {
   const dirents = await fs.readdir(hotDir, { withFileTypes: true });
   // 🛑 acpx'S OWN STORES ARE EXCLUDED BEFORE CLASSIFICATION, not left to a downstream
@@ -404,7 +409,15 @@ export async function scanSessionDir(hotDir: string): Promise<{
   }
 
   const orphans: ArchiveCandidate[] = [];
+  const loneSpawnStates: string[] = [];
   for (const [safeId, fileSet] of orphanSets) {
+    // O1 (atrium S7): a spawn-state file with no record and nothing else is residue of an attempt
+    // whose record never was, or is gone — it is neither archived nor swept as an orphan id (it has
+    // no history to keep); the apply step removes it after checking the archive has no record either.
+    if (fileSet.length === 1 && fileSet[0] === `${safeId}${SPAWN_STATE_SUFFIX}`) {
+      loneSpawnStates.push(fileSet[0]);
+      continue;
+    }
     // Belt and braces with the claim phase: an orphan is an id with NO record
     // file, and that judgement goes through the one record-presence helper.
     if (findRecordFile(safeId, fileSet) == null) {
@@ -414,7 +427,7 @@ export async function scanSessionDir(hotDir: string): Promise<{
     }
   }
 
-  return { candidates, orphans, ignoredFiles: ignored };
+  return { candidates, orphans, ignoredFiles: ignored, loneSpawnStates };
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
@@ -749,6 +762,7 @@ export type PlanInput = {
   candidates: ArchiveCandidate[];
   orphans: ArchiveCandidate[];
   ignoredFiles: string[];
+  loneSpawnStates?: string[];
   boundaries: RetentionBoundaries;
   includeOrphans: boolean;
   explicitIds?: readonly string[];
@@ -988,6 +1002,7 @@ export async function buildArchivePlan(input: PlanInput): Promise<ArchivePlan> {
     blocked: state.blocked,
     droppedAnchors: state.droppedAnchors,
     ignoredFiles: input.ignoredFiles,
+    loneSpawnStates: input.loneSpawnStates ?? [],
     orphanAggregate: aggregateOrphans(selected),
     boundaries: input.boundaries,
     livenessDegraded: input.liveness.wakeups.status === "unevaluable",
