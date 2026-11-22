@@ -490,6 +490,127 @@ test("watch: ADDED for the current set, then MODIFIED / DELETED as the state mov
   });
 });
 
+test("F13: list items carry no kind/apiVersion, timestamps are second precision, selectors the real API accepts are accepted", async () => {
+  await withApi(
+    {
+      pods: [
+        { name: "ag-a", node: "n1", serviceAccount: "dev-server-control" },
+        { name: "ag-b", serviceAccount: "other" },
+      ],
+      nodes: [{ name: "n1" }, { name: "n2", unschedulable: true }],
+    },
+    async (api) => {
+      const list = (await getJson(api, `/api/v1/namespaces/${NS}/pods`)).body;
+      assert.equal(list.kind, "PodList");
+      for (const item of list.items as Array<Record<string, any>>) {
+        assert.equal(item.kind, undefined, "a list item names no kind");
+        assert.equal(item.apiVersion, undefined);
+        assert.match(item.metadata.creationTimestamp, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/);
+        assert.match(
+          item.status.conditions[0].lastTransitionTime,
+          /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/,
+        );
+      }
+      assert.equal((await getJson(api, podPath("ag-a"))).body.kind, "Pod", "a single object does");
+      const names = async (query: string, base: string) =>
+        (
+          (await getJson(api, `${base}?${query}`)).body.items as Array<{
+            metadata: { name: string };
+          }>
+        )
+          .map((item) => item.metadata.name)
+          .toSorted();
+      assert.deepEqual(
+        await names(
+          "fieldSelector=spec.serviceAccountName%3Ddev-server-control",
+          `/api/v1/namespaces/${NS}/pods`,
+        ),
+        ["ag-a"],
+      );
+      assert.deepEqual(await names("fieldSelector=spec.unschedulable%3Dfalse", "/api/v1/nodes"), [
+        "n1",
+      ]);
+      assert.deepEqual(await names("fieldSelector=spec.unschedulable%3Dtrue", "/api/v1/nodes"), [
+        "n2",
+      ]);
+    },
+  );
+});
+
+test("F13: an unscheduled Pending pod has no nodeName key and no Ready condition; a failing node is KubeletNotReady", async () => {
+  await withApi(
+    {
+      pods: [
+        { name: "ag-p", phase: "Pending" },
+        { name: "ag-q", phase: "Pending", node: "n1" },
+      ],
+      nodes: [
+        { name: "n1", ready: "False" },
+        { name: "n2", ready: "Unknown" },
+      ],
+    },
+    async (api) => {
+      const pending = (await getJson(api, podPath("ag-p"))).body;
+      assert.equal("nodeName" in pending.spec, false);
+      assert.deepEqual(
+        pending.status.conditions.map((c: { type: string; status: string }) => [c.type, c.status]),
+        [["PodScheduled", "False"]],
+      );
+      const scheduled = (await getJson(api, podPath("ag-q"))).body;
+      assert.equal(scheduled.spec.nodeName, "n1");
+      assert.equal(
+        scheduled.status.conditions[0].status,
+        "True",
+        "PodScheduled once it has a node",
+      );
+      assert.equal(
+        (await getJson(api, "/api/v1/nodes/n1")).body.status.conditions[0].reason,
+        "KubeletNotReady",
+      );
+      assert.equal(
+        (await getJson(api, "/api/v1/nodes/n2")).body.status.conditions[0].reason,
+        "NodeStatusUnknown",
+      );
+      // setPodReady adds the Ready condition a Pending pod did not have
+      api.setPodReady("ag-p", "True", "2026-11-21T11:30:00Z", NS);
+      const after = (await getJson(api, podPath("ag-p"))).body;
+      assert.deepEqual(
+        after.status.conditions.find((c: { type: string }) => c.type === "Ready"),
+        { type: "Ready", status: "True", lastTransitionTime: "2026-11-21T11:30:00Z" },
+      );
+    },
+  );
+});
+
+test("F13: a watch from a resourceVersion the server no longer holds gets an ERROR event, 410 Expired (atrium's re-list path)", async () => {
+  await withApi({ pods: [{ name: "ag-1" }] }, async (api) => {
+    const listed = (await getJson(api, `/api/v1/namespaces/${NS}/pods`)).body;
+    const rv = (listed.metadata as { resourceVersion: string }).resourceVersion;
+    api.setPodPhase("ag-1", "Failed", NS);
+    api.compact();
+    const expired = await fetch(
+      `${api.url}/api/v1/namespaces/${NS}/pods?watch=true&resourceVersion=${rv}`,
+    );
+    const lines = (await expired.text())
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, any>);
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0]?.type, "ERROR");
+    assert.deepEqual(
+      [lines[0]?.object.kind, lines[0]?.object.reason, lines[0]?.object.code],
+      ["Status", "Expired", 410],
+    );
+    // a watch from the current version is fine
+    const fresh = (await getJson(api, `/api/v1/namespaces/${NS}/pods`)).body.metadata
+      .resourceVersion;
+    const ok = await fetch(
+      `${api.url}/api/v1/namespaces/${NS}/pods?watch=1&resourceVersion=${fresh}&timeoutSeconds=1`,
+    );
+    assert.equal((await ok.text()).includes("ERROR"), false);
+  });
+});
+
 test("an unknown path is a Status 404 and a non-GET is a Status 405", async () => {
   await withApi({}, async (api) => {
     assert.equal((await getJson(api, "/apis/apps/v1/deployments")).status, 404);

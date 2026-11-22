@@ -577,7 +577,11 @@ test("CLI: agent pod — a record command about an unresolvable session is passe
   const { result, requests } = await runCallingHome(
     ["sessions", "set-os", "rec-nobody", "default"],
     home,
-    { calls: [{ answer: { exit: 4, stderr: "no session\n" } }] },
+    // the real atrium refuses a target it cannot resolve; here the control pod knows the session
+    {
+      resolveTargetAs: "rec-nobody-on-the-control-pod",
+      calls: [{ answer: { exit: 4, stderr: "no session\n" } }],
+    },
   );
   assert.equal(result.status, 4, result.stderr);
   assert.equal(result.stderr, "no session\n", "the control pod's answer, verbatim");

@@ -29,8 +29,10 @@ export interface PodSeed {
   name: string;
   namespace?: string;
   uid?: string;
-  /** spec.nodeName */
+  /** spec.nodeName; absent = unscheduled (the key is absent from the pod, as on the real API). */
   node?: string;
+  /** spec.serviceAccountName; default "default". */
+  serviceAccount?: string;
   /** Default `Running`. `Succeeded` and `Failed` are the terminal phases (C3.3). */
   phase?: string;
   /** The pod's Ready condition status; default "True" while Running, else "False". */
@@ -53,6 +55,8 @@ export interface NodeSeed {
   ready?: ReadyStatus | null;
   /** The Ready condition's `lastTransitionTime` (ISO); default: now. */
   readyTransitionTime?: string;
+  /** spec.unschedulable (cordoned); absent otherwise, as on the real API. */
+  unschedulable?: boolean;
   labels?: Record<string, string>;
 }
 
@@ -204,6 +208,11 @@ export function matchesLabelSelector(labels: Record<string, string>, selector: s
   return true;
 }
 
+/** The real API's timestamps have second precision: `2026-11-18T08:22:07Z`. */
+function nowIso(): string {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
 function fieldValue(object: KubeObject, path: string, supported: string[]): string {
   if (!supported.includes(path)) {
     // The real API's answer to a field it cannot select on — measured for metadata.uid (A5's report).
@@ -216,6 +225,9 @@ function fieldValue(object: KubeObject, path: string, supported: string[]): stri
         ? (value as Record<string, unknown>)[part]
         : undefined;
   }
+  if (value === undefined && path === "spec.unschedulable") {
+    return "false"; // an absent field selects as false, as on the real API
+  }
   return typeof value === "string" || typeof value === "number" || typeof value === "boolean"
     ? String(value)
     : "";
@@ -225,10 +237,12 @@ const POD_FIELDS = [
   "metadata.name",
   "metadata.namespace",
   "spec.nodeName",
+  "spec.serviceAccountName",
+  "spec.restartPolicy",
   "status.phase",
   "status.podIP",
 ];
-const NODE_FIELDS = ["metadata.name"];
+const NODE_FIELDS = ["metadata.name", "spec.unschedulable"];
 
 function matchesFieldSelector(object: KubeObject, selector: string, supported: string[]): boolean {
   for (const term of splitTerms(selector)) {
@@ -256,6 +270,8 @@ export class FakeApiServer {
   private token: string | undefined;
   private defaultNamespace = "default";
   private resourceVersion = 1000;
+  /** Events older than this resourceVersion are no longer held (`compact()`): a watch from before it is Expired. */
+  private minResourceVersion = 0;
   private podCounter = 0;
   private hostName = "127.0.0.1";
 
@@ -332,6 +348,12 @@ export class FakeApiServer {
     this.requests.length = 0;
   }
 
+  /** The server forgets its watch history up to now: a watch resumed from an older resourceVersion gets `410 Expired`. */
+  compact(): void {
+    this.minResourceVersion = this.resourceVersion;
+    this.events.length = 0;
+  }
+
   // ---- state mutation: a test moves the cluster between two asks -------------------------------
 
   /** Create the pod, or replace it (same namespace and name) — a watcher sees ADDED or MODIFIED. */
@@ -347,22 +369,40 @@ export class FakeApiServer {
         namespace,
         uid: seed.uid ?? uuidFrom(`${namespace}/${seed.name}/${String(this.podCounter)}`),
         resourceVersion: String(this.resourceVersion),
-        creationTimestamp: new Date().toISOString(),
+        creationTimestamp: nowIso(),
         labels: seed.labels ?? {},
         annotations: seed.annotations ?? {},
-        ...(seed.deleting === true ? { deletionTimestamp: new Date().toISOString() } : {}),
+        ...(seed.deleting === true ? { deletionTimestamp: nowIso() } : {}),
       },
-      spec: { nodeName: seed.node ?? "" },
+      // an unscheduled pod has no nodeName key at all
+      spec: {
+        ...(seed.node === undefined || seed.node === "" ? {} : { nodeName: seed.node }),
+        serviceAccountName: seed.serviceAccount ?? "default",
+        restartPolicy: "Never",
+      },
       status: {
         phase: seed.phase ?? "Running",
         ...(seed.podIP === undefined ? {} : { podIP: seed.podIP }),
-        conditions: [
-          {
-            type: "Ready",
-            status: seed.ready ?? ((seed.phase ?? "Running") === "Running" ? "True" : "False"),
-            lastTransitionTime: seed.readyTransitionTime ?? new Date().toISOString(),
-          },
-        ],
+        // a Pending pod that never became Ready reports no Ready condition (only PodScheduled), as on the real API
+        conditions:
+          (seed.phase ?? "Running") === "Pending" &&
+          seed.ready === undefined &&
+          seed.readyTransitionTime === undefined
+            ? [
+                {
+                  type: "PodScheduled",
+                  status: seed.node === undefined || seed.node === "" ? "False" : "True",
+                  lastTransitionTime: nowIso(),
+                },
+              ]
+            : [
+                {
+                  type: "Ready",
+                  status:
+                    seed.ready ?? ((seed.phase ?? "Running") === "Running" ? "True" : "False"),
+                  lastTransitionTime: seed.readyTransitionTime ?? nowIso(),
+                },
+              ],
       },
     };
     const id = `${namespace}/${seed.name}`;
@@ -399,7 +439,13 @@ export class FakeApiServer {
     const entry = conditions.find((condition) => condition.type === "Ready");
     if (entry !== undefined) {
       entry.status = ready;
-      entry.lastTransitionTime = transitionTime ?? new Date().toISOString();
+      entry.lastTransitionTime = transitionTime ?? nowIso();
+    } else {
+      conditions.push({
+        type: "Ready",
+        status: ready,
+        lastTransitionTime: transitionTime ?? nowIso(),
+      });
     }
     pod.metadata.resourceVersion = String(this.resourceVersion);
     this.emit("MODIFIED", pod);
@@ -426,6 +472,7 @@ export class FakeApiServer {
         labels: seed.labels ?? {},
         resourceVersion: "1",
       },
+      spec: seed.unschedulable === true ? { unschedulable: true } : {},
       status: {
         conditions:
           ready === null
@@ -434,9 +481,14 @@ export class FakeApiServer {
                 {
                   type: "Ready",
                   status: ready,
-                  reason: ready === "True" ? "KubeletReady" : "NodeStatusUnknown",
-                  lastHeartbeatTime: new Date().toISOString(),
-                  lastTransitionTime: seed.readyTransitionTime ?? new Date().toISOString(),
+                  reason:
+                    ready === "True"
+                      ? "KubeletReady"
+                      : ready === "False"
+                        ? "KubeletNotReady"
+                        : "NodeStatusUnknown",
+                  lastHeartbeatTime: nowIso(),
+                  lastTransitionTime: seed.readyTransitionTime ?? nowIso(),
                 },
               ],
       },
@@ -698,7 +750,11 @@ export class FakeApiServer {
       kind,
       apiVersion: "v1",
       metadata: { resourceVersion: String(this.resourceVersion) },
-      items,
+      // the real list's items carry no kind / apiVersion of their own
+      items: items.map((item) => {
+        const { kind: _kind, apiVersion: _apiVersion, ...rest } = item;
+        return rest;
+      }),
     };
   }
 
@@ -723,6 +779,21 @@ export class FakeApiServer {
     response.writeHead(200, { "content-type": "application/json", "transfer-encoding": "chunked" });
     response.flushHeaders();
     const since = Number(url.searchParams.get("resourceVersion") ?? "0");
+    if (Number.isFinite(since) && since > 0 && since < this.minResourceVersion) {
+      // as the real API, for a resourceVersion older than what it still holds: an ERROR event, 410 Expired
+      response.write(
+        `${JSON.stringify({
+          type: "ERROR",
+          object: statusBody(
+            410,
+            `too old resource version: ${String(since)} (${String(this.minResourceVersion)})`,
+            "Expired",
+          ),
+        })}\n`,
+      );
+      response.end();
+      return;
+    }
     if (!Number.isFinite(since) || since <= 0) {
       for (const pod of matching) {
         response.write(`${JSON.stringify({ type: "ADDED", object: pod })}\n`);
@@ -803,6 +874,9 @@ export class FakeApiServer {
       case "setFaults":
         this.setFaults(op.faults);
         break;
+      case "compact":
+        this.compact();
+        break;
     }
   }
 }
@@ -822,7 +896,8 @@ export type KitOp =
   | { op: "addNode"; node: NodeSeed }
   | { op: "removeNode"; name: string }
   | { op: "setNodeReady"; name: string; ready: ReadyStatus | null }
-  | { op: "setFaults"; faults: ApiFault[] };
+  | { op: "setFaults"; faults: ApiFault[] }
+  | { op: "compact" };
 
 export async function startFakeApiServer(
   script: ApiScript = {},
