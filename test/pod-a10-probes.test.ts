@@ -16,7 +16,11 @@ import {
 } from "../src/models/claude-advertisement.js";
 import { classifyArgv } from "../src/pod/command-classes.js";
 import type { PlacementDecision } from "../src/pod/placement-step.js";
-import { podStartingRefusal } from "../src/pod/pod-refusal.js";
+import {
+  admissionBusyRefusal,
+  agentCapRefusal,
+  podStartingRefusal,
+} from "../src/pod/pod-refusal.js";
 import {
   newestRecordAdvertisement,
   RECORD_ADVERTISEMENT_MAX_READS,
@@ -252,6 +256,116 @@ test("records: at most RECORD_ADVERTISEMENT_MAX_READS candidates are opened befo
     undefined,
   );
   assert.equal(s.loaded.length, RECORD_ADVERTISEMENT_MAX_READS);
+});
+
+test("round 2 / F-A: a Codex record with NO profile (what a default-profile session writes) answers --profile <the default>; an explicit OTHER profile does not; a no-profile record answers nothing when the asked profile is not the default", async () => {
+  const s = store([
+    { id: "plain", command: CODEX, lastUsedAt: "2026-11-21T00:00:00Z", models: ["g[low]"] },
+    {
+      id: "other",
+      command: CODEX,
+      lastUsedAt: "2026-11-22T00:00:00Z",
+      models: ["x[low]"],
+      profile: "elsewhere",
+    },
+  ]);
+  const base = { entries: s.entries as never, load: s.load };
+  const query = { agentCommand: CODEX, need: "available_models" as const, profile: "codexgpt" };
+  // codexgpt IS what "no profile" means here → the newer explicit-other record is skipped, the plain one serves
+  const served = await newestRecordAdvertisement(query, {
+    ...base,
+    noProfileMatches: (p) => p === "codexgpt",
+  });
+  assert.equal(served?.recordId, "plain");
+  // negative: asked for another profile than the default → the plain record must NOT answer it
+  assert.equal(
+    await newestRecordAdvertisement(
+      { ...query, profile: "someone" },
+      { ...base, noProfileMatches: (p) => p === "codexgpt" },
+    ),
+    undefined,
+  );
+  // negative: a box where no profile means "nothing matches" serves only explicit-profile records
+  assert.equal(
+    await newestRecordAdvertisement(query, { ...base, noProfileMatches: () => false }),
+    undefined,
+  );
+  // an explicit profile equal to the asked one always answers, whatever the default
+  assert.equal(
+    (
+      await newestRecordAdvertisement(
+        { ...query, profile: "elsewhere" },
+        { ...base, noProfileMatches: () => false },
+      )
+    )?.recordId,
+    "other",
+  );
+});
+
+test("round 2 / F-B + F-G: a record of the box's own adapter command answers even when a NEWER record of another command (a dev or rig adapter) exists — a newer rig record never hides the deployed adapter's output styles", async () => {
+  const s = store([
+    {
+      id: "deployed",
+      command: CLAUDE,
+      lastUsedAt: "2026-11-10T00:00:00Z",
+      configOptions: [styleOption("default", "Explanatory")],
+    },
+    {
+      id: "rig",
+      command: "node /workspace/projects/claude-agent-acp/sdk-0.3.325/dist/index.js",
+      lastUsedAt: "2026-11-22T00:00:00Z",
+      configOptions: [modelOption("opus")],
+    },
+  ]);
+  const found = await newestRecordAdvertisement(
+    { agentCommand: CLAUDE, need: "config_options" },
+    { entries: s.entries as never, load: s.load },
+  );
+  assert.equal(found?.recordId, "deployed");
+  assert.equal(found?.match, "exact");
+  assert.deepEqual(s.loaded, ["deployed"], "the newer rig record is not even opened");
+  // control: with no record of the box's own command the rig record is the (labelled) answer
+  const only = store([
+    {
+      id: "rig",
+      command: CLAUDE_OLD,
+      lastUsedAt: "2026-11-22T00:00:00Z",
+      configOptions: [modelOption("opus")],
+    },
+  ]);
+  const fallback = await newestRecordAdvertisement(
+    { agentCommand: CLAUDE, need: "config_options" },
+    { entries: only.entries as never, load: only.load },
+  );
+  assert.equal(fallback?.match, "harness");
+});
+
+test("round 2 / F-F: a utility pod's refusals say neither session nor message; a session's keep their wording; `tokenLine` is in every pod-plane refusal's JSON detail", () => {
+  const cap = agentCapRefusal({ live: 5, cap: 5, box: "devbox", why: "cap" });
+  assert.doesNotMatch(cap.capacityRefusal.message ?? "", /session|message|queued/i);
+  assert.match(cap.capacityRefusal.message ?? "", /utility pod/);
+  assert.equal(cap.capacityRefusal.tokenLine, cap.stderrLine);
+  const busy = admissionBusyRefusal({ utility: true });
+  assert.doesNotMatch(busy.capacityRefusal.message ?? "", /session|message|queued/i);
+  assert.match(busy.capacityRefusal.message ?? "", /utility pod/);
+  assert.equal(busy.capacityRefusal.tokenLine, busy.stderrLine);
+  assert.match(busy.stderrLine, /^acpx: REFUSED reason=admission_busy /);
+  const starting = podStartingRefusal({ phase: "starting" });
+  assert.equal(starting.capacityRefusal.tokenLine, starting.stderrLine);
+  // negative control: a session's wake keeps the session wording
+  assert.match(
+    agentCapRefusal({ live: 5, cap: 5, box: "devbox", why: "cap", wake: "r1" }).capacityRefusal
+      .message ?? "",
+    /message stays queued/,
+  );
+  assert.match(
+    admissionBusyRefusal().capacityRefusal.message ?? "",
+    /session's agent pod[\s\S]*message stays queued/,
+  );
+  assert.match(
+    podStartingRefusal({ phase: "starting", wake: "r1" }).capacityRefusal.message ?? "",
+    /session's agent pod/,
+  );
 });
 
 // ───────────────────────── the Claude advertisement, with no probe ─────────────────────────
@@ -731,11 +845,17 @@ function cli(args: string[], env: NodeJS.ProcessEnv, stdin?: string): Promise<Cl
   });
 }
 
-const record = (id: string, command: string, acpx: Record<string, unknown>) => ({
+const record = (
+  id: string,
+  command: string,
+  acpx: Record<string, unknown>,
+  lastUsedAt = "2026-11-10T00:00:00.000Z",
+) => ({
   acpxRecordId: id,
   acpSessionId: `acp-${id}`,
   agentCommand: command,
   cwd: "/workspace",
+  lastUsedAt,
   acpx: acpx as never,
 });
 
@@ -927,5 +1047,159 @@ test("REAL CLI, pod mode (A-7 negatives): a call that is already routed is refus
     assert.equal(pod.calls().length, 0);
   } finally {
     await pod.close();
+  }
+});
+
+function writeRegistry(home: string): void {
+  const dir = path.join(home, ".acpx", "subscriptions");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "registry.json"),
+    JSON.stringify({
+      version: 3,
+      profiles: [
+        {
+          id: "codexgpt",
+          label: "Codex ChatGPT (native ~/.codex)",
+          authMode: "chatgpt",
+          adapter: "codex",
+          account: "codexgpt",
+          codexHome: path.join(home, ".codex"),
+        },
+      ],
+    }),
+  );
+}
+
+const ATRIUM_CODEX_ARGV = (cwd: string, profile = "codexgpt") => [
+  "--format",
+  "json",
+  "--profile",
+  profile,
+  "--cwd",
+  cwd,
+  "--agent",
+  CODEX,
+  "model-catalogue",
+];
+
+test("REAL CLI, round 2 / F-A: atrium's exact Codex argv (--profile <active> --cwd <empty dir>) is served from Codex records WITHOUT a profile — the shape 233 of 236 real records have — with the record's age and a null currentModelId when it has none", async () => {
+  const r = await rig({
+    records: [
+      record(
+        "55555555-5555-4555-8555-555555555551",
+        CODEX,
+        { available_models: ["gpt-5[low]", "gpt-5[high]"] },
+        "2026-11-20T14:36:00.000Z",
+      ),
+    ],
+  });
+  try {
+    writeRegistry(r.home);
+    const cwd = fs.mkdtempSync(path.join(ROOT, "empty-"));
+    const result = await cli(ATRIUM_CODEX_ARGV(cwd), r.env);
+    assert.equal(result.code, 0, result.stderr);
+    const json = JSON.parse(result.stdout.trim().split("\n").at(-1) ?? "{}") as Record<
+      string,
+      unknown
+    >;
+    assert.equal(json.source, "records");
+    assert.equal(json.record_id, "55555555-5555-4555-8555-555555555551");
+    assert.equal(json.record_last_used_at, "2026-11-20T14:36:00.000Z");
+    assert.equal(
+      json.currentModelId,
+      null,
+      "null, as the transient path answers — never an empty string",
+    );
+    assert.equal(r.broker.requests.length, 0);
+    assert.equal(r.calls().length, 0);
+  } finally {
+    await r.close();
+  }
+});
+
+test("REAL CLI, round 2 / F-A (negative): an explicit OTHER profile on the only Codex record is not served for atrium's argv — it routes to the home utility pod instead", async () => {
+  const r = await rig({
+    records: [
+      record("55555555-5555-4555-8555-555555555552", CODEX, {
+        available_models: ["gpt-5[low]"],
+        session_options: { profile: "elsewhere" },
+      }),
+    ],
+    stub: { exit: 0, stdout: "{}\n" },
+  });
+  try {
+    writeRegistry(r.home);
+    const cwd = fs.mkdtempSync(path.join(ROOT, "empty-"));
+    const result = await cli(ATRIUM_CODEX_ARGV(cwd), r.env);
+    assert.equal(result.code, 0, result.stderr);
+    const post = r.broker.requests.find((q) => q.method === "POST");
+    assert.equal(
+      post?.key,
+      "util-home",
+      "Codex is home-placed (C1.2): its probe cannot run on the pool pod",
+    );
+    assert.equal(r.calls().length, 1);
+  } finally {
+    await r.close();
+  }
+});
+
+test("REAL CLI, round 2 / F-B + F-G: an older record of the box's own claude command answers atrium's output-styles call although a NEWER record of a rig adapter lacks the style option — `supported:true`, never a hidden row — and carries its age", async () => {
+  const r = await rig({
+    records: [
+      record(
+        "66666666-6666-4666-8666-666666666661",
+        CLAUDE,
+        { config_options: [styleOption("default", "Explanatory")] },
+        "2026-11-10T00:00:00.000Z",
+      ),
+      record(
+        "66666666-6666-4666-8666-666666666662",
+        "node /workspace/projects/claude-agent-acp/sdk-0.3.325/dist/index.js",
+        { config_options: [modelOption("opus")] },
+        "2026-11-22T00:00:00.000Z",
+      ),
+    ],
+  });
+  try {
+    const result = await cli(
+      ["--approve-all", "--agent", CLAUDE, "--format", "json", "output-styles"],
+      r.env,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const json = JSON.parse(result.stdout.trim().split("\n").at(-1) ?? "{}") as Record<
+      string,
+      unknown
+    >;
+    assert.equal(json.supported, true);
+    assert.deepEqual(json.available, ["default", "Explanatory"]);
+    assert.equal(json.adapter_match, "exact");
+    assert.equal(json.record_last_used_at, "2026-11-10T00:00:00.000Z");
+  } finally {
+    await r.close();
+  }
+});
+
+test("REAL CLI, round 2 / F-F: a utility refusal in JSON carries tokenLine == stderr line 1 and nothingStarted, and its sentence names no session or message", async () => {
+  const r = await rig({});
+  try {
+    r.broker.setScript({
+      default: { final: { refused: { reason: "agent_cap", live: 5, cap: 5 } } },
+      status: { home: { live: 0, cap: 5 } },
+    });
+    const result = await cli(["--format", "json", "--agent", CLAUDE, "exec", "hi"], r.env);
+    assert.equal(result.code, 75, result.stderr);
+    const error = (
+      JSON.parse(result.stdout.trim().split("\n")[0] ?? "{}") as {
+        error: { message: string; data: Record<string, unknown> };
+      }
+    ).error;
+    assert.equal(error.data.tokenLine, result.stderr.split("\n")[0]);
+    assert.equal(error.data.nothingStarted, true);
+    assert.equal(error.data.reason, "agent_cap");
+    assert.doesNotMatch(String(error.data.message), /session|message|queued/i);
+  } finally {
+    await r.close();
   }
 });

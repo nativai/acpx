@@ -471,7 +471,7 @@ function wakeBoundRefusal(
     return podStartingRefusal({ phase: phase ?? "scheduling", wake: ctx.wake });
   }
   if (!agents?.ok) {
-    return admissionBusyRefusal();
+    return admissionBusyRefusal({ utility: ctx.wake === undefined });
   }
   return agentCapRefusal({
     live: agents.agents.live,
@@ -519,7 +519,7 @@ async function brokerAnswerOutcome(
     throw new RoutedCallError({ outcome: "not_run", reason, callId: ctx.callId });
   }
   if (answer.kind === "unavailable") {
-    throw admissionBusyRefusal();
+    throw admissionBusyRefusal({ utility: ctx.wake === undefined });
   }
   throw wakeBoundRefusal(answer.phase, ctx, ctx.agents());
 }
@@ -553,7 +553,7 @@ async function askBroker(options: RoutedCallOptions, callId: string): Promise<En
   const sources = readAgentBrokerOriginSources();
   const origin = options.broker?.origin ?? resolveAgentBrokerOrigin(options.env, sources);
   if (!origin) {
-    throw admissionBusyRefusal();
+    throw admissionBusyRefusal({ utility: options.target.harness === "utility" });
   }
   const brokerOptions = {
     origin,
@@ -593,7 +593,7 @@ async function ensureOwnerPod(options: RoutedCallOptions, callId: string): Promi
   }
   const found = await options.lookup(options.key);
   if (found.state === "unknown") {
-    throw admissionBusyRefusal();
+    throw admissionBusyRefusal({ utility: options.target.harness === "utility" });
   }
   if (found.state === "exists" && found.ready) {
     return { uid: found.uid, ip: found.ip };

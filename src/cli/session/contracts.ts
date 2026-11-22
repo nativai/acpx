@@ -436,6 +436,8 @@ export type AgentOutputStyleListResult = {
   recordId?: string;
   /** A10, `source: "records"`: `exact` = same adapter command as the box launches now; `harness` = same harness, older/other command. */
   adapterMatch?: "exact" | "harness";
+  /** A10, `source: "records"`: when that record was last used (ISO) — the answer's age, for a staleness label. */
+  recordLastUsedAt?: string;
 };
 
 /** A10: what served a probe — session records, or the utility pod (a routed call; the pod itself reports `transient`). */

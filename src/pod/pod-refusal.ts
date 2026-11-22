@@ -64,6 +64,7 @@ export function podStartingRefusal(input: {
     tokenLine,
     sentence,
     detail: {
+      tokenLine,
       reason: "pod_starting",
       nothingStarted: true,
       retryAfterS,
@@ -91,13 +92,16 @@ export function agentCapRefusal(input: {
     `retry_after_s=${AGENT_CAP_RETRY_AFTER_S} live=${input.live} cap=${input.cap} ` +
     `box=${input.box} why=${input.why}` +
     (input.wake === undefined ? "" : ` wake=${input.wake}`);
+  const state = `${input.live} of ${input.cap} in use; ${input.why}`;
   const sentence =
-    `acpx: no agent pod can be started on this box now (${input.live} of ${input.cap} in use; ` +
-    `${input.why}). Nothing was started; the message stays queued until room frees.`;
+    input.wake === undefined
+      ? `acpx: the box's utility pod cannot be started now (${state}). Nothing was started; this is not available right now.`
+      : `acpx: no agent pod can be started on this box now (${state}). Nothing was started; the message stays queued until room frees.`;
   return new CapacityRefusedError({
     tokenLine,
     sentence,
     detail: {
+      tokenLine,
       reason: "agent_cap",
       nothingStarted: true,
       retryAfterS: AGENT_CAP_RETRY_AFTER_S,
@@ -116,15 +120,18 @@ export function agentCapRefusal(input: {
  * table), with a sentence that says so: the shared builder's sentence blames the admission lock and
  * says "nothing queued", neither of which is true in the pod plane (TE L-2).
  */
-export function admissionBusyRefusal(): CapacityRefusedError {
+export function admissionBusyRefusal(options: { utility?: boolean } = {}): CapacityRefusedError {
   const base = capacityRefusal("admission_busy");
-  const sentence =
-    "acpx: the broker or the Kubernetes API server did not answer, so the session's agent pod could not be checked or started. " +
-    "Nothing was started; the message stays queued and is delivered when they answer.";
+  // A utility pod belongs to no session and no message waits for it (A-10): its sentence says so.
+  const sentence = options.utility
+    ? "acpx: the broker or the Kubernetes API server did not answer, so the box's utility pod could not be checked or started. " +
+      "Nothing was started; this is not available right now."
+    : "acpx: the broker or the Kubernetes API server did not answer, so the session's agent pod could not be checked or started. " +
+      "Nothing was started; the message stays queued and is delivered when they answer.";
   return new CapacityRefusedError({
     tokenLine: base.stderrLine,
     sentence,
-    detail: { ...base.capacityRefusal, message: sentence },
+    detail: { ...base.capacityRefusal, tokenLine: base.stderrLine, message: sentence },
   });
 }
 

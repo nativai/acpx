@@ -466,7 +466,7 @@ export async function handleModelCatalogue(
     emitJsonResult(globalFlags.format, {
       action: "model_catalogue",
       agent: agent.agentName,
-      currentModelId: models?.currentModelId ?? null,
+      currentModelId: printedCurrentModelId(models, served),
       advertisedModelCatalogue: advertisedCatalogue(families),
       ...recordSourceFields(served),
     })
@@ -488,7 +488,9 @@ async function readModelAdvertisement(
   config: ResolvedAcpxConfig,
 ): Promise<{
   models: SessionModelState | undefined;
-  served: { source: string; recordId: string; adapterMatch: string } | undefined;
+  served:
+    | { source: string; recordId: string; adapterMatch: string; recordLastUsedAt: string }
+    | undefined;
 }> {
   const fromRecords = await modelCatalogueFromRecords(agentCommand, globalFlags.profile);
   if (fromRecords) {
@@ -498,6 +500,7 @@ async function readModelAdvertisement(
         source: "records",
         recordId: fromRecords.recordId,
         adapterMatch: fromRecords.adapterMatch,
+        recordLastUsedAt: fromRecords.recordLastUsedAt,
       },
     };
   }
@@ -516,6 +519,18 @@ async function readModelAdvertisement(
   return { models, served: undefined };
 }
 
+/**
+ * `null` where the transient path answers `null`: a record without a current model reads as `""` in the
+ * state built from it, which must not reach the JSON as an empty-string id (TE F-D).
+ */
+function printedCurrentModelId(
+  models: SessionModelState | undefined,
+  served: unknown,
+): string | null {
+  const id = models?.currentModelId ?? null;
+  return served !== undefined && id === "" ? null : id;
+}
+
 /** A10 (additive JSON fields): present only when the answer was served from a session record. */
 function recordSourceFields(
   served:
@@ -523,6 +538,7 @@ function recordSourceFields(
         source?: string;
         recordId?: string;
         adapterMatch?: string;
+        recordLastUsedAt?: string;
       }
     | undefined
     | false,
@@ -532,6 +548,7 @@ function recordSourceFields(
         ...(served.source ? { source: served.source } : {}),
         ...(served.recordId ? { record_id: served.recordId } : {}),
         ...(served.adapterMatch ? { adapter_match: served.adapterMatch } : {}),
+        ...(served.recordLastUsedAt ? { record_last_used_at: served.recordLastUsedAt } : {}),
       }
     : {};
 }
@@ -550,6 +567,7 @@ async function modelCatalogueFromRecords(
       models: SessionModelState;
       recordId: string;
       adapterMatch: "exact" | "harness";
+      recordLastUsedAt: string;
     }
   | undefined
 > {
@@ -572,6 +590,7 @@ async function modelCatalogueFromRecords(
     },
     recordId: found.recordId,
     adapterMatch: found.match,
+    recordLastUsedAt: found.lastUsedAt,
   };
 }
 

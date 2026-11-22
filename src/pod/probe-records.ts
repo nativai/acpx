@@ -1,5 +1,9 @@
+import os from "node:os";
+import path from "node:path";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
 import { acpAdapterKind } from "../acp/agent-command.js";
+import { findProfile, loadProfileRegistry } from "../config/profiles.js";
+import { defaultAccountBindingForAgent } from "../runtime/engine/default-account-binding.js";
 import { listSessionIndexEntries, resolveSessionRecord } from "../session/persistence.js";
 import type { SessionIndexEntry } from "../session/persistence/index.js";
 import type { SessionRecord } from "../types.js";
@@ -12,14 +16,18 @@ import { podMode, thisPodFile } from "./placement.js";
  * "from records where possible").
  *
  * The rule, one place: of the sessions that have run (an `acpSessionId`), of the SAME harness as the
- * agent asked about, take the newest — by `lastUsedAt` — whose record carries the advertisement
- * wanted. `match` says how close it is:
- *   exact    the record was started with the very agent command the box would launch now — its
- *            adapter version is the deployed one;
- *   harness  an older or different command of the same harness (an adapter that was deployed since,
- *            or a different registry entry): a good-faith answer, labelled so.
- * A record is NOT filtered by account for output styles and Claude's model list (those do not vary by
- * account); `profile` filters the model list of a harness whose catalogue does (Codex).
+ * agent asked about, prefer a record started with the very agent command this box launches (`exact`),
+ * then any other command of the harness (`harness`), each newest first by `lastUsedAt`; the first
+ * whose record carries the advertisement wanted answers. `match`:
+ *   exact    the record's agent command is the SAME COMMAND STRING as this box's deployed one. Real
+ *            commands are the stable link `node /opt/<adapter>/dist/index.js`, which a deploy does not
+ *            change: `exact` is NOT "the same adapter version" — a record written before a deploy is
+ *            still `exact`. Records hold no version.
+ *   harness  another command of the same harness (a dev or rig worktree adapter): a good-faith answer.
+ * Output styles and Claude's model list are served whatever account the record ran under — which is an
+ * approximation (output styles DO vary by account directory: `<account>/output-styles/*.md`); `profile`
+ * filters the model list of a harness whose catalogue differs by account (Codex), where a record with
+ * no profile counts as the default profile (see `profileMatches`).
  *
  * ⚠️ This module is the HEAVY side (record reads); the placement step (light graph) only imports it
  * dynamically.
@@ -51,6 +59,7 @@ export const RECORD_ADVERTISEMENT_MAX_READS = 25;
 export type RecordAdvertisementDeps = {
   entries?: typeof listSessionIndexEntries;
   load?: (id: string) => Promise<SessionRecord>;
+  noProfileMatches?: NoProfileMatches;
 };
 
 function satisfies(record: SessionRecord, need: AdvertisementNeed): boolean {
@@ -65,9 +74,21 @@ function recordProfile(record: SessionRecord): string | undefined {
   return typeof options?.profile === "string" ? options.profile : undefined;
 }
 
-/** The candidates, newest first: sessions that have run, of the harness asked about. */
+/**
+ * Order of preference: a record of the very adapter command this box launches (`exact`) before any
+ * other command of the harness (`harness` — a dev or rig worktree), each newest first. A newer rig
+ * record must never hide what the deployed adapter's own sessions advertise (TE F-G).
+ */
+function newestExactFirst(agentCommand: string) {
+  return (a: SessionIndexEntry, b: SessionIndexEntry): number =>
+    Number(b.agentCommand === agentCommand) - Number(a.agentCommand === agentCommand) ||
+    b.lastUsedAt.localeCompare(a.lastUsedAt);
+}
+
+/** The candidates: sessions that have run, of the harness asked about, in the order above. */
 async function candidateEntries(
   harness: string,
+  agentCommand: string,
   entries: RecordAdvertisementDeps["entries"],
 ): Promise<SessionIndexEntry[]> {
   const all = await (entries ?? listSessionIndexEntries)();
@@ -78,15 +99,56 @@ async function candidateEntries(
         entry.acpSessionId.length > 0 &&
         acpAdapterKind(entry.agentCommand) === harness,
     )
-    .toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt))
+    .toSorted(newestExactFirst(agentCommand))
     .slice(0, RECORD_ADVERTISEMENT_MAX_READS);
 }
 
-function answers(record: SessionRecord, query: RecordAdvertisementQuery): boolean {
-  return (
-    satisfies(record, query.need) &&
-    (query.profile === undefined || recordProfile(record) === query.profile)
-  );
+/**
+ * `--profile P` matches a record started under P — and a record that names NO profile, when P is
+ * what "no profile" means on this box: the profile no selection binds to for this agent
+ * (`defaultAccountBindingForAgent`, the creation seam), or a profile whose Codex home is the native
+ * `~/.codex` a raw login uses. 233 of 236 real Codex records carry no profile (a default-profile
+ * session writes none), while atrium always asks for the active one (TE F-A).
+ */
+function profileMatches(
+  record: SessionRecord,
+  query: RecordAdvertisementQuery,
+  noProfileMatches: NoProfileMatches,
+): boolean {
+  if (query.profile === undefined) {
+    return true;
+  }
+  const own = recordProfile(record);
+  return own === undefined
+    ? noProfileMatches(query.profile, query.agentCommand)
+    : own === query.profile;
+}
+
+/** Whether a record with no profile ran as the asked profile. Injected in tests; the box's registry otherwise. */
+export type NoProfileMatches = (profile: string, agentCommand: string) => boolean;
+
+export const noProfileMatchesOnThisBox: NoProfileMatches = (profile, agentCommand) => {
+  try {
+    if (defaultAccountBindingForAgent(agentCommand)?.profile === profile) {
+      return true;
+    }
+    const entry = findProfile(profile, loadProfileRegistry());
+    return (
+      entry?.authMode === "chatgpt" &&
+      path.resolve(entry.codexHome) ===
+        path.resolve(process.env.CODEX_HOME?.trim() || path.join(os.homedir(), ".codex"))
+    );
+  } catch {
+    return false;
+  }
+};
+
+function answers(
+  record: SessionRecord,
+  query: RecordAdvertisementQuery,
+  noProfileMatches: NoProfileMatches,
+): boolean {
+  return satisfies(record, query.need) && profileMatches(record, query, noProfileMatches);
 }
 
 async function loadQuietly(
@@ -125,9 +187,9 @@ export async function newestRecordAdvertisement(
   if (harness === undefined) {
     return undefined;
   }
-  for (const entry of await candidateEntries(harness, deps.entries)) {
+  for (const entry of await candidateEntries(harness, query.agentCommand, deps.entries)) {
     const record = await loadQuietly(deps.load ?? resolveSessionRecord, entry.acpxRecordId);
-    if (record && answers(record, query)) {
+    if (record && answers(record, query, deps.noProfileMatches ?? noProfileMatchesOnThisBox)) {
       return advertisementOf(entry, record, query);
     }
   }

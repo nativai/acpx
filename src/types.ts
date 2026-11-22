@@ -279,6 +279,8 @@ export type CapacityRefusalDetail = {
   wake?: { sessionId: string; seatId: string | null };
   /** `pod_starting` / `agent_cap` only (C7.2): the fields of the token line beyond the common ones. */
   pod?: { phase?: string; why?: string; live?: number; cap?: number; box?: string };
+  /** The first stderr line, repeated in JSON (`error.data.tokenLine`) like the placement refusals do (C7.2). */
+  tokenLine?: string;
 };
 
 /**

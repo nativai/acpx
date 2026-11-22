@@ -8,7 +8,12 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { queueKeyForSession } from "../src/cli/queue/paths.js";
 import { COMMAND_TABLE } from "../src/pod/command-classes.js";
-import { decidePlacement, refusalFor, type PlacementDecision } from "../src/pod/placement-step.js";
+import {
+  decidePlacement,
+  refusalFor,
+  refusalJson,
+  type PlacementDecision,
+} from "../src/pod/placement-step.js";
 import {
   agentPodName,
   canonicalHome,
@@ -928,11 +933,15 @@ test("F3 CLI: --format json carries the placement refusal in error.data (C7.2)",
   };
   assert.equal(out.error.data.reason, "admission_busy");
   assert.equal(r.stderr.split("\n")[0]?.startsWith("acpx: REFUSED reason=admission_busy"), true);
+  // Restored (A10 round 2, TE F-H): line 1 stays on stderr AND is `error.data.tokenLine`; nothing started.
+  assert.equal(out.error.data.tokenLine, r.stderr.split("\n")[0], "line 1 stays on stderr too");
+  assert.equal(out.error.data.nothingStarted, true);
   const u = run(["--format", "json", "seats", "zzz"], podEnv(home));
-  assert.equal(
-    (JSON.parse(u.stdout) as { error: { data: { reason: string } } }).error.data.reason,
-    "unclassified_command",
-  );
+  const unclassified = JSON.parse(u.stdout) as {
+    error: { data: { reason: string; tokenLine: string } };
+  };
+  assert.equal(unclassified.error.data.reason, "unclassified_command");
+  assert.equal(unclassified.error.data.tokenLine, u.stderr.split("\n")[0]);
   const pod = podEnv(podHome({ podFile: "ag-0123456789abcdef01234567" }));
   const leaf = run(["governor", "status", "--format", "json"], pod);
   assert.equal(
@@ -952,6 +961,21 @@ test("F3 CLI: --format json carries the placement refusal in error.data (C7.2)",
   );
   // Text mode: nothing on stdout.
   assert.equal(run(["exec", "hi"], podEnv(home)).stdout, "");
+});
+
+test("F3 successor (A10 round 2, TE F-H): a placement-step branch refusal's JSON carries nothing_started and tokenLine == line 1 — the row `exec` held until its branch was built", () => {
+  const d = decide(["exec", "hi"]);
+  assert.equal(d.kind, "branch");
+  const refusal = refusalFor(d);
+  assert.ok(refusal);
+  const json = JSON.parse(refusalJson(refusal)) as {
+    error: { code: number; data: Record<string, unknown> };
+  };
+  assert.equal(json.error.code, -32602);
+  assert.equal(json.error.data.reason, "pod_branch_unbuilt");
+  assert.equal(json.error.data.branch, "utility-pod");
+  assert.equal(json.error.data.nothing_started, true);
+  assert.equal(json.error.data.tokenLine, refusal.lines[0], "line 1 is repeated in error.data");
 });
 
 test('F5: NODE_TEST_CONTEXT="" honours NEITHER seam (home and service account agree)', () => {
