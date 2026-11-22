@@ -67,9 +67,12 @@ export interface BrokerBehavior {
   /** The stream never finishes: the steps are sent, then nothing, until DELETE or close. */
   hang?: boolean;
   /**
-   * The stream ENDS after the steps with NO final line — the real broker's `AgentEnsure.run()` catches only `Done` and
-   * `KubeError`, so anything else (a restart, an OOM) escapes after the 200 and some steps (broker.py `run()`). The Job
-   * goes on; a later POST follows it.
+   * The CREATOR's stream ENDS after the steps with NO final line — the real broker's `AgentEnsure.run()` catches only
+   * `Done` and `KubeError`, so anything else (a restart, an OOM) escapes after the 200 and some steps (broker.py
+   * `run()`). It is PER REQUEST, as in the real broker: the Job goes on, and a later POST is a fresh ensure that follows
+   * it — told where the pod is now, and, if the Job is scripted to get there (`afterTimeout: { final: … }`, the same
+   * "what the Job does afterwards" the stream-ending `error timeout` uses), it sees the scripted final, `ready`
+   * included. Without `afterTimeout` the Job sits where it is and a follower waits.
    */
   truncate?: boolean;
   /**
@@ -180,7 +183,7 @@ interface Job {
   lines: string[];
   /** The line the CREATOR's stream ends with while the Job goes on (`error timeout`, `error kube_api_error`). */
   creatorEnd: string | undefined;
-  /** The creator's stream ended with NO final line (`truncate`); the Job goes on. */
+  /** The CREATOR's stream ends with NO final line (`truncate`); the Job goes on and followers are unaffected. */
   truncated: boolean;
   done: boolean;
   /** The pod ended or the final line was not `ready`: a later POST creates a NEW Job (new uid). */
@@ -560,7 +563,11 @@ export class FakeBroker {
       if (spec.truncate === true) {
         job.truncated = true;
         this.notify(job);
-        return;
+        if (spec.afterTimeout === undefined) {
+          return;
+        }
+        spec = spec.afterTimeout;
+        continue;
       }
       await this.sleep(job, spec.finalDelayMs ?? 0);
       if (job.deleted) {
@@ -1022,7 +1029,7 @@ export class FakeBroker {
         response.end();
         return;
       }
-      if (job.truncated) {
+      if (!follower && job.truncated) {
         record.outcome = "truncated";
         response.end();
         return;

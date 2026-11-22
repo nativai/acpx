@@ -128,7 +128,8 @@ test("ensure: a bound reached before any step names no phase", async () => {
 });
 
 test("ensure: a broker that never answers, refuses the connection, or answers 5xx is `unavailable`", async () => {
-  // A server that never sends response headers (the kit's `hang` sends the 200 first; the real broker always does).
+  // A server that never sends response headers: a wedged or frozen real broker does (not by protocol); the kit's
+  // `hang` sends the 200 first.
   const silent = await rawHttp(() => undefined);
   try {
     const result = await ensureAgentPod(KEY, REQUEST, { origin: silent.url, wakeBoundMs: 200 });

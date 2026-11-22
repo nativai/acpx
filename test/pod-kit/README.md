@@ -61,7 +61,7 @@ Script (`BrokerScript`): `default` · `jobs[]` (the 1st Job CREATED gets `jobs[0
   final: {ready:{ip,pod,uid,node,placement}} | {refused:{reason,live,cap}} | {error:"start_failed"} | "<raw line>",
   finalDelayMs: 100,
   hang: true,                                  // the steps, then never a final line (until DELETE / close)
-  truncate: true,                              // the steps, then the stream ENDS with no final line (broker.py run() raising past its catches)
+  truncate: true,                              // the CREATOR's stream ends after the steps with no final line (broker.py run() raising past its catches); the Job goes on — script its end with afterTimeout:{final} and a later POST follows it to ready
   drop: {afterLines:1, times:1, beforeHeaders:false}, // cut the stream; the Job goes on
   respond: {status:503, body:"busy"} }         // a plain HTTP failure instead of a stream
 ```
