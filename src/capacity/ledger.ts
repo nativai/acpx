@@ -456,6 +456,10 @@ export async function appendDecisionLog(
   const logDir = path.join(dir, "log");
   const day = now.toISOString().slice(0, 10);
   const file = path.join(logDir, `${day}.ndjson`);
+  // ⚠️ OUTSIDE THE `try` BELOW: that catch is "a log that cannot be written never changes a decision", and
+  // the A-8 guard is a refusal, not a write fault (A8 TE F4: the lock-free wake paths append from an agent
+  // pod with no lock to trip the guard first). A9, `test/pod-admission-guard.test.ts`.
+  assertBoxWideWriteAllowed("ledger", file);
   try {
     await fs.mkdir(logDir, { recursive: true, mode: 0o700 });
     const firstOfDay = await fs.stat(file).then(

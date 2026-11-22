@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 import { acpAdapterKind } from "../acp/agent-command.js";
 import { CapacityRefusedError } from "../errors.js";
+import { assertBoxWideWriteAllowed, PodForeignWriteError } from "../pod/foreign-write-guard.js";
 import type { CapacityRefusalReason } from "../types.js";
 import { readPodInfo } from "./budget.js";
 import { type Harness, isHarness, MIB } from "./constants.js";
@@ -429,7 +431,26 @@ async function decideUnderLock(ctx: GateContext): Promise<Decision> {
   return decision;
 }
 
+/**
+ * ⚠️ THE A-8 GUARD IS NOT AN INSTRUMENT FAULT (block A9, A8 TE finding F5). Every fail-open path below
+ * treats an I/O fault of the ledger or its lock as "admit without a check"; `pod_foreign_write` is a
+ * REFUSAL that fires in an agent pod, so swallowing it would turn "an agent pod must never touch the
+ * box-wide ledger" into "an agent pod's admission quietly passes". `test/pod-admission-guard.test.ts`
+ * holds the case per catch site. Call this FIRST in every `catch` that can fail open or stay silent.
+ */
+function rethrowGuard(error: unknown): void {
+  if (error instanceof PodForeignWriteError) {
+    throw error;
+  }
+}
+
+/** The ledger's lock file: the one box-wide path every admission entry point would write. */
+function assertLedgerWriteAllowed(env: NodeJS.ProcessEnv): void {
+  assertBoxWideWriteAllowed("ledger", path.join(admissionDir(env), "admission.lock"), env);
+}
+
 function failOpen(stage: string, error: unknown): undefined {
+  rethrowGuard(error);
   const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(
     `[acpx] WARNING: session admission ${stage} failed (${message}); admitting without a check\n`,
@@ -437,13 +458,14 @@ function failOpen(stage: string, error: unknown): undefined {
   return undefined;
 }
 
-function ticketFor(dir: string, key: string): AdmissionTicket {
+export function ticketFor(dir: string, key: string): AdmissionTicket {
   const update = async (change: (entries: PendingEntry[]) => PendingEntry[]) => {
     try {
       await withAdmissionLock(dir, async () => {
         await writeLedgerFile(dir, change(await readLedgerFile(dir)));
       });
-    } catch {
+    } catch (error) {
+      rethrowGuard(error);
       // Best effort: an unbound entry is dropped once its admitter exits, an unreleased one at its
       // TTL — both only ever over-reserve for a while, never under-reserve.
     }
@@ -517,6 +539,7 @@ export async function admitCreate(
   request: CreateAdmissionRequest,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<AdmissionTicket | undefined> {
+  assertLedgerWriteAllowed(env);
   const ctx = gateContextFor(request, env);
   const decision = ctx ? await decide(ctx) : undefined;
   if (decision?.kind === "refused") {
@@ -1135,6 +1158,7 @@ export async function releaseAdmittedWake(
   admitted: { readonly key: string; readonly expiresAt: string },
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<void> {
+  assertLedgerWriteAllowed(env);
   const dir = admissionDir(env);
   try {
     await withAdmissionLock(dir, async () => {
@@ -1146,7 +1170,8 @@ export async function releaseAdmittedWake(
         ),
       );
     });
-  } catch {
+  } catch (error) {
+    rethrowGuard(error);
     // Best effort: an unreleased entry is dropped at its TTL — over-reserving, never under.
   }
 }
@@ -1160,6 +1185,7 @@ export async function admitWake(
   request: WakeAdmissionRequest,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<WakeDecision> {
+  assertLedgerWriteAllowed(env);
   const cls = wakeClassOf(request, env);
   if (cls === undefined) {
     return { decision: "not-gated", why: "no-class" };
