@@ -277,3 +277,5 @@ test("DISCOVERY NEGATIVE: a fresh file that loads node:sqlite is flagged without
       .map((entry) => entry.split("@")[0])
       .toSorted(),
     [path.join("nested", "fourth-loader.ts"), "value-import.ts"],
+  );
+});
