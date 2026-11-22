@@ -13,6 +13,7 @@ import type {
 import { backgroundTasksField, type BackgroundTasksJson } from "../background-task-gate.js";
 import type { MessageRouteAnswer } from "../prompt-routing.js";
 import { probeQueueOwnerHealth } from "../queue/ipc.js";
+import { refuseWakeWhilePodNotGone } from "../session/pod-wake-guard.js";
 import type {
   SessionCloseDrainReport,
   SessionCloseRecordState,
@@ -688,6 +689,10 @@ export async function printPromptSessionBanner(
     return;
   }
 
+  // A-16 (F4): before the banner's own socket probe prints anything — the refusal token must be the
+  // FIRST stderr line (atrium reads it), and a session whose lease names a pod not proven gone is
+  // never probed from the control pod in local mode. `sendSession` repeats it for the quiet formats.
+  await refuseWakeWhilePodNotGone(record.acpxRecordId);
   const status = await resolveSessionConnectionStatus(record);
   process.stderr.write(`${formatPromptSessionBannerLine(record, currentCwd, status)}\n`);
 }

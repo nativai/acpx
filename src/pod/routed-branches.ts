@@ -51,6 +51,20 @@ export type BranchDeps = {
   loadRecord: (id: string) => Promise<RoutedRecord | undefined>;
   harnessOf: (agentCommand: string) => string | undefined;
   lookup: AgentPodLookup;
+  /**
+   * The uid of the pod the session's LEASE names — the pod the failed call targeted. The DELETE's uid
+   * comes from here and nowhere else (C4's precondition exists so a pod that replaced it meanwhile is
+   * never deleted); absent or undefined ⇒ nothing is deleted.
+   */
+  leasePodUid?: (sessionId: string) => Promise<string | undefined>;
+  /**
+   * `DELETE /v1/agents/<key>?uid=<uid>` (C4, A-1): what `close` and `recover` send for a pod they
+   * could not reach. Optional so a caller that never deletes needs none; absent ⇒ nothing is deleted.
+   */
+  deleteAgent?: (
+    key: string,
+    uid: string,
+  ) => Promise<{ kind: "deleted" | "refused" | "unavailable" }>;
   releases: () => ResolveReleasesResult;
   /** The target session's URL for the broker's Job annotation (C4 `sessionUrl`); may read the box's base URL. */
   sessionUrl?: (sessionId: string) => string | undefined;
@@ -281,14 +295,55 @@ async function dispatchRouted(
     return await usageError(PROMPT_REQUIRED_MESSAGE, ready.classification.output, deps);
   }
   const { agentPodKey } = await import("./routed-call.js");
+  const key = agentPodKey(ready.record.acpxRecordId);
   try {
-    const result = await deps.run(
-      runOptions(ready, plan, deps, routedClass, agentPodKey(ready.record.acpxRecordId)),
-    );
+    const result = await deps.run(runOptions(ready, plan, deps, routedClass, key));
     return result.kind === "no_pod" ? "proceed" : result.exitCode;
   } catch (error) {
+    if (await deletedUnreachablePod(error, ready, routedClass, key, deps)) {
+      return "proceed";
+    }
     return await deps.fail(error, ready.classification.output);
   }
+}
+
+const DELETES_UNREACHABLE_POD = new Set(["sessions close", "sessions recover"]);
+
+/** A routed call that ended `ROUTED outcome=not_run reason=agent_unreachable` (C2, past the 60 s bound). */
+function isUnreachable(error: unknown): boolean {
+  const failure = error as { outcome?: unknown; reason?: unknown } | null;
+  return failure?.outcome === "not_run" && failure.reason === "agent_unreachable";
+}
+
+/**
+ * A4 (C2 "A pod that is Ready and cannot be reached", C4): an EXPLICIT `close` or `recover` whose
+ * routed call found the pod unreachable deletes it through the broker with the pod's uid as the
+ * precondition — so a pod that replaced it meanwhile is never deleted — and then answers from the
+ * record, as `owner-if-pod` does for a session with no pod. Nothing else deletes a pod because it
+ * cannot be reached: not a prompt, not a status, not a setting (A-1). Returns true only when the
+ * broker confirmed the pod gone; on `refused` / `unavailable` the original failure is shown.
+ */
+async function deletedUnreachablePod(
+  error: unknown,
+  ready: Ready,
+  routedClass: "owner-ensure" | "owner-if-pod",
+  key: string,
+  deps: BranchDeps,
+): Promise<boolean> {
+  const path = ready.classification.path;
+  if (
+    routedClass !== "owner-if-pod" ||
+    !DELETES_UNREACHABLE_POD.has(path) ||
+    !isUnreachable(error) ||
+    !deps.deleteAgent ||
+    !deps.leasePodUid
+  ) {
+    return false;
+  }
+  // F2: the uid of the pod that could not be reached — from the lease, never from a second lookup,
+  // which could answer with a replacement pod.
+  const uid = await deps.leasePodUid(ready.record.acpxRecordId);
+  return uid !== undefined && (await deps.deleteAgent(key, uid)).kind === "deleted";
 }
 
 export function routedBranchHandlers(
@@ -382,6 +437,19 @@ async function liveDeps(): Promise<BranchDeps> {
     },
     harnessOf: (command) => agentCommand.acpAdapterKind(command),
     lookup: createAgentPodLookup(process.env),
+    leasePodUid: async (sessionId) =>
+      (await (await import("../cli/queue/lease-store.js")).readQueueOwnerRecord(sessionId))?.pod
+        ?.uid,
+    deleteAgent: async (key, uid) => {
+      const broker = await import("./broker-client.js");
+      const origin = broker.resolveAgentBrokerOrigin(
+        process.env,
+        broker.readAgentBrokerOriginSources(),
+      );
+      return origin
+        ? await broker.deleteAgent(key, { uid, origin })
+        : { kind: "unavailable" as const };
+    },
     releases: () => routed.resolveReleases(testRuntimeDir(process.env)),
     payloadDir: testPayloadDir(process.env),
     sessionUrl: (id) => {

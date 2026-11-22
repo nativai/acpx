@@ -24,6 +24,7 @@ import {
 import { createOutputFormatter, getTextErrorRemediationHints } from "./cli/output/output.js";
 import { runQueueOwnerFromEnv } from "./cli/queue/owner-env.js";
 import { flushPerfMetricsCapture, installPerfMetricsCapture } from "./perf-metrics-capture.js";
+import { OwnerOutsidePodError } from "./pod/owner-pod.js";
 import { setSessionIndexRebuildLogSuppressed } from "./session/persistence/index.js";
 import { EXIT_CODES, OUTPUT_FORMATS, type OutputFormat, type OutputPolicy } from "./types.js";
 import { getAcpxVersion } from "./version.js";
@@ -476,6 +477,12 @@ async function handleQueueOwnerCommand(argv: string[]): Promise<boolean> {
     await runQueueOwnerFromEnv(process.env);
     return true;
   } catch (error) {
+    if (error instanceof OwnerOutsidePodError) {
+      // C7.2 owner_outside_pod: the refusal line, then the failure line the cold-start waiter scans for.
+      process.stderr.write(`${error.stderrLine}\n[acpx] queue owner failed: ${error.stderrLine}\n`);
+      process.exit(error.exitCode);
+      return true;
+    }
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`[acpx] queue owner failed: ${message}\n`);
     process.exit(EXIT_CODES.ERROR);

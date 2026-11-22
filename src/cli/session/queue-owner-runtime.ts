@@ -10,6 +10,7 @@ import { defaultBoxRuntimeInfoPath } from "../../box-runtime-info.js";
 import { QueueConnectionError, SessionClosedError } from "../../errors.js";
 import { checkpointPerfMetricsCapture } from "../../perf-metrics-capture.js";
 import { incrementPerfCounter, setPerfGauge } from "../../perf-metrics.js";
+import { assertOwnerEntryInOwnPod } from "../../pod/owner-pod.js";
 import { promptToDisplayText } from "../../prompt-content.js";
 import { bindRecordToDefaultAccount } from "../../runtime/engine/default-account-binding.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
@@ -91,6 +92,7 @@ import {
   reapAndLogOnOwnerExit,
   type OwnerTaskReaper,
 } from "./owner-task-reap.js";
+import { refuseWakeWhilePodNotGone } from "./pod-wake-guard.js";
 import {
   applySetConfigOptionToConnectedSession,
   applySetModeToConnectedSession,
@@ -1183,6 +1185,9 @@ function sharedClientRebuildFailedLine(
 
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
 export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): Promise<void> {
+  // C1.1 / K4: the owner entry refuses unless it is in the session's own pod (pod mode); first, so
+  // nothing — no lease, no socket, no heartbeat — exists for an owner that must not run here.
+  assertOwnerEntryInOwnPod(options.sessionId);
   const lease = await tryAcquireQueueOwnerLease(options.sessionId);
   if (!lease) {
     return;
@@ -2104,6 +2109,8 @@ export type SendSessionRuntimeDeps = {
     waitForCompletion: boolean,
   ) => Promise<SessionSendOutcome | undefined>;
   spawnQueueOwnerProcess: (options: QueueOwnerRuntimeOptions) => SpawnedQueueOwner;
+  /** A-16: refuses a LOCAL wake while the session's lease names a pod not proven gone. Injectable for tests. */
+  refuseWakeWhilePodNotGone?: (sessionId: string) => Promise<void>;
   waitMs: (ms: number) => Promise<void>;
   readStartupFailureDetail: (sessionId: string) => string | undefined;
   startupBudgetMs: number;
@@ -2242,6 +2249,7 @@ export async function spawnAndAwaitQueueOwner(
   const sessionId = effectiveOptions.sessionId;
   const runtimeOptions = queueOwnerRuntimeOptionsFromSend(effectiveOptions);
 
+  await (deps.refuseWakeWhilePodNotGone ?? refuseWakeWhilePodNotGone)(sessionId);
   let spawned = deps.spawnQueueOwnerProcess(runtimeOptions);
   let spawnsUsed = 1;
   let lastExit: OwnerExitInfo | undefined;
@@ -2388,6 +2396,10 @@ export async function sendSession(
   // record twice — a refused prompt must not mutate the session it was refused by.
   const record = await resolveSessionRecord(options.sessionId);
   assertRecordOpenForCliPrompt(record, options);
+  // A-16 (F4): in local mode a session whose lease names a pod not proven gone is refused HERE — before
+  // the record is written and before any socket attempt (`trySubmitToRunningOwner` would try the pod's
+  // pod-local socket and fail as "another pid namespace", exit 1).
+  await (deps.refuseWakeWhilePodNotGone ?? refuseWakeWhilePodNotGone)(options.sessionId);
   // The wake gate (brick 2b3b259f, CONCEPTION §3.1): a send that would cold-start a released owner
   // on a full box is refused HERE, exit 75, before the record is written — and again right before
   // the spawn, for an owner that vanished in between (`wake-gate.ts`).

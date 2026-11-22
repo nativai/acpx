@@ -972,6 +972,22 @@ export type SessionAcpxState = {
     reason: string;
     observed_model?: string;
   };
+  /**
+   * Block A4 (C3.3): the end of the session's last agent pod, recorded by the control pod when its
+   * death proof said `gone`. `reason` is the pod's terminal reason (`OOMKilled`, `Error`, `Evicted`)
+   * read from the pod object when the API server still held it; absent when the pod was already
+   * gone (nothing left to read). An agent-pod OOM is invisible to the control pod's governor — this
+   * is where it shows. Idempotent per pod uid.
+   */
+  last_pod_end?: {
+    at: string;
+    /** The pod's name (`ag-<key>`). */
+    pod: string;
+    uid: string;
+    proof: "pod-gone" | "pod-terminal";
+    reason?: string;
+    exit_code?: number;
+  };
   session_options?: {
     model?: string;
     allowed_tools?: string[];

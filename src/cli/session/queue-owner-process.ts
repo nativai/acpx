@@ -12,6 +12,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { resolveSessionRoot } from "../../config/session-root.js";
+import { ownerInheritedEnv } from "../../pod/owner-pod.js";
 import { assertBridgeMayStartHere } from "../../pod/placement.js";
 import type { SessionAgentOptions } from "../../runtime/engine/session-options.js";
 import type {
@@ -275,6 +276,7 @@ function queueOwnerProcessCwd(): string {
 export function buildQueueOwnerSpawnOptions(
   payload: string,
   logFd: number | null = null,
+  parentEnv: NodeJS.ProcessEnv = process.env,
 ): {
   detached: true;
   stdio: "ignore" | ["ignore", number, number];
@@ -295,7 +297,9 @@ export function buildQueueOwnerSpawnOptions(
     // (so an owner/adapter crash is diagnosable), else the prior "ignore".
     stdio: logFd !== null ? ["ignore", logFd, logFd] : "ignore",
     env: {
-      ...process.env,
+      // C2 "What the owner inherits": in pod mode the ACPX_ROUTED_* variables and the caller's
+      // identity are removed, so an owner's environment never depends on who woke it.
+      ...ownerInheritedEnv(parentEnv),
       ACPX_QUEUE_OWNER_PAYLOAD: payload,
       // Signal to the in-owner client that its stderr is the per-session owner log,
       // so it may emit diagnostic disconnect/exit lines there. Set ONLY when the log

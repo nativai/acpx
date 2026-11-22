@@ -796,6 +796,8 @@ export function cloneSessionAcpxState(
     // clone; without these the served-truth surface + durable park are dropped on
     // EVERY real turn. Flat objects (all string fields) → spread is a full clone.
     ...cloneFloorState(state),
+    // Block A4: the pod's last end (OOMKilled included) — written by the control pod, re-based by turns.
+    last_pod_end: cloneOptional(state.last_pod_end),
     session_options: cloneSessionOptions(state.session_options),
   };
 }

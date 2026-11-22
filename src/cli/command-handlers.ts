@@ -242,6 +242,7 @@ import {
   withInheritedWorktree,
 } from "./session/inherited-metadata.js";
 import { refuseCloseOverOpenPersonRequests } from "./session/open-person-requests-guard.js";
+import { refuseWakeWhilePodNotGone } from "./session/pod-wake-guard.js";
 import { mergeSessionMetadata, validateSessionMetadataValue } from "./session/session-metadata.js";
 import type {
   SetParentRefusalCode,
@@ -3590,6 +3591,12 @@ export async function handleSessionsClose(
   const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
   const record = await requireExplicitSessionRecord(selector, agent.agentName);
 
+  // A-16 (R2-1): in local mode a session whose lease names a pod not proven gone is NOT closed here —
+  // `pod_starting … phase=turnover` (exit 75), decided before anything is touched: no drain, no
+  // `close_session`, no `closed` / `closed_at` / pid fields written. (`set-metadata` is class `record`
+  // and stays as it is.)
+  await refuseWakeWhilePodNotGone(record.acpxRecordId);
+
   // Brick 6867bbfc D6 — AFTER the record resolves (so `--seat` targets are covered) and BEFORE
   // anything is touched: a refusal drains nothing, stops no owner, writes no record.
   const bywayRefusal = bywayCloseRefusal(record);
@@ -5217,6 +5224,11 @@ export async function handleSessionsTemplate(
   // brick ad6ba1c2 (Contract C3) — marking a template CLOSES the session: the same gate, before
   // anything is touched.
   const gateRecord = await resolveSessionRecord(sessionId);
+  // A-16 (R3-1): marking a template CLOSES the session (`closed`, `closed_at`, pid, `template`), so in
+  // local mode a lease naming a pod not proven gone refuses it first — `pod_starting … phase=turnover`
+  // (exit 75), before the background-task gate's socket probe and before any write. `--disable` only
+  // retracts the marker (a `record`-class write) and is not guarded.
+  await refuseWakeWhilePodNotGone(gateRecord.acpxRecordId);
   // --owner and the fixed-owner rule are settled BEFORE the close: a refusal must leave the session open.
   const ownerId = await resolveMarkOwner(flags, gateRecord.template?.slug);
   const { refusal, gate, answer } = await evaluateBackgroundTaskGate({
