@@ -15,5 +15,39 @@ const ACP_SERVER_TRANSCRIPT_COMMAND = /(?:^|[\s/])acp-server-transcript(?:@|[\s/
 
 export function isClaudePtyCommand(agentCommand: string | undefined): boolean {
   const command = (agentCommand ?? "").trim();
-  return CLAUDE_PTY_ACP_COMMAND.test(command) || ACP_SERVER_TRANSCRIPT_COMMAND.test(command);
+  // The bare name is the agent id acpx used to register (a config `agents` override may spell it so).
+  return (
+    command === "claude-pty" ||
+    CLAUDE_PTY_ACP_COMMAND.test(command) ||
+    ACP_SERVER_TRANSCRIPT_COMMAND.test(command)
+  );
+}
+
+/**
+ * The agent command a command line names: `--agent <cmd>`, else the positional agent's registry command,
+ * else the config's default agent — `undefined` when it cannot be resolved. ⚠️ HEAVY (dynamic imports
+ * only, so this module stays light): config and the agent registry.
+ */
+export async function invocationAgentCommand(
+  agent: string | undefined,
+  argv: readonly string[],
+): Promise<string | undefined> {
+  const { flagValue } = await import("./utility-branch.js");
+  const override = flagValue(argv, "--agent")?.trim();
+  if (override) {
+    return override;
+  }
+  try {
+    const [{ loadResolvedConfig }, registry] = await Promise.all([
+      import("../cli/config.js"),
+      import("../agent-registry.js"),
+    ]);
+    const config = await loadResolvedConfig(flagValue(argv, "--cwd") ?? process.cwd());
+    return registry.resolveAgentCommand(
+      agent ?? config.defaultAgent ?? registry.DEFAULT_AGENT_NAME,
+      config.agents,
+    );
+  } catch {
+    return undefined;
+  }
 }

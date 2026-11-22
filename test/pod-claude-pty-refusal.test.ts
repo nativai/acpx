@@ -154,7 +154,7 @@ function saFixture(): string {
 const READY = `ready ip=10.1.2.3 pod=ag-x-abcde uid=${UID} node=n1 placement=pool`;
 
 /** The control pod in pod mode, no pod anywhere, the fixture record in its store. */
-async function rig(recordCommand: string) {
+async function rig(recordCommand: string, options: { withRecord?: boolean } = {}) {
   const home = fs.mkdtempSync(path.join(ROOT, "home-"));
   const stubDir = fs.mkdtempSync(path.join(ROOT, "stub-"));
   fs.writeFileSync(path.join(stubDir, "agent-exec"), STUB, { mode: 0o755 });
@@ -177,7 +177,9 @@ async function rig(recordCommand: string) {
   delete (record as { messages_log?: unknown }).messages_log;
   const file = sessionFilePath(home, PTY_ID);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`);
+  if (options.withRecord !== false) {
+    fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`);
+  }
   const api = await startApi();
   const broker = await startBroker({ lines: ["scheduling", READY] });
   const env: NodeJS.ProcessEnv = {
@@ -211,6 +213,7 @@ async function rig(recordCommand: string) {
   }
   return {
     env,
+    sessionsDir: path.dirname(file),
     calls: (): number => {
       const callsFile = path.join(stubDir, "calls.jsonl");
       return fs.existsSync(callsFile)
@@ -340,6 +343,73 @@ test("A-39 off pod mode: the claude-pty record's commands are unchanged — no h
       result.stdout.includes(PTY_ID),
       "the local command answered about the claude-pty record",
     );
+    assert.equal(pod.brokerRequests(), 0);
+  } finally {
+    pod.close();
+  }
+});
+
+// ───────────────────────── create: nothing is written for a record that can never run ─────────────────────────
+
+const MOCK_AGENT = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
+
+/** Every file in the sessions directory (the directory may not exist). */
+function sessionFiles(dir: string): string[] {
+  return fs.existsSync(dir) ? fs.readdirSync(dir).toSorted() : [];
+}
+
+test("A-39 create: `sessions new --agent claude-pty` in pod mode is refused by name BEFORE any record is written — no record file, no index row, no broker request, exit 1", async () => {
+  for (const args of [
+    [...PTY_AGENT, "sessions", "new", "--name", "pty"],
+    ["--format", "json", ...PTY_AGENT, "sessions", "new", "--name", "pty"],
+  ]) {
+    const pod = await rig(PTY_COMMAND, { withRecord: false });
+    try {
+      const result = await cli(args, pod.env);
+      assert.equal(result.code, 1, `${args.join(" ")}: ${result.stdout} ${result.stderr}`);
+      assert.match(result.stderr.split("\n")[0] ?? "", REFUSAL, args.join(" "));
+      assert.deepEqual(
+        sessionFiles(pod.sessionsDir),
+        [],
+        "nothing was created: no record, no index, no sidecar",
+      );
+      assert.equal(pod.brokerRequests(), 0);
+      assert.equal(pod.calls(), 0);
+    } finally {
+      pod.close();
+    }
+  }
+});
+
+test("A-39 create control: the same create with a claude command still writes its record-only record in pod mode (the rig is live, so the refusal above is the harness)", async () => {
+  const pod = await rig(CLAUDE_COMMAND, { withRecord: false });
+  try {
+    const result = await cli([...CLAUDE_AGENT, "sessions", "new", "--name", "ctl"], pod.env);
+    assert.equal(result.code, 0, `${result.stdout} ${result.stderr}`);
+    assert.ok(
+      sessionFiles(pod.sessionsDir).some((name) => /^[0-9a-f-]{36}\.json$/.test(name)),
+      `a record file was written: ${sessionFiles(pod.sessionsDir).join(",")}`,
+    );
+    assert.equal(pod.brokerRequests(), 0, "a record-only create asks no broker");
+  } finally {
+    pod.close();
+  }
+});
+
+test("A-39 create off pod mode: a claude-pty-named agent's create is unchanged — it writes its record, no refusal", async () => {
+  // A harmless mock ACP agent under a directory NAMED claude-pty-acp, so the command is claude-pty-shaped.
+  const dir = path.join(fs.mkdtempSync(path.join(ROOT, "ptylink-")), "claude-pty-acp");
+  fs.symlinkSync(path.dirname(MOCK_AGENT), dir);
+  const command = `node ${path.join(dir, "mock-agent.js")}`;
+  assert.equal(isClaudePtyCommand(command), true, "the stand-in really is claude-pty-shaped");
+  const pod = await rig(CLAUDE_COMMAND, { withRecord: false });
+  try {
+    const off = { ...pod.env };
+    delete off.ACPX_OWNER_PLACEMENT;
+    const result = await cli(["--agent", command, "sessions", "new", "--name", "off"], off);
+    assert.equal(result.stderr.includes("harness_unsupported"), false, result.stderr);
+    assert.equal(result.code, 0, `${result.stdout} ${result.stderr}`);
+    assert.ok(sessionFiles(pod.sessionsDir).some((name) => /^[0-9a-f-]{36}\.json$/.test(name)));
     assert.equal(pod.brokerRequests(), 0);
   } finally {
     pod.close();
