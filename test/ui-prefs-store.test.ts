@@ -84,6 +84,25 @@ test("ordering is most-recently-starred first, computed in the store", () => {
   store.close();
 });
 
+test("a repeated star keeps its ORIGINAL time and place — `models fav add` is repeat-safe (F-22)", () => {
+  const store = openUiPrefsStore(tempDb());
+  store.addFavorite("openrouter", "a/first", 1_000);
+  store.addFavorite("openrouter", "a/second", 2_000);
+  // a repeat of the OLDER star, later in time: it must not jump to the front
+  store.addFavorite("openrouter", "a/first", 9_000);
+  assert.deepEqual(store.favoriteKeys(), ["openrouter:a/second", "openrouter:a/first"]);
+  assert.equal(
+    store.listFavorites().find((entry) => entry.id === "a/first")?.favoritedAt,
+    new Date(1_000).toISOString(),
+    "the original favorited_at survives",
+  );
+  // twin: unstar then star again IS a new star, stamped now
+  store.removeFavorite("openrouter", "a/first");
+  store.addFavorite("openrouter", "a/first", 9_000);
+  assert.deepEqual(store.favoriteKeys(), ["openrouter:a/first", "openrouter:a/second"]);
+  store.close();
+});
+
 test("last_used_model is one row per agent type, overwritten in place", () => {
   const store = openUiPrefsStore(tempDb());
   assert.equal(store.getLastUsedModel("claude"), undefined);

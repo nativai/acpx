@@ -113,7 +113,7 @@ export async function handleStatus(
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName, config);
 
   await printSessionStatus(record, globalFlags.format);
 }

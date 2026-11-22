@@ -112,7 +112,7 @@ async function writeAlarmLevel(record: SessionRecord, raw: string): Promise<stri
 async function handleContext(flags: ContextFlags, command: Command, config: ResolvedAcpxConfig) {
   const { format } = resolveGlobalFlags(command, config);
   const selector = ownSessionSelector(resolveSessionTargetSelector({ flags, command }));
-  const record = await requireExplicitSessionRecord(selector, config.defaultAgent);
+  const record = await requireExplicitSessionRecord(selector, config.defaultAgent, config);
   const changed =
     flags.alarm === undefined ? undefined : await writeAlarmLevel(record, flags.alarm);
   const report = await readSessionContext(record);

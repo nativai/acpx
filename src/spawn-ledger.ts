@@ -142,10 +142,11 @@ export function openSpawnLedgerForRecord(
 }
 
 function isCanonicalSessionDirectory(directory: string): boolean {
-  const actual = fs.realpathSync(directory);
+  // F-7: a transient error on either realpath is the RETRIED refusal, not a raw errno outside the table.
+  const actual = realpathOrRefusal(directory);
   let canonical: string;
   try {
-    canonical = fs.realpathSync(path.join(os.homedir(), ".acpx", "sessions"));
+    canonical = realpathOrRefusal(path.join(os.homedir(), ".acpx", "sessions"));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
       throw error;
@@ -153,6 +154,14 @@ function isCanonicalSessionDirectory(directory: string): boolean {
     return false;
   }
   return actual === canonical;
+}
+
+function realpathOrRefusal(directory: string): string {
+  try {
+    return fs.realpathSync(directory);
+  } catch (error) {
+    throw transientReadRefusal(error, "the sessions directory", directory) ?? error;
+  }
 }
 
 const BUSY_ERROR_PATTERN = /database is locked|SQLITE_BUSY/;
@@ -360,11 +369,16 @@ function rebindsReservedDestination(writer: DiskRecord, current: DiskRecord): bo
     Boolean(metadataValue(current, "spawn_key")) && current.acp_session_id !== writer.acp_session_id
   );
 }
+/**
+ * `ownerMayRebind` is a THUNK, evaluated ONLY when the write really rebinds the reserved destination
+ * (F-19). It reads the session's queue lease; evaluated eagerly it made a transient errno on that read refuse an
+ * ordinary adopted checkpoint that needs no rebind at all — the common write, on every spawn-owned session.
+ */
 function assertRecordIdentity(
   id: string,
   writer: DiskRecord,
   current: DiskRecord | undefined,
-  ownerMayRebind = false,
+  ownerMayRebind: () => boolean = () => false,
 ): void {
   if (writer.acpx_record_id !== id) {
     throw new SpawnLedgerError("record-ownership", "record id does not own destination");
@@ -382,7 +396,7 @@ function assertRecordIdentity(
   // record an attempt owns. The one legitimate rebind is the session's OWN owner after its
   // cold session/resume misses and falls back to session/new (brick d36c222f) — see
   // `SpawnLedger.ownerMayRebind`.
-  if (rebindsReservedDestination(writer, current) && !ownerMayRebind) {
+  if (rebindsReservedDestination(writer, current) && !ownerMayRebind()) {
     throw new SpawnLedgerError("record-ownership", "destination belongs to another ACP session");
   }
 }
@@ -465,13 +479,21 @@ function readRecordFile(file: string): DiskRecord | undefined {
 
 /** The session's queue lease names THIS process (pid and birth identity) — pod-local, read as today. */
 function leaseNamesThisProcess(id: string): boolean {
+  const file = queueLockFilePath(id);
   try {
-    const lease = JSON.parse(fs.readFileSync(queueLockFilePath(id), "utf8")) as {
+    const lease = JSON.parse(fs.readFileSync(file, "utf8")) as {
       pid?: unknown;
       processIdentity?: unknown;
     };
     return lease.pid === process.pid && leaseIdentityIsOurs(lease.processIdentity);
-  } catch {
+  } catch (error) {
+    // F-6: a transient read (EIO, ESTALE, EMFILE, ENFILE, …) says nothing about who holds the lease — it
+    // is the RETRIED refusal, not the final "someone else may rebind" (`record-ownership`) it used to
+    // become. No lease, an unreadable body or a lease that names another process are still "not ours".
+    const transient = transientReadRefusal(error, "the queue lease", file);
+    if (transient) {
+      throw transient;
+    }
     return false;
   }
 }
@@ -515,7 +537,7 @@ export class PodSpawnRecordWriter implements SpawnRecordWriter {
       id,
       record,
       current,
-      stateAllowsRebind(read.state) && leaseNamesThisProcess(id),
+      () => stateAllowsRebind(read.state) && leaseNamesThisProcess(id),
     );
     preserveSpawnState(record, current);
     writeRecordAtomic(file, record, options.beforePublish);
@@ -921,7 +943,7 @@ export class SpawnLedger {
       id,
       writer,
       current,
-      Boolean(attempt) && this.ownerMayRebind(id, attempt!),
+      () => Boolean(attempt) && this.ownerMayRebind(id, attempt!),
     );
     if (!key) {
       return;

@@ -90,6 +90,12 @@ export type IdentityLockPolicy = {
   /** Judges a LEGACY body (no identity). Default: ESRCH ⇒ breakable, otherwise unjudgeable. */
   judgeLegacy?: (body: Record<string, unknown>) => LockHolderVerdict;
   makeTimeoutError: (lockPath: string, holder: string) => Error;
+  /**
+   * Maps an error from TAKING the lock (creating its file, linking it) — never one from the action — to the
+   * error the caller wants; `undefined` keeps the original. Record locks use it to label fd exhaustion and
+   * a mount's hiccup as the retried `record-lock-unavailable` instead of a raw errno (F-8).
+   */
+  mapAcquireError?: (error: unknown) => Error | undefined;
 };
 
 type ReadHolder = { raw: string; ageMs: number; body: Record<string, unknown> | undefined };
@@ -778,7 +784,12 @@ export async function withIdentityFileLock<T>(
   policy: IdentityLockPolicy,
   action: (lock: HeldLock) => Promise<T>,
 ): Promise<T> {
-  const content = await acquireIdentityFileLock(lockPath, policy);
+  let content: string;
+  try {
+    content = await acquireIdentityFileLock(lockPath, policy);
+  } catch (error) {
+    throw policy.mapAcquireError?.(error) ?? error;
+  }
   try {
     return await action({
       assertHeld: () => assertLockHeld(lockPath, content),

@@ -497,45 +497,163 @@ function exportedValues(text: string): string[] {
 }
 
 /**
- * Uses of a module system this discovery cannot follow (K4-2): a non-literal `import(x)`, `createRequire(…)`, and a
- * custom loader's `x.import(…)`. They could load the ledger under a name no specifier shows, so each is a use it
- * cannot see — and the row's own rule is that such a use is not nothing. The sites that exist today are REGISTERED below
- * as known non-ledger; a NEW one is red until someone reads it and registers it.
+ * Uses of a module system this discovery cannot follow (K4-2, FN-2/FN-3): code that could load the ledger under a name
+ * no specifier shows. Each SITE is returned as `<file> | <kind> | <the call as written>` with how many times it occurs, so
+ * the registry below can pin every site exactly (a second site in a registered file is a new key, or a higher count).
+ *
+ * Kinds: a non-literal `import(x)`; `createRequire` however it is reached — a named import (aliased or not), a
+ * `node:module` default or namespace binding's `.createRequire`, `process.getBuiltinModule(…).createRequire`;
+ * `getBuiltinModule(…)` itself; `new Function(…)` / `Function(…)` / `eval(…)`; a non-literal `require(x)`; and a custom
+ * loader's `.import(…)` / `.require(…)`, also as `loader["import"](…)`; and `new Worker(…)` of `node:worker_threads`
+ * (aliased, or reached as `wt.Worker`) — a worker loads whatever it likes, by path or as `eval: true` code (lows-r3 FN-2a).
+ *
+ * NOT seen — named so nobody reads the registry as a proof of absence: indirect eval `(0, eval)(…)`, `globalThis.eval` /
+ * `globalThis.Function` / `(() => {}).constructor(…)`; `node:vm` (`runInThisContext`, `new vm.Script`, `compileFunction`);
+ * a `createRequire` held in a variable or destructured / renamed out of a DYNAMIC `node:module` load (`const { createRequire:
+ * mk } = await import("node:module")`), `createRequire.call(…)`; a loader member not called directly (`loader.import.call(…)`,
+ * `Reflect.apply(loader.import, …)`, a computed key); `module.register(…)` (loader hooks); `child_process.fork(modulePath)`.
+ * None of those is in `src/` today (`grep -rnE` over src/, lows-r3 TE).
  */
-function unfollowableUses(files: Iterable<[string, string]>): Map<string, string[]> {
-  const found = new Map<string, string[]>();
+function unfollowableSites(files: Iterable<[string, string]>): Map<string, number> {
+  const found = new Map<string, number>();
   for (const [rel, text] of files) {
     const sf = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true);
-    const kinds = new Set<string>();
+    // bindings of `node:module` / `module`: the aliases of createRequire, and the names of the module object itself
+    const createRequireNames = new Set<string>(["createRequire"]);
+    const moduleObjects = new Set<string>();
+    // bindings of `node:worker_threads`: the aliases of `Worker`, and the names of the module object itself
+    const workerNames = new Set<string>();
+    const workerModules = new Set<string>();
+    for (const statement of sf.statements) {
+      if (
+        ts.isImportDeclaration(statement) &&
+        ["node:worker_threads", "worker_threads"].includes(
+          stringOf(statement.moduleSpecifier) ?? "",
+        )
+      ) {
+        const bindings = statement.importClause?.namedBindings;
+        if (statement.importClause?.name) {
+          workerModules.add(statement.importClause.name.text);
+        }
+        if (bindings && ts.isNamespaceImport(bindings)) {
+          workerModules.add(bindings.name.text);
+        } else if (bindings && ts.isNamedImports(bindings)) {
+          for (const element of bindings.elements) {
+            if ((element.propertyName ?? element.name).text === "Worker") {
+              workerNames.add(element.name.text);
+            }
+          }
+        }
+      }
+      if (
+        ts.isImportDeclaration(statement) &&
+        ["node:module", "module"].includes(stringOf(statement.moduleSpecifier) ?? "")
+      ) {
+        const bindings = statement.importClause?.namedBindings;
+        if (statement.importClause?.name) {
+          moduleObjects.add(statement.importClause.name.text);
+        }
+        if (bindings && ts.isNamespaceImport(bindings)) {
+          moduleObjects.add(bindings.name.text);
+        } else if (bindings && ts.isNamedImports(bindings)) {
+          for (const element of bindings.elements) {
+            if ((element.propertyName ?? element.name).text === "createRequire") {
+              createRequireNames.add(element.name.text);
+            }
+          }
+        }
+      }
+    }
+    const note = (kind: string, node: ts.Node): void => {
+      const written = node.getText(sf).replace(/\s+/gu, " ").slice(0, 160);
+      const key = `${rel} | ${kind} | ${written}`;
+      found.set(key, (found.get(key) ?? 0) + 1);
+    };
+    const memberName = (callee: ts.Expression): string | undefined => {
+      if (ts.isPropertyAccessExpression(callee)) {
+        return callee.name.text;
+      }
+      return ts.isElementAccessExpression(callee) ? stringOf(callee.argumentExpression) : undefined;
+    };
     const visit = (node: ts.Node): void => {
-      if (ts.isCallExpression(node)) {
+      if (
+        ts.isNewExpression(node) &&
+        ts.isIdentifier(node.expression) &&
+        node.expression.text === "Function"
+      ) {
+        note("new Function", node);
+      } else if (
+        ts.isNewExpression(node) &&
+        ((ts.isIdentifier(node.expression) && workerNames.has(node.expression.text)) ||
+          (ts.isPropertyAccessExpression(node.expression) &&
+            node.expression.name.text === "Worker" &&
+            ts.isIdentifier(node.expression.expression) &&
+            workerModules.has(node.expression.expression.text)))
+      ) {
+        note("new Worker", node);
+      } else if (ts.isCallExpression(node)) {
         const callee = node.expression;
-        if (
-          callee.kind === ts.SyntaxKind.ImportKeyword &&
-          stringOf(node.arguments[0]) === undefined
+        const member = memberName(callee);
+        const receiver =
+          ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)
+            ? callee.expression
+            : undefined;
+        if (callee.kind === ts.SyntaxKind.ImportKeyword) {
+          if (stringOf(node.arguments[0]) === undefined) {
+            note("non-literal import()", node);
+          }
+        } else if (ts.isIdentifier(callee) && createRequireNames.has(callee.text)) {
+          note("createRequire", node);
+        } else if (member === "createRequire") {
+          note("createRequire", node); // module.createRequire(…), process.getBuiltinModule("node:module").createRequire(…)
+        } else if (
+          member === "getBuiltinModule" ||
+          (ts.isIdentifier(callee) && callee.text === "getBuiltinModule")
         ) {
-          kinds.add("non-literal import()");
-        } else if (ts.isIdentifier(callee) && callee.text === "createRequire") {
-          kinds.add("createRequire");
-        } else if (ts.isPropertyAccessExpression(callee) && callee.name.text === "import") {
-          kinds.add("custom loader .import()");
+          note("getBuiltinModule", node);
+        } else if (ts.isIdentifier(callee) && ["Function", "eval"].includes(callee.text)) {
+          note(callee.text === "eval" ? "eval" : "new Function", node);
+        } else if (ts.isIdentifier(callee) && callee.text === "require") {
+          if (stringOf(node.arguments[0]) === undefined) {
+            note("non-literal require()", node);
+          }
+        } else if (member === "import" || member === "require") {
+          // a custom loader's `.import(…)` / `.require(…)` — except a call ON a `node:module` object's own members
+          if (
+            !(
+              receiver &&
+              ts.isIdentifier(receiver) &&
+              moduleObjects.has(receiver.text) &&
+              member === "require"
+            )
+          ) {
+            note(
+              member === "import" ? "custom loader .import()" : "custom loader .require()",
+              node,
+            );
+          }
         }
       }
       ts.forEachChild(node, visit);
     };
     visit(sf);
-    if (kinds.size > 0) {
-      found.set(rel, [...kinds].toSorted());
-    }
   }
   return found;
 }
 
-/** The unfollowable uses in `src/` today, each READ and none of them the ledger (K4-2). */
-const KNOWN_NON_LEDGER_UNFOLLOWABLE: Readonly<Record<string, readonly string[]>> = {
-  "acp/claude-fork-index.ts": ["non-literal import()"], // loads the harness's own fork-index module by a specifier it computes
-  "flows/cli.ts": ["custom loader .import()", "non-literal import()"], // a flow file's URL, loaded by the flow runner
-  "pod/sqlite-loader.ts": ["createRequire"], // `node:sqlite`, loaded once by `loadSqlite`
+/** The unfollowable SITES in `src/` today, each READ and none of them the ledger — keyed `<file> | <kind> | <call as written>`, with an exact count. */
+const KNOWN_NON_LEDGER_UNFOLLOWABLE: Readonly<Record<string, number>> = {
+  // loads the harness's own fork-index module by a specifier it computes
+  "acp/claude-fork-index.ts | non-literal import() | import(specifier)": 1,
+  // a flow file's URL, loaded by the flow runner through tsx's loader (`.import()` for ESM, `.require()` for CJS) and a plain import()
+  "flows/cli.ts | custom loader .import() | loader.import(flowUrl, import.meta.url)": 1,
+  "flows/cli.ts | custom loader .require() | loader.require(flowUrl, import.meta.url)": 1,
+  "flows/cli.ts | non-literal import() | import(flowUrl)": 1,
+  // the capacity governor's /proc readers: a worker run from a template-literal source (`READER_SOURCE`) that requires only node:fs / node:os /
+  // node:worker_threads and reads /proc/<pid>/stat — not a ledger use
+  "capacity/governor/scan.ts | new Worker | new Worker(READER_SOURCE, { eval: true, workerData: { ctl, port: port2, index, count: options.readers, procRoot, nice: options.nice }, transferList: [port2], re": 1,
+  // `node:sqlite`, loaded once by `loadSqlite`
+  "pod/sqlite-loader.ts | createRequire | createRequire(import.meta.url)": 1,
 };
 
 function* srcFiles(dir: string): Generator<[string, string]> {
@@ -777,42 +895,128 @@ test("K4-2: a `Promise.all` array with a spread anywhere counts as the WHOLE ent
   assert.deepEqual(entriesOf(after), ALL_ENTRIES);
 });
 
-test("K4-2: uses of a module system the discovery cannot follow are found — a non-literal import(), createRequire, a loader's .import() — and each is red unless registered", () => {
-  const kinds = (text: string): string[] =>
-    unfollowableUses([["cli/x.ts", text]]).get("cli/x.ts") ?? [];
-  assert.deepEqual(kinds("const m = await import(specifier);"), ["non-literal import()"]);
-  assert.deepEqual(kinds("const m = await import(`./${name}.js`);"), ["non-literal import()"]);
-  assert.deepEqual(
-    kinds(
+/** The kinds found in one source text (as a file of `cli/`), sorted, with duplicates kept. */
+const siteKinds = (text: string): string[] =>
+  [...unfollowableSites([["cli/x.ts", text]]).entries()]
+    .flatMap(([key, count]) => Array.from({ length: count }, () => key.split(" | ")[1] ?? ""))
+    .toSorted();
+
+test("K4-2 / FN-2: every way to load a module this discovery cannot follow is found — the plain forms and the aliased, qualified, built-in-reached and loader forms the first version missed", () => {
+  const cases: Array<[string, string[]]> = [
+    ["const m = await import(specifier);", ["non-literal import()"]],
+    ["const m = await import(`./${name}.js`);", ["non-literal import()"]],
+    [
       'import { createRequire } from "node:module";\nconst r = createRequire(import.meta.url);',
-    ),
-    ["createRequire"],
-  );
-  assert.deepEqual(kinds("const m = await loader.import(url, base);"), ["custom loader .import()"]);
-  // controls: a LITERAL import(), a plain require-free file and an ordinary `.import` of nothing are not flagged
-  assert.deepEqual(kinds('const m = await import("./a.js");'), []);
-  assert.deepEqual(kinds("const x = 1;"), []);
+      ["createRequire"],
+    ],
+    ["const m = await loader.import(url, base);", ["custom loader .import()"]],
+    // FN-2: the forms nobody listed
+    [
+      'import { createRequire as mk } from "node:module";\nconst r = mk(import.meta.url);',
+      ["createRequire"],
+    ],
+    [
+      'import mod from "node:module";\nconst r = mod.createRequire(import.meta.url);',
+      ["createRequire"],
+    ],
+    [
+      'import * as ns from "node:module";\nconst r = ns.createRequire(import.meta.url);',
+      ["createRequire"],
+    ],
+    [
+      'const r = process.getBuiltinModule("node:module").createRequire(import.meta.url);',
+      ["createRequire", "getBuiltinModule"],
+    ],
+    ['const m = process.getBuiltinModule("node:fs");', ["getBuiltinModule"]],
+    ['const load = new Function("s", "return import(s)");', ["new Function"]],
+    ['const load = Function("s", "return import(s)");', ["new Function"]],
+    ["const x = eval(code);", ["eval"]],
+    ["const m = require(spec);", ["non-literal require()"]],
+    ['const m = await loader["import"](url);', ["custom loader .import()"]],
+    ["const m = loader.require(url, base);", ["custom loader .require()"]],
+    // FN-2a: a worker, by path or as eval code, aliased or reached through the module object
+    [
+      'import { Worker } from "node:worker_threads";\nconst w = new Worker(new URL("./x.js", import.meta.url));',
+      ["new Worker"],
+    ],
+    [
+      'import { Worker as W } from "node:worker_threads";\nconst w = new W(code, { eval: true });',
+      ["new Worker"],
+    ],
+    [
+      'import * as wt from "node:worker_threads";\nconst w = new wt.Worker(code, { eval: true });',
+      ["new Worker"],
+    ],
+    ['import wt from "worker_threads";\nconst w = new wt.Worker(file);', ["new Worker"]],
+    ['const m = loader["require"](url);', ["custom loader .require()"]],
+  ];
+  for (const [text, want] of cases) {
+    assert.deepEqual(siteKinds(text), want, text);
+  }
+  // controls: a LITERAL import() / require(), a plain file, a createRequire-named local that is not called, are not flagged
+  assert.deepEqual(siteKinds('const m = await import("./a.js");'), []);
+  assert.deepEqual(siteKinds('const m = require("./a.js");'), []);
+  // a `Worker` that is not node's (no `node:worker_threads` import), and an import of it that is never constructed
+  assert.deepEqual(siteKinds("class Worker {}\nconst w = new Worker();"), []);
+  assert.deepEqual(siteKinds('import { Worker } from "node:worker_threads";\nlet x: Worker;'), []);
+  assert.deepEqual(siteKinds("const x = 1; const createRequireLater = 2;"), []);
 });
 
-test("K4-2: the unfollowable uses in src/ today are exactly the registered ones, none of them the ledger; a fresh one is red", () => {
-  const found = unfollowableUses(srcFiles(SRC));
+test("K4-2 / FN-3: the unfollowable SITES in src/ today are exactly the registered ones — each pinned by its call text and an exact count — none the ledger; a second site, even in a registered file, is red", () => {
+  const found = unfollowableSites(srcFiles(SRC));
   const actual = Object.fromEntries(
     [...found.entries()].toSorted(([a], [b]) => a.localeCompare(b)),
   );
   assert.deepEqual(actual, KNOWN_NON_LEDGER_UNFOLLOWABLE);
   // none of the registered files is a ledger caller (so "known non-ledger" is checked, not asserted)
   const callers = ledgerCallers(srcFiles(SRC));
-  for (const rel of Object.keys(KNOWN_NON_LEDGER_UNFOLLOWABLE)) {
+  for (const key of Object.keys(KNOWN_NON_LEDGER_UNFOLLOWABLE)) {
+    const rel = key.split(" | ")[0] ?? "";
     assert.equal(
       callers.has(rel),
       false,
       `${rel} is registered as non-ledger but calls a ledger entry`,
     );
   }
-  // NEGATIVE: a new file with a non-literal import() is found and is in no registry
-  const fresh = unfollowableUses([
+  // NEGATIVES, on in-memory copies of REGISTERED files with one more site (the TE's FN-3 measurement):
+  const registered = [
+    ...new Set(Object.keys(KNOWN_NON_LEDGER_UNFOLLOWABLE).map((key) => key.split(" | ")[0] ?? "")),
+  ];
+  for (const rel of registered) {
+    const source = [...srcFiles(SRC)].find(([file]) => file === rel)?.[1] ?? "";
+    for (const extra of [
+      "\nexport const sneakyLoad = (p: string) => import(p);\n", // a different call text: a new key
+      "\nexport const again = async () => (await import(specifier));\n", // the SAME text as a registered one, if any: a higher count
+    ]) {
+      const grown = unfollowableSites([[rel, source + extra]]);
+      assert.notDeepEqual(
+        Object.fromEntries([...grown.entries()].toSorted(([a], [b]) => a.localeCompare(b))),
+        Object.fromEntries(
+          Object.entries(KNOWN_NON_LEDGER_UNFOLLOWABLE).filter(([key]) =>
+            key.startsWith(`${rel} | `),
+          ),
+        ),
+        `${rel}: one more site is NOT green`,
+      );
+    }
+    // and a duplicate of an existing registered call text raises its count
+    const firstKey = Object.keys(KNOWN_NON_LEDGER_UNFOLLOWABLE).find((key) =>
+      key.startsWith(`${rel} | `),
+    );
+    const written = (firstKey ?? "").split(" | ").slice(2).join(" | ");
+    const doubled = unfollowableSites([[rel, `${source}\nconst dup = ${written};\n`]]);
+    assert.ok(
+      (doubled.get(firstKey ?? "") ?? 0) > (KNOWN_NON_LEDGER_UNFOLLOWABLE[firstKey ?? ""] ?? 0),
+      `${firstKey}: the count rises`,
+    );
+  }
+  // a fresh FILE is also red (it is in no registry)
+  const fresh = unfollowableSites([
     ["cli/brand-new.ts", "export const load = (s: string) => import(s);"],
   ]);
-  assert.deepEqual([...fresh.keys()], ["cli/brand-new.ts"]);
-  assert.equal("cli/brand-new.ts" in KNOWN_NON_LEDGER_UNFOLLOWABLE, false);
+  assert.equal(fresh.size, 1);
+  assert.equal(
+    Object.keys(KNOWN_NON_LEDGER_UNFOLLOWABLE).some((key) => key.startsWith("cli/brand-new.ts")),
+    false,
+  );
 });

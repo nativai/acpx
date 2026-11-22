@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -87,7 +88,7 @@ function diskRecord(home: string, metadata: Record<string, string>): DiskRecord 
 }
 
 /** The control pod's side: a real ledger takes the attempt to `adopted`; then the home becomes an agent pod. */
-function adoptedAgentPod(options: { adopt?: boolean } = {}): Fixture {
+function adoptedAgentPod(options: { adopt?: boolean; controlPod?: boolean } = {}): Fixture {
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "acpx-spawnstate-")));
   roots.push(home);
   process.env.HOME = home;
@@ -145,10 +146,13 @@ function adoptedAgentPod(options: { adopt?: boolean } = {}): Fixture {
     fs.writeFileSync(stateFile, typeof state === "string" ? state : JSON.stringify(state));
   };
   writeState(published);
-  // From here on this home is an agent pod, and it has no ledger database at all.
-  fs.writeFileSync(path.join(home, ".nv-agent"), "ag-spawnstate\n");
-  for (const suffix of ["", "-wal", "-shm"]) {
-    fs.rmSync(path.join(home, ".acpx", `brick-outbox.db${suffix}`), { force: true });
+  // From here on this home is an agent pod, and it has no ledger database at all — unless `controlPod`: the
+  // control pod with pod mode OFF (every brick-trigger-spawned session's checkpoint today), ledger kept.
+  if (options.controlPod !== true) {
+    fs.writeFileSync(path.join(home, ".nv-agent"), "ag-spawnstate\n");
+    for (const suffix of ["", "-wal", "-shm"]) {
+      fs.rmSync(path.join(home, ".acpx", `brick-outbox.db${suffix}`), { force: true });
+    }
   }
   const recordFile = path.join(sessions, `${ID}.json`);
   return {
@@ -516,4 +520,196 @@ test("O2-b: ENOENT keeps its meaning on each read — no instance.json is the FI
   const f = adoptedAgentPod();
   fs.rmSync(path.join(f.home, ".acpx", "instance.json"));
   await refuses(f, "outbox-home-unadmitted");
+});
+
+// ---- brick 20d6bce2 (F-6, F-7, F-8): the OTHER reads on the pod write path, through writeSessionRecord ---------
+
+function podDeps(): void {
+  const pod = { name: "ag-spawnstate", uid: "uid-ss", node: "node-a", namespace: "ns" };
+  setPodLockDepsForTests({ ownPod: () => pod, lockPod: () => pod });
+}
+
+/** Runs `run` with `fs.realpathSync` failing with `code` for paths ending in `suffix`. */
+async function withRealpathFailure<T>(
+  suffix: string,
+  code: string,
+  run: () => Promise<T>,
+): Promise<T> {
+  const real = fs.realpathSync;
+  const patched = ((target: fs.PathLike, ...rest: unknown[]) => {
+    if (typeof target === "string" && target.endsWith(suffix)) {
+      throw Object.assign(new Error(`${code}: realpath failed`), { code });
+    }
+    return (real as (...args: unknown[]) => unknown)(target, ...rest);
+  }) as typeof fs.realpathSync;
+  patched.native = real.native;
+  fs.realpathSync = patched;
+  try {
+    return await run();
+  } finally {
+    fs.realpathSync = real;
+  }
+}
+
+/** Runs `run` with `fs/promises.writeFile` (the lock file's own create) failing with `code` for `.lock.…tmp` paths. */
+async function withLockCreateFailure<T>(code: string, run: () => Promise<T>): Promise<T> {
+  const real = fsp.writeFile;
+  fsp.writeFile = ((target: unknown, ...rest: unknown[]) => {
+    if (typeof target === "string" && /\.lock\.[^/]*\.tmp$/u.test(target)) {
+      return Promise.reject(Object.assign(new Error(`${code}: open failed`), { code }));
+    }
+    return (real as (...args: unknown[]) => Promise<void>)(target, ...rest);
+  }) as typeof fsp.writeFile;
+  try {
+    return await run();
+  } finally {
+    fsp.writeFile = real;
+  }
+}
+
+function parsedRecord(f: Fixture) {
+  const parsed = parseSessionRecord(JSON.parse(f.recordBytes()));
+  assert.ok(parsed, "the control pod's record parses");
+  return parsed;
+}
+
+test("F-6: a transient read of the QUEUE LEASE on an owner rebind is the RETRIED spawn-state-missing, not the final record-ownership — through writeSessionRecord", async () => {
+  const f = adoptedAgentPod();
+  podDeps();
+  holdOwnLease();
+  const rebound = { ...parsedRecord(f), acpSessionId: "fresh-after-resume-miss" };
+  const before = f.recordBytes();
+  for (const code of TRANSIENT) {
+    await withReadFailure(path.basename(queueLockFilePath(ID)), code, async () => {
+      await assert.rejects(writeSessionRecord(rebound), refusedWith("spawn-state-missing"), code);
+    });
+  }
+  assert.equal(f.recordBytes(), before, "nothing written");
+  // negative: a permanent error keeps its old meaning (the lease is not provably ours: final)
+  await withReadFailure(path.basename(queueLockFilePath(ID)), "EACCES", async () => {
+    await assert.rejects(writeSessionRecord(rebound), refusedWith("record-ownership"));
+  });
+  // twin: the lease reads, names this process, and the rebind goes through
+  await writeSessionRecord(rebound);
+  assert.equal(
+    (JSON.parse(f.recordBytes()) as DiskRecord).acp_session_id,
+    "fresh-after-resume-miss",
+  );
+});
+
+test("F-7: a transient error on realpath(sessions directory) is the RETRIED spawn-state-missing, not a raw errno — through writeSessionRecord", async () => {
+  const f = adoptedAgentPod();
+  podDeps();
+  const record = { ...parsedRecord(f), lastRequestId: "after realpath" };
+  const before = f.recordBytes();
+  for (const code of TRANSIENT) {
+    await withRealpathFailure(path.join(".acpx", "sessions"), code, async () => {
+      await assert.rejects(writeSessionRecord(record), refusedWith("spawn-state-missing"), code);
+    });
+  }
+  assert.equal(f.recordBytes(), before);
+  // negative: a permanent error is not relabelled (raw, as before)
+  await withRealpathFailure(path.join(".acpx", "sessions"), "EACCES", async () => {
+    await assert.rejects(
+      writeSessionRecord(record),
+      (error) => (error as { code?: string }).code === "EACCES",
+    );
+  });
+  await writeSessionRecord(record);
+  assert.equal((JSON.parse(f.recordBytes()) as DiskRecord).last_request_id, "after realpath");
+});
+
+test("F-8: fd exhaustion (or a mount's hiccup) TAKING the record lock is the RETRIED record-lock-unavailable, not a raw errno — nothing written", async () => {
+  const f = adoptedAgentPod();
+  podDeps();
+  const record = { ...parsedRecord(f), lastRequestId: "after lock" };
+  const before = f.recordBytes();
+  const unavailable = (error: unknown) =>
+    (error as { code?: string }).code === "record-lock-unavailable" &&
+    /could not be taken just now/u.test((error as Error).message);
+  for (const code of TRANSIENT) {
+    await withLockCreateFailure(code, async () => {
+      await assert.rejects(writeSessionRecord(record), unavailable, code);
+    });
+  }
+  assert.equal(f.recordBytes(), before, "nothing written");
+  // negative: a permanent error taking the lock is NOT relabelled
+  await withLockCreateFailure("EACCES", async () => {
+    await assert.rejects(
+      writeSessionRecord(record),
+      (error) => (error as { code?: string }).code === "EACCES",
+    );
+  });
+  // twin: with no failure the write goes through, and no lock file is left behind
+  await writeSessionRecord(record);
+  assert.equal((JSON.parse(f.recordBytes()) as DiskRecord).last_request_id, "after lock");
+  assert.deepEqual(
+    fs.readdirSync(f.sessions).filter((name) => name.includes(".lock")),
+    [],
+  );
+});
+
+// ---- F-19: the lease is read ONLY when the write rebinds the ACP id ------------------------------------------
+
+const LEASE_NAME = () => path.basename(queueLockFilePath(ID));
+const LEASE_ERRNOS = [...TRANSIENT, "EACCES"];
+
+test("F-19 (pod writer): an ORDINARY adopted checkpoint — no rebind — still WRITES under any lease-read errno", async () => {
+  const f = adoptedAgentPod();
+  for (const code of LEASE_ERRNOS) {
+    await withReadFailure(LEASE_NAME(), code, async () => {
+      await podWrite(f, { ...f.record, last_request_id: `ordinary ${code}` });
+    });
+    assert.equal((JSON.parse(f.recordBytes()) as DiskRecord).last_request_id, `ordinary ${code}`);
+  }
+});
+
+test("F-19 (writeSessionRecord, pod mode OFF — a brick-trigger-spawned session's checkpoint on the control pod, through the SQLite ledger): an ordinary adopted checkpoint still WRITES under any lease-read errno", async () => {
+  const f = adoptedAgentPod({ controlPod: true });
+  const parsed = parsedRecord(f);
+  for (const code of LEASE_ERRNOS) {
+    await withReadFailure(LEASE_NAME(), code, async () => {
+      await writeSessionRecord({ ...parsed, lastRequestId: `control ${code}` });
+    });
+    assert.equal((JSON.parse(f.recordBytes()) as DiskRecord).last_request_id, `control ${code}`);
+  }
+});
+
+test("F-19 (SpawnLedger.saveRecord, atrium's in-process writer): an ordinary adopted checkpoint still WRITES; a REBIND under a transient lease errno is the retried refusal (F-6 on this writer too)", async () => {
+  const f = adoptedAgentPod({ controlPod: true });
+  const ledger = new SpawnLedger();
+  try {
+    for (const code of LEASE_ERRNOS) {
+      await withReadFailure(LEASE_NAME(), code, async () => {
+        ledger.saveRecord({ ...f.record, last_request_id: `in-process ${code}` });
+      });
+      assert.equal(
+        (JSON.parse(f.recordBytes()) as DiskRecord).last_request_id,
+        `in-process ${code}`,
+      );
+    }
+    const rebound = {
+      ...(JSON.parse(f.recordBytes()) as DiskRecord),
+      acp_session_id: "fresh-after-resume-miss",
+    };
+    const before = f.recordBytes();
+    for (const code of TRANSIENT) {
+      await withReadFailure(LEASE_NAME(), code, async () => {
+        assert.throws(() => ledger.saveRecord(rebound), refusedWith("spawn-state-missing"), code);
+      });
+    }
+    assert.equal(f.recordBytes(), before);
+    // a permanent errno on a rebind keeps its old meaning; with no failure and the lease held, it lands
+    await withReadFailure(LEASE_NAME(), "EACCES", async () => {
+      assert.throws(() => ledger.saveRecord(rebound), refusedWith("record-ownership"));
+    });
+    holdOwnLease();
+    ledger.saveRecord(rebound);
+    assert.equal(
+      (JSON.parse(f.recordBytes()) as DiskRecord).acp_session_id,
+      "fresh-after-resume-miss",
+    );
+  } finally {
+    ledger.close();
+  }
 });

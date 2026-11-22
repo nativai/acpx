@@ -13,9 +13,12 @@ import ts from "typescript";
 // Seen: `endsWith` with a literal / template / constant (any file) / concatenation / multi-line call, AND with an
 // ELEMENT of a constant list or Set — the parameter of a `.some/.find/.findLast/.findIndex/.every/.filter/.map/
 // .flatMap/.forEach` callback over it, or the variable of `for (const s of LIST)` (the predicate's own idiom; a
-// list may be inline, `as const`, spread into `[...LIST]`, a `new Set([…])`, an alias, or imported from any file);
+// list may be inline, `as const`, spread into `[...LIST]`, `Array.from(LIST)`, `LIST.slice()` / `.toSorted()` /
+// `.toReversed()`, a `new Set([…])`, an alias, or imported from any file) — and the iterated ELEMENT compared with
+// `===`/`!==` against a suffix-derived value instead of `endsWith` (F-17: `EXTS.some((e) => ext === e)`);
 // `extname`, `slice`, `substring`, `substr`, `at`, `split().pop()` compared with `.json`/`json` — directly, or
-// through ONE local of the same function (`const ext = path.extname(n); ext === ".json"`); `includes`/`has`/
+// through ONE local of the same function (`const ext = path.extname(n); ext === ".json"`) — including when that
+// local is READ in a nested closure of the function that declared it (F-18: `const isRecord = () => ext === ".json"`); `includes`/`has`/
 // `indexOf` on a literal OR constant array/Set holding `.json` with an argument derived from such a call or
 // local (`EXTS.has(path.extname(n))`); regex literals and `new RegExp(…)` ending `\.json$`;
 // `glob`/`globSync`/`matchesGlob` with a pattern ending `.json` (a glob is a listing AND a suffix test in one
@@ -36,6 +39,13 @@ import ts from "typescript";
 //   · `.call` / `.apply` / `.bind`, `Reflect.apply(fn, thisArg, args)` and element access (`fs["readdir"]`)
 //   · a listing function copied through an OBJECT property, assigned with `let`, or promisified INLINE
 //     (`promisify(fs.readdir)(d)`); a listing handed to a callback (`run(fs.readdir)`); other glob libraries
+//   · list iteration through `reduce` (the element is the SECOND parameter), a counted index loop
+//     (`for (let i = 0; i < LIST.length; i += 1) n.endsWith(LIST[i])`), `LIST.entries()` / `Object.entries(…)`
+//     destructuring, or an element handed to a helper (F-17, the part that is not cheap)
+//   · a list copy other than spread / `Array.from` / `slice` / `toSorted` / `toReversed` — `concat`, `filter`,
+//     `flatMap`, `map` — and `Object.is(a, b)` in place of `===`
+//   · a suffix local that is DESTRUCTURED (`const { ext } = path.parse(n)`) or assigned AFTER its declaration
+//     (`let ext; ext = path.extname(n);`) — only `const x = <suffix call>` binds one (F-25)
 //   · a suffix taken with `reverse()[0]`, or through more than one local hop, or passed to a callback
 // What keeps an escape cheap is the rest of the net: the predicate is the only thing the index, the archive scan
 // and the backfill call, and a suffix test that bypasses it shows as index churn (test/delivery-json-sidecar.test.ts).
@@ -169,6 +179,22 @@ function listElements(
   if (ts.isIdentifier(node)) {
     return lists.get(node.text);
   }
+  if (ts.isCallExpression(node)) {
+    // `Array.from(LIST)` and the copies of a list that keep its elements
+    const callee = node.expression;
+    if (ts.isPropertyAccessExpression(callee)) {
+      if (
+        callee.expression.getText() === "Array" &&
+        callee.name.text === "from" &&
+        node.arguments[0]
+      ) {
+        return listElements(node.arguments[0], constants, lists, depth + 1);
+      }
+      if (["slice", "values", "toSorted", "toReversed"].includes(callee.name.text)) {
+        return listElements(callee.expression, constants, lists, depth + 1);
+      }
+    }
+  }
   return undefined;
 }
 
@@ -222,6 +248,30 @@ function enclosingFunction(node: ts.Node): string {
     }
   }
   return "<module>";
+}
+
+/**
+ * EVERY named function around `node`, innermost first (`isRecord`, `f` for a closure inside `f`). A suffix-derived
+ * local is declared in one function (`f`) and may be READ in a closure of it (`const isRecord = () => ext ===
+ * ".json"`): the lookup walks the chain (F-18) while the scoping still stops a name leaking between siblings.
+ */
+function enclosingFunctionChain(node: ts.Node): string[] {
+  const chain: string[] = [];
+  for (let current: ts.Node | undefined = node.parent; current; current = current.parent) {
+    if (
+      (ts.isFunctionDeclaration(current) || ts.isMethodDeclaration(current)) &&
+      current.name !== undefined
+    ) {
+      chain.push(current.name.getText());
+    } else if (
+      (ts.isArrowFunction(current) || ts.isFunctionExpression(current)) &&
+      ts.isVariableDeclaration(current.parent) &&
+      ts.isIdentifier(current.parent.name)
+    ) {
+      chain.push(current.parent.name.text);
+    }
+  }
+  return chain.length > 0 ? chain : ["<module>"];
 }
 
 const SUFFIX_CALLS = new Set(["extname", "slice", "substring", "substr", "pop", "at"]);
@@ -280,9 +330,9 @@ export function suffixLocals(sf: ts.SourceFile): SuffixLocals {
 
 function mentionsAny(node: ts.Node, names: SuffixLocals): boolean {
   let found = false;
-  const fn = enclosingFunction(node);
+  const chain = enclosingFunctionChain(node);
   const visit = (child: ts.Node): void => {
-    if (ts.isIdentifier(child) && names.has(`${fn}::${child.text}`)) {
+    if (ts.isIdentifier(child) && chain.some((fn) => names.has(`${fn}::${child.text}`))) {
       found = true;
     }
     if (!found) {
@@ -396,9 +446,19 @@ function jsonSuffixTest(
       [node.left, node.right],
       [node.right, node.left],
     ];
-    return sides.some(
-      ([literal, other]) =>
-        isJsonish(stringValues(literal, constants)) && derivedFromSuffix(other, locals),
+    // F-17: `ext === s` where `s` is an element of a `.json`-holding constant list being iterated
+    const elementCompared = sides.some(
+      ([element, other]) =>
+        ts.isIdentifier(element) &&
+        isJsonish(elementsOfIterated(element, constants, lists)) &&
+        derivedFromSuffix(other, locals),
+    );
+    return (
+      elementCompared ||
+      sides.some(
+        ([literal, other]) =>
+          isJsonish(stringValues(literal, constants)) && derivedFromSuffix(other, locals),
+      )
     );
   }
   return false;

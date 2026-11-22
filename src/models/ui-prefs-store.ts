@@ -102,7 +102,11 @@ export function openUiPrefsStore(dbPath: string = defaultUiPrefsDbPath()): UiPre
       "SELECT 1 AS present FROM favorite_models WHERE source = ? AND model_id = ?",
     ),
     addFavorite: db.prepare(
-      "INSERT OR REPLACE INTO favorite_models (source, model_id, favorited_at) VALUES (?, ?, ?)",
+      // ⚠️ DO NOTHING ON CONFLICT, NOT `INSERT OR REPLACE`: a repeated star must keep its ORIGINAL
+      // `favorited_at`. REPLACE re-stamped it, and the list is ordered by it, so a repeated `fav add` reordered the
+      // favorites — yet `models fav add` is marked repeatSafe (a CALL_HOME unknown outcome says "repeat it").
+      // Held by test/ui-prefs-store.test.ts ("a repeated star keeps its original time").
+      "INSERT INTO favorite_models (source, model_id, favorited_at) VALUES (?, ?, ?) ON CONFLICT(source, model_id) DO NOTHING",
     ),
     removeFavorite: db.prepare("DELETE FROM favorite_models WHERE source = ? AND model_id = ?"),
     getLastUsed: db.prepare(

@@ -78,6 +78,12 @@ export type CommandEntry = {
    * sessions and is passed through — stream HoD ruling Q, 2026-11-21).
    */
   readonly controlPodOnly?: true | { readonly unless: string };
+  /**
+   * The command only READS, or sets a value to what it already says, so running it AGAIN is harmless — the
+   * advice after `CALL_HOME outcome=unknown` says so instead of "may apply twice" (brick 20d6bce2 F-13).
+   * Only where that is true by construction; every other command keeps the "check first" advice.
+   */
+  readonly repeatSafe?: true;
 };
 
 const SELECT = ["--session-id", "--session-url", "-s", "--session"] as const;
@@ -309,14 +315,24 @@ export const COMMAND_TABLE: Readonly<Record<string, CommandEntry>> = {
   "models fav": {
     class: "control-store",
     reason: "reads model preferences — a SQLite database, opened on the control pod only (A7)",
+    repeatSafe: true,
   },
-  "models fav add": { class: "control-store", reason: "model preferences (C1.2 list)" },
-  "models fav rm": { class: "control-store", reason: "model preferences" },
+  "models fav add": {
+    class: "control-store",
+    reason: "model preferences (C1.2 list)",
+    repeatSafe: true,
+  },
+  "models fav rm": { class: "control-store", reason: "model preferences", repeatSafe: true },
   "models last-used": {
     class: "control-store",
     reason: "reads model preferences — a SQLite database, opened on the control pod only (A7)",
+    repeatSafe: true,
   },
-  "models last-used set": { class: "control-store", reason: "model preferences" },
+  "models last-used set": {
+    class: "control-store",
+    reason: "model preferences",
+    repeatSafe: true,
+  },
   providers: { class: "local", reason: "group: help only" },
   "providers list": { class: "read", reason: "reads providers.json" },
   capacity: { class: "control-store", reason: "capacity (C1.2 control-store list)" },

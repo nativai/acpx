@@ -330,6 +330,18 @@ const LIST_SPELLINGS: Readonly<Record<string, string>> = {
     'import { EXTS } from "./exts.js";\nexport const f = (n: string) => EXTS.some((e) => n.endsWith(e));',
   "F-14 a function expression callback":
     'const EXTS = [".json"];\nexport const f = (n: string) => EXTS.some(function (e) {\n  return n.endsWith(e);\n});',
+  "F-18 a suffix local read in a nested closure of its declaring function":
+    'import path from "node:path";\nexport const f = (n: string) => {\n  const ext = path.extname(n);\n  const isRecord = () => ext === ".json";\n  return isRecord();\n};',
+  "F-18 a suffix local read in a closure, against a constant list":
+    'import path from "node:path";\nconst EXTS = [".json"];\nexport function f(n: string) {\n  const ext = path.extname(n);\n  return () => EXTS.includes(ext);\n}',
+  "F-17 the iterated element compared (===) with a suffix local":
+    'import path from "node:path";\nconst EXTS = [".json"];\nexport const f = (n: string) => {\n  const ext = path.extname(n);\n  return EXTS.some((e) => ext === e);\n};',
+  "F-17 for…of with the element compared against an extname call":
+    'import path from "node:path";\nconst EXTS = [".json"];\nexport const f = (n: string) => {\n  for (const e of EXTS) {\n    if (path.extname(n) === e) {\n      return true;\n    }\n  }\n  return false;\n};',
+  "F-17 Array.from(LIST).some":
+    'const EXTS = [".json"];\nexport const f = (n: string) => Array.from(EXTS).some((e) => n.endsWith(e));',
+  "F-17 a copy of the list (slice / toSorted)":
+    'const EXTS = [".json"];\nexport const f = (n: string) => EXTS.slice().some((e) => n.endsWith(e)) || EXTS.toSorted().some((e) => n.endsWith(e));',
   "F-15 includes on a const list":
     'import path from "node:path";\nconst EXTS = [".json", ".yaml"];\nexport const f = (n: string) => EXTS.includes(path.extname(n));',
   "F-15 has on a const Set":
@@ -352,6 +364,12 @@ const LIST_CONTROLS: Readonly<Record<string, string>> = {
     'import path from "node:path";\nconst EXTS = [".md", ".txt"];\nexport const f = (n: string) => EXTS.includes(path.extname(n));',
   'a list holding "json" tested with a value from ANOTHER function (locals are scoped)':
     'const FORMATS = ["text", "json"];\nexport const a = (v: string) => FORMATS.includes(v);\nexport const b = (raw: string) => {\n  const v = raw.slice(0, 4);\n  return v;\n};',
+  "a closure reading a local that is NOT suffix-derived":
+    "export const f = (n: string) => {\n  const ext = n.length;\n  return () => ext === 5;\n};",
+  "a closure reading a suffix local, compared with something else":
+    'import path from "node:path";\nexport const f = (n: string) => {\n  const ext = path.extname(n);\n  return () => ext === ".md";\n};',
+  "a sibling function reading a same-named local it did not derive":
+    'import path from "node:path";\nexport const a = (n: string) => {\n  const ext = path.extname(n);\n  return ext;\n};\nexport const b = (ext: string) => ext === ".json";',
   "a json list whose element is never used as a suffix":
     'const EXTS = [".json"];\nexport const f = (n: string) => EXTS.some((e) => n === e);',
 };

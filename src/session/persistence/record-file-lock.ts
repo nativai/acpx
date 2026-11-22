@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
+import { isTransientReadError } from "../../pod/spawn-state.js";
 import { isProcessDefinitelyDead } from "../../process-liveness.js";
 import {
   LOCK_LOST_CODE,
@@ -60,6 +61,30 @@ const LOCAL_HOST = os.hostname();
 const LOCAL_BOOT = bootId();
 
 export const RECORD_LOCK_TIMEOUT_CODE = "record-lock-timeout";
+export const RECORD_LOCK_UNAVAILABLE_CODE = "record-lock-unavailable";
+
+/**
+ * The record lock could not be TAKEN for a reason that passes — file descriptors for a moment (`EMFILE`,
+ * `ENFILE`), memory, a mount's hiccup (`isTransientReadError`). Nothing was written; the next attempt (the
+ * next checkpoint) may succeed, so it is RETRIED, like `spawn-state-missing` — not a raw errno (F-8).
+ */
+export class RecordLockUnavailableError extends Error {
+  readonly code = RECORD_LOCK_UNAVAILABLE_CODE;
+  constructor(lockPath: string, errno: string) {
+    super(
+      `session record lock ${lockPath} could not be taken just now (${errno}); nothing was written: retry`,
+    );
+  }
+}
+
+/** `code`, not `instanceof` — the atrium server loads this module through `pod-lock.ts` (a second load is a second class). */
+export function isRecordLockUnavailable(error: unknown): boolean {
+  return (
+    !!error &&
+    typeof error === "object" &&
+    (error as { code?: unknown }).code === RECORD_LOCK_UNAVAILABLE_CODE
+  );
+}
 
 export class RecordLockTimeoutError extends Error {
   readonly code = RECORD_LOCK_TIMEOUT_CODE;
@@ -142,6 +167,12 @@ export async function withRecordFileLock<T>(
       }),
       judgeLegacy: judgeLegacyRecordHolder,
       makeTimeoutError: (lockPath, holder) => new RecordLockTimeoutError(lockPath, holder),
+      mapAcquireError: (error) => {
+        const errno = (error as NodeJS.ErrnoException | undefined)?.code;
+        return isTransientReadError(errno)
+          ? new RecordLockUnavailableError(`${recordFile}.lock`, String(errno))
+          : undefined;
+      },
     },
     action,
   );

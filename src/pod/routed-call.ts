@@ -916,7 +916,8 @@ function unknownOutcome(run: TransportRun, exitCode: number, ctx: SettleContext)
 
 /**
  * C2's outcome table. For an unknown outcome the command's partial stderr is dropped from the
- * output, not relayed: the ROUTED line must be the first stderr line, which the atrium server reads.
+ * output, not relayed: the atrium server finds the `acpx: ROUTED ` token by its head and exit code (A-53), and
+ * a half-run command's own stderr would only bury it.
  */
 async function settle(run: TransportRun, ctx: SettleContext): Promise<RoutedCallResult> {
   if (run.spawnError !== undefined) {

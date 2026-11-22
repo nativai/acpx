@@ -279,7 +279,12 @@ export type CapacityRefusalDetail = {
   wake?: { sessionId: string; seatId: string | null };
   /** `pod_starting` / `agent_cap` only (C7.2): the fields of the token line beyond the common ones. */
   pod?: { phase?: string; why?: string; live?: number; cap?: number; box?: string };
-  /** The first stderr line, repeated in JSON (`error.data.tokenLine`) like the placement refusals do (C7.2). */
+  /**
+   * The C7.2 token line, repeated in JSON (`error.data.tokenLine`) like the placement refusals do. In text mode
+   * it is NOT necessarily the first stderr line (A-53): a reader finds it by its head — the first line that
+   * begins `acpx: REFUSED ` (exit 75 or 2) or `acpx: ROUTED ` / `acpx: CALL_HOME ` (exit 1) — and skips the
+   * progress lines and warnings before it.
+   */
   tokenLine?: string;
 };
 
