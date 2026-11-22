@@ -151,6 +151,8 @@ export interface CallClassification {
   class?: string;
   help?: boolean;
   targetSessionId?: string | null;
+  /** A-52: WHY `targetSessionId` is null. Absent from an acpx before A-52, and then the reason is `target-unresolved`. */
+  targetError?: { kind: "not-found" | "ambiguous" | "failed"; message?: string };
 }
 export type Classify = (argv: readonly string[]) => Promise<CallClassification>;
 
@@ -520,6 +522,13 @@ async function loadClassTable(): Promise<ClassTableModule | null> {
   return loadedTable;
 }
 
+/** acpx's `resolveTargetOutcome` (A-52): the record id, or why there is none. */
+type TargetOutcome =
+  | { recordId: string; error?: undefined }
+  | { recordId: null; error: { kind: "not-found" | "ambiguous" | "failed"; message?: string } };
+/** No store was given, so nothing was looked up: not a failure, no match — the answer before A-52 was `null` too. */
+const NO_OUTCOME: TargetOutcome = { recordId: null, error: { kind: "not-found" } };
+
 /** acpx's `TARGET_CLASSES`: the classes whose passability depends on WHICH session the call is about. */
 const TARGET_CLASSES: ReadonlySet<string> = new Set(["record", "owner-if-pod", "owner-ensure"]);
 
@@ -533,16 +542,32 @@ process.stdin.on("data", async (chunk) => {
     const line = buffer.slice(0, i);
     buffer = buffer.slice(i + 1);
     const { id, target } = JSON.parse(line);
-    process.stdout.write(JSON.stringify({ id, record: await m.resolveTargetRecordId(target) }) + "\\n");
+    process.stdout.write(JSON.stringify({ id, outcome: await m.resolveTargetOutcome(target) }) + "\\n");
   }
 });
 `;
+
+/**
+ * A-52, commandClasses.ts: `target-unresolved` means ONLY that no session matches; an ambiguous value is
+ * `target-ambiguous` with the resolver's own sentence; any other lookup failure is `target-lookup-failed` with its
+ * message. A classification WITHOUT `targetError` (an acpx before A-52) is `target-unresolved`, as before.
+ */
+function unresolvedVerdict(c: CallClassification): { ok: false; reason: string; message?: string } {
+  const error = c.targetError;
+  if (error?.kind === "ambiguous") {
+    return { ok: false, reason: "target-ambiguous", message: error.message ?? "" };
+  }
+  if (error?.kind === "failed") {
+    return { ok: false, reason: "target-lookup-failed", message: error.message ?? "" };
+  }
+  return { ok: false, reason: "target-unresolved" };
+}
 
 /** commandClasses.ts `passability`. */
 function passability(
   c: CallClassification,
   callerRecordId: string,
-): { ok: true; class: string } | { ok: false; reason: string } {
+): { ok: true; class: string } | { ok: false; reason: string; message?: string } {
   if (c.kind === "table-unavailable") {
     return { ok: false, reason: "table-unavailable" };
   }
@@ -557,7 +582,7 @@ function passability(
   }
   if (c.class === "record" || c.class === "owner-if-pod") {
     if (c.targetSessionId === undefined || c.targetSessionId === null || c.targetSessionId === "") {
-      return { ok: false, reason: "target-unresolved" };
+      return unresolvedVerdict(c);
     }
     if (c.targetSessionId === callerRecordId) {
       return { ok: false, reason: "own-session" };
@@ -719,7 +744,7 @@ export class RecordedAtrium {
   private readonly createdRecords = new Map<string, { call: string; fingerprint: string }>();
   private resolver: ChildProcess | null = null;
   private resolverReady: Promise<void> | null = null;
-  private readonly resolverPending = new Map<number, (record: string | null) => void>();
+  private readonly resolverPending = new Map<number, (outcome: TargetOutcome) => void>();
   private resolverSeq = 0;
   private readonly rulesLeft = new Map<CallRule, number>();
   private phases: AtriumPhase[] = [{ mode: "normal" }];
@@ -844,7 +869,7 @@ export class RecordedAtrium {
       child.once("error", reject);
       child.once("exit", () => {
         for (const settle of this.resolverPending.values()) {
-          settle(null);
+          settle(NO_OUTCOME);
         }
         this.resolverPending.clear();
         reject(new Error("the resolver child exited"));
@@ -858,8 +883,8 @@ export class RecordedAtrium {
             resolve();
             continue;
           }
-          const answer = JSON.parse(line) as { id: number; record: string | null };
-          this.resolverPending.get(answer.id)?.(answer.record);
+          const answer = JSON.parse(line) as { id: number; outcome: TargetOutcome };
+          this.resolverPending.get(answer.id)?.(answer.outcome);
           this.resolverPending.delete(answer.id);
         }
       });
@@ -868,18 +893,18 @@ export class RecordedAtrium {
     return this.resolverReady;
   }
 
-  private async resolveTarget(target: unknown): Promise<string | null> {
+  private async resolveTarget(target: unknown): Promise<TargetOutcome> {
     const home = this.script.stateHome;
     if (home === undefined || target === undefined) {
-      return null; // no store was given: nothing is read, nothing is written
+      return NO_OUTCOME; // no store was given: nothing is read, nothing is written
     }
     try {
       await this.startResolver(home);
     } catch {
-      return null;
+      return NO_OUTCOME;
     }
     const id = (this.resolverSeq += 1);
-    return await new Promise<string | null>((resolve) => {
+    return await new Promise<TargetOutcome>((resolve) => {
       this.resolverPending.set(id, resolve);
       this.resolver?.stdin?.write(`${JSON.stringify({ id, target })}\n`);
     });
@@ -908,7 +933,9 @@ export class RecordedAtrium {
       return base;
     }
     const resolved = await this.resolveTarget(c.target);
-    return { ...base, targetSessionId: resolved };
+    return resolved.error === undefined
+      ? { ...base, targetSessionId: resolved.recordId }
+      : { ...base, targetSessionId: null, targetError: resolved.error };
   }
 
   private applyScript(script: AtriumScript): void {
@@ -1414,10 +1441,16 @@ export class RecordedAtrium {
       (classified.targetSessionId === undefined || classified.targetSessionId === null)
     ) {
       classified.targetSessionId = this.script.resolveTargetAs;
+      delete classified.targetError;
     }
     const verdict = passability(classified, body.caller?.record_id ?? "");
     if (!verdict.ok) {
-      refuse(bad("class-not-passable", { reason: verdict.reason }));
+      refuse(
+        bad("class-not-passable", {
+          reason: verdict.reason,
+          ...(verdict.message === undefined ? {} : { message: verdict.message }),
+        }),
+      );
       return;
     }
     const path = classified.path ?? "";

@@ -848,6 +848,13 @@ export type CallClassification =
        * class does not depend on it.
        */
       targetSessionId?: string | null;
+      /**
+       * WHY `targetSessionId` is `null` (A-52): present exactly when it is `null` on a class that depends on the
+       * target, absent otherwise. `kind` is `not-found` (no match, no selector), `ambiguous` (acpx's resolver will
+       * not choose; `message` is its own sentence) or `failed` (a store or I/O error, a selector refused as usage;
+       * `message`). A reader that does not know the field reads `null` as "unresolved", as before A-52.
+       */
+      targetError?: { kind: "not-found" | "ambiguous" | "failed"; message?: string };
     }
   | { kind: "unclassified"; contract: typeof COMMAND_CLASSES_CONTRACT; path: string };
 
@@ -877,6 +884,9 @@ export async function classifyCall(
   if (!TARGET_CLASSES.has(c.class)) {
     return base;
   }
-  const { resolveTargetRecordId } = await import("./target-resolver.js");
-  return { ...base, targetSessionId: await resolveTargetRecordId(c.target) };
+  const { resolveTargetOutcome } = await import("./target-resolver.js");
+  const outcome = await resolveTargetOutcome(c.target);
+  return outcome.error === undefined
+    ? { ...base, targetSessionId: outcome.recordId }
+    : { ...base, targetSessionId: null, targetError: outcome.error };
 }

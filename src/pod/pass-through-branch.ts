@@ -14,7 +14,7 @@ import {
   type CallHomeOutcome,
 } from "./call-home.js";
 import type { Classification, OutputMode } from "./command-classes.js";
-import { answerLikeLocal } from "./not-found-answer.js";
+import { answerLikeLocal, type TargetFailure } from "./not-found-answer.js";
 import {
   buildPassThroughCall,
   PassThroughUsageError,
@@ -89,6 +89,7 @@ type AnswerBody = {
   stderr?: unknown;
   error?: unknown;
   reason?: unknown;
+  message?: unknown;
 };
 
 function asBody(value: unknown): AnswerBody {
@@ -108,14 +109,20 @@ async function localAnswerFor(
     classification: Extract<Classification, { kind: "classified" }>;
   },
 ): Promise<number | undefined> {
-  if (
-    status !== 400 ||
-    body.error !== "class-not-passable" ||
-    body.reason !== "target-unresolved"
-  ) {
+  if (status !== 400 || body.error !== "class-not-passable") {
     return undefined;
   }
-  return await answerLikeLocal(deps.classification, deps.output, deps.context);
+  // A-52: `target-unresolved` means ONLY that no session matches; `target-ambiguous` carries the resolver's own
+  // sentence. `target-lookup-failed` (and any reason this build does not know) keeps the door's refusal.
+  const failure: TargetFailure | undefined =
+    body.reason === "target-unresolved"
+      ? { kind: "not-found" }
+      : body.reason === "target-ambiguous" && typeof body.message === "string"
+        ? { kind: "ambiguous", message: body.message }
+        : undefined;
+  return failure === undefined
+    ? undefined
+    : await answerLikeLocal(deps.classification, deps.context.argv, deps.context, failure);
 }
 
 /** Print what atrium answered, or the failure it amounts to; returns the exit code. */
