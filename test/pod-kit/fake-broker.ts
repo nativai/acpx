@@ -66,8 +66,27 @@ export interface BrokerBehavior {
    * instead of sending the 200 first.
    */
   drop?: { afterLines: number; times?: number; beforeHeaders?: boolean };
+  /**
+   * What the Job does AFTER a stream-ending final (`error timeout` / `error kube_api_error`): the Job continues
+   * (broker.py "the Job continues"), so a later POST follows it — from the current phase — and sees these steps and
+   * this final. Absent: the Job sits where it is.
+   */
+  afterTimeout?: BrokerThen;
+  /**
+   * How long a FOLLOWER waits before ITS OWN `error timeout` (the real `agent_wait`): its stream ends with that line
+   * and the Job goes on. Absent: a follower waits for ever (until the Job ends, a DELETE, or the client closes).
+   */
+  agentWaitMs?: number;
   /** Answer the whole POST with this HTTP response instead of a stream (a 5xx, a hang is `hang`). */
   respond?: { status: number; body?: string; headers?: Record<string, string> };
+}
+
+export interface BrokerThen {
+  steps?: BrokerStep[];
+  final?: BrokerFinal;
+  finalDelayMs?: number;
+  hang?: boolean;
+  afterTimeout?: BrokerThen;
 }
 
 export interface BrokerStatus {
@@ -86,7 +105,17 @@ export interface BrokerScript {
   keys?: Record<string, BrokerBehavior>;
   default?: BrokerBehavior;
   /** DELETE: delay before answering, and the status (default 200). */
-  delete?: { delayMs?: number; status?: number };
+  delete?: {
+    delayMs?: number;
+    status?: number;
+    /**
+     * For a 504 (the DELETE's wait ran out): how long AFTER the DELETE began the terminating pod really goes away
+     * (default: with the DELETE's own delay; `null`: never). A POST that meets a terminating pod waits for it, up to
+     * `goneWaitMs` (default 1000), then ends `error start_failed`.
+     */
+    goneAfterMs?: number | null;
+    goneWaitMs?: number;
+  };
   /**
    * The box's limits, as `GET /v1/agents` reports them AND as admission applies them (cap, reserve,
    * quota, home cap, pool state). Defaults: cap 100, reserve 1, home cap 0 (as the real broker), quota hard
@@ -130,6 +159,8 @@ interface Job {
   uid: string;
   behavior: BrokerBehavior;
   lines: string[];
+  /** The line the CREATOR's stream ends with while the Job goes on (`error timeout`, `error kube_api_error`). */
+  creatorEnd: string | undefined;
   done: boolean;
   /** The pod ended or the final line was not `ready`: a later POST creates a NEW Job (new uid). */
   ended: boolean;
@@ -468,8 +499,7 @@ export class FakeBroker {
     });
   }
 
-  private finalLine(job: Job, key: string): string {
-    const final = job.behavior.final;
+  private finalLine(job: Job, key: string, final: BrokerFinal | undefined): string {
     if (typeof final === "string") {
       return final;
     }
@@ -491,33 +521,46 @@ export class FakeBroker {
   }
 
   private async runJob(job: Job): Promise<void> {
-    for (const step of job.behavior.steps ?? []) {
-      const line = typeof step === "string" ? step : step.line;
-      const delayMs = typeof step === "string" ? 0 : (step.delayMs ?? 0);
-      await this.sleep(job, delayMs);
+    let spec: BrokerThen & { steps?: BrokerStep[] } = job.behavior;
+    for (;;) {
+      for (const step of spec.steps ?? []) {
+        const line = typeof step === "string" ? step : step.line;
+        const delayMs = typeof step === "string" ? 0 : (step.delayMs ?? 0);
+        await this.sleep(job, delayMs);
+        if (job.deleted) {
+          return;
+        }
+        job.lines.push(line);
+        this.notify(job);
+      }
+      if (spec.hang === true) {
+        return;
+      }
+      await this.sleep(job, spec.finalDelayMs ?? 0);
       if (job.deleted) {
         return;
       }
+      const line = this.finalLine(job, job.key, spec.final);
+      if (line === "error timeout" || line === "error kube_api_error") {
+        // These end THE STREAM, not the Job (broker.py: "the Job continues"): the creator's stream ends with the
+        // line, the Job keeps its slot and its uid, and a later POST follows it — from the current phase, with its
+        // own wait — and may see it ready (`then`).
+        job.creatorEnd = line;
+        this.notify(job);
+        if (spec.afterTimeout === undefined) {
+          return;
+        }
+        spec = spec.afterTimeout;
+        continue;
+      }
       job.lines.push(line);
+      job.done = true;
+      // A final that is not `ready` leaves no pod behind: the next POST of the key is a new request —
+      // admission is evaluated again and a Job with a new uid is created (never a replay of this line).
+      job.ended = !line.startsWith("ready ");
       this.notify(job);
-    }
-    if (job.behavior.hang === true) {
       return;
     }
-    await this.sleep(job, job.behavior.finalDelayMs ?? 0);
-    if (job.deleted) {
-      return;
-    }
-    const line = this.finalLine(job, job.key);
-    job.lines.push(line);
-    job.done = true;
-    // A final that is not `ready` leaves no pod behind: the next POST of the key is a new request —
-    // admission is evaluated again and a Job with a new uid is created (never a replay of this line).
-    // `error timeout` (and `error kube_api_error`) end THE STREAM, not the Job (broker.py: "the Job continues"): the pod
-    // may still become ready, the Job keeps its slot, and the next POST follows the same Job and uid.
-    job.ended =
-      !line.startsWith("ready ") && line !== "error timeout" && line !== "error kube_api_error";
-    this.notify(job);
   }
 
   /**
@@ -665,7 +708,8 @@ export class FakeBroker {
     const answer = (outcome: string, body: string): void => {
       record.outcome = outcome;
       // the scripted failure is the answer of a DELETE that RAN; a refusal or "nothing there" is always 200
-      const ran = outcome === "deleted" || outcome === "deleted_terminating";
+      const ran =
+        outcome === "deleted" || outcome === "deleted_terminating" || outcome === "delete_failed";
       const status = ran ? (this.script.delete?.status ?? 200) : 200;
       // the real broker's failure bodies: 504 after the delete wait, 502 when the kube API failed
       const failure =
@@ -687,6 +731,36 @@ export class FakeBroker {
     // — and every one that starts before the answer — ends `error deleted`.
     this.deleteActive.set(key, (this.deleteActive.get(key) ?? 0) + 1);
     try {
+      const failing = (this.script.delete?.status ?? 200) !== 200;
+      if (live !== undefined && failing && this.script.delete?.status === 504) {
+        // broker.py issues `delete_job` (Foreground) BEFORE its wait, and only the WAIT times out: the Job carries a
+        // deletionTimestamp, the terminating pod still counts toward the cap, and the next POST waits for it to go
+        // (then creates a NEW Job with a NEW uid) or ends `start_failed` — it never follows the old pod as ready.
+        this.jobs.delete(key);
+        this.cancelJob(live);
+        const delay = this.script.delete?.delayMs ?? 0;
+        const goneAfter = this.script.delete?.goneAfterMs;
+        const done = new Promise<void>((resolve) => {
+          if (goneAfter !== null) {
+            setTimeout(resolve, Math.max(delay, delay + (goneAfter ?? 0)));
+          }
+        });
+        this.terminating.set(key, { job: live, done });
+        void done.then(() => {
+          if (this.terminating.get(key)?.job === live) {
+            this.terminating.delete(key);
+          }
+        });
+        await new Promise<void>((resolve) => setTimeout(resolve, delay));
+        answer("delete_failed", "");
+        return;
+      }
+      if (live !== undefined && failing) {
+        // 502: the kube API failed — it may have deleted nothing: the pod is still there and the next POST follows it
+        await new Promise<void>((resolve) => setTimeout(resolve, this.script.delete?.delayMs ?? 0));
+        answer("delete_failed", "");
+        return;
+      }
       if (live !== undefined) {
         this.jobs.delete(key);
         this.cancelJob(live);
@@ -768,15 +842,28 @@ export class FakeBroker {
     let follower = true;
     if (job === undefined) {
       follower = false;
+      // "never created while another pod of the key is terminating" (K4): wait for it to go, bounded; a pod that
+      // does not go ends the request `start_failed` (broker.py ensure_job / wait_gone)
+      const dying = this.terminating.get(key);
+      if (dying !== undefined) {
+        const waitMs = this.script.delete?.goneWaitMs ?? 1000;
+        await Promise.race([
+          dying.done,
+          new Promise<void>((resolve) => setTimeout(resolve, waitMs)),
+        ]);
+        if (this.terminating.get(key) === dying) {
+          finishWith("error start_failed", "error_start_failed");
+          return;
+        }
+        if (this.tombstoned(key, answeredAtStart)) {
+          finishWith("error deleted", "error_deleted");
+          return;
+        }
+      }
       const klass = body.class as string;
       const asked = body.placement as string;
       const target =
         asked === "auto" ? (this.limits().pool.state === "ready" ? "pool" : "home") : asked;
-      if (asked === "pool" && this.limits().pool.state !== "ready") {
-        // an explicit pool request when the pool template is not usable: broker.py create() -> template_rejected
-        finishWith("error template_rejected", "error_template_rejected");
-        return;
-      }
       const refusal = this.admissionRefusal(klass, target);
       if (refusal !== null) {
         const cap = this.limits();
@@ -785,6 +872,11 @@ export class FakeBroker {
           `refused reason=${refusal} live=${String(cap.live)} cap=${String(cap.cap)}`,
           "refused",
         );
+        return;
+      }
+      if (asked === "pool" && this.limits().pool.state !== "ready") {
+        // an explicit pool request when the pool template is not usable: broker.py create() -> template_rejected
+        finishWith("error template_rejected", "error_template_rejected");
         return;
       }
       const behavior = this.behaviorFor(key);
@@ -796,16 +888,24 @@ export class FakeBroker {
         return;
       }
       this.jobCounter += 1;
+      const scriptedFinal = behavior.final;
+      const scriptedPlacement =
+        scriptedFinal !== undefined && typeof scriptedFinal === "object" && "ready" in scriptedFinal
+          ? scriptedFinal.ready.placement
+          : undefined;
       job = {
         seq: this.jobCounter,
         key,
         uid: this.podUidFor(behavior, key, this.jobCounter),
         behavior,
         lines: [],
+        creatorEnd: undefined,
         done: false,
         ended: false,
         deleted: false,
-        target,
+        // a scripted `ready placement=…` is where the pod is: occupancy and the line must agree
+        target:
+          scriptedPlacement === "home" || scriptedPlacement === "pool" ? scriptedPlacement : target,
         dropsLeft: behavior.drop?.times ?? 1,
         timers: new Set(),
         wake: new Set(),
@@ -843,6 +943,16 @@ export class FakeBroker {
       gone.value = true;
       this.notify(job);
     });
+    const waitExpired = { value: false };
+    const waitMs = job.behavior.agentWaitMs;
+    const waitTimer =
+      follower && waitMs !== undefined
+        ? setTimeout(() => {
+            waitExpired.value = true;
+            this.notify(job);
+          }, waitMs)
+        : undefined;
+    response.once("close", () => clearTimeout(waitTimer));
     // A follower starts a fresh tracker at the Job's CURRENT phase (broker.py `follow`): it is told where the
     // pod is now — the last step, or the final line — never the history; a step it already sent is not repeated.
     let sent = follower ? Math.max(0, job.lines.length - 1) : 0;
@@ -878,6 +988,19 @@ export class FakeBroker {
       if (job.done) {
         record.outcome = "final";
         response.end();
+        return;
+      }
+      if (!follower && job.creatorEnd !== undefined) {
+        record.linesSent.push(job.creatorEnd);
+        record.outcome = "final";
+        response.end(`${job.creatorEnd}\n`);
+        return;
+      }
+      if (follower && waitExpired.value) {
+        // the follower's OWN timeout: its stream ends, the Job continues
+        record.linesSent.push("error timeout");
+        record.outcome = "final";
+        response.end("error timeout\n");
         return;
       }
       if (job.deleted || this.tombstoned(job.key, answeredAtStart)) {

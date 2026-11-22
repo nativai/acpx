@@ -434,6 +434,31 @@ test("bindIdentity is the only instance_id writer and refuses an unadmitted or f
   );
 });
 
+test("boundInstanceId reads the ledger's own binding: null before bindIdentity, the bound id after, null for a refused bind", () => {
+  freshHome("bound-instance-id");
+  admit("i-111111111111");
+  const ledger = new SpawnLedger();
+  try {
+    assert.equal(ledger.boundInstanceId(), null);
+    assert.throws(
+      () => ledger.bindIdentity({ instance_id: "i-222222222222" }),
+      (error) => codeOf(error) === "outbox-foreign-bind",
+    );
+    assert.equal(ledger.boundInstanceId(), null, "a refused bind leaves the ledger unbound");
+    ledger.bindIdentity({ instance_id: "i-111111111111" });
+    assert.equal(ledger.boundInstanceId(), "i-111111111111");
+  } finally {
+    ledger.close();
+  }
+  // A second handle on the same HOME reads the persisted binding, not a per-process cache.
+  const reopened = new SpawnLedger();
+  try {
+    assert.equal(reopened.boundInstanceId(), "i-111111111111");
+  } finally {
+    reopened.close();
+  }
+});
+
 test("the instance-mismatch detector refuses spawn-owned writes after instance.json was re-minted", () => {
   freshHome("mismatch");
   admit("i-111111111111");

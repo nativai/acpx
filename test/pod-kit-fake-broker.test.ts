@@ -702,25 +702,53 @@ test("F14: a scripted DELETE failure carries the real body — 504 `error timeou
   }
 });
 
-test("K-R2-3: `error timeout` ends the STREAM, not the Job — the next POST follows the same Job and uid, which still holds a slot", async () => {
+test("K-R2-3 / K-R3-1: `error timeout` ends the STREAM, not the Job — a later POST follows the same Job and uid, from the CURRENT phase, and can see it READY", async () => {
   await withBroker(
     {
-      jobs: [{ steps: ["pulling"], final: { error: "timeout" } }],
-      default: { steps: ["starting"] },
+      jobs: [
+        {
+          steps: ["pulling"],
+          final: { error: "timeout" },
+          afterTimeout: { steps: [{ line: "starting", delayMs: 150 }], finalDelayMs: 150 },
+        },
+      ],
     },
     async (broker) => {
       const { key, body } = wellFormedAgentRequest("session-timeout");
       const first = await postAgent(broker, key, body);
-      assert.deepEqual(first.lines, ["pulling", "error timeout"]);
+      assert.deepEqual(
+        first.lines,
+        ["pulling", "error timeout"],
+        "the creator's stream ends with the timeout",
+      );
       assert.equal((await getAgents(broker)).live, 1, "the Job continues and keeps its slot");
       const second = await postAgent(broker, key, body);
-      assert.equal(broker.requestsFor("POST", key)[1]?.joinedExistingJob, true);
-      assert.equal(
-        broker.requestsFor("POST", key)[1]?.jobSeq,
-        broker.requestsFor("POST", key)[0]?.jobSeq,
-        "the same Job",
+      const posts = broker.requestsFor("POST", key);
+      assert.equal(posts[1]?.joinedExistingJob, true);
+      assert.equal(posts[1]?.jobSeq, posts[0]?.jobSeq, "the same Job");
+      assert.notDeepEqual(
+        second.lines,
+        ["error timeout"],
+        "NOT the stored timeout answered at once",
       );
-      assert.equal(second.lines.at(-1), "error timeout");
+      assert.equal(second.lines[0], "pulling", "from the current phase");
+      assert.match(second.lines.at(-1) ?? "", READY_LINE, "and it ends READY once the pod is up");
+    },
+  );
+  // a follower has its OWN wait: its stream ends `error timeout`, the Job goes on — and a third POST waits again
+  await withBroker(
+    { jobs: [{ steps: ["pulling"], final: { error: "timeout" }, agentWaitMs: 120 }] },
+    async (broker) => {
+      const { key, body } = wellFormedAgentRequest("session-follower-wait");
+      await postAgent(broker, key, body);
+      const started = Date.now();
+      const second = await postAgent(broker, key, body);
+      assert.deepEqual(second.lines, ["pulling", "error timeout"]);
+      assert.ok(Date.now() - started >= 100, "the follower WAITED its own bound");
+      const third = Date.now();
+      assert.deepEqual((await postAgent(broker, key, body)).lines, ["pulling", "error timeout"]);
+      assert.ok(Date.now() - third >= 100, "and a third waits again, not an instant replay");
+      assert.equal((await getAgents(broker)).live, 1);
     },
   );
   // the contrast: a failed start IS an ended Job — the next POST is a new request
@@ -729,6 +757,83 @@ test("K-R2-3: `error timeout` ends the STREAM, not the Job — the next POST fol
     await postAgent(broker, key, body);
     assert.equal((await getAgents(broker)).live, 0);
   });
+});
+
+test("K-R3-5: at cap an explicit `pool` request is REFUSED (retryable), not `template_rejected`; K-R3-6: a scripted ready placement is where the Job counts", async () => {
+  await withBroker(
+    { status: { pool: { state: "no-template" }, live: 100, cap: 100 } },
+    async (broker) => {
+      const { key, body } = wellFormedAgentRequest("session-pool-cap", { placement: "pool" });
+      assert.deepEqual((await postAgent(broker, key, body)).lines, [
+        "refused reason=agent_cap live=100 cap=100",
+      ]);
+    },
+  );
+  await withBroker(
+    { default: { final: { ready: { placement: "home" } } }, status: { home: { cap: 2 } } },
+    async (broker) => {
+      const { key, body } = wellFormedAgentRequest("session-ready-home", { placement: "auto" });
+      assert.match((await postAgent(broker, key, body)).lines.at(-1) ?? "", /placement=home$/);
+      assert.deepEqual(
+        (await getAgents(broker)).home,
+        { live: 1, cap: 2 },
+        "home.live agrees with the line",
+      );
+    },
+  );
+});
+
+test("K-R3-7 / K-R4-1: a 502 DELETE may have removed nothing (the next POST follows the pod); a 504 DELETE already deleted the Job — only the WAIT timed out", async () => {
+  await withBroker({ delete: { status: 502 } }, async (broker) => {
+    const { key, body } = wellFormedAgentRequest("session-delete-502");
+    const first = (await postAgent(broker, key, body)).lines.at(-1) ?? "";
+    assert.equal((await deleteAgent(broker, key)).status, 502);
+    assert.equal((await getAgents(broker)).live, 1, "the pod is still there");
+    assert.equal(
+      (await postAgent(broker, key, body)).lines.at(-1),
+      first,
+      "the same pod, the same uid",
+    );
+    assert.equal(broker.requestsFor("POST", key)[1]?.joinedExistingJob, true);
+  });
+  // 504: the Job is terminating; it still counts; the next POST WAITS for it to go, then makes a NEW Job with a NEW uid
+  await withBroker({ delete: { status: 504, goneAfterMs: 300 } }, async (broker) => {
+    const { key, body } = wellFormedAgentRequest("session-delete-504");
+    const first = (await postAgent(broker, key, body)).lines.at(-1) ?? "";
+    const answer = await deleteAgent(broker, key);
+    assert.deepEqual(answer, { status: 504, text: "error timeout\n" });
+    assert.equal(
+      (await getAgents(broker)).live,
+      1,
+      "the terminating pod still counts toward the cap",
+    );
+    const started = Date.now();
+    const next = await postAgent(broker, key, body);
+    assert.ok(Date.now() - started >= 200, "the next POST waited for the old pod to go");
+    assert.match(next.lines.at(-1) ?? "", READY_LINE);
+    assert.notEqual(
+      /uid=(\S+)/.exec(next.lines.at(-1) ?? "")?.[1],
+      /uid=(\S+)/.exec(first)?.[1],
+      "a NEW uid — never the old pod handed back as ready",
+    );
+    const posts = broker.requestsFor("POST", key);
+    assert.equal(posts[1]?.joinedExistingJob, false);
+    assert.notEqual(posts[1]?.jobSeq, posts[0]?.jobSeq);
+    assert.equal((await getAgents(broker)).live, 1, "one pod: the new one");
+  });
+  // 504 and the pod never goes: the next POST ends `start_failed` after its gone-wait, the old pod still counts
+  await withBroker(
+    { delete: { status: 504, goneAfterMs: null, goneWaitMs: 150 } },
+    async (broker) => {
+      const { key, body } = wellFormedAgentRequest("session-delete-504-stuck");
+      await postAgent(broker, key, body);
+      assert.equal((await deleteAgent(broker, key)).status, 504);
+      const started = Date.now();
+      assert.deepEqual((await postAgent(broker, key, body)).lines, ["error start_failed"]);
+      assert.ok(Date.now() - started >= 120);
+      assert.equal((await getAgents(broker)).live, 1, "the stuck pod still counts");
+    },
+  );
 });
 
 test("K-R2-4: `ready` prints the placement the Job was ROUTED to — an `auto` request with the pool not ready goes home, and home.live counts it", async () => {

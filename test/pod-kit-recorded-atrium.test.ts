@@ -8,8 +8,9 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { COMMAND_TABLE, PASS_THROUGH_INHERIT } from "../src/pod/command-classes.js";
 import { addRecord } from "./pod-a3-helpers.js";
-import { CREATE_PATHS, INHERIT_ALLOWED, startRecordedAtrium } from "./pod-kit/recorded-atrium.js";
+import { INHERIT_ALLOWED, startRecordedAtrium } from "./pod-kit/recorded-atrium.js";
 import type { AtriumScript, Classify, RecordedAtrium } from "./pod-kit/recorded-atrium.js";
+import { removeTempHomeSync } from "./temp-home.js";
 
 // Self-test of the X1 recorded atrium. The rule of the kit: the fake follows the REAL atrium
 // (acpx-ui agent-pods `server/acpxCall/passThrough.ts`, `server/message-routes.ts`,
@@ -435,17 +436,16 @@ test("inherit: a name outside the closed list is 400 inherit-not-allowed (+name)
   );
 });
 
-test("the kit's copies cannot drift: INHERIT_ALLOWED = PASS_THROUGH_INHERIT, CREATE_PATHS = the CLASS TABLE's creates (F11)", () => {
+test("the kit's one copy cannot drift: INHERIT_ALLOWED = PASS_THROUGH_INHERIT; create-ness comes from the class table itself (no copy)", () => {
   assert.deepEqual([...INHERIT_ALLOWED], [...PASS_THROUGH_INHERIT]);
-  const tableCreates = Object.entries(COMMAND_TABLE)
-    .filter(([, entry]) => entry.class === "create")
-    .map(([path]) => path)
-    .toSorted();
-  assert.deepEqual(
-    [...CREATE_PATHS].toSorted(),
-    tableCreates,
-    "a create path added to the class table, or removed, goes red here — atrium derives create-ness from the table",
+  // atrium derives "is a create" from the table's verdict (`class === "create"`, not `sessions handover`); the kit does the
+  // same at run time, so a create path added to the table is checked as a create without any list to update. Pin it.
+  const creates = new Set(
+    Object.entries(COMMAND_TABLE)
+      .filter(([, entry]) => entry.class === "create")
+      .map(([path]) => path),
   );
+  assert.ok(creates.has("sessions new") && creates.has("sessions handover"), "the table's creates");
 });
 
 test("A-27: a create's --created-by-call must be call_id (400 call-id-mismatch); --record-id must be one uuid; one first message", async () => {
@@ -1112,7 +1112,186 @@ test("K-R2-2: the kit never touches a store it was not given — the test proces
     [],
     "nothing was created under HOME — no .acpx, no index.json",
   );
-  fs.rmSync(home, { recursive: true });
+  removeTempHomeSync(home);
+});
+
+test("K-R3-2: the same ids with a DIFFERENT request — another --name, reordered flags — is acpx's CREATE_REPLAY_MISMATCH (exit 2), never replay:true", async () => {
+  await withAtrium({}, async (atrium) => {
+    const callId = randomUUID();
+    const base = ["sessions", "new", "--record-id", RECORD, "--created-by-call", callId];
+    const first = await call(
+      atrium,
+      callBody({ call_id: callId, argv: [...base, "--name", "one"] }),
+    );
+    assert.equal(first.json.exit, 0);
+    // the identical request: acpx answers from the record
+    assert.equal(
+      (await call(atrium, callBody({ call_id: callId, argv: [...base, "--name", "one"] }))).json
+        .exit,
+      0,
+    );
+    for (const argv of [
+      [...base, "--name", "two"],
+      ["sessions", "new", "--created-by-call", callId, "--record-id", RECORD, "--name", "one"],
+      [...base],
+    ]) {
+      const mismatch = await call(atrium, callBody({ call_id: callId, argv }));
+      assert.equal(mismatch.json.exit, 2, argv.join(" "));
+      assert.match(String(mismatch.json.stderr), /^CREATE_REPLAY_MISMATCH: record /);
+      assert.equal(mismatch.json.delivery, undefined);
+      assert.equal(atrium.requests.at(-1)?.replayed, false);
+    }
+    // with --format json acpx writes the JSON-RPC error on stdout and leaves stderr empty
+    const json = await call(
+      atrium,
+      callBody({ call_id: callId, argv: ["--format", "json", ...base, "--name", "three"] }),
+    );
+    assert.equal(json.json.exit, 2);
+    assert.equal(json.json.stderr, "");
+    assert.equal(
+      (JSON.parse(String(json.json.stdout)) as { error: { data: { detailCode: string } } }).error
+        .data.detailCode,
+      "CREATE_REPLAY_MISMATCH",
+    );
+  });
+});
+
+test("K-R3-2 / K-R2-1: the `record-id already exists` refusal is a JSON-RPC error on stdout under --format json", async () => {
+  await withAtrium({}, async (atrium) => {
+    const id = randomUUID();
+    await call(
+      atrium,
+      callBody({
+        call_id: id,
+        argv: ["sessions", "new", "--record-id", RECORD, "--created-by-call", id],
+      }),
+    );
+    const again = randomUUID();
+    const refused = await call(
+      atrium,
+      callBody({
+        call_id: again,
+        argv: ["--format", "json", "sessions", "new", "--record-id", RECORD],
+      }),
+    );
+    assert.equal(refused.json.exit, 1);
+    assert.equal(refused.json.stderr, "");
+    const rpc = JSON.parse(String(refused.json.stdout)) as {
+      error: { code: number; message: string };
+    };
+    assert.equal(rpc.error.code, -32603);
+    assert.match(rpc.error.message, /record-id destination already exists/);
+  });
+});
+
+test("K-R3-4: a caller-chosen delivery id is compared as atrium's ACTOR — from X-Source-Session only; seat first; anonymous never matches", async () => {
+  await withAtrium({}, async (atrium) => {
+    const send = (
+      id: string,
+      headers: Record<string, string>,
+      body: Record<string, unknown> = {},
+    ) =>
+      post(
+        atrium,
+        "/api/sessions/s/message",
+        { text: "a", delivery_id: id, ...body },
+        {
+          "content-type": "application/json",
+          ...headers,
+        },
+      );
+    const seatUrl = (seat: string, session?: string) =>
+      `https://atrium.invalid/?seat=${seat}${session === undefined ? "" : `&session=${session}`}`;
+    // the same session / seat re-sends under its own id; a SUCCESSOR on the same seat does too
+    const a = randomUUID();
+    assert.equal(
+      (await send(a, { "x-source-session": seatUrl("seat-1", "sess-old") })).status,
+      202,
+    );
+    assert.equal(
+      (await send(a, { "x-source-session": seatUrl("seat-1", "sess-old") })).status,
+      202,
+    );
+    assert.equal(
+      (await send(a, { "x-source-session": seatUrl("seat-1", "sess-new") })).status,
+      202,
+      "the seat is compared first",
+    );
+    // another seat: refused
+    assert.equal(
+      (await send(a, { "x-source-session": seatUrl("seat-2", "sess-old") })).json.code,
+      "delivery-id-conflict",
+    );
+    // a body-only `from` is not an identity: unattributed never matches
+    const b = randomUUID();
+    assert.equal((await send(b, {}, { from: "alice" })).status, 202);
+    assert.equal(
+      (await send(b, {}, { from: "alice" })).json.code,
+      "delivery-id-conflict",
+      "not even itself",
+    );
+    assert.equal(
+      (
+        await send(
+          b,
+          { "x-source-session": "https://atrium.invalid/?session=sess-x" },
+          { from: "alice" },
+        )
+      ).json.code,
+      "delivery-id-conflict",
+    );
+    // the same SESSION (no seats on either side) matches
+    const c = randomUUID();
+    assert.equal(
+      (await send(c, { "x-source-session": "https://atrium.invalid/?session=sess-1" })).status,
+      202,
+    );
+    assert.equal(
+      (await send(c, { "x-source-session": "https://atrium.invalid/?session=sess-1" })).status,
+      202,
+    );
+    assert.equal(
+      (await send(c, { "x-source-session": "https://atrium.invalid/?session=sess-2" })).json.code,
+      "delivery-id-conflict",
+    );
+    // a call's id and the call's caller (record id + seat url) are the same actor model
+    const callId = randomUUID();
+    await call(
+      atrium,
+      callBody({
+        call_id: callId,
+        argv: [
+          "sessions",
+          "new",
+          "--record-id",
+          RECORD,
+          "--created-by-call",
+          callId,
+          "--prompt",
+          "x",
+        ],
+        caller: { session_url: "x", record_id: RECORD, seat_url: seatUrl("seat-9") },
+      }),
+    );
+    const successor = await call(
+      atrium,
+      callBody({
+        call_id: callId,
+        argv: [
+          "sessions",
+          "new",
+          "--record-id",
+          RECORD,
+          "--created-by-call",
+          callId,
+          "--prompt",
+          "x",
+        ],
+        caller: { session_url: "x", record_id: OTHER_RECORD, seat_url: seatUrl("seat-9") },
+      }),
+    );
+    assert.equal(successor.status, 200, "a successor on the same seat is not a stranger");
+  });
 });
 
 test("K-R2-2: with `stateHome` a target resolves against THAT store (acpx's own resolver, in a child), and only that one", async () => {
@@ -1142,9 +1321,9 @@ test("K-R2-2: with `stateHome` a target resolves against THAT store (acpx's own 
   });
   assert.ok(
     before.every((name) => fs.existsSync(path.join(home, ".acpx", "sessions", name))),
-    "the given store was only read",
+    "the given store was read (acpx's resolver writes only its own index and lock files there)",
   );
-  fs.rmSync(home, { recursive: true });
+  removeTempHomeSync(home);
 });
 
 test("K-R2-7: --format json: the create-replay-mismatch is a JSON-RPC error on STDOUT, stderr empty", async () => {
@@ -1310,8 +1489,18 @@ test("K-R2-7: the recipient's state — seat 404 / 409 vacant, session 404 / arc
     },
     async (atrium) => {
       const seat = (id: string) => post(atrium, `/api/seats/${id}/message`, { text: "a" });
-      const session = (id: string, extra: Record<string, unknown> = {}) =>
-        post(atrium, `/api/sessions/${id}/message`, { text: "a", ...extra });
+      const session = (id: string, extra: Record<string, unknown> = {}, who?: string) =>
+        post(
+          atrium,
+          `/api/sessions/${id}/message`,
+          { text: "a", ...extra },
+          {
+            "content-type": "application/json",
+            ...(who === undefined
+              ? {}
+              : { "x-source-session": `https://atrium.invalid/?session=${who}` }),
+          },
+        );
       assert.deepEqual(
         [(await seat("ghost")).status, (await seat("ghost")).json.code],
         [404, "not-a-seat"],
@@ -1349,13 +1538,13 @@ test("K-R2-7: the recipient's state — seat 404 / 409 vacant, session 404 / arc
       );
       // R4: a caller-chosen delivery id belongs to its first sender
       const id = randomUUID();
-      assert.equal((await session("fine", { delivery_id: id, from: "alice" })).status, 202);
+      assert.equal((await session("fine", { delivery_id: id }, "alice")).status, 202);
       assert.equal(
-        (await session("fine", { delivery_id: id, from: "alice" })).status,
+        (await session("fine", { delivery_id: id }, "alice")).status,
         202,
         "its own re-send",
       );
-      const conflict = await session("fine", { delivery_id: id, from: "bob" });
+      const conflict = await session("fine", { delivery_id: id }, "bob");
       assert.deepEqual(
         [conflict.status, conflict.json.code, conflict.json.delivery_id],
         [409, "delivery-id-conflict", id],
@@ -1394,7 +1583,7 @@ test("K-R2-7: heldSentence names the paused / held-by-policy reasons and the rec
   );
 });
 
-test("K-R2-6: in a BARE process the fallback classifier is conservative — only the create paths pass, everything else is table-unavailable, flag values are not path words", async () => {
+test("K-R2-6 / K-R3-3: with the class table UNLOADED (a bare process) every call is refused `table-unavailable`, creates included — as the real door does", async () => {
   const source = fileURLToPath(new URL("../../test/pod-kit/recorded-atrium.ts", import.meta.url));
   const child = spawn(process.execPath, [source, "--port", "0", "--script", "{}"], {
     stdio: ["ignore", "pipe", "inherit"],
@@ -1417,23 +1606,24 @@ test("K-R2-6: in a BARE process the fallback classifier is conservative — only
         headers: { "content-type": "application/json" },
         body: JSON.stringify(callBody({ argv })),
       });
-      return [response.status, (await response.json()) as Record<string, any>] as const;
+      return [response.status, (await response.json()) as Record<string, unknown>] as const;
     };
-    assert.deepEqual(await callWith(["sessions", "prune", "--dry-run"]), [
-      400,
-      { error: "class-not-passable", reason: "table-unavailable" },
-    ]);
-    assert.deepEqual(await callWith(["prompt", "hi"]), [
-      400,
-      { error: "class-not-passable", reason: "table-unavailable" },
-    ]);
-    assert.equal((await callWith(["sessions", "new", "--record-id", RECORD]))[0], 200);
-    // `--format json sessions new` IS a create: its flags are checked (record id required), not skipped
-    assert.deepEqual(await callWith(["--format", "json", "sessions", "new", "--name", "x"]), [
-      400,
-      { error: "record-id-required" },
-    ]);
-    assert.equal((await callWith(["sessions", "new", "-h"]))[1].reason, "help");
+    const unavailable = [400, { error: "class-not-passable", reason: "table-unavailable" }];
+    for (const argv of [
+      ["sessions", "new", "--record-id", RECORD],
+      ["sessions", "prune", "--dry-run"],
+      ["prompt", "hi"],
+      ["--format", "json", "sessions", "new", "--name", "x"],
+    ]) {
+      assert.deepEqual(await callWith(argv), unavailable, argv.join(" "));
+    }
+    // the shape refusals still come first, as in the real parser
+    const noCallId = await fetch(`${base}/api/acpx/call`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...callBody(), call_id: "x" }),
+    });
+    assert.equal(((await noCallId.json()) as { error: string }).error, "bad-call-id");
   } finally {
     child.kill("SIGTERM");
     await new Promise((resolve) => child.once("exit", resolve));
@@ -1548,9 +1738,9 @@ test("an unknown path under /api and a GET are 404", async () => {
   });
 });
 
-test("run as a process from its TypeScript source: prints its port, honours --script, mode is steerable over /_kit (the fallback classifier serves creates)", async () => {
+test("run as a process from its TypeScript source: prints its port, honours --script, mode is steerable over /_kit", async () => {
   const source = fileURLToPath(new URL("../../test/pod-kit/recorded-atrium.ts", import.meta.url));
-  const script = JSON.stringify({ calls: [{ answer: { exit: 7, stdout: "x" } }] });
+  const script = JSON.stringify({ messages: { default: "queued" } });
   const child = spawn(process.execPath, [source, "--port", "0", "--script", script], {
     stdio: ["ignore", "pipe", "inherit"],
   });
@@ -1571,18 +1761,18 @@ test("run as a process from its TypeScript source: prints its port, honours --sc
     assert.equal(announced.fake, "atrium");
     const base = `http://127.0.0.1:${String(announced.port)}`;
     const callStatus = async (): Promise<number> => {
-      const response = await fetch(`${base}/api/acpx/call`, {
+      const response = await fetch(`${base}/api/seats/t/message`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(callBody()),
+        body: JSON.stringify({ text: "hello" }),
       });
       return response.status;
     };
-    assert.equal(await callStatus(), 200);
+    assert.equal(await callStatus(), 202);
     await fetch(`${base}/_kit/mode`, { method: "POST", body: JSON.stringify({ mode: "away" }) });
     assert.equal(await callStatus(), 503);
     await fetch(`${base}/_kit/mode`, { method: "POST", body: JSON.stringify({ mode: "normal" }) });
-    assert.equal(await callStatus(), 200);
+    assert.equal(await callStatus(), 202);
     const record = (await (await fetch(`${base}/_kit/record`)).json()) as {
       requests: Array<{ mode: string; outcome: string }>;
     };

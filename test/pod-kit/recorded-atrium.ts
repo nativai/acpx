@@ -144,19 +144,6 @@ export type RecipientState =
  */
 export const INHERIT_ALLOWED: readonly string[] = ["ACPX_SUBSCRIPTION", "ATRIUM_OS"];
 
-/**
- * Atrium decides what is a create from acpx's CLASS TABLE (`verdict.class === "create"` and not `sessions
- * handover`, passThrough.ts:563). The kit loads that table's `classifyCall` when it can (compiled, in-process:
- * `dist-test/src/pod/command-classes.js`) and otherwise — bare `node recorded-atrium.ts` — falls back to this copy
- * of the create paths. The self-test compares the copy with the class table.
- */
-export const CREATE_PATHS: readonly string[] = [
-  "sessions new",
-  "sessions copy",
-  "sessions import",
-  "sessions handover",
-];
-
 /** What atrium needs of acpx's `classifyCall` (the shape of its answer, read by `passability`). */
 export interface CallClassification {
   kind: string;
@@ -203,10 +190,67 @@ export interface AtriumRequestRecord {
   replayed: boolean;
 }
 
+/** atrium's actor, as `sameSender` compares it (server/deliveryIdOwnership.ts): an agent by seat, then session, then label. */
+interface Actor {
+  kind: "agent" | "unattributed";
+  seat_id?: string;
+  session_id?: string;
+  label?: string;
+}
+
 interface RecordedItem {
-  /** The sender the item was recorded for (the caller's record id). */
-  sender: string;
+  /** Who first sent under this wire id. */
+  actor: Actor;
   text: string;
+}
+
+/** The actor of a message route: from `X-Source-Session` ONLY (a body `from` is not an identity); absent / anonymous = unattributed. */
+function actorOfHeader(header: string | undefined): Actor {
+  const value = (header ?? "").trim();
+  if (value === "" || value === "anonymous") {
+    return { kind: "unattributed" };
+  }
+  const seat = /[?&]seat=([^&#]+)/.exec(value)?.[1];
+  const session = /[?&]session=([^&#]+)/.exec(value)?.[1];
+  if (seat !== undefined || session !== undefined) {
+    return {
+      kind: "agent",
+      ...(seat === undefined ? {} : { seat_id: decodeURIComponent(seat) }),
+      ...(session === undefined ? {} : { session_id: decodeURIComponent(session) }),
+    };
+  }
+  // a bare id: a record uuid is a session; anything else is a self-chosen label
+  return UUID_RE.test(value)
+    ? { kind: "agent", session_id: value.toLowerCase() }
+    : { kind: "agent", label: value };
+}
+
+/** The actor of a pass-through call: the claimed caller's session and seat. */
+function actorOfCaller(caller: { record_id: string; seat_url?: string }): Actor {
+  const seat =
+    caller.seat_url === undefined ? undefined : /[?&]seat=([^&#]+)/.exec(caller.seat_url)?.[1];
+  return {
+    kind: "agent",
+    session_id: caller.record_id,
+    ...(seat === undefined ? {} : { seat_id: decodeURIComponent(seat) }),
+  };
+}
+
+/** `sameSender`: the same SEAT when both carry one (a successor keeps it), else the session, else the label; `unattributed` never matches. */
+function sameActor(a: Actor, b: Actor): boolean {
+  if (a.kind !== "agent" || b.kind !== "agent") {
+    return false;
+  }
+  if (a.seat_id !== undefined && b.seat_id !== undefined) {
+    return a.seat_id === b.seat_id;
+  }
+  if (a.session_id !== undefined || b.session_id !== undefined) {
+    return a.session_id !== undefined && a.session_id === b.session_id;
+  }
+  if (a.seat_id !== undefined || b.seat_id !== undefined) {
+    return false;
+  }
+  return a.label !== undefined && a.label === b.label;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -430,49 +474,13 @@ function prepareCreate(
   };
 }
 
-/** acpx's GLOBAL options that take a value (so `--format json sessions new` is read as `sessions new`). */
-const GLOBAL_VALUE_FLAGS: ReadonlySet<string> = new Set([
-  "--format",
-  "--agent",
-  "--cwd",
-  "--timeout",
-  "--ttl",
-  "--model",
-  "--auth-policy",
-]);
-
 /**
  * Fallback when acpx's class table cannot be loaded (a BARE process: `node recorded-atrium.ts`, where acpx's `.js`
- * specifiers do not resolve from source). Conservative, as the real door is for an unloaded table
- * (`class-not-passable`, `table-unavailable`): only the create paths pass; everything else — control-store included —
- * is refused. `-h` / `--help` is help. The in-process kit uses the real table instead.
+ * specifiers do not resolve from source). The real door refuses EVERY call then — creates included
+ * (`class-not-passable`, `table-unavailable`, passThrough.ts:539-545) — and so does the kit: a bare process answers the
+ * pass-through only with its refusals. Use the in-process kit (or an injected `classify`) to see a call through.
  */
-const fallbackClassify: Classify = async (argv) => {
-  // acpx's classifier reads a leading `acpx` as an agent name and classifies what follows
-  const rest = argv[0] === "acpx" ? argv.slice(1) : argv;
-  const words: string[] = [];
-  for (let index = 0; index < rest.length; index += 1) {
-    const word = rest[index] ?? "";
-    if (word === "--") {
-      break;
-    }
-    if (word.startsWith("-")) {
-      if (GLOBAL_VALUE_FLAGS.has(word)) {
-        index += 1;
-      }
-      continue;
-    }
-    words.push(word);
-  }
-  const path = `${words[0] ?? ""} ${words[1] ?? ""}`.trim();
-  if (words.length === 0) {
-    return { kind: "unclassified", path };
-  }
-  const help = rest.includes("--help") || rest.includes("-h");
-  return CREATE_PATHS.includes(path)
-    ? { kind: "classified", path, class: "create", help }
-    : { kind: "table-unavailable", path };
-};
+const fallbackClassify: Classify = async () => ({ kind: "table-unavailable", path: "" });
 
 /** What the in-process kit loads of acpx: the class table's SYNCHRONOUS classifier (no store access). */
 interface ClassTableModule {
@@ -577,6 +585,43 @@ function handoverBriefShared(argv: readonly string[]): boolean {
   return true;
 }
 
+/** acpx's `createRequestFingerprint`: the create's argv (the one acpx is run with) — any other request differs. */
+function requestFingerprint(argv: readonly string[]): string {
+  return createHash("sha256").update(JSON.stringify(argv)).digest("hex");
+}
+
+function replayMismatchText(recordId: string): string {
+  return `CREATE_REPLAY_MISMATCH: record ${recordId} was created by this call id with a different first message; a replay must be the identical request, so nothing was queued and the first answer is not returned for it`;
+}
+
+/** acpx's error answer: text on stderr, or with `--format json` a JSON-RPC error on STDOUT and stderr empty. */
+function jsonAwareError(
+  exit: number,
+  message: string,
+  acpxCode: "RUNTIME" | "USAGE",
+  json: boolean,
+  detailCode?: string,
+): { exit: number; stdout: string; stderr: string } {
+  if (!json) {
+    return { exit, stdout: "", stderr: `${message}\n` };
+  }
+  const rpc = {
+    jsonrpc: "2.0",
+    id: null,
+    error: {
+      code: acpxCode === "USAGE" ? -32602 : -32603,
+      message,
+      data: {
+        acpxCode,
+        ...(detailCode === undefined ? {} : { detailCode }),
+        origin: "cli",
+        sessionId: "unknown",
+      },
+    },
+  };
+  return { exit, stdout: `${JSON.stringify(rpc)}\n`, stderr: "" };
+}
+
 function uuidFromText(text: string): string {
   const hex = createHash("sha256").update(text).digest("hex");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
@@ -671,7 +716,7 @@ export class RecordedAtrium {
   private readonly items = new Map<string, RecordedItem>();
   private readonly classifyOverride: Classify | undefined;
   /** record id -> the `--created-by-call` of the create that made it (acpx's own record store, as far as atrium sees it). */
-  private readonly createdRecords = new Map<string, string>();
+  private readonly createdRecords = new Map<string, { call: string; fingerprint: string }>();
   private resolver: ChildProcess | null = null;
   private resolverReady: Promise<void> | null = null;
   private readonly resolverPending = new Map<number, (record: string | null) => void>();
@@ -734,8 +779,15 @@ export class RecordedAtrium {
 
   async close(): Promise<void> {
     clearTimeout(this.phaseTimer);
-    this.resolver?.kill("SIGTERM");
+    const resolver = this.resolver;
     this.resolver = null;
+    if (resolver !== null && resolver.exitCode === null) {
+      // wait for it to be gone: a test removing the HOME it was given must not find a process still holding it
+      await new Promise<void>((resolve) => {
+        resolver.once("exit", () => resolve());
+        resolver.kill("SIGTERM");
+      });
+    }
     for (const socket of this.sockets) {
       socket.destroy();
     }
@@ -1222,7 +1274,10 @@ export class RecordedAtrium {
     // R4: a caller-chosen id must be free, or this sender's own
     if (chosenId) {
       const owner = this.items.get(deliveryId);
-      if (owner !== undefined && owner.sender !== from) {
+      if (
+        owner !== undefined &&
+        !sameActor(owner.actor, actorOfHeader(record.headers["x-source-session"]))
+      ) {
         stop(
           409,
           {
@@ -1277,7 +1332,10 @@ export class RecordedAtrium {
           ? { reason: "pod_starting", ahead: 0 }
           : { reason: answer.held.reason, ahead: answer.held.ahead ?? 0 };
     if (chosenId) {
-      this.items.set(deliveryId, { sender: from, text });
+      this.items.set(deliveryId, {
+        actor: actorOfHeader(record.headers["x-source-session"]),
+        text,
+      });
     }
     record.outcome = held === undefined ? "answered" : "held";
     this.sendJson(response, record, 202, {
@@ -1383,7 +1441,7 @@ export class RecordedAtrium {
         if (item === undefined) {
           continue;
         }
-        if (item.sender !== body.caller.record_id) {
+        if (!sameActor(item.actor, actorOfCaller(body.caller))) {
           record.outcome = "refused:delivery-id-conflict";
           this.sendJson(response, record, 409, { error: "delivery-id-conflict", delivery_id: id });
           return;
@@ -1412,15 +1470,15 @@ export class RecordedAtrium {
         const stored = recordedIds.includes(ids.message) ? this.items.get(ids.message) : undefined;
         if (stored === undefined || stored.text !== prepared.message) {
           record.outcome = "refused:create-replay-mismatch";
-          const text = `CREATE_REPLAY_MISMATCH: record ${prepared.recordId} was created by this call id with a different first message; a replay must be the identical request, so nothing was queued and the first answer is not returned for it`;
           const json = findFlag(body.argv, "--format").some((f) => f.value === "json");
-          // with `--format json` acpx writes a JSON-RPC error on STDOUT and leaves stderr empty
           this.sendJson(response, record, 200, {
-            exit: 2,
-            stdout: json
-              ? `${JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32602, message: text, data: { acpxCode: "USAGE", detailCode: "CREATE_REPLAY_MISMATCH", origin: "cli", sessionId: "unknown" } } })}\n`
-              : "",
-            stderr: json ? "" : `${text}\n`,
+            ...jsonAwareError(
+              2,
+              replayMismatchText(prepared.recordId),
+              "USAGE",
+              json,
+              "CREATE_REPLAY_MISMATCH",
+            ),
             error: "create-replay-mismatch",
           });
           return;
@@ -1435,12 +1493,24 @@ export class RecordedAtrium {
     if (create !== null) {
       const existing = this.createdRecords.get(create.recordId);
       const flagged = findFlag(argv, "--created-by-call")[0]?.value?.toLowerCase();
-      if (existing !== undefined && flagged !== existing) {
-        run = {
-          exit: 1,
-          stdout: "",
-          stderr: "record-id destination already exists; refusing to create another ACP session\n",
-        };
+      const json = findFlag(body.argv, "--format").some((f) => f.value === "json");
+      if (existing !== undefined && flagged !== existing.call) {
+        run = jsonAwareError(
+          1,
+          "record-id destination already exists; refusing to create another ACP session",
+          "RUNTIME",
+          json,
+        );
+      } else if (existing !== undefined && existing.fingerprint !== requestFingerprint(argv)) {
+        // acpx's `assertSameRequest` (A-20, M-2): the same ids with ANOTHER request — another name, reordered flags —
+        // is `CREATE_REPLAY_MISMATCH`, exit 2, nothing written
+        run = jsonAwareError(
+          2,
+          replayMismatchText(create.recordId),
+          "USAGE",
+          json,
+          "CREATE_REPLAY_MISMATCH",
+        );
       }
     }
     if (run === undefined) {
@@ -1469,10 +1539,12 @@ export class RecordedAtrium {
       stderr: run.stderr ?? "",
     };
     if (create !== null && run.exit === 0) {
-      this.createdRecords.set(
-        create.recordId,
-        findFlag(argv, "--created-by-call")[0]?.value?.toLowerCase() ?? "",
-      );
+      if (!this.createdRecords.has(create.recordId)) {
+        this.createdRecords.set(create.recordId, {
+          call: findFlag(argv, "--created-by-call")[0]?.value?.toLowerCase() ?? "",
+          fingerprint: requestFingerprint(argv),
+        });
+      }
     }
     // `delivery` only for a create that succeeded (passThrough.ts: `if (create && result.exit === 0)`): the caller's
     // message, else a template's prompt; the fork notice first when the script has one (an acpx answer carries it).
@@ -1490,12 +1562,12 @@ export class RecordedAtrium {
           replay: true,
         };
       } else if (message !== null || notice !== null) {
-        const sender = body.caller.record_id;
+        const sender = actorOfCaller(body.caller);
         if (notice !== null) {
-          this.items.set(ids.notice, { sender, text: notice });
+          this.items.set(ids.notice, { actor: sender, text: notice });
         }
         if (message !== null) {
-          this.items.set(ids.message, { sender, text: message });
+          this.items.set(ids.message, { actor: sender, text: message });
         }
         const hold = this.script.firstMessageHold;
         answer.delivery = {
