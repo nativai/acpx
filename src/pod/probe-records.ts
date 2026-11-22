@@ -213,20 +213,24 @@ export const START_PEEK_BYTES = 8192;
  * probes took 1.6 s instead of 0.8 s and atrium's create dialog sat on "Loading…" (brick 94958870).
  *
  * `agent_started_at` is a top-level key that `serializeSessionRecordForDisk` writes BEFORE `messages`
- * and the `acpx` object (which carries the advertisement and is last in the file), so the first
- * {@link START_PEEK_BYTES} hold it. The peek is conclusive when it finds the field or reaches
- * `"messages":` (a key that always follows it; an unescaped `"key":` cannot occur inside a JSON string);
- * otherwise — a record in some other order — the whole file is parsed. A record that has no field ranks
- * last. `test/pod-a10-probes.test.ts` pins the serializer's key order, so a reorder reds there.
+ * and the `acpx` object, so on a normal record the first {@link START_PEEK_BYTES} hold it. The peek
+ * READS THE HEAD AS JSON, not as text ({@link scanHeadForStart}): it tracks string and bracket depth, and
+ * accepts the field ONLY as a key of the record's own top-level object — a nested `"agent_started_at"` (in a
+ * tool call's input, in `agent_capabilities._meta`) is not the record's start (brick c2b7358d, R1a).
+ * It is conclusive only when it finds that key, or reads the whole record's closing brace. Anything else —
+ * the head ends before either (a large `messages` array, a record written in another key order, even a
+ * `"messages":` key reached with no start before it: the field may follow it, R1b) — falls back to parsing the
+ * whole file. A record that has no field ranks last; on a record with no field the fallback is a full parse.
+ * `test/pod-a10-probes.test.ts` pins the serializer's key order, so a reorder reds there.
  */
 export async function peekAgentStartedAt(file: string): Promise<string | undefined> {
   try {
     const head = await readHead(file);
-    const found = START_FIELD.exec(head.text);
-    if (found) {
-      return found[1] || undefined;
+    const scanned = scanHeadForStart(head.text, head.whole);
+    if (scanned.kind === "found") {
+      return scanned.value;
     }
-    if (MESSAGES_KEY.test(head.text) || head.whole) {
+    if (scanned.kind === "absent") {
       return undefined;
     }
     const parsed = JSON.parse(await fs.readFile(file, "utf8")) as { agent_started_at?: unknown };
@@ -238,9 +242,119 @@ export async function peekAgentStartedAt(file: string): Promise<string | undefin
   }
 }
 
-// `\s*` because some writers pretty-print (the public file store indents); the store's own is compact.
-const START_FIELD = /"agent_started_at"\s*:\s*"([^"\\]*)"/u;
-const MESSAGES_KEY = /"messages"\s*:/u;
+type HeadScan =
+  | { kind: "found"; value: string | undefined }
+  | { kind: "absent" }
+  | { kind: "unsure" };
+
+/** The end index (of the closing quote) of the JSON string opening at `from`, or -1 when the text ends first. */
+function stringEnd(text: string, from: number): number {
+  for (let i = from + 1; i < text.length; i += 1) {
+    if (text[i] === "\\") {
+      i += 1;
+    } else if (text[i] === '"') {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/** The index of the next non-whitespace character at or after `from`, or -1. */
+function nextSignificant(text: string, from: number): number {
+  for (let i = from; i < text.length; i += 1) {
+    if (!/\s/u.test(text[i] ?? "")) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Scan the head of a record file for the top-level key `agent_started_at`: `found` (its string value, or
+ * `undefined` for a value that is not a non-empty string), `absent` (the record's own object closed in the
+ * head without it), or `unsure` (the head ended first, or is not a JSON object).
+ */
+export function scanHeadForStart(text: string, whole: boolean): HeadScan {
+  let depth = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] === '"') {
+      const step = scanStringAt(text, i, depth);
+      if ("stop" in step) {
+        return step.stop;
+      }
+      i = step.end;
+      continue;
+    }
+    const delta = bracketDelta(text[i]);
+    depth += delta;
+    if (delta < 0 && depth === 0) {
+      return whole ? { kind: "absent" } : { kind: "unsure" };
+    }
+  }
+  return { kind: "unsure" };
+}
+
+/** One string met while scanning: the scan ends (`stop`), or goes on after the string (`end`). */
+function scanStringAt(
+  text: string,
+  from: number,
+  depth: number,
+): { stop: HeadScan } | { end: number } {
+  const token = stringToken(text, from);
+  if (token === undefined) {
+    return { stop: { kind: "unsure" } };
+  }
+  if (depth === 1 && token.isKey && token.value === "agent_started_at") {
+    return { stop: startValueAt(text, token.afterColon) };
+  }
+  return { end: token.end };
+}
+
+function bracketDelta(char: string | undefined): number {
+  if (char === "{" || char === "[") {
+    return 1;
+  }
+  return char === "}" || char === "]" ? -1 : 0;
+}
+
+/** The string opening at `from`: where it ends, its raw text, and whether a `:` follows it (it is a key). Undefined when the text ends inside it. */
+function stringToken(
+  text: string,
+  from: number,
+): { end: number; value: string; isKey: boolean; afterColon: number } | undefined {
+  const end = stringEnd(text, from);
+  if (end < 0) {
+    return undefined;
+  }
+  const colon = nextSignificant(text, end + 1);
+  return {
+    end,
+    value: text.slice(from + 1, end),
+    isKey: colon >= 0 && text[colon] === ":",
+    afterColon: colon + 1,
+  };
+}
+
+/** The value after `agent_started_at:` — a string is the answer; any other value is "no start"; a cut value is unsure. */
+function startValueAt(text: string, from: number): HeadScan {
+  const at = nextSignificant(text, from);
+  if (at < 0) {
+    return { kind: "unsure" };
+  }
+  if (text[at] !== '"') {
+    return { kind: "found", value: undefined };
+  }
+  const end = stringEnd(text, at);
+  if (end < 0) {
+    return { kind: "unsure" };
+  }
+  try {
+    const value: unknown = JSON.parse(text.slice(at, end + 1));
+    return { kind: "found", value: typeof value === "string" && value ? value : undefined };
+  } catch {
+    return { kind: "unsure" };
+  }
+}
 
 /** The first {@link START_PEEK_BYTES} of a file, and whether that was all of it. */
 async function readHead(file: string): Promise<{ text: string; whole: boolean }> {
@@ -289,8 +403,9 @@ async function rankTier(
  *
  * The pool is cut by last use BEFORE start times are known (reading start times of a whole store is
  * what this avoids). It can miss a record that started later but was used earlier than 25 others'
- * last use; since a session's last use is never before its start, that needs 25 more recently used
- * sessions — accepted, and documented in EXPORT-probes.md.
+ * last use; a session's last use is almost never before its start (1 of 3,045 real records measured has an
+ * adapter start AFTER its last use), so that needs 25 more recently used sessions — accepted, and documented in
+ * EXPORT-probes.md.
  */
 export async function newestRecordAdvertisement(
   query: RecordAdvertisementQuery,

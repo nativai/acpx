@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import { COMMAND_TABLE } from "../src/pod/command-classes.js";
+import { classifyArgv, COMMAND_TABLE } from "../src/pod/command-classes.js";
+import { ownTargetRecordId } from "../src/pod/own-target.js";
 import { routeFor } from "../src/pod/placement-step.js";
+import { agentPodName } from "../src/pod/placement.js";
 import { konsiqPair, peopleDocument } from "./people-test-helpers.js";
 import {
   addRecord,
@@ -15,6 +17,7 @@ import {
 } from "./pod-a3-helpers.js";
 import { startRecordedAtrium } from "./pod-kit/recorded-atrium.js";
 import type { AtriumScript, RecordedAtrium } from "./pod-kit/recorded-atrium.js";
+import { makeSessionRecord, writeSessionRecordFile } from "./runtime-test-helpers.js";
 
 // brick 3fda4443 — `acpx sessions template <own id>` in an agent pod tripped `pod_foreign_write
 // file=index`: marking a template assigns the slug's next VERSION from every entry of the box's index,
@@ -82,7 +85,23 @@ type OwnIdCase = {
   prepare: (home: string) => Promise<string[]>;
 };
 const OWN_ID_CASES: Readonly<Record<string, OwnIdCase>> = {
-  "sessions reopen": { prepare: async () => ["sessions", "reopen", POD_SESSION] },
+  "sessions reopen": {
+    // Seeded CLOSED (T1): reopening an OPEN record writes nothing, so the row would pass without reaching a write.
+    prepare: async (home) => {
+      await writeSessionRecordFile(
+        home,
+        makeSessionRecord({
+          acpxRecordId: POD_SESSION,
+          acpSessionId: "bbbbbbbb-0000-4000-8000-0000000000b2",
+          agentCommand: "agent",
+          cwd: home,
+          closed: true,
+          closedAt: "2026-11-01T00:00:00.000Z",
+        }),
+      );
+      return ["sessions", "reopen", POD_SESSION];
+    },
+  },
   "sessions set-metadata": {
     prepare: async () => ["sessions", "set-metadata", "--session-id", POD_SESSION, "k", "v"],
   },
@@ -127,11 +146,122 @@ test("A-8 conformance: no `record`-class command about the pod's OWN id trips po
     const { home } = agentPodHome();
     await addRecord(home, POD_SESSION, "bbbbbbbb-0000-4000-8000-0000000000b2");
     const argv = await testCase.prepare(home);
+    const ownRecord = path.join(home, ".acpx", "sessions", `${POD_SESSION}.json`);
+    const before = await fs.readFile(ownRecord, "utf8");
     await withAtrium({}, async (atrium) => {
       const r = await runCli(argv, agentPodEnv(home, atrium.url));
       assert.doesNotMatch(r.stderr, GUARD, `${commandPath}: ${r.stderr}`);
       assert.equal(r.status, 0, `${commandPath} did not reach its write: ${r.stderr}`);
       assert.equal(callsOf(atrium).length, 0, `${commandPath} stayed local`);
     });
+    // T1: the exit code alone passes a verb that stopped before its write — the own record's BYTES must have moved.
+    // (`people set-owner` writes the person's owner onto the session record, so it moves it too.)
+    assert.notEqual(
+      await fs.readFile(ownRecord, "utf8"),
+      before,
+      `${commandPath}: the pod's own record was not written — the row is vacuous`,
+    );
   }
+});
+
+// ---- T3 (brick c2b7358d): `sessions set-parent --children-of <id>` from an agent pod ----
+
+test("T3: `--children-of` SELECTS its target in the class table", () => {
+  const classified = classifyArgv(
+    ["sessions", "set-parent", "--children-of", OTHER_SESSION, "--parent-id", POD_SESSION],
+    {
+      builtInAgents: ["claude"],
+    },
+  );
+  assert.equal(classified.kind, "classified");
+  if (classified.kind === "classified") {
+    assert.equal(classified.class, "record");
+    assert.deepEqual(classified.target, {
+      via: "flag",
+      flag: "--children-of",
+      value: OTHER_SESSION,
+    });
+  }
+  // The negative that was the bug: before, no selector was named, so atrium could not resolve a target at all.
+  assert.deepEqual(
+    COMMAND_TABLE["sessions set-parent"]?.target?.flags.includes("--children-of"),
+    true,
+  );
+});
+
+test("T3: from a pod `--children-of` is NEVER own — not even when the parent is the pod's own session — while `--session-id <own>` still is", async () => {
+  const { home, podName } = agentPodHome();
+  await addRecord(home, POD_SESSION, "bbbbbbbb-0000-4000-8000-0000000000b2");
+  const sessionsDir = path.join(home, ".acpx", "sessions");
+  assert.equal(podName, agentPodName(POD_SESSION));
+  const target = (flag: string) => ({ via: "flag" as const, flag, value: POD_SESSION });
+  assert.equal(ownTargetRecordId(target("--children-of"), podName, sessionsDir), null);
+  // The control: the same value under `--session-id` IS the pod's own record.
+  assert.equal(ownTargetRecordId(target("--session-id"), podName, sessionsDir), POD_SESSION);
+});
+
+test("T3 on the real CLI in an agent pod: `set-parent --children-of <other parent>` passes through to atrium verbatim, writes nothing locally and trips no guard; with the pod's OWN session as the parent atrium refuses it by name (own-session) — neither local nor passed; an unresolvable parent is refused by name", async () => {
+  // (1) another parent: passed through, answered by atrium.
+  const { home } = agentPodHome();
+  await addRecord(home, POD_SESSION, "bbbbbbbb-0000-4000-8000-0000000000b2");
+  await addRecord(home, OTHER_SESSION, "bbbbbbbb-0000-4000-8000-0000000000b3");
+  const ownRecord = path.join(home, ".acpx", "sessions", `${POD_SESSION}.json`);
+  const before = await fs.readFile(ownRecord, "utf8");
+  await withAtrium(
+    {
+      resolveTargetAs: OTHER_SESSION,
+      calls: [{ answer: { exit: 0, stdout: "rewrote 2\n", stderr: "" } }],
+    },
+    async (atrium) => {
+      const argv = [
+        "sessions",
+        "set-parent",
+        "--children-of",
+        OTHER_SESSION,
+        "--parent-id",
+        POD_SESSION,
+      ];
+      const r = await runCli(argv, agentPodEnv(home, atrium.url));
+      assert.doesNotMatch(r.stderr, GUARD, r.stderr);
+      assert.equal(r.status, 0, r.stderr);
+      assert.equal(r.stdout, "rewrote 2\n", "atrium's answer, verbatim");
+      const [call] = callsOf(atrium);
+      assert.deepEqual(call?.body?.argv, argv);
+      assert.equal(callsOf(atrium).length, 1);
+    },
+  );
+  assert.equal(await fs.readFile(ownRecord, "utf8"), before, "nothing was written in the pod");
+  // (2) the pod's OWN session as the parent: it writes OTHER sessions' records, so acpx never runs it locally;
+  // atrium refuses a passed-through command about the caller's own session (`own-session`). A named refusal, not a
+  // guard trip and not a write — reported as a limit (brick c2b7358d).
+  await withAtrium({ resolveTargetAs: POD_SESSION }, async (atrium) => {
+    const r = await runCli(
+      ["sessions", "set-parent", "--children-of", POD_SESSION, "--parent-id", OTHER_SESSION],
+      agentPodEnv(home, atrium.url),
+    );
+    assert.notEqual(r.status, 0);
+    assert.doesNotMatch(r.stderr, GUARD, r.stderr);
+    assert.match(r.stderr, /class-not-passable detail=own-session/u, r.stderr);
+  });
+  assert.equal(await fs.readFile(ownRecord, "utf8"), before, "and nothing was written");
+  // (3) Unresolvable parent (the kit's atrium resolves nothing without `resolveTargetAs`): refused by name, not run.
+  await withAtrium(
+    { calls: [{ answer: { exit: 0, stdout: "must-not-run\n", stderr: "" } }] },
+    async (atrium) => {
+      const r = await runCli(
+        [
+          "sessions",
+          "set-parent",
+          "--children-of",
+          "cccccccc-0000-4000-8000-0000000000ee",
+          "--parent-id",
+          POD_SESSION,
+        ],
+        agentPodEnv(home, atrium.url),
+      );
+      assert.notEqual(r.status, 0);
+      assert.match(r.stderr, /target-unresolved|class-not-passable/u, r.stderr);
+      assert.equal(r.stdout.includes("must-not-run"), false);
+    },
+  );
 });

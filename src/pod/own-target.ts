@@ -55,6 +55,9 @@ const EXACT_FORM_BY_FLAG: Readonly<
   "-s": () => false,
   "--session": (_url, commandPath) => commandPath?.startsWith("people ") === true,
   "--session-id": (url) => url === undefined,
+  // `set-parent --children-of <parent>` writes every CHILD's record, other sessions', so it is never the pod's own
+  // write even when the parent is (brick c2b7358d, T3): always passed through to the control pod.
+  "--children-of": () => false,
   // `--seat` takes a seat id or a URL carrying ?seat=; a ?session= URL is refused by the resolver (N-1).
   "--seat": (url) => url?.session === undefined,
 };
