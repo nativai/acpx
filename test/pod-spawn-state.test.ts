@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -516,4 +517,131 @@ test("O2-b: ENOENT keeps its meaning on each read — no instance.json is the FI
   const f = adoptedAgentPod();
   fs.rmSync(path.join(f.home, ".acpx", "instance.json"));
   await refuses(f, "outbox-home-unadmitted");
+});
+
+// ---- brick 20d6bce2 (F-6, F-7, F-8): the OTHER reads on the pod write path, through writeSessionRecord ---------
+
+function podDeps(): void {
+  const pod = { name: "ag-spawnstate", uid: "uid-ss", node: "node-a", namespace: "ns" };
+  setPodLockDepsForTests({ ownPod: () => pod, lockPod: () => pod });
+}
+
+/** Runs `run` with `fs.realpathSync` failing with `code` for paths ending in `suffix`. */
+async function withRealpathFailure<T>(
+  suffix: string,
+  code: string,
+  run: () => Promise<T>,
+): Promise<T> {
+  const real = fs.realpathSync;
+  const patched = ((target: fs.PathLike, ...rest: unknown[]) => {
+    if (typeof target === "string" && target.endsWith(suffix)) {
+      throw Object.assign(new Error(`${code}: realpath failed`), { code });
+    }
+    return (real as (...args: unknown[]) => unknown)(target, ...rest);
+  }) as typeof fs.realpathSync;
+  patched.native = real.native;
+  fs.realpathSync = patched;
+  try {
+    return await run();
+  } finally {
+    fs.realpathSync = real;
+  }
+}
+
+/** Runs `run` with `fs/promises.writeFile` (the lock file's own create) failing with `code` for `.lock.…tmp` paths. */
+async function withLockCreateFailure<T>(code: string, run: () => Promise<T>): Promise<T> {
+  const real = fsp.writeFile;
+  fsp.writeFile = ((target: unknown, ...rest: unknown[]) => {
+    if (typeof target === "string" && /\.lock\.[^/]*\.tmp$/u.test(target)) {
+      return Promise.reject(Object.assign(new Error(`${code}: open failed`), { code }));
+    }
+    return (real as (...args: unknown[]) => Promise<void>)(target, ...rest);
+  }) as typeof fsp.writeFile;
+  try {
+    return await run();
+  } finally {
+    fsp.writeFile = real;
+  }
+}
+
+function parsedRecord(f: Fixture) {
+  const parsed = parseSessionRecord(JSON.parse(f.recordBytes()));
+  assert.ok(parsed, "the control pod's record parses");
+  return parsed;
+}
+
+test("F-6: a transient read of the QUEUE LEASE on an owner rebind is the RETRIED spawn-state-missing, not the final record-ownership — through writeSessionRecord", async () => {
+  const f = adoptedAgentPod();
+  podDeps();
+  holdOwnLease();
+  const rebound = { ...parsedRecord(f), acpSessionId: "fresh-after-resume-miss" };
+  const before = f.recordBytes();
+  for (const code of TRANSIENT) {
+    await withReadFailure(path.basename(queueLockFilePath(ID)), code, async () => {
+      await assert.rejects(writeSessionRecord(rebound), refusedWith("spawn-state-missing"), code);
+    });
+  }
+  assert.equal(f.recordBytes(), before, "nothing written");
+  // negative: a permanent error keeps its old meaning (the lease is not provably ours: final)
+  await withReadFailure(path.basename(queueLockFilePath(ID)), "EACCES", async () => {
+    await assert.rejects(writeSessionRecord(rebound), refusedWith("record-ownership"));
+  });
+  // twin: the lease reads, names this process, and the rebind goes through
+  await writeSessionRecord(rebound);
+  assert.equal(
+    (JSON.parse(f.recordBytes()) as DiskRecord).acp_session_id,
+    "fresh-after-resume-miss",
+  );
+});
+
+test("F-7: a transient error on realpath(sessions directory) is the RETRIED spawn-state-missing, not a raw errno — through writeSessionRecord", async () => {
+  const f = adoptedAgentPod();
+  podDeps();
+  const record = { ...parsedRecord(f), lastRequestId: "after realpath" };
+  const before = f.recordBytes();
+  for (const code of TRANSIENT) {
+    await withRealpathFailure(path.join(".acpx", "sessions"), code, async () => {
+      await assert.rejects(writeSessionRecord(record), refusedWith("spawn-state-missing"), code);
+    });
+  }
+  assert.equal(f.recordBytes(), before);
+  // negative: a permanent error is not relabelled (raw, as before)
+  await withRealpathFailure(path.join(".acpx", "sessions"), "EACCES", async () => {
+    await assert.rejects(
+      writeSessionRecord(record),
+      (error) => (error as { code?: string }).code === "EACCES",
+    );
+  });
+  await writeSessionRecord(record);
+  assert.equal((JSON.parse(f.recordBytes()) as DiskRecord).last_request_id, "after realpath");
+});
+
+test("F-8: fd exhaustion (or a mount's hiccup) TAKING the record lock is the RETRIED record-lock-unavailable, not a raw errno — nothing written", async () => {
+  const f = adoptedAgentPod();
+  podDeps();
+  const record = { ...parsedRecord(f), lastRequestId: "after lock" };
+  const before = f.recordBytes();
+  const unavailable = (error: unknown) =>
+    (error as { code?: string }).code === "record-lock-unavailable" &&
+    /could not be taken just now/u.test((error as Error).message);
+  for (const code of TRANSIENT) {
+    await withLockCreateFailure(code, async () => {
+      await assert.rejects(writeSessionRecord(record), unavailable, code);
+    });
+  }
+  assert.equal(f.recordBytes(), before, "nothing written");
+  // negative: a permanent error taking the lock is NOT relabelled
+  await withLockCreateFailure("EACCES", async () => {
+    await assert.rejects(
+      writeSessionRecord(record),
+      (error) => (error as { code?: string }).code === "EACCES",
+    );
+  });
+  // twin: with no failure the write goes through, and no lock file is left behind
+  await writeSessionRecord(record);
+  assert.equal((JSON.parse(f.recordBytes()) as DiskRecord).last_request_id, "after lock");
+  assert.deepEqual(
+    fs.readdirSync(f.sessions).filter((name) => name.includes(".lock")),
+    [],
+  );
 });

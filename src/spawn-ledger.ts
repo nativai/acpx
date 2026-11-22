@@ -142,10 +142,11 @@ export function openSpawnLedgerForRecord(
 }
 
 function isCanonicalSessionDirectory(directory: string): boolean {
-  const actual = fs.realpathSync(directory);
+  // F-7: a transient error on either realpath is the RETRIED refusal, not a raw errno outside the table.
+  const actual = realpathOrRefusal(directory);
   let canonical: string;
   try {
-    canonical = fs.realpathSync(path.join(os.homedir(), ".acpx", "sessions"));
+    canonical = realpathOrRefusal(path.join(os.homedir(), ".acpx", "sessions"));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
       throw error;
@@ -153,6 +154,14 @@ function isCanonicalSessionDirectory(directory: string): boolean {
     return false;
   }
   return actual === canonical;
+}
+
+function realpathOrRefusal(directory: string): string {
+  try {
+    return fs.realpathSync(directory);
+  } catch (error) {
+    throw transientReadRefusal(error, "the sessions directory", directory) ?? error;
+  }
 }
 
 const BUSY_ERROR_PATTERN = /database is locked|SQLITE_BUSY/;
@@ -465,13 +474,21 @@ function readRecordFile(file: string): DiskRecord | undefined {
 
 /** The session's queue lease names THIS process (pid and birth identity) — pod-local, read as today. */
 function leaseNamesThisProcess(id: string): boolean {
+  const file = queueLockFilePath(id);
   try {
-    const lease = JSON.parse(fs.readFileSync(queueLockFilePath(id), "utf8")) as {
+    const lease = JSON.parse(fs.readFileSync(file, "utf8")) as {
       pid?: unknown;
       processIdentity?: unknown;
     };
     return lease.pid === process.pid && leaseIdentityIsOurs(lease.processIdentity);
-  } catch {
+  } catch (error) {
+    // F-6: a transient read (EIO, ESTALE, EMFILE, ENFILE, …) says nothing about who holds the lease — it
+    // is the RETRIED refusal, not the final "someone else may rebind" (`record-ownership`) it used to
+    // become. No lease, an unreadable body or a lease that names another process are still "not ours".
+    const transient = transientReadRefusal(error, "the queue lease", file);
+    if (transient) {
+      throw transient;
+    }
     return false;
   }
 }
