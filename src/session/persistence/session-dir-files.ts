@@ -71,29 +71,45 @@ export function isNonSessionRecordFile(filename: string): boolean {
 }
 
 /**
- * ⚠️ THE ONE ANSWER TO "IS THIS NAME A SESSION RECORD FILE?" (brick 99bf1c0d, atrium O8-1) — an ALLOW-LIST
- * shape, not one more name in a deny-list: `<id>.json`, where the id part is non-empty and has NO `.`, and
- * is not one of acpx's own stores ({@link isNonSessionRecordFile}).
+ * acpx-ui's delivery store's files, which share the sessions directory and ALL end in `.json`:
+ * `<id>.delivery.json` (390 on devbox) and its legacy siblings `<id>.queue.json`, `<id>.inflight.json`
+ * (`ACTIVE_SIDECAR_SUFFIXES` in acpx-ui `server/delivery-store.ts` — keep in step). Archive identity reads
+ * the same list for its `active-delivery-sidecar` blocker, so there is one list here.
+ */
+export const DELIVERY_SIDECAR_SUFFIXES: readonly string[] = [
+  ".delivery.json",
+  ".queue.json",
+  ".inflight.json",
+];
+
+/**
+ * ⚠️ THE ONE ANSWER TO "IS THIS NAME A SESSION RECORD FILE?" (brick 99bf1c0d, atrium O8-1): `<id>.json` — a
+ * non-empty id, no path separator — that is neither one of acpx's own stores ({@link isNonSessionRecordFile})
+ * nor a delivery sidecar ({@link DELIVERY_SIDECAR_SUFFIXES}).
  *
- * Why not "ends with `.json`": the directory also holds `<id>.delivery.json` (acpx-ui's delivery store;
- * 390 on devbox), `<id>.queue.json` and `<id>.inflight.json`. They end in `.json` too, so every
- * `endsWith(".json")` enumerator counted them as session records: phantom members of the index's `files`
- * (the whole index rewritten whenever one appears or goes — "drift"), a false `parse` error each in the
- * seat backfill, and a full read of each as a record candidate. Had one ever held record-shaped JSON it
- * would have become a phantom session `<id>.delivery`.
+ * Why not "ends with `.json`": the directory also holds `<id>.delivery.json` (390 on devbox) and its
+ * siblings. They end in `.json` too, so every `endsWith(".json")` enumerator counted them as session records:
+ * phantom members of the index's `files` (the whole index rewritten whenever one appears or goes — "drift"),
+ * a false `parse` error each in the seat backfill, and a full read of each as a record candidate. Had one
+ * ever held record-shaped JSON it would have become a phantom session `<id>.delivery`.
  *
- * Why not "uuid-shaped": ids are opaque. devbox carries real `ses_…` records (opencode) and the archive a
- * slug id, and a uuid test would silently drop them from the index. The only structural fact every record
- * file has and no sidecar has is the single dot. An id containing `.` is therefore not a record file here
- * (0 of 3,447 hot records on devbox; acpx mints uuids) — widen THIS function if that ever changes.
+ * Why not "uuid-shaped" (the brief's first wording): ids are opaque. devbox carries real `ses_…` records
+ * (opencode) and the archive a slug id; a uuid test would silently drop them from the index.
+ * Why not "no dot in the id" (the first cut): ids may contain dots — `pruneSessions` has rows for an id with
+ * `.stream.` in it — and a dot-free rule would drop such a record.
  *
- * `test/session-record-file-name.test.ts` scans `src/` for `.json` filters and fails on one that does not
- * go through here, so a new enumerator cannot fall back to a suffix test.
+ * ⚠️ So this IS a deny-list over the one known family, which `session-dir-files.ts`'s own header calls the
+ * fragile shape. KNOWN LIMIT: a NEW sidecar family named `<id>.<x>.json` would be counted again until its
+ * suffix joins {@link DELIVERY_SIDECAR_SUFFIXES}. What keeps that cheap: `test/session-record-file-name.test.ts`
+ * scans `src/` and fails on any `.json` filter that does not go through here, so the fix is this one list.
  * Takes a BARE FILENAME, like {@link isNonSessionRecordFile}.
  */
 export function isSessionRecordFileName(filename: string): boolean {
-  const stem = SESSION_RECORD_FILE.exec(filename)?.[1];
-  return stem !== undefined && !isNonSessionRecordFile(filename);
+  return (
+    filename.endsWith(".json") &&
+    filename.length > ".json".length &&
+    !/[\\/]/u.test(filename) &&
+    !isNonSessionRecordFile(filename) &&
+    !DELIVERY_SIDECAR_SUFFIXES.some((suffix) => filename.endsWith(suffix))
+  );
 }
-
-const SESSION_RECORD_FILE = /^([^./\\]+)\.json$/u;

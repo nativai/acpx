@@ -3,7 +3,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { isSessionRecordFileName } from "../src/session/persistence/session-dir-files.js";
+import {
+  DELIVERY_SIDECAR_SUFFIXES,
+  isSessionRecordFileName,
+} from "../src/session/persistence/session-dir-files.js";
 
 // brick 99bf1c0d — the ONE predicate for "is this name a session record file?", and the conformance rows
 // that keep every enumeration of the sessions directory behind it (see test/delivery-json-sidecar.test.ts for
@@ -15,6 +18,7 @@ test("the predicate: `<id>.json` with a dot-free id — uuid, uuidv7, `ses_…` 
     "019edbeb-53e3-7a83-a3d0-ab305b914d2a.json", // uuidv7
     "ses_f84bb7041ffeOayX6OGKPn4Elu.json", // real opaque ids on devbox: a uuid test would drop these
     "mid-turn-injection.json", // the archive's slug-id record
+    "an-id.with.stream.in-it.json", // ids may contain dots (the prune rows use one): not a sidecar
   ]) {
     assert.equal(isSessionRecordFileName(name), true, name);
   }
@@ -25,11 +29,9 @@ test("the predicate NEGATIVES: every sidecar and store that ends in `.json`, and
     "11111111-aaaa-4aaa-8aaa-111111111111.delivery.json", // acpx-ui's delivery store
     "11111111-aaaa-4aaa-8aaa-111111111111.queue.json", // its legacy siblings
     "11111111-aaaa-4aaa-8aaa-111111111111.inflight.json",
-    "11111111-aaaa-4aaa-8aaa-111111111111.anything-new.json", // a sidecar nobody has named yet
     "index.json", // acpx's own stores
     "seats.json",
     ".json", // no id part
-    "a.b.json",
     "x.json.tmp",
     "x.json.bak-mig-2026-10-06T191739004Z",
     "x.json.123.456.tmp",
@@ -40,6 +42,17 @@ test("the predicate NEGATIVES: every sidecar and store that ends in `.json`, and
   ]) {
     assert.equal(isSessionRecordFileName(name), false, JSON.stringify(name));
   }
+});
+
+test("KNOWN LIMIT, stated as a row: a sidecar family nobody has listed is counted again until its suffix joins DELIVERY_SIDECAR_SUFFIXES", () => {
+  assert.equal(
+    isSessionRecordFileName("11111111-aaaa-4aaa-8aaa-111111111111.some-future-sidecar.json"),
+    true,
+  );
+  assert.deepEqual(
+    [...DELIVERY_SIDECAR_SUFFIXES],
+    [".delivery.json", ".queue.json", ".inflight.json"],
+  );
 });
 
 // ---- the conformance row: no enumeration falls back to a `.json` suffix test ------------------------------

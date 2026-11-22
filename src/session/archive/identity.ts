@@ -9,7 +9,10 @@
  * two pseudo-ids.
  */
 
-import { isSessionRecordFileName } from "../persistence/session-dir-files.js";
+import {
+  DELIVERY_SIDECAR_SUFFIXES,
+  isSessionRecordFileName,
+} from "../persistence/session-dir-files.js";
 import { encodeSessionSafeId } from "./safe-id.js";
 
 /**
@@ -84,11 +87,7 @@ const INGEST_ORPHAN_ID_SHAPE =
  * The suffixes acpx-ui treats as an ACTIVE delivery sidecar — `ACTIVE_SIDECAR_SUFFIXES`
  * in `acpx-ui/server/delivery-store.ts`. Their presence means undelivered work.
  */
-const ACTIVE_SIDECAR_SUFFIXES: readonly string[] = [
-  ".delivery.json",
-  ".queue.json",
-  ".inflight.json",
-];
+const ACTIVE_SIDECAR_SUFFIXES: readonly string[] = DELIVERY_SIDECAR_SUFFIXES;
 
 const DELIVERY_FAMILY_PREFIXES: readonly string[] = [".delivery.", ".queue.", ".inflight."];
 
