@@ -666,6 +666,47 @@ test("claude advertisement from records: an `exact` record WITHOUT agent_started
   assert.equal(known.status.recordAgentStartedAt, "2026-11-20T00:00:00.000Z");
 });
 
+test("claude advertisement from records: `adapterMatch` says exact / harness beside `state` — an exact record without agent_started_at is stale AND exact; a harness record is harness; no record served leaves the key absent", async () => {
+  const where = claudeAdvertDir();
+  const served = (found: ReturnType<typeof recordOf>) =>
+    ensureClaudeAdvertisement({
+      ...where,
+      env: {},
+      mode: "never",
+      servedFromRecords: () => true,
+      recordAdvertisement: async () => found,
+    });
+  // the case atrium could not tell apart: stale because the age is unknown, yet the box's own command
+  const exactNoStart = await served(recordOf("exact", null));
+  assert.equal(exactNoStart.status.state, "stale");
+  assert.equal(exactNoStart.status.adapterMatch, "exact");
+  assert.equal(exactNoStart.status.recordAgentStartedAt, undefined);
+  // an exact record with a start: fresh and exact (the existing values of `state` are unchanged)
+  const exactKnown = await served(recordOf("exact"));
+  assert.equal(exactKnown.status.state, "fresh");
+  assert.equal(exactKnown.status.adapterMatch, "exact");
+  // a harness record: stale (always) and harness — with or without a start
+  for (const startedAt of [undefined, null] as const) {
+    const harness = await served(
+      startedAt === null ? recordOf("harness", null) : recordOf("harness"),
+    );
+    assert.equal(harness.status.state, "stale");
+    assert.equal(harness.status.adapterMatch, "harness");
+  }
+  // no record served: the key is ABSENT (not null, not empty) and `state` is whatever it was
+  const none = await ensureClaudeAdvertisement({
+    ...where,
+    env: {},
+    mode: "never",
+    servedFromRecords: () => true,
+    recordAdvertisement: async () => undefined,
+  });
+  assert.equal("adapterMatch" in none.status, false);
+  assert.equal(none.status.state, "none");
+  // and it survives the JSON the catalogue prints
+  assert.equal(JSON.parse(JSON.stringify(exactNoStart.status)).adapterMatch, "exact");
+});
+
 test("round 2 / F-B + F-G: a record of the box's own adapter command answers even when a NEWER record of another command (a dev or rig adapter) exists — a newer rig record never hides the deployed adapter's output styles", async () => {
   const s = store([
     {

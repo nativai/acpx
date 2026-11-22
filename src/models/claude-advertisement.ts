@@ -683,6 +683,8 @@ function statusFromRecord(
     deployedSdkVersion: key.sdkVersion,
     error: null,
     ...(found.agentStartedAt ? { recordAgentStartedAt: found.agentStartedAt } : {}),
+    // Present whenever a record served the advertisement — beside, never instead of, `state` (brick c2b7358d).
+    adapterMatch: found.match,
   };
 }
 
