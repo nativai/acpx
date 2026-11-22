@@ -9,7 +9,11 @@ import {
 } from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { isBoxWideFileInAgentPod } from "../../pod/foreign-write-guard.js";
-import { SpawnLedger, openSpawnLedgerForRecord, type DiskRecord } from "../../spawn-ledger.js";
+import {
+  openSpawnLedgerForRecord,
+  type DiskRecord,
+  type SpawnRecordWriter,
+} from "../../spawn-ledger.js";
 import type {
   PersistedActor,
   SessionAcpxState,
@@ -1393,7 +1397,7 @@ async function writeMessagesSidecar(
 async function persistRecordFile(
   file: string,
   raw: DiskRecord,
-  ledger: SpawnLedger | undefined,
+  ledger: SpawnRecordWriter | undefined,
   lock: HeldLock,
 ): Promise<DiskRecord> {
   if (ledger) {

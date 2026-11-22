@@ -4,6 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { queueLockFilePath } from "./cli/queue/paths.js";
+import { isBoxWideFileInAgentPod } from "./pod/foreign-write-guard.js";
+import {
+  judgeSpawnState,
+  readSpawnStateFile,
+  spawnStatePath,
+  stateAllowsRebind,
+} from "./pod/spawn-state.js";
 import { loadSqlite } from "./pod/sqlite-loader.js";
 import {
   classifyRecordedIdentity,
@@ -105,15 +112,30 @@ export class SpawnLedgerError extends Error {
 }
 
 /**
- * The ledger for a record write, or undefined when the record is not spawn-owned or does not live
+ * What a record writer needs of the spawn-owned path: save one record under the ownership guard.
+ * The control pod's is the SQLite ledger; an agent pod's is {@link PodSpawnRecordWriter}.
+ */
+export interface SpawnRecordWriter {
+  saveRecordAsync(record: DiskRecord, options?: SaveRecordOptions): Promise<DiskRecord>;
+  close(): void;
+}
+
+/**
+ * The writer for a record write, or undefined when the record is not spawn-owned or does not live
  * in this HOME's canonical session directory. Ordinary session writes therefore never open SQLite.
+ *
+ * ⚠️ IN AN AGENT POD THE ANSWER IS NEVER `SpawnLedger` (C1.2 rule 5): the pod's owner checks the
+ * attempt from `<id>.spawn-state` and writes the record file by the plain locked path.
  */
 export function openSpawnLedgerForRecord(
   metadata: Record<string, string> | undefined,
   directory = path.join(os.homedir(), ".acpx", "sessions"),
-): SpawnLedger | undefined {
+): SpawnRecordWriter | undefined {
   if (!metadata?.spawn_key || !isCanonicalSessionDirectory(directory)) {
     return undefined;
+  }
+  if (isBoxWideFileInAgentPod(directory)) {
+    return new PodSpawnRecordWriter(path.join(os.homedir(), ".acpx", "sessions"));
   }
   return new SpawnLedger();
 }
@@ -390,6 +412,89 @@ function writeRecordAtomic(file: string, record: DiskRecord, beforePublish?: () 
   } finally {
     fs.closeSync(directory);
   }
+}
+
+function recordFilePath(sessionsDir: string, id: string): string {
+  if (!id) {
+    throw new SpawnLedgerError("invalid-record-id", "local record id is required");
+  }
+  return path.join(sessionsDir, `${encodeURIComponent(id)}.json`);
+}
+function readRecordFile(file: string): DiskRecord | undefined {
+  try {
+    const value: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("invalid record image");
+    }
+    return value as DiskRecord;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+/** The session's queue lease names THIS process (pid and birth identity) — pod-local, read as today. */
+function leaseNamesThisProcess(id: string): boolean {
+  try {
+    const lease = JSON.parse(fs.readFileSync(queueLockFilePath(id), "utf8")) as {
+      pid?: unknown;
+      processIdentity?: unknown;
+    };
+    return lease.pid === process.pid && leaseIdentityIsOurs(lease.processIdentity);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A spawn-owned record's writer in an AGENT POD (block A7): the ledger's checks, read from
+ * `<id>.spawn-state` instead of SQLite — nothing here opens a database, and nothing falls back to one.
+ * Called inside the record lock (C3.2), so `current` is read under it. Checks 2 and 5 of the shape
+ * (record identity, `preserveSpawnState`) are the record-only ones, unchanged.
+ */
+export class PodSpawnRecordWriter implements SpawnRecordWriter {
+  constructor(readonly sessionsDir: string) {}
+
+  async saveRecordAsync(record: DiskRecord, options: SaveRecordOptions = {}): Promise<DiskRecord> {
+    return this.saveRecord(record, options);
+  }
+
+  private saveRecord(record: DiskRecord, options: SaveRecordOptions): DiskRecord {
+    const id = String(record.acpx_record_id);
+    const spawnKey = metadataValue(record, "spawn_key");
+    const file = recordFilePath(this.sessionsDir, id);
+    const current = readRecordFile(file);
+    if (!spawnKey) {
+      // Only a spawn-owned record is routed here; a record that lost its key is not this guard's to judge.
+      throw new SpawnLedgerError("record-ownership", "a spawn-state write needs a spawn_key");
+    }
+    const read = readSpawnStateFile(spawnStatePath(this.sessionsDir, id));
+    if (!read.ok) {
+      throw new SpawnLedgerError(read.refusal.code, read.refusal.message);
+    }
+    const refusal = judgeSpawnState(read.state, {
+      recordId: id,
+      writerSpawnKey: spawnKey,
+      currentSpawnState: metadataValue(current, "spawn_state"),
+      admittedInstanceId,
+    });
+    if (refusal) {
+      throw new SpawnLedgerError(refusal.code, refusal.message);
+    }
+    assertRecordIdentity(
+      id,
+      record,
+      current,
+      stateAllowsRebind(read.state) && leaseNamesThisProcess(id),
+    );
+    preserveSpawnState(record, current);
+    writeRecordAtomic(file, record, options.beforePublish);
+    return record;
+  }
+
+  close(): void {}
 }
 
 export class SpawnLedger {
@@ -772,24 +877,10 @@ export class SpawnLedger {
       .run(key, value);
   }
   recordPath(id: string): string {
-    if (!id) {
-      throw new SpawnLedgerError("invalid-record-id", "local record id is required");
-    }
-    return path.join(this.sessionsDir, `${encodeURIComponent(id)}.json`);
+    return recordFilePath(this.sessionsDir, id);
   }
   readRecord(id: string): DiskRecord | undefined {
-    try {
-      const value: unknown = JSON.parse(fs.readFileSync(this.recordPath(id), "utf8"));
-      if (!value || typeof value !== "object" || Array.isArray(value)) {
-        throw new Error("invalid record image");
-      }
-      return value as DiskRecord;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        return undefined;
-      }
-      throw error;
-    }
+    return readRecordFile(this.recordPath(id));
   }
 
   /** The spawn_key ownership check: only a live attempt's own destination may be written. */
@@ -839,15 +930,7 @@ export class SpawnLedger {
     if (!run || run.adopted_fence !== Number(attempt.fence)) {
       return false;
     }
-    try {
-      const lease = JSON.parse(fs.readFileSync(queueLockFilePath(id), "utf8")) as {
-        pid?: unknown;
-        processIdentity?: unknown;
-      };
-      return lease.pid === process.pid && leaseIdentityIsOurs(lease.processIdentity);
-    } catch {
-      return false;
-    }
+    return leaseNamesThisProcess(id);
   }
 
   /** Callback must not yield while holding the lock. */
