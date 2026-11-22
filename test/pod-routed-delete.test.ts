@@ -36,6 +36,8 @@ function rig(options: {
   lookup?: Awaited<ReturnType<BranchDeps["lookup"]>>;
   deleteKind?: "deleted" | "refused" | "unavailable";
   withDelete?: boolean;
+  /** The uid the session's lease names; `null` = no lease / a lease without `pod`. */
+  leaseUid?: string | null;
 }): Rig {
   const state: Rig = { deps: undefined as unknown as BranchDeps, deletes: [], failures: [] };
   state.deps = {
@@ -48,6 +50,8 @@ function rig(options: {
     loadRecord: async () => RECORD,
     harnessOf: () => "claude",
     lookup: async () => options.lookup ?? { state: "exists", uid: POD_UID, ready: true },
+    leasePodUid: async () =>
+      options.leaseUid === null ? undefined : (options.leaseUid ?? POD_UID),
     releases: () => ({ ok: true, releases: { acpx: "r1" } }),
     admissionClass: () => "delivery",
     run: async () => {
@@ -144,13 +148,29 @@ test("negative: only agent_unreachable deletes — a deadline, a connection brea
   }
 });
 
-test("negative: a pod that is gone or unknown by the time of the lookup is not deleted", async () => {
-  for (const lookup of [{ state: "absent" }, { state: "unknown" }] as const) {
-    const r = rig({ lookup });
-    await routedBranchHandlers(r.deps)["routed-if-pod"](
-      decision(["sessions", "recover", SESSION]),
-      context,
-    );
+test("F2: the uid is the LEASE's — a second lookup that answers a replacement pod is never used", async () => {
+  const REPLACEMENT = "99999999-9999-4999-8999-999999999999";
+  const r = rig({ lookup: { state: "exists", uid: REPLACEMENT, ready: true } });
+  await routedBranchHandlers(r.deps)["routed-if-pod"](
+    decision(["sessions", "close", SESSION]),
+    context,
+  );
+  assert.deepEqual(
+    r.deletes,
+    [{ key: KEY, uid: POD_UID }],
+    "the unreachable pod's uid, not the replacement's",
+  );
+  assert.notEqual(r.deletes[0]?.uid, REPLACEMENT);
+});
+
+test("negative: no pod uid on the lease (no lease, or one without `pod`) deletes nothing", async () => {
+  for (const argv of [
+    ["sessions", "close", SESSION],
+    ["sessions", "recover", SESSION],
+  ]) {
+    const r = rig({ leaseUid: null });
+    const result = await routedBranchHandlers(r.deps)["routed-if-pod"](decision(argv), context);
+    assert.equal(result, 1, "the unreachable failure is shown");
     assert.deepEqual(r.deletes, []);
   }
 });

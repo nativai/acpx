@@ -2390,6 +2390,10 @@ export async function sendSession(
   // record twice — a refused prompt must not mutate the session it was refused by.
   const record = await resolveSessionRecord(options.sessionId);
   assertRecordOpenForCliPrompt(record, options);
+  // A-16 (F4): in local mode a session whose lease names a pod not proven gone is refused HERE — before
+  // the record is written and before any socket attempt (`trySubmitToRunningOwner` would try the pod's
+  // pod-local socket and fail as "another pid namespace", exit 1).
+  await (deps.refuseWakeWhilePodNotGone ?? refuseWakeWhilePodNotGone)(options.sessionId);
   // The wake gate (brick 2b3b259f, CONCEPTION §3.1): a send that would cold-start a released owner
   // on a full box is refused HERE, exit 75, before the record is written — and again right before
   // the spawn, for an owner that vanished in between (`wake-gate.ts`).

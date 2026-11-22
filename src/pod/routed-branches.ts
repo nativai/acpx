@@ -52,6 +52,12 @@ export type BranchDeps = {
   harnessOf: (agentCommand: string) => string | undefined;
   lookup: AgentPodLookup;
   /**
+   * The uid of the pod the session's LEASE names — the pod the failed call targeted. The DELETE's uid
+   * comes from here and nowhere else (C4's precondition exists so a pod that replaced it meanwhile is
+   * never deleted); absent or undefined ⇒ nothing is deleted.
+   */
+  leasePodUid?: (sessionId: string) => Promise<string | undefined>;
+  /**
    * `DELETE /v1/agents/<key>?uid=<uid>` (C4, A-1): what `close` and `recover` send for a pod they
    * could not reach. Optional so a caller that never deletes needs none; absent ⇒ nothing is deleted.
    */
@@ -329,12 +335,15 @@ async function deletedUnreachablePod(
     routedClass !== "owner-if-pod" ||
     !DELETES_UNREACHABLE_POD.has(path) ||
     !isUnreachable(error) ||
-    !deps.deleteAgent
+    !deps.deleteAgent ||
+    !deps.leasePodUid
   ) {
     return false;
   }
-  const pod = await deps.lookup(key);
-  return pod.state === "exists" && (await deps.deleteAgent(key, pod.uid)).kind === "deleted";
+  // F2: the uid of the pod that could not be reached — from the lease, never from a second lookup,
+  // which could answer with a replacement pod.
+  const uid = await deps.leasePodUid(ready.record.acpxRecordId);
+  return uid !== undefined && (await deps.deleteAgent(key, uid)).kind === "deleted";
 }
 
 export function routedBranchHandlers(
@@ -428,6 +437,9 @@ async function liveDeps(): Promise<BranchDeps> {
     },
     harnessOf: (command) => agentCommand.acpAdapterKind(command),
     lookup: createAgentPodLookup(process.env),
+    leasePodUid: async (sessionId) =>
+      (await (await import("../cli/queue/lease-store.js")).readQueueOwnerRecord(sessionId))?.pod
+        ?.uid,
     deleteAgent: async (key, uid) => {
       const broker = await import("./broker-client.js");
       const origin = broker.resolveAgentBrokerOrigin(

@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
-import { readQueueOwnerStatus, tryAcquireQueueOwnerLease } from "../src/cli/queue/lease-store.js";
+import {
+  readQueueOwnerStatus,
+  recoverQueueOwnerForSession,
+  terminateQueueOwnerForSession,
+  tryAcquireQueueOwnerLease,
+} from "../src/cli/queue/lease-store.js";
 import { queueLockFilePath } from "../src/cli/queue/paths.js";
 import { recordPodEnd } from "../src/pod/pod-end.js";
 import { parseSessionRecord } from "../src/session/persistence.js";
@@ -161,3 +166,56 @@ test("negative: an unknown proof reaps nothing and records nothing", async () =>
     await api.close();
   }
 });
+
+// F1: `recover` and `close` record the pod's end exactly as status, ensure and acquire do — the
+// likeliest first reader after an OOM is a person recovering the session, and the lease it reaps is
+// the only trace of the pod.
+for (const verb of ["recover", "close"] as const) {
+  test(`F1: ${verb} reaps a proven-gone OOMKilled pod's lease and the record names OOMKilled`, async () => {
+    const owner = makeWorld(`podend-${verb}`);
+    const api = await startFakeApi("dev-kit");
+    try {
+      await writeRecord(owner.home);
+      api.state.pods.set(owner.pod.name, {
+        uid: owner.pod.uid,
+        phase: "Failed",
+        containerStatuses: [
+          { name: "agent", state: { terminated: { reason: "OOMKilled", exitCode: 137 } } },
+        ],
+      });
+      await withEnv(worldEnv(owner, { place: "agent-pod", podMode: true }), async () => {
+        assert(await tryAcquireQueueOwnerLease(SESSION));
+        const file = queueLockFilePath(SESSION);
+        const lease = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+        fs.writeFileSync(
+          file,
+          `${JSON.stringify({ ...lease, heartbeatAt: "2026-01-01T00:00:00.000Z" })}\n`,
+        );
+      });
+      const control = makeWorld(`podend-${verb}-control`);
+      const env = worldEnv(control, {
+        place: "control",
+        identity: false,
+        extra: {
+          ACPX_STATE_HOME: owner.home,
+          ACPX_POD_SA_DIR: owner.saDir,
+          ACPX_POD_API_URL: api.url,
+        },
+      });
+      await withEnv(env, async () => {
+        if (verb === "recover") {
+          assert.equal((await recoverQueueOwnerForSession(SESSION)).state, "dead_owner");
+        } else {
+          assert.equal((await terminateQueueOwnerForSession(SESSION)).reason, "already-gone");
+        }
+        assert.equal(fs.existsSync(queueLockFilePath(SESSION)), false, "the lease was reaped");
+      });
+      const end = readAcpx(owner.home)?.last_pod_end as Record<string, unknown>;
+      assert.equal(end?.reason, "OOMKilled");
+      assert.equal(end?.exit_code, 137);
+      assert.equal(end?.uid, owner.pod.uid);
+    } finally {
+      await api.close();
+    }
+  });
+}

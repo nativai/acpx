@@ -8,6 +8,7 @@ import {
 import { lockHostPlace, parsePodRef, type PodRef } from "../../pod/identity.js";
 import {
   isOwnPod,
+  isReplacedPredecessor,
   leasePodFields,
   podSocketDir,
   podSocketPath,
@@ -789,6 +790,9 @@ async function judgePodLease(
   pod: PodRef,
 ): Promise<LeaseJudgement> {
   const base = baseLiveness(sessionId, owner, "foreign");
+  if (isReplacedPredecessor(pod)) {
+    return { liveness: { ...base, ...replacedPredecessorRow() } };
+  }
   const fresh = isFresh(base.heartbeatAgeMs, QUEUE_OWNER_STALE_HEARTBEAT_MS);
   const proof = fresh ? undefined : await proofFromControlPod(pod);
   if (proof?.answer === "gone") {
@@ -802,8 +806,12 @@ async function judgePodLease(
       recoverable: false,
       alive: fresh || proof?.answer === "exists" ? true : null,
     },
-    skipReason: isOwnProcessScopeVerified() ? "foreign-owner" : "identity-unverified",
+    skipReason: foreignSkipReason(),
   };
+}
+
+function foreignSkipReason(): QueueOwnerSkipReason {
+  return isOwnProcessScopeVerified() ? "foreign-owner" : "identity-unverified";
 }
 
 /** What a pod lease never has: a pid of this namespace, a pingable socket, a matched identity. */
@@ -812,6 +820,17 @@ const NO_LOCAL_FACTS = {
   socketReachable: null,
   processIdentityMatched: null,
 } as const;
+
+/** NG-K4.5: a dead predecessor under this pod's own name — dead at once, whatever its heartbeat says. */
+function replacedPredecessorRow() {
+  return {
+    ...NO_LOCAL_FACTS,
+    state: "dead_owner" as const,
+    recoverable: true,
+    alive: false as const,
+    deathReason: "pod-replaced",
+  };
+}
 
 function podLeaseRow(proof: Extract<DeathProofDetail, { answer: "gone" }>, pod: PodRef) {
   return {
@@ -910,12 +929,25 @@ async function reapJudgedLeaseUnderGuard(
   return true;
 }
 
-async function reapJudgedLease(sessionId: string, judged: QueueOwnerRecord): Promise<boolean> {
+/**
+ * `proven` is the judgement that licensed the reap: when it names a pod's end (C3.3), a reap that
+ * REALLY removed the lease records that end on the session — by construction at every reaper
+ * (status, ensure, recover, close), so the OOM is never lost to whichever verb read first.
+ */
+async function reapJudgedLease(
+  sessionId: string,
+  judged: QueueOwnerRecord,
+  proven?: QueueOwnerLiveness,
+): Promise<boolean> {
   try {
-    return await withQueueLeaseMutation(
+    const reaped = await withQueueLeaseMutation(
       sessionId,
       async () => await reapJudgedLeaseUnderGuard(sessionId, judged),
     );
+    if (reaped && proven) {
+      await recordProvenPodEnd(sessionId, proven);
+    }
+    return reaped;
   } catch (error) {
     if (isQueueLeaseGuardTimeout(error)) {
       return false; // the reap does not happen this time
@@ -934,11 +966,7 @@ async function cleanupRecoverableQueueOwner(
   }
   // INVARIANT (North Star): cleanup NEVER signals a process, and removes only the generation that
   // was judged provably gone.
-  const reaped = await reapJudgedLease(sessionId, owner);
-  if (reaped) {
-    await recordProvenPodEnd(sessionId, state);
-  }
-  return reaped;
+  return await reapJudgedLease(sessionId, owner, state);
 }
 
 /** A4: a pod proven gone leaves its end (OOMKilled included) on the session record. Never throws. */
@@ -1398,7 +1426,7 @@ async function stopJudgedOwner(
 ): Promise<QueueOwnerStopOutcome> {
   const judgement = await judgeLease(sessionId, owner);
   if (judgement.liveness.recoverable) {
-    await reapJudgedLease(sessionId, owner);
+    await reapJudgedLease(sessionId, owner, judgement.liveness);
     return { stopped: true, reason: "already-gone", reap: unmeasuredReap("no-owner") };
   }
   if (!judgement.signalIdentity) {
@@ -1495,7 +1523,7 @@ export async function recoverQueueOwnerForSession(
   const judgement = await judgeLease(sessionId, owner);
   const { liveness } = judgement;
   if (liveness.recoverable) {
-    await reapJudgedLease(sessionId, owner);
+    await reapJudgedLease(sessionId, owner, liveness);
     return deadOwnerRecovery(sessionId, owner, liveness);
   }
   if (!judgement.signalIdentity) {
