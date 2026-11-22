@@ -470,7 +470,7 @@ test("utility branch: a probe the records can answer is answered HERE (`proceed`
     assert.equal(d.runs.length, 0);
   }
   // negative: ONLY the two probe verbs have a record-served form — `exec` and `flow run` never proceed, however answerable
-  assert.deepEqual([...RECORD_SERVED_PATHS].sort(), ["model-catalogue", "output-styles"]);
+  assert.deepEqual([...RECORD_SERVED_PATHS].toSorted(), ["model-catalogue", "output-styles"]);
   for (const argv of [
     ["exec", "hi"],
     ["flow", "run", "f.ts"],
@@ -840,7 +840,7 @@ test("REAL CLI, pod mode: NO record can answer → the box's utility pod is star
     const result = await cli(["--agent", CLAUDE, "--format", "json", "output-styles"], r.env);
     assert.equal(result.code, 0, result.stderr);
     assert.equal(result.stdout, '{"action":"output_styles_list"}\n');
-    const [post] = r.broker.requests.filter((q) => q.method === "POST");
+    const post = r.broker.requests.find((q) => q.method === "POST");
     assert.ok(post);
     assert.equal(post.key, "util-pool");
     assert.deepEqual(post.problems, [], "the kit judges the body as the real broker does");
