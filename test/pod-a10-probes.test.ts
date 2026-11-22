@@ -23,7 +23,9 @@ import {
 } from "../src/pod/pod-refusal.js";
 import {
   newestRecordAdvertisement,
+  peekAgentStartedAt,
   RECORD_ADVERTISEMENT_MAX_READS,
+  START_PEEK_BYTES,
   type RecordAdvertisement,
 } from "../src/pod/probe-records.js";
 import type { RoutedCallOptions } from "../src/pod/routed-call.js";
@@ -38,6 +40,7 @@ import {
   UTILITY_TIMEOUT_GRACE_MS,
   type UtilityDeps,
 } from "../src/pod/utility-branch.js";
+import { serializeSessionRecordForDisk } from "../src/session/persistence/serialize.js";
 import type { SessionRecord } from "../src/types.js";
 import { startFakeApiServer, type PodSeed } from "./pod-kit/fake-apiserver.js";
 import { startFakeBroker } from "./pod-kit/fake-broker.js";
@@ -113,7 +116,19 @@ function store(seeds: Seed[]) {
       },
     } as unknown as SessionRecord;
   };
-  return { entries, load, loaded };
+  // The ranking's own read: the start time alone. Tracks how many run at once and how many in all.
+  const peeked: string[] = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const peekStart = async (entry: { acpxRecordId: string }): Promise<string | undefined> => {
+    peeked.push(entry.acpxRecordId);
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    inFlight -= 1;
+    return seeds.find((seed) => seed.id === entry.acpxRecordId)?.startedAt;
+  };
+  return { entries, load, loaded, peekStart, peeked, maxInFlight: () => maxInFlight };
 }
 
 test("records: the NEWEST session of the same harness that carries the advertisement answers; its id is named", async () => {
@@ -133,11 +148,12 @@ test("records: the NEWEST session of the same harness that carries the advertise
   ]);
   const found = await newestRecordAdvertisement(
     { agentCommand: CLAUDE, need: "config_options" },
-    { entries: s.entries as never, load: s.load },
+    { entries: s.entries as never, load: s.load, peekStart: s.peekStart },
   );
   assert.equal(found?.recordId, "new");
-  // ranking by the adapter's start time needs every candidate of the tier opened (at most the read bound)
-  assert.deepEqual(s.loaded.toSorted(), ["new", "old"]);
+  // both are peeked for the ranking; only the one that answers is loaded in full
+  assert.deepEqual(s.peeked.toSorted(), ["new", "old"]);
+  assert.deepEqual(s.loaded, ["new"]);
 });
 
 test("records (negative): a sleeping record, a sub-agent, another harness and a record without the advertisement never answer", async () => {
@@ -164,7 +180,7 @@ test("records (negative): a sleeping record, a sub-agent, another harness and a 
     },
     { id: "bare", command: CLAUDE, lastUsedAt: "2026-11-21T08:00:00Z", configOptions: [] },
   ]);
-  const deps = { entries: s.entries as never, load: s.load };
+  const deps = { entries: s.entries as never, load: s.load, peekStart: s.peekStart };
   assert.equal(
     await newestRecordAdvertisement({ agentCommand: CLAUDE, need: "config_options" }, deps),
     undefined,
@@ -189,7 +205,7 @@ test("records: adapter_match — the very command the box launches is `exact`; a
       configOptions: [styleOption("a")],
     },
   ]);
-  const deps = { entries: s.entries as never, load: s.load };
+  const deps = { entries: s.entries as never, load: s.load, peekStart: s.peekStart };
   assert.equal(
     (await newestRecordAdvertisement({ agentCommand: CLAUDE_OLD, need: "config_options" }, deps))
       ?.match,
@@ -219,7 +235,7 @@ test("records: --profile narrows the model list to records started under that pr
       profile: "p2",
     },
   ]);
-  const deps = { entries: s.entries as never, load: s.load };
+  const deps = { entries: s.entries as never, load: s.load, peekStart: s.peekStart };
   assert.equal(
     (
       await newestRecordAdvertisement(
@@ -254,11 +270,92 @@ test("records: at most RECORD_ADVERTISEMENT_MAX_READS candidates are opened befo
   assert.equal(
     await newestRecordAdvertisement(
       { agentCommand: CLAUDE, need: "config_options" },
-      { entries: s.entries as never, load: s.load },
+      { entries: s.entries as never, load: s.load, peekStart: s.peekStart },
     ),
     undefined,
   );
   assert.equal(s.loaded.length, RECORD_ADVERTISEMENT_MAX_READS);
+});
+
+test("probe speed: the pool is bounded at 25 PEEKS, 8 at a time; full records load in RANK order and stop at the first that answers", async () => {
+  // r15..r39 are the pool (newest use first); r30 started last but advertises nothing, r20 started next.
+  const seeds: Seed[] = Array.from({ length: RECORD_ADVERTISEMENT_MAX_READS + 15 }, (_, i) => ({
+    id: `r${i}`,
+    command: CLAUDE,
+    lastUsedAt: `2026-11-01T00:${String(i).padStart(2, "0")}:00Z`,
+    configOptions: i === 20 ? [styleOption("answer")] : [],
+    ...(i === 30 ? { startedAt: "2026-11-22T00:00:00Z" } : {}),
+    ...(i === 20 ? { startedAt: "2026-11-21T00:00:00Z" } : {}),
+    ...(i === 5 ? { startedAt: "2026-11-23T00:00:00Z" } : {}), // outside the pool: never even peeked
+  }));
+  const s = store(seeds);
+  const found = await newestRecordAdvertisement(
+    { agentCommand: CLAUDE, need: "config_options" },
+    { entries: s.entries as never, load: s.load, peekStart: s.peekStart },
+  );
+  assert.equal(found?.recordId, "r20");
+  assert.equal(s.peeked.length, RECORD_ADVERTISEMENT_MAX_READS, "25 peeks, no more");
+  assert.ok(!s.peeked.includes("r5"), "a record outside the pool is not read at all");
+  assert.ok(s.maxInFlight() <= 8, `at most 8 at once (saw ${s.maxInFlight()})`);
+  assert.ok(s.maxInFlight() > 1, "and they really overlap (positive control for the bound)");
+  assert.deepEqual(s.loaded, ["r30", "r20"], "rank order, and the 23 others never load in full");
+});
+
+test("probe speed: `agent_started_at` is read from the first bytes — pinned to the serializer's key order, with a real record file", async () => {
+  const dir = fs.mkdtempSync(path.join(ROOT, "peek-"));
+  const record = makeSessionRecord({
+    acpxRecordId: "99999999-9999-4999-8999-999999999991",
+    acpSessionId: "acp-peek",
+    agentCommand: CLAUDE,
+    cwd: "/workspace",
+    agentStartedAt: "2026-11-20T10:00:00.000Z",
+    acpx: { config_options: Array.from({ length: 4000 }, (_, i) => styleOption(`v${i}`)) } as never,
+  });
+  const onDisk = JSON.stringify(serializeSessionRecordForDisk(record, { messages: "split-tail" }));
+  const at = (key: string) => onDisk.indexOf(`"${key}":`);
+  assert.ok(
+    onDisk.length > 10 * START_PEEK_BYTES,
+    "a large record: the advertisement is far past the peek",
+  );
+  assert.ok(
+    at("agent_started_at") > 0 && at("agent_started_at") < at("messages"),
+    "field before messages",
+  );
+  assert.ok(at("messages") < at("acpx"), "and messages before the acpx object");
+  assert.ok(
+    at("messages") < START_PEEK_BYTES,
+    "so the peek always reaches `messages` on a normal record",
+  );
+  const file = path.join(dir, "with.json");
+  fs.writeFileSync(file, onDisk);
+  assert.equal(await peekAgentStartedAt(file), "2026-11-20T10:00:00.000Z");
+  // no field → undefined (ranks last), not an error
+  const bare = path.join(dir, "bare.json");
+  fs.writeFileSync(
+    bare,
+    JSON.stringify(
+      serializeSessionRecordForDisk(
+        { ...record, agentStartedAt: undefined },
+        { messages: "split-tail" },
+      ),
+    ),
+  );
+  assert.equal(await peekAgentStartedAt(bare), undefined);
+  // a record whose key order is NOT the serializer's (the field past the peek, no `messages` before it) is found by the fallback parse
+  const odd = path.join(dir, "odd.json");
+  fs.writeFileSync(
+    odd,
+    JSON.stringify({
+      padding: "x".repeat(2 * START_PEEK_BYTES),
+      agent_started_at: "2026-11-19T00:00:00.000Z",
+    }),
+  );
+  assert.equal(await peekAgentStartedAt(odd), "2026-11-19T00:00:00.000Z");
+  // a missing or unparsable file is "no start time", never a throw
+  assert.equal(await peekAgentStartedAt(path.join(dir, "absent.json")), undefined);
+  const junk = path.join(dir, "junk.json");
+  fs.writeFileSync(junk, "x".repeat(2 * START_PEEK_BYTES));
+  assert.equal(await peekAgentStartedAt(junk), undefined);
 });
 
 test("round 2 / F-A: a Codex record with NO profile (what a default-profile session writes) answers --profile <the default>; an explicit OTHER profile does not; a no-profile record answers nothing when the asked profile is not the default", async () => {
@@ -272,7 +369,7 @@ test("round 2 / F-A: a Codex record with NO profile (what a default-profile sess
       profile: "elsewhere",
     },
   ]);
-  const base = { entries: s.entries as never, load: s.load };
+  const base = { entries: s.entries as never, load: s.load, peekStart: s.peekStart };
   const query = { agentCommand: CODEX, need: "available_models" as const, profile: "codexgpt" };
   // codexgpt IS what "no profile" means here → the newer explicit-other record is skipped, the plain one serves
   const served = await newestRecordAdvertisement(query, {
@@ -332,6 +429,7 @@ test("rank by agent_started_at: a session that started BEFORE an update does not
   const served = await newestRecordAdvertisement(query, {
     entries: s.entries as never,
     load: s.load,
+    peekStart: s.peekStart,
   });
   assert.equal(served?.recordId, "recent-start");
   assert.equal(served?.agentStartedAt, "2026-11-20T00:00:00Z");
@@ -362,6 +460,7 @@ test("rank by agent_started_at: a session that started BEFORE an update does not
       await newestRecordAdvertisement(query, {
         entries: swapped.entries as never,
         load: swapped.load,
+        peekStart: swapped.peekStart,
       })
     )?.recordId,
     "a",
@@ -378,6 +477,7 @@ test("rank by agent_started_at: a session that started BEFORE an update does not
   const alone = await newestRecordAdvertisement(query, {
     entries: only.entries as never,
     load: only.load,
+    peekStart: only.peekStart,
   });
   assert.equal(alone?.recordId, "only");
   assert.equal(alone?.agentStartedAt, undefined);
@@ -399,8 +499,13 @@ test("rank by agent_started_at: a session that started BEFORE an update does not
     },
   ]);
   assert.equal(
-    (await newestRecordAdvertisement(query, { entries: tie.entries as never, load: tie.load }))
-      ?.recordId,
+    (
+      await newestRecordAdvertisement(query, {
+        entries: tie.entries as never,
+        load: tie.load,
+        peekStart: tie.peekStart,
+      })
+    )?.recordId,
     "t2",
   );
 });
@@ -424,7 +529,7 @@ test("rank by agent_started_at never lifts a `harness` record over an `exact` on
   ]);
   const served = await newestRecordAdvertisement(
     { agentCommand: CLAUDE, need: "config_options" },
-    { entries: s.entries as never, load: s.load },
+    { entries: s.entries as never, load: s.load, peekStart: s.peekStart },
   );
   assert.equal(served?.recordId, "exact-old-start");
   assert.equal(served?.match, "exact");
@@ -469,7 +574,7 @@ test("round 2 / F-B + F-G: a record of the box's own adapter command answers eve
   ]);
   const found = await newestRecordAdvertisement(
     { agentCommand: CLAUDE, need: "config_options" },
-    { entries: s.entries as never, load: s.load },
+    { entries: s.entries as never, load: s.load, peekStart: s.peekStart },
   );
   assert.equal(found?.recordId, "deployed");
   assert.equal(found?.match, "exact");
@@ -485,7 +590,7 @@ test("round 2 / F-B + F-G: a record of the box's own adapter command answers eve
   ]);
   const fallback = await newestRecordAdvertisement(
     { agentCommand: CLAUDE, need: "config_options" },
-    { entries: only.entries as never, load: only.load },
+    { entries: only.entries as never, load: only.load, peekStart: only.peekStart },
   );
   assert.equal(fallback?.match, "harness");
 });

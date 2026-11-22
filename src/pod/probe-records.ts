@@ -1,10 +1,15 @@
+import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
 import { acpAdapterKind } from "../acp/agent-command.js";
 import { mapWithConcurrency } from "../async-control.js";
 import { findProfile, loadProfileRegistry } from "../config/profiles.js";
-import { listSessionIndexEntries, resolveSessionRecord } from "../session/persistence.js";
+import {
+  listSessionIndexEntries,
+  resolveSessionRecord,
+  sessionBaseDir,
+} from "../session/persistence.js";
 import type { SessionIndexEntry } from "../session/persistence/index.js";
 import type { SessionRecord } from "../types.js";
 import { podMode, thisPodFile } from "./placement.js";
@@ -66,7 +71,10 @@ export const RECORD_ADVERTISEMENT_MAX_READS = 25;
 
 export type RecordAdvertisementDeps = {
   entries?: typeof listSessionIndexEntries;
+  /** The FULL record, loaded only for a candidate the ranking reaches. */
   load?: (id: string) => Promise<SessionRecord>;
+  /** The ranking field alone (`agent_started_at`) — default: a few KB read from the record file. */
+  peekStart?: (entry: SessionIndexEntry) => Promise<string | undefined>;
   noProfileMatches?: NoProfileMatches;
 };
 
@@ -193,27 +201,96 @@ function advertisementOf(
   };
 }
 
-/** How many candidate records are read at once. */
+/** How many candidate records are peeked at once. */
 const RECORD_READ_CONCURRENCY = 8;
 
-/** Later adapter start first; a record with no `agent_started_at` last; ties newest `lastUsedAt` first. */
-function startedLastFirst(
-  a: { entry: SessionIndexEntry; record: SessionRecord },
-  b: { entry: SessionIndexEntry; record: SessionRecord },
-): number {
-  const left = a.record.agentStartedAt ?? "";
-  const right = b.record.agentStartedAt ?? "";
+/** How much of a record file is read to find `agent_started_at` (it sits ~900 bytes in). */
+export const START_PEEK_BYTES = 8192;
+
+/**
+ * ⚠️ THE RANKING READS A FEW KB OF EACH CANDIDATE, NOT THE RECORD. A real record is up to ~1.7 MB, and
+ * the first version of the ranking opened up to 25 of them in full (messages log included): record-served
+ * probes took 1.6 s instead of 0.8 s and atrium's create dialog sat on "Loading…" (brick 94958870).
+ *
+ * `agent_started_at` is a top-level key that `serializeSessionRecordForDisk` writes BEFORE `messages`
+ * and the `acpx` object (which carries the advertisement and is last in the file), so the first
+ * {@link START_PEEK_BYTES} hold it. The peek is conclusive when it finds the field or reaches
+ * `"messages":` (a key that always follows it; an unescaped `"key":` cannot occur inside a JSON string);
+ * otherwise — a record in some other order — the whole file is parsed. A record that has no field ranks
+ * last. `test/pod-a10-probes.test.ts` pins the serializer's key order, so a reorder reds there.
+ */
+export async function peekAgentStartedAt(file: string): Promise<string | undefined> {
+  try {
+    const head = await readHead(file);
+    const found = START_FIELD.exec(head.text);
+    if (found) {
+      return found[1] || undefined;
+    }
+    if (MESSAGES_KEY.test(head.text) || head.whole) {
+      return undefined;
+    }
+    const parsed = JSON.parse(await fs.readFile(file, "utf8")) as { agent_started_at?: unknown };
+    return typeof parsed.agent_started_at === "string" && parsed.agent_started_at
+      ? parsed.agent_started_at
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// `\s*` because some writers pretty-print (the public file store indents); the store's own is compact.
+const START_FIELD = /"agent_started_at"\s*:\s*"([^"\\]*)"/u;
+const MESSAGES_KEY = /"messages"\s*:/u;
+
+/** The first {@link START_PEEK_BYTES} of a file, and whether that was all of it. */
+async function readHead(file: string): Promise<{ text: string; whole: boolean }> {
+  const handle = await fs.open(file, "r");
+  try {
+    const buffer = Buffer.alloc(START_PEEK_BYTES);
+    const { bytesRead } = await handle.read(buffer, 0, START_PEEK_BYTES, 0);
+    return { text: buffer.toString("utf8", 0, bytesRead), whole: bytesRead < START_PEEK_BYTES };
+  } finally {
+    await handle.close();
+  }
+}
+
+const peekStartFromDisk = (entry: SessionIndexEntry): Promise<string | undefined> =>
+  peekAgentStartedAt(path.join(sessionBaseDir(), entry.file));
+
+type Ranked = { entry: SessionIndexEntry; start: string | undefined };
+
+/** Later adapter start first; no `agent_started_at` last; ties newest `lastUsedAt` first, then id. */
+function startedLastFirst(a: Ranked, b: Ranked): number {
   return (
-    right.localeCompare(left) ||
+    (b.start ?? "").localeCompare(a.start ?? "") ||
     b.entry.lastUsedAt.localeCompare(a.entry.lastUsedAt) ||
     a.entry.acpxRecordId.localeCompare(b.entry.acpxRecordId)
   );
 }
 
+/** One tier's candidates in answering order: peek the start times (8 at a time), then rank. */
+async function rankTier(
+  tier: readonly SessionIndexEntry[],
+  peek: (entry: SessionIndexEntry) => Promise<string | undefined>,
+): Promise<SessionIndexEntry[]> {
+  const starts = await mapWithConcurrency(tier, RECORD_READ_CONCURRENCY, peek);
+  return tier
+    .map((entry, index): Ranked => ({ entry, start: starts[index] }))
+    .toSorted(startedLastFirst)
+    .map((ranked) => ranked.entry);
+}
+
 /**
  * The record that can answer and whose adapter started last, or undefined — "records cannot answer"
- * (the caller routes to the utility pod). At most {@link RECORD_ADVERTISEMENT_MAX_READS} records are
- * opened, `exact` ones first; the `harness` tier is only ranked when no `exact` record answers.
+ * (the caller routes to the utility pod). The pool is at most {@link RECORD_ADVERTISEMENT_MAX_READS}
+ * candidates (`exact` before `harness`, newest `lastUsedAt` first); their start times are peeked, and
+ * full records are loaded in RANK order until one answers — usually the first, so one full load.
+ * The `harness` tier is only ranked when no `exact` record answers.
+ *
+ * The pool is cut by last use BEFORE start times are known (reading start times of a whole store is
+ * what this avoids). It can miss a record that started later but was used earlier than 25 others'
+ * last use; since a session's last use is never before its start, that needs 25 more recently used
+ * sessions — accepted, and documented in EXPORT-probes.md.
  */
 export async function newestRecordAdvertisement(
   query: RecordAdvertisementQuery,
@@ -224,22 +301,37 @@ export async function newestRecordAdvertisement(
     return undefined;
   }
   const candidates = await candidateEntries(harness, query.agentCommand, deps.entries);
-  const noProfileMatches = deps.noProfileMatches ?? noProfileMatchesOnThisBox;
-  const load = deps.load ?? resolveSessionRecord;
+  const reads = {
+    load: deps.load ?? resolveSessionRecord,
+    peek: deps.peekStart ?? peekStartFromDisk,
+    noProfileMatches: deps.noProfileMatches ?? noProfileMatchesOnThisBox,
+  };
   for (const exact of [true, false]) {
     const tier = candidates.filter(
       (entry) => (entry.agentCommand === query.agentCommand) === exact,
     );
-    const hits = (
-      await mapWithConcurrency(tier, RECORD_READ_CONCURRENCY, async (entry) => {
-        const record = await loadQuietly(load, entry.acpxRecordId);
-        return record && answers(record, query, noProfileMatches) ? { entry, record } : undefined;
-      })
-    )
-      .filter((hit) => hit !== undefined)
-      .toSorted(startedLastFirst);
-    if (hits[0]) {
-      return advertisementOf(hits[0].entry, hits[0].record, query);
+    const found = await firstAnsweringInRank(tier, query, reads);
+    if (found) {
+      return found;
+    }
+  }
+  return undefined;
+}
+
+/** Full records, best-ranked first, until one answers. */
+async function firstAnsweringInRank(
+  tier: readonly SessionIndexEntry[],
+  query: RecordAdvertisementQuery,
+  reads: {
+    load: (id: string) => Promise<SessionRecord>;
+    peek: (entry: SessionIndexEntry) => Promise<string | undefined>;
+    noProfileMatches: NoProfileMatches;
+  },
+): Promise<RecordAdvertisement | undefined> {
+  for (const entry of await rankTier(tier, reads.peek)) {
+    const record = await loadQuietly(reads.load, entry.acpxRecordId);
+    if (record && answers(record, query, reads.noProfileMatches)) {
+      return advertisementOf(entry, record, query);
     }
   }
   return undefined;
