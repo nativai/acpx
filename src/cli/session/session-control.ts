@@ -1316,6 +1316,9 @@ async function closeSelfOwnedSession(
   const ownerPid = selfOwner.pid;
   // Same privileged terminal write as the non-self path — `closed: true` lands on disk first.
   const recordClosedState = await writeTerminalCloseRecord(record);
+  // A8 / TE F6: the --now self-close arm ends its own owner before the owner's deferred-close exit
+  // kind could remove the scratch, so it removes it here, after the record is durably closed.
+  removeScratchOnTerminalClose(record);
   await landOrDropIndexUpdatesBeforeSelfTerminate();
 
   // brick e50e171d — TELL the own owner a close is on, without waiting. Its SIGTERM sweep then writes `done /

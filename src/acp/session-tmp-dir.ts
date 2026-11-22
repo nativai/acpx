@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { join, sep } from "node:path";
 import { lockHostPlace, podModeRequested } from "../pod/identity.js";
 import { acpxStateRoot } from "../session/persistence/session-base-dir.js";
@@ -180,30 +180,30 @@ export function ensureSessionTmpDir(
 }
 
 /**
- * Removes THIS session's scratch directory at its terminal close — pod placement only (outside it the
- * directory is `/tmp`'s and the pod restart wipes it, as before). Returns whether a directory was
- * removed. Never throws: a close that failed over a tidy-up would be worse than a directory the
- * control pod's age sweep collects.
+ * Removes THIS session's scratch directory at its terminal close. Returns whether a directory was
+ * removed. Never throws: a close that failed over a tidy-up would be worse than a directory the control
+ * pod's age sweep collects (`reapSessionScratch`).
  *
- * ⚠️ THE TARGET IS COMPOSED, NEVER TAKEN: `<podSessionTmpRoot>/acpx-<id>`, for an id that is a single
- * path segment, and only that directory. `ACPX_SESSION_TMP_ROOT` is not honoured here — an override
- * names a root somebody else owns, and a recursive removal under it is not this function's to make.
+ * The target is the POD-ERA scratch directory, `<state home>/session-tmp/acpx-<id>`, WHATEVER the
+ * placement is now (TE finding F6): a box whose switch was reverted (A-16) runs in local mode, where the
+ * root is `/tmp` — and the scratch a session made while pod mode was on is still on the shared volume
+ * and must go with the close. Where no pod-era directory exists this removes nothing; `/tmp`'s own
+ * scratch is the pod's and goes with its restart, as before.
+ *
+ * ⚠️ THE TARGET IS COMPOSED, NEVER TAKEN: `<state home>/session-tmp/acpx-<id>`, for an id that is a
+ * single path segment, and only that directory. `ACPX_SESSION_TMP_ROOT` is not honoured here — an
+ * override names a root somebody else owns, and a recursive removal under it is not this function's to make.
  */
 export function removeSessionTmpDir(
   sessionId: string,
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  const root = podSessionTmpRoot(env);
-  if (
-    root === undefined ||
-    !/^[\w.-]+$/u.test(sessionId) ||
-    sessionId === "." ||
-    sessionId === ".."
-  ) {
+  const root = join(acpxStateRoot(env), SESSION_TMP_POD_SUBDIR);
+  if (!/^[\w.-]+$/u.test(sessionId) || sessionId === "." || sessionId === "..") {
     return false;
   }
   const dir = sessionTmpDirFor(sessionId, root);
-  if (!dir.startsWith(`${root}${sep}`)) {
+  if (!dir.startsWith(`${root}${sep}`) || !existsSync(dir)) {
     return false;
   }
   try {

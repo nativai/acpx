@@ -161,14 +161,39 @@ test("A8: removeSessionTmpDir removes the session's directory in pod placement â
   });
 });
 
-test("A8 NEGATIVE: outside pod placement removeSessionTmpDir removes nothing (today's /tmp scratch is untouched)", async () => {
+test("A8 NEGATIVE: outside pod placement today's /tmp scratch (an override root) is untouched", async () => {
   await asPlace("control", () => {
     const keep = mkdtempSync(join(tmpdir(), "acpx-keep-"));
     process.env[SESSION_TMP_ROOT_ENV] = keep;
     const dir = ensureSessionTmpDir("sess-keep");
-    assert.equal(removeSessionTmpDir("sess-keep"), false);
+    assert.equal(removeSessionTmpDir("sess-keep"), false, "nothing of the pod era to remove");
     assert.equal(existsSync(dir), true);
     rmSync(keep, { recursive: true, force: true });
+  });
+});
+
+test("A8/F6: on a box whose switch was REVERTED (local mode) a close still removes the pod-era scratch on the shared volume", async () => {
+  await asPlace("control", async (home) => {
+    const { writeSessionRecord } = await import("../src/session/persistence.js");
+    const { closeSession } = await import("../src/cli/session/session-control.js");
+    const { makeSessionRecord } = await import("./runtime-test-helpers.js");
+    await writeSessionRecord(
+      makeSessionRecord({
+        acpxRecordId: "reverted",
+        acpSessionId: "acp-reverted",
+        agentCommand: "agent",
+        cwd: "/tmp/reverted",
+      }),
+    );
+    const podEra = join(home, ".acpx", "session-tmp", "acpx-reverted");
+    mkdirSync(podEra, { recursive: true });
+    writeFileSync(join(podEra, "left-behind.txt"), "x");
+    const neighbour = join(home, ".acpx", "session-tmp", "acpx-other");
+    mkdirSync(neighbour, { recursive: true });
+    assert.equal(resolveSessionTmpRoot(undefined), "/tmp", "this box is in local mode now");
+    await closeSession("reverted");
+    assert.equal(existsSync(podEra), false, "the pod-era scratch went with the close");
+    assert.equal(existsSync(neighbour), true);
   });
 });
 
