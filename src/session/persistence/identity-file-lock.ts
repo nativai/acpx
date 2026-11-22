@@ -12,7 +12,6 @@ import {
 import {
   lockHostPlace,
   lockPodIdentity,
-  ownPodIdentity,
   parsePodRef,
   podModeRequested,
   podTestHome,
@@ -141,7 +140,7 @@ type PodLockDeps = {
 };
 
 const realDeps: PodLockDeps = {
-  ownPod: () => ownPodIdentity(),
+  ownPod: () => lockPodIdentity(),
   lockPod: () => lockPodIdentity(),
   podModeRequested: () => podModeRequested(),
   place: () => lockHostPlace(),

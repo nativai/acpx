@@ -56,6 +56,9 @@ function facts(over: Partial<HostFacts> & { env?: NodeJS.ProcessEnv } = {}): Hos
   return {
     controlRole: true,
     homedir: CANONICAL_HOME,
+    // A-26: an unseamed control-role host asks PID 1 for what the process lacks — these rows must
+    // not read the box they run on, so PID 1 is a stand-in that carries nothing.
+    pid1: () => undefined,
     ...over,
     env: { ACPX_OWNER_PLACEMENT: "pod", ...IDENTITY(), ...over.env },
   };

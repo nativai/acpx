@@ -5,6 +5,7 @@ import { isControlPod } from "../config/control-pod.js";
 import {
   AGENT_POD_FILE_NAME,
   CANONICAL_HOME,
+  effectivePodEnv,
   podModeVerdict,
   readAgentPodFile,
   TEST_HOME_ENV,
@@ -103,22 +104,23 @@ export function lockHostPlace(env: NodeJS.ProcessEnv = process.env): LockHostPla
 }
 
 /**
- * C1.1 A-5: pod mode is REQUESTED here — A1's verdict is `pod` or `refuse` (the switch, a
- * control-role host, the state home resolving to the canonical one). The lock module refuses to
- * write a body without `pod` in that state (`PodIdentityMissingError`).
+ * C1.1 A-5 / A-26: pod mode is REQUESTED here — A1's verdict is `pod` or `refuse` (the switch, a
+ * control-role host, the state home resolving to the canonical one, the switch read from the
+ * process or else PID 1, or the place file standing for it). The lock module refuses to write a body
+ * without `pod` in that state (`PodIdentityMissingError`).
  */
 export function podModeRequested(env: NodeJS.ProcessEnv = process.env): boolean {
-  if (env[OWNER_PLACEMENT_ENV] !== "pod") {
-    return false;
-  }
   return (
     podModeVerdict({ env, controlRole: isControlPod(env), homedir: os.homedir() }).mode !== "off"
   );
 }
 
-/** The pod a lock body names: this process's pod whenever it knows it (C1.1 A-5). */
+/**
+ * The pod a lock body names: this process's pod whenever it knows it (C1.1 A-5) — from its own
+ * environment first, and on a control-role host what that lacks from PID 1 (A-26 (b)).
+ */
 export function lockPodIdentity(env: NodeJS.ProcessEnv = process.env): PodIdentity | undefined {
-  return ownPodIdentity(env);
+  return ownPodIdentity(effectivePodEnv(env));
 }
 
 /** A `pod` field as read from a lock body or lease: name and uid required, the rest optional. */

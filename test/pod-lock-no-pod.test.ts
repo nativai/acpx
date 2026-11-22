@@ -32,8 +32,12 @@ function setup(): { dir: string; options: PodEnvOptions; record: string } {
 
 function controlShaped(options: PodEnvOptions): PodEnvOptions {
   // `runInPod(undefined, …)` strips NV_POD_* and ACPX_OWNER_PLACEMENT; the role is set here.
+  // ⚠️ A-26: an UNSEAMED control-role host reads what its process lacks from PID 1 — and the
+  // workbench this suite runs in has NV_POD_* in its PID 1. No service-account namespace means the
+  // fourth identity source is missing everywhere, so these rows still measure a host that cannot
+  // name its pod (the production "unswitched, no identity" shape) whatever box they run on.
   process.env.NV_DEV_SERVER_ROLE = "control";
-  return options;
+  return { ...options, saDir: "/nonexistent/acpx-test/serviceaccount" };
 }
 
 test.afterEach(() => {
@@ -70,13 +74,13 @@ test("control-pod-shaped, pod mode off, no NV_POD_*: the record-lock body is tod
 });
 
 test("control-pod-shaped, pod mode ON but a NON-canonical state home, no NV_POD_*: pod mode is not honoured — today's body", async () => {
-  const { dir, options, record } = setup();
+  const { dir, record } = setup();
   const run = spawnSync(process.execPath, [CHILD, "record-body", record], {
     env: childEnv({
       NV_DEV_SERVER_ROLE: "control",
       ACPX_OWNER_PLACEMENT: "pod",
       ACPX_STATE_HOME: dir, // not /home/node: C1.1 leaves pod mode off
-      ACPX_POD_SA_DIR: options.saDir,
+      ACPX_POD_SA_DIR: "/nonexistent/acpx-test/serviceaccount", // see controlShaped (A-26)
     }),
     encoding: "utf8",
   });

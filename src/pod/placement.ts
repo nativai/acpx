@@ -54,7 +54,24 @@ export type HostFacts = {
   env: NodeJS.ProcessEnv;
   controlRole: boolean;
   homedir: string;
+  /** PID 1's environment, the four named facts only (A-26). Injected by tests; absent ⇒ the real one. */
+  pid1?: () => PodFacts | undefined;
 };
+
+/**
+ * A-26 (b): the switch and the pod's identity are facts of the POD. The four names a process may
+ * lack — and PID 1 (set by the Deployment or template, unchangeable by any process of the pod) still
+ * carries.
+ */
+export const POD_FACT_NAMES = [
+  OWNER_PLACEMENT_ENV,
+  "NV_POD_NAME",
+  "NV_POD_UID",
+  "NV_NODE_NAME",
+] as const;
+export type PodFacts = Partial<Record<(typeof POD_FACT_NAMES)[number], string>>;
+/** The test stand-in for PID 1's environ (a file, NUL-separated like the real one) — seam only. */
+export const PID1_STAND_IN_ENV = "ACPX_POD_TEST_PID1_ENVIRON";
 
 /**
  * ⚠️ A NON-EMPTY `NODE_TEST_CONTEXT` (node's runner sets `child` / `child-v8`), the same test as
@@ -116,32 +133,141 @@ export function stateRoot(facts: HostFacts): string {
 }
 
 /**
- * C1.1 (with A-5, A-6): `ACPX_OWNER_PLACEMENT=pod` is honoured only when the host is control-role
- * AND the state home in use resolves to the canonical one (`/home/node/.acpx`; an `ACPX_STATE_HOME`
- * that resolves there stays in pod mode) AND the process can name its pod. With the first two and
- * no pod identity: `refuse` — never either mode. Anything else — a workbench, a suite, a rig —
- * behaves as today.
+ * The four facts out of an environ blob, FILTERED AT READ TIME: nothing else of it is kept, and
+ * nothing here ever prints it (PID 1's environ is a credential dump on these boxes).
+ */
+function factsOf(blob: string): PodFacts {
+  const facts: PodFacts = {};
+  for (const entry of blob.split("\0")) {
+    const eq = entry.indexOf("=");
+    const name = eq > 0 ? entry.slice(0, eq) : "";
+    if ((POD_FACT_NAMES as readonly string[]).includes(name)) {
+      facts[name as keyof PodFacts] = entry.slice(eq + 1);
+    }
+  }
+  return facts;
+}
+
+let memoPid1: { facts: PodFacts | undefined } | undefined;
+
+/** The REAL PID 1's four facts, read once per process (it cannot change); undefined if unreadable. */
+function readRealPid1(): PodFacts | undefined {
+  if (memoPid1 === undefined) {
+    try {
+      memoPid1 = { facts: factsOf(fs.readFileSync("/proc/1/environ", "utf8")) };
+    } catch {
+      memoPid1 = { facts: undefined };
+    }
+  }
+  return memoPid1.facts;
+}
+
+/** The stand-in under the honoured seam: the file `ACPX_POD_TEST_PID1_ENVIRON` names, else nothing. */
+function readStandIn(env: NodeJS.ProcessEnv): PodFacts | undefined {
+  const file = env[PID1_STAND_IN_ENV]?.trim();
+  try {
+    return file ? factsOf(fs.readFileSync(file, "utf8")) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * ⚠️ UNDER THE HONOURED SEAM NOTHING OF THE REAL POD IS READ — not its place file, not its PID 1:
+ * the seam's directory and the process's environment are the whole world, and a test gives PID 1 a
+ * stand-in (`facts.pid1`, or the file named by `ACPX_POD_TEST_PID1_ENVIRON`). `NODE_TEST_CONTEXT`
+ * alone is no seam (H1): a leaked one leaves the real PID 1 in force.
+ */
+function pid1Of(facts: HostFacts): PodFacts | undefined {
+  if (facts.pid1) {
+    return facts.pid1();
+  }
+  return testHome(facts.env) !== undefined ? readStandIn(facts.env) : readRealPid1();
+}
+
+/**
+ * A-26 (b): the process's environment with what it LACKS filled from PID 1 — own value first, and
+ * only the value `pod` is the switch, so any other switch value counts as missing and PID 1 is asked
+ * (a process cannot opt out). Control-role hosts only; a workbench, a rig or a suite behaves as
+ * today. PID 1 is read only when the process lacks something, so a process that carries everything
+ * costs no read. `switchNeeded` is false where the place file already stands for the switch.
+ */
+export function effectiveEnv(facts: HostFacts, switchNeeded = true): NodeJS.ProcessEnv {
+  if (!facts.controlRole && testHome(facts.env) === undefined) {
+    return facts.env;
+  }
+  const missing = missingFacts(facts.env, switchNeeded);
+  const pid1 = missing.length === 0 ? undefined : pid1Of(facts);
+  return pid1 === undefined ? facts.env : overlay(facts.env, missing, pid1);
+}
+
+/** The names the process lacks; any switch value but `pod` counts as lacking (no opt-out). */
+function missingFacts(env: NodeJS.ProcessEnv, switchNeeded: boolean): string[] {
+  return POD_FACT_NAMES.filter((name) =>
+    name === OWNER_PLACEMENT_ENV
+      ? switchNeeded && env[name] !== OWNER_PLACEMENT_POD
+      : !env[name]?.trim(),
+  );
+}
+
+function overlay(env: NodeJS.ProcessEnv, missing: string[], pid1: PodFacts): NodeJS.ProcessEnv {
+  const merged: NodeJS.ProcessEnv = { ...env };
+  for (const name of missing) {
+    const value = pid1[name as keyof PodFacts]?.trim();
+    const isSwitch = name === OWNER_PLACEMENT_ENV;
+    if (value && (!isSwitch || value === OWNER_PLACEMENT_POD)) {
+      merged[name] = value;
+    }
+  }
+  return merged;
+}
+
+/** `effectiveEnv` for this host and `env` (live facts) — the env the identity readers should see. */
+export function effectivePodEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return effectiveEnv(liveHostFacts(env), false);
+}
+
+/**
+ * C1.1 (with A-5, A-6, A-26): pod mode is decided from the POD's facts.
+ * - A workbench, a rig or a suite (not control-role, no seam): `off`, nothing read.
+ * - On a control-role host that carries the place file (an agent pod) the place file stands for the
+ *   switch: `ACPX_OWNER_PLACEMENT` is not consulted. With the box's canonical state home that is pod
+ *   mode, or `refuse` when the pod cannot be named; a caller's own state home behaves as today.
+ * - Otherwise (the control pod) `ACPX_OWNER_PLACEMENT=pod`, from the process or else PID 1, is the
+ *   switch — same state-home and identity rules (A-5). An unswitched control pod reads PID 1 once and
+ *   answers `off`, byte-identical to before.
  */
 export function podModeVerdict(facts: HostFacts): PodModeVerdict {
-  if (facts.env[OWNER_PLACEMENT_ENV] !== OWNER_PLACEMENT_POD) {
-    return { mode: "off", why: "switch-unset" };
-  }
   const seam = testHome(facts.env);
   if (!facts.controlRole && seam === undefined) {
-    return { mode: "off", why: "not-control-role" };
+    const claimed = facts.env[OWNER_PLACEMENT_ENV] === OWNER_PLACEMENT_POD;
+    return { mode: "off", why: claimed ? "not-control-role" : "switch-unset" };
   }
+  const carriesPlaceFile = readAgentPodFile(agentPodFilePath(facts.env)).kind !== "absent";
+  const env = effectiveEnv(facts, !carriesPlaceFile);
+  if (!carriesPlaceFile && env[OWNER_PLACEMENT_ENV] !== OWNER_PLACEMENT_POD) {
+    return { mode: "off", why: "switch-unset" };
+  }
+  return stateHomeAndIdentity(facts, env, seam !== undefined);
+}
+
+/** The rules that follow a switched (or place-filed) control-role host: state home, then identity. */
+function stateHomeAndIdentity(
+  facts: HostFacts,
+  env: NodeJS.ProcessEnv,
+  underSeam: boolean,
+): PodModeVerdict {
   // A-5 "resolved": the realpath of the `.acpx` directory in use against the canonical one's.
   const root = resolvedPath(stateRoot(facts));
   if (root !== resolvedPath(path.join(canonicalHome(facts.env), ".acpx"))) {
     // Under the seam a state home outside the sandbox refuses: the seam leads only into it.
-    return seam === undefined
-      ? { mode: "off", why: "non-canonical-state-home" }
-      : { mode: "refuse", reason: "test_seam_outside_sandbox" };
+    return underSeam
+      ? { mode: "refuse", reason: "test_seam_outside_sandbox" }
+      : { mode: "off", why: "non-canonical-state-home" };
   }
-  if (!podIdentityComplete(facts.env)) {
-    return { mode: "refuse", reason: "pod_identity_missing" };
-  }
-  return { mode: "pod" };
+  return podIdentityComplete(env)
+    ? { mode: "pod" }
+    : { mode: "refuse", reason: "pod_identity_missing" };
 }
 
 /**
@@ -163,14 +289,12 @@ function liveHostFacts(env: NodeJS.ProcessEnv): HostFacts {
  * gates use acpx's predicate rather than a twin (brick b479441f reports/EXPORT-class-table.md).
  */
 export function podModeVerdictNow(env: NodeJS.ProcessEnv = process.env): PodModeVerdict {
-  return env[OWNER_PLACEMENT_ENV] === OWNER_PLACEMENT_POD
-    ? podModeVerdict(liveHostFacts(env))
-    : { mode: "off", why: "switch-unset" };
+  return podModeVerdict(liveHostFacts(env));
 }
 
 let memoVerdict: PodModeVerdict | undefined;
 
-/** Decided once per process (C1.1). The switch is read first, so pod-off reads nothing else. */
+/** Decided once per process (C1.1). A non-control-role host reads nothing; a control-role one reads its place file and, if the process lacks a fact, PID 1 once (A-26). */
 export function podMode(): PodModeVerdict {
   if (memoVerdict === undefined) {
     const env = process.env;
