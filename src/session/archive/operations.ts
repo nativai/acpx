@@ -258,7 +258,7 @@ export async function applyArchiveRun(options: ArchiveRunOptions): Promise<Archi
 
   await assertSameDevice(context.hotDir, context.archiveDir);
 
-  await removeLoneSpawnStates(context, plan.loneSpawnStates, result.warnings);
+  await removeLoneSpawnStates(context, plan.loneSpawnStates, options.boundaries, result.warnings);
   const seatStore = await readSeatStoreForNames(context, result.warnings);
   const writer = await ArchiveManifestWriter.open(context.archiveDir, context.at, context.wave);
   const shardEntries: ArchiveIndexEntry[] = [];
@@ -298,12 +298,16 @@ export async function applyArchiveRun(options: ArchiveRunOptions): Promise<Archi
 async function removeLoneSpawnStates(
   context: ArchiveContext,
   files: readonly string[],
+  boundaries: RetentionBoundaries,
   warnings: string[],
 ): Promise<void> {
   for (const file of files) {
     const recordFile = recordFileNameFor(file.slice(0, -SPAWN_STATE_SUFFIX.length));
     try {
+      // The quiet window is judged again here: atrium may have republished it since the plan.
+      const { mtimeMs } = await fs.stat(path.join(context.hotDir, file));
       if (
+        boundaries.nowMs - mtimeMs < boundaries.quietMs ||
         (await pathExists(path.join(context.hotDir, recordFile))) ||
         (await pathExists(path.join(context.archiveDir, recordFile)))
       ) {

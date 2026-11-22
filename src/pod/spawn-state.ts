@@ -18,7 +18,7 @@ import path from "node:path";
  * "CANNOT TELL NEVER PERMITS." A missing, unreadable or unknown-version file refuses the write; so does
  * a file older or newer than the record. Every lagging case ends in a refusal or in less permission,
  * never in more (shape §5a). The two refusals a caller retries alike are `spawn-state-missing` and
- * `spawn-state-stale`; they are kept apart only for the log.
+ * `spawn-state-stale`; they are kept apart only for the log. A transient read error is `missing`.
  */
 
 export const SPAWN_STATE_SUFFIX = ".spawn-state";
@@ -126,18 +126,44 @@ export function parseSpawnState(raw: string): SpawnStateRead {
     : { ok: true, state: field as unknown as SpawnState };
 }
 
-/** Reads `<id>.spawn-state`. Absent ⇒ `spawn-state-missing`; anything else unreadable ⇒ unsupported. */
-export function readSpawnStateFile(file: string): SpawnStateRead {
+/**
+ * Read errors a network mount raises and then stops raising (NFS: a stale handle, an I/O error, a
+ * timeout). They say nothing about the file, so — like "no file yet" — they refuse as the RETRIED
+ * `spawn-state-missing` (O-2); any other error (a permission, a directory in its place) is not going
+ * to heal and stays `spawn-state-unsupported`.
+ */
+const TRANSIENT_READ_ERRORS: ReadonlySet<string> = new Set([
+  "EIO",
+  "ESTALE",
+  "ETIMEDOUT",
+  "EAGAIN",
+  "EBUSY",
+  "EINTR",
+  "ENOTCONN",
+]);
+
+/**
+ * Reads `<id>.spawn-state`. Absent, or a transient read error ⇒ `spawn-state-missing` (retried); any
+ * other unreadable ⇒ `spawn-state-unsupported`. `read` is the seam for tests of the error mapping.
+ */
+export function readSpawnStateFile(
+  file: string,
+  read: (file: string) => string = (target) => fs.readFileSync(target, "utf8"),
+): SpawnStateRead {
   let raw: string;
   try {
-    raw = fs.readFileSync(file, "utf8");
+    raw = read(file);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+    const code = (error as NodeJS.ErrnoException).code ?? "";
+    if (code === "ENOENT" || TRANSIENT_READ_ERRORS.has(code)) {
       return {
         ok: false,
         refusal: {
           code: "spawn-state-missing",
-          message: `no spawn-state file at ${file}: the control pod has not published this attempt (retry)`,
+          message:
+            code === "ENOENT"
+              ? `no spawn-state file at ${file}: the control pod has not published this attempt (retry)`
+              : `spawn-state file at ${file} could not be read just now (${code}): retry`,
         },
       };
     }

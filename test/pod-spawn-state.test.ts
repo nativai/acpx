@@ -6,6 +6,7 @@ import test from "node:test";
 import { queueLockFilePath } from "../src/cli/queue/paths.js";
 import {
   parseSpawnState,
+  readSpawnStateFile,
   SPAWN_STATE_SUFFIX,
   spawnStatePath,
   type SpawnState,
@@ -400,4 +401,49 @@ test("parseSpawnState: the shape the atrium writer publishes (every field presen
   assert.equal(parseSpawnState(JSON.stringify(f.published)).ok, true);
   const { published_at: _gone, ...without } = f.published;
   assert.equal(parseSpawnState(JSON.stringify(without)).ok, false);
+});
+
+test("O-2: a transient read error (EIO, ESTALE, …) is the RETRIED spawn-state-missing; an error that will not heal stays unsupported", () => {
+  const failing = (code: string) => () => {
+    throw Object.assign(new Error(`${code}: read failed`), { code });
+  };
+  for (const code of [
+    "ENOENT",
+    "EIO",
+    "ESTALE",
+    "ETIMEDOUT",
+    "EAGAIN",
+    "EBUSY",
+    "EINTR",
+    "ENOTCONN",
+  ]) {
+    const read = readSpawnStateFile("/x/id.spawn-state", failing(code));
+    assert.ok(!read.ok && read.refusal.code === "spawn-state-missing", code);
+  }
+  for (const code of ["EACCES", "EISDIR", "EMFILE", ""]) {
+    const read = readSpawnStateFile("/x/id.spawn-state", failing(code));
+    assert.ok(!read.ok && read.refusal.code === "spawn-state-unsupported", `not retried: ${code}`);
+  }
+  // twin: the same seam with a good file reads it
+  const f = adoptedAgentPod();
+  assert.equal(readSpawnStateFile(f.stateFile, () => JSON.stringify(f.published)).ok, true);
+});
+
+test("O-3: a HOME with no instance.json refuses outbox-home-unadmitted; one that moved refuses instance-identity-moved — only when the file names an instance", async () => {
+  const f = adoptedAgentPod();
+  const instanceFile = path.join(f.home, ".acpx", "instance.json");
+  fs.rmSync(instanceFile);
+  await refuses(f, "outbox-home-unadmitted");
+  fs.writeFileSync(
+    instanceFile,
+    JSON.stringify({ instance_id: INSTANCE, home: "/somewhere/else" }),
+  );
+  await refuses(f, "instance-identity-moved");
+  // instance_id null skips the instance check, so neither is reached
+  f.writeState({ ...f.published, instance_id: null });
+  await podWrite(f);
+  // twin: the admitted identity is back and the file names it
+  fs.writeFileSync(instanceFile, JSON.stringify({ instance_id: INSTANCE, home: f.home }));
+  f.writeState(f.published);
+  await podWrite(f);
 });

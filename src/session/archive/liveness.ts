@@ -87,7 +87,7 @@ export async function loadWakeupLiveness(
     if (podModeVerdictNow(env).mode !== "off") {
       return {
         status: "unevaluable",
-        detail: `wakeups.db not found at ${dbPath}: in pod mode a missing database is "cannot tell", so every id is treated as live`,
+        detail: `wakeups.db not found at ${dbPath}: in pod mode a missing database is "cannot tell"`,
       };
     }
     return { status: "absent" };

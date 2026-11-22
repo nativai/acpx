@@ -46,19 +46,26 @@ async function writeClosedRecord(hotDir: string, id: string): Promise<void> {
   await fs.utimes(file, old, old);
 }
 
-async function writeSpawnState(dir: string, id: string): Promise<string> {
+/** `fresh`: left with its mtime of now (a reservation's file, republished at every transition). */
+async function writeSpawnState(dir: string, id: string, fresh = false): Promise<string> {
   const file = path.join(dir, `${id}.spawn-state`);
   await fs.writeFile(file, STATE, "utf8");
-  const old = new Date(Date.now() - OLD_MS);
-  await fs.utimes(file, old, old);
+  if (!fresh) {
+    const old = new Date(Date.now() - OLD_MS);
+    await fs.utimes(file, old, old);
+  }
   return file;
 }
 
-async function archiveRun(hotDir: string, options: { dryRun: boolean; includeOrphans?: boolean }) {
+async function archiveRun(
+  hotDir: string,
+  options: { dryRun: boolean; includeOrphans?: boolean; explicitIds?: string[] },
+) {
   const context = createContext(hotDir, "a7");
   const boundaries = resolveBoundaries(context.nowMs);
   const plan = await planArchiveRun(context, boundaries, {
     includeOrphans: options.includeOrphans ?? false,
+    ...(options.explicitIds ? { explicitIds: options.explicitIds } : {}),
     liveness: { primary: undefined, wakeups: await loadWakeupLiveness(hotDir) },
   });
   const result = await applyArchiveRun({
@@ -101,7 +108,10 @@ test("a LONE spawn-state is not an orphan id: the scan sets it apart, even under
     await writeClosedRecord(hotDir, OTHER);
     await writeSpawnState(hotDir, ID);
     const scan = await scanSessionDir(hotDir);
-    assert.deepEqual(scan.loneSpawnStates, [`${ID}.spawn-state`]);
+    assert.deepEqual(
+      scan.loneSpawnStates.map((entry) => entry.file),
+      [`${ID}.spawn-state`],
+    );
     assert.deepEqual(scan.orphans, [], "not an orphan");
     assert.deepEqual(scan.ignoredFiles, []);
     // NEGATIVE twin: with a record beside it the same file is part of that id, not lone.
@@ -149,6 +159,69 @@ test("O1: a lone spawn-state is removed on apply with ONE line; a dry run only s
     );
     // the other id's own archive is untouched by the removal
     assert.equal(applied.result.moved.length, 1);
+  });
+});
+
+const SPAWN_LINE = (line: string) => line.includes("spawn-state");
+
+test("F1: a lone spawn-state inside the quiet window is KEPT (a reservation's fresh file); an old one is removed — dry run and apply agree", async () => {
+  await withTempDir("acpx-a7-lone-quiet-", async (hotDir) => {
+    await writeClosedRecord(hotDir, OTHER);
+    const fresh = await writeSpawnState(hotDir, ID, true);
+    const dry = await archiveRun(hotDir, { dryRun: true });
+    assert.deepEqual(dry.plan.loneSpawnStates, [], "not even planned");
+    assert.deepEqual(dry.result.warnings.filter(SPAWN_LINE), []);
+    const applied = await archiveRun(hotDir, { dryRun: false, includeOrphans: true });
+    assert.equal(await fileExists(fresh), true, "kept: it is inside the quiet window");
+    assert.deepEqual(applied.result.warnings.filter(SPAWN_LINE), []);
+    // twin: the same file once it is old enough is removed
+    const old = new Date(Date.now() - OLD_MS);
+    await fs.utimes(fresh, old, old);
+    const later = await archiveRun(hotDir, { dryRun: false });
+    assert.equal(await fileExists(fresh), false);
+    assert.equal(later.result.warnings.filter(SPAWN_LINE).length, 1);
+  });
+});
+
+test("F1: the quiet window is judged again at the removal — a file republished between plan and apply is kept", async () => {
+  await withTempDir("acpx-a7-lone-republish-", async (hotDir) => {
+    const lone = await writeSpawnState(hotDir, ID); // old at plan time
+    const context = createContext(hotDir, "a7-republish");
+    const boundaries = resolveBoundaries(context.nowMs);
+    const plan = await planArchiveRun(context, boundaries, {
+      includeOrphans: false,
+      liveness: { primary: undefined, wakeups: await loadWakeupLiveness(hotDir) },
+    });
+    assert.deepEqual(plan.loneSpawnStates, [`${ID}.spawn-state`]);
+    await fs.writeFile(lone, STATE, "utf8"); // atrium republishes: mtime is now
+    const result = await applyArchiveRun({
+      context,
+      boundaries,
+      plan,
+      dryRun: false,
+      allowFirstRun: true,
+    });
+    assert.equal(await fileExists(lone), true);
+    assert.deepEqual(result.warnings.filter(SPAWN_LINE), []);
+  });
+});
+
+test("F1: `--ids X` removes only X's lone spawn-state — never Y's; naming Y's id removes Y's", async () => {
+  await withTempDir("acpx-a7-lone-ids-", async (hotDir) => {
+    await writeClosedRecord(hotDir, OTHER);
+    const x = await writeSpawnState(hotDir, ID);
+    const y = await writeSpawnState(hotDir, "cccccccc-3333-4333-8333-cccccccccccc");
+    const named = await archiveRun(hotDir, { dryRun: false, explicitIds: [OTHER] });
+    assert.equal(await fileExists(x), true, "an id that was not named is not touched");
+    assert.equal(await fileExists(y), true);
+    assert.deepEqual(named.result.warnings.filter(SPAWN_LINE), []);
+    const naming = await archiveRun(hotDir, { dryRun: false, explicitIds: [ID] });
+    assert.equal(await fileExists(x), false, "the named id's own file is removed");
+    assert.equal(await fileExists(y), true, "and Y's still is not");
+    assert.equal(naming.result.warnings.filter(SPAWN_LINE).length, 1);
+    // no --ids: the box-wide sweep takes Y's too
+    await archiveRun(hotDir, { dryRun: false });
+    assert.equal(await fileExists(y), false);
   });
 });
 

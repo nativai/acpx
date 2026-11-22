@@ -69,6 +69,12 @@ function parseModelsFormat(value: string): string {
   return normalized;
 }
 
+/**
+ * Whether the global `--json-strict` is on for the verb being run — set by the `preAction` hook of
+ * `registerModelsCommand` (the handlers below see only the verb's own flags).
+ */
+let jsonStrictRequested = false;
+
 function out(text: string): void {
   process.stdout.write(text);
 }
@@ -115,11 +121,17 @@ async function readCatalogue(
   } catch (error) {
     // An agent pod opens no SQLite (C1.2 rule 5): the catalogue is the same, only the stars are
     // absent — one plain line, not a failure.
-    diag(
-      error instanceof PodNoSqliteError
-        ? "[acpx] note: favorites are kept on the control pod; none are shown in an agent pod\n"
-        : `[acpx] warning: could not read the favorites store: ${asMessage(error)}\n`,
-    );
+    if (error instanceof PodNoSqliteError) {
+      // `--json-strict` carries a shipped contract of EMPTY stderr: the note is dropped there, the
+      // catalogue is the same either way (the missing stars are the note's whole content).
+      if (!jsonStrictRequested) {
+        diag(
+          "[acpx] note: favorites are kept on the control pod; none are shown in an agent pod\n",
+        );
+      }
+    } else {
+      diag(`[acpx] warning: could not read the favorites store: ${asMessage(error)}\n`);
+    }
   }
   return decorateFavorites(catalogue, favorites);
 }
@@ -809,6 +821,9 @@ export function registerModelsCommand(parent: Command, config: ResolvedAcpxConfi
       "Browse the model catalogue: every model acpx can run, its thinking-depth ladder, its price, and this box's favorites",
     );
   addListFlags(modelsCommand);
+  modelsCommand.hook("preAction", (_command, action) => {
+    jsonStrictRequested = action.optsWithGlobals().jsonStrict === true;
+  });
 
   addListFlags(modelsCommand.command("list"))
     .description(
