@@ -19,7 +19,12 @@ import os from "node:os";
 import path from "node:path";
 import { CapacityRefusedError } from "../src/errors.js";
 import { RoutedCallError } from "../src/pod/pod-refusal.js";
-import { agentPodKey, type RoutedCallOptions, runRoutedCall } from "../src/pod/routed-call.js";
+import {
+  agentPodKey,
+  OWNER_IF_POD_DEADLINE_MS,
+  type RoutedCallOptions,
+  runRoutedCall,
+} from "../src/pod/routed-call.js";
 import { makeSessionRecord, writeSessionRecordFile } from "../test/runtime-test-helpers.js";
 
 const ARGOCD_PIN = "7c7e34e4";
@@ -100,9 +105,10 @@ const sink = (): Sink => ({
   },
 });
 
-type Observed = { verdict: string; stdout: string; stderr: string };
+type Observed = { verdict: string; stdout: string; stderr: string; ms: number };
 
 async function observe(lb: Loopback, overrides: Partial<RoutedCallOptions>): Promise<Observed> {
+  const started = Date.now();
   const out = sink();
   const err = sink();
   let verdict: string;
@@ -136,7 +142,7 @@ async function observe(lb: Loopback, overrides: Partial<RoutedCallOptions>): Pro
         ? error.stderrLine
         : `unexpected ${String(error)}`;
   }
-  return { verdict, stdout: out.text, stderr: err.text };
+  return { verdict, stdout: out.text, stderr: err.text, ms: Date.now() - started };
 }
 
 type Setting = Array<[string, string]>;
@@ -151,6 +157,42 @@ type Case = {
 
 const re = (want: RegExp) => (o: Observed) =>
   want.test(o.verdict) ? undefined : `verdict ${o.verdict}`;
+
+/**
+ * A DEADLINE case must prove the call's OWN deadline, not that some deadline applied: the command sleeps 30 s, and
+ * every call inherits a longer default (20 s for a one-shot, longer for an owner-if-pod call), so the verdict
+ * `reason=deadline` alone stays green when the 2 s is ignored (TE F-6: 20 024 ms against 2 039 ms). It also has to have
+ * waited at all (a refusal at once would carry the same words).
+ */
+const DEADLINE_RE = /^acpx: ROUTED outcome=unknown reason=deadline call_id=\S+$/;
+export function deadlineWithin(ownMs: number, o: Observed): string | undefined {
+  if (!DEADLINE_RE.test(o.verdict)) {
+    return `verdict ${o.verdict}`;
+  }
+  if (o.ms < ownMs - 200) {
+    return `ended after ${String(o.ms)} ms, before its own ${String(ownMs)} ms deadline`;
+  }
+  return o.ms <= ownMs + 6000
+    ? undefined
+    : `ended after ${String(o.ms)} ms: its own ${String(ownMs)} ms deadline was not the one applied`;
+}
+
+/** The gate's check of its own instrument, run first: the F-6 shape must be refused and the honest one accepted. */
+function selfCheck(): void {
+  const verdict = "acpx: ROUTED outcome=unknown reason=deadline call_id=x";
+  const mk = (ms: number): Observed => ({ verdict, stdout: "", stderr: "", ms });
+  const problems = [
+    deadlineWithin(2000, mk(20_024)) === undefined
+      ? "a 20 s fallback passed as a 2 s deadline"
+      : "",
+    deadlineWithin(2000, mk(50)) === undefined ? "an instant refusal passed as a deadline" : "",
+    deadlineWithin(2000, mk(2039)) === undefined ? "" : "the honest 2 s deadline was refused",
+  ].filter((problem) => problem !== "");
+  if (problems.length > 0) {
+    process.stderr.write(`pod-loopback-gate: SELF-CHECK FAILED — ${problems.join("; ")}\n`);
+    process.exit(2);
+  }
+}
 const TURNOVER =
   /^acpx: REFUSED reason=pod_starting nothing_started=true protocol=1 retry_after_s=3 phase=turnover wake=gate-session$/;
 
@@ -208,16 +250,13 @@ const CASES: Case[] = [
     expect: re(/^acpx: ROUTED outcome=not_run reason=cwd_not_shared call_id=\S+$/),
   },
   {
-    label: "a command past its deadline → unknown deadline",
+    label: "an owner-if-pod command past the CLASS deadline (20 s) → unknown deadline",
     // The gate's loopback pod is a SESSION's pod (its identity marker names `lb.key`), so the deadline is the
-    // `owner-if-pod` call's own. (The case once passed `class: "one-shot"` with a Claude session's target, which
-    // A-7's utility-scope check refuses before anything runs — the one-shot form has its own rows in
-    // `test/pod-routed-call.test.ts`.)
-    options: () => ({
-      argv: ["sleep", "30"],
-      deadlineMs: 2000,
-    }),
-    expect: re(/^acpx: ROUTED outcome=unknown reason=deadline call_id=\S+$/),
+    // `owner-if-pod` call's own — a CLASS constant (C2: `OWNER_IF_POD_DEADLINE_MS`), NOT the call's `deadlineMs`, which
+    // only a one-shot takes. (An earlier version passed `deadlineMs: 2000` and the case ended at ~20 s: the option was
+    // never read; the elapsed-time check, TE F-6, is what showed it.) The command sleeps 30 s, so only that deadline can end it.
+    options: () => ({ argv: ["sleep", "30"] }),
+    expect: (o) => deadlineWithin(OWNER_IF_POD_DEADLINE_MS, o),
   },
   {
     label: "the payload file is visible in the pod, at the path ACPX_ROUTED_PAYLOAD names",
@@ -326,7 +365,7 @@ const UTILITY_CASES: Case[] = [
       argv: ["sleep", "30"],
       deadlineMs: 2000,
     }),
-    expect: re(/^acpx: ROUTED outcome=unknown reason=deadline call_id=\S+$/),
+    expect: (o) => deadlineWithin(2000, o),
   },
   {
     label: "one-shot for util-home against the util-pool pod → not_run identity",
@@ -497,6 +536,7 @@ async function runCliCases(lb: Loopback, script: string, root: string): Promise<
 }
 
 async function main(): Promise<void> {
+  selfCheck();
   process.env.GATE_SECRET_TOKEN = "must-not-travel";
   process.env.ACPX_STATE_HOME = "/tmp/must-not-travel";
   process.env.ACPX_ROUTED_PAYLOAD_FORGED = "must-not-travel";

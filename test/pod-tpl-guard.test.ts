@@ -333,15 +333,14 @@ const OWN_ID_INVOCATIONS: Readonly<Record<string, string[]>> = {
 };
 
 /** Paths that cannot be driven here, each with the reason — and where the own-id rule for them is held instead. */
-const OWN_UNHELD =
-  "A-8's no-pod_foreign_write property for this verb in its OWN pod is NOT held on agent-pods yet — " +
-  "a prompt starts the pod's owner and an adapter, which this rig cannot drive; pod-owner-guard.test.ts holds the " +
-  "owner-ENTRY guard (a different property), not this one. A9's test/pod-wake-own-pod.test.ts (sentinel adapter) " +
-  "will hold it once A9 lands; until then the row is open.";
+const OWN_HELD =
+  "a prompt starts the pod's owner and an adapter, which this rig cannot drive; A-8's no-pod_foreign_write property " +
+  "for it in its OWN pod is held by test/pod-wake-own-pod.test.ts (A9: a sentinel adapter, the admission directory at " +
+  "its production place, the first prompt from a person, an agent and atrium) — for each of the forms below";
 const OWN_ID_EXEMPT: Readonly<Record<string, string>> = {
-  "": `bare \`acpx <text>\` is a prompt. ${OWN_UNHELD}`,
-  prompt: OWN_UNHELD,
-  "<agent>": `the same prompt, through the agent form. ${OWN_UNHELD}`,
+  "": "bare `acpx <text>` names NO session, so it is refused before any gate runs (the root takes no --session-id and reads its first word as the agent); the refusal and the form it advises are held by test/no-session-hint.test.ts",
+  prompt: `\`prompt --session-id <id> <text>\`: ${OWN_HELD}`,
+  "<agent>": `\`<agent> --session-id <id> <text>\` and \`<agent> prompt --session-id <id> <text>\`: ${OWN_HELD}`,
   exec: "spawns an adapter for a one-shot",
   "model-catalogue": "spawns an adapter unless a record answers (held by pod-a10-probes.test.ts)",
   "flow run": "runs ACP nodes: spawns an adapter",
@@ -493,4 +492,34 @@ test("T2 conformance: no command of a locally-running class about the pod's OWN 
       `${commandPath}: the own record ${outcome.writes === true ? "must have been written" : "must be untouched"}`,
     );
   }
+});
+
+test("T2 exemptions point at rows that EXIST: the prompt forms in pod-wake-own-pod, the bare refusal in no-session-hint (a stale pointer is red)", async () => {
+  const read = async (file: string): Promise<string> =>
+    await fs.readFile(new URL(`../../test/${file}`, import.meta.url), "utf8");
+  const wake = await read("pod-wake-own-pod.test.ts");
+  // the three forms the exemptions name, each as a committed argv
+  assert.match(
+    wake,
+    /"prompt", "--session-id", r\.id, "hello"/u,
+    "`prompt --session-id <id> <text>`",
+  );
+  assert.match(
+    wake,
+    /"claude", "--session-id", id, "hello"/u,
+    "`<agent> --session-id <id> <text>`",
+  );
+  assert.match(
+    wake,
+    /"claude", "prompt", "--session-id", id, "hello"/u,
+    "`<agent> prompt --session-id <id> <text>`",
+  );
+  const hint = await read("no-session-hint.test.ts");
+  assert.match(hint, /Session not found/u, "the bare form's advised command is run");
+  // the exemption texts name those files
+  assert.match(OWN_ID_EXEMPT.prompt ?? "", /pod-wake-own-pod\.test\.ts/u);
+  assert.match(OWN_ID_EXEMPT["<agent>"] ?? "", /pod-wake-own-pod\.test\.ts/u);
+  assert.match(OWN_ID_EXEMPT[""] ?? "", /no-session-hint\.test\.ts/u);
+  // NEGATIVE: the check discriminates — a text that lacks a form is not matched
+  assert.doesNotMatch("claude prompt only", /"claude", "--session-id", id, "hello"/u);
 });
