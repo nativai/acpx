@@ -10,6 +10,7 @@ import { COMMAND_TABLE, PASS_THROUGH_INHERIT } from "../src/pod/command-classes.
 import { addRecord } from "./pod-a3-helpers.js";
 import { INHERIT_ALLOWED, startRecordedAtrium } from "./pod-kit/recorded-atrium.js";
 import type { AtriumScript, Classify, RecordedAtrium } from "./pod-kit/recorded-atrium.js";
+import { removeTempHomeSync } from "./temp-home.js";
 
 // Self-test of the X1 recorded atrium. The rule of the kit: the fake follows the REAL atrium
 // (acpx-ui agent-pods `server/acpxCall/passThrough.ts`, `server/message-routes.ts`,
@@ -1111,7 +1112,7 @@ test("K-R2-2: the kit never touches a store it was not given — the test proces
     [],
     "nothing was created under HOME — no .acpx, no index.json",
   );
-  fs.rmSync(home, { recursive: true });
+  removeTempHomeSync(home);
 });
 
 test("K-R3-2: the same ids with a DIFFERENT request — another --name, reordered flags — is acpx's CREATE_REPLAY_MISMATCH (exit 2), never replay:true", async () => {
@@ -1322,7 +1323,7 @@ test("K-R2-2: with `stateHome` a target resolves against THAT store (acpx's own 
     before.every((name) => fs.existsSync(path.join(home, ".acpx", "sessions", name))),
     "the given store was read (acpx's resolver writes only its own index and lock files there)",
   );
-  fs.rmSync(home, { recursive: true });
+  removeTempHomeSync(home);
 });
 
 test("K-R2-7: --format json: the create-replay-mismatch is a JSON-RPC error on STDOUT, stderr empty", async () => {
