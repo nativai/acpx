@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { callerIdentityFrom } from "./caller-identity.js";
 import type { Classification, OutputMode } from "./command-classes.js";
 import { isClaudePtyCommand } from "./harness-support.js";
+import { isHomeOnlyHarness, readBoxFacts, type BoxFacts } from "./home-only.js";
 import {
   registerBranchHandler,
   type BranchContext,
@@ -63,19 +64,14 @@ export const UTILITY_PROBE_DEADLINE_MS = 30_000;
 export const UTILITY_RUN_DEADLINE_MS = 15 * 60_000;
 export const UTILITY_TIMEOUT_GRACE_MS = 15_000;
 
-/**
- * Harnesses whose utility pod is the HOME one: Codex's home is mounted directly in home-placed pods. (The
- * terminal harness was home-placed too until A-39 took it out of phase 1.)
- *
- * ⚠️ `pi` IS HERE UNTIL BLOCK P1 IS ON THE BOX (A-44, brick b3879529): pi writes its session JSONL under its
- * data and session directory even for a one-shot `exec` (`PI_CODING_AGENT_DIR` is pi's data dir; a missing
- * session dir hangs pi), and pool pods have no read-write Pi store before P1. P1 REMOVES `pi` from this set.
- * `test/pod-a10-probes.test.ts` ("utilityKeyFor") pins it.
- */
-const HOME_HARNESSES: ReadonlySet<string> = new Set(["codex", "pi"]);
+// Which harnesses go to the HOME utility pod is `isHomeOnlyHarness` (`home-only.ts`, A-44): codex always, pi
+// until P1 is on THIS box — a per-box fact, never an acpx release.
 
-export function utilityKeyFor(harness: string | undefined): UtilityKey {
-  return harness !== undefined && HOME_HARNESSES.has(harness) ? "util-home" : "util-pool";
+export function utilityKeyFor(
+  harness: string | undefined,
+  box: BoxFacts = readBoxFacts(),
+): UtilityKey {
+  return isHomeOnlyHarness(harness, box) ? "util-home" : "util-pool";
 }
 
 /** The value of a global flag in an argv, `--flag v` or `--flag=v`, up to the `--` terminator. */
@@ -162,7 +158,10 @@ function utilityCallOptions(
   plan: Exclude<Awaited<ReturnType<typeof planPayload>>, "prompt_required">,
   deps: UtilityDeps,
 ): RoutedCallOptions {
-  const key = utilityKeyFor(agentCommand === undefined ? undefined : deps.harnessOf(agentCommand));
+  const key = utilityKeyFor(
+    agentCommand === undefined ? undefined : deps.harnessOf(agentCommand),
+    readBoxFacts(deps.env),
+  );
   const admissionClass = deps.admissionClass();
   return {
     class: "one-shot",

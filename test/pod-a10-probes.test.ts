@@ -742,6 +742,10 @@ async function rig(opts: {
   place?: "control" | "agent-pod";
   /** Tools whose control-pod release link is left out (C9). */
   withoutLinks?: string[];
+  /** The kit broker's home cap (default 5): 0 makes `util-home` answer `home_full`. */
+  homeCap?: number;
+  /** Extra environment for the CLI (the P1 test seam, A-44). */
+  extraEnv?: NodeJS.ProcessEnv;
   /** Pods the kit's API server already shows (a Ready utility pod, A-43 (b)). */
   pods?: PodSeed[];
 }): Promise<Rig> {
@@ -771,7 +775,7 @@ async function rig(opts: {
   const api = await startFakeApiServer({ namespace: "dev-devbox", pods: opts.pods ?? [] });
   const broker = await startFakeBroker({
     // The kit's home cap is the real broker's default, 0: `util-home` then answers `home_full`.
-    status: { home: { live: 0, cap: 5 } },
+    status: { home: { live: 0, cap: opts.homeCap ?? 5 } },
     default: {
       steps: ["scheduling"],
       final: {
@@ -805,6 +809,7 @@ async function rig(opts: {
     NV_AGENT_BROKER_URL: broker.url,
     ACPX_AGENT_EXEC: path.join(stubDir, "agent-exec"),
     ACPX_TEST_RUNTIME_DIR: runtime,
+    ...opts.extraEnv,
   };
   for (const name of [
     "ACPX_SESSION_URL",
@@ -1285,6 +1290,9 @@ test("A-43 row 43.2: a Ready utility pod whose releases annotation lacks `pi` (o
     ["no annotation at all", undefined],
     ["unparseable", "{not json"],
     ["not an object of strings", JSON.stringify({ pi: 7 })],
+    ["pi is the EMPTY string", JSON.stringify({ acpx: "r", pi: "" })],
+    ["pi is not a release-shaped name", JSON.stringify({ acpx: "r", pi: "../../etc" })],
+    ["pi is whitespace", JSON.stringify({ acpx: "r", pi: "  " })],
   ];
   for (const [label, annotation] of cases) {
     const r = await rig({ pods: [home(annotation)] });
@@ -1366,5 +1374,86 @@ test("A-43 unit: a call whose agent is Pi carries `agentIsPi`; a Claude or Codex
     await dispatchUtility(decisionFor(argv), context(d.out), d.deps);
     assert.equal(d.runs[0]?.agentIsPi === true, expected, command);
     assert.equal(d.runs[0]?.target.harness, "utility", "the pod's harness stays utility");
+  }
+});
+
+// ───────────────────────── A-44 (rows 44.1–44.3): Pi goes home until P1 is on THIS box ─────────────────────────
+
+test("A-44 row 44.1: P1 not on the box, home cap 1 — a Pi `exec` posts util-home with placement home and is routed; a Claude `exec` posts util-pool", async () => {
+  const r = await rig({ homeCap: 1, stub: { exit: 0, stdout: "ran\n" } });
+  try {
+    const pi = await cli(["--agent", PI, "exec", "hi"], r.env);
+    assert.equal(pi.code, 0, pi.stderr);
+    assert.equal(POSTS(r).length, 1);
+    assert.equal(POSTS(r)[0]?.key, "util-home");
+    assert.equal(POSTS(r)[0]?.body?.placement, "home");
+    assert.equal(r.calls().length, 1, "routed");
+    const claude = await cli(["--agent", CLAUDE, "exec", "hi"], r.env);
+    assert.equal(claude.code, 0, claude.stderr);
+    assert.equal(POSTS(r)[1]?.key, "util-pool");
+    assert.equal(
+      POSTS(r).filter((post) => post.key === "util-pool").length,
+      1,
+      "a Pi one-shot never went to the pool",
+    );
+  } finally {
+    await r.close();
+  }
+});
+
+test("A-44 row 44.2: home cap 0 — a Pi `exec` is refused agent_cap why=home_full (exit 75), nothing started; a Pi probe with a usable record is still answered from it", async () => {
+  const r = await rig({
+    homeCap: 0,
+    records: [
+      record("77777777-7777-4777-8777-777777777771", PI, {
+        available_models: ["pi-a"],
+        current_model_id: "pi-a",
+      }),
+    ],
+  });
+  try {
+    r.broker.setScript({
+      default: { final: { refused: { reason: "home_full", live: 0, cap: 0 } } },
+    });
+    const exec = await cli(["--agent", PI, "exec", "hi"], r.env);
+    assert.equal(exec.code, 75, exec.stderr);
+    assert.match(
+      exec.stderr.split("\n")[0] ?? "",
+      /^acpx: REFUSED reason=agent_cap .*why=home_full/,
+    );
+    assert.equal(r.calls().length, 0, "nothing started");
+    assert.equal(POSTS(r)[0]?.key, "util-home", "it asked for the HOME pod, not the pool");
+    const probe = await cli(["--agent", PI, "model-catalogue"], r.env);
+    assert.equal(probe.code, 0, probe.stderr);
+    assert.equal(POSTS(r).length, 1, "the probe asked the broker for nothing");
+  } finally {
+    await r.close();
+  }
+});
+
+test("A-44 row 44.3 (CLI): a Pi one-shot goes home on a box WITHOUT P1's signal — the acpx release alone never moves Pi — and to the pool on a box WITH it; codex stays home, claude pool", async () => {
+  // The seam is honoured only under node --test, so the rig's env carries NODE_TEST_CONTEXT; without the
+  // signal (absent, or set to anything but "1") Pi stays home.
+  for (const extraEnv of [{}, { ACPX_TEST_P1_ON_BOX: "0" }, { ACPX_TEST_P1_ON_BOX: "yes" }]) {
+    const r = await rig({ extraEnv, stub: { exit: 0 } });
+    try {
+      await cli(["--agent", PI, "exec", "hi"], r.env);
+      assert.equal(POSTS(r)[0]?.key, "util-home", JSON.stringify(extraEnv));
+    } finally {
+      await r.close();
+    }
+  }
+  const p1 = await rig({ extraEnv: { ACPX_TEST_P1_ON_BOX: "1" }, stub: { exit: 0 } });
+  try {
+    await cli(["--agent", PI, "exec", "hi"], p1.env);
+    await cli(["--agent", CODEX, "exec", "hi"], p1.env);
+    await cli(["--agent", CLAUDE, "exec", "hi"], p1.env);
+    assert.deepEqual(
+      POSTS(p1).map((post) => post.key),
+      ["util-pool", "util-home", "util-pool"],
+      "with P1's signal: Pi → pool, codex stays home, claude pool",
+    );
+  } finally {
+    await p1.close();
   }
 });

@@ -574,9 +574,15 @@ function refuseReadyPodWithoutPi(
   releases: Record<string, string> | undefined,
   callId: string,
 ): void {
-  if (options.class === "one-shot" && needsPi(options) && releases?.pi === undefined) {
+  if (options.class === "one-shot" && needsPi(options) && !isReleaseName(releases?.pi)) {
     throw piUnresolved(callId);
   }
+}
+
+/** A release directory name, as the broker validates one: a plain token. An empty or odd value is NOT a release — it counts as absent. */
+const RELEASE_NAME = /^[A-Za-z0-9._+-]{1,128}$/;
+function isReleaseName(value: string | undefined): boolean {
+  return value !== undefined && RELEASE_NAME.test(value);
 }
 
 /** The one named line for a Pi call that cannot have `pi` (A-42/A-43): no new public reason. */
