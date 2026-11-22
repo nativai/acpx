@@ -27,6 +27,7 @@ import {
 import { isRecordedPidPossiblyAlive } from "../process-identity.js";
 import { sessionArchiveDirFor } from "../session/archive/paths.js";
 import { parseSessionRecord } from "../session/persistence.js";
+import { isSessionRecordFileName } from "../session/persistence/session-dir-files.js";
 import { namesAgentSession } from "../session/sleeping.js";
 import type { SessionRecord } from "../types.js";
 import { readQueueOwnerLiveness } from "./queue/lease-store.js";
@@ -376,7 +377,7 @@ async function indexRecordFiles(ids: Set<string>, homes: Homes): Promise<RecordI
   const index: RecordIndex = new Map();
   for (const dir of [hotDir, sessionArchiveDirFor(hotDir)]) {
     for (const dirent of await readDirents(dir)) {
-      if (dirent.isFile() && dirent.name.endsWith(".json") && dirent.name !== "index.json") {
+      if (dirent.isFile() && isSessionRecordFileName(dirent.name)) {
         await indexRecordFile(path.join(dir, dirent.name), ids, index);
       }
     }

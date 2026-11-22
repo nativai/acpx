@@ -9,6 +9,7 @@
  * two pseudo-ids.
  */
 
+import { isSessionRecordFileName } from "../persistence/session-dir-files.js";
 import { encodeSessionSafeId } from "./safe-id.js";
 
 /**
@@ -322,7 +323,7 @@ export function claimArchiveFileSets(files: readonly string[]): Map<string, stri
 function archiveCandidateTokens(files: readonly string[]): Set<string> {
   const candidates = new Set<string>();
   for (const file of files) {
-    if (!file.endsWith(".json") || RESERVED_ID_PARTS.has(idPartOf(file))) {
+    if (!isSessionRecordFileName(file) || RESERVED_ID_PARTS.has(idPartOf(file))) {
       continue;
     }
     const token = file.slice(0, -".json".length);

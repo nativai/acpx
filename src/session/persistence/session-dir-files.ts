@@ -69,3 +69,31 @@ export const SEAT_STORE_FILE = "seats.json";
 export function isNonSessionRecordFile(filename: string): boolean {
   return filename === SESSION_INDEX_FILE || filename === SEAT_STORE_FILE;
 }
+
+/**
+ * ⚠️ THE ONE ANSWER TO "IS THIS NAME A SESSION RECORD FILE?" (brick 99bf1c0d, atrium O8-1) — an ALLOW-LIST
+ * shape, not one more name in a deny-list: `<id>.json`, where the id part is non-empty and has NO `.`, and
+ * is not one of acpx's own stores ({@link isNonSessionRecordFile}).
+ *
+ * Why not "ends with `.json`": the directory also holds `<id>.delivery.json` (acpx-ui's delivery store;
+ * 390 on devbox), `<id>.queue.json` and `<id>.inflight.json`. They end in `.json` too, so every
+ * `endsWith(".json")` enumerator counted them as session records: phantom members of the index's `files`
+ * (the whole index rewritten whenever one appears or goes — "drift"), a false `parse` error each in the
+ * seat backfill, and a full read of each as a record candidate. Had one ever held record-shaped JSON it
+ * would have become a phantom session `<id>.delivery`.
+ *
+ * Why not "uuid-shaped": ids are opaque. devbox carries real `ses_…` records (opencode) and the archive a
+ * slug id, and a uuid test would silently drop them from the index. The only structural fact every record
+ * file has and no sidecar has is the single dot. An id containing `.` is therefore not a record file here
+ * (0 of 3,447 hot records on devbox; acpx mints uuids) — widen THIS function if that ever changes.
+ *
+ * `test/session-record-file-name.test.ts` scans `src/` for `.json` filters and fails on one that does not
+ * go through here, so a new enumerator cannot fall back to a suffix test.
+ * Takes a BARE FILENAME, like {@link isNonSessionRecordFile}.
+ */
+export function isSessionRecordFileName(filename: string): boolean {
+  const stem = SESSION_RECORD_FILE.exec(filename)?.[1];
+  return stem !== undefined && !isNonSessionRecordFile(filename);
+}
+
+const SESSION_RECORD_FILE = /^([^./\\]+)\.json$/u;
