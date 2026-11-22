@@ -5224,6 +5224,11 @@ export async function handleSessionsTemplate(
   // brick ad6ba1c2 (Contract C3) — marking a template CLOSES the session: the same gate, before
   // anything is touched.
   const gateRecord = await resolveSessionRecord(sessionId);
+  // A-16 (R3-1): marking a template CLOSES the session (`closed`, `closed_at`, pid, `template`), so in
+  // local mode a lease naming a pod not proven gone refuses it first — `pod_starting … phase=turnover`
+  // (exit 75), before the background-task gate's socket probe and before any write. `--disable` only
+  // retracts the marker (a `record`-class write) and is not guarded.
+  await refuseWakeWhilePodNotGone(gateRecord.acpxRecordId);
   // --owner and the fixed-owner rule are settled BEFORE the close: a refusal must leave the session open.
   const ownerId = await resolveMarkOwner(flags, gateRecord.template?.slug);
   const { refusal, gate, answer } = await evaluateBackgroundTaskGate({

@@ -72,7 +72,7 @@ function run(env: NodeJS.ProcessEnv, cwd: string, args: string[]): Promise<Run> 
   });
 }
 
-test("A-16 on the real CLI: prompt, cancel, set-mode and sessions close answer pod_starting turnover (75) for an existing pod, a failed delete and an unknown API; a gone pod wakes locally", async () => {
+test("A-16 on the real CLI: prompt, cancel, set-mode, sessions close and sessions template answer pod_starting turnover (75) for an existing pod, a failed delete and an unknown API; a gone pod wakes locally", async () => {
   const api = await startFakeApi("dev-kit");
   try {
     const owner = makeWorld("a16-cli");
@@ -180,6 +180,8 @@ test("A-16 on the real CLI: prompt, cancel, set-mode and sessions close answer p
         ["set-mode", "plan", "--session-id", id],
         // R2-1: `sessions close` writes `closed` / `closed_at` / pid fields — it is refused first.
         ["sessions", "close", "--session-id", id],
+        // R3-1: `sessions template` closes the session too (closed, closed_at, pid, template fields).
+        ["sessions", "template", id],
       ]) {
         const result = await run(env, cwd, verb);
         assert.equal(
