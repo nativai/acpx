@@ -353,6 +353,25 @@ test("class-not-passable: an injected classifier decides (record / owner-if-pod 
   );
 });
 
+test("a record command whose target atrium cannot resolve is refused (target-unresolved); resolveTargetAs says the session exists on the control pod", async () => {
+  const argv = ["sessions", "set-metadata", "--session-id", "nobody-here", "--key", "k"];
+  await withAtrium({}, async (atrium) => {
+    const refused = await call(atrium, callBody({ argv }));
+    assert.deepEqual(
+      [refused.status, refused.json],
+      [400, { error: "class-not-passable", reason: "target-unresolved" }],
+    );
+  });
+  await withAtrium({ resolveTargetAs: OTHER_RECORD }, async (atrium) => {
+    assert.equal((await call(atrium, callBody({ argv }))).status, 200);
+    const own = await call(
+      atrium,
+      callBody({ argv, caller: { session_url: "x", record_id: OTHER_RECORD } }),
+    );
+    assert.equal(own.json.reason, "own-session", "still not the caller's own session");
+  });
+});
+
 test("a create's file arguments are refused: --prompt-file <path>, a handover brief that is not an absolute shared path", async () => {
   await withAtrium({}, async (atrium) => {
     const promptFile = await call(

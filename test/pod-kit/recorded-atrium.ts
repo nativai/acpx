@@ -81,6 +81,13 @@ export interface AtriumScript {
    * that key; a `utility` pod claims no caller at all — else `403 {"error":"caller-mismatch"}`.
    */
   callerClass?: "local" | "agent-pod";
+  /**
+   * Atrium resolves the target of a record / owner-if-pod command against the control pod's session store and
+   * REFUSES one it cannot (`400 class-not-passable`, `target-unresolved`). The kit's classifier runs in the
+   * test's own process, so every target resolves to nothing there: this makes an unresolved target resolve to
+   * the given record id instead (a session that exists on the control pod).
+   */
+  resolveTargetAs?: string;
   agentPod?: { sessionKey?: string; utility?: boolean };
 }
 
@@ -967,6 +974,13 @@ export class RecordedAtrium {
       }
     }
     const classified = await (this.classifyOverride ?? (await defaultClassify()))(body.argv);
+    if (
+      this.script.resolveTargetAs !== undefined &&
+      (classified.class === "record" || classified.class === "owner-if-pod") &&
+      (classified.targetSessionId === undefined || classified.targetSessionId === null)
+    ) {
+      classified.targetSessionId = this.script.resolveTargetAs;
+    }
     const verdict = passability(classified, body.caller?.record_id ?? "");
     if (!verdict.ok) {
       refuse(bad("class-not-passable", { reason: verdict.reason }));
