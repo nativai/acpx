@@ -73,53 +73,105 @@ test("KNOWN LIMIT, stated as a row: a sidecar family nobody has listed is counte
 // and every call that LISTS a directory, under `readdir`/`opendir`, an import alias, or a bound/destructured copy.
 
 const SRC = path.resolve("src");
-const key = (site: Site): string => `${site.file}::${site.text}`;
+/** An exemption is one OCCURRENCE: file, enclosing FUNCTION, and the occurrence's own text. */
+const key = (site: Site): string => `${site.file}::${site.fn}::${site.text}`;
+
+/** `count`: how many occurrences with this exact key are expected (default 1) — EXACT, not "at least". */
+type Exemption = { why: string; count?: number };
 
 /**
- * Suffix tests that are NOT about the sessions directory, EACH PER OCCURRENCE (file + the occurrence's own
- * text) — a new filter in the same file is a different occurrence and is flagged. `seat-archive.ts` is the
- * case that made this per-occurrence: it lists the seat-archive dir AND the sessions dir.
+ * Suffix tests that are NOT about the sessions directory. Keyed `file::function::text`: a new filter in the
+ * same file but another function — or a second identical one in the same function — is a different
+ * occurrence (it fails the exact count) and is flagged. `seat-archive.ts` is the case that made this
+ * per-occurrence: it lists the seat-archive dir AND the sessions dir, and the TE showed that a text-only key let
+ * a new `name.endsWith(".json")` in `unfoldRacedHolders` ride on the exemption of `readSeatArchiveLedger`.
  */
-const JSON_SUFFIX_EXEMPT: Readonly<Record<string, string>> = {
-  'session/persistence/session-dir-files.ts::filename.endsWith(".json")': "defines the predicate",
-  "session/archive/archive-index.ts::/^(\\d{4})-(\\d{2})\\.json$/":
-    "ARCHIVE-INDEX shard names `YYYY-MM.json`",
-  'session/persistence/seat-archive.ts::name.endsWith(".json")':
-    "the seat-archive directory (`<seatId>.json`) in readSeatArchiveLedger, not the sessions dir",
-  'acp/pi-model-knowledge.ts::cachePath.endsWith(".json")':
-    "derives a sibling path of a cache file; lists nothing",
-  'capacity/waiting.ts::name.endsWith(".json")': "the capacity waiting-queue directory",
-  'capacity/governor/notify.ts::name.endsWith(".json")': "the governor's notification outbox",
-  "capacity/governor/record.ts::/^\\d{4}-\\d{2}-\\d{2}\\.json$/u":
-    "the governor's dated peak files",
-  'flows/json.ts::text.slice(contentStart, contentStart + 4).toLowerCase() === "json"':
-    "a Markdown code-fence language tag, not a file name",
+const JSON_SUFFIX_EXEMPT: Readonly<Record<string, Exemption>> = {
+  'session/persistence/session-dir-files.ts::isSessionRecordFileName::filename.endsWith(".json")': {
+    why: "defines the predicate",
+  },
+  "session/archive/archive-index.ts::<module>::/^(\\d{4})-(\\d{2})\\.json$/": {
+    why: "ARCHIVE-INDEX shard names `YYYY-MM.json`",
+  },
+  'session/persistence/seat-archive.ts::readSeatArchiveLedger::name.endsWith(".json")': {
+    why: "the seat-archive directory (`<seatId>.json`), not the sessions dir",
+  },
+  'acp/pi-model-knowledge.ts::piKeptOverlayPath::cachePath.endsWith(".json")': {
+    why: "derives a sibling path of a cache file; lists nothing",
+  },
+  'capacity/waiting.ts::readWaiting::name.endsWith(".json")': {
+    why: "the capacity waiting-queue directory",
+  },
+  'capacity/governor/notify.ts::readOutbox::name.endsWith(".json")': {
+    why: "the governor's notification outbox",
+  },
+  "capacity/governor/record.ts::pendingPeaksDays::/^\\d{4}-\\d{2}-\\d{2}\\.json$/u": {
+    why: "the governor's dated peak files",
+  },
+  'flows/json.ts::extractFencedJsonText::text.slice(contentStart, contentStart + 4).toLowerCase() === "json"':
+    { why: "a Markdown code-fence language tag, not a file name (an accepted over-fire)" },
 };
+
+/** Occurrences of a suffix test that no exemption covers — by key AND by exact count per key. */
+export function unexemptedSuffixTests(
+  sites: readonly Site[],
+  exempt: Readonly<Record<string, Exemption>>,
+): string[] {
+  const seen = new Map<string, Site[]>();
+  for (const site of sites) {
+    seen.set(key(site), [...(seen.get(key(site)) ?? []), site]);
+  }
+  const flagged: string[] = [];
+  for (const [siteKey, group] of seen) {
+    const allowed = exempt[siteKey]?.count ?? (exempt[siteKey] ? 1 : 0);
+    if (group.length > allowed) {
+      flagged.push(`${siteKey} (${group.length} occurrence(s), ${allowed} exempted)`);
+    }
+  }
+  return flagged.toSorted();
+}
+
+/** Exemptions whose live count is not EXACTLY what they say (stale or too wide). */
+export function wrongExemptionCounts(
+  sites: readonly Site[],
+  exempt: Readonly<Record<string, Exemption>>,
+): string[] {
+  const counts = new Map<string, number>();
+  for (const site of sites) {
+    counts.set(key(site), (counts.get(key(site)) ?? 0) + 1);
+  }
+  return Object.entries(exempt)
+    .filter(([siteKey, entry]) => (counts.get(siteKey) ?? 0) !== (entry.count ?? 1))
+    .map(([siteKey]) => siteKey)
+    .toSorted();
+}
 
 const parsed = parseTree(SRC);
 const constants = collectConstants(parsed);
 
-export function unexemptedSuffixTests(
-  sites: readonly Site[],
-  exempt: Readonly<Record<string, string>>,
-): string[] {
-  return sites
-    .filter((site) => exempt[key(site)] === undefined)
-    .map((site) => `${site.file} :: ${site.fn} :: ${site.text}`)
-    .toSorted();
-}
-
-test("CONFORMANCE: every `.json` suffix test in src/ is behind the predicate or a per-OCCURRENCE exemption — found by parse", () => {
+test("CONFORMANCE: every `.json` suffix test in src/ is behind the predicate or a per-OCCURRENCE exemption (file::function::text, exact count) — found by parse", () => {
   const sites = jsonSuffixSites(parsed, constants);
   assert.deepEqual(unexemptedSuffixTests(sites, JSON_SUFFIX_EXEMPT), []);
-  // a stale exemption widens nothing silently: each names exactly one live occurrence
-  for (const exempted of Object.keys(JSON_SUFFIX_EXEMPT)) {
-    assert.equal(
-      sites.filter((site) => key(site) === exempted).length >= 1,
-      true,
-      `stale exemption: ${exempted}`,
-    );
-  }
+  // each exemption names EXACTLY its live count: a stale one (0) and a too-wide one (more occurrences) both fail
+  assert.deepEqual(wrongExemptionCounts(sites, JSON_SUFFIX_EXEMPT), []);
+});
+
+test("CONFORMANCE: the exemption counters themselves can fail — a stale exemption and a doubled occurrence are both reported", () => {
+  const site: Site = { file: "a.ts", fn: "f", text: 'n.endsWith(".json")' };
+  const exempt = { [key(site)]: { why: "x" } };
+  assert.deepEqual(wrongExemptionCounts([site], exempt), []);
+  assert.deepEqual(wrongExemptionCounts([], exempt), [key(site)], "stale: nothing live matches");
+  assert.deepEqual(
+    wrongExemptionCounts([site, site], exempt),
+    [key(site)],
+    "too wide: two live, one exempted",
+  );
+  assert.deepEqual(
+    unexemptedSuffixTests([site, site], exempt).length,
+    1,
+    "and the second occurrence is flagged",
+  );
+  assert.deepEqual(wrongExemptionCounts([site, site], { [key(site)]: { why: "x", count: 2 } }), []);
 });
 
 /** Each way a suffix test can be spelled — every one must be SEEN by the parse. */
@@ -147,6 +199,16 @@ const SPELLINGS: Readonly<Record<string, string>> = {
   "regex literal": "export const f = (n: string) => /\\.json$/u.test(n);",
   "regex literal, a capture group": "export const f = (n: string) => /^([^.]+)\\.json$/u.exec(n);",
   "new RegExp": 'export const f = (n: string) => new RegExp("\\\\.json$").test(n);',
+  "extname into a local (F-2, R3)":
+    'import path from "node:path";\nexport const f = (n: string) => {\n  const ext = path.extname(n);\n  return ext === ".json";\n};',
+  "extname into a local, then a list":
+    'import { extname } from "node:path";\nexport const f = (n: string) => {\n  const ext = extname(n).toLowerCase();\n  return [".json"].includes(ext);\n};',
+  "fs.globSync with a json pattern (F-2, R4)":
+    'import fs from "node:fs";\nexport const f = (dir: string) => fs.globSync("*.json", { cwd: dir });',
+  "fs.promises.glob with a json pattern":
+    'import fs from "node:fs";\nexport const f = (dir: string) => fs.promises.glob("**/*.json", { cwd: dir });',
+  "path.matchesGlob":
+    'import path from "node:path";\nexport const f = (n: string) => path.matchesGlob(n, "*.json");',
   "RegExp from a constant":
     'const PATTERN = "\\\\.json$";\nexport const f = (n: string) => RegExp(PATTERN).test(n);',
 };
@@ -162,6 +224,10 @@ const CONTROLS: Readonly<Record<string, string>> = {
   "a comment that says it":
     '// n.endsWith(".json") and path.extname(n) === ".json"\nexport const f = 1;',
   "prose in a string": 'export const f = "use endsWith(\\".json\\") never";',
+  "extname into a local compared with something else":
+    'import path from "node:path";\nexport const f = (n: string) => {\n  const ext = path.extname(n);\n  return ext === ".md";\n};',
+  "a glob that is not json":
+    'import fs from "node:fs";\nexport const f = (d: string) => fs.globSync("*.md", { cwd: d });',
   "building a record path": "export const f = (id: string) => `${id}.json`;",
 };
 
@@ -197,20 +263,28 @@ test("the old line-based scan MISSED these spellings (F-C5a) — and the parse s
   const escaped = Object.entries(SPELLINGS)
     .filter(([, text]) => !legacyCatches(text))
     .map(([name]) => name);
-  assert.deepEqual(escaped.toSorted(), [
-    "RegExp from a constant",
-    "endsWith, a call split across lines",
-    "endsWith, a constant",
-    "endsWith, a constant built by concatenation",
-    "extname",
-    "extname in a list",
-    "extname, lower-cased, reversed operands",
-    "new RegExp",
-    "slice with a computed length",
-    "slice(-5)",
-    "split().pop()",
-    "substring",
-  ]);
+  assert.deepEqual(
+    escaped.toSorted(),
+    [
+      "RegExp from a constant",
+      "endsWith, a call split across lines",
+      "endsWith, a constant",
+      "endsWith, a constant built by concatenation",
+      "extname",
+      "extname into a local (F-2, R3)",
+      "extname into a local, then a list",
+      "fs.globSync with a json pattern (F-2, R4)",
+      "fs.promises.glob with a json pattern",
+      "path.matchesGlob",
+      "extname in a list",
+      "extname, lower-cased, reversed operands",
+      "new RegExp",
+      "slice with a computed length",
+      "slice(-5)",
+      "split().pop()",
+      "substring",
+    ].toSorted(),
+  );
   // positive control: the old scan did catch these, so the filter itself is not broken
   for (const name of [
     "endsWith, double quotes",
@@ -247,18 +321,48 @@ test("CONFORMANCE NEGATIVE: a constant suffix defined in ANOTHER file is followe
   );
 });
 
-test("CONFORMANCE NEGATIVE (per occurrence): an exempted file does NOT excuse a second filter — the seat-archive case", () => {
-  const first =
-    'export const seats = (names: string[]) => names.filter((name) => name.endsWith(".json"));';
-  const second =
-    'export const hot = (names: string[]) => names.filter((n) => n.endsWith(".json"));';
-  const sites = scanFresh({ "seat-archive.ts": `${first}\n${second}` });
-  const exempt = { 'seat-archive.ts::name.endsWith(".json")': "the seat-archive dir" };
-  assert.deepEqual(unexemptedSuffixTests(sites, exempt), [
-    'seat-archive.ts :: hot :: n.endsWith(".json")',
+test('CONFORMANCE NEGATIVE (per occurrence, the TE\'s R2): a NEW `name.endsWith(".json")` in another function of an exempted file is flagged — same variable name, same text', () => {
+  const exempted = `export function readSeatArchiveLedger(names: string[]) {
+  return names.filter((name) => name.endsWith(".json"));
+}`;
+  const another = `export function unfoldRacedHolders(names: string[]) {
+  return names.filter((name) => name.endsWith(".json"));
+}`;
+  const exempt = {
+    'seat-archive.ts::readSeatArchiveLedger::name.endsWith(".json")': {
+      why: "the seat-archive dir",
+    },
+  };
+  // twin: only the exempted occurrence — clean, and its count is exactly right
+  const alone = scanFresh({ "seat-archive.ts": exempted });
+  assert.deepEqual(unexemptedSuffixTests(alone, exempt), []);
+  assert.deepEqual(wrongExemptionCounts(alone, exempt), []);
+  // the TE's case: the same text, another function
+  const both = scanFresh({ "seat-archive.ts": `${exempted}\n${another}` });
+  assert.deepEqual(unexemptedSuffixTests(both, exempt), [
+    'seat-archive.ts::unfoldRacedHolders::name.endsWith(".json") (1 occurrence(s), 0 exempted)',
   ]);
-  // twin: with only the exempted occurrence the file is clean
-  assert.deepEqual(unexemptedSuffixTests(scanFresh({ "seat-archive.ts": first }), exempt), []);
+  // …and a SECOND identical occurrence inside the exempted function itself
+  const doubled = scanFresh({
+    "seat-archive.ts": `export function readSeatArchiveLedger(a: string[], b: string[]) {
+  return [a.filter((name) => name.endsWith(".json")), b.filter((name) => name.endsWith(".json"))];
+}`,
+  });
+  assert.deepEqual(unexemptedSuffixTests(doubled, exempt), [
+    'seat-archive.ts::readSeatArchiveLedger::name.endsWith(".json") (2 occurrence(s), 1 exempted)',
+  ]);
+});
+
+test("CONFORMANCE: the same row against the REAL tree — a new `.json` filter in unfoldRacedHolders would be flagged (the exemption is keyed to readSeatArchiveLedger)", () => {
+  const injected: Site = {
+    file: "session/persistence/seat-archive.ts",
+    fn: "unfoldRacedHolders",
+    text: 'name.endsWith(".json")',
+  };
+  const sites = [...jsonSuffixSites(parsed, constants), injected];
+  assert.deepEqual(unexemptedSuffixTests(sites, JSON_SUFFIX_EXEMPT), [
+    'session/persistence/seat-archive.ts::unfoldRacedHolders::name.endsWith(".json") (1 occurrence(s), 0 exempted)',
+  ]);
 });
 
 // ---- the inventory of directory listings: per CALL SITE (file::function), each says what it lists ----
@@ -405,6 +509,10 @@ const LISTING_SPELLINGS: Readonly<Record<string, string>> = {
     'import fs from "node:fs";\nconst list = fs.readdirSync;\nexport const f = (d: string) => list(d);',
   "a destructured copy":
     'import fs from "node:fs";\nconst { readdirSync: scan } = fs;\nexport const f = (d: string) => scan(d);',
+  "fs.globSync":
+    'import fs from "node:fs";\nexport const f = (d: string) => fs.globSync("*.md", { cwd: d });',
+  "fs.promises.glob":
+    'import fs from "node:fs";\nexport const f = (d: string) => fs.promises.glob("*.md", { cwd: d });',
   "a promisified copy":
     'import fs from "node:fs";\nimport { promisify } from "node:util";\nconst ls = promisify(fs.readdir);\nexport const f = (d: string) => ls(d);',
 };

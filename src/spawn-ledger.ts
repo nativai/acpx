@@ -275,18 +275,6 @@ export function spawnIdempotencyKey(runId: string, fence: number): string {
 }
 
 /**
- * The instance id this HOME admits — the only identity a ledger living under this HOME may carry.
- *
- * ⚠️ TAKES NO ARGUMENT, AND THAT IS THE WHOLE POINT. `SpawnLedger`'s constructor derives `dbPath`
- * from `os.homedir()`; this derives the admitted id from the same `os.homedir()`. Both sides of the
- * comparison therefore come from the environment the process is actually running in, and a caller
- * cannot make them agree by handing one of them in.
- *
- * A missing / unreadable `instance.json` is a REFUSAL, not a permit: this HOME has not been
- * admitted, so nothing may bind a ledger under it (brick 42b4fb28). Production never reaches this
- * state, because acpx-ui mints the record before it starts the trigger owner.
- */
-/**
  * The RETRIED refusal for a read that failed transiently (see `isTransientReadError`), or undefined for any
  * other error. It is `spawn-state-missing` — the code a caller already retries — on every read of the pod
  * write path, whatever file it was (the spawn-state file, `instance.json`, the record).
@@ -305,6 +293,20 @@ function transientReadRefusal(
     : undefined;
 }
 
+/**
+ * The instance id this HOME admits — the only identity a ledger living under this HOME may carry.
+ *
+ * ⚠️ TAKES NO ARGUMENT, AND THAT IS THE WHOLE POINT. `SpawnLedger`'s constructor derives `dbPath`
+ * from `os.homedir()`; this derives the admitted id from the same `os.homedir()`. Both sides of the
+ * comparison therefore come from the environment the process is actually running in, and a caller
+ * cannot make them agree by handing one of them in.
+ *
+ * A missing or malformed `instance.json` is a REFUSAL, not a permit: this HOME has not been admitted, so
+ * nothing may bind a ledger under it (brick 42b4fb28). Production never reaches this state, because
+ * acpx-ui mints the record before it starts the trigger owner. A TRANSIENT read error (a mount's hiccup,
+ * descriptors for a moment) says nothing about the identity: it is the RETRIED `spawn-state-missing`,
+ * not a refusal of it (O2-b).
+ */
 function admittedInstanceId(): string {
   const home = os.homedir();
   const file = path.join(home, ".acpx", "instance.json");
