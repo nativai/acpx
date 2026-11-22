@@ -215,10 +215,14 @@ export const COMMAND_TABLE: Readonly<Record<string, CommandEntry>> = {
   "sessions set-parent": {
     class: "record",
     reason: "the parent field of a record",
-    target: BY_FLAGS,
+    // `--children-of <parent>` SELECTS its target (brick c2b7358d, T3): it rewrites every CHILD of the parent —
+    // other sessions' records — so atrium must resolve it (else `400 target-unresolved`, and the call could not
+    // run from a pod at all), and from a pod it is never "own": `own-target.ts` answers not-own for it, so it
+    // always passes through to the control pod, even when the parent is the pod's own session.
+    target: { flags: [...SELECT, "--children-of"] },
     judgment:
-      "--children-of rewrites every child of a parent (several records): still record-class per " +
-      "record under its lock; the pass-through decides on the first named session",
+      "--children-of rewrites every child of a parent (several records): record-class, and the flag " +
+      "names its target so the pass-through can resolve it; never local in a pod (it writes other sessions' records)",
   },
   "sessions activate": {
     class: "control-store",
