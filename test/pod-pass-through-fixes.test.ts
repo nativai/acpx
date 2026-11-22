@@ -64,41 +64,49 @@ test("F-1: a lost answer, then the PRINTED retry, is an IDENTICAL request (same 
   const { home } = agentPodHome();
   const work = tmpDir("acpx-a3-work-");
   fs.writeFileSync(path.join(work, "brief.md"), "the brief\n");
-  await withAtrium({ calls: [{ answer: { exit: 0 }, loseAnswer: true }] }, async (atrium) => {
-    const env = agentPodEnv(home, atrium.url, FAST);
-    const first = await runCli(
-      ["sessions", "new", "--name", "it's child", "--prompt-file", "brief.md"],
-      env,
-      { cwd: work },
-    );
-    assert.equal(first.status, 1, first.stderr);
-    assert.match(first.stderr, /^acpx: CALL_HOME outcome=unknown reason=connection call_id=/u);
-    const printed = shellSplit(retryLineOf(first.stderr));
-    assert.equal(printed[0], "acpx");
-    // The command line the agent was told to run: its own words plus the two ids, nothing else.
-    assert.deepEqual(printed.slice(1, 6), [
-      "sessions",
-      "new",
-      "--name",
-      "it's child",
-      "--prompt-file",
-    ]);
-    const retry = await runCli(printed.slice(1), env, { cwd: work });
-    assert.equal(retry.status, 0, retry.stderr);
-    const [a, b] = atrium.requests.filter((r) => r.route === "call");
-    assert.ok(a?.body && b?.body, "two calls reached atrium");
-    assert.deepEqual(b.body.argv, a.body.argv, "the retry's argv is byte-identical to the first's");
-    assert.equal(b.body.call_id, a.body.call_id, "same call_id");
-    assert.equal(b.callId, a.callId);
-    assert.equal(b.stdin, a.stdin, "same file bytes");
-    const argv = a.body.argv as string[];
-    assert.equal(
-      argv[argv.indexOf("--created-by-call") + 1],
-      a.body.call_id,
-      "call_id IS the created-by call",
-    );
-    assert.match(argv[argv.indexOf("--record-id") + 1] ?? "", UUID);
-  });
+  // the lost answer is the FIRST run only: the retry is a replay (atrium runs acpx again and answers `replay:true`)
+  await withAtrium(
+    { calls: [{ answer: { exit: 0 }, loseAnswer: true, times: 1 }] },
+    async (atrium) => {
+      const env = agentPodEnv(home, atrium.url, FAST);
+      const first = await runCli(
+        ["sessions", "new", "--name", "it's child", "--prompt-file", "brief.md"],
+        env,
+        { cwd: work },
+      );
+      assert.equal(first.status, 1, first.stderr);
+      assert.match(first.stderr, /^acpx: CALL_HOME outcome=unknown reason=connection call_id=/u);
+      const printed = shellSplit(retryLineOf(first.stderr));
+      assert.equal(printed[0], "acpx");
+      // The command line the agent was told to run: its own words plus the two ids, nothing else.
+      assert.deepEqual(printed.slice(1, 6), [
+        "sessions",
+        "new",
+        "--name",
+        "it's child",
+        "--prompt-file",
+      ]);
+      const retry = await runCli(printed.slice(1), env, { cwd: work });
+      assert.equal(retry.status, 0, retry.stderr);
+      const [a, b] = atrium.requests.filter((r) => r.route === "call");
+      assert.ok(a?.body && b?.body, "two calls reached atrium");
+      assert.deepEqual(
+        b.body.argv,
+        a.body.argv,
+        "the retry's argv is byte-identical to the first's",
+      );
+      assert.equal(b.body.call_id, a.body.call_id, "same call_id");
+      assert.equal(b.callId, a.callId);
+      assert.equal(b.stdin, a.stdin, "same file bytes");
+      const argv = a.body.argv as string[];
+      assert.equal(
+        argv[argv.indexOf("--created-by-call") + 1],
+        a.body.call_id,
+        "call_id IS the created-by call",
+      );
+      assert.match(argv[argv.indexOf("--record-id") + 1] ?? "", UUID);
+    },
+  );
 });
 
 test("F-1: the caller's own --record-id / --created-by-call are forwarded as given; only the missing one is minted", () => {

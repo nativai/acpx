@@ -121,7 +121,8 @@ test("a create in an agent pod passes through: argv, stdin bytes, --record-id, c
 
 test("the caller's own --record-id is kept, not replaced; a control-store command and a record command about ANOTHER session pass through", async () => {
   const { home } = agentPodHome();
-  await withAtrium({}, async (atrium) => {
+  // the real atrium refuses a record command whose target it cannot resolve (target-unresolved): the session exists there
+  await withAtrium({ resolveTargetAs: OTHER_SESSION }, async (atrium) => {
     const env = agentPodEnv(home, atrium.url);
     const mine = "dddddddd-0000-4000-8000-0000000000d1";
     assert.equal((await runCli(["sessions", "new", "--record-id", mine], env)).status, 0);
