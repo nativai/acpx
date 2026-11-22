@@ -70,6 +70,7 @@ import { copySeatHolderFields, copySeatLinkageFields } from "./seat-fields.js";
 import { findHolderlessSeats, reapHolderlessSeats } from "./seat-holderless.js";
 import { serializeSessionRecordForDisk } from "./serialize.js";
 import { sessionBaseDir } from "./session-base-dir.js";
+import { isPtyScreenFile, PTY_SCREEN_SUFFIX } from "./session-dir-files.js";
 import { dropStaleSleepingForPersist } from "./sleeping-merge.js";
 import {
   canonicalMarkBase,
@@ -2053,9 +2054,12 @@ async function unlinkHardDeletedFiles(
   }
   await unlinkIfPresent(timestampsSidecarPath(sessionDir, safeId));
   await unlinkIfPresent(markersSidecarPath(sessionDir, safeId));
+  await unlinkIfPresent(screenSnapshotPath(sessionDir, safeId));
   try {
     const dirEntries = await fs.readdir(sessionDir);
-    for (const name of dirEntries.filter((entry) => isSessionStreamFile(entry, safeId))) {
+    for (const name of dirEntries.filter(
+      (entry) => isSessionStreamFile(entry, safeId) || isPtyScreenFile(safeId, entry),
+    )) {
       await unlinkIfPresent(path.join(sessionDir, name));
     }
   } catch {
@@ -2867,6 +2871,9 @@ async function unlinkPrunedSessionFiles(
     bytesFreed += await unlinkCountingBytes(timestampsSidecarPath(sessionDir, safeId));
     bytesFreed += await unlinkCountingBytes(markersSidecarPath(sessionDir, safeId));
   }
+  // C12.1: the terminal bridge's pane snapshot goes with the session — RECORD tier, like the owner log
+  // (it is the pod's last screen, not history), so it goes even under `--no-include-history`.
+  bytesFreed += await unlinkCountingBytes(screenSnapshotPath(sessionDir, safeId));
   return bytesFreed;
 }
 
@@ -2920,6 +2927,11 @@ function ownerLogPaths(sessionDir: string, safeId: string): string[] {
  */
 function markersSidecarPath(sessionDir: string, safeId: string): string {
   return path.join(sessionDir, `${safeId}.markers.ndjson`);
+}
+
+/** C12.1 (A-30): the terminal bridge's scrubbed pane snapshot `<id>.pty-screen`. */
+function screenSnapshotPath(sessionDir: string, safeId: string): string {
+  return path.join(sessionDir, `${safeId}${PTY_SCREEN_SUFFIX}`);
 }
 
 function timestampsSidecarPath(sessionDir: string, safeId: string): string {

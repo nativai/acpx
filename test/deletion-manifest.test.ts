@@ -1189,6 +1189,39 @@ test("A8: the marker sidecar follows the stream, in both directions", async () =
   });
 });
 
+/** C12.1 (block A12) — the terminal bridge's pane snapshot `<id>.pty-screen` is the pod's last screen,
+ *  not history: a prune takes it with the session even under `--no-include-history`, and never touches
+ *  another session's snapshot. */
+test("A12: the pane snapshot is deleted with its session — also without history — and another id's stays", async () => {
+  for (const flags of [[], ["--no-include-history"]]) {
+    await withTempHome(async (homeDir) => {
+      const workCwd = path.join(homeDir, "workspace");
+      await fs.mkdir(workCwd, { recursive: true });
+      const id = `screen-${flags.length}`;
+      await seedSession(homeDir, id, workCwd);
+      await seedSession(homeDir, `${id}-neighbour`, workCwd);
+      const shot = (name: string) => path.join(sessionDir(homeDir), `${safe(name)}.pty-screen`);
+      await fs.writeFile(shot(id), '{"v":1}', "utf8");
+      await fs.writeFile(shot(`${id}-neighbour`), '{"v":1}', "utf8");
+      const pruned = await runCli(["claude", "sessions", "prune", id, ...flags], {
+        home: homeDir,
+        cwd: workCwd,
+      });
+      assert.equal(pruned.code, 0, pruned.stderr);
+      assert.equal(
+        await fileExists(shot(id)),
+        false,
+        `the snapshot went with its session (${flags.join(" ") || "default"})`,
+      );
+      assert.equal(
+        await fileExists(shot(`${id}-neighbour`)),
+        true,
+        "another session's snapshot is untouched",
+      );
+    });
+  }
+});
+
 /** T-F6 — a template blueprint spared by a prune keeps its NEW-class files too.
  *  The non-template fixture in the same run is the positive control: its files
  *  of the same classes go present -> absent, so "the blueprint's survived" is

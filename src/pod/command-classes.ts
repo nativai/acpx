@@ -253,6 +253,14 @@ export const COMMAND_TABLE: Readonly<Record<string, CommandEntry>> = {
     judgment:
       "one class per path: the plain read (no --alarm) is passed through from an agent pod too",
   },
+  "__screen-lease": {
+    class: "owner-if-pod",
+    reason:
+      "C12.1 (A-30): the screen lease. On the control pod the routed call when a pod exists, else " +
+      "`no_pod` from the record; in the session's own pod it writes the pod-local lease. Never " +
+      "asks the broker, never talks to the owner",
+    target: { flags: ["--session-id"] },
+  },
   "agent-folders": { class: "local", reason: "group: help only" },
   "agent-folders migrate": {
     class: "control-store",

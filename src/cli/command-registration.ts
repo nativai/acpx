@@ -83,6 +83,7 @@ import { registerModelsCommand } from "./models-command.js";
 import { registerPeopleCommand } from "./people-command.js";
 import { registerProfilesCommand } from "./profiles-command.js";
 import { registerProvidersCommand } from "./providers-command.js";
+import { registerScreenLeaseCommand } from "./screen-lease-command.js";
 import { registerSeatsCommand } from "./seats-command.js";
 import { DEFAULT_CLOSE_DRAIN_TIMEOUT_MS } from "./session/contracts.js";
 import { registerStatusCommand } from "./status-command.js";
@@ -1327,6 +1328,9 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
   // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS` (`"agent-folders"`) — same commit, or the
   // token is absorbed as an agent name (C7, brick 09197f03).
   registerAgentFoldersCommand(program, config);
+  // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS` (`"__screen-lease"`, C12.1 / block A12) —
+  // same commit, plus its class and grammar rows. HIDDEN: atrium's lease call only.
+  registerScreenLeaseCommand(program, config);
   // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS` (`"transcripts"`, brick 81433524).
   registerTranscriptsCommand(program, config);
   registerSubscriptionsCommand(program, config);

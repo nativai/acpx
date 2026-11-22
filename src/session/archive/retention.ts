@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { SEAT_STORE_FILE, seatFromStore, type SeatStore } from "../persistence/seat-store.js";
-import { isNonSessionRecordFile } from "../persistence/session-dir-files.js";
+import { isNonSessionRecordFile, isPtyScreenFile } from "../persistence/session-dir-files.js";
 import {
   claimFileSets,
   claimOrphanFileSets,
@@ -326,7 +326,9 @@ function makeCandidate(
   const fileMtimes = new Map<string, number>();
   for (const file of fileSet) {
     const stat = stats.get(file);
-    if (!stat) {
+    // C12.1: the terminal bridge's pane snapshot is rewritten every second while a viewer looks — it
+    // says nothing about the session's age or quiet, and it is removed (not archived) at apply.
+    if (!stat || isPtyScreenFile(safeId, file)) {
       continue;
     }
     bytes += stat.bytes;

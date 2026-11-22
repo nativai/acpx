@@ -400,6 +400,10 @@ async function archiveOneId(
   for (const failure of outcome.failed) {
     result.failures.push({ id: candidate.id, ...failure });
   }
+  // C12.1: the record is archived (or failed) above; the bridge's pane snapshot is removed, never archived.
+  for (const screenFile of revalidated.screenFiles) {
+    await fs.rm(path.join(context.hotDir, screenFile), { force: true });
+  }
   const bytes = revalidated.stats.reduce((sum, stat) => sum + stat.bytes, 0);
   result.moved.push({
     id: candidate.id,

@@ -3,6 +3,7 @@ import path from "node:path";
 import { withSessionIndexLock } from "../persistence/index-lock.js";
 import { reconcileSessionIndex, writeSessionIndex } from "../persistence/index.js";
 import { readSeatStore, seatFromStore } from "../persistence/seat-store.js";
+import { isPtyScreenFile } from "../persistence/session-dir-files.js";
 import { ACTIVE_SIDECAR_SUFFIXES, recordFileNameFor } from "./identity.js";
 import type { ArchiveManifestRow, ArchiveManifestWriter } from "./manifest.js";
 import { readArchiveRecord, type ArchiveRecordView } from "./record-view.js";
@@ -211,7 +212,13 @@ export async function moveFileSet(
 }
 
 export type ApplyRevalidation =
-  | { ok: true; view: ArchiveRecordView | undefined; stats: FileStat[] }
+  | {
+      ok: true;
+      view: ArchiveRecordView | undefined;
+      stats: FileStat[];
+      /** C12.1: the bridge's pane snapshot (and its temp name) — REMOVED at apply, never archived. */
+      screenFiles: string[];
+    }
   | { ok: false; reason: string; detail?: string };
 
 /**
@@ -262,7 +269,13 @@ export async function revalidateBeforeApply(
   }
 
   const view = revalidatedRecord.view;
-  const stats = await statFileSet(hotDir, files);
+  // C12.1: `<id>.pty-screen` is the pod's last screen, not session history. It is set aside here — so
+  // it neither moves into the archive nor counts toward `touched-recently` — and removed after the move.
+  const screenFiles = files.filter((file) => isPtyScreenFile(safeId, file));
+  const stats = await statFileSet(
+    hotDir,
+    files.filter((file) => !isPtyScreenFile(safeId, file)),
+  );
   if (stats.length === 0) {
     return { ok: false, reason: "nothing-to-move" };
   }
@@ -270,7 +283,7 @@ export async function revalidateBeforeApply(
   if (nowMs - newestMtimeMs < quietMs) {
     return { ok: false, reason: "touched-recently" };
   }
-  return { ok: true, view, stats };
+  return { ok: true, view, stats, screenFiles };
 }
 
 async function revalidateRecord(

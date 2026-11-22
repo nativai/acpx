@@ -190,6 +190,7 @@ export const COMMAND_GRAMMAR: Readonly<Record<string, GrammarNode>> = {
   },
   "agent-folders": { valueFlags: [], helpCommand: true },
   "agent-folders migrate": { valueFlags: ["--format", "--pool", "--sessions-dir"] },
+  "__screen-lease": { valueFlags: ["--session-id", "--ttl-s"] },
   transcripts: { valueFlags: [], helpCommand: true },
   "transcripts dedup": { valueFlags: ["--format", "--manifest", "--session"] },
   "transcripts restore": { valueFlags: ["--format", "--to"] },

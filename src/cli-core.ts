@@ -94,6 +94,9 @@ export const TOP_LEVEL_VERBS = new Set([
   // `registerAgentFoldersCommand`. This entry is the second half of the two registrations that verb needs:
   // without it `acpx agent-folders bogus` is a prompt delivery to the cwd's session, not an error.
   "agent-folders",
+  // `__screen-lease` — C12.1's hidden lease verb (block A12), registered by `registerScreenLeaseCommand`.
+  // Second half of the two registrations: without it `acpx __screen-lease bogus` is read as an agent name.
+  "__screen-lease",
   // `transcripts` — `transcripts dedup` / `transcripts restore` (brick 81433524), registered by
   // `registerTranscriptsCommand`. Second half of the two registrations: without it
   // `acpx transcripts bogus` is a prompt delivery to the cwd's session, not an error.

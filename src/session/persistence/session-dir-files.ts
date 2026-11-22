@@ -69,3 +69,17 @@ export const SEAT_STORE_FILE = "seats.json";
 export function isNonSessionRecordFile(filename: string): boolean {
   return filename === SESSION_INDEX_FILE || filename === SEAT_STORE_FILE;
 }
+
+/** `.pty-screen` — the terminal bridge's pane snapshot's suffix (C12.1, A-30). NEVER `.json` (A-13). */
+export const PTY_SCREEN_SUFFIX = ".pty-screen";
+
+/**
+ * `<id>.pty-screen` and its writer's temp name `<id>.pty-screen.tmp-<pid>` — a file the bridge writes
+ * in the session's own pod beside the record, not a record and not history. The hard delete removes
+ * it with the session; the archive step REMOVES it instead of archiving it (C12.1 "The file is kept
+ * after the lease ends" — until the session is archived or deleted). Takes a bare filename.
+ */
+export function isPtyScreenFile(safeId: string, fileName: string): boolean {
+  const base = `${safeId}${PTY_SCREEN_SUFFIX}`;
+  return fileName === base || fileName.startsWith(`${base}.tmp-`);
+}
