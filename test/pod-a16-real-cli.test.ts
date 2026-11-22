@@ -12,8 +12,6 @@ import { queueLockFilePath } from "../src/cli/queue/paths.js";
 import { sessionKey } from "../src/pod/placement.js";
 import { sessionBaseDir } from "../src/session/persistence/session-base-dir.js";
 import {
-  bare404,
-  clearNodes,
   clearPods,
   failWith,
   putNode,

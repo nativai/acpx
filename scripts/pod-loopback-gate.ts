@@ -209,12 +209,13 @@ const CASES: Case[] = [
   },
   {
     label: "a command past its deadline → unknown deadline",
-    options: (lb) => ({
-      class: "one-shot",
-      expectUid: lb.uid,
+    // The gate's loopback pod is a SESSION's pod (its identity marker names `lb.key`), so the deadline is the
+    // `owner-if-pod` call's own. (The case once passed `class: "one-shot"` with a Claude session's target, which
+    // A-7's utility-scope check refuses before anything runs — the one-shot form has its own rows in
+    // `test/pod-routed-call.test.ts`.)
+    options: () => ({
       argv: ["sleep", "30"],
       deadlineMs: 2000,
-      lookup: undefined,
     }),
     expect: re(/^acpx: ROUTED outcome=unknown reason=deadline call_id=\S+$/),
   },

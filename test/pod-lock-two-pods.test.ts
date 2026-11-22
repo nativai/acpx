@@ -6,7 +6,6 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
-  bare404,
   clearNodes,
   clearPods,
   failWith,

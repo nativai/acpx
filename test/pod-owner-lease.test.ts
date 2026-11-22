@@ -15,8 +15,6 @@ import { LEASE_ROUTED_CONTRACT, leasePodFields, podSocketPath } from "../src/pod
 import { sessionKey } from "../src/pod/placement.js";
 import { ROUTED_CONTRACT_VERSION } from "../src/pod/routed-call.js";
 import {
-  bare404,
-  clearNodes,
   clearPods,
   failWith,
   putNode,

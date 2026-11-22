@@ -10,16 +10,7 @@ import {
 import { queueLockFilePath } from "../src/cli/queue/paths.js";
 import { recordPodEnd } from "../src/pod/pod-end.js";
 import { parseSessionRecord } from "../src/session/persistence.js";
-import {
-  bare404,
-  clearNodes,
-  clearPods,
-  failWith,
-  putNode,
-  putPod,
-  requestLines,
-  startKitApi,
-} from "./pod-kit-api-helpers.js";
+import { failWith, putPod, startKitApi } from "./pod-kit-api-helpers.js";
 import { makeWorld, withEnv, worldEnv } from "./pod-owner-helpers.js";
 import {
   makeSessionRecord,

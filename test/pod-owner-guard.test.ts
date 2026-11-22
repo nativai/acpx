@@ -22,16 +22,7 @@ import {
 import { agentPodName } from "../src/pod/placement.js";
 import { textPrompt } from "../src/prompt-content.js";
 import type { OutputFormatter } from "../src/types.js";
-import {
-  bare404,
-  clearNodes,
-  clearPods,
-  failWith,
-  putNode,
-  putPod,
-  requestLines,
-  startKitApi,
-} from "./pod-kit-api-helpers.js";
+import { failWith, putNode, putPod, requestLines, startKitApi } from "./pod-kit-api-helpers.js";
 import { makeWorld, withEnv, worldEnv, writePlaceFile } from "./pod-owner-helpers.js";
 
 // Block A4 (brick 30df3a5b): the owner-entry guard (C7.2 `owner_outside_pod`), the owner spawn's
