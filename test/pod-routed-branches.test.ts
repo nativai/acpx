@@ -140,6 +140,7 @@ test("routed-ensure: the call goes to the session's key as class owner-ensure, w
     sessionId: SESSION,
     seat: "seat-1",
     harness: "claude",
+    placement: "auto", // A-45: Claude is not home-only
     admissionClass: "delivery",
   });
   assert.equal(h.stdinReads, 0, "text given: stdin is not read");
@@ -242,6 +243,36 @@ test("A-39: a `claude-pty` harness is refused by name before anything is asked �
     assert.equal(routed.failures.length, 0, kind);
     assert.equal(routed.runs.length, 1, `${kind} still routes`);
   }
+});
+
+// A-45 (brick 25e97206): a session's placement follows the SAME home-only function as a one-shot's pod key.
+test("A-45 unit: a home-only harness is placed `home`, anything else `auto`; with P1's per-box fact Pi is `auto` for sessions — codex never leaves home", async () => {
+  const placementOf = async (kind: string, env: NodeJS.ProcessEnv = {}) => {
+    const h = harness({
+      record: { acpxRecordId: SESSION, agentCommand: `node /opt/${kind}/dist/index.js` },
+      harnessOf: () => kind,
+      env: { PATH: "/usr/bin", ...env },
+    });
+    await routedBranchHandlers(h.deps)["routed-ensure"](
+      decisionFor(["claude", "prompt", "--session-id", SESSION, "x"]),
+      ctx(),
+    );
+    assert.equal(h.runs.length, 1, kind);
+    return h.runs[0]?.target.placement;
+  };
+  assert.equal(await placementOf("codex"), "home");
+  assert.equal(await placementOf("pi"), "home", "before P1");
+  assert.equal(await placementOf("claude"), "auto");
+  const p1 = { NODE_TEST_CONTEXT: "child", ACPX_TEST_P1_ON_BOX: "1" };
+  assert.equal(await placementOf("pi", p1), "auto", "with P1's fact");
+  assert.equal(await placementOf("codex", p1), "home", "codex stays home");
+  assert.equal(await placementOf("claude", p1), "auto");
+  // The seam outside a test, or with another value, is no signal: the acpx release alone never moves Pi.
+  assert.equal(await placementOf("pi", { ACPX_TEST_P1_ON_BOX: "1" }), "home");
+  assert.equal(
+    await placementOf("pi", { NODE_TEST_CONTEXT: "child", ACPX_TEST_P1_ON_BOX: "0" }),
+    "home",
+  );
 });
 
 // ───────────────────────── stdin (the routed command has none) ─────────────────────────
@@ -867,6 +898,41 @@ test("A-39 off pod mode: a claude-pty record behaves exactly as today — no har
   } finally {
     pod.closeAll();
   }
+});
+
+test("A-45 rows 45.1/45.2 (CLI, pod mode): the wake of a Codex session posts `placement: home`, a Claude session `auto`, a Pi session `home` before P1 and `auto` with P1's fact", async () => {
+  const wake = async (command: string, extra: NodeJS.ProcessEnv = {}) => {
+    const pod = await podFixture({
+      command,
+      api: { items: [] },
+      broker: { lines: ["scheduling", READY] },
+      stub: { exit: 0, stdout: "queued\n" },
+    });
+    try {
+      const result = await cli(["claude", "prompt", "--session-id", SESSION, "hello"], {
+        ...pod.env,
+        ...extra,
+      });
+      assert.equal(result.code, 0, `${command}: ${result.stderr}`);
+      const [body, ...rest] = pod.brokerBodies();
+      assert.equal(rest.length, 0, command);
+      return body?.placement;
+    } finally {
+      pod.closeAll();
+    }
+  };
+  assert.equal(await wake("node /opt/codex-acp/dist/index.js"), "home", "45.1");
+  assert.equal(await wake(CLAUDE), "auto", "45.1 control");
+  assert.equal(await wake("node /opt/pi-acp/dist/index.js"), "home", "45.2 before P1");
+  assert.equal(
+    await wake("node /opt/pi-acp/dist/index.js", { ACPX_TEST_P1_ON_BOX: "1" }),
+    "auto",
+    "45.2 with P1's fact",
+  );
+  assert.equal(
+    await wake("node /opt/codex-acp/dist/index.js", { ACPX_TEST_P1_ON_BOX: "1" }),
+    "home",
+  );
 });
 
 test("seams: the release directory and payload directory seams are honoured only under node --test", async () => {
