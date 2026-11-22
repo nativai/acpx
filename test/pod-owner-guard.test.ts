@@ -22,7 +22,7 @@ import {
 import { agentPodName } from "../src/pod/placement.js";
 import { textPrompt } from "../src/prompt-content.js";
 import type { OutputFormatter } from "../src/types.js";
-import { startFakeApi } from "./pod-lock-fake-api.js";
+import { failWith, putNode, putPod, requestLines, startKitApi } from "./pod-kit-api-helpers.js";
 import { makeWorld, withEnv, worldEnv, writePlaceFile } from "./pod-owner-helpers.js";
 
 // Block A4 (brick 30df3a5b): the owner-entry guard (C7.2 `owner_outside_pod`), the owner spawn's
@@ -258,11 +258,11 @@ function localControlEnv(owner: ReturnType<typeof makeWorld>, apiUrl: string) {
 
 test("A-16: switch off, the lease names a pod that still exists → pod_starting turnover (75), NO local owner starts", async () => {
   const owner = makeWorld("wake-exists");
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
     // The pod's delete FAILED (or has not happened): the API server still shows it, so it is not gone.
-    api.state.pods.set(owner.pod.name, { uid: owner.pod.uid, phase: "Running" });
-    api.state.nodes.set(owner.pod.node, "True");
+    putPod(api, owner.pod.name, { uid: owner.pod.uid, phase: "Running" });
+    putNode(api, owner.pod.node, "True");
     await staleLeaseFromPod(owner);
     const counting = countingDeps();
     await withEnv(localControlEnv(owner, api.url), async () => {
@@ -294,9 +294,9 @@ test("A-16: switch off, the lease names a pod that still exists → pod_starting
 
 test("A-16: the API server cannot be asked (unknown) → the same refusal; unknown is alive", async () => {
   const owner = makeWorld("wake-unknown");
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
-    api.state.failure = "500";
+    failWith(api, "500");
     await staleLeaseFromPod(owner);
     const counting = countingDeps();
     await withEnv(localControlEnv(owner, api.url), async () => {
@@ -312,9 +312,9 @@ test("A-16: the API server cannot be asked (unknown) → the same refusal; unkno
 
 test("A-16: the pod is proven gone → the wake proceeds and the stale lease is reaped by its proof", async () => {
   const owner = makeWorld("wake-gone");
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
-    api.state.nodes.set(owner.pod.node, "True"); // no pod of that name, its node is Ready: gone
+    putNode(api, owner.pod.node, "True"); // no pod of that name, its node is Ready: gone
     await staleLeaseFromPod(owner);
     const counting = countingDeps();
     await withEnv(localControlEnv(owner, api.url), async () => {
@@ -335,7 +335,7 @@ test("A-16: the pod is proven gone → the wake proceeds and the stale lease is 
 
 test("A-16 negative: a lease WITHOUT a pod field is today's — the guard asks nothing and starts a local owner", async () => {
   const world = makeWorld("wake-nopod");
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
     // A control-pod lease: no `pod`, written by a process that is not in an agent pod.
     await withEnv(worldEnv(world, { place: "control" }), async () => {
@@ -349,7 +349,7 @@ test("A-16 negative: a lease WITHOUT a pod field is today's — the guard asks n
       },
     );
     assert.equal(counting.spawns(), 1);
-    assert.deepEqual(api.state.requests, [], "no death proof for a lease that names no pod");
+    assert.deepEqual(requestLines(api), [], "no death proof for a lease that names no pod");
   } finally {
     await api.close();
   }

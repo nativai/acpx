@@ -25,6 +25,7 @@ import {
   newestRecordAdvertisement,
   peekAgentStartedAt,
   RECORD_ADVERTISEMENT_MAX_READS,
+  scanHeadForStart,
   START_PEEK_BYTES,
   type RecordAdvertisement,
 } from "../src/pod/probe-records.js";
@@ -358,6 +359,114 @@ test("probe speed: `agent_started_at` is read from the first bytes — pinned to
   assert.equal(await peekAgentStartedAt(junk), undefined);
 });
 
+// ---- brick c2b7358d, R1: the peek accepts `agent_started_at` only as a key of the record's OWN top-level object ----
+
+function peekOf(text: string): Promise<string | undefined> {
+  const dir = fs.mkdtempSync(path.join(ROOT, "peek-r1-"));
+  const file = path.join(dir, "record.json");
+  fs.writeFileSync(file, text);
+  return peekAgentStartedAt(file);
+}
+
+const REAL_START = "2026-11-19T00:00:00.000Z";
+const DECOY = "2099-01-01T00:00:00.000Z";
+
+test("R1a: a NESTED `agent_started_at` is never the record's start — in a tool call's input, in `agent_capabilities._meta`, or inside a string — and with no top-level one the record ranks last", async () => {
+  const bodies: string[] = [
+    // a nested object in the head, no top-level field; messages follow
+    JSON.stringify({
+      schema: "x",
+      agent_capabilities: { _meta: { agent_started_at: DECOY } },
+      messages: [{ tool_use: { input: { agent_started_at: DECOY } } }],
+      acpx: {},
+    }),
+    // the same inside an ARRAY element's object, before the top-level keys end
+    JSON.stringify({ items: [{ agent_started_at: DECOY }], acpx: {} }),
+    // an escaped copy inside a string value
+    JSON.stringify({ title: `x "agent_started_at": "${DECOY}" y`, acpx: {} }),
+  ];
+  for (const text of bodies) {
+    assert.equal(await peekOf(text), undefined, text.slice(0, 80));
+  }
+  // The decoy is really in the head (so the old text scan WOULD have read it): positive control for the rows.
+  assert.ok(bodies[0]?.includes(`"agent_started_at":"${DECOY}"`));
+});
+
+test("R1a: a nested decoy BEFORE the real top-level field does not hide it; a decoy AFTER does not replace it", async () => {
+  assert.equal(
+    await peekOf(
+      JSON.stringify({
+        a: { agent_started_at: DECOY },
+        agent_started_at: REAL_START,
+        messages: [],
+      }),
+    ),
+    REAL_START,
+  );
+  assert.equal(
+    await peekOf(
+      JSON.stringify({ agent_started_at: REAL_START, messages: [{ agent_started_at: DECOY }] }),
+    ),
+    REAL_START,
+  );
+  // braces and quotes inside strings do not move the depth
+  assert.equal(
+    await peekOf(
+      JSON.stringify({
+        title: '}{ "agent_started_at": "' + DECOY + '" [[',
+        agent_started_at: REAL_START,
+      }),
+    ),
+    REAL_START,
+  );
+});
+
+test("R1b: a top-level `agent_started_at` that comes AFTER a large `messages` (past the peek) is found, not ranked last — `messages` is not conclusive", async () => {
+  const big = JSON.stringify({
+    messages: [{ text: "x".repeat(3 * START_PEEK_BYTES) }],
+    agent_started_at: REAL_START,
+  });
+  assert.ok(big.indexOf("agent_started_at") > START_PEEK_BYTES, "the key lies past the peek");
+  assert.equal(await peekOf(big), REAL_START);
+  // a normal record (start before messages) is still settled by the head: its tail is never parsed
+  const settled = `{"agent_started_at":"${REAL_START}","messages":["${"y".repeat(3 * START_PEEK_BYTES)}`; // torn tail
+  assert.equal(
+    await peekOf(settled),
+    REAL_START,
+    "found in the head — a full parse would have thrown",
+  );
+  // The same torn record with the field past the peek is NOT found (the full parse fails) — and never throws.
+  assert.equal(await peekOf(`{"messages":["${"y".repeat(3 * START_PEEK_BYTES)}`), undefined);
+});
+
+test("R1: a key straddling the peek boundary, a non-string value and an empty one are handled", async () => {
+  for (const pad of [START_PEEK_BYTES - 40, START_PEEK_BYTES - 20, START_PEEK_BYTES - 5]) {
+    const text = JSON.stringify({ padding: "p".repeat(pad), agent_started_at: REAL_START });
+    assert.equal(await peekOf(text), REAL_START, `pad ${pad}`);
+  }
+  assert.equal(await peekOf(JSON.stringify({ agent_started_at: null })), undefined);
+  assert.equal(await peekOf(JSON.stringify({ agent_started_at: 5 })), undefined);
+  assert.equal(await peekOf(JSON.stringify({ agent_started_at: "" })), undefined);
+  assert.equal(await peekOf("not json at all"), undefined);
+});
+
+test("R1 the head scan itself: found / absent / unsure, with the depth rule", () => {
+  assert.deepEqual(scanHeadForStart(`{"agent_started_at":"${REAL_START}"}`, true), {
+    kind: "found",
+    value: REAL_START,
+  });
+  assert.deepEqual(scanHeadForStart('{"a":1}', true), { kind: "absent" });
+  assert.deepEqual(scanHeadForStart('{"a":{"agent_started_at":"x"}}', true), { kind: "absent" });
+  assert.deepEqual(scanHeadForStart('{"a":1', false), { kind: "unsure" }, "the head ended first");
+  assert.deepEqual(
+    scanHeadForStart('{"a":1}', false),
+    { kind: "unsure" },
+    "a head that is not the whole file cannot say absent",
+  );
+  assert.deepEqual(scanHeadForStart('{"agent_star', false), { kind: "unsure" });
+  assert.deepEqual(scanHeadForStart("", true), { kind: "unsure" });
+});
+
 test("round 2 / F-A: a Codex record with NO profile (what a default-profile session writes) answers --profile <the default>; an explicit OTHER profile does not; a no-profile record answers nothing when the asked profile is not the default", async () => {
   const s = store([
     { id: "plain", command: CODEX, lastUsedAt: "2026-11-21T00:00:00Z", models: ["g[low]"] },
@@ -555,6 +664,47 @@ test("claude advertisement from records: an `exact` record WITHOUT agent_started
   });
   assert.equal(known.status.state, "fresh");
   assert.equal(known.status.recordAgentStartedAt, "2026-11-20T00:00:00.000Z");
+});
+
+test("claude advertisement from records: `adapterMatch` says exact / harness beside `state` — an exact record without agent_started_at is stale AND exact; a harness record is harness; no record served leaves the key absent", async () => {
+  const where = claudeAdvertDir();
+  const served = (found: ReturnType<typeof recordOf>) =>
+    ensureClaudeAdvertisement({
+      ...where,
+      env: {},
+      mode: "never",
+      servedFromRecords: () => true,
+      recordAdvertisement: async () => found,
+    });
+  // the case atrium could not tell apart: stale because the age is unknown, yet the box's own command
+  const exactNoStart = await served(recordOf("exact", null));
+  assert.equal(exactNoStart.status.state, "stale");
+  assert.equal(exactNoStart.status.adapterMatch, "exact");
+  assert.equal(exactNoStart.status.recordAgentStartedAt, undefined);
+  // an exact record with a start: fresh and exact (the existing values of `state` are unchanged)
+  const exactKnown = await served(recordOf("exact"));
+  assert.equal(exactKnown.status.state, "fresh");
+  assert.equal(exactKnown.status.adapterMatch, "exact");
+  // a harness record: stale (always) and harness — with or without a start
+  for (const startedAt of [undefined, null] as const) {
+    const harness = await served(
+      startedAt === null ? recordOf("harness", null) : recordOf("harness"),
+    );
+    assert.equal(harness.status.state, "stale");
+    assert.equal(harness.status.adapterMatch, "harness");
+  }
+  // no record served: the key is ABSENT (not null, not empty) and `state` is whatever it was
+  const none = await ensureClaudeAdvertisement({
+    ...where,
+    env: {},
+    mode: "never",
+    servedFromRecords: () => true,
+    recordAdvertisement: async () => undefined,
+  });
+  assert.equal("adapterMatch" in none.status, false);
+  assert.equal(none.status.state, "none");
+  // and it survives the JSON the catalogue prints
+  assert.equal(JSON.parse(JSON.stringify(exactNoStart.status)).adapterMatch, "exact");
 });
 
 test("round 2 / F-B + F-G: a record of the box's own adapter command answers even when a NEWER record of another command (a dev or rig adapter) exists — a newer rig record never hides the deployed adapter's output styles", async () => {

@@ -2,8 +2,6 @@ import "./install-owner-reaper.js";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
-import http from "node:http";
-import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -11,7 +9,8 @@ import { fileURLToPath } from "node:url";
 import { isClaudePtyCommand } from "../src/pod/harness-support.js";
 import { newestRecordAdvertisement } from "../src/pod/probe-records.js";
 import type { SessionRecord } from "../src/types.js";
-import { startBroker } from "./pod-local-fake-broker.js";
+import { startFakeApiServer } from "./pod-kit/fake-apiserver.js";
+import { startFakeBroker } from "./pod-kit/fake-broker.js";
 import { sessionFilePath } from "./runtime-test-helpers.js";
 
 // A-39 (brick b69eeecf), the REAL-SHAPED rows: the terminal harness `claude-pty` is not in phase 1, so in
@@ -128,22 +127,6 @@ fs.appendFileSync(path.join(__dirname, "calls.jsonl"), JSON.stringify({ argv: pr
 process.stdout.write("stub-answer\\n");
 `;
 
-async function startApi(): Promise<{ url: string; close(): void }> {
-  const server = http.createServer((_req, res) => {
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ kind: "PodList", items: [] }));
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const { port } = server.address() as AddressInfo;
-  return {
-    url: `http://127.0.0.1:${port}`,
-    close: () => {
-      server.closeAllConnections();
-      server.close();
-    },
-  };
-}
-
 function saFixture(): string {
   const dir = fs.mkdtempSync(path.join(ROOT, "sa-"));
   fs.writeFileSync(path.join(dir, "namespace"), "dev-devbox\n");
@@ -186,8 +169,13 @@ async function rig(
   if (options.withRecord !== false) {
     fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`);
   }
-  const api = await startApi();
-  const broker = await startBroker({ lines: ["scheduling", READY] });
+  const api = await startFakeApiServer({ namespace: "dev-devbox", token: "tok-1", pods: [] });
+  // The kit's home cap is the real broker's default, 0: a home-placed wake (A-45: Pi before P1) is `home_full`
+  // unless the box has a home cap.
+  const broker = await startFakeBroker({
+    default: { steps: ["scheduling"], final: READY },
+    status: { home: { cap: 5 } },
+  });
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     HOME: home,
@@ -199,7 +187,7 @@ async function rig(
     NV_NODE_NAME: "node-a",
     ACPX_POD_SA_DIR: saFixture(),
     ACPX_POD_API_URL: api.url,
-    NV_AGENT_BROKER_URL: broker.origin,
+    NV_AGENT_BROKER_URL: broker.url,
     ACPX_AGENT_EXEC: path.join(stubDir, "agent-exec"),
     ACPX_TEST_RUNTIME_DIR: runtime,
   };
@@ -226,15 +214,15 @@ async function rig(
         ? fs.readFileSync(callsFile, "utf8").trim().split("\n").length
         : 0;
     },
-    brokerRequests: () => broker.seen.length,
+    brokerRequests: () => broker.requests.length,
     brokerBodies: () =>
-      broker.seen
+      broker.requests
         .filter((request) => request.method === "POST")
-        .map((request) => JSON.parse(request.body) as { releases?: Record<string, string> }),
-    brokerPosts: () => broker.seen.filter((request) => request.method === "POST").length,
-    close: () => {
-      api.close();
-      broker.close();
+        .map((request) => (request.body ?? {}) as { releases?: Record<string, string> }),
+    brokerPosts: () => broker.requests.filter((request) => request.method === "POST").length,
+    close: async () => {
+      await api.close();
+      await broker.close();
     },
   };
 }
@@ -285,7 +273,7 @@ async function refused(args: string[], label: string) {
       );
     }
   } finally {
-    pod.close();
+    await pod.close();
   }
 }
 
@@ -324,7 +312,7 @@ test("A-39 controls in the same rig and store: a claude one-shot still goes to t
         `${args.join(" ")}: the broker was asked (nothing answered from the claude-pty record)`,
       );
     } finally {
-      pod.close();
+      await pod.close();
     }
   }
 });
@@ -337,7 +325,7 @@ test("A-39 the other harnesses' prompts still route in this rig (the rig is live
     assert.equal(pod.brokerRequests(), 1);
     assert.equal(pod.calls(), 1);
   } finally {
-    pod.close();
+    await pod.close();
   }
 });
 
@@ -355,7 +343,7 @@ test("A-39 off pod mode: the claude-pty record's commands are unchanged — no h
     );
     assert.equal(pod.brokerRequests(), 0);
   } finally {
-    pod.close();
+    await pod.close();
   }
 });
 
@@ -386,7 +374,7 @@ test("A-39 create: `sessions new --agent claude-pty` in pod mode is refused by n
       assert.equal(pod.brokerRequests(), 0);
       assert.equal(pod.calls(), 0);
     } finally {
-      pod.close();
+      await pod.close();
     }
   }
 });
@@ -402,7 +390,7 @@ test("A-39 create control: the same create with a claude command still writes it
     );
     assert.equal(pod.brokerRequests(), 0, "a record-only create asks no broker");
   } finally {
-    pod.close();
+    await pod.close();
   }
 });
 
@@ -422,7 +410,7 @@ test("A-39 create off pod mode: a claude-pty-named agent's create is unchanged �
     assert.ok(sessionFiles(pod.sessionsDir).some((name) => /^[0-9a-f-]{36}\.json$/.test(name)));
     assert.equal(pod.brokerRequests(), 0);
   } finally {
-    pod.close();
+    await pod.close();
   }
 });
 
@@ -441,7 +429,7 @@ test("A-42 (row 42.1): the control pod's `pi` link absent — a prompt to a PI r
     assert.equal(piRig.brokerRequests(), 0, "the broker was never asked");
     assert.equal(piRig.calls(), 0, "no pod was asked for or started");
   } finally {
-    piRig.close();
+    await piRig.close();
   }
   const claudeRig = await rig(CLAUDE_COMMAND, { withoutLinks: withoutPi });
   try {
@@ -453,7 +441,7 @@ test("A-42 (row 42.1): the control pod's `pi` link absent — a prompt to a PI r
     assert.equal("acpx" in (body?.releases ?? {}), true, "and still names the others");
     assert.equal(claudeRig.calls(), 1);
   } finally {
-    claudeRig.close();
+    await claudeRig.close();
   }
   // Control: the Pi record with `pi` linked is routed.
   const linked = await rig("node /opt/pi-acp/dist/index.js");
@@ -462,6 +450,6 @@ test("A-42 (row 42.1): the control pod's `pi` link absent — a prompt to a PI r
     assert.equal(result.code, 0, result.stderr);
     assert.equal(linked.brokerRequests(), 1);
   } finally {
-    linked.close();
+    await linked.close();
   }
 });

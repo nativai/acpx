@@ -555,6 +555,17 @@ function releasesOrFail(options: RoutedCallOptions, callId: string): Record<stri
       callId,
     });
   }
+  // A-46: a name that is not a release name never goes out, whoever resolved it — a bad pin fails HERE,
+  // before the broker, not at the pod's start.
+  const badTool = Object.entries(releases.releases).find(([, name]) => !isReleaseName(name))?.[0];
+  if (badTool !== undefined) {
+    throw new RoutedCallError({
+      outcome: "not_run",
+      reason: "release_unresolved",
+      tool: badTool,
+      callId,
+    });
+  }
   // A-41: `pi` is optional in `releases`, so a Pi session on a box without it is refused HERE — named,
   // before the broker — instead of getting a pod whose adapter cannot start. Claude and Codex are unaffected.
   if (needsPi(options) && releases.releases.pi === undefined) {
@@ -579,10 +590,15 @@ function refuseReadyPodWithoutPi(
   }
 }
 
-/** A release directory name, as the broker validates one: a plain token. An empty or odd value is NOT a release — it counts as absent. */
-const RELEASE_NAME = /^[A-Za-z0-9._+-]{1,128}$/;
-function isReleaseName(value: string | undefined): boolean {
-  return value !== undefined && RELEASE_NAME.test(value);
+/**
+ * THE release-name grammar (C9, A-46): the entrypoint's rule (`runtime-links.sh`) plus a 128-character bound —
+ * it starts with a letter or digit (so never `.`, `..` or a hidden name), has no path separator and no `+`,
+ * and is never `previous`. A release name ends up in a path, so every place that reads or sends one asks THIS.
+ * Every bootstrap name (`<sha>-<stamp>[-in-place]`) passes. An empty or odd value is NOT a release.
+ */
+export const RELEASE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+export function isReleaseName(value: string | undefined): value is string {
+  return value !== undefined && RELEASE_NAME.test(value) && value !== "previous";
 }
 
 /** The one named line for a Pi call that cannot have `pi` (A-42/A-43): no new public reason. */
@@ -959,7 +975,7 @@ function releaseNameOf(target: string, tool: string): string | undefined {
   const parts = target.split("/").filter((part) => part.length > 0);
   const name = parts.at(-1);
   const shaped = parts.at(-3) === ".releases" && parts.at(-2) === tool;
-  return shaped ? name : undefined;
+  return shaped && isReleaseName(name) ? name : undefined;
 }
 
 /** The link's target; `null` when NOTHING is there (ENOENT); `undefined` when something is there that cannot be read as a link. */

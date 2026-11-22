@@ -287,6 +287,14 @@ export type ClaudeAdvertisementStatus = {
    * what the names' age really is (`probedAt` is the record's last use). A record with none is `stale`.
    */
   recordAgentStartedAt?: string;
+  /**
+   * `source: "records"` only (additive; absent otherwise): whether the serving record was started with the box's
+   * OWN adapter command (`"exact"`) or another command of the same harness (`"harness"`) — the same value the
+   * record-served `adapter_match` carries elsewhere. It says WHICH adapter; `state` and `recordAgentStartedAt`
+   * say how old. A consumer must read the two separately: an `exact` record with no `agent_started_at` is
+   * `state: "stale"` (age unknown) although it is not a `harness` record.
+   */
+  adapterMatch?: "exact" | "harness";
 };
 
 /** How well the catalogue knows what the box's OpenRouter key allows. */
