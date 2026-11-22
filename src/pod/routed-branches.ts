@@ -267,7 +267,7 @@ async function dispatchRouted(
   if (isRoutedCall(deps.env)) {
     // A command that arrived in a pod already routed is never routed again (A-8 `routed_twice`) —
     // the same helper block A3's pass-through uses.
-    return refuseRoutedTwice(decision.classification.output, context.write);
+    return refuseRoutedTwice(decision.classification.output, context.write, context.writeStdout);
   }
   const ready = await readyOrFail(decision, deps, routedClass);
   if (typeof ready === "number") {

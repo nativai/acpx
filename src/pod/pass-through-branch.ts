@@ -59,7 +59,12 @@ export {
 
 // ─── the marker: a routed command is never routed twice (A-8) — one helper, shared with block A6 ──
 
-import { isRoutedCall, ROUTED_MARKER_ENV, ROUTED_TWICE_REFUSAL } from "./routed-twice.js";
+import {
+  isRoutedCall,
+  refuseRoutedTwice,
+  ROUTED_MARKER_ENV,
+  ROUTED_TWICE_REFUSAL,
+} from "./routed-twice.js";
 
 export { isRoutedCall, ROUTED_MARKER_ENV, ROUTED_TWICE_REFUSAL };
 
@@ -219,12 +224,7 @@ export async function runPassThrough(run: PassThroughRun): Promise<number> {
   const env = run.env ?? process.env;
   const { decision, context } = run;
   if (isRoutedCall(env)) {
-    return refuseLines(
-      decision,
-      context,
-      ROUTED_TWICE_REFUSAL.lines,
-      ROUTED_TWICE_REFUSAL.exitCode,
-    );
+    return refuseRoutedTwice(decision.output, context.write, context.writeStdout);
   }
   const call = buildCallOrRefuse(run, env);
   if (typeof call === "number") {
@@ -273,7 +273,7 @@ registerBranchHandler("message-route", async (decision, context) => {
   const refuseWith = (lines: readonly [string, string], exitCode: number): number =>
     refuseLines(decision, context, lines, exitCode);
   if (isRoutedCall()) {
-    return refuseWith(ROUTED_TWICE_REFUSAL.lines, ROUTED_TWICE_REFUSAL.exitCode);
+    return refuseRoutedTwice(decision.output, context.write, context.writeStdout);
   }
   // atrium's own delivery spawns (`--message-id`, `--batch-file`) run in the RECIPIENT's pod, over the
   // routed channel; one reaching another pod's message route is a misroute, not a caller's prompt.
