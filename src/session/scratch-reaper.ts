@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { lstatSync, readdirSync, rmSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -98,7 +99,26 @@ async function ownerStateOf(sessionId: string): Promise<ScratchOwnerState> {
   }
 }
 
+/**
+ * A fingerprint of the session's lease FILE as it stands: `absent`, `error:<code>`, or inode + mtime + size +
+ * content hash. Taken before the judgement and again right before a removal (O-R2): an owner that started in
+ * between wrote a lease, so the two differ and the directory is kept. This narrows the window to
+ * microseconds; it does not close it (that would need the owner and the reaper to share a lock).
+ */
+async function leaseFingerprint(sessionId: string): Promise<string> {
+  const file = queueLockFilePath(sessionId);
+  try {
+    const [stat, body] = await Promise.all([fs.lstat(file), fs.readFile(file)]);
+    const hash = createHash("sha256").update(body).digest("hex").slice(0, 16);
+    return `${stat.ino}:${stat.mtimeMs}:${body.length}:${hash}`;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === "ENOENT" ? "absent" : `error:${code ?? "unknown"}`;
+  }
+}
+
 type Verdict = "remove" | "keep-young" | "keep-owner" | "skip";
+type Judged = { verdict: Verdict; id?: string; leaseBefore?: string };
 
 /** The session id of a real `acpx-<id>` directory under `root`; "skip" for anything else; undefined if it vanished. */
 function realEntryId(root: string, name: string): { id: string } | "skip" | undefined {
@@ -120,16 +140,18 @@ async function judgeEntry(
   name: string,
   window: { nowMs: number; maxAgeMs: number },
   judge: (sessionId: string) => Promise<ScratchOwnerState>,
-): Promise<Verdict | undefined> {
+): Promise<Judged | undefined> {
   const entry = realEntryId(root, name);
   if (entry === undefined || entry === "skip") {
-    return entry;
+    return entry === undefined ? undefined : { verdict: entry };
   }
   const newest = newestMtimeMs(path.join(root, name));
   if (newest === undefined || window.nowMs - newest < window.maxAgeMs) {
-    return "keep-young";
+    return { verdict: "keep-young" };
   }
-  return (await judge(entry.id)) === "gone" ? "remove" : "keep-owner";
+  const leaseBefore = await leaseFingerprint(entry.id);
+  const state = await judge(entry.id);
+  return { verdict: state === "gone" ? "remove" : "keep-owner", id: entry.id, leaseBefore };
 }
 
 function removeEntry(root: string, name: string): boolean {
@@ -154,6 +176,8 @@ export async function reapSessionScratch(
     env?: NodeJS.ProcessEnv;
     /** Test seam: the owner's state per session id (default: the lease, judged as everywhere else). */
     ownerState?: (sessionId: string) => Promise<ScratchOwnerState>;
+    /** Test seam: runs between the judgement and the lease re-check — where an owner could start. */
+    betweenJudgeAndRemove?: (sessionId: string) => Promise<void>;
   } = {},
 ): Promise<ScratchReapResult> {
   const env = options.env ?? process.env;
@@ -164,12 +188,25 @@ export async function reapSessionScratch(
   const result: ScratchReapResult = { removed: [], keptLiveOwner: [], keptYoung: [], skipped: [] };
   const window = windowOf(options);
   for (const name of listEntries(root)) {
-    const verdict = await judgeEntry(root, name, window, options.ownerState ?? ownerStateOf);
-    if (verdict !== undefined) {
+    const judged = await judgeEntry(root, name, window, options.ownerState ?? ownerStateOf);
+    if (judged !== undefined) {
+      const verdict = await recheckBeforeRemoval(judged, options.betweenJudgeAndRemove);
       result[bucketOf(verdict, root, name)].push(name);
     }
   }
   return result;
+}
+
+/** A "remove" verdict stands only if the lease is exactly as it was when judged (O-R2); otherwise keep. */
+async function recheckBeforeRemoval(
+  judged: Judged,
+  between: ((sessionId: string) => Promise<void>) | undefined,
+): Promise<Verdict> {
+  if (judged.verdict !== "remove" || judged.id === undefined) {
+    return judged.verdict;
+  }
+  await between?.(judged.id);
+  return (await leaseFingerprint(judged.id)) === judged.leaseBefore ? "remove" : "keep-owner";
 }
 
 function windowOf(options: { maxAgeMs?: number; nowMs?: number }): {

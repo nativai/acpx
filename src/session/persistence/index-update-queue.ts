@@ -395,12 +395,20 @@ function isPlainRecordFileName(file: string): boolean {
   );
 }
 
-async function recordFileExists(sessionDir: string, file: string): Promise<boolean> {
+/**
+ * `file` (a regular file), `other` (a symlink, a directory, anything not a record), or `missing`. The
+ * lstat is the point (TE finding F1): the index lists records as `readdir` shows them — regular files —
+ * so a named SYMLINK to a record outside the directory is not a member, and indexing it would put a row
+ * the next reconcile removes.
+ */
+async function recordFileKind(
+  sessionDir: string,
+  file: string,
+): Promise<"file" | "other" | "missing"> {
   try {
-    await fs.access(path.join(sessionDir, file));
-    return true;
+    return (await fs.lstat(path.join(sessionDir, file))).isFile() ? "file" : "other";
   } catch {
-    return false;
+    return "missing";
   }
 }
 
@@ -417,13 +425,15 @@ async function readNamedRecords(
 ): Promise<NamedVerdicts> {
   const verdicts: NamedVerdicts = { replaced: new Map(), present: new Set(), removed: new Set() };
   for (const file of named) {
+    if ((await recordFileKind(sessionDir, file)) !== "file") {
+      verdicts.removed.add(file); // gone, or not a regular file: not a member
+      continue;
+    }
     const entry = await readIndexEntryFromDisk(sessionDir, file);
     if (entry) {
       verdicts.replaced.set(file, entry);
-    } else if (await recordFileExists(sessionDir, file)) {
-      verdicts.present.add(file); // unparsable: keep the row it has
     } else {
-      verdicts.removed.add(file);
+      verdicts.present.add(file); // unparsable (or vanished just now): keep the row it has
     }
   }
   return verdicts;

@@ -245,3 +245,131 @@ test("`acpx __scratch-reap` prints the result as JSON on the control pod, and ex
     assert.equal(fs.existsSync(dir), true);
   }, "agent-pod");
 });
+
+// ---- F3: every unknown argument is refused with exit 2 BEFORE anything is judged or removed ----
+
+function runVerb(
+  home: string,
+  args: string[],
+): { status: number | null; stdout: string; stderr: string } {
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, ACPX_POD_TEST_HOME: home };
+  delete env.ACPX_STATE_HOME;
+  return spawnSync(process.execPath, [CLI, "__scratch-reap", ...args], { env, encoding: "utf8" });
+}
+
+function fingerprintTree(dir: string): string {
+  const parts: string[] = [];
+  const walk = (current: string): void => {
+    for (const name of fs.readdirSync(current).toSorted((a, b) => a.localeCompare(b))) {
+      const full = path.join(current, name);
+      const stat = fs.lstatSync(full);
+      parts.push(
+        `${path.relative(dir, full)}:${stat.mtimeMs}:${stat.isDirectory() ? "d" : fs.readFileSync(full, "utf8")}`,
+      );
+      if (stat.isDirectory()) {
+        walk(full);
+      }
+    }
+  };
+  walk(dir);
+  return parts.join("\n");
+}
+
+test("F3: `--dry-run`, an invented flag, a stray word and a malformed --max-age-days all exit 2 and the planted scratch is byte-identical", async () => {
+  await withHome(async (home, root) => {
+    entry(root, "must-survive-flags", 40); // old, no owner: a real reap WOULD remove it
+    const before = fingerprintTree(root);
+    for (const args of [
+      ["--dry-run"],
+      ["--invented-flag"],
+      ["--dry-run", "--max-age-days", "1"],
+      ["--max-age-days", "1", "--dry-run"],
+      ["stray-word"],
+      ["--max-age-days"],
+      ["--max-age-days", "0"],
+      ["--max-age-days", "abc"],
+      ["--max-age-days=", ""],
+      ["--max-age-days", "1", "--max-age-days", "2"],
+      ["-n"],
+    ]) {
+      const ran = runVerb(home, args);
+      assert.equal(
+        ran.status,
+        2,
+        `${JSON.stringify(args)} → exit ${ran.status}; stdout=${ran.stdout}`,
+      );
+      assert.equal(ran.stdout, "", "no JSON result: nothing was judged");
+      assert.match(ran.stderr, /usage: acpx __scratch-reap/u);
+    }
+    assert.equal(fingerprintTree(root), before, "nothing was touched");
+  });
+});
+
+test("F3: the accepted forms still work — no argument, `--max-age-days <n>`, `--max-age-days=<n>` — with the one-line JSON contract", async () => {
+  await withHome(async (home, root) => {
+    entry(root, "twenty-days", 20);
+    const young = runVerb(home, ["--max-age-days=30"]);
+    assert.equal(young.status, 0, young.stderr);
+    assert.deepEqual(JSON.parse(young.stdout), {
+      removed: [],
+      keptLiveOwner: [],
+      keptYoung: ["acpx-twenty-days"],
+      skipped: [],
+    });
+    assert.equal(young.stdout.trim().split("\n").length, 1, "ONE JSON line");
+    const reaped = runVerb(home, ["--max-age-days", "10"]);
+    assert.equal(reaped.status, 0, reaped.stderr);
+    assert.deepEqual((JSON.parse(reaped.stdout) as { removed: string[] }).removed, [
+      "acpx-twenty-days",
+    ]);
+    assert.equal(runVerb(home, []).status, 0);
+  });
+});
+
+// ---- O-R2: the lease is re-read just before each removal ----
+
+test("O-R2: an owner that starts between the judgement and the removal keeps its scratch (counted under keptLiveOwner)", async () => {
+  await withHome(async (_home, root) => {
+    const dir = entry(root, "owner-starts", 30);
+    const result = await reapSessionScratch({
+      ownerState: owner({}), // judged gone: no owner yet
+      betweenJudgeAndRemove: async (id) => {
+        plantLease(id, JSON.stringify({ pid: process.pid, started: "just now" }));
+      },
+    });
+    assert.deepEqual(result.removed, []);
+    assert.deepEqual(result.keptLiveOwner, ["acpx-owner-starts"]);
+    assert.equal(fs.existsSync(dir), true);
+  });
+});
+
+test("O-R2: a lease REWRITTEN in the window (a dead owner's lease replaced by a fresh one) keeps the scratch too", async () => {
+  await withHome(async (_home, root) => {
+    const dir = entry(root, "owner-replaced", 30);
+    plantLease("owner-replaced", JSON.stringify({ pid: 999_999 }));
+    const result = await reapSessionScratch({
+      ownerState: owner({}),
+      betweenJudgeAndRemove: async (id) => {
+        plantLease(id, JSON.stringify({ pid: process.pid, generation: "new owner" }));
+      },
+    });
+    assert.deepEqual(result.keptLiveOwner, ["acpx-owner-replaced"]);
+    assert.equal(fs.existsSync(dir), true);
+  });
+});
+
+test("O-R2 NEGATIVE CONTROL: with the lease unchanged across the window the same entry IS removed", async () => {
+  await withHome(async (_home, root) => {
+    const dir = entry(root, "nothing-changes", 30);
+    let called = 0;
+    const result = await reapSessionScratch({
+      ownerState: owner({}),
+      betweenJudgeAndRemove: async () => {
+        called += 1;
+      },
+    });
+    assert.equal(called, 1, "the window really was exercised");
+    assert.deepEqual(result.removed, ["acpx-nothing-changes"]);
+    assert.equal(fs.existsSync(dir), false);
+  });
+});
