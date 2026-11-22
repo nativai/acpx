@@ -20,6 +20,7 @@ import {
   OWNER_IF_POD_DEADLINE_MS,
   RELEASE_TOOLS_OPTIONAL,
   RELEASE_TOOLS_REQUIRED,
+  isReleaseName,
   resolveReleases,
   runRoutedCall,
   sweepRoutedPayloads,
@@ -1500,4 +1501,92 @@ test("L-2: the admission_busy sentence of the pod plane names the broker and the
   assert.match(sentence ?? "", /broker or the Kubernetes API server did not answer/);
   assert.doesNotMatch(sentence ?? "", /admission lock|creations|nothing was started or queued/i);
   assert.equal(refusal.message.split("\n").length, 2);
+});
+
+// ───────────────────────── A-46 (row 46.1): ONE release-name grammar ─────────────────────────
+
+const REAL_NAMES = [
+  `${"a".repeat(40)}-20261122T025946Z`,
+  `${"0123456789abcdef".repeat(2)}01234567-20261122T025946Z-in-place`,
+  "rel-1",
+  "r",
+  "a".repeat(128),
+];
+const BAD_NAMES = [
+  ".",
+  "..",
+  ".hidden",
+  "a/b",
+  "a+b",
+  "previous",
+  "a".repeat(129),
+  "",
+  "-leading-dash",
+  "../x",
+  "x/..",
+  "a b",
+  "a\nb",
+];
+
+test("A-46 the grammar: every bootstrap name passes; `.`, `..`, hidden, separators, `+`, `previous`, 129 characters and the empty name never do", () => {
+  for (const name of REAL_NAMES) {
+    assert.equal(isReleaseName(name), true, name);
+  }
+  for (const name of BAD_NAMES) {
+    assert.equal(isReleaseName(name), false, JSON.stringify(name));
+  }
+  assert.equal(isReleaseName(undefined), false);
+  // `previous` is refused as a whole name only: it is fine inside a longer one.
+  assert.equal(isReleaseName("previous-1"), true);
+});
+
+test("A-46 a control-pod link whose release name is bad fails resolveReleases, naming the tool — `.releases/pi/..` included; a real name resolves", () => {
+  for (const tool of ["pi", "acpx", "claude-pty-acp"]) {
+    for (const bad of BAD_NAMES.filter((name) => name !== "" && !name.includes("/"))) {
+      const dir = runtimeWith(ALL_TOOLS.filter((t) => t !== tool));
+      fs.symlinkSync(`.releases/${tool}/${bad}`, path.join(dir, tool));
+      assert.deepEqual(
+        resolveReleases(dir),
+        { ok: false, tool },
+        `${tool} → ${JSON.stringify(bad)}`,
+      );
+    }
+    for (const real of REAL_NAMES) {
+      const dir = runtimeWith(ALL_TOOLS.filter((t) => t !== tool));
+      fs.symlinkSync(`.releases/${tool}/${real}`, path.join(dir, tool));
+      const result = resolveReleases(dir) as { ok: true; releases: Record<string, string> };
+      assert.equal(result.ok, true, real);
+      assert.equal(result.releases[tool], real);
+    }
+  }
+});
+
+test("A-46 a `releases` that names a bad release for one tool is refused release_unresolved tool=<that tool> BEFORE the broker; with every name real, the broker is asked", async () => {
+  const broker = await startBroker({ lines: [READY] });
+  try {
+    const good = { acpx: "rel-1", "pi-acp": "rel-3", pi: "rel-2" };
+    for (const bad of [".", "..", ".hidden", "a+b", "previous", "a".repeat(129)]) {
+      const options = ensureOptions(makeStub(), broker.origin, {
+        releases: { ok: true, releases: { ...good, "claude-agent-acp": bad } },
+      });
+      const error = await expectRouted(runRoutedCall(options));
+      assert.equal(error.reason, "release_unresolved", bad);
+      assert.equal(
+        error.stderrLine,
+        `acpx: ROUTED outcome=not_run reason=release_unresolved tool=claude-agent-acp call_id=${options.callId}`,
+      );
+      assert.equal(broker.seen.length, 0, `${JSON.stringify(bad)}: the broker was never asked`);
+    }
+    for (const real of REAL_NAMES) {
+      const before: number = broker.seen.length;
+      await runRoutedCall(
+        ensureOptions(makeStub(), broker.origin, {
+          releases: { ok: true, releases: { ...good, "claude-agent-acp": real } },
+        }),
+      );
+      assert.equal(broker.seen.length, before + 1, `${real}: the broker was asked`);
+    }
+  } finally {
+    broker.close();
+  }
 });
