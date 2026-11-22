@@ -255,8 +255,9 @@ async function liveUtilityDeps(): Promise<UtilityDeps> {
     import("./probe-records.js"),
     import("../cli/config.js"),
   ]);
-  // The first stderr line of a routed call is atrium's to read (C2): the index-rebuild notice, which the
-  // record read can print, must not precede it. `main` sets this flag itself when the call proceeds locally.
+  // Atrium finds a routed call's token by its head and the exit code (C2, A-53), so a line before it would
+  // not break the reader — the index-rebuild notice, which the record read can print, is still kept off a
+  // routed call's stderr so it stays the command's own. `main` sets this flag itself when the call proceeds locally.
   (await import("../session/persistence/index.js")).setSessionIndexRebuildLogSuppressed(true);
   return {
     argv: () => routedArgv(process.argv, process.env),

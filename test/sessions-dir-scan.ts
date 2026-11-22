@@ -42,6 +42,10 @@ import ts from "typescript";
 //   · list iteration through `reduce` (the element is the SECOND parameter), a counted index loop
 //     (`for (let i = 0; i < LIST.length; i += 1) n.endsWith(LIST[i])`), `LIST.entries()` / `Object.entries(…)`
 //     destructuring, or an element handed to a helper (F-17, the part that is not cheap)
+//   · a list copy other than spread / `Array.from` / `slice` / `toSorted` / `toReversed` — `concat`, `filter`,
+//     `flatMap`, `map` — and `Object.is(a, b)` in place of `===`
+//   · a suffix local that is DESTRUCTURED (`const { ext } = path.parse(n)`) or assigned AFTER its declaration
+//     (`let ext; ext = path.extname(n);`) — only `const x = <suffix call>` binds one (F-25)
 //   · a suffix taken with `reverse()[0]`, or through more than one local hop, or passed to a callback
 // What keeps an escape cheap is the rest of the net: the predicate is the only thing the index, the archive scan
 // and the backfill call, and a suffix test that bypasses it shows as index churn (test/delivery-json-sidecar.test.ts).

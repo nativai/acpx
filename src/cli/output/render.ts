@@ -689,8 +689,9 @@ export async function printPromptSessionBanner(
     return;
   }
 
-  // A-16 (F4): before the banner's own socket probe prints anything — the refusal token must be the
-  // FIRST stderr line (atrium reads it), and a session whose lease names a pod not proven gone is
+  // A-16 (F4): before the banner's own socket probe prints anything — a refusal must come BEFORE any
+  // banner output (atrium finds the token by its head and exit code, A-53, but a banner line after a
+  // refusal would still be wrong), and a session whose lease names a pod not proven gone is
   // never probed from the control pod in local mode. `sendSession` repeats it for the quiet formats.
   await refuseWakeWhilePodNotGone(record.acpxRecordId);
   const status = await resolveSessionConnectionStatus(record);

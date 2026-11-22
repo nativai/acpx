@@ -3,8 +3,9 @@ import { AcpxOperationalError, CapacityRefusedError } from "../errors.js";
 
 /**
  * C7.2 — the two refusal lines of the pod plane, in the wire format every capacity refusal has:
- * exit 75, first stderr line the machine token, second line one plain sentence. Atrium's
- * `capacityRefusalToken.ts` reads the first line: its shape is public.
+ * exit 75, the machine token, and on the next line one plain sentence. Atrium's `capacityRefusalToken.ts`
+ * finds the token by its head (`acpx: REFUSED `) and the exit code — never by its place among the stderr
+ * lines (A-53): a progress line or a warning may precede it. Its shape is public.
  */
 
 export const POD_STARTING_PHASES = [
@@ -142,8 +143,8 @@ export function admissionBusyRefusal(
 }
 
 /**
- * Exit 1; the FIRST stderr line is `acpx: ROUTED outcome=… call_id=…` (C2) — the atrium server
- * reads `outcome=unknown` as "retry with the same message id". `stderrLine` keeps it on stderr in
+ * Exit 1; the token is the line beginning `acpx: ROUTED outcome=… call_id=…` (C2, found by its head and the
+ * exit code — A-53, not by its place) — the atrium server reads `outcome=unknown` as "retry with the same message id". `stderrLine` keeps it on stderr in
  * json mode too, as `CapacityRefusedError` does.
  */
 export class RoutedCallError extends AcpxOperationalError {
