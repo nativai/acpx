@@ -10,7 +10,7 @@ import {
   type SessionIndex,
   type SessionIndexEntry,
 } from "./index.js";
-import { isNonSessionRecordFile } from "./session-dir-files.js";
+import { isSessionRecordFileName } from "./session-dir-files.js";
 
 /**
  * Per-process index write policy (perf-loadfix W2.3):
@@ -385,14 +385,9 @@ export async function projectRecordFilesIntoIndex(
   return { files: named.length };
 }
 
+/** A name the caller handed in: only what the enumeration itself would list (`isSessionRecordFileName`). */
 function isPlainRecordFileName(file: string): boolean {
-  return (
-    file.endsWith(".json") &&
-    path.basename(file) === file &&
-    file !== "." &&
-    file !== ".." &&
-    !isNonSessionRecordFile(file)
-  );
+  return isSessionRecordFileName(file);
 }
 
 /**

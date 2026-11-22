@@ -25,7 +25,7 @@ import {
   seatFieldsToIndexEntry,
 } from "./seat-fields.js";
 import { readSeatStore } from "./seat-store.js";
-import { isNonSessionRecordFile } from "./session-dir-files.js";
+import { isSessionRecordFileName } from "./session-dir-files.js";
 
 const SESSION_INDEX_SCHEMA = "acpx.session-index.v1";
 
@@ -989,16 +989,13 @@ export async function listSessionRecordFiles(sessionDir: string): Promise<string
     .filter(
       (entry) =>
         entry.isFile() &&
-        entry.name.endsWith(".json") &&
-        // 🛑 THROUGH THE REGISTRY, NOT A NAME. This filter used to spell `index.json`
-        // and nothing else, which is why the seat store — added to this same directory
-        // deliberately — was silently enumerated as a session record the day it landed:
-        // `seats.json` reached the index's `files` array and `readIndexEntryFromDisk`
-        // tried to parse the store as a record, a permanent files-vs-entries mismatch
-        // that costs work on every reconcile and reports nothing. A deny-list over a
-        // directory breaks EVERY time a file is added, so the names live in ONE place
-        // (`session-dir-files.ts`) that every such site imports.
-        !isNonSessionRecordFile(entry.name),
+        // 🛑 THROUGH THE ONE PREDICATE, NOT A SUFFIX (`session-dir-files.ts`). This filter used to spell
+        // `endsWith(".json")` and `index.json`, then the registry of store names; a `<id>.delivery.json`
+        // sidecar (acpx-ui's delivery store) still passed and became a phantom member of `files` —
+        // "drift" and a whole-index rewrite each time one appeared or went (brick 99bf1c0d). A deny-list
+        // over a directory breaks every time a file is added, so what a record file IS is stated once,
+        // as a shape, beside the store names.
+        isSessionRecordFileName(entry.name),
     )
     .map((entry) => entry.name)
     .toSorted();

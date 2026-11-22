@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { isSessionRecordFileName } from "../src/session/persistence/session-dir-files.js";
 import type { SessionRecord } from "../src/types.js";
 import { scopeHarnessConfigDirRootForCli } from "./config-dir-root-isolation.js";
 import {
@@ -236,7 +237,8 @@ async function seedSession(
  * the PRODUCTION rebuild path (triggered by deleting index.json, exactly as
  * happens in the field) and reads the rebuilt `index.files` back off disk.
  *
- * The `.delivery.json` decoy is the POSITIVE CONTROL, and it is the one that
+ * The `decoy.json` file (a non-record that IS still enumerated; it was a `.delivery.json` until
+ * brick 99bf1c0d made those a non-member) is the POSITIVE CONTROL, and it is the one that
  * makes the assertion mean something: it proves the sweeper in this very run
  * DOES ingest a non-record file whose name ends in `.json` — so "deletions.ndjson
  * is absent" reports the name, not a sweeper that swept nothing.
@@ -252,7 +254,7 @@ test("rider 3: the real index rebuild does not sweep up deletions.ndjson", async
     // Positive control: a non-record file that DOES end in `.json`. acpx-ui
     // writes 200 of these into the real store, and the sweeper ingests every
     // one of them.
-    await fs.writeFile(path.join(dir, "decoy.delivery.json"), "{}\n", "utf8");
+    await fs.writeFile(path.join(dir, "decoy.json"), "{}\n", "utf8");
     await fs.rm(path.join(dir, "index.json"), { force: true });
 
     // A real prune: it WRITES the manifest and then runs the production
@@ -277,7 +279,7 @@ test("rider 3: the real index rebuild does not sweep up deletions.ndjson", async
     // THIS run. Without it, "deletions.ndjson is absent" is indistinguishable
     // from a sweeper that swept nothing.
     assert.ok(
-      index.files.includes("decoy.delivery.json"),
+      index.files.includes("decoy.json"),
       `the sweeper ingested nothing .json-suffixed, so this test proves nothing: ${JSON.stringify(index.files)}`,
     );
     assert.ok(index.files.includes("rebuild-survivor.json"), "a real record must be indexed");
@@ -294,12 +296,15 @@ test("rider 3: the real index rebuild does not sweep up deletions.ndjson", async
  *  If someone renames the manifest to anything `.json`-suffixed, this fails with
  *  a message that says why, before the behavioural test above even runs. */
 test("rider 3: the manifest name does not satisfy the sweeper's predicate", async () => {
-  const sweptUp = (name: string): boolean => name.endsWith(".json") && name !== "index.json";
+  // THE SWEEPER'S OWN PREDICATE — `<id>.delivery.json` is no longer swept up (brick 99bf1c0d), so the
+  // positive control is a plain `<x>.json` that is not a record.
+  const sweptUp = isSessionRecordFileName;
   assert.equal(sweptUp("deletions.ndjson"), false);
   // Controls in both directions, so a predicate that answered `false` to
   // everything could not pass this.
   assert.equal(sweptUp("4e25443c-aa01.json"), true);
-  assert.equal(sweptUp("decoy.delivery.json"), true);
+  assert.equal(sweptUp("decoy.json"), true);
+  assert.equal(sweptUp("decoy.delivery.json"), false, "acpx-ui's delivery sidecar is not a record");
   assert.equal(sweptUp("index.json"), false);
 });
 

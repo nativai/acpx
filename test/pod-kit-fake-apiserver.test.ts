@@ -671,3 +671,43 @@ test("run as a process from its TypeScript source: prints its port, honours --sc
     await new Promise((resolve) => child.once("exit", resolve));
   }
 });
+
+// ---- brick 27b28c68 (L-557-4): the terminal detail every real pod carries ----
+
+test("PodSeed.containerStatuses and reason are served as the real API reports them (OOMKilled lives in containerStatuses); a pod without them has none", async () => {
+  const { startFakeApiServer } = await import("./pod-kit/fake-apiserver.js");
+  const api = await startFakeApiServer({
+    namespace: "dev-kit",
+    pods: [
+      {
+        name: "ag-oom",
+        uid: "uid-oom",
+        phase: "Failed",
+        reason: "OOMKilled-pod-level",
+        containerStatuses: [
+          { name: "agent", state: { terminated: { reason: "OOMKilled", exitCode: 137 } } },
+        ],
+      },
+      { name: "ag-plain", uid: "uid-plain" },
+    ],
+  });
+  try {
+    const oom = (await (
+      await fetch(`${api.url}/api/v1/namespaces/dev-kit/pods/ag-oom`)
+    ).json()) as {
+      status: { phase: string; reason?: string; containerStatuses?: unknown[] };
+    };
+    assert.equal(oom.status.phase, "Failed");
+    assert.equal(oom.status.reason, "OOMKilled-pod-level");
+    assert.deepEqual(oom.status.containerStatuses, [
+      { name: "agent", state: { terminated: { reason: "OOMKilled", exitCode: 137 } } },
+    ]);
+    const plain = (await (
+      await fetch(`${api.url}/api/v1/namespaces/dev-kit/pods/ag-plain`)
+    ).json()) as { status: Record<string, unknown> };
+    assert.equal("containerStatuses" in plain.status, false);
+    assert.equal("reason" in plain.status, false);
+  } finally {
+    await api.close();
+  }
+});

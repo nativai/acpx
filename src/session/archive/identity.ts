@@ -9,6 +9,10 @@
  * two pseudo-ids.
  */
 
+import {
+  DELIVERY_SIDECAR_SUFFIXES,
+  isSessionRecordFileName,
+} from "../persistence/session-dir-files.js";
 import { encodeSessionSafeId } from "./safe-id.js";
 
 /**
@@ -83,11 +87,7 @@ const INGEST_ORPHAN_ID_SHAPE =
  * The suffixes acpx-ui treats as an ACTIVE delivery sidecar — `ACTIVE_SIDECAR_SUFFIXES`
  * in `acpx-ui/server/delivery-store.ts`. Their presence means undelivered work.
  */
-const ACTIVE_SIDECAR_SUFFIXES: readonly string[] = [
-  ".delivery.json",
-  ".queue.json",
-  ".inflight.json",
-];
+const ACTIVE_SIDECAR_SUFFIXES: readonly string[] = DELIVERY_SIDECAR_SUFFIXES;
 
 const DELIVERY_FAMILY_PREFIXES: readonly string[] = [".delivery.", ".queue.", ".inflight."];
 
@@ -322,7 +322,7 @@ export function claimArchiveFileSets(files: readonly string[]): Map<string, stri
 function archiveCandidateTokens(files: readonly string[]): Set<string> {
   const candidates = new Set<string>();
   for (const file of files) {
-    if (!file.endsWith(".json") || RESERVED_ID_PARTS.has(idPartOf(file))) {
+    if (!isSessionRecordFileName(file) || RESERVED_ID_PARTS.has(idPartOf(file))) {
       continue;
     }
     const token = file.slice(0, -".json".length);

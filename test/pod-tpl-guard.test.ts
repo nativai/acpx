@@ -306,9 +306,9 @@ const OWN_ID_INVOCATIONS: Readonly<Record<string, string[]>> = {
   agents: ["agents"],
   "agents list": ["agents", "list"],
   "agents show": ["agents", "show", "claude"],
-  models: ["models", "--offline"],
-  "models list": ["models", "list", "--offline"],
-  "models show": ["models", "show", "claude-subscription:opus", "--offline"],
+  models: ["models"],
+  "models list": ["models", "list"],
+  "models show": ["models", "show", "claude-subscription:opus"],
   "providers list": ["providers", "list"],
   "people list": ["people", "list"],
   "people resolve": ["people", "resolve", "nobody"],
@@ -341,18 +341,90 @@ const OWN_ID_INVOCATIONS: Readonly<Record<string, string[]>> = {
 };
 
 /** Paths that cannot be driven here, each with the reason — and where the own-id rule for them is held instead. */
+const OWN_UNHELD =
+  "A-8's no-pod_foreign_write property for this verb in its OWN pod is NOT held on agent-pods yet — " +
+  "a prompt starts the pod's owner and an adapter, which this rig cannot drive; pod-owner-guard.test.ts holds the " +
+  "owner-ENTRY guard (a different property), not this one. A9's test/pod-wake-own-pod.test.ts (sentinel adapter) " +
+  "will hold it once A9 lands; until then the row is open.";
 const OWN_ID_EXEMPT: Readonly<Record<string, string>> = {
-  "": "bare `acpx <text>` is a prompt: it starts the pod's owner and an adapter (see `prompt`)",
-  prompt:
-    "starts the pod's owner and an adapter; the owner-entry guard is held by pod-owner-guard.test.ts",
-  "<agent>": "the same prompt, through the agent form",
+  "": `bare \`acpx <text>\` is a prompt. ${OWN_UNHELD}`,
+  prompt: OWN_UNHELD,
+  "<agent>": `the same prompt, through the agent form. ${OWN_UNHELD}`,
   exec: "spawns an adapter for a one-shot",
   "model-catalogue": "spawns an adapter unless a record answers (held by pod-a10-probes.test.ts)",
   "flow run": "runs ACP nodes: spawns an adapter",
-  "models endpoints": "an HTTP fetch from a vendor; no store write",
+  "models endpoints":
+    "an HTTP fetch from a vendor; it writes a cache file under ~/.acpx/endpoints (not a guarded file)",
   "governor status": "reads the box's process table (control-pod machinery)",
   "governor scan": "walks the box's process table (control-pod machinery)",
   "capacity run-build": "starts a build",
+};
+
+/**
+ * What each invocation must DO for the row to mean anything (brick 27b28c68, L-T2-1): an invocation that dies
+ * before its body — a flag commander does not know, a usage error — passes "no guard, no call" while exercising
+ * nothing. So each names the exit status it reaches and, for a non-zero or silent one, a line that only the BODY
+ * prints (`reached`); `writes` marks the verbs that write the pod's own record (its bytes must move — and for every
+ * other invocation they must NOT).
+ */
+type OwnIdOutcome = {
+  status: number;
+  /** A line only the body prints (searched in stdout + stderr). EVERY row names one — status 0 alone is not proof (F-2). */
+  reached: RegExp;
+  /** A group's (or `help`'s) own usage: the only rows allowed to print `Usage: acpx …` on stdout. */
+  group?: true;
+  writes?: true;
+};
+const USAGE = (group: string): RegExp => new RegExp(`Usage: acpx ${group} \\[options\\]`, "u");
+const POD_ID = new RegExp(POD_SESSION, "u");
+const OWN_ID_OUTCOMES: Readonly<Record<string, OwnIdOutcome>> = {
+  "sessions templates": { status: 0, reached: /No sessions/u },
+  "sessions show": { status: 0, reached: new RegExp(`id: ${POD_SESSION}`, "u") },
+  "sessions history": { status: 0, reached: /\(0\/0 shown\)/u },
+  "sessions read": { status: 0, reached: /\(0\/0 shown\)/u },
+  "sessions export": { status: 0, reached: /exported session to export\.json/u },
+  "seats show": { status: 1, reached: /SEAT_ROW_MISSING/u },
+  // `seats list` of an empty box prints nothing; the line below is the index load its body does first.
+  "seats list": { status: 0, reached: /full session-index rebuild/u },
+  subscriptions: { status: 0, reached: /No subscriptions registered/u },
+  "subscriptions list": { status: 0, reached: /No subscriptions registered/u },
+  "subscriptions usage": { status: 0, reached: /No subscriptions registered/u },
+  "subscriptions ceiling show": { status: 0, reached: /Registry default: /u },
+  profiles: { status: 0, reached: /No profiles registered/u },
+  "profiles list": { status: 0, reached: /No profiles registered/u },
+  "profiles show": { status: 1, reached: /profile "nosuch" not found/u },
+  agents: { status: 0, reached: /Harness capabilities, declared in acpx/u },
+  "agents list": { status: 0, reached: /Harness capabilities, declared in acpx/u },
+  "agents show": { status: 0, reached: /claude {2}\(claude\)/u },
+  models: { status: 0, reached: /ON YOUR SUBSCRIPTION/u },
+  "models list": { status: 0, reached: /ON YOUR SUBSCRIPTION/u },
+  "models show": { status: 0, reached: /key {9}claude-subscription:opus/u },
+  "providers list": { status: 0, reached: /no box provider credentials/u },
+  "people list": { status: 0, reached: /no people are registered/u },
+  "people resolve": { status: 3, reached: /no person matches/u },
+  "people principal": { status: 6, reached: /not recorded/u },
+  config: { status: 0, reached: /"/u },
+  "config show": { status: 0, reached: /"/u },
+  cancel: { status: 0, reached: /nothing to cancel/u },
+  "set-mode": { status: 1, reached: /Failed to spawn agent command/u, writes: true },
+  set: { status: 1, reached: /Failed to spawn agent command/u, writes: true },
+  status: { status: 0, reached: new RegExp(`session: ${POD_SESSION}`, "u") },
+  "sessions close": { status: 0, reached: POD_ID, writes: true },
+  "sessions recover": { status: 0, reached: /no queue owner found/u },
+  "sessions owner-status": { status: 0, reached: /"ownerFound":false/u },
+  "output-styles": { status: 0, reached: /does not support output styles/u },
+  sessions: { status: 0, reached: /No sessions/u },
+  "sessions list": { status: 0, reached: /No sessions/u },
+  seats: { status: 1, reached: USAGE("seats"), group: true },
+  "agent-folders": { status: 1, reached: USAGE("agent-folders"), group: true },
+  transcripts: { status: 1, reached: USAGE("transcripts"), group: true },
+  "subscriptions ceiling": { status: 1, reached: USAGE("subscriptions ceiling"), group: true },
+  providers: { status: 0, reached: /no box provider credentials/u },
+  people: { status: 2, reached: USAGE("people"), group: true },
+  governor: { status: 1, reached: USAGE("governor"), group: true },
+  box: { status: 1, reached: USAGE("box"), group: true },
+  flow: { status: 1, reached: USAGE("flow"), group: true },
+  help: { status: 0, reached: USAGE("seats"), group: true },
 };
 
 const ownIdPaths = (): string[] =>
@@ -371,6 +443,11 @@ test("T2 conformance: every command of a locally-running class has an own-id inv
     [],
     "a path is driven or exempt, not both",
   );
+  assert.deepEqual(
+    Object.keys(OWN_ID_OUTCOMES).toSorted(),
+    Object.keys(OWN_ID_INVOCATIONS).toSorted(),
+    "every invocation says what it must reach",
+  );
   const fresh = [...ownIdPaths(), "sessions brand-new-read-verb"].toSorted();
   assert.notDeepEqual(fresh, known, "the discovery flags a path the registry lacks");
   // the classes really are the ones that run locally on the own pod (the premise of this row)
@@ -379,16 +456,49 @@ test("T2 conformance: every command of a locally-running class has an own-id inv
   }
 });
 
-test("T2 conformance: no command of a locally-running class about the pod's OWN id trips pod_foreign_write, and none leaves the pod", async () => {
+test("T2 conformance: no command of a locally-running class about the pod's OWN id trips pod_foreign_write or leaves the pod — and each REACHES ITS BODY (its exit status, a body-only line, the own record moved or not)", async () => {
   for (const [commandPath, argv] of Object.entries(OWN_ID_INVOCATIONS)) {
+    const outcome = OWN_ID_OUTCOMES[commandPath];
+    assert.ok(outcome, commandPath);
     const { home } = agentPodHome();
     await addRecord(home, POD_SESSION, "bbbbbbbb-0000-4000-8000-0000000000b2");
+    const ownRecord = path.join(home, ".acpx", "sessions", `${POD_SESSION}.json`);
+    const before = await fs.readFile(ownRecord, "utf8");
     await withAtrium({}, async (atrium) => {
-      const r = await runCli(argv, agentPodEnv(home, atrium.url), { cwd: home, timeoutMs: 60_000 });
+      // F-5 (a): the admission ledger where PRODUCTION puts it — under the pod's canonical home — not the suite's /tmp
+      // seam (`scripts/run-tests.mjs` sets `ACPX_ADMISSION_DIR` for the whole run, which hides a verb that writes the
+      // box-wide ledger from an agent pod: K1, A9's 582e4292).
+      const env = agentPodEnv(home, atrium.url, {
+        ACPX_ADMISSION_DIR: path.join(home, ".acpx", "admission"),
+      });
+      const r = await runCli(argv, env, { cwd: home, timeoutMs: 60_000 });
+      const said = `${r.stdout}\n${r.stderr}`;
       assert.notEqual(r.status, null, `${commandPath}: answered, not killed`);
-      assert.doesNotMatch(r.stderr, GUARD, `${commandPath}: ${r.stderr}`);
-      assert.doesNotMatch(r.stdout, GUARD, `${commandPath}: ${r.stdout}`);
+      assert.doesNotMatch(said, GUARD, `${commandPath}: ${said}`);
       assert.equal(callsOf(atrium).length, 0, `${commandPath} stayed in the pod`);
+      // The body, not the front door: commander's refusal of an unknown flag or a missing operand is not it.
+      assert.doesNotMatch(
+        r.stderr,
+        /unknown option|unknown command|missing required argument|too many arguments/u,
+        `${commandPath} died at commander before its body: ${r.stderr}`,
+      );
+      assert.equal(r.status, outcome.status, `${commandPath}: ${said}`);
+      assert.match(said, outcome.reached, `${commandPath} did not print what only its body prints`);
+      // F-2: `--help` is the one commander exit that is 0. A non-group path that printed its usage on stdout stopped
+      // at the front door (a group, and `help`, print theirs by design).
+      if (outcome.group !== true) {
+        assert.doesNotMatch(
+          r.stdout,
+          /^Usage: acpx /mu,
+          `${commandPath} printed its usage instead of running`,
+        );
+      }
     });
+    const after = await fs.readFile(ownRecord, "utf8");
+    assert.equal(
+      after !== before,
+      outcome.writes === true,
+      `${commandPath}: the own record ${outcome.writes === true ? "must have been written" : "must be untouched"}`,
+    );
   }
 });

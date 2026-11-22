@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import {
   admitCreate,
   admitWake,
@@ -167,9 +168,41 @@ const LEDGER_ENTRIES = new Set([
   "admitWake",
   "admitCreate",
   "releaseAdmittedWake",
+  "ticketFor",
   "withAdmissionLock",
   "writeLedgerFile",
   "appendDecisionLog",
+]);
+/**
+ * Every OTHER value exported by the two ledger modules — none of them writes the ledger, takes its lock or
+ * appends its log (pure builders, readers, constants). A fresh export is in neither set until someone
+ * classifies it: the completeness row below is red for it (K4: `ticketFor` was exported and unlisted).
+ */
+const NOT_LEDGER_ENTRIES = new Set([
+  "takeAdmissionClassFromEnv",
+  "declaredAdmissionClass",
+  "buildClause",
+  "capacityRefusal",
+  "cpuRefuses",
+  "readPendingReservationsForProbe",
+  "readWaitingForProbe",
+  "isFreshSuccessor",
+  "wakeRefusal",
+  "ADMISSION_TTL_MS",
+  "ADMISSION_TTL_AUTOMATION_MS",
+  "admissionDir",
+  "AdmissionLockTimeoutError",
+  "readAdmissionLockState",
+  "ADMISSION_BUSY_RETRY_AFTER_S",
+  "containerInstance",
+  "readLedgerFile",
+  "liveEntries",
+  "ttlFor",
+  "boundEntry",
+  "reservationsOf",
+  "newBuildEntry",
+  "buildExpiry",
+  "newEntry",
 ]);
 /** Entries a LOCAL-in-an-agent-pod command may reach. `releaseAdmittedWake` only follows an `admitted` decision, which `admitWake` never yields in an agent pod (row K1 above). */
 const SAFE_IN_AGENT_POD = new Set(["admitWake", "releaseAdmittedWake"]);
@@ -198,25 +231,240 @@ const CALLERS: Record<string, Caller> = {
   },
 };
 
+// ── discovery by a REAL PARSE (K4) ───────────────────────────────────────────────────────────────────
+// The first version of this row read importers with a regex over `{ … } from "…"`, which cannot see a
+// namespace import (`import * as ledger`), an import gathered by `Promise.all([import(…), …])`, a
+// `.then(m => m.f())`, a re-export or an alias. Every form below is read from the TypeScript AST, and a
+// form whose use cannot be followed (a namespace that escapes, an unawaited `import()`) counts as the
+// WHOLE entry set — never as nothing: a caller we cannot read is a caller we must see registered.
+
+const LEDGER_MODULES = new Set(["capacity/admission.js", "capacity/ledger.js"]);
+
+function resolvesToLedger(rel: string, specifier: string): boolean {
+  return (
+    specifier.startsWith(".") &&
+    LEDGER_MODULES.has(path.posix.normalize(path.posix.join(path.posix.dirname(rel), specifier)))
+  );
+}
+
+const stringOf = (node: ts.Node | undefined): string | undefined =>
+  node !== undefined && ts.isStringLiteralLike(node) ? node.text : undefined;
+
+/** The entries a binding pattern takes out of the module: `{a, b: c}` is a and b; a rest or a computed key is all. */
+function patternEntries(pattern: ts.BindingName, sf: ts.SourceFile, add: Adder): void {
+  if (ts.isIdentifier(pattern)) {
+    identifierUses(pattern.text, sf, add);
+    return;
+  }
+  if (!ts.isObjectBindingPattern(pattern)) {
+    add(undefined);
+    return;
+  }
+  for (const element of pattern.elements) {
+    const key = element.propertyName ?? element.name;
+    const name = ts.isIdentifier(key) || ts.isStringLiteralLike(key) ? key.text : undefined;
+    add(element.dotDotDotToken || name === undefined ? undefined : name);
+  }
+}
+
+/** `undefined` adds EVERY entry (an unreadable use); a name adds itself if it is a ledger entry. */
+type Adder = (name: string | undefined) => void;
+
+/** How an identifier bound to the module namespace is used: `ns.f` is f; any other use lets it escape. */
+function identifierUses(local: string, sf: ts.SourceFile, add: Adder): void {
+  const visit = (node: ts.Node): void => {
+    if (ts.isIdentifier(node) && node.text === local) {
+      const parent = node.parent;
+      const declaresIt =
+        ts.isNamespaceImport(parent) ||
+        (ts.isBindingElement(parent) && parent.name === node) ||
+        (ts.isVariableDeclaration(parent) && parent.name === node);
+      if (declaresIt) {
+        // the binding's own declaration: not a use
+      } else if (ts.isPropertyAccessExpression(parent) && parent.expression === node) {
+        add(parent.name.text);
+      } else if (ts.isElementAccessExpression(parent) && parent.expression === node) {
+        add(stringOf(parent.argumentExpression));
+      } else {
+        add(undefined);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+}
+
+const PROMISE_COMBINATORS = new Set(["all", "allSettled"]);
+
+/** What `import("…")` hands to its surroundings. */
+function dynamicImportEntries(call: ts.CallExpression, sf: ts.SourceFile, add: Adder): void {
+  let node: ts.Node = call;
+  let awaited = false;
+  const lift = () => {
+    while (
+      node.parent &&
+      (ts.isAwaitExpression(node.parent) ||
+        ts.isParenthesizedExpression(node.parent) ||
+        ts.isAsExpression(node.parent))
+    ) {
+      awaited ||= ts.isAwaitExpression(node.parent);
+      node = node.parent;
+    }
+  };
+  lift();
+  let parent = node.parent;
+  // a stored PROMISE (`const p = import(…)`) is not the module: only an awaited one can be followed
+  if (awaited && ts.isVariableDeclaration(parent) && parent.initializer === node) {
+    patternEntries(parent.name, sf, add);
+    return;
+  }
+  if (
+    ts.isPropertyAccessExpression(parent) &&
+    parent.expression === node &&
+    parent.name.text !== "then"
+  ) {
+    add(parent.name.text);
+    return;
+  }
+  if (ts.isArrayLiteralExpression(parent)) {
+    // `await Promise.all([import(a), import(b)])`, destructured at once
+    const index = parent.elements.indexOf(node as ts.Expression);
+    const combinator = parent.parent;
+    if (
+      ts.isCallExpression(combinator) &&
+      ts.isPropertyAccessExpression(combinator.expression) &&
+      PROMISE_COMBINATORS.has(combinator.expression.name.text) &&
+      combinator.arguments[0] === parent
+    ) {
+      node = combinator;
+      lift();
+      parent = node.parent;
+      if (
+        ts.isVariableDeclaration(parent) &&
+        parent.initializer === node &&
+        ts.isArrayBindingPattern(parent.name)
+      ) {
+        const element = parent.name.elements[index];
+        if (element !== undefined && ts.isBindingElement(element)) {
+          patternEntries(element.name, sf, add);
+          return;
+        }
+      }
+    }
+  }
+  add(undefined); // `.then(…)`, a returned or stored promise, …: not followed — counts as everything
+}
+
+/** Every ledger entry each source file imports, by any import form. `capacity/admission|ledger.ts` themselves are skipped. */
 function ledgerCallers(files: Iterable<[string, string]>): Map<string, Set<string>> {
   const found = new Map<string, Set<string>>();
-  const importRe =
-    /\{([^{}]*)\}\s*(?:=\s*await\s+import\(\s*|from\s+)["'][^"']*(?:capacity\/|\.\/)(?:admission|ledger)\.js["']/gu;
   for (const [rel, text] of files) {
     if (rel === "capacity/admission.ts" || rel === "capacity/ledger.ts") {
       continue;
     }
-    for (const match of text.matchAll(importRe)) {
-      const names = match[1]
-        .split(",")
-        .map((name) => name.trim().replace(/^type\s+/u, ""))
-        .filter((name) => LEDGER_ENTRIES.has(name));
-      if (names.length > 0) {
-        found.set(rel, new Set([...(found.get(rel) ?? []), ...names]));
+    const sf = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true);
+    const names = new Set<string>();
+    const add: Adder = (name) => {
+      if (name === undefined) {
+        for (const entry of LEDGER_ENTRIES) {
+          names.add(entry);
+        }
+      } else if (LEDGER_ENTRIES.has(name)) {
+        names.add(name);
       }
+    };
+    const visit = (node: ts.Node): void => {
+      if (
+        ts.isImportDeclaration(node) &&
+        resolvesToLedger(rel, stringOf(node.moduleSpecifier) ?? "")
+      ) {
+        const clause = node.importClause;
+        const bindings = clause?.namedBindings;
+        if (clause && !clause.isTypeOnly && bindings && ts.isNamedImports(bindings)) {
+          for (const element of bindings.elements) {
+            add(element.isTypeOnly ? "" : (element.propertyName ?? element.name).text);
+          }
+        } else if (clause && !clause.isTypeOnly && bindings && ts.isNamespaceImport(bindings)) {
+          identifierUses(bindings.name.text, sf, add);
+        }
+      } else if (ts.isImportEqualsDeclaration(node)) {
+        const reference = node.moduleReference;
+        if (
+          ts.isExternalModuleReference(reference) &&
+          resolvesToLedger(rel, stringOf(reference.expression) ?? "")
+        ) {
+          add(undefined);
+        }
+      } else if (
+        ts.isExportDeclaration(node) &&
+        resolvesToLedger(rel, stringOf(node.moduleSpecifier) ?? "")
+      ) {
+        const clause = node.exportClause;
+        if (!node.isTypeOnly && clause && ts.isNamedExports(clause)) {
+          for (const element of clause.elements) {
+            add(element.isTypeOnly ? "" : (element.propertyName ?? element.name).text);
+          }
+        } else if (!node.isTypeOnly) {
+          add(undefined); // `export * from` / `export * as ns from`
+        }
+      } else if (ts.isCallExpression(node)) {
+        const specifier = stringOf(node.arguments[0]);
+        const isDynamic = node.expression.kind === ts.SyntaxKind.ImportKeyword;
+        const isRequire = ts.isIdentifier(node.expression) && node.expression.text === "require";
+        if (
+          (isDynamic || isRequire) &&
+          specifier !== undefined &&
+          resolvesToLedger(rel, specifier)
+        ) {
+          if (isDynamic) {
+            dynamicImportEntries(node, sf, add);
+          } else {
+            add(undefined);
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sf);
+    if (names.size > 0) {
+      found.set(rel, names);
     }
   }
   return found;
+}
+
+/** The values a module exports: `export function|const|class|let|var` declarations and `export { … }` lists. */
+function exportedValues(text: string): string[] {
+  const sf = ts.createSourceFile("m.ts", text, ts.ScriptTarget.Latest, true);
+  const out: string[] = [];
+  for (const statement of sf.statements) {
+    const exported = ts.canHaveModifiers(statement)
+      ? ts.getModifiers(statement)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword)
+      : false;
+    if (
+      exported &&
+      (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
+      statement.name
+    ) {
+      out.push(statement.name.text);
+    } else if (exported && ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        if (ts.isIdentifier(declaration.name)) {
+          out.push(declaration.name.text);
+        }
+      }
+    } else if (
+      ts.isExportDeclaration(statement) &&
+      statement.exportClause &&
+      ts.isNamedExports(statement.exportClause) &&
+      !statement.isTypeOnly
+    ) {
+      out.push(
+        ...statement.exportClause.elements.filter((e) => !e.isTypeOnly).map((e) => e.name.text),
+      );
+    }
+  }
+  return out;
 }
 
 function* srcFiles(dir: string): Generator<[string, string]> {
@@ -260,8 +508,115 @@ test("CONFORMANCE: every caller of a ledger entry is registered, and one that se
   assert.deepEqual(offenders, []);
 });
 
+test("CONFORMANCE: every value the two ledger modules export is a ledger entry or named as one that is not (a fresh export is red until classified)", () => {
+  const exported = ["capacity/admission.ts", "capacity/ledger.ts"].flatMap((rel) =>
+    exportedValues(fs.readFileSync(path.join(SRC, rel), "utf8")),
+  );
+  assert.ok(exported.length >= 30, `positive control: ${exported.length} exports read`);
+  const unclassified = exported.filter(
+    (name) => !LEDGER_ENTRIES.has(name) && !NOT_LEDGER_ENTRIES.has(name),
+  );
+  assert.deepEqual(unclassified, [], "an exported value that is in neither set");
+  for (const entry of LEDGER_ENTRIES) {
+    assert.ok(exported.includes(entry), `${entry} is no longer exported — drop it from the set`);
+  }
+  for (const name of NOT_LEDGER_ENTRIES) {
+    assert.ok(exported.includes(name), `${name} is no longer exported — drop it from the set`);
+  }
+  // NEGATIVE: a fresh export is read, and is in neither set.
+  const fresh = exportedValues("export async function sneakyLedgerWrite() {}\nexport const x = 1;");
+  assert.deepEqual(fresh, ["sneakyLedgerWrite", "x"]);
+  assert.equal(
+    LEDGER_ENTRIES.has("sneakyLedgerWrite") || NOT_LEDGER_ENTRIES.has("sneakyLedgerWrite"),
+    false,
+  );
+  assert.ok(
+    LEDGER_ENTRIES.has("ticketFor"),
+    "ticketFor (a ticket's bind / release write the ledger) is an entry",
+  );
+});
+
+/** One source text, as a file of `cli/`: which ledger entries does the discovery find in it? */
+const entriesOf = (text: string): string[] =>
+  [...(ledgerCallers([["cli/new-caller.ts", text]]).get("cli/new-caller.ts") ?? [])].toSorted();
+const ALL_ENTRIES = [...LEDGER_ENTRIES].toSorted();
+const ADM = "../capacity/admission.js";
+const LED = "../capacity/ledger.js";
+
+test("CONFORMANCE negative cases (K4): every import form is discovered — each was invisible to the first, regex-based row", () => {
+  // named, aliased and `type`-qualified specifiers
+  assert.deepEqual(entriesOf(`import { admitCreate } from "${ADM}";`), ["admitCreate"]);
+  assert.deepEqual(entriesOf(`import { admitCreate as go, newEntry } from "${ADM}";`), [
+    "admitCreate",
+  ]);
+  assert.deepEqual(entriesOf(`import { type admitWake, ticketFor } from "${ADM}";`), ["ticketFor"]);
+  assert.deepEqual(
+    entriesOf(`import type { admitWake } from "${ADM}";`),
+    [],
+    "a type-only import is erased",
+  );
+  // NAMESPACE import: the uses are followed; an escaping namespace is everything
+  assert.deepEqual(
+    entriesOf(`import * as ledger from "${LED}";\nawait ledger.appendDecisionLog(d, {}, now);`),
+    ["appendDecisionLog"],
+  );
+  assert.deepEqual(
+    entriesOf(`import * as ledger from "${LED}";\nconst w = ledger["writeLedgerFile"];`),
+    ["writeLedgerFile"],
+  );
+  assert.deepEqual(entriesOf(`import * as ledger from "${LED}";\nuse(ledger);`), ALL_ENTRIES);
+  assert.deepEqual(entriesOf(`import * as ledger from "${LED}";\nconst l = ledger;`), ALL_ENTRIES);
+  // DYNAMIC import: destructured, member access, and the unfollowed `.then` / stored promise
+  assert.deepEqual(
+    entriesOf(`const { admitWake, releaseAdmittedWake } = await import("${ADM}");`),
+    ["admitWake", "releaseAdmittedWake"],
+  );
+  assert.deepEqual(entriesOf(`const m = await import("${ADM}");\nm.admitCreate({});`), [
+    "admitCreate",
+  ]);
+  assert.deepEqual(entriesOf(`const f = (await import("${ADM}")).admitCreate;`), ["admitCreate"]);
+  assert.deepEqual(entriesOf(`import("${ADM}").then((m) => m.admitCreate({}));`), ALL_ENTRIES);
+  assert.deepEqual(entriesOf(`const p = import("${ADM}");`), ALL_ENTRIES);
+  // PROMISE.ALL of dynamic imports, destructured at once
+  assert.deepEqual(
+    entriesOf(
+      `const [{ admitCreate }, other] = await Promise.all([import("${ADM}"), import("./other.js")]);`,
+    ),
+    ["admitCreate"],
+  );
+  assert.deepEqual(
+    entriesOf(
+      `const [other, { appendDecisionLog }] = await Promise.all([import("./other.js"), import("${LED}")]);`,
+    ),
+    ["appendDecisionLog"],
+  );
+  assert.deepEqual(
+    entriesOf(`const [ns] = await Promise.allSettled([import("${LED}")]);\nns.writeLedgerFile();`),
+    ["writeLedgerFile"],
+  );
+  assert.deepEqual(
+    entriesOf(`await Promise.all([import("${ADM}")]).then(([m]) => m.admitCreate({}));`),
+    ALL_ENTRIES,
+    "a Promise.all that is not destructured at once is not followed",
+  );
+  // RE-EXPORTS and the legacy forms
+  assert.deepEqual(entriesOf(`export { admitCreate, newEntry } from "${ADM}";`), ["admitCreate"]);
+  assert.deepEqual(entriesOf(`export * from "${LED}";`), ALL_ENTRIES);
+  assert.deepEqual(entriesOf(`import ledger = require("${LED}");`), ALL_ENTRIES);
+  assert.deepEqual(entriesOf(`const l = require("${LED}");`), ALL_ENTRIES);
+  // ticketFor is one of the entries
+  assert.deepEqual(entriesOf(`const { ticketFor } = await import("${ADM}");`), ["ticketFor"]);
+  // CONTROLS: the same names from another module, and a path that only looks alike, are not callers
+  assert.deepEqual(entriesOf(`import { admitCreate } from "./other.js";`), []);
+  assert.deepEqual(
+    entriesOf(`import * as m from "../spawn-ledger.js";\nm.appendDecisionLog();`),
+    [],
+  );
+  assert.deepEqual(entriesOf(`const { admitWake } = await import("../other/admission.js");`), []);
+});
+
 test("CONFORMANCE negative cases: a fresh caller is flagged; a local-class caller of a guarded entry is flagged", () => {
-  const fresh = `import { admitCreate } from "../capacity/admission.js";\nexport const f = () => admitCreate({});\n`;
+  const fresh = `import * as admission from "../capacity/admission.js";\nexport const f = () => admission.admitCreate({});\n`;
   const found = ledgerCallers([["cli/brand-new.ts", fresh]]);
   assert.deepEqual(
     [...found.keys()],
@@ -269,15 +624,14 @@ test("CONFORMANCE negative cases: a fresh caller is flagged; a local-class calle
     "found without being registered anywhere",
   );
   assert.equal(Object.keys(CALLERS).includes("cli/brand-new.ts"), false);
-  // dynamic-import form (wake-gate's shape) is discovered too
-  const dynamic = `const { admitWake, releaseAdmittedWake } = await import("../../capacity/admission.js");`;
-  assert.deepEqual([...(ledgerCallers([["cli/x.ts", dynamic]]).get("cli/x.ts") ?? [])].toSorted(), [
-    "admitWake",
-    "releaseAdmittedWake",
-  ]);
   // the rule: `owner-ensure` is LOCAL in an agent pod, so a caller serving it may not call `admitCreate`
   assert.equal(localInAgentPod("owner-ensure"), true);
   assert.equal(localInAgentPod("create"), false);
   assert.equal(localInAgentPod("control-store"), false);
   assert.equal(SAFE_IN_AGENT_POD.has("admitCreate"), false);
+  assert.equal(
+    SAFE_IN_AGENT_POD.has("ticketFor"),
+    false,
+    "a ticket writes the ledger: not safe in an agent pod",
+  );
 });
