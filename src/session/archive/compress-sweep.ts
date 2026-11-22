@@ -175,6 +175,7 @@ function emptyFamilies(): FamilyTotals {
     "stream-segment": { files: 0, logicalBytes: 0 },
     messages: { files: 0, logicalBytes: 0 },
     timestamps: { files: 0, logicalBytes: 0 },
+    markers: { files: 0, logicalBytes: 0 },
   };
 }
 

@@ -82,7 +82,13 @@ test("claiming: an id may itself contain dots, including a literal `.stream.`", 
   // regression test ("a safeId may itself contain `.stream.`"). A first-dot split
   // attributes every file below to the pseudo-id "agent".
   const dotted = "agent.stream.probe-7";
-  const files = [`${dotted}.json`, `${dotted}.stream.ndjson`, `${dotted}.timestamps.ndjson`];
+  const files = [
+    `${dotted}.json`,
+    `${dotted}.stream.ndjson`,
+    `${dotted}.timestamps.ndjson`,
+    // C5: the marker sidecar is claimed with its session — the unit of archiving is the whole prefix set.
+    `${dotted}.markers.ndjson`,
+  ];
   const { claimed, unclaimed } = claimFileSets(files, new Set([dotted]));
   assert.deepEqual(claimed.get(dotted)?.toSorted(), files.toSorted());
   assert.deepEqual(unclaimed, []);

@@ -115,7 +115,11 @@ import {
   runQueuedTask,
   type SharedClientRebindReason,
 } from "./runtime.js";
-import { releaseConfigDirOnTerminalClose, writeTerminalCloseRecord } from "./terminal-close.js";
+import {
+  releaseConfigDirOnTerminalClose,
+  removeScratchOnTerminalClose,
+  writeTerminalCloseRecord,
+} from "./terminal-close.js";
 import { createSendWakeGate, type SendWakeGate } from "./wake-gate.js";
 
 // Wall-clock budget for a cold-respawn owner startup, shared across all re-spawn
@@ -510,7 +514,9 @@ async function closeQueueOwnerRuntime(params: {
 
 async function releaseConfigDirAfterOwnClose(sessionId: string): Promise<void> {
   try {
-    releaseConfigDirOnTerminalClose(await resolveSessionRecord(sessionId));
+    const record = await resolveSessionRecord(sessionId);
+    releaseConfigDirOnTerminalClose(record);
+    removeScratchOnTerminalClose(record);
   } catch {
     // best effort, like every other close's release — the orphan sweep remains the guarantee
   }

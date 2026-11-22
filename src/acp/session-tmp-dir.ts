@@ -1,5 +1,7 @@
-import { chmodSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, mkdirSync, rmSync } from "node:fs";
+import { join, sep } from "node:path";
+import { lockHostPlace, podModeRequested } from "../pod/identity.js";
+import { acpxStateRoot } from "../session/persistence/session-base-dir.js";
 
 /**
  * `ACPX_SESSION_TMP` — a per-session scratch directory, one per `acpxRecordId`
@@ -71,10 +73,29 @@ const SESSION_TMP_DIR_PREFIX = "acpx-";
 export const SESSION_TMP_ROOT_ENV = "ACPX_SESSION_TMP_ROOT";
 
 /**
+ * ⚠️ IN POD PLACEMENT THE ROOT IS THE STATE HOME, NOT `/tmp` (block A8; CONCEPTION r4 K7 rule 1,
+ * decided by the head of development 2026-11-21): `<state home>/session-tmp`. A pod's `/tmp` is gone
+ * after every idle period, and a file an agent attaches from its scratch directory must be readable by
+ * atrium on the control pod at the SAME absolute path — so the scratch directory lives on the shared
+ * volume and survives the pod. This reverses the "DO NOT FIX THIS BACK TO /workspace" rationale above
+ * for pod placement ONLY: there the directory is removed when the session closes
+ * (`removeSessionTmpDir`, called from the terminal close) and — by a separate sweep on the control pod,
+ * not built here — after 14 days untouched. Outside pod placement nothing changes: `/tmp`.
+ */
+export const SESSION_TMP_POD_SUBDIR = "session-tmp";
+
+/** The pod-placement scratch root, or `undefined` outside pod placement (the agent pod, or pod mode). */
+export function podSessionTmpRoot(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return lockHostPlace(env) === "agent-pod" || podModeRequested(env)
+    ? join(acpxStateRoot(env), SESSION_TMP_POD_SUBDIR)
+    : undefined;
+}
+
+/**
  * Resolve the root all session-tmp directories live under.
  *
- * Precedence: an explicit argument, then {@link SESSION_TMP_ROOT_ENV}, then the
- * real default. A blank/whitespace-only value at either level is treated as
+ * Precedence: an explicit argument, then {@link SESSION_TMP_ROOT_ENV}, then the pod-placement root
+ * ({@link podSessionTmpRoot}), then the real default. A blank/whitespace-only value at either level is treated as
  * ABSENT, not as the empty string — `join("", id)` would otherwise resolve to a
  * path relative to the process cwd.
  */
@@ -90,7 +111,7 @@ export function resolveSessionTmpRoot(
   if (fromEnv) {
     return fromEnv;
   }
-  return SESSION_TMP_DEFAULT_ROOT;
+  return podSessionTmpRoot(env) ?? SESSION_TMP_DEFAULT_ROOT;
 }
 
 /**
@@ -156,4 +177,39 @@ export function ensureSessionTmpDir(
     );
   }
   return dir;
+}
+
+/**
+ * Removes THIS session's scratch directory at its terminal close — pod placement only (outside it the
+ * directory is `/tmp`'s and the pod restart wipes it, as before). Returns whether a directory was
+ * removed. Never throws: a close that failed over a tidy-up would be worse than a directory the
+ * control pod's age sweep collects.
+ *
+ * ⚠️ THE TARGET IS COMPOSED, NEVER TAKEN: `<podSessionTmpRoot>/acpx-<id>`, for an id that is a single
+ * path segment, and only that directory. `ACPX_SESSION_TMP_ROOT` is not honoured here — an override
+ * names a root somebody else owns, and a recursive removal under it is not this function's to make.
+ */
+export function removeSessionTmpDir(
+  sessionId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const root = podSessionTmpRoot(env);
+  if (
+    root === undefined ||
+    !/^[\w.-]+$/u.test(sessionId) ||
+    sessionId === "." ||
+    sessionId === ".."
+  ) {
+    return false;
+  }
+  const dir = sessionTmpDirFor(sessionId, root);
+  if (!dir.startsWith(`${root}${sep}`)) {
+    return false;
+  }
+  try {
+    rmSync(dir, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
 }

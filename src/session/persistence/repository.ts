@@ -2052,6 +2052,7 @@ async function unlinkHardDeletedFiles(
     await unlinkIfPresent(ownerLog);
   }
   await unlinkIfPresent(timestampsSidecarPath(sessionDir, safeId));
+  await unlinkIfPresent(markersSidecarPath(sessionDir, safeId));
   try {
     const dirEntries = await fs.readdir(sessionDir);
     for (const name of dirEntries.filter((entry) => isSessionStreamFile(entry, safeId))) {
@@ -2605,7 +2606,7 @@ async function reapSeatsOfPrunedRecords(
  * unreachable once the record is gone.
  *
  * HISTORY tier (unless `--no-include-history`): the event streams and the
- * timestamps sidecar. The sidecar is acpx-ui's file, and acpx deletes it not as
+ * timestamps sidecar (and, counted with it, the marker sidecar — C5). The sidecar is acpx-ui's file, and acpx deletes it not as
  * a tidy-up in someone else's data but because it is an INDEX OF THE STREAM and
  * the stream is acpx's: acpx-ui derives its path from the stream path and only
  * ever opens it that way, so deleting the stream makes it unreachable to its own
@@ -2864,6 +2865,7 @@ async function unlinkPrunedSessionFiles(
       bytesFreed += await unlinkCountingBytes(path.join(sessionDir, name));
     }
     bytesFreed += await unlinkCountingBytes(timestampsSidecarPath(sessionDir, safeId));
+    bytesFreed += await unlinkCountingBytes(markersSidecarPath(sessionDir, safeId));
   }
   return bytesFreed;
 }
@@ -2911,6 +2913,15 @@ function ownerLogPaths(sessionDir: string, safeId: string): string[] {
  * an index it just made unreachable. Keep the stream
  * (`--no-include-history`) and the index stays with it.
  */
+/**
+ * C5 / block A8: atrium's marker sidecar `<id>.markers.ndjson` — another INDEX OF THE STREAM, so it is
+ * history tier and goes wherever the timestamps sidecar goes (counted in the `"timestamps"` class of
+ * `deletedFileClasses`). Not a stream segment: `isSessionStreamFile` must not match it.
+ */
+function markersSidecarPath(sessionDir: string, safeId: string): string {
+  return path.join(sessionDir, `${safeId}.markers.ndjson`);
+}
+
 function timestampsSidecarPath(sessionDir: string, safeId: string): string {
   return path.join(sessionDir, `${safeId}.timestamps.ndjson`);
 }

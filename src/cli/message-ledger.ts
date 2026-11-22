@@ -14,6 +14,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { normalizeOutputError } from "../acp/error-normalization.js";
+import { lockHostPlace, lockPodIdentity } from "../pod/identity.js";
 import { parseSeatRefOrThrow, sessionBaseDir } from "../session/persistence.js";
 import type { PromptInput } from "../types.js";
 import { parseSeatIdFromUrl, parseSessionIdFromUrl } from "./session-selector.js";
@@ -91,6 +92,26 @@ export function messageLedgerDir(): string {
   return path.join(path.dirname(sessionBaseDir()), "message-ledger");
 }
 
+/**
+ * C10 / block A8: ONE LEDGER FILE PER WRITING POD. On the control pod, and anywhere outside an agent
+ * pod, the file is today's `<day>.ndjson`; in an agent pod it is `<day>.<pod uid>.ndjson`, so two
+ * machines never append to one file (two machines appending to one file lose lines — C10's spike: 23.5 %
+ * and 9 %). A pod that cannot name itself writes nothing (`pod_identity_missing`), never a shared file.
+ * The reader keeps a position per file name; `<day>.ndjson` and `<day>.<uid>.ndjson` are different files.
+ */
+export function messageLedgerFileName(day: string, env: NodeJS.ProcessEnv = process.env): string {
+  if (lockHostPlace(env) !== "agent-pod") {
+    return `${day}.ndjson`;
+  }
+  const uid = lockPodIdentity(env)?.uid;
+  if (uid === undefined || !/^[\w-]+$/u.test(uid)) {
+    throw new Error(
+      "pod_identity_missing: an agent pod that cannot name itself writes no ledger file",
+    );
+  }
+  return `${day}.${uid}.ndjson`;
+}
+
 /** Text blocks joined, untrimmed — a single text prompt is recorded byte for byte. */
 function ledgerText(prompt: PromptInput): string {
   return prompt.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n\n");
@@ -111,7 +132,7 @@ export function appendMessageLedgerLine(line: MessageLedgerLine): void {
   try {
     const dir = messageLedgerDir();
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const file = path.join(dir, `${line.at.slice(0, 10)}.ndjson`);
+    const file = path.join(dir, messageLedgerFileName(line.at.slice(0, 10)));
     const bytes = Buffer.from(`${JSON.stringify(line)}\n`, "utf8");
     const fd = fs.openSync(
       file,

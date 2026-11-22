@@ -108,6 +108,7 @@ import {
 } from "./prompt-runner.js";
 import {
   releaseConfigDirOnTerminalClose,
+  removeScratchOnTerminalClose,
   type SessionCloseRecordState,
   writeTerminalCloseRecord,
 } from "./terminal-close.js";
@@ -1027,6 +1028,7 @@ export async function closeSession(
   const recordClosedState = await writeTerminalCloseRecord(record);
 
   releaseConfigDirOnTerminalClose(record);
+  removeScratchOnTerminalClose(record);
 
   // brick 1e77037f D5 — the LAST step: remove the copy this session left in another subscription,
   // now that the record is durably closed and the owner, its group and the adapter are proven gone.
