@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { assertBoxWideWriteAllowed } from "../../pod/foreign-write-guard.js";
 import {
   acquireIdentityFileLock,
   releaseIdentityFileLock,
@@ -631,6 +632,8 @@ export async function initializeCompressionDirs(archiveDir: string): Promise<voi
  */
 export async function withCompressionLock<T>(archiveDir: string, fn: () => Promise<T>): Promise<T> {
   const lockPath = compressionLockPath(archiveDir);
+  // A-8: the sweep lock is a box-wide file of the control pod (the sweep itself is `control_pod_only`).
+  assertBoxWideWriteAllowed("index", lockPath);
   const content = await acquireIdentityFileLock(lockPath, {
     label: "compression lock",
     budgetMs: LOCK_WAIT_MS,

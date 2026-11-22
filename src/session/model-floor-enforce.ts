@@ -1,5 +1,5 @@
 import { ModelFloorUnmetError } from "../errors.js";
-import type { SessionMessage, SessionRecord } from "../types.js";
+import type { AcpJsonRpcMessage, SessionMessage, SessionRecord } from "../types.js";
 import {
   belowFloorEpisodeOpen,
   clearFloorBreadcrumbs,
@@ -44,7 +44,12 @@ export type ModelFloorVerdict =
  */
 export async function enforceModelFloorPostServe(
   record: SessionRecord,
-  params: { servedModel: string | undefined; verbose?: boolean },
+  params: {
+    servedModel: string | undefined;
+    verbose?: boolean;
+    /** The turn's OPEN stream writer (A8/F2): the terminal error is appended through it, never a second writer. */
+    appendToStream?: (message: AcpJsonRpcMessage) => Promise<void>;
+  },
 ): Promise<ModelFloorVerdict> {
   const pinnedModel = pinnedModelFloor(record);
   if (!pinnedModel) {
@@ -65,7 +70,7 @@ export async function enforceModelFloorPostServe(
   stampServedBelowFloor(record, evaluation);
 
   return floorHardEnabled(record)
-    ? await refuseHardBelowFloor(record, evaluation, params.verbose)
+    ? await refuseHardBelowFloor(record, evaluation, params.verbose, params.appendToStream)
     : await acceptWithWarning(record, evaluation, firstOfEpisode, params.verbose);
 }
 
@@ -113,6 +118,7 @@ async function refuseHardBelowFloor(
   record: SessionRecord,
   evaluation: ModelFloorEvaluation,
   verbose: boolean | undefined,
+  appendToStream: ((message: AcpJsonRpcMessage) => Promise<void>) | undefined,
 ): Promise<ModelFloorVerdict> {
   const error = new ModelFloorUnmetError({
     pinnedModel: evaluation.pinnedModel,
@@ -120,7 +126,7 @@ async function refuseHardBelowFloor(
     phase: "post-serve",
   });
   setFloorParked(record, evaluation.servedModel);
-  await persistTerminalTurnError(record, error).catch(() => {});
+  await persistTerminalTurnError(record, error, { appendToStream }).catch(() => {});
   await mirrorTerminalTurnErrorToMessages(record, error).catch(() => {});
   await writeSessionRecordAtBoundary(record).catch(() => {});
   logFloor(

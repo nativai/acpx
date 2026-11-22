@@ -5008,6 +5008,13 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     const floorVerdict = await enforceModelFloorPostServe(record, {
       servedModel,
       verbose: options.verbose,
+      // A8/F2: this turn's writer is OPEN and holds the stream lock — the terminal error goes
+      // through it (after the frames still buffered, to keep the stream's order), never through a
+      // second writer that would wait on, or steal, the turn's own lock.
+      appendToStream: async (message) => {
+        await flushPendingMessages(false);
+        await eventWriter.appendMessage(message, { checkpoint: false });
+      },
     }).catch(() => ({ accept: true }) as const);
     acpxState = cloneSessionAcpxState(record.acpx);
     if (!floorVerdict.accept) {

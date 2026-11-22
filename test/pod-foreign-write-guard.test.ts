@@ -201,3 +201,81 @@ test("DISCOVERY negative case: a FRESH unguarded writer, registered nowhere, is 
     "the same writer with the guard is not flagged",
   );
 });
+
+// ---- discovery, widened to LOCK paths (TE finding F3): a lock file in the box's state home is a box-wide
+// write too — and the fault report's mount stalls make an agent pod holding one a stall for the control pod.
+const LOCK_ACQUIRE =
+  /\b(?:acquireIdentityFileLock|acquireIdentityFileLockDetailed|withIdentityFileLock)\s*\(/u;
+/**
+ * The files that take an identity lock DIRECTLY and are allowed to in an agent pod, each for a reason that
+ * is a per-SESSION file bound to the session's own pod (C3.2: "Locks two pods can hold: a session's record
+ * lock; its lease guard; the fork-source stage lock") — plus the primitive itself.
+ */
+const SESSION_LOCKS = new Map<string, string>([
+  ["session/persistence/identity-file-lock.ts", "the primitive"],
+  ["session/persistence/record-file-lock.ts", "the session's record lock"],
+  ["cli/queue/lease-mutation.ts", "the session's lease guard"],
+  ["acp/fork-source-staging.ts", "the fork-source stage lock"],
+  ["session/events.ts", "the session's stream lock (one writing pod, C10)"],
+]);
+
+/** True for a direct lock taker that is neither registered as a per-session lock nor guarded. */
+export function unguardedLockTaker(rel: string, text: string): boolean {
+  return LOCK_ACQUIRE.test(text) && !SESSION_LOCKS.has(rel) && !GUARD.test(text);
+}
+
+test("DISCOVERY (locks): every src file that takes an identity lock directly is a registered per-session lock or carries the guard", () => {
+  const unguarded: string[] = [];
+  const takers: string[] = [];
+  for (const file of sourceFiles(SRC)) {
+    const rel = path.relative(SRC, file);
+    const text = fs.readFileSync(file, "utf8");
+    if (LOCK_ACQUIRE.test(text)) {
+      takers.push(rel);
+    }
+    if (unguardedLockTaker(rel, text)) {
+      unguarded.push(rel);
+    }
+  }
+  assert.ok(takers.length >= 8, `positive control: ${takers.length} direct lock takers found`);
+  assert.deepEqual(unguarded, [], "a box-wide lock taker without assertBoxWideWriteAllowed");
+  // the registry holds only files that really take a lock (no stale entry)
+  for (const registered of SESSION_LOCKS.keys()) {
+    assert.ok(takers.includes(registered), `${registered} no longer takes a lock — drop its entry`);
+  }
+});
+
+test("DISCOVERY (locks) negative case: a FRESH unregistered, unguarded lock taker is flagged", () => {
+  const fresh = `import { withIdentityFileLock } from "./identity-file-lock.js";\nexport const f = () => withIdentityFileLock(p, policy, async () => 1);\n`;
+  assert.equal(unguardedLockTaker("session/new-store.ts", fresh), true);
+  assert.equal(
+    unguardedLockTaker("session/new-store.ts", `${fresh}\nassertBoxWideWriteAllowed("index", p);`),
+    false,
+  );
+});
+
+test("F3: withSessionIndexLock refuses in an agent pod before it creates the lock file; `sessions template <own id>`'s write path is that call", async () => {
+  const { withSessionIndexLock } = await import("../src/session/persistence/index-lock.js");
+  const { persistTemplateMark } = await import("../src/session/persistence.js");
+  const { sessions } = sandbox("agent-pod");
+  await assert.rejects(
+    withSessionIndexLock(sessions, async () => 1),
+    refused("index"),
+  );
+  assert.deepEqual(fs.readdirSync(sessions), [], "no index.json.lock was created");
+  // the reachable path TE measured: a record-class command taking the lock around its record write
+  const marked = makeSessionRecord({
+    acpxRecordId: "tmpl-own",
+    acpSessionId: "acp-tmpl",
+    agentCommand: "agent",
+    cwd: "/tmp/tmpl",
+  });
+  marked.template = { enabled: true, created_at: "2026-11-22T00:00:00.000Z" } as never;
+  await assert.rejects(persistTemplateMark(marked, {}), refused("index"));
+  assert.equal(fs.existsSync(path.join(sessions, "index.json.lock")), false);
+  // NEGATIVE: the control pod takes it as before
+  sandbox("control");
+  const control = process.env.HOME ?? "";
+  const controlSessions = path.join(control, ".acpx", "sessions");
+  assert.equal(await withSessionIndexLock(controlSessions, async () => 7), 7);
+});

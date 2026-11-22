@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
+import { assertBoxWideWriteAllowed } from "../../pod/foreign-write-guard.js";
 import { acquireIdentityFileLock, releaseIdentityFileLock } from "./identity-file-lock.js";
 
 /**
@@ -80,6 +81,11 @@ export async function withAdvisoryLock<T>(lockPath: string, fn: () => Promise<T>
   if (held?.has(lockPath)) {
     return await fn();
   }
+  // C3.2 / A-8 (block A8, TE finding F3): the index lock — and the cold archive's lock, which reuses
+  // this implementation — is taken on the control pod only. An agent pod that stalled on its mount while
+  // holding it would block every control-pod index writer, and the control pod may not break a live
+  // foreign pod's lock. Refused BEFORE the lock file is created.
+  assertBoxWideWriteAllowed("index", lockPath);
 
   const previous = inProcessQueues.get(lockPath) ?? Promise.resolve();
   let releaseQueue!: () => void;
