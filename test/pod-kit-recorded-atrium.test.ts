@@ -219,7 +219,7 @@ test("message routes record their target and body; default answer is a queued de
   });
 });
 
-test("message routes: both answers — 200 queued when accepted, 202 held when queued for room — in the scripted order", async () => {
+test("message routes: both answers — 202 queued, and 202 queued + held{reason} when held for room — in the scripted order", async () => {
   await withAtrium(
     {
       messages: {
