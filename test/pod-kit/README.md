@@ -105,40 +105,47 @@ required`); a malformed JSON body is the framework's 400 HTML.
 **The call** is judged as `parseCallBody` does, in its order — `unsupported-contract` (+`contract`), `bad-call-id`, `bad-argv`, `bad-stdin` / 413
 `stdin-too-large`, `bad-caller` (+`field`), `bad-admission-class`, `bad-inherit`, `inherit-not-string` (+`name`), `bad-deadline` (+`max_ms`) — then: the
 claimed caller against the calling pod (`callerClass: "agent-pod"` + `agentPod`: `403 caller-mismatch`), `bad-caller` for a call with no caller from a `local`
-peer, `inherit-not-allowed` (+`name`; the closed list `INHERIT_ALLOWED`), then **acpx's class table**: the kit loads `classifyCall` from the compiled
-`src/pod/command-classes.js` when it can (in acpx's suite) and otherwise — a bare process — a fallback of the create paths (`CREATE_PATHS`); a verdict that does
-not pass is `400 class-not-passable` (+`reason`: `unclassified` · `help` · `class` · `target-unresolved` · `own-session` · `no-caller` · `file-argument`). A record /
-owner-if-pod target atrium cannot resolve is refused `target-unresolved`; `resolveTargetAs` says the session exists on the control pod. A leading `acpx` is read as
-an agent name (measured), so the A-24 shape is NOT refused by the table. A **create** (class `create`, not `sessions handover`) then needs `record-id-required` /
+peer, `inherit-not-allowed` (+`name`; the closed list `INHERIT_ALLOWED`), then **acpx's class table**: the kit loads acpx's synchronous `classifyArgv` from the compiled
+`src/pod/command-classes.js` when it can (in acpx's suite). A verdict that does not pass is `400 class-not-passable` (+`reason`: `unclassified` · `help` · `class` · `target-unresolved` ·
+`own-session` · `no-caller` · `file-argument` · `table-unavailable`). **The kit never touches a store it was not given**: the test process's own HOME is never read or written.
+A record / owner-if-pod target resolves only against `stateHome` — the HOME (holding `.acpx`) of the control pod's store, which a test seeds with its own sessions (`addRecord`); then a
+long-lived child process runs acpx's own `resolveTargetRecordId` with HOME = `stateHome` (every `ACPX_*` variable removed). Without `stateHome` a target is `target-unresolved`, unless
+`resolveTargetAs` says it exists. In a BARE process (`node recorded-atrium.ts`, where acpx's `.js` specifiers do not resolve) a conservative fallback is used, as the real door is
+for an unloaded table: only the create paths pass (`--format json sessions new …` is read as `sessions new`: global value flags are skipped), `-h` is help, everything else is
+`table-unavailable`. A leading `acpx` is read as an agent name (measured), so the A-24 shape is NOT refused by the table. A **create** (class `create`, not `sessions handover`) then needs `record-id-required` /
 `call-id-mismatch` (A-27) / `more-than-one-first-message`; its first message (`--prompt <t>`, `--prompt-file -` + stdin) is taken OUT of the argv acpx is run with.
 `cwd` is ignored (A-9); a present one is the recorded problem `cwd_present`. Nothing runs for a refusal (no rule consumed).
 
 **At most once** is atrium's, not the kit's: a create whose first message was recorded under `call_id` is a **replay** — acpx IS run again (the next rule answers) and
 the answer carries `delivery:{delivery_id, to, status:"queued", replay:true}`; another sender reusing the id is `409 delivery-id-conflict`; a replay with another
 first message is `200 {exit:2, error:"create-replay-mismatch"}` and nothing runs. Everything else — a create without a message, a non-create, a changed `--record-id` —
-is run again as sent. `loseAnswer` runs the call (the first message stays recorded) and cuts the connection before answering. `firstMessageHold` marks the first
-message `delivery.held`.
+is run again as sent. Acpx's own at-most-once is modelled: a create whose record id exists is answered from the record only for the SAME `--created-by-call`; a repeat WITHOUT it (or with another call id) is
+refused by acpx — `exit 1`, `record-id destination already exists; refusing to create another ACP session`, no `delivery`, never `replay:true`. `loseAnswer` runs the call (the first message stays recorded) and cuts the connection before answering. `firstMessageHold` marks the first
+message `delivery.held`; `forkNotice` / `templatePrompt` are what acpx's answer carries for atrium to queue besides the caller's message (the notice's wire id is `uuid5(call_id, "fork-notice")`; `delivery`
+names the message, else the notice; both ids are conflict-checked). With `--format json` a create-replay-mismatch is a JSON-RPC error on STDOUT and stderr is empty.
 
 A rule: `calls[{argvPrefix?, answer, times?, loseAnswer?}]` matches the argv acpx is RUN with; `answer` is `{exit, stdout?, stderr?}` (wrapped as `{exit,stdout,stderr,delivery?}`)
 or `{status, body}` (a whole HTTP answer).
 
-**Messages**: `text` (or content blocks) required, `delivery_id` a lowercase uuid (`400 bad-delivery-id`) and echoed; `from` = the body's, else `X-Source-Session`, else
-`anonymous`. Every accepted message is **202** `{delivery_id, from, to, to_seat?, status:"queued"}`; a held one adds `held:{since, reason, ahead}` and `message` (atrium's
-`heldSentence`) — `status` stays `queued`. `messages{answers?[], default?, seats?, seatOf?}`: `"queued"` · `"held"` / `{held:{reason, ahead?}}` · `{status, body}`;
-`seats` maps a seat to its holder's record id (`to` on the seat route), `seatOf` a session to its seat (`to_seat`).
+**Messages**: `text` (or content blocks: `bad-content` for a malformed list / block, `bad-task-options`, `task-options-too-large`) required, `delivery_id` a lowercase uuid (`400 bad-delivery-id`) and echoed — and
+owned by its first sender (`409 delivery-id-conflict` for another, shared with the call route's ids); `from` = the body's, else `X-Source-Session`, else `anonymous`. Every accepted message is **202** `{delivery_id, from, to,
+to_seat?, status:"queued"}`; a held one adds `held:{since, reason, ahead}` and `message` (atrium's `heldSentence`: `pod_starting`, `agent_cap`, `paused`, `held-by-policy`, else "no room"; the recipient's NAME from
+`messages.names`) — `status` stays `queued`. `messages{answers?[], default?, seats?, seatOf?, names?, recipients?}`: `"queued"` · `"held"` / `{held:{reason, ahead?}}` · `{status, body}`; `seats` maps a seat to its holder's record id
+(`to` on the seat route), `seatOf` a session to its seat (`to_seat`); `recipients` scripts what the route refuses about the recipient — seat route: `unknown`/`not-a-seat` (404 `not-a-seat`), `vacant` (409 SEAT_VACANT); session route:
+`unknown` (404); both: `archived` (409 SESSION_ARCHIVED), `template`, `closing` (409 SESSION_CLOSING), `closed` (409 SESSION_CLOSED unless the body says `reopen:true`).
 
 **Hints**: key `^[0-9a-f]{24}$` else `400 bad-key`; a present `contract` ≠ 1 is `400 unsupported-contract`; `ready` answers `{ok:true, redriven}` (`hints.redriven`), `ended`
 `{ok:true}`; the `ended` reason is an open set. Shape departures atrium does not refuse are `problems`.
 
 **Modes**, as `phases` (each ends after `forMs` or after `forRequests` answered requests; the last is for ever):
 
-| mode        | what a client meets                                                                                                                                              |
-| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `normal`    | answers from the script                                                                                                                                          |
-| `away`      | the forwarder's answer: `503`, `Retry-After: 5`, `Connection: close`, `{"error":"atrium-away"}` — every route                                                    |
-| `refused`   | the port refuses connections (real `ECONNREFUSED`; open connections cut); back on the same port after `forMs`                                                    |
-| `hang`      | accepts, never answers                                                                                                                                           |
-| `forbidden` | the gate's final 403 with the REAL body (`code:"CALLER_NOT_ALLOWED"`, `caller_class`, `route_class` `control` / `messaging`); the public hints are never refused |
+| mode        | what a client meets                                                                                                                                                                                                                                          |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `normal`    | answers from the script                                                                                                                                                                                                                                      |
+| `away`      | the forwarder's answer: `503`, `Retry-After: 5`, `Connection: close`, `{"error":"atrium-away"}` — every route                                                                                                                                                |
+| `refused`   | the port refuses connections (real `ECONNREFUSED`; open connections cut); back on the same port after `forMs`                                                                                                                                                |
+| `hang`      | accepts, never answers                                                                                                                                                                                                                                       |
+| `forbidden` | the gate's final 403 with the REAL body (`code:"CALLER_NOT_ALLOWED"`, `caller_class`, `route_class:"control"`) on the pass-through only — the `messaging` (both message routes) and `public` (the hints) classes are open to every caller, as in `isAllowed` |
 
 "Away for N s, then back": `[{mode:"away",forMs:N*1000},{mode:"normal"}]`. **Compressing the client's 600 s budget:** use
 `[{mode:"away",forRequests:3},{mode:"normal"}]` (no clock at all — back after the 3rd refused attempt), or short `forMs`; the budget override itself belongs to the

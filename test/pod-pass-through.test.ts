@@ -15,6 +15,7 @@ import {
   type PassThroughInput,
 } from "../src/pod/pass-through-branch.js";
 import {
+  addRecord,
   agentPodEnv,
   agentPodHome,
   OTHER_SESSION,
@@ -121,8 +122,9 @@ test("a create in an agent pod passes through: argv, stdin bytes, --record-id, c
 
 test("the caller's own --record-id is kept, not replaced; a control-store command and a record command about ANOTHER session pass through", async () => {
   const { home } = agentPodHome();
-  // the real atrium refuses a record command whose target it cannot resolve (target-unresolved): the session exists there
-  await withAtrium({ resolveTargetAs: OTHER_SESSION }, async (atrium) => {
+  // the real world: the other session EXISTS in the store atrium resolves against (the kit reads only `stateHome`)
+  await addRecord(home, OTHER_SESSION, "dddddddd-5555-4666-8777-888888888801");
+  await withAtrium({ stateHome: home }, async (atrium) => {
     const env = agentPodEnv(home, atrium.url);
     const mine = "dddddddd-0000-4000-8000-0000000000d1";
     assert.equal((await runCli(["sessions", "new", "--record-id", mine], env)).status, 0);

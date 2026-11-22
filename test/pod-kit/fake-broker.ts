@@ -74,8 +74,8 @@ export interface BrokerStatus {
   live?: number;
   cap?: number;
   reserve?: number;
-  quota?: { used: number; hard: number };
-  home?: { live: number; cap: number };
+  quota?: { used?: number; hard?: number };
+  home?: { live?: number; cap?: number };
   pool?: { state: string };
 }
 
@@ -259,7 +259,7 @@ function parseAgentBody(bodyText: string, key: string): ParsedAgentBody {
       // a utility pod has no session and no seat: both may be absent
       if (
         (name === "sessionId" || name === "seat") &&
-        value === undefined &&
+        (value === undefined || value === null) &&
         body.harness === "utility"
       ) {
         text[name] = "";
@@ -286,7 +286,7 @@ function parseAgentBody(bodyText: string, key: string): ParsedAgentBody {
   const problems: string[] = [];
   if (key.startsWith("util-")) {
     // a sent seat is ignored by the real broker (no seat label on a utility pod); the kit names it
-    if (body.seat !== undefined) {
+    if (body.seat !== undefined && body.seat !== null) {
       problems.push("field_present:seat");
     }
     if (text.harness !== "utility" || text.sessionId !== "" || text.placement !== key.slice(5)) {
@@ -481,8 +481,8 @@ export class FakeBroker {
       return `error ${final.error}`;
     }
     const given = final?.ready ?? {};
-    const asked = job.request?.placement;
-    const placement = given.placement ?? (asked === "home" ? "home" : "pool");
+    // the placement the Job was actually routed to (an `auto` request routed home says home)
+    const placement = given.placement ?? job.target;
     const ip = given.ip ?? `10.244.${String(job.seq % 250)}.10`;
     const pod = given.pod ?? `ag-${key}`;
     const uid = job.uid;
@@ -513,7 +513,10 @@ export class FakeBroker {
     job.done = true;
     // A final that is not `ready` leaves no pod behind: the next POST of the key is a new request —
     // admission is evaluated again and a Job with a new uid is created (never a replay of this line).
-    job.ended = !line.startsWith("ready ");
+    // `error timeout` (and `error kube_api_error`) end THE STREAM, not the Job (broker.py: "the Job continues"): the pod
+    // may still become ready, the Job keeps its slot, and the next POST follows the same Job and uid.
+    job.ended =
+      !line.startsWith("ready ") && line !== "error timeout" && line !== "error kube_api_error";
     this.notify(job);
   }
 
@@ -548,8 +551,9 @@ export class FakeBroker {
       await this.handleControl(method, path, request, response);
       return;
     }
-    const arrivedAnswered = new Map(this.deleteAnswered);
     const bodyText = await readBody(request);
+    // the follower snapshot is taken once the body is read, as broker.py's `AgentEnsure.__init__` does
+    const arrivedAnswered = new Map(this.deleteAnswered);
     const headers: Record<string, string> = {};
     for (const [name, value] of Object.entries(request.headers)) {
       headers[name] = Array.isArray(value) ? value.join(", ") : (value ?? "");
@@ -615,10 +619,10 @@ export class FakeBroker {
       live,
       cap,
       reserve: scripted.reserve ?? 1,
-      quota: scripted.quota ?? { used: live, hard: cap },
-      home: scripted.home ?? {
-        live: occupying.filter((job) => job.target === "home").length,
-        cap: 0,
+      quota: { used: scripted.quota?.used ?? live, hard: scripted.quota?.hard ?? cap },
+      home: {
+        live: scripted.home?.live ?? occupying.filter((job) => job.target === "home").length,
+        cap: scripted.home?.cap ?? 0,
       },
       pool: scripted.pool ?? { state: "ready" },
     };
@@ -660,7 +664,9 @@ export class FakeBroker {
     record.jobSeq = target?.seq ?? null;
     const answer = (outcome: string, body: string): void => {
       record.outcome = outcome;
-      const status = this.script.delete?.status ?? 200;
+      // the scripted failure is the answer of a DELETE that RAN; a refusal or "nothing there" is always 200
+      const ran = outcome === "deleted" || outcome === "deleted_terminating";
+      const status = ran ? (this.script.delete?.status ?? 200) : 200;
       // the real broker's failure bodies: 504 after the delete wait, 502 when the kube API failed
       const failure =
         status === 504 ? "error timeout\n" : status === 502 ? "error kube_api_error\n" : null;
@@ -766,6 +772,11 @@ export class FakeBroker {
       const asked = body.placement as string;
       const target =
         asked === "auto" ? (this.limits().pool.state === "ready" ? "pool" : "home") : asked;
+      if (asked === "pool" && this.limits().pool.state !== "ready") {
+        // an explicit pool request when the pool template is not usable: broker.py create() -> template_rejected
+        finishWith("error template_rejected", "error_template_rejected");
+        return;
+      }
       const refusal = this.admissionRefusal(klass, target);
       if (refusal !== null) {
         const cap = this.limits();
