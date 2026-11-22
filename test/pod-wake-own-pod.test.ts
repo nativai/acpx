@@ -122,6 +122,30 @@ for (const [who, extra] of CALLERS) {
   });
 }
 
+// F-7 (brick f422cfcb): the other FORMS of a prompt in the pod's own session. T2's exemptions point here for `prompt` and
+// `<agent>` — so each form has a row that drives it: the agent form with text, and the agent form with the `prompt` verb.
+const OWN_PROMPT_FORMS: Array<[string, (id: string) => string[]]> = [
+  [
+    "`claude --session-id <id> <text>` (the agent form)",
+    (id) => ["claude", "--session-id", id, "hello"],
+  ],
+  [
+    "`claude prompt --session-id <id> <text>`",
+    (id) => ["claude", "prompt", "--session-id", id, "hello"],
+  ],
+];
+
+for (const [form, argv] of OWN_PROMPT_FORMS) {
+  test(`K1 (F-7): ${form} of a pod session in its own pod passes the wake gate — no pod_foreign_write, adapter started, nothing under admission/`, async () => {
+    const r = rig();
+    const done = await run(["--format", "json", ...argv(r.id)], r.env, r.home);
+    assert.doesNotMatch(done.out, /pod_foreign_write/u, done.out);
+    assert.notEqual(done.code, 2, done.out);
+    assert.deepEqual(r.spawned(), ["claude"], "the wake got past the gate and started the adapter");
+    assert.equal(fs.existsSync(r.admission), false, "no ledger, lock or log was written");
+  });
+}
+
 test("K1: a live `set` of a pod session in its own pod (gateSetConnect) passes the wake gate the same way", async () => {
   const r = rig();
   const done = await run(

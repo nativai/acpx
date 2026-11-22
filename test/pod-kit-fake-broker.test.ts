@@ -1123,18 +1123,58 @@ test("truncate is PER REQUEST: the creator's stream ends after its steps with no
   }
 });
 
-test("truncate without afterTimeout: the Job sits where it is — a follower is told where the pod is NOW and waits (no final line is invented)", async () => {
+test("truncate F-3a (i): a follower attached to a Job still IN PROGRESS is not cut — it gets the steps it missed and then the scripted `ready`, while only the creator's stream was cut", async () => {
   const broker = await startFakeBroker({
-    default: { steps: ["scheduling", "pulling"], truncate: true },
+    default: {
+      steps: ["scheduling", "pulling"],
+      truncate: true,
+      // the Job is still going when the follower attaches: its final comes 600 ms after the truncation
+      afterTimeout: { steps: ["starting"], finalDelayMs: 600, final: { ready: {} } },
+    },
   });
   try {
     const { key, body } = wellFormedAgentRequest("11111111-1111-4111-8111-111111111111");
-    const one = await postAgent(broker, key, body);
-    assert.deepEqual(one.lines, ["scheduling", "pulling"]);
-    const abort = new AbortController();
-    const follower = postAgent(broker, key, body, { stopAfterLines: 1, signal: abort.signal });
-    assert.deepEqual((await follower).lines, ["pulling"], "told where the pod is NOW");
-    abort.abort();
+    const creator = await postAgent(broker, key, body);
+    assert.deepEqual(creator.lines, ["scheduling", "pulling"], "the creator is cut: steps only");
+    const began = Date.now();
+    const follower = await postAgent(broker, key, body);
+    assert.ok(
+      Date.now() - began >= 300,
+      "it really attached while the Job was in progress, and waited",
+    );
+    assert.equal(broker.requests[1]?.joinedExistingJob, true);
+    assert.notEqual(broker.requests[1]?.outcome, "truncated", "the follower is NOT cut");
+    assert.match(follower.lines.at(-1) ?? "", READY_LINE, "it ends with the scripted ready");
+    assert.ok(
+      follower.lines.includes("starting"),
+      `it was told the steps the Job went on to: ${JSON.stringify(follower.lines)}`,
+    );
+  } finally {
+    await broker.close();
+  }
+});
+
+test("truncate F-3a (ii): without afterTimeout NO final line is invented — not at once and not LATER: a follower waits out its own bound and ends `error timeout`, never `ready`", async () => {
+  const broker = await startFakeBroker({
+    default: { steps: ["scheduling", "pulling"], truncate: true, agentWaitMs: 500 },
+  });
+  try {
+    const { key, body } = wellFormedAgentRequest("11111111-1111-4111-8111-111111111111");
+    const creator = await postAgent(broker, key, body);
+    assert.deepEqual(creator.lines, ["scheduling", "pulling"]);
+    const began = Date.now();
+    const follower = await postAgent(broker, key, body);
+    const waited = Date.now() - began;
+    assert.ok(
+      waited >= 450,
+      `the follower WAITED for its bound (${String(waited)} ms): nothing was invented before it`,
+    );
+    assert.equal(follower.lines.at(-1), "error timeout", "its own bound ended it");
+    assert.equal(
+      follower.lines.some((line) => READY_LINE.test(line)),
+      false,
+      "and it never saw a ready",
+    );
     assert.equal(broker.requests[1]?.joinedExistingJob, true);
   } finally {
     await broker.close();
