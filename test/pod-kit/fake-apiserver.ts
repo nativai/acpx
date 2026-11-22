@@ -45,6 +45,13 @@ export interface PodSeed {
   podIP?: string;
   labels?: Record<string, string>;
   annotations?: Record<string, string>;
+  /**
+   * `status.containerStatuses`, as the real API reports them — every real pod has them, and a terminal one's
+   * `state.terminated.reason` (`OOMKilled`, `Completed`, …) lives there. Default: none (a pod not yet started).
+   */
+  containerStatuses?: unknown[];
+  /** `status.reason` (a pod-level reason such as `Evicted`). Default: none. */
+  reason?: string;
   /** Sets metadata.deletionTimestamp: the pod is terminating, and still exists. */
   deleting?: boolean;
 }
@@ -382,6 +389,10 @@ export class FakeApiServer {
       },
       status: {
         phase: seed.phase ?? "Running",
+        ...(seed.reason === undefined ? {} : { reason: seed.reason }),
+        ...(seed.containerStatuses === undefined
+          ? {}
+          : { containerStatuses: seed.containerStatuses }),
         ...(seed.podIP === undefined ? {} : { podIP: seed.podIP }),
         // a Pending pod that never became Ready reports no Ready condition (only PodScheduled), as on the real API
         conditions:
