@@ -74,9 +74,9 @@ function loopback(script: string, args: string[]): string {
 /** The session the CLI rows are about; the loopback pod is started under ITS key. */
 const CLI_SESSION = "11111111-1111-4111-8111-111111111111";
 
-function startLoopback(script: string, root: string): Loopback {
+function startLoopback(script: string, root: string, key = agentPodKey(CLI_SESSION)): Loopback {
   const kv = Object.fromEntries(
-    loopback(script, ["start", "--key", agentPodKey(CLI_SESSION)])
+    loopback(script, ["start", "--key", key])
       .split("\n")
       .filter((line) => line.includes("="))
       .map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]),
@@ -154,14 +154,6 @@ const re = (want: RegExp) => (o: Observed) =>
 const TURNOVER =
   /^acpx: REFUSED reason=pod_starting nothing_started=true protocol=1 retry_after_s=3 phase=turnover wake=gate-session$/;
 
-// ⚠️ NO ONE-SHOT (UTILITY-SCOPE) CASE HERE, AND WHY (brick 27b28c68, L-557-1). A one-shot's call must carry a
-// utility key (`util-pool` / `util-home`: `assertUtilityTarget`), and the pod-side entry checks that key against
-// the pod's identity marker — but infrastructure's `agent-loopback start` accepts only a 24-hex session key
-// (`--key must be 24 hex characters`, argocd pin and `main` alike), so no loopback can be started under a utility
-// key and a one-shot over the real `agent-exec` has no pod to reach. It needs infrastructure's loopback to learn
-// the two utility keys; until then the one-shot's run, deadline and uid rules are held by
-// `test/pod-routed-call.test.ts` over a stub transport. (A call whose target is a session's pod is NOT a one-shot:
-// the "past its deadline" case below is the `owner-if-pod` call's own.)
 const CASES: Case[] = [
   {
     label: "echo through the pod: exit 0, stdout relayed",
@@ -257,6 +249,89 @@ const CASES: Case[] = [
         ? undefined
         : `missing=${missing.join(",")} leaked=${leaked.join(",")} verdict=${o.verdict}`;
     },
+  },
+];
+
+// ───────────── the one-shot (utility-scope) cases (brick 27b28c68, L-557-1 / TE F-1) ─────────────
+
+/**
+ * A one-shot's call carries a utility key (`util-pool` / `util-home`: `assertUtilityTarget`) and a utility target
+ * (no session, no seat), and the pod-side entry checks the key against the pod's identity. The loopback only STARTS
+ * under a 24-hex session key — but its own `set` verbs retarget it: `set <dir> hostname ag-util-pool` and
+ * `set <dir> marker ag-util-pool` give it a utility pod's identity, and the call is handed the pod by uid
+ * (`expectUid`) the way a one-shot is handed a Ready pod. The cases run on a loopback of their own, in order: the
+ * FIRST is the refusal BEFORE the retarget (the host is still `ag-<24 hex>`), the rest run after it.
+ */
+const UTILITY_KEY = "util-pool";
+const UTILITY_SESSION = "22222222-2222-4222-8222-222222222222";
+const utilityOptions = (lb: Loopback): Partial<RoutedCallOptions> => ({
+  class: "one-shot",
+  key: UTILITY_KEY,
+  target: { sessionId: "", seat: "", harness: "utility" },
+  expectUid: lb.uid,
+  lookup: undefined,
+  deadlineMs: 20_000, // a one-shot carries its own deadline (C2); the deadline case shortens it
+});
+
+const UTILITY_CASES: Case[] = [
+  {
+    label: "one-shot before the pod is retargeted (its host is still ag-<hex>) → not_run identity",
+    options: (lb) => ({ ...utilityOptions(lb), argv: ["echo", "must-not-run"] }),
+    expect: (o) =>
+      /^acpx: ROUTED outcome=not_run reason=identity call_id=\S+$/.test(o.verdict) &&
+      o.stdout === ""
+        ? undefined
+        : JSON.stringify(o),
+  },
+  {
+    label: "one-shot through the utility pod: exit 0, stdout relayed",
+    set: () => [
+      ["hostname", "ag-util-pool"],
+      ["marker", "ag-util-pool"],
+    ],
+    options: (lb) => ({ ...utilityOptions(lb), argv: ["echo", "hello-from-utility"] }),
+    expect: (o) =>
+      o.verdict === "completed exit=0" && o.stdout === "hello-from-utility\n"
+        ? undefined
+        : JSON.stringify(o),
+  },
+  {
+    label: "one-shot: the command's own exit code and streams pass through",
+    options: (lb) => ({
+      ...utilityOptions(lb),
+      argv: ["sh", "-c", "echo out; echo err >&2; exit 7"],
+    }),
+    expect: (o) =>
+      o.verdict === "completed exit=7" && o.stdout === "out\n" && o.stderr.startsWith("err\n")
+        ? undefined
+        : JSON.stringify(o),
+  },
+  {
+    label: "one-shot to a pod with another uid → not_run uid_mismatch",
+    options: (lb) => ({
+      ...utilityOptions(lb),
+      expectUid: "00000000-0000-4000-8000-000000000000",
+      argv: ["echo", "must-not-run"],
+    }),
+    expect: (o) =>
+      /^acpx: ROUTED outcome=not_run reason=uid_mismatch call_id=\S+$/.test(o.verdict) &&
+      o.stdout === ""
+        ? undefined
+        : JSON.stringify(o),
+  },
+  {
+    label: "one-shot past its OWN deadline → unknown deadline",
+    options: (lb) => ({
+      ...utilityOptions(lb),
+      argv: ["sleep", "30"],
+      deadlineMs: 2000,
+    }),
+    expect: re(/^acpx: ROUTED outcome=unknown reason=deadline call_id=\S+$/),
+  },
+  {
+    label: "one-shot for util-home against the util-pool pod → not_run identity",
+    options: (lb) => ({ ...utilityOptions(lb), key: "util-home", argv: ["echo", "must-not-run"] }),
+    expect: re(/^acpx: ROUTED outcome=not_run reason=identity call_id=\S+$/),
   },
 ];
 
@@ -438,11 +513,23 @@ async function main(): Promise<void> {
       failures += problem === undefined ? 0 : 1;
     }
     failures += await runCliCases(lb, script, root);
+    const utility = startLoopback(script, root, agentPodKey(UTILITY_SESSION));
+    try {
+      for (const testCase of UTILITY_CASES) {
+        const problem = await runCase(utility, script, testCase);
+        process.stdout.write(
+          `${problem === undefined ? "ok     " : "FAILED "} ${testCase.label}${problem ? ` — ${problem}` : ""}\n`,
+        );
+        failures += problem === undefined ? 0 : 1;
+      }
+    } finally {
+      loopback(script, ["stop", utility.dir]);
+    }
   } finally {
     loopback(script, ["stop", lb.dir]);
     fs.rmSync(root, { recursive: true, force: true });
   }
-  const total = CASES.length + CLI_CASES.length;
+  const total = CASES.length + CLI_CASES.length + UTILITY_CASES.length;
   process.stdout.write(
     `pod-loopback-gate: ${total - failures}/${total} cases matched (argocd pin ${ARGOCD_PIN})\n`,
   );
