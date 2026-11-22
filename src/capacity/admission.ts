@@ -3,6 +3,8 @@ import path from "node:path";
 import { acpAdapterKind } from "../acp/agent-command.js";
 import { CapacityRefusedError } from "../errors.js";
 import { assertBoxWideWriteAllowed, PodForeignWriteError } from "../pod/foreign-write-guard.js";
+import { isControlPlaneInPodMode, podRoom, readAgentsFigures } from "../pod/pod-capacity.js";
+import { admissionBusyRefusal, agentCapRefusal } from "../pod/pod-refusal.js";
 import type { CapacityRefusalReason } from "../types.js";
 import { readPodInfo } from "./budget.js";
 import { type Harness, isHarness, MIB } from "./constants.js";
@@ -1146,6 +1148,87 @@ async function admitInteractiveWake(ctx: WakeContext): Promise<WakeDecision> {
   return { decision: "not-gated", why: "interactive" };
 }
 
+// ── the wake gate in pod mode (block A9, C7.3) ───────────────────────────────────────────────────
+
+/** A pod-plane refusal in the wake gate's own shape: the token line is `error.stderrLine`. */
+function podWakeRefusal(
+  error: CapacityRefusedError,
+  figures: { box: string | null; live: number | null },
+  queuedAhead: number,
+): WakeDecision {
+  const detail = error.capacityRefusal;
+  return {
+    decision: "refused",
+    error,
+    refusal: {
+      message: error.message,
+      tokenLine: error.stderrLine,
+      reason: detail.reason,
+      retryAfterS: detail.retryAfterS,
+      queuedAhead,
+      box: figures.box,
+      live: figures.live,
+      starting: null,
+      freeSlots: 0,
+      needMib: null,
+    },
+  };
+}
+
+/**
+ * In pod mode the room for a woken session is the BROKER's: `GET /v1/agents` — its cap (less the
+ * people's reserve), the namespace's pod quota and, for a home-only harness, the home cap — and no
+ * memory reading, ledger entry or lock of the control pod. It admits exactly when `acpx capacity
+ * --need 1` says met for the same class (`podRoom` is that test), and nothing is reserved: the broker
+ * enforces the cap when the pod is asked for (C4), so a second admit between this read and that ask is
+ * the broker's refusal, never an over-commit. A broker that does not answer is `admission_busy`
+ * (C2), not a pass: this gate does not fail open on the broker.
+ */
+async function decideWakeInPodPlane(ctx: WakeContext): Promise<WakeDecision> {
+  const waiting = readWaiting(ctx.dir);
+  const figures = await readAgentsFigures(ctx.env);
+  if (!figures.ok) {
+    await logWake(ctx, "refused", undefined, {
+      reason: "admission_busy",
+      plane: "pod",
+      detail: figures.detail,
+      waiting: waiting.count,
+    });
+    return podWakeRefusal(admissionBusyRefusal(), { box: figures.box, live: null }, waiting.count);
+  }
+  const room = podRoom(figures.agents, {
+    harness: ctx.harness,
+    admissionClass: ctx.capacityClass,
+    waitingCount: waiting.count,
+  });
+  const reading = {
+    plane: "pod",
+    live: figures.agents.live,
+    cap: figures.agents.cap,
+    waiting: waiting.count,
+  };
+  if (room.slots >= 1) {
+    await logWake(ctx, "not-gated", undefined, {
+      why: "pod-room",
+      ...reading,
+      freeSlots: room.slots,
+    });
+    return { decision: "not-gated", why: "pod-room" };
+  }
+  const why = room.why ?? "cap";
+  await logWake(ctx, "refused", undefined, { reason: "agent_cap", why, ...reading });
+  const { target } = ctx.request;
+  const error = agentCapRefusal({
+    live: figures.agents.live,
+    cap: figures.agents.cap,
+    box: figures.box,
+    why,
+    wake: target.id,
+    seatId: target.seatId ?? null,
+  });
+  return podWakeRefusal(error, { box: figures.box, live: figures.agents.live }, waiting.count);
+}
+
 /**
  * brick 5c44d8ba (HoD decision 2026-11-07): an admitted ownerless `set` holds its `wake:` entry only
  * while its direct connect runs. That adapter is closed before the verb returns, so the entry would
@@ -1202,10 +1285,24 @@ export async function admitWake(
     await logWake(ctx, "not-gated", undefined, { why: "closed" });
     return { decision: "not-gated", why: "closed" };
   }
-  if (cls.value === "interactive") {
+  return isControlPlaneInPodMode() ? await admitWakeInPodPlane(ctx) : await admitWakeOnBox(ctx);
+}
+
+/** An authenticated human is never refused; the decision line carries no control-pod memory reading. */
+async function admitWakeInPodPlane(ctx: WakeContext): Promise<WakeDecision> {
+  if (ctx.cls.value === "interactive") {
+    await logWake(ctx, "not-gated", undefined, { why: "interactive", plane: "pod" });
+    return { decision: "not-gated", why: "interactive" };
+  }
+  return await decideWakeInPodPlane(ctx);
+}
+
+/** Today's gate: the control pod's own memory, its ledger and its lock. */
+async function admitWakeOnBox(ctx: WakeContext): Promise<WakeDecision> {
+  if (ctx.cls.value === "interactive") {
     return await admitInteractiveWake(ctx);
   }
-  if (!readPodInfo(capacitySourcesFromEnv(env).podinfoDir).present) {
+  if (!readPodInfo(capacitySourcesFromEnv(ctx.env).podinfoDir).present) {
     await logWake(ctx, "not-gated", undefined, { why: "unconfigured" });
     return { decision: "not-gated", why: "unconfigured" }; // no lock on an unconfigured box (§3.3)
   }

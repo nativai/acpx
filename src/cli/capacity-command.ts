@@ -16,12 +16,25 @@ import {
 import {
   type CapacityClass,
   type CapacitySnapshot,
+  ACPX_FEATURES,
   capacitySourcesFromEnv,
   needMet,
   needMetReason,
   readCapacity,
 } from "../capacity/reading.js";
 import { type RunBuildResult, runBuild } from "../capacity/run-build.js";
+import type { BrokerAgentsSnapshot } from "../pod/broker-client.js";
+import {
+  isControlPlaneInPodMode,
+  podCapacitySnapshot,
+  podNeedMet,
+  podNeedReason,
+  podRoom,
+  renderPodCapacityLines,
+  type PodCapacitySnapshot,
+  readAgentsFigures,
+  type PodRoom,
+} from "../pod/pod-capacity.js";
 import { EXIT_CODES, type OutputFormat } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import { parseOutputFormat, resolveGlobalFlags } from "./flags.js";
@@ -171,7 +184,10 @@ function itemLabel(item: CapacitySnapshot["waiting"]["items"][number]): string {
  * One line while anything waits for room — agent-facing wording (CONCEPTION e8abe1e8 §12.3; A1 §8:
  * held messages wait too, one item per session that needs waking, so the count is ITEMS).
  */
-export function waitingLine(s: CapacitySnapshot, now: Date = new Date()): string | undefined {
+export function waitingLine(
+  s: Pick<CapacitySnapshot, "waiting" | "class">,
+  now: Date = new Date(),
+): string | undefined {
   const { count, items } = s.waiting;
   if (count === 0) {
     return undefined;
@@ -330,14 +346,12 @@ function writeCapacityText(
   }
 }
 
-function writeCapacity(
-  format: OutputFormat,
-  snapshot: CapacitySnapshot,
-  lock: AdmissionLockState,
+/** The answer's JSON: its body plus the verdicts of `--need` and `--need-build`, when asked for. */
+function withVerdicts(
+  body: Record<string, unknown>,
   request: NeedRequest | undefined,
   buildRequest: NeedVerdict | undefined,
-): void {
-  const body = { ...snapshot, admissionLock: lock };
+): Record<string, unknown> {
   const withNeed = request
     ? {
         ...body,
@@ -346,7 +360,7 @@ function writeCapacity(
         needMetReason: request.verdict.reason,
       }
     : body;
-  const json = buildRequest
+  return buildRequest
     ? {
         ...withNeed,
         needBuild: true,
@@ -354,6 +368,16 @@ function writeCapacity(
         needBuildReason: buildRequest.reason,
       }
     : withNeed;
+}
+
+function writeCapacity(
+  format: OutputFormat,
+  snapshot: CapacitySnapshot,
+  lock: AdmissionLockState,
+  request: NeedRequest | undefined,
+  buildRequest: NeedVerdict | undefined,
+): void {
+  const json = withVerdicts({ ...snapshot, admissionLock: lock }, request, buildRequest);
   if (emitJsonResult(format, json)) {
     return;
   }
@@ -364,11 +388,159 @@ function writeCapacity(
   writeCapacityText(snapshot, lock, request, buildRequest);
 }
 
+// ── pod mode (block A9, C7.3): the verbs answer from the broker's `GET /v1/agents` ─────────────────
+
+type PodAnswer = {
+  readonly body: Record<string, unknown>;
+  readonly text: string[];
+  readonly need: NeedRequest | undefined;
+  readonly buildRequest: NeedVerdict | undefined;
+};
+
+/** The local reading, for `--need-build` alone: a release build runs on the control pod. */
+function localBuildSnapshot(agent: Harness): CapacitySnapshot {
+  return readCapacity({ agent, sources: capacitySourcesFromEnv() });
+}
+
+/**
+ * The broker did not answer. The verb still ANSWERS, with `pod.available: false` — atrium reads the
+ * `features` of every `capacity` answer (a field-less one reads "no features" and stops delivering
+ * forks at a cut, `ACPX_FEATURES`), so an outage must not take them away. `--need` then holds: exit 75,
+ * `needMetReason` beginning `admission_busy:` (the form atrium's probe already reads for a busy lock);
+ * a plain `capacity` exits 0, as an unconfigured box does, with a warning.
+ */
+function podUnavailable(
+  flags: CapacityFlags,
+  figures: { box: string; detail: string },
+  waiting: CapacitySnapshot["waiting"],
+): PodAnswer {
+  const warning = `the broker did not answer (${figures.detail}); the room for a pod cannot be read`;
+  const reason = `admission_busy: ${warning}; retry after 5 s`;
+  return {
+    body: {
+      action: "capacity",
+      schema: 1,
+      features: ACPX_FEATURES,
+      box: figures.box,
+      class: flags.class ?? "spawn",
+      agent: flags.agent ?? "claude",
+      basis: "pod",
+      waiting,
+      measuredAt: new Date().toISOString(),
+      pod: { available: false, detail: figures.detail },
+      warnings: [warning],
+    },
+    text: [`${figures.box} · pod plane: ⚠ ${warning}`],
+    need:
+      flags.need === undefined ? undefined : { need: flags.need, verdict: { met: false, reason } },
+    buildRequest: undefined,
+  };
+}
+
+/** `--need N` against the broker's room: met when that many new sessions of the harness fit. */
+function podNeedOf(
+  need: number | undefined,
+  agents: BrokerAgentsSnapshot,
+  agent: Harness,
+  room: PodRoom,
+): NeedRequest | undefined {
+  return need === undefined
+    ? undefined
+    : {
+        need,
+        verdict: { met: podNeedMet(room, need), reason: podNeedReason(agents, agent, need, room) },
+      };
+}
+
+function podTextOf(snapshot: PodCapacitySnapshot): string[] {
+  const waiting = waitingLine(snapshot);
+  return [...renderPodCapacityLines(snapshot), ...(waiting === undefined ? [] : [waiting])];
+}
+
+async function podAnswerFor(flags: CapacityFlags): Promise<PodAnswer> {
+  const agent = flags.agent ?? "claude";
+  const admissionClass = flags.class ?? "spawn";
+  const waiting = readWaitingForProbe();
+  const figures = await readAgentsFigures();
+  if (!figures.ok) {
+    return podUnavailable(flags, figures, waiting);
+  }
+  const snapshot = podCapacitySnapshot({
+    agents: figures.agents,
+    box: figures.box,
+    agent,
+    admissionClass,
+    waiting,
+  });
+  const room = podRoom(figures.agents, {
+    harness: agent,
+    admissionClass,
+    waitingCount: waiting.count,
+  });
+  // `--need-build` stays local: a release build runs on the control pod (the broker knows nothing of it).
+  const build = flags.needBuild ? localBuildSnapshot(agent).build : undefined;
+  return {
+    body: build ? { ...snapshot, build } : snapshot,
+    text: podTextOf(snapshot),
+    need: podNeedOf(flags.need, figures.agents, agent, room),
+    buildRequest: build ? { met: build.fits, reason: build.reason } : undefined,
+  };
+}
+
+/** The `need …: met|NOT MET` lines of the text answer. */
+function verdictLines(
+  agent: Harness,
+  need: NeedRequest | undefined,
+  buildRequest: NeedVerdict | undefined,
+): string[] {
+  const label = (met: boolean) => (met ? "met (exit 0)" : "NOT MET (exit 75)");
+  return [
+    ...(need
+      ? [
+          `need ${plural(need.need, `${agent} slot`)}: ${label(need.verdict.met)} — ${need.verdict.reason}`,
+        ]
+      : []),
+    ...(buildRequest ? [`need build: ${label(buildRequest.met)} — ${buildRequest.reason}`] : []),
+  ];
+}
+
+function writePodCapacity(format: OutputFormat, answer: PodAnswer, agent: Harness): void {
+  const { need, buildRequest } = answer;
+  if (emitJsonResult(format, withVerdicts(answer.body, need, buildRequest))) {
+    return;
+  }
+  if (format === "quiet") {
+    const slots = (answer.body as Partial<PodCapacitySnapshot>).slotsAfterMakeRoom?.[agent];
+    process.stdout.write(`${slots ?? "unavailable"}\n`);
+    return;
+  }
+  process.stdout.write(
+    `${[...answer.text, ...verdictLines(agent, need, buildRequest)].join("\n")}\n`,
+  );
+}
+
+async function handlePodCapacity(
+  flags: CapacityFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const { format } = resolveGlobalFlags(command, config);
+  const answer = await podAnswerFor(flags);
+  writePodCapacity(format, answer, flags.agent ?? "claude");
+  if (!allMet([answer.need?.verdict, answer.buildRequest])) {
+    process.exitCode = EXIT_CODES.CAPACITY;
+  }
+}
+
 async function handleCapacity(
   flags: CapacityFlags,
   command: Command,
   config: ResolvedAcpxConfig,
 ): Promise<void> {
+  if (isControlPlaneInPodMode()) {
+    await handlePodCapacity(flags, command, config);
+    return;
+  }
   const { format } = resolveGlobalFlags(command, config);
   const snapshot = readCapacity({
     agent: flags.agent ?? "claude",

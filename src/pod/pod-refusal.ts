@@ -93,10 +93,13 @@ export function agentCapRefusal(input: {
     `box=${input.box} why=${input.why}` +
     (input.wake === undefined ? "" : ` wake=${input.wake}`);
   const state = `${input.live} of ${input.cap} in use; ${input.why}`;
+  // `waiting-line` is a CREATE's refusal only (C7.2): no message waits and nothing was created.
   const sentence =
-    input.wake === undefined
-      ? `acpx: the box's utility pod cannot be started now (${state}). Nothing was started; this is not available right now.`
-      : `acpx: no agent pod can be started on this box now (${state}). Nothing was started; the message stays queued until room frees.`;
+    input.why === "waiting-line"
+      ? `acpx: the box's line of sessions waiting for a pod is full (${state}). Nothing was created; try again in a minute.`
+      : input.wake === undefined
+        ? `acpx: the box's utility pod cannot be started now (${state}). Nothing was started; this is not available right now.`
+        : `acpx: no agent pod can be started on this box now (${state}). Nothing was started; the message stays queued until room frees.`;
   return new CapacityRefusedError({
     tokenLine,
     sentence,

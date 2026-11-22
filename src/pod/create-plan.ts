@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { AcpxOperationalError } from "../errors.js";
+import { admissionDir } from "../capacity/ledger.js";
+import { readWaiting, type WaitingQueue } from "../capacity/waiting.js";
+import { AcpxOperationalError, type CapacityRefusedError } from "../errors.js";
 import { podMode, thisPodFile } from "./placement.js";
+import { readAgentsFigures, WAITING_LINE_FACTOR } from "./pod-capacity.js";
+import { agentCapRefusal } from "./pod-refusal.js";
 
 /**
  * C1.3 — the create plan (CONTRACTS-r4 C1.3, block A2, brick 569497cb).
@@ -335,29 +339,39 @@ export function isRecordOnlyCreate(): boolean {
 
 /**
  * C1.3: a record-only create is never refused for room. The one refusal is the box's waiting line
- * (`acpx: REFUSED reason=agent_cap … why=waiting-line`, C7.2): sessions waiting for a pod above
- * 2 × the cap. That number comes from the broker (`GET /v1/agents`, A9 / [D2]), which does not
- * exist yet — so this seam answers "no refusal" until it does.
+ * (`acpx: REFUSED reason=agent_cap … why=waiting-line`, C7.2): more sessions waiting for a pod than
+ * {@link WAITING_LINE_FACTOR} × the cap. What waits is the waiting dir atrium publishes (a held message,
+ * one item per session that needs a pod — the same queue `acpx capacity` lists); the cap is the
+ * broker's (`GET /v1/agents`, block A9).
+ *
+ * ⚠️ IT FAILS OPEN, ON PURPOSE: a broker that does not answer cannot make a create refuse — "never
+ * refused for capacity" is the rule and the line is its single exception, so only a line SEEN to be full
+ * refuses. An empty queue never asks the broker at all (`test/pod-capacity.test.ts` holds both).
  */
 export type WaitingLineRefusal = { live: number; cap: number; box: string };
 
-export async function waitingLineRefusal(): Promise<WaitingLineRefusal | undefined> {
-  return undefined;
+export async function waitingLineRefusal(
+  options: { env?: NodeJS.ProcessEnv; fetchImpl?: typeof fetch; waiting?: WaitingQueue } = {},
+): Promise<WaitingLineRefusal | undefined> {
+  const env = options.env ?? process.env;
+  const waiting = options.waiting ?? readWaiting(admissionDir(env));
+  if (waiting.count === 0) {
+    return undefined;
+  }
+  const figures = await readAgentsFigures(env, options.fetchImpl);
+  if (!figures.ok || waiting.count <= WAITING_LINE_FACTOR * figures.agents.cap) {
+    return undefined;
+  }
+  return { live: figures.agents.live, cap: figures.agents.cap, box: figures.box };
 }
 
 /**
  * The C7.2 line for that one refusal — exit 75 (`CAPACITY`), line 1 the machine token, line 2 one
- * sentence; nothing was created. Typed here because the reason `agent_cap` joins acpx's capacity
- * reasons with C7.2's own block, not with A2.
+ * sentence; nothing was created. A `CapacityRefusedError`, so the token also reaches STDERR in
+ * `--format json` mode, where atrium reads it (a plain operational error prints it only inside the JSON).
  */
-export function waitingLineRefusalError(refusal: WaitingLineRefusal): AcpxOperationalError {
-  const token =
-    `acpx: REFUSED reason=agent_cap nothing_started=true protocol=1 retry_after_s=60 ` +
-    `live=${refusal.live} cap=${refusal.cap} box=${refusal.box} why=waiting-line`;
-  return new AcpxOperationalError(
-    `${token}\nThe box's line of sessions waiting for a pod is full; nothing was created — try again in a minute.`,
-    { outputCode: "CAPACITY", detailCode: "agent-cap", origin: "cli", retryable: true },
-  );
+export function waitingLineRefusalError(refusal: WaitingLineRefusal): CapacityRefusedError {
+  return agentCapRefusal({ ...refusal, why: "waiting-line" });
 }
 
 /** C1.3 — the create gate in pod mode: never "no room", only the waiting line. */
