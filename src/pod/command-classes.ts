@@ -179,9 +179,12 @@ export const COMMAND_TABLE: Readonly<Record<string, CommandEntry>> = {
   },
   "sessions restore": { class: "control-store", reason: "the archive" },
   "sessions template": {
-    class: "record",
-    reason: "marks one session's record as a template",
-    target: BY_OPERAND,
+    class: "control-store",
+    reason:
+      "marking assigns the slug's next VERSION from every entry of the box's index, under the index lock — a box-wide read-modify-write",
+    judgment:
+      "it names one session's record, but it was `record` and, on the pod's OWN id, ran locally and " +
+      "tripped `pod_foreign_write file=index` (brick 3fda4443); passed through for any id",
   },
   "sessions new": { class: "create", reason: "a create (C1.3)" },
   "sessions close": {

@@ -906,7 +906,11 @@ test("the argv shapes atrium really sends classify as expected (acpx-ui origin/m
       "owner-if-pod",
     ],
     // server/sessionTemplateMark.ts:77
-    [["--format", "json", "sessions", "template", "S", "--enable"], "sessions template", "record"],
+    [
+      ["--format", "json", "sessions", "template", "S", "--enable"],
+      "sessions template",
+      "control-store",
+    ],
     // server/sessionArchiveRetention.ts:493
     [
       ["sessions", "archive", "--compress", "--apply", "--max-bytes", "1", "--json"],
