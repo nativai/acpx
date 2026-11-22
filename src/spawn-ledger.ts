@@ -563,6 +563,15 @@ export class SpawnLedger {
     }
   }
 
+  /**
+   * The instance this ledger is bound to, or null before `bindIdentity` ran. Read-only and additive:
+   * the atrium writer of `<id>.spawn-state` takes its `instance_id` from here, because a value it
+   * tracked beside the ledger could be null or wrong after a restart while the ledger is bound.
+   */
+  boundInstanceId(): string | null {
+    return this.meta("instance_id");
+  }
+
   listSpawnAttempts(runId: string): SpawnAttempt[] {
     return this.db
       .prepare(`SELECT a.*,r.trigger_id,r.parent_brick_id,r.child_brick_id
