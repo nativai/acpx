@@ -13,7 +13,8 @@ import {
   waitingLine,
   type CallHomeOutcome,
 } from "./call-home.js";
-import type { OutputMode } from "./command-classes.js";
+import type { Classification, OutputMode } from "./command-classes.js";
+import { answerLikeLocal } from "./not-found-answer.js";
 import {
   buildPassThroughCall,
   PassThroughUsageError,
@@ -94,17 +95,49 @@ function asBody(value: unknown): AnswerBody {
   return typeof value === "object" && value !== null ? (value as AnswerBody) : {};
 }
 
+/**
+ * K5: a target atrium cannot resolve (`400 class-not-passable` + `target-unresolved`) is the control pod's
+ * "Session not found", not a policy refusal — for the verbs and selector forms `not-found-answer.ts` maps.
+ */
+async function localAnswerFor(
+  status: number,
+  body: AnswerBody,
+  deps: {
+    output: OutputMode;
+    context: BranchContext;
+    classification: Extract<Classification, { kind: "classified" }>;
+  },
+): Promise<number | undefined> {
+  if (
+    status !== 400 ||
+    body.error !== "class-not-passable" ||
+    body.reason !== "target-unresolved"
+  ) {
+    return undefined;
+  }
+  return await answerLikeLocal(deps.classification, deps.output, deps.context);
+}
+
 /** Print what atrium answered, or the failure it amounts to; returns the exit code. */
-function finishAnswered(
+async function finishAnswered(
   outcome: Extract<CallHomeOutcome, { kind: "answered" }>,
   call: PassThroughCall,
-  deps: { output: OutputMode; io: PassThroughIo; context: BranchContext },
-): number {
+  deps: {
+    output: OutputMode;
+    io: PassThroughIo;
+    context: BranchContext;
+    classification: Extract<Classification, { kind: "classified" }>;
+  },
+): Promise<number> {
   const body = asBody(outcome.body);
   if (outcome.status === 200 && typeof body.exit === "number") {
     deps.io.stdout(typeof body.stdout === "string" ? body.stdout : "");
     deps.io.stderr(typeof body.stderr === "string" ? body.stderr : "");
     return body.exit;
+  }
+  const local = await localAnswerFor(outcome.status, body, deps);
+  if (local !== undefined) {
+    return local;
   }
   // A 4xx is a refusal by the door (a 400 class-not-passable, a 403 caller gate): FINAL, never
   // retried. Any other answer (a 500, a body that is not `{exit}`): the command may have run.
@@ -232,10 +265,21 @@ export async function runPassThrough(run: PassThroughRun): Promise<number> {
   }
   const outcome = await sendCall(run, env, call, decision.output);
   if (outcome.kind === "answered") {
-    return finishAnswered(outcome, call, {
+    // `buildCallOrRefuse` fails closed on anything unclassified, so this is the classified branch.
+    const classification = decision.classification;
+    if (classification.kind !== "classified") {
+      return refuseLines(
+        decision,
+        context,
+        ROUTED_TWICE_REFUSAL.lines,
+        ROUTED_TWICE_REFUSAL.exitCode,
+      );
+    }
+    return await finishAnswered(outcome, call, {
       output: decision.output,
       io: run.io ?? defaultIo,
       context,
+      classification,
     });
   }
   const failure =

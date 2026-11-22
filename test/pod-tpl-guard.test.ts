@@ -244,7 +244,10 @@ test("T3 on the real CLI in an agent pod: `set-parent --children-of <other paren
     assert.match(r.stderr, /class-not-passable detail=own-session/u, r.stderr);
   });
   assert.equal(await fs.readFile(ownRecord, "utf8"), before, "and nothing was written");
-  // (3) Unresolvable parent (the kit's atrium resolves nothing without `resolveTargetAs`): refused by name, not run.
+  // (3) Unresolvable parent (the kit's atrium resolves nothing without `resolveTargetAs`): it answers what the control
+  // pod answers (K5, brick 75956474) — `set-parent: SESSION_NOT_FOUND: --children-of refers to unknown session`, exit 4,
+  // a not-found and not a policy refusal — and nothing runs. The control's wording is measured in
+  // `test/pod-not-found.test.ts` ("sessions set-parent --children-of"), which compares the whole answer.
   await withAtrium(
     { calls: [{ answer: { exit: 0, stdout: "must-not-run\n", stderr: "" } }] },
     async (atrium) => {
@@ -259,8 +262,13 @@ test("T3 on the real CLI in an agent pod: `set-parent --children-of <other paren
         ],
         agentPodEnv(home, atrium.url),
       );
-      assert.notEqual(r.status, 0);
-      assert.match(r.stderr, /target-unresolved|class-not-passable/u, r.stderr);
+      assert.equal(r.status, 4, r.stderr);
+      assert.match(
+        r.stderr,
+        /^set-parent: SESSION_NOT_FOUND: --children-of refers to unknown session: cccccccc-0000-4000-8000-0000000000ee\n/u,
+        r.stderr,
+      );
+      assert.doesNotMatch(r.stderr, /pass_through_refused|class-not-passable/u);
       assert.equal(r.stdout.includes("must-not-run"), false);
     },
   );

@@ -576,22 +576,32 @@ test("CLI: a local-routed command runs as today in pod mode (the step lets it th
   assert.doesNotMatch(r.stderr, /REFUSED/u);
 });
 
-test("CLI: agent pod — a record command about an unresolvable session is passed through (A3: it reaches atrium)", async () => {
+test("CLI: agent pod — a record command about an unresolvable session answers as the control pod does: exit 4 `Session not found` (K5; brick 75956474)", async () => {
+  // The recorded atrium has no `resolveTargetAs` here, so it refuses `400 class-not-passable` +
+  // `target-unresolved` exactly as the real one does for an id it cannot resolve (the old row scripted a world
+  // the real atrium never produces, and so hid X1 TE round 2 P1: exit 2 and a policy-refusal sentence).
   const home = podHome({ podFile: agentPodName("rec-own") });
-  const { result, requests } = await runCallingHome(
-    ["sessions", "set-os", "rec-nobody", "default"],
-    home,
-    // the real atrium refuses a target it cannot resolve; here the control pod knows the session
-    {
-      resolveTargetAs: "rec-nobody-on-the-control-pod",
-      calls: [{ answer: { exit: 4, stderr: "no session\n" } }],
-    },
-  );
-  assert.equal(result.status, 4, result.stderr);
-  assert.equal(result.stderr, "no session\n", "the control pod's answer, verbatim");
+  const argv = ["sessions", "set-os", "rec-nobody", "default"];
+  const { result, requests } = await runCallingHome(argv, home, {});
+  // The control pod's answer, MEASURED: the same verb outside any pod, in a home whose index already exists.
+  const controlHome = tmpDir();
+  const controlEnv: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH,
+    HOME: controlHome,
+    ACPX_STATE_HOME: controlHome,
+    NODE_TEST_CONTEXT: "child",
+  };
+  run(argv, controlEnv); // builds the index (and says so, once)
+  const control = run(argv, controlEnv);
+  assert.equal(control.status, 4, "the measure: the control pod says not-found, exit 4");
+  assert.match(control.stderr, /^Session not found: rec-nobody\n/u);
+  assert.equal(result.status, control.status, result.stderr);
+  assert.equal(result.stderr, control.stderr);
+  assert.equal(result.stdout, control.stdout);
+  assert.doesNotMatch(result.stderr, /pass_through_refused/u);
   const calls = requests.filter((q) => q.route === "call");
-  assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0]?.body?.argv, ["sessions", "set-os", "rec-nobody", "default"]);
+  assert.equal(calls.length, 1, "it reached atrium once, and nothing ran in the pod");
+  assert.deepEqual(calls[0]?.body?.argv, argv);
 });
 
 const DETERMINISTIC: string[][] = [
