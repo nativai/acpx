@@ -58,6 +58,13 @@ export async function connectToQueueOwner(
 ): Promise<net.Socket | undefined> {
   let lastError: unknown;
 
+  if (owner.pod) {
+    // A-16 backstop (F4): the one door to an owner's socket. A lease that names a pod is not connected
+    // to from the control pod in local mode unless the pod is proven gone — whatever verb asked.
+    const { refuseWhilePodNotGone } = await import("../../pod/turnover-guard.js");
+    await refuseWhilePodNotGone(owner.sessionId, owner.pod);
+  }
+
   const attempts = Math.max(1, Math.trunc(maxAttempts));
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {

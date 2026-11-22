@@ -1,3 +1,4 @@
+import { damagedSleepingPlan, parseSleepingPlan } from "../../pod/create-plan.js";
 import { parseRecordPidIdentity } from "../../process-identity.js";
 import type {
   SessionAcpxState,
@@ -310,7 +311,7 @@ function hasValidConversationCore(record: Record<string, unknown>): record is Re
   );
 }
 
-function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
+function parseAcpxState(raw: unknown, neverRan: boolean): SessionAcpxState | undefined {
   const record = asRecord(raw);
   if (!record) {
     return undefined;
@@ -319,7 +320,7 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
   const state: SessionAcpxState = {};
 
   assignBooleanTrue(state, "reset_on_next_ensure", record.reset_on_next_ensure);
-  assignSleeping(state, record.sleeping);
+  assignSleeping(state, record.sleeping, neverRan);
   assignStringState(state, "current_mode_id", record.current_mode_id);
   assignStringState(state, "desired_mode_id", record.desired_mode_id);
 
@@ -395,6 +396,7 @@ function parseAcpxState(raw: unknown): SessionAcpxState | undefined {
   assignServedState(state, record.served);
   assignServedBelowFloor(state, record.served_below_floor);
   assignFloorParked(state, record.floor_parked);
+  assignLastPodEnd(state, record.last_pod_end);
   // B3: the depth-projection outcome MUST round-trip for the same reason the
   // served block does. It is the ONLY record of what a --reasoning-effort request
   // actually produced (three of its six outcomes send no value at all, so
@@ -472,6 +474,29 @@ function assignServedBelowFloor(state: SessionAcpxState, raw: unknown): void {
   copyStringField(parsed, crumb, "pinned_model");
   copyStringField(parsed, crumb, "pinned_effort");
   state.served_below_floor = parsed as NonNullable<SessionAcpxState["served_below_floor"]>;
+}
+
+/** The four required strings of `last_pod_end`; undefined when any is missing or `proof` is unknown. */
+function podEndCore(end: Record<string, unknown>): Record<string, unknown> | undefined {
+  const { at, pod, uid, proof } = end;
+  const named = [at, pod, uid].every((value) => typeof value === "string");
+  return named && (proof === "pod-gone" || proof === "pod-terminal")
+    ? { at, pod, uid, proof }
+    : undefined;
+}
+
+/** A4: a pod's end survives a cold reload, or the OOM it names is forgotten at the next owner respawn. */
+function assignLastPodEnd(state: SessionAcpxState, raw: unknown): void {
+  const end = asRecord(raw);
+  const parsed = end ? podEndCore(end) : undefined;
+  if (!end || !parsed) {
+    return;
+  }
+  copyStringField(parsed, end, "reason");
+  if (typeof end.exit_code === "number" && Number.isFinite(end.exit_code)) {
+    parsed.exit_code = end.exit_code;
+  }
+  state.last_pod_end = parsed as NonNullable<SessionAcpxState["last_pod_end"]>;
 }
 
 function assignFloorParked(state: SessionAcpxState, raw: unknown): void {
@@ -830,18 +855,17 @@ function assignLastTurnProvider(state: SessionAcpxState, value: unknown): void {
  */
 // UMQ K7 — `acpx.sleeping`: kept only when well-formed, so a damaged value reads as "not sleeping"
 // (a record that does carry a real `acpSessionId` must never be mistaken for one that never ran).
-function assignSleeping(state: SessionAcpxState, value: unknown): void {
-  const record = asRecord(value);
-  if (!record || typeof record.since !== "string" || record.since.length === 0) {
-    return;
+// C1.3 / R3-F1 — except on a record that NEVER RAN (`acp_session_id ""`): there a PRESENT value that is not
+// a valid mark is a damaged plan (`plan -1`, the raw value kept), refused at the wake by name, never "not
+// sleeping" (which fails with a misleading reconnect error and erases the value).
+function assignSleeping(state: SessionAcpxState, value: unknown, neverRan: boolean): void {
+  // C1.3 — the whole plan (version, cut, by-the-way), never just `since` + `fork.from`.
+  const sleeping = parseSleepingPlan(value);
+  if (sleeping) {
+    state.sleeping = sleeping;
+  } else if (neverRan && value !== undefined) {
+    state.sleeping = damagedSleepingPlan(value);
   }
-  const fork = asRecord(record.fork);
-  state.sleeping = {
-    since: record.since,
-    ...(fork && typeof fork.from === "string" && fork.from.length > 0
-      ? { fork: { from: fork.from } }
-      : {}),
-  };
 }
 
 function assignLastTurnSubscription(state: SessionAcpxState, value: unknown): void {
@@ -1596,7 +1620,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
       updated_at: conversation.updated_at,
       cumulative_token_usage: conversation.cumulative_token_usage,
       request_token_usage: conversation.request_token_usage,
-      acpx: parseAcpxState(record.acpx),
+      acpx: parseAcpxState(record.acpx, record.acp_session_id === ""),
       kind,
       parentSessionId: parentSessionId ?? undefined,
       parentSessionUrl: parentSessionUrl ?? undefined,

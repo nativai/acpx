@@ -164,6 +164,15 @@ export const PERSISTED_ACPX_SENTINEL = {
     reason: "sentinel-parked-reason",
     observed_model: "sentinel-parked-observed",
   },
+  // Block A4: every NESTED key needs its sentinel, or a leg can stop carrying it with every row green.
+  last_pod_end: {
+    at: "2026-09-10T00:00:06.500Z",
+    pod: "ag-sentinel-pod",
+    uid: "sentinel-pod-uid",
+    proof: "pod-terminal",
+    reason: "sentinel-pod-reason",
+    exit_code: 137,
+  },
   session_options: {
     model: "sentinel-option-model",
     allowed_tools: ["sentinel-allowed-tool"],

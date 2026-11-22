@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { SPAWN_STATE_SUFFIX } from "../../pod/spawn-state.js";
 import { SEAT_STORE_FILE, seatFromStore, type SeatStore } from "../persistence/seat-store.js";
 import { isNonSessionRecordFile } from "../persistence/session-dir-files.js";
 import {
@@ -105,6 +106,38 @@ export type DroppedAnchor = {
   companionBlocker: ArchiveBlocker;
 };
 
+/** A `<id>.spawn-state` with no record and no other file in the hot dir (O1), as the scan saw it. */
+export type LoneSpawnState = { file: string; safeId: string; mtimeMs: number };
+
+/**
+ * Which lone spawn-state files the plan may remove: ones that have been QUIET as long as a record must
+ * be before it moves (`quietMs`) — a reservation's fresh file exists before its record does, and
+ * atrium republishes it at every transition — and, when ids were NAMED (`--ids`, the pod pass-through
+ * form), only the named ones. A file that fails either is kept, not reported.
+ */
+export function removableLoneSpawnStates(
+  lone: readonly LoneSpawnState[],
+  boundaries: Pick<RetentionBoundaries, "quietMs" | "nowMs">,
+  explicitIds?: readonly string[],
+): string[] {
+  const named = explicitIds ? new Set(explicitIds) : undefined;
+  return lone
+    .filter(
+      (entry) =>
+        boundaries.nowMs - entry.mtimeMs >= boundaries.quietMs &&
+        (named === undefined || named.has(entry.safeId) || named.has(safeDecode(entry.safeId))),
+    )
+    .map((entry) => entry.file);
+}
+
+function safeDecode(safeId: string): string {
+  try {
+    return decodeURIComponent(safeId);
+  } catch {
+    return safeId;
+  }
+}
+
 export type ArchivePlan = {
   /** Ordered: COMPANIONS BEFORE THEIR ANCHORS. See `orderForApply`. */
   selected: PlannedArchive[];
@@ -112,11 +145,15 @@ export type ArchivePlan = {
   droppedAnchors: DroppedAnchor[];
   /** Files that are not session files at all (reserved names, non-session JSON). */
   ignoredFiles: string[];
+  /** Lone `<id>.spawn-state` files (no record, nothing else): removed on apply, with one line (O1). */
+  loneSpawnStates: string[];
   /** Orphans are reported in AGGREGATE, never listed individually (BRIEF §6.7). */
   orphanAggregate: { ids: number; files: number; bytes: number };
   boundaries: RetentionBoundaries;
   /** True when the wakeups store exists but could not be read — every id is LIVE. */
   livenessDegraded: boolean;
+  /** The reader's own words for why liveness is degraded ("not found at <path>", the open error); absent otherwise. */
+  livenessDetail?: string;
   /**
    * Ids blocked by `touched-recently` this run.
    *
@@ -354,11 +391,29 @@ function decodeSafeIdForDisplay(safeId: string): string {
   }
 }
 
+/**
+ * O1 (atrium S7): a spawn-state file with no record and nothing else is residue of an attempt whose
+ * record never was, or is gone — it is neither archived nor swept as an orphan id (it has no history
+ * to keep); the apply step removes it, when quiet, after checking the archive has no record either.
+ */
+function loneSpawnStateOf(
+  safeId: string,
+  fileSet: readonly string[],
+  stats: ReadonlyMap<string, { bytes: number; mtimeMs: number }>,
+): LoneSpawnState | undefined {
+  const file = fileSet[0];
+  return fileSet.length === 1 && file === `${safeId}${SPAWN_STATE_SUFFIX}`
+    ? { file, safeId, mtimeMs: stats.get(file)?.mtimeMs ?? 0 }
+    : undefined;
+}
+
 /** Scan a hot dir into candidates, orphans and non-session files. */
 export async function scanSessionDir(hotDir: string): Promise<{
   candidates: ArchiveCandidate[];
   orphans: ArchiveCandidate[];
   ignoredFiles: string[];
+  /** `<id>.spawn-state` files whose id has no record in the hot dir and no other file here (O1). */
+  loneSpawnStates: LoneSpawnState[];
 }> {
   const dirents = await fs.readdir(hotDir, { withFileTypes: true });
   // 🛑 acpx'S OWN STORES ARE EXCLUDED BEFORE CLASSIFICATION, not left to a downstream
@@ -404,7 +459,13 @@ export async function scanSessionDir(hotDir: string): Promise<{
   }
 
   const orphans: ArchiveCandidate[] = [];
+  const loneSpawnStates: LoneSpawnState[] = [];
   for (const [safeId, fileSet] of orphanSets) {
+    const lone = loneSpawnStateOf(safeId, fileSet, stats);
+    if (lone) {
+      loneSpawnStates.push(lone);
+      continue;
+    }
     // Belt and braces with the claim phase: an orphan is an id with NO record
     // file, and that judgement goes through the one record-presence helper.
     if (findRecordFile(safeId, fileSet) == null) {
@@ -414,7 +475,7 @@ export async function scanSessionDir(hotDir: string): Promise<{
     }
   }
 
-  return { candidates, orphans, ignoredFiles: ignored };
+  return { candidates, orphans, ignoredFiles: ignored, loneSpawnStates };
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
@@ -749,6 +810,7 @@ export type PlanInput = {
   candidates: ArchiveCandidate[];
   orphans: ArchiveCandidate[];
   ignoredFiles: string[];
+  loneSpawnStates?: LoneSpawnState[];
   boundaries: RetentionBoundaries;
   includeOrphans: boolean;
   explicitIds?: readonly string[];
@@ -988,9 +1050,17 @@ export async function buildArchivePlan(input: PlanInput): Promise<ArchivePlan> {
     blocked: state.blocked,
     droppedAnchors: state.droppedAnchors,
     ignoredFiles: input.ignoredFiles,
+    loneSpawnStates: removableLoneSpawnStates(
+      input.loneSpawnStates ?? [],
+      input.boundaries,
+      input.explicitIds,
+    ),
     orphanAggregate: aggregateOrphans(selected),
     boundaries: input.boundaries,
     livenessDegraded: input.liveness.wakeups.status === "unevaluable",
+    ...(input.liveness.wakeups.status === "unevaluable"
+      ? { livenessDetail: input.liveness.wakeups.detail }
+      : {}),
     touchedRecentlyIds: state.blocked
       .filter((entry) => entry.blocker === "touched-recently")
       .map((entry) => entry.candidate.id),

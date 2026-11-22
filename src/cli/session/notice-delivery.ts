@@ -78,7 +78,13 @@ function failureReason(error: unknown, timeoutMs: number): string {
 
 async function postNotice(
   origin: string,
-  params: { successorId: string; notice: string; env: NodeJS.ProcessEnv; timeoutMs: number },
+  params: {
+    successorId: string;
+    notice: string;
+    env: NodeJS.ProcessEnv;
+    timeoutMs: number;
+    from?: string;
+  },
 ): Promise<ActivationNoticeDelivery> {
   const { env } = params;
   const response = await fetch(
@@ -89,7 +95,7 @@ async function postNotice(
         "content-type": "application/json",
         ...(env.ACPX_SESSION_URL ? { "x-source-session": env.ACPX_SESSION_URL } : {}),
       },
-      body: JSON.stringify({ text: params.notice, from: noticeSender(env) }),
+      body: JSON.stringify({ text: params.notice, from: params.from ?? noticeSender(env) }),
       signal: AbortSignal.timeout(params.timeoutMs),
     },
   );
@@ -114,6 +120,8 @@ export async function deliverActivationNotice(params: {
   notice: string;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
+  /** The sender atrium records, when not the activator's session (a pod-mode first message, C1.3). */
+  from?: string;
 }): Promise<ActivationNoticeDelivery> {
   const env = params.env ?? process.env;
   const timeoutMs = params.timeoutMs ?? NOTICE_DELIVERY_TIMEOUT_MS;
@@ -127,6 +135,7 @@ export async function deliverActivationNotice(params: {
       notice: params.notice,
       env,
       timeoutMs,
+      ...(params.from === undefined ? {} : { from: params.from }),
     });
   } catch (error) {
     return { delivered: false, reason: failureReason(error, timeoutMs) };

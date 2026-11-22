@@ -155,6 +155,24 @@ async function writeArchivedSession(
         JSON.stringify({ o: i * 97, t: 1_788_000_000_000 + i }),
       ).join("\n"),
     ),
+    // C5 (block A8): atrium's marker sidecar — lines shaped as atrium writes them, enough of them to
+    // cross the sweep's size floor like the other families.
+    [`${id}.markers.ndjson`]: Buffer.from(
+      `${Array.from({ length: 400 }, (_, i) =>
+        JSON.stringify({
+          v: 1,
+          ts: "2026-09-01T10:00:00.000Z",
+          offset: i * 97,
+          ino: 12345,
+          fp: "4096:abcdef0123456789",
+          marker: {
+            jsonrpc: "2.0",
+            method: "acpxui/message_sent",
+            params: { delivery_id: `d-${i}`, body: `hello ${i}` },
+          },
+        }),
+      ).join("\n")}\n`,
+    ),
   };
   for (const [name, data] of Object.entries(logical)) {
     await fs.writeFile(path.join(archive, name), data);
@@ -278,15 +296,15 @@ test("--compress with no intent is refused (exit 2); --dry-run writes nothing �
       compressed: unknown[];
     };
     assert.equal(body.outcome, "dry-run");
-    assert.equal(body.eligible.files, 4, "the four families — never the record");
-    assert.equal(body.selected, 4);
+    assert.equal(body.eligible.files, 5, "the five families — never the record");
+    assert.equal(body.selected, 5);
     assert.ok(body.estimate && body.estimate.ratio > 0 && body.estimate.ratio < 1);
     assert.deepEqual(body.compressed, []);
     assert.equal(await treeFingerprint(fixture.archive), before);
   });
 });
 
-test("--compress --apply --initialize: four .zst, record plain, mtimes kept, journal + run record + README; a re-run compresses nothing twice", async () => {
+test("--compress --apply --initialize: five .zst, record plain, mtimes kept, journal + run record + README; a re-run compresses nothing twice", async () => {
   await withFixture(async (fixture) => {
     const body = (await compressAll(fixture)) as {
       outcome: string;
@@ -298,7 +316,7 @@ test("--compress --apply --initialize: four .zst, record plain, mtimes kept, jou
     };
     assert.equal(body.outcome, "applied");
     assert.equal(body.initialized, true);
-    assert.equal(body.compressed.length, 4);
+    assert.equal(body.compressed.length, 5);
     assert.ok(body.bytesAfter < body.bytesBefore / 4);
     for (const entry of body.compressed) {
       assert.equal(entry.logicalSha256, sha(fixture.logical[entry.file]), entry.file);
@@ -320,8 +338,8 @@ test("--compress --apply --initialize: four .zst, record plain, mtimes kept, jou
       journal,
       /^at\twave\taction\tfile\tlogical_bytes\tlogical_sha256\tzst_bytes\tzst_sha256\tverified\tdetail\n/,
     );
-    assert.equal(journal.match(/\tbegin\t/g)?.length, 4);
-    assert.equal(journal.match(/\tcompress\t/g)?.length, 4);
+    assert.equal(journal.match(/\tbegin\t/g)?.length, 5);
+    assert.equal(journal.match(/\tcompress\t/g)?.length, 5);
     assert.ok(names.includes("README.md"));
     assert.match(
       await fs.readFile(path.join(fixture.archive, "README.md"), "utf8"),
@@ -442,7 +460,7 @@ test("selection: a half-restored id (record hot) and a file whose last MANIFEST 
       "the half-restored id is untouched",
     );
     assert.ok(!compressed.includes(restoredFile), "a restore-row file belongs to --repair");
-    assert.equal(compressed.filter((file) => file.startsWith(interrupted.id)).length, 3);
+    assert.equal(compressed.filter((file) => file.startsWith(interrupted.id)).length, 4);
   });
 });
 
@@ -676,9 +694,9 @@ test("A3 --verify: a compressed file is PRESENT, not LOST; --verify --deep decod
       deepChecked: number;
       corrupt: unknown[];
     };
-    assert.equal(ok.checked, 5);
+    assert.equal(ok.checked, 6);
     assert.deepEqual(ok.problems, []);
-    assert.equal(ok.deepChecked, 4);
+    assert.equal(ok.deepChecked, 5);
     const zst = path.join(fixture.archive, zstNameFor(`${fixture.id}.stream.1.ndjson`));
     await fs.writeFile(zst, corruptCopy(await fs.readFile(zst), (await fs.stat(zst)).size - 3));
     const bad = await runCli(fixture.home, ["sessions", "archive", "--verify", "--deep", "--json"]);
@@ -737,7 +755,7 @@ test("A2 restore of a compressed session: hot files byte-identical to the origin
     };
     assert.equal(body.restored.length, 1);
     assert.equal(body.restored[0].files.at(-1), `${fixture.id}.json`, "the record lands LAST");
-    assert.equal(body.restored[0].decompressed.length, 4);
+    assert.equal(body.restored[0].decompressed.length, 5);
     const total = Object.values(fixture.logical).reduce((sum, data) => sum + data.length, 0);
     assert.equal(body.restored[0].bytes, total, "logical bytes");
     for (const [name, data] of Object.entries(fixture.logical)) {
@@ -967,7 +985,7 @@ test("A11 re-archiving an id whose .zst lingers in the archive is a clobber (alr
 
 // ─── thaw / cat (cli-contract §1, §4) ─────────────────────────────────────────
 
-test("--thaw: record + four families, plain, verified, with mtimes; the archive is untouched", async () => {
+test("--thaw: record + five families (the marker sidecar included), plain, verified, with mtimes; the archive is untouched", async () => {
   await withFixture(async (fixture) => {
     await compressAll(fixture);
     const before = await treeFingerprint(fixture.archive);
@@ -993,6 +1011,7 @@ test("--thaw: record + four families, plain, verified, with mtimes; the archive 
       assert.equal(body.status, "thawed");
       assert.equal(body.maxBytes, 1024 ** 3);
       assert.deepEqual(body.files.map((entry) => entry.family).toSorted(), [
+        "markers",
         "messages",
         "record",
         "stream",
@@ -1307,7 +1326,7 @@ test("AC-13 --decompress --all --apply: every plain back with its original sha25
       "--dry-run",
       "--json",
     ]);
-    assert.equal((JSON.parse(dry.stdout) as { selected: { files: number } }).selected.files, 4);
+    assert.equal((JSON.parse(dry.stdout) as { selected: { files: number } }).selected.files, 5);
     const result = await runCli(fixture.home, [
       "sessions",
       "archive",
@@ -1317,7 +1336,7 @@ test("AC-13 --decompress --all --apply: every plain back with its original sha25
       "--json",
     ]);
     assert.equal(result.code, 0, result.stderr);
-    assert.equal((JSON.parse(result.stdout) as { decompressed: unknown[] }).decompressed.length, 4);
+    assert.equal((JSON.parse(result.stdout) as { decompressed: unknown[] }).decompressed.length, 5);
     for (const [name, data] of Object.entries(fixture.logical)) {
       assert.equal(sha(await fs.readFile(path.join(fixture.archive, name))), sha(data), name);
       assert.equal(
@@ -1353,7 +1372,7 @@ test("AC-11 shard `bytes` = ON-DISK bytes after a sweep, and a --reindex rebuild
       onDisk += (await fs.stat(path.join(fixture.archive, name))).size;
     }
     assert.equal(live.entries[0].bytes, onDisk);
-    assert.equal(live.entries[0].files, 5);
+    assert.equal(live.entries[0].files, 6);
     await runCli(fixture.home, ["sessions", "archive", "--reindex", "--json"]);
     const rebuilt = JSON.parse(await fs.readFile(path.join(shardDir, shardFile), "utf8")) as {
       entries: unknown[];
@@ -1408,7 +1427,7 @@ test("capability probe: an atrium advertising zst-v1 passes; an HTML SPA catch-a
           { ACPX_UI_BASE_URL: origin },
         );
         assert.equal(result.code, 0, result.stderr);
-        assert.equal((JSON.parse(result.stdout) as { compressed: unknown[] }).compressed.length, 4);
+        assert.equal((JSON.parse(result.stdout) as { compressed: unknown[] }).compressed.length, 5);
       },
     );
   });

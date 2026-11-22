@@ -24,6 +24,7 @@ import {
 import { createOutputFormatter, getTextErrorRemediationHints } from "./cli/output/output.js";
 import { runQueueOwnerFromEnv } from "./cli/queue/owner-env.js";
 import { flushPerfMetricsCapture, installPerfMetricsCapture } from "./perf-metrics-capture.js";
+import { OwnerOutsidePodError } from "./pod/owner-pod.js";
 import { setSessionIndexRebuildLogSuppressed } from "./session/persistence/index.js";
 import { EXIT_CODES, OUTPUT_FORMATS, type OutputFormat, type OutputPolicy } from "./types.js";
 import { getAcpxVersion } from "./version.js";
@@ -122,6 +123,10 @@ export const TOP_LEVEL_VERBS = new Set([
   // (it runs `dist/capacity/governor/main.js`); without this entry `acpx governor status` would be a
   // prompt delivery to the cwd's session.
   "governor",
+  // `box` — `box refresh`, the control-store verb that releases this box from an agent pod too (A-17,
+  // brick f2fde405), registered by `registerBoxCommand`. Second half of the two registrations: without
+  // it `acpx box refresh` is a prompt delivery to the cwd's session.
+  "box",
   // `output-styles` is registered top-level by `registerSharedAgentSubcommands`
   // (command-registration.ts, called with `program` from `registerDefaultCommands`)
   // and was MISSING here — brick https://acpx.devbox.nativai.de/?brick=eb9c1d1e.
@@ -472,6 +477,12 @@ async function handleQueueOwnerCommand(argv: string[]): Promise<boolean> {
     await runQueueOwnerFromEnv(process.env);
     return true;
   } catch (error) {
+    if (error instanceof OwnerOutsidePodError) {
+      // C7.2 owner_outside_pod: the refusal line, then the failure line the cold-start waiter scans for.
+      process.stderr.write(`${error.stderrLine}\n[acpx] queue owner failed: ${error.stderrLine}\n`);
+      process.exit(error.exitCode);
+      return true;
+    }
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`[acpx] queue owner failed: ${message}\n`);
     process.exit(EXIT_CODES.ERROR);

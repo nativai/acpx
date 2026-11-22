@@ -1,4 +1,5 @@
 import { releaseHarnessConfigDir } from "../../acp/harness-config-dir.js";
+import { removeSessionTmpDir } from "../../acp/session-tmp-dir.js";
 import {
   isoNow,
   readRawRecordClosedState,
@@ -100,4 +101,14 @@ export function releaseConfigDirOnTerminalClose(record: SessionRecord): void {
   } catch {
     // Best-effort by design — see above. The orphan sweep is the guarantee.
   }
+}
+
+/**
+ * Block A8: in pod placement the scratch directory (`<state home>/session-tmp/acpx-<id>`) is removed
+ * when the session closes — the shared volume must not accumulate what a pod's `/tmp` used to shed on
+ * its own. Called beside `releaseConfigDirOnTerminalClose` on every close arm. Never throws, and does
+ * nothing outside pod placement (`removeSessionTmpDir`).
+ */
+export function removeScratchOnTerminalClose(record: SessionRecord): void {
+  removeSessionTmpDir(record.acpxRecordId);
 }

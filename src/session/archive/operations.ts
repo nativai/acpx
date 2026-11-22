@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { SPAWN_STATE_SUFFIX } from "../../pod/spawn-state.js";
 import {
   reconcileSeatArchive,
   type SeatArchiveReconcileResult,
@@ -187,6 +188,7 @@ export async function planArchiveRun(
     candidates: scan.candidates,
     orphans: scan.orphans,
     ignoredFiles: scan.ignoredFiles,
+    loneSpawnStates: scan.loneSpawnStates,
     boundaries,
     includeOrphans: options.includeOrphans,
     explicitIds: options.explicitIds,
@@ -243,6 +245,9 @@ export async function applyArchiveRun(options: ArchiveRunOptions): Promise<Archi
     return result;
   }
   if (options.dryRun) {
+    for (const file of plan.loneSpawnStates) {
+      result.warnings.push(`lone spawn-state ${file} (no record) would be removed on apply`);
+    }
     // Predicts THIS wave too: its selected holders are read as archived.
     result.seatArchive = await reconcileSeatsAfter(context, undefined, result.warnings, {
       dryRun: true,
@@ -253,6 +258,7 @@ export async function applyArchiveRun(options: ArchiveRunOptions): Promise<Archi
 
   await assertSameDevice(context.hotDir, context.archiveDir);
 
+  await removeLoneSpawnStates(context, plan.loneSpawnStates, options.boundaries, result.warnings);
   const seatStore = await readSeatStoreForNames(context, result.warnings);
   const writer = await ArchiveManifestWriter.open(context.archiveDir, context.at, context.wave);
   const shardEntries: ArchiveIndexEntry[] = [];
@@ -280,6 +286,48 @@ export async function applyArchiveRun(options: ArchiveRunOptions): Promise<Archi
   result.seatArchive = await reconcileSeatsAfter(context, undefined, result.warnings);
   result.applied = true;
   return result;
+}
+
+/**
+ * O1 (atrium S7, brick 9289d7c4): a `<id>.spawn-state` file whose id has no record — hot OR archived —
+ * is residue; it is removed and ONE line says so (`result.warnings`, which the command prints). The
+ * checks are re-made right before each removal (a record may have appeared since the scan), and a
+ * failure to remove is a warning, never a failed run. Atrium does not backfill archived attempts, so
+ * a spawn-state whose record IS archived is left where it is: restore brings the pair together.
+ */
+async function removeLoneSpawnStates(
+  context: ArchiveContext,
+  files: readonly string[],
+  boundaries: RetentionBoundaries,
+  warnings: string[],
+): Promise<void> {
+  for (const file of files) {
+    const recordFile = recordFileNameFor(file.slice(0, -SPAWN_STATE_SUFFIX.length));
+    try {
+      // The quiet window is judged again here: atrium may have republished it since the plan.
+      const { mtimeMs } = await fs.stat(path.join(context.hotDir, file));
+      if (
+        boundaries.nowMs - mtimeMs < boundaries.quietMs ||
+        (await pathExists(path.join(context.hotDir, recordFile))) ||
+        (await pathExists(path.join(context.archiveDir, recordFile)))
+      ) {
+        continue;
+      }
+      await fs.rm(path.join(context.hotDir, file), { force: true });
+      warnings.push(`removed orphan spawn-state ${file}: no record, hot or archived`);
+    } catch (error) {
+      warnings.push(`could not remove orphan spawn-state ${file}: ${(error as Error).message}`);
+    }
+  }
+}
+
+async function pathExists(file: string): Promise<boolean> {
+  try {
+    await fs.access(file);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**

@@ -196,8 +196,8 @@ export type AdvertisedBy = {
   sdkVersion: string | null;
   /** ISO-8601 of the probe the advertisement came from. */
   probedAt: string;
-  /** `"probe"` = a real transient session; `"fixture"` = `ACPX_TEST_CLAUDE_ADVERT_JSON`. */
-  source: "probe" | "fixture";
+  /** `"probe"` = a real transient session; `"fixture"` = `ACPX_TEST_CLAUDE_ADVERT_JSON`; `"records"` = a session record (A10, pod mode). */
+  source: "probe" | "fixture" | "records";
 };
 
 export type SelectabilityCounts = {
@@ -276,12 +276,25 @@ export type ClaudeAdvertisementStatus = {
   probedAt: string | null;
   adapterSha: string | null;
   sdkVersion: string | null;
-  source: "probe" | "fixture" | null;
+  source: "probe" | "fixture" | "records" | null;
   /** The key deployed now. */
   deployedAdapterSha: string | null;
   deployedSdkVersion: string | null;
   /** The last probe failure's message, iff it was for the deployed key. */
   error: string | null;
+  /**
+   * `source: "records"` only (additive; absent otherwise): when the serving record's adapter STARTED —
+   * what the names' age really is (`probedAt` is the record's last use). A record with none is `stale`.
+   */
+  recordAgentStartedAt?: string;
+  /**
+   * `source: "records"` only (additive; absent otherwise): whether the serving record was started with the box's
+   * OWN adapter command (`"exact"`) or another command of the same harness (`"harness"`) — the same value the
+   * record-served `adapter_match` carries elsewhere. It says WHICH adapter; `state` and `recordAgentStartedAt`
+   * say how old. A consumer must read the two separately: an `exact` record with no `agent_started_at` is
+   * `state: "stale"` (age unknown) although it is not a `harness` record.
+   */
+  adapterMatch?: "exact" | "harness";
 };
 
 /** How well the catalogue knows what the box's OpenRouter key allows. */

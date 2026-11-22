@@ -23,6 +23,7 @@ import {
 import { textPrompt } from "../src/prompt-content.js";
 import { sessionBaseDir } from "../src/session/persistence.js";
 import { withTempHome } from "./runtime-test-helpers.js";
+import { removeTempHome } from "./temp-home.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -596,5 +597,128 @@ test("ledger writer · NEGATIVE: an unwritable ledger never throws, returns the 
     const lines = stderr.split("\n").filter((line) => line.length > 0);
     assert.equal(lines.length, 1, stderr);
     assert.match(lines[0], LEDGER_FAILURE_RE);
+  });
+});
+
+// ---- block A8 (brick 88112988): one ledger file per writing pod (C10) ----
+
+type PodScope = { home: string; saDir: string };
+
+async function asLedgerPod<T>(
+  place: "agent-pod" | "control",
+  pod: { name: string; uid: string } | undefined,
+  fn: (scope: PodScope) => Promise<T> | T,
+): Promise<T> {
+  const names = [
+    "HOME",
+    "ACPX_STATE_HOME",
+    "ACPX_POD_TEST_HOME",
+    "ACPX_POD_SA_DIR",
+    "NV_POD_NAME",
+    "NV_POD_UID",
+    "NV_NODE_NAME",
+  ] as const;
+  const saved = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  const root = await fs.mkdtemp(path.join((await import("node:os")).tmpdir(), "acpx-ledger-pod-"));
+  const saDir = path.join(root, "sa");
+  await fs.mkdir(saDir, { recursive: true });
+  await fs.writeFile(path.join(saDir, "namespace"), "ns\n");
+  await fs.writeFile(path.join(saDir, "token"), "t\n");
+  if (place === "agent-pod") {
+    await fs.writeFile(path.join(root, ".nv-agent"), "ag-ledger\n");
+  }
+  process.env.HOME = root;
+  delete process.env.ACPX_STATE_HOME;
+  process.env.ACPX_POD_TEST_HOME = root;
+  process.env.ACPX_POD_SA_DIR = saDir;
+  for (const name of ["NV_POD_NAME", "NV_POD_UID", "NV_NODE_NAME"] as const) {
+    delete process.env[name];
+  }
+  if (pod) {
+    process.env.NV_POD_NAME = pod.name;
+    process.env.NV_POD_UID = pod.uid;
+    process.env.NV_NODE_NAME = "node-a";
+  }
+  try {
+    return await fn({ home: root, saDir });
+  } finally {
+    for (const name of names) {
+      const value = saved[name];
+      if (value === undefined) {
+        delete process.env[name];
+      } else {
+        process.env[name] = value;
+      }
+    }
+    await removeTempHome(root);
+  }
+}
+
+function ledgerLine(text: string): MessageLedgerLine {
+  return {
+    v: 1,
+    id: randomUUID(),
+    at: "2026-11-22T10:00:00.000Z",
+    kind: "prompt",
+    from: { session: "11111111-1111-1111-1111-111111111111", seat: null, url: null },
+    to: { session: "22222222-2222-2222-2222-222222222222", seat: null },
+    addressedAs: "session",
+    outcome: "accepted",
+    failureCode: null,
+    text,
+  };
+}
+
+test("A8: an agent pod's ledger lines go to <day>.<pod uid>.ndjson; two pods never share a file", async () => {
+  const { appendMessageLedgerLine } = await import("../src/cli/message-ledger.js");
+  await asLedgerPod("agent-pod", { name: "ag-one", uid: "uid-one" }, async ({ home }) => {
+    appendMessageLedgerLine(ledgerLine("from one"));
+    process.env.NV_POD_UID = "uid-two";
+    process.env.NV_POD_NAME = "ag-two";
+    appendMessageLedgerLine(ledgerLine("from two"));
+    const dir = path.join(home, ".acpx", "message-ledger");
+    assert.deepEqual((await fs.readdir(dir)).toSorted(), [
+      "2026-11-22.uid-one.ndjson",
+      "2026-11-22.uid-two.ndjson",
+    ]);
+    assert.match(
+      await fs.readFile(path.join(dir, "2026-11-22.uid-one.ndjson"), "utf8"),
+      /from one/,
+    );
+    assert.doesNotMatch(
+      await fs.readFile(path.join(dir, "2026-11-22.uid-one.ndjson"), "utf8"),
+      /from two/,
+    );
+  });
+});
+
+test("A8 NEGATIVE: the control pod keeps today's <day>.ndjson", async () => {
+  const { appendMessageLedgerLine } = await import("../src/cli/message-ledger.js");
+  await asLedgerPod("control", undefined, async ({ home }) => {
+    appendMessageLedgerLine(ledgerLine("control"));
+    assert.deepEqual(await fs.readdir(path.join(home, ".acpx", "message-ledger")), [
+      "2026-11-22.ndjson",
+    ]);
+  });
+});
+
+test("A8 NEGATIVE: an agent pod that cannot name itself writes no ledger file — never the shared one", async () => {
+  const { appendMessageLedgerLine } = await import("../src/cli/message-ledger.js");
+  await asLedgerPod("agent-pod", undefined, async ({ home }) => {
+    const written: string[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      written.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      appendMessageLedgerLine(ledgerLine("nameless"));
+    } finally {
+      process.stderr.write = realWrite;
+    }
+    assert.match(written.join(""), /message ledger not written: .*pod_identity_missing/);
+    const dir = path.join(home, ".acpx", "message-ledger");
+    const files = await fs.readdir(dir).catch(() => [] as string[]);
+    assert.deepEqual(files, []);
   });
 });

@@ -505,6 +505,7 @@ function archiveRunJson(context: ArchiveContext, result: ArchiveRunResult): unkn
     droppedAnchors: result.plan.droppedAnchors,
     orphanAggregate: result.plan.orphanAggregate,
     livenessDegraded: result.plan.livenessDegraded,
+    ...(result.plan.livenessDetail ? { livenessDetail: result.plan.livenessDetail } : {}),
     // Emitted for acpx-ui's 3-consecutive-run tripwire; see `ArchivePlan`.
     touchedRecentlyIds: result.plan.touchedRecentlyIds,
     moved: result.moved.map((entry) => ({
@@ -557,7 +558,7 @@ function appendBlockedLines(lines: string[], result: ArchiveRunResult): void {
 }
 
 function appendPlanNotes(lines: string[], result: ArchiveRunResult): void {
-  const { droppedAnchors, orphanAggregate, livenessDegraded } = result.plan;
+  const { droppedAnchors, orphanAggregate, livenessDegraded, livenessDetail } = result.plan;
   if (droppedAnchors.length > 0) {
     lines.push(`  dropped anchors (a subagent could not move): ${droppedAnchors.length}`);
     for (const dropped of droppedAnchors.slice(0, 10)) {
@@ -573,7 +574,7 @@ function appendPlanNotes(lines: string[], result: ArchiveRunResult): void {
   }
   if (livenessDegraded) {
     lines.push(
-      `  ⚠ liveness DEGRADED: the wakeups store exists but could not be read, so every id was treated as LIVE and nothing was selected. This is the guard failing closed, not a no-op run.`,
+      `  ⚠ liveness DEGRADED: ${livenessDetail ?? "the wakeups store could not be read"} — so every id was treated as LIVE and nothing was selected. This is the guard failing closed, not a no-op run.`,
     );
   }
 }

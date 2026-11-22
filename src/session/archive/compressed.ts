@@ -79,10 +79,10 @@ export class ZstdUnavailable extends Error {
 // families and names
 // ────────────────────────────────────────────────────────────────────────────────
 
-export type TranscriptFamily = "stream" | "stream-segment" | "messages" | "timestamps";
+export type TranscriptFamily = "stream" | "stream-segment" | "messages" | "timestamps" | "markers";
 
 /**
- * The four compressible families (amendment §H.1) — and nothing else, by
+ * The compressible families (amendment §H.1; four, plus the marker sidecar — C5, block A8) — and nothing else, by
  * construction: anything this returns `undefined` for MUST stay plain. `<id>.json`
  * is NEVER compressible (record presence is the archived-vs-orphan verdict, the
  * byway sweep's destruction guard and seat residency — amendment §A).
@@ -103,6 +103,11 @@ export function compressibleFamilyOf(
   }
   if (rest === ".timestamps.ndjson") {
     return "timestamps";
+  }
+  // C5 (block A8): atrium's marker sidecar is an index of the stream like the timestamps sidecar —
+  // thawed, compressed and listed with it.
+  if (rest === ".markers.ndjson") {
+    return "markers";
   }
   return /^\.stream\.[1-9]\d*\.ndjson$/.test(rest) ? "stream-segment" : undefined;
 }

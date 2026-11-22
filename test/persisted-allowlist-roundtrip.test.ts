@@ -223,8 +223,8 @@ test("guard 7 · the contract covers every key of SessionAcpxState", () => {
   // the annotation. It states the count so a silent shrink is visible in a diff.
   assert.equal(
     ACPX_KEYS.length,
-    28,
-    `SessionAcpxState has ${ACPX_KEYS.length} persisted keys, the contract expected 28. ` +
+    29, // 28 + `last_pod_end` (block A4, brick 30df3a5b)
+    `SessionAcpxState has ${ACPX_KEYS.length} persisted keys, the contract expected 29. ` +
       `If you added one: give it a sentinel, then run the rows above and add it to every ` +
       `allowlist they name. If you removed one: update this count deliberately.`,
   );

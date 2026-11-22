@@ -203,6 +203,12 @@ export type SessionCreateOptions = {
    * `forkFromSessionId` the first wake forks that template; without it, a fresh session.
    */
   sleeping?: boolean;
+  /**
+   * C1.3 — pod mode (on the control pod): EVERY create form is record-only and writes the create plan
+   * into `acpx.sleeping` (`src/pod/create-plan.ts`); a resume writes its `acpSessionId` and is not
+   * sleeping. Nothing is started. `byway` marks a by-the-way fork in the plan.
+   */
+  recordOnly?: { byway?: boolean };
 } & TimedRunOptions;
 
 export type SessionSendOptions = {
@@ -424,7 +430,20 @@ export type AgentOutputStyleListResult = {
    *  disconnected from behaviour outbound. Never label a UI chip from it. */
   current?: string;
   available: string[];
+  /** A10: where the answer came from. Absent = a transient session (today). */
+  source?: ProbeSource;
+  /** A10, `source: "records"`: the session record that carried the advertisement. */
+  recordId?: string;
+  /** A10, `source: "records"`: `exact` = same adapter command as the box launches now; `harness` = same harness, older/other command. */
+  adapterMatch?: "exact" | "harness";
+  /** A10, `source: "records"`: when that record was last used (ISO) — the answer's age, for a staleness label. */
+  recordLastUsedAt?: string;
+  /** A10 follow-up, `source: "records"`: when that record's adapter STARTED (ISO) — what the lists' age really is; absent when the record has none (it ranks last, never fresh). */
+  recordAgentStartedAt?: string;
 };
+
+/** A10: what served a probe — session records, or the utility pod (a routed call; the pod itself reports `transient`). */
+export type ProbeSource = "records" | "utility-pod" | "transient";
 
 // brick://874fee67 — the per-session Claude Code output style.
 export type SessionSetOutputStyleOptions = {

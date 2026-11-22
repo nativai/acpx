@@ -1,0 +1,134 @@
+{
+  "schema": "acpx.session.v1",
+  "acpx_record_id": "00000000-0000-4000-8000-0000000c1a7e",
+  "acp_session_id": "00000000-0000-4000-8000-0000000c1a7e",
+  "agent_name": "claude-pty",
+  "agent_command": "node /opt/claude-pty-acp/dist/index.js",
+  "cwd": "/workspace",
+  "created_at": "2026-06-18T19:05:33.573Z",
+  "last_used_at": "2026-06-18T19:05:51.704Z",
+  "last_seq": 11,
+  "last_request_id": "00000000-0000-4000-8000-0000000000aa",
+  "event_log": {
+    "active_path": "/home/node/.acpx/sessions/00000000-0000-4000-8000-0000000c1a7e.stream.ndjson",
+    "segment_count": 5,
+    "max_segment_bytes": 67108864,
+    "max_segments": 5,
+    "last_write_at": "2026-06-18T19:05:51.704Z",
+    "last_write_error": null
+  },
+  "closed": true,
+  "closed_at": "2026-06-30T14:03:27.170Z",
+  "favorite": false,
+  "agent_started_at": "2026-06-18T19:05:38.346Z",
+  "last_prompt_at": "2026-06-18T19:05:49.377Z",
+  "last_agent_exit_code": null,
+  "last_agent_exit_signal": null,
+  "last_agent_exit_at": "2026-06-18T19:20:51.801Z",
+  "last_agent_disconnect_reason": "connection_close",
+  "protocol_version": 1,
+  "agent_capabilities": {
+    "_meta": {
+      "adapterInputPolicy": {
+        "schemaVersion": "independent-claude-acp/input-policy/v1",
+        "text": "accepted",
+        "maxBytes": 1048576,
+        "maxChars": null,
+        "embeddedContext": "disabled; text resources converted only if sent despite capability",
+        "image": "disabled; converted to unsupported-placeholder if sent despite capability",
+        "resourceLink": "converted-to-labeled-text if sent despite missing first-class support",
+        "unsupported": "converted-to-unsupported-placeholder"
+      },
+      "loadSession": {
+        "supported": true,
+        "replaySupported": true,
+        "resumable": true,
+        "restartResumable": true,
+        "sessionStateSchema": "independent-claude-acp/session-state/v1"
+      },
+      "forkSession": {
+        "supported": true,
+        "copiesClaudeTranscript": true,
+        "atIndexSupported": true
+      }
+    },
+    "loadSession": true,
+    "promptCapabilities": {
+      "embeddedContext": false,
+      "image": false,
+      "audio": false
+    },
+    "mcpCapabilities": {
+      "acp": false,
+      "http": false,
+      "sse": false
+    },
+    "sessionCapabilities": {
+      "close": {},
+      "fork": {}
+    }
+  },
+  "title": null,
+  "messages": [],
+  "messages_log": {
+    "v": 1,
+    "count": 3,
+    "base_index": 0,
+    "bytes": 1107
+  },
+  "updated_at": "2026-06-18T19:05:49.372Z",
+  "cumulative_token_usage": {},
+  "request_token_usage": {},
+  "acpx": {
+    "desired_config_options": {
+      "effort": "max"
+    },
+    "current_model_id": "opus",
+    "available_models": ["opus", "sonnet", "haiku"],
+    "config_options": [
+      {
+        "id": "effort",
+        "name": "Effort",
+        "description": "Claude CLI reasoning effort",
+        "type": "select",
+        "category": "thought_level",
+        "currentValue": "high",
+        "options": [
+          {
+            "value": "low",
+            "name": "Low"
+          },
+          {
+            "value": "medium",
+            "name": "Medium"
+          },
+          {
+            "value": "high",
+            "name": "High"
+          },
+          {
+            "value": "xhigh",
+            "name": "Extra High"
+          },
+          {
+            "value": "max",
+            "name": "Max"
+          }
+        ]
+      }
+    ],
+    "owner_options": {
+      "permission_mode": "approve-all",
+      "non_interactive_permissions": "deny",
+      "auth_policy": "skip"
+    },
+    "session_options": {
+      "model": "opus",
+      "profile": "sanitized",
+      "effort": "max"
+    }
+  },
+  "seat_id": "00000000-0000-4000-8000-0000000005ea",
+  "holder_ordinal": 1,
+  "holder_active": true
+}

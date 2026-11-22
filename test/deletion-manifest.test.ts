@@ -116,6 +116,9 @@ function streamPath(homeDir: string, id: string): string {
   return path.join(sessionDir(homeDir), `${safe(id)}.stream.ndjson`);
 }
 
+function markersPath(homeDir: string, id: string): string {
+  return path.join(sessionDir(homeDir), `${safe(id)}.markers.ndjson`);
+}
 function timestampsPath(homeDir: string, id: string): string {
   return path.join(sessionDir(homeDir), `${safe(id)}.timestamps.ndjson`);
 }
@@ -212,6 +215,8 @@ async function seedSession(
   if (options.ownerLog !== false) {
     await fs.writeFile(ownerLogPath(homeDir, id), `owner log for ${id}\n`, "utf8");
   }
+  // C5 (block A8): atrium's marker sidecar sits beside the stream like the timestamps sidecar.
+  await fs.writeFile(markersPath(homeDir, id), `{"v":1,"offset":0,"marker":{}}\n`, "utf8");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1146,6 +1151,44 @@ test("T-F5: the timestamps sidecar follows the stream, in both directions", asyn
   });
 });
 
+/** C5 (block A8) — the marker sidecar is HISTORY tier like the timestamps sidecar: deleted with the
+ *  stream, kept with `--no-include-history`, and never reported as a class of its own. */
+test("A8: the marker sidecar follows the stream, in both directions", async () => {
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace");
+    await fs.mkdir(workCwd, { recursive: true });
+    await seedSession(homeDir, "tier-mk-default", workCwd);
+    assert.equal(await fileExists(markersPath(homeDir, "tier-mk-default")), true, "seeded");
+    const defaulted = await runCli(["claude", "sessions", "prune", "tier-mk-default"], {
+      home: homeDir,
+      cwd: workCwd,
+    });
+    assert.equal(defaulted.code, 0, defaulted.stderr);
+    assert.equal(
+      await fileExists(markersPath(homeDir, "tier-mk-default")),
+      false,
+      "(a) with the stream deleted, the marker sidecar must go too — no orphan in the hot dir",
+    );
+  });
+
+  await withTempHome(async (homeDir) => {
+    const workCwd = path.join(homeDir, "workspace");
+    await fs.mkdir(workCwd, { recursive: true });
+    await seedSession(homeDir, "tier-mk-kept", workCwd);
+    const kept = await runCli(
+      ["claude", "sessions", "prune", "tier-mk-kept", "--no-include-history"],
+      { home: homeDir, cwd: workCwd },
+    );
+    assert.equal(kept.code, 0, kept.stderr);
+    assert.equal(await fileExists(streamPath(homeDir, "tier-mk-kept")), true);
+    assert.equal(
+      await fileExists(markersPath(homeDir, "tier-mk-kept")),
+      true,
+      "(b) keep the stream and its marker sidecar stays with it",
+    );
+  });
+});
+
 /** T-F6 — a template blueprint spared by a prune keeps its NEW-class files too.
  *  The non-template fixture in the same run is the positive control: its files
  *  of the same classes go present -> absent, so "the blueprint's survived" is
@@ -1221,6 +1264,11 @@ test("T-M1 sibling: templates rollback --delete leaves no owner log or timestamp
       await fileExists(timestampsPath(homeDir, "rb-victim")),
       false,
       "and as exactly this one",
+    );
+    assert.equal(
+      await fileExists(markersPath(homeDir, "rb-victim")),
+      false,
+      "C5: the marker sidecar of a hard-deleted session is not left behind as an orphan",
     );
     // The messages sidecar. Omitted originally, and that omission WAS the hole:
     // dropping the two messages-log unlinks from `unlinkHardDeletedFiles` — the

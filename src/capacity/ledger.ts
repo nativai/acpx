@@ -3,6 +3,7 @@ import { readFileSync, statSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { assertBoxWideWriteAllowed } from "../pod/foreign-write-guard.js";
 import {
   getOwnProcessIdentity,
   getOwnProcessScope,
@@ -126,6 +127,8 @@ const LOCK_POLICY: IdentityLockPolicy = {
  * fails OPEN on (§3.3).
  */
 export async function withAdmissionLock<T>(dir: string, action: () => Promise<T>): Promise<T> {
+  // A-8: the lock file is a write to a box-wide file too — refused before any byte.
+  assertBoxWideWriteAllowed("ledger", path.join(dir, "admission.lock"));
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   const lockPath = path.join(dir, "admission.lock");
   const content = await acquireIdentityFileLock(lockPath, LOCK_POLICY);
@@ -248,6 +251,7 @@ export async function writeLedgerFile(
   entries: readonly PendingEntry[],
 ): Promise<void> {
   const file = path.join(dir, "pending.json");
+  assertBoxWideWriteAllowed("ledger", file);
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
   await fs.writeFile(temporary, `${JSON.stringify({ schema: 1, entries }, null, 2)}\n`, {
     mode: 0o600,
@@ -452,6 +456,10 @@ export async function appendDecisionLog(
   const logDir = path.join(dir, "log");
   const day = now.toISOString().slice(0, 10);
   const file = path.join(logDir, `${day}.ndjson`);
+  // ⚠️ OUTSIDE THE `try` BELOW: that catch is "a log that cannot be written never changes a decision", and
+  // the A-8 guard is a refusal, not a write fault (A8 TE F4: the lock-free wake paths append from an agent
+  // pod with no lock to trip the guard first). A9, `test/pod-admission-guard.test.ts`.
+  assertBoxWideWriteAllowed("ledger", file);
   try {
     await fs.mkdir(logDir, { recursive: true, mode: 0o700 });
     const firstOfDay = await fs.stat(file).then(

@@ -1,11 +1,16 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import { incrementPerfCounter } from "../../perf-metrics.js";
 import { isIndexLockTimeoutError, withSessionIndexLock } from "./index-lock.js";
 import {
   readIndexEntryFromDisk,
+  readSessionIndex,
   reconcileSessionIndex,
   writeSessionIndex,
+  type SessionIndex,
   type SessionIndexEntry,
 } from "./index.js";
+import { isNonSessionRecordFile } from "./session-dir-files.js";
 
 /**
  * Per-process index write policy (perf-loadfix W2.3):
@@ -254,15 +259,15 @@ async function writePendingEntries(sessionDir: string, state: DirState): Promise
 function entryToWrite(
   fresh: SessionIndexEntry | undefined,
   existing: SessionIndexEntry | undefined,
-  snapshot: SessionIndexEntry,
-): SessionIndexEntry {
+  snapshot: SessionIndexEntry | undefined,
+): SessionIndexEntry | undefined {
   return fresh ?? existing ?? snapshot;
 }
 
 async function writeEntriesUnderLock(
   sessionDir: string,
   state: DirState,
-  pending: Map<string, SessionIndexEntry>,
+  pending: Map<string, SessionIndexEntry | undefined>,
 ): Promise<void> {
   await withSessionIndexLock(sessionDir, async () => {
     // 🛑 THE MERGE RULE (brick 19ee17ab, M2): the entry written is the record's
@@ -293,7 +298,10 @@ async function writeEntriesUnderLock(
       // A pending file pruned by another process between queue and flush
       // stays dropped — never resurrect an index row for a vanished file.
       if (diskFiles.has(file)) {
-        entries.push(entryToWrite(fresh.get(file), existing.get(file), snapshot));
+        const entry = entryToWrite(fresh.get(file), existing.get(file), snapshot);
+        if (entry) {
+          entries.push(entry);
+        }
       }
     }
     await writeSessionIndex(sessionDir, { files: index.files, entries });
@@ -340,6 +348,138 @@ export async function updateSessionIndexForRecordWrite(
     timer.unref?.();
     state.timer = timer;
   }
+}
+
+/**
+ * THE PROJECTION EXPORT (block A8, `src/index-projection.ts`): the atrium server's batch entry.
+ *
+ * ⚠️ THE LOCK IS HELD FOR TIME THAT SCALES WITH THE BATCH, NOT THE STORE (brick 5e64449b; atrium S5 measured
+ * the old whole-store reconcile holding `index.json.lock` 370–480 ms for a few files, ~40 % of the time at
+ * one call a second). Under the index lock this reads ONLY the named record files, replaces or removes
+ * ONLY those rows (each from the record AS IT STANDS ON DISK, read inside the lock — the monotonic-close
+ * rule), leaves every other row exactly as it is, and does ONE rewrite. It does NOT list the sessions
+ * directory and does NOT reconcile membership of files it was not asked about: that is the rarer path,
+ * `reconcileSessionIndexFromDisk` (the index rebuild, or the control pod's sweep).
+ *
+ * Per named file: the record exists and parses → its row is replaced (or added); it exists but does not
+ * parse → its existing row is kept (no snapshot exists here, never a hole); it is gone → its row and its
+ * `files` entry are removed. An index that does not exist yet is rebuilt from disk once (everything is
+ * named by then). A lock timeout throws `IndexLockTimeoutError`: nothing is written unlocked.
+ */
+export async function projectRecordFilesIntoIndex(
+  sessionDir: string,
+  files: readonly string[],
+): Promise<{ files: number }> {
+  const named = [...new Set(files)].filter(isPlainRecordFileName);
+  if (named.length === 0) {
+    return { files: 0 };
+  }
+  await withSessionIndexLock(sessionDir, async () => {
+    const existing = await readSessionIndex(sessionDir);
+    if (!existing) {
+      await writeSessionIndex(sessionDir, (await reconcileSessionIndex(sessionDir)).index);
+      return;
+    }
+    await writeSessionIndex(sessionDir, await applyNamedRecords(sessionDir, existing, named));
+  });
+  return { files: named.length };
+}
+
+function isPlainRecordFileName(file: string): boolean {
+  return (
+    file.endsWith(".json") &&
+    path.basename(file) === file &&
+    file !== "." &&
+    file !== ".." &&
+    !isNonSessionRecordFile(file)
+  );
+}
+
+/**
+ * `file` (a regular file), `other` (a symlink, a directory, anything not a record), or `missing`. The
+ * lstat is the point (TE finding F1): the index lists records as `readdir` shows them — regular files —
+ * so a named SYMLINK to a record outside the directory is not a member, and indexing it would put a row
+ * the next reconcile removes.
+ */
+async function recordFileKind(
+  sessionDir: string,
+  file: string,
+): Promise<"file" | "other" | "missing"> {
+  try {
+    return (await fs.lstat(path.join(sessionDir, file))).isFile() ? "file" : "other";
+  } catch {
+    return "missing";
+  }
+}
+
+type NamedVerdicts = {
+  replaced: Map<string, SessionIndexEntry>;
+  present: Set<string>;
+  removed: Set<string>;
+};
+
+/** What the disk says about each named file: a fresh row, present-but-unparsable, or gone. */
+async function readNamedRecords(
+  sessionDir: string,
+  named: readonly string[],
+): Promise<NamedVerdicts> {
+  const verdicts: NamedVerdicts = { replaced: new Map(), present: new Set(), removed: new Set() };
+  for (const file of named) {
+    if ((await recordFileKind(sessionDir, file)) !== "file") {
+      verdicts.removed.add(file); // gone, or not a regular file: not a member
+      continue;
+    }
+    const entry = await readIndexEntryFromDisk(sessionDir, file);
+    if (entry) {
+      verdicts.replaced.set(file, entry);
+    } else {
+      verdicts.present.add(file); // unparsable (or vanished just now): keep the row it has
+    }
+  }
+  return verdicts;
+}
+
+/** The index with ONLY the named files' rows and membership changed; every other row is the object read. */
+async function applyNamedRecords(
+  sessionDir: string,
+  existing: SessionIndex,
+  named: readonly string[],
+): Promise<{ files: string[]; entries: SessionIndexEntry[] }> {
+  const { replaced, present, removed } = await readNamedRecords(sessionDir, named);
+  const files = new Set(existing.files);
+  for (const file of [...replaced.keys(), ...present]) {
+    files.add(file);
+  }
+  for (const file of removed) {
+    files.delete(file);
+  }
+  const entries = existing.entries
+    .filter((entry) => !removed.has(entry.file))
+    .map((entry) => replaced.get(entry.file) ?? entry);
+  const placed = new Set(entries.map((entry) => entry.file));
+  for (const [file, entry] of replaced) {
+    if (!placed.has(file)) {
+      entries.push(entry);
+    }
+  }
+  return { files: [...files], entries };
+}
+
+/**
+ * THE RARER PATH: the whole-store reconcile of the index against the sessions directory, under the lock,
+ * written once if membership drifted. Moved here from the per-batch projection (brick 5e64449b); the
+ * atrium server calls it from its control-pod sweep, and the index rebuild does the same work.
+ */
+export async function reconcileSessionIndexFromDisk(
+  sessionDir: string,
+): Promise<{ drift: boolean }> {
+  return await withSessionIndexLock(sessionDir, async () => {
+    const { index, drift } = await reconcileSessionIndex(sessionDir);
+    if (drift) {
+      await writeSessionIndex(sessionDir, index);
+    }
+    return { drift };
+  });
 }
 
 /**

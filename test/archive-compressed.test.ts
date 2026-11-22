@@ -456,13 +456,17 @@ test("zstdFrameLength: frames node's encoder writes — checksum on/off, content
 
 // ─── families and names ───────────────────────────────────────────────────────
 
-test("families: exactly the four transcript families; the record and everything else stay plain", () => {
+test("families: exactly the five transcript families (the marker sidecar, C5, included); the record and everything else stay plain", () => {
   const id = "019f4e32-0966-7c53-ba59-0008a693fe6a";
   assert.equal(compressibleFamilyOf(id, `${id}.stream.ndjson`), "stream");
   assert.equal(compressibleFamilyOf(id, `${id}.stream.3.ndjson`), "stream-segment");
   assert.equal(compressibleFamilyOf(id, `${id}.messages.ndjson`), "messages");
   assert.equal(compressibleFamilyOf(id, `${id}.timestamps.ndjson`), "timestamps");
+  assert.equal(compressibleFamilyOf(id, `${id}.markers.ndjson`), "markers");
   for (const never of [
+    `${id}.markers.1.ndjson`,
+    `${id}.markers.ndjson.stale`,
+    `${id}.marker.ndjson`,
     `${id}.json`,
     `${id}.json.bak-mig-20260101`,
     `${id}.delivery.json`,
@@ -485,12 +489,14 @@ test("claiming: `<id>.<family>.zst` is claimed to <id>, never a candidate of its
     `${id}.stream.ndjson.zst`,
     `${id}.messages.ndjson.zst`,
     `${id}.timestamps.ndjson`,
+    `${id}.markers.ndjson`,
     "COMPRESSION",
     "MANIFEST.tsv",
   ]);
   assert.deepEqual([...sets.keys()], [id]);
   assert.deepEqual(logicalFileSet(id, sets.get(id) ?? []), [
     `${id}.json`,
+    `${id}.markers.ndjson`,
     `${id}.messages.ndjson`,
     `${id}.stream.ndjson`,
     `${id}.timestamps.ndjson`,

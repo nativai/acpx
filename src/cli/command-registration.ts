@@ -8,6 +8,7 @@ import {
   handleSessionsRestore,
   type SessionsArchiveFlags,
 } from "./archive-command.js";
+import { registerBoxCommand } from "./box-command.js";
 import { registerCapacityCommand } from "./capacity-command.js";
 import {
   handleCancel,
@@ -52,6 +53,7 @@ import {
   addPromptInputOption,
   addSessionNameOption,
   addSessionOption,
+  parseCreatedByCall,
   parseDaysOlderThan,
   parseDrainTimeoutMs,
   parseExpectEntry,
@@ -539,7 +541,13 @@ export function registerSessionsCommand(
       "With --from-template: do not auto-fire the template's stored auto-prompt (create a pure copy).",
     )
     // UMQ K7 (CONCEPTION §6.1) — hidden: atrium's automated starts only (ACPX_ADMISSION_CLASS=automation).
-    .addOption(new Option("--sleeping").hideHelp());
+    .addOption(new Option("--sleeping").hideHelp())
+    // C6.2 — hidden: atrium's pass-through creates (at most once; needs --record-id).
+    .addOption(
+      new Option("--created-by-call <uuid>")
+        .hideHelp()
+        .argParser((value: string) => parseCreatedByCall(value)),
+    );
   // `--prompt <text>` and `--no-prompt` share commander's ONE `prompt` key and the last one
   // wins, so "both given" cannot be read off the parsed flags; these record each occurrence.
   newCommand.on("option:prompt", () => newCommand.setOptionValue("promptTextGiven", true));
@@ -686,6 +694,12 @@ Closing your OWN session (run from inside it, e.g. --seat "$ACPX_SEAT_URL"):
     )
     // UMQ K7 (CONCEPTION §6.1) — hidden: atrium's automated starts only (ACPX_ADMISSION_CLASS=automation).
     .addOption(new Option("--sleeping").hideHelp())
+    // C6.2 — hidden: atrium's pass-through creates (at most once; needs --record-id).
+    .addOption(
+      new Option("--created-by-call <uuid>")
+        .hideHelp()
+        .argParser((value: string) => parseCreatedByCall(value)),
+    )
     .action(async function (this: Command, flags: SessionsCopyFlags) {
       await handleSessionsCopy(explicitAgentName, flags, this, config);
     });
@@ -1037,6 +1051,17 @@ DISPLAY LABEL and never a key — nothing resolves a holder by it.
         "destinationCwd",
       ).argParser((value: string) => parseNonEmptyValue("Imported session cwd", value)),
     )
+    .option(
+      "--record-id <uuid>",
+      "Use this local record UUID for the imported session",
+      (value: string) => parseCreatedByCall(value),
+    )
+    // C6.2 — hidden: atrium's pass-through creates (at most once; needs --record-id).
+    .addOption(
+      new Option("--created-by-call <uuid>")
+        .hideHelp()
+        .argParser((value: string) => parseCreatedByCall(value)),
+    )
     .action(async function (this: Command, archivePath: string, flags: SessionsImportFlags) {
       await handleSessionsImport(explicitAgentName, archivePath, flags, this, config);
     });
@@ -1315,6 +1340,8 @@ export function registerDefaultCommands(program: Command, config: ResolvedAcpxCo
   registerPeopleCommand(program, config);
   // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS` (`"governor"`, brick 5d7a23b6).
   registerGovernorCommand(program, config);
+  // ⚠️ SECOND HALF IN `src/cli-core.ts`'s `TOP_LEVEL_VERBS` (`"box"`, A-17, brick f2fde405).
+  registerBoxCommand(program, config);
   registerConfigCommand(program, config);
   registerFlowCommand(program, config);
 }

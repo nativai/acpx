@@ -253,6 +253,26 @@ test("NEGATIVE --now: the same shape with --now still ends the turn at once — 
   });
 });
 
+// A8, TE finding F6: the --now arm kills its own owner before the owner's deferred-close exit could
+// remove the session's pod-era scratch directory, so the arm removes it itself (REAL CLI, REAL owner).
+test("A8/F6: `sessions close --now` from inside the session removes its scratch directory — and a neighbour's stays", async () => {
+  await withSession(async (rig) => {
+    const scratchRoot = path.join(rig.homeDir, ".acpx", "session-tmp");
+    const mine = path.join(scratchRoot, `acpx-${rig.id}`);
+    const neighbour = path.join(scratchRoot, "acpx-someone-else");
+    await fs.mkdir(mine, { recursive: true });
+    await fs.mkdir(neighbour, { recursive: true });
+    await fs.writeFile(path.join(mine, "attachment.txt"), "x");
+    await prompt(
+      rig,
+      runThenSay({ argv: closeFromInside(rig, ["--now"]), say: `GONE-${process.pid}` }),
+    );
+    await waitFor("the immediate close", 30_000, async () => (await recordOf(rig)).closed === true);
+    await waitFor("the scratch directory's removal", 30_000, async () => !(await exists(mine)));
+    assert.equal(await exists(neighbour), true, "a neighbour's scratch is untouched");
+  });
+});
+
 test("NEGATIVE custody: a message queued in the deferred window is never started — it ends SESSION_CLOSED_UNDELIVERED", async () => {
   await withSession(async (rig) => {
     const flag = path.join(rig.homeDir, "closed-returned");

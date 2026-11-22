@@ -39,6 +39,7 @@ import {
   PermissionPromptUnavailableError,
   SessionClosedError,
   SessionCwdMissingError,
+  SessionMaterialisationError,
 } from "../../errors.js";
 import {
   attemptFailoverAndRetry,
@@ -3980,6 +3981,11 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
   // MODEL_NOT_ADVERTISED (~10 % of first wakes under load) and the woken record kept `sleeping`.
   // The record write funnel still merges the durable options from disk, so skipping here loses none.
   let connecting = false;
+  // C1.3 / L-1 — TRUE once a SLEEPING record's first wake was REFUSED (a cut it cannot execute, a
+  // plan it does not know): no agent ran, so the closing legs below must not write the dead adapter's
+  // lifecycle (pid, birth identity, start time, OS observation) onto the record that stays as created (except the
+  // event-stream counters, which describe the events really appended — see `connectAndLoadSession`).
+  let wakeRefused = false;
   const mergeLatestDurablePreferences = (
     persisted: PersistedSessionLifecycle | undefined,
   ): void => {
@@ -4446,6 +4452,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       emitConnectPerfMetric(connectStartedAt, options.verbose);
       return connected;
     } catch (error) {
+      wakeRefused = error instanceof SessionMaterialisationError;
       flushConnectOutput();
       throw error;
     }
@@ -5001,6 +5008,13 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     const floorVerdict = await enforceModelFloorPostServe(record, {
       servedModel,
       verbose: options.verbose,
+      // A8/F2: this turn's writer is OPEN and holds the stream lock — the terminal error goes
+      // through it (after the frames still buffered, to keep the stream's order), never through a
+      // second writer that would wait on, or steal, the turn's own lock.
+      appendToStream: async (message) => {
+        await flushPendingMessages(false);
+        await eventWriter.appendMessage(message, { checkpoint: false });
+      },
     }).catch(() => ({ accept: true }) as const);
     acpxState = cloneSessionAcpxState(record.acpx);
     if (!floorVerdict.accept) {
@@ -5235,7 +5249,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     if (ownClient) {
       await client.close();
     }
-    applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
+    if (!wakeRefused) {
+      applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
+    }
     applyConversation(record, conversation);
     await mergeLatestDurablePreferencesFromDisk().catch(() => {
       record.acpx = acpxState;

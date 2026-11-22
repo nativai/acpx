@@ -9,6 +9,10 @@ import {
   resolvedModelLabelForRecord,
   servedModelOf,
 } from "../../models/claude-advertised-label.js";
+import {
+  assertBoxWideWriteAllowed,
+  isBoxWideFileInAgentPod,
+} from "../../pod/foreign-write-guard.js";
 import type { SessionRecord } from "../../types.js";
 import { modelSetMethodKnownUnsupported } from "../mode-preference.js";
 import { isIndexLockTimeoutError, withSessionIndexLock } from "./index-lock.js";
@@ -343,7 +347,7 @@ export type SessionIndexEntry = {
   parentSeatId?: string;
 };
 
-type SessionIndex = {
+export type SessionIndex = {
   schema: typeof SESSION_INDEX_SCHEMA;
   files: string[];
   entries: SessionIndexEntry[];
@@ -918,6 +922,28 @@ function withProjectedName(
   return name === undefined ? projected : { ...projected, name };
 }
 
+// `new Intl.Collator().compare` IS `String.prototype.localeCompare` with the default locale and options, bound
+// once: same order, without a collator lookup per comparison (a rewrite of a ~4 MB index sorts ~10^4 rows).
+const lastUsedCollator = new Intl.Collator();
+
+/**
+ * The entries newest-first by `lastUsedAt`. An already-ordered list — the usual case, a rewrite after a few
+ * rows changed — is returned as it is (a stable sort of an ordered list is that list), so the O(n log n)
+ * sort is paid only when something moved (brick 5e64449b: the index rewrite is inside the index lock).
+ */
+function sortedByLastUsed(entries: readonly SessionIndexEntry[]): SessionIndexEntry[] {
+  const compare = (a: SessionIndexEntry, b: SessionIndexEntry): number =>
+    lastUsedCollator.compare(b.lastUsedAt, a.lastUsedAt);
+  for (let i = 1; i < entries.length; i += 1) {
+    const previous = entries[i - 1];
+    const current = entries[i];
+    if (previous !== undefined && current !== undefined && compare(previous, current) > 0) {
+      return entries.toSorted(compare);
+    }
+  }
+  return [...entries];
+}
+
 export async function writeSessionIndex(
   sessionDir: string,
   index: {
@@ -926,6 +952,7 @@ export async function writeSessionIndex(
   },
 ): Promise<void> {
   const filePath = sessionIndexPath(sessionDir);
+  assertBoxWideWriteAllowed("index", filePath);
   const entries = await projectSeatNames(sessionDir, index.entries);
   // Per-call randomUUID: `${pid}.${Date.now()}` alone is NOT unique. Two writes
   // from this process in the same millisecond build the identical temp path, so
@@ -942,7 +969,7 @@ export async function writeSessionIndex(
   const payload = JSON.stringify({
     schema: SESSION_INDEX_SCHEMA,
     files: [...index.files].toSorted(),
-    entries: entries.toSorted((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt)),
+    entries: sortedByLastUsed(entries),
   });
   await fs.writeFile(tempFile, `${payload}\n`, "utf8");
   await fs.rename(tempFile, filePath);
@@ -1011,6 +1038,11 @@ export async function rebuildSessionIndex(
   // rebuilds on new-file creation" target (VERIFICATION-ANNEX S4 greps for it).
   if (!rebuildLogSuppressed) {
     process.stderr.write(`[acpx] full session-index rebuild (reason: ${reason})\n`);
+  }
+  // C10 / A8: in an agent pod the index is the control pod's file — a read there builds the answer
+  // in memory and persists nothing (never the guard's throw on a plain read).
+  if (isBoxWideFileInAgentPod(sessionIndexPath(sessionDir))) {
+    return await buildSessionIndexFromDisk(sessionDir);
   }
   // Lock (re-entrant under a caller already holding it). The rebuild only PROJECTS durable
   // record files, so a lock timeout (brick ae547131 §6.2: the lock never proceeds unlocked) is not

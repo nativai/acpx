@@ -1,11 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
-import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { queueLockFilePath } from "./cli/queue/paths.js";
-import { isSqliteExperimentalWarning } from "./models/ui-prefs-store.js";
+import { isBoxWideFileInAgentPod } from "./pod/foreign-write-guard.js";
+import {
+  judgeSpawnState,
+  readSpawnStateFile,
+  spawnStatePath,
+  stateAllowsRebind,
+} from "./pod/spawn-state.js";
+import { loadSqlite } from "./pod/sqlite-loader.js";
 import {
   classifyRecordedIdentity,
   compareProcessBirthIdentity,
@@ -32,41 +38,10 @@ import {
  * `SPAWN_LEDGER_API_VERSION`; change the surface only in lockstep with acpx-ui `server/brickOutbox.ts`.
  */
 
-type SqliteModule = { DatabaseSync: new (path: string) => DatabaseSync };
-let sqliteModule: SqliteModule | undefined;
-
-/**
- * node:sqlite must NOT load at CLI-module time: importing it emits an
- * ExperimentalWarning on stderr, and --version/--help/non-writing commands
- * promise clean stderr. The module is required lazily, on first SpawnLedger
- * construction — i.e. only on a path that actually opens the ledger. The
- * filter installed around the require drops exactly the one SQLite
- * ExperimentalWarning (name+message matched by the shared, tested predicate
- * in ui-prefs-store) and is removed immediately; every other warning flows
- * to the original handler. NEVER widen this to --no-warnings or
- * removeAllListeners — the ui-prefs-store comment explains the blast radius.
- */
-function requireSqlite(): SqliteModule {
-  if (sqliteModule) {
-    return sqliteModule;
-  }
-  const original = process.emitWarning.bind(process);
-  const filtered = (warning: unknown, ...rest: unknown[]): void => {
-    if (isSqliteExperimentalWarning(warning, rest)) {
-      return;
-    }
-    (original as (...args: unknown[]) => void)(warning, ...rest);
-  };
-  process.emitWarning = filtered as typeof process.emitWarning;
-  try {
-    sqliteModule = createRequire(import.meta.url)("node:sqlite") as SqliteModule;
-  } finally {
-    process.emitWarning = original;
-  }
-  return sqliteModule;
-}
-
 export const SPAWN_LEDGER_API_VERSION = 2;
+
+/** `saveRecord` options — additive (an older caller passes none). */
+export type SaveRecordOptions = { beforePublish?: () => void };
 
 export type SpawnAttemptState =
   | "reserved"
@@ -137,15 +112,30 @@ export class SpawnLedgerError extends Error {
 }
 
 /**
- * The ledger for a record write, or undefined when the record is not spawn-owned or does not live
+ * What a record writer needs of the spawn-owned path: save one record under the ownership guard.
+ * The control pod's is the SQLite ledger; an agent pod's is {@link PodSpawnRecordWriter}.
+ */
+export interface SpawnRecordWriter {
+  saveRecordAsync(record: DiskRecord, options?: SaveRecordOptions): Promise<DiskRecord>;
+  close(): void;
+}
+
+/**
+ * The writer for a record write, or undefined when the record is not spawn-owned or does not live
  * in this HOME's canonical session directory. Ordinary session writes therefore never open SQLite.
+ *
+ * ⚠️ IN AN AGENT POD THE ANSWER IS NEVER `SpawnLedger` (C1.2 rule 5): the pod's owner checks the
+ * attempt from `<id>.spawn-state` and writes the record file by the plain locked path.
  */
 export function openSpawnLedgerForRecord(
   metadata: Record<string, string> | undefined,
   directory = path.join(os.homedir(), ".acpx", "sessions"),
-): SpawnLedger | undefined {
+): SpawnRecordWriter | undefined {
   if (!metadata?.spawn_key || !isCanonicalSessionDirectory(directory)) {
     return undefined;
+  }
+  if (isBoxWideFileInAgentPod(directory)) {
+    return new PodSpawnRecordWriter(path.join(os.homedir(), ".acpx", "sessions"));
   }
   return new SpawnLedger();
 }
@@ -398,7 +388,7 @@ const SPAWN_TRANSITIONS: Record<string, (context: TransitionContext) => boolean>
 };
 
 /** Atomic file replacement with the directory entry persisted before SQLite commits. */
-function writeRecordAtomic(file: string, record: DiskRecord): void {
+function writeRecordAtomic(file: string, record: DiskRecord, beforePublish?: () => void): void {
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
   const fd = fs.openSync(temporary, "wx", 0o600);
   try {
@@ -407,6 +397,14 @@ function writeRecordAtomic(file: string, record: DiskRecord): void {
   } finally {
     fs.closeSync(fd);
   }
+  // C3.2 A-4: the record lock's holder checks its token immediately before this rename; a throw
+  // publishes nothing (and rolls back the caller's transaction).
+  try {
+    beforePublish?.();
+  } catch (error) {
+    fs.rmSync(temporary, { force: true });
+    throw error;
+  }
   fs.renameSync(temporary, file);
   const directory = fs.openSync(path.dirname(file), "r");
   try {
@@ -414,6 +412,89 @@ function writeRecordAtomic(file: string, record: DiskRecord): void {
   } finally {
     fs.closeSync(directory);
   }
+}
+
+function recordFilePath(sessionsDir: string, id: string): string {
+  if (!id) {
+    throw new SpawnLedgerError("invalid-record-id", "local record id is required");
+  }
+  return path.join(sessionsDir, `${encodeURIComponent(id)}.json`);
+}
+function readRecordFile(file: string): DiskRecord | undefined {
+  try {
+    const value: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("invalid record image");
+    }
+    return value as DiskRecord;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+/** The session's queue lease names THIS process (pid and birth identity) — pod-local, read as today. */
+function leaseNamesThisProcess(id: string): boolean {
+  try {
+    const lease = JSON.parse(fs.readFileSync(queueLockFilePath(id), "utf8")) as {
+      pid?: unknown;
+      processIdentity?: unknown;
+    };
+    return lease.pid === process.pid && leaseIdentityIsOurs(lease.processIdentity);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A spawn-owned record's writer in an AGENT POD (block A7): the ledger's checks, read from
+ * `<id>.spawn-state` instead of SQLite — nothing here opens a database, and nothing falls back to one.
+ * Called inside the record lock (C3.2), so `current` is read under it. Checks 2 and 5 of the shape
+ * (record identity, `preserveSpawnState`) are the record-only ones, unchanged.
+ */
+export class PodSpawnRecordWriter implements SpawnRecordWriter {
+  constructor(readonly sessionsDir: string) {}
+
+  async saveRecordAsync(record: DiskRecord, options: SaveRecordOptions = {}): Promise<DiskRecord> {
+    return this.saveRecord(record, options);
+  }
+
+  private saveRecord(record: DiskRecord, options: SaveRecordOptions): DiskRecord {
+    const id = String(record.acpx_record_id);
+    const spawnKey = metadataValue(record, "spawn_key");
+    const file = recordFilePath(this.sessionsDir, id);
+    const current = readRecordFile(file);
+    if (!spawnKey) {
+      // Only a spawn-owned record is routed here; a record that lost its key is not this guard's to judge.
+      throw new SpawnLedgerError("record-ownership", "a spawn-state write needs a spawn_key");
+    }
+    const read = readSpawnStateFile(spawnStatePath(this.sessionsDir, id));
+    if (!read.ok) {
+      throw new SpawnLedgerError(read.refusal.code, read.refusal.message);
+    }
+    const refusal = judgeSpawnState(read.state, {
+      recordId: id,
+      writerSpawnKey: spawnKey,
+      currentSpawnState: metadataValue(current, "spawn_state"),
+      admittedInstanceId,
+    });
+    if (refusal) {
+      throw new SpawnLedgerError(refusal.code, refusal.message);
+    }
+    assertRecordIdentity(
+      id,
+      record,
+      current,
+      stateAllowsRebind(read.state) && leaseNamesThisProcess(id),
+    );
+    preserveSpawnState(record, current);
+    writeRecordAtomic(file, record, options.beforePublish);
+    return record;
+  }
+
+  close(): void {}
 }
 
 export class SpawnLedger {
@@ -425,13 +506,15 @@ export class SpawnLedger {
 
   constructor() {
     const directory = path.join(os.homedir(), ".acpx");
-    fs.mkdirSync(directory, { recursive: true });
-    this.sessionsDir = path.join(directory, "sessions");
-    fs.mkdirSync(this.sessionsDir, { recursive: true });
     // The file keeps its pre-ledger name: renaming a live WAL database while old-code processes
     // still hold it open across a deploy is not safe.
     this.dbPath = path.join(directory, "brick-outbox.db");
-    this.db = new (requireSqlite().DatabaseSync)(this.dbPath);
+    // First: in an agent pod nothing below runs — no directory is made, no module is loaded.
+    const { DatabaseSync: Database } = loadSqlite("spawn-ledger", this.dbPath);
+    fs.mkdirSync(directory, { recursive: true });
+    this.sessionsDir = path.join(directory, "sessions");
+    fs.mkdirSync(this.sessionsDir, { recursive: true });
+    this.db = new Database(this.dbPath);
     try {
       // busy_timeout=0: every busy site is retried by retryOnBusy, so the loop owns the waiting
       // and the budget accounting stays exact.
@@ -550,6 +633,15 @@ export class SpawnLedger {
           `trigger owner re-binds the live identity on its next start.`,
       );
     }
+  }
+
+  /**
+   * The instance this ledger is bound to, or null before `bindIdentity` ran. Read-only and additive:
+   * the atrium writer of `<id>.spawn-state` takes its `instance_id` from here, because a value it
+   * tracked beside the ledger could be null or wrong after a restart while the ledger is bound.
+   */
+  boundInstanceId(): string | null {
+    return this.meta("instance_id");
   }
 
   listSpawnAttempts(runId: string): SpawnAttempt[] {
@@ -785,24 +877,10 @@ export class SpawnLedger {
       .run(key, value);
   }
   recordPath(id: string): string {
-    if (!id) {
-      throw new SpawnLedgerError("invalid-record-id", "local record id is required");
-    }
-    return path.join(this.sessionsDir, `${encodeURIComponent(id)}.json`);
+    return recordFilePath(this.sessionsDir, id);
   }
   readRecord(id: string): DiskRecord | undefined {
-    try {
-      const value: unknown = JSON.parse(fs.readFileSync(this.recordPath(id), "utf8"));
-      if (!value || typeof value !== "object" || Array.isArray(value)) {
-        throw new Error("invalid record image");
-      }
-      return value as DiskRecord;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        return undefined;
-      }
-      throw error;
-    }
+    return readRecordFile(this.recordPath(id));
   }
 
   /** The spawn_key ownership check: only a live attempt's own destination may be written. */
@@ -852,15 +930,7 @@ export class SpawnLedger {
     if (!run || run.adopted_fence !== Number(attempt.fence)) {
       return false;
     }
-    try {
-      const lease = JSON.parse(fs.readFileSync(queueLockFilePath(id), "utf8")) as {
-        pid?: unknown;
-        processIdentity?: unknown;
-      };
-      return lease.pid === process.pid && leaseIdentityIsOurs(lease.processIdentity);
-    } catch {
-      return false;
-    }
+    return leaseNamesThisProcess(id);
   }
 
   /** Callback must not yield while holding the lock. */
@@ -880,15 +950,19 @@ export class SpawnLedger {
     });
   }
 
-  /** Persists a spawn-owned session record under the ledger's write lock and ownership guard. */
-  saveRecord(record: DiskRecord): DiskRecord {
-    return this.locked(() => this.saveRecordLocked(record));
+  /**
+   * Persists a spawn-owned session record under the ledger's write lock and ownership guard.
+   * `beforePublish` runs immediately before the record's rename — the record lock's "check before
+   * publish" (C3.2 A-4; pass the held lock's `assertHeldSync`); a throw publishes nothing.
+   */
+  saveRecord(record: DiskRecord, options: SaveRecordOptions = {}): DiskRecord {
+    return this.locked(() => this.saveRecordLocked(record, options));
   }
   /** `saveRecord` for async callers — identical, but waits for the lock without blocking the loop. */
-  async saveRecordAsync(record: DiskRecord): Promise<DiskRecord> {
-    return await this.lockedAsync(() => this.saveRecordLocked(record));
+  async saveRecordAsync(record: DiskRecord, options: SaveRecordOptions = {}): Promise<DiskRecord> {
+    return await this.lockedAsync(() => this.saveRecordLocked(record, options));
   }
-  private saveRecordLocked(record: DiskRecord): DiskRecord {
+  private saveRecordLocked(record: DiskRecord, options: SaveRecordOptions): DiskRecord {
     if (metadataValue(record, "spawn_key")) {
       this.assertBoundToThisInstance();
     }
@@ -896,7 +970,7 @@ export class SpawnLedger {
     const current = this.readRecord(id);
     this.assertSpawnOwnership(id, record, current);
     preserveSpawnState(record, current);
-    writeRecordAtomic(this.recordPath(id), record);
+    writeRecordAtomic(this.recordPath(id), record, options.beforePublish);
     return record;
   }
 

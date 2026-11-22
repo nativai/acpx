@@ -14,8 +14,13 @@ import { queueLockFilePath } from "./paths.js";
  * the fork's own identity lock primitive instead of `@openclaw/fs-safe`, and — deliberately unlike
  * upstream — an UNJUDGEABLE holder (another pid namespace) is broken after 10 s rather than never:
  * a phase-1 seat pod that dies holding the guard must not wedge its lease forever.
+ *
+ * ACROSS PODS (C3.2, brick 8d85cb47): the guard is one of the three locks two pods can hold. A guard
+ * whose body names ANOTHER pod is never broken by that 10 s age, only once the death proof says the
+ * pod is gone; the age rule stays for a body without `pod` and a holder in the reader's own pod.
  */
 
+/** The lease guard waiter's budget — ONE named constant (C3.2). */
 const GUARD_WAIT_MS = 2_000;
 const GUARD_STALE_MS = 10_000;
 

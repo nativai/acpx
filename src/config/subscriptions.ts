@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path, { dirname } from "node:path";
+import { assertBoxWideWriteAllowed } from "../pod/foreign-write-guard.js";
 
 // Per-subscription Claude credential registry. Each subscription is a
 // CLAUDE_CONFIG_DIR holding its own .credentials.json (and per-dir runtime
@@ -656,6 +657,7 @@ function mutateLockFieldsInArray(
 }
 
 function writeRegistryDocument(registryPath: string, document: Record<string, unknown>): void {
+  assertBoxWideWriteAllowed("registry", registryPath);
   mkdirSync(dirname(registryPath), { recursive: true });
   // DELIBERATELY no randomUUID here, unlike the async write-tmp+rename sites
   // (persistence/repository.ts, persistence/index.ts, runtime/public/file-session-store.ts,

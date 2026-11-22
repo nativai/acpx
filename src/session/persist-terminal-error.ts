@@ -27,9 +27,17 @@ import { isoNow, writeSessionRecordAtBoundary } from "./persistence.js";
 // shape is byte-identical to the stdout one — `error.data.detailCode` carries the
 // cross-repo contract string. Best-effort: a failure to persist must not mask the
 // original turn error, which still propagates on the CLI output layer.
+//
+// ⚠️ NEVER OPEN A SECOND STREAM WRITER WHILE THE TURN'S WRITER IS OPEN IN THIS PROCESS (block A8, TE
+// finding F2). The stream lock is A5's primitive: a live holder is never broken, so a second
+// `SessionEventWriter.open` here waits out the lock's 20 s budget and then throws (`stream-lock-timeout`)
+// or — outside a pod, on a body without `pod` — steals the turn writer's lock, whose next flush fails
+// `lock-lost`. A caller that is INSIDE a turn passes `appendToStream`, which appends through the turn's
+// own open writer; only a caller with no open writer lets this open one.
 export async function persistTerminalTurnError(
   record: SessionRecord,
   error: unknown,
+  options: { appendToStream?: (message: AcpJsonRpcMessage) => Promise<void> } = {},
 ): Promise<void> {
   const normalized = normalizeOutputError(error, { origin: "runtime" });
   const message: AcpJsonRpcMessage = buildJsonRpcErrorResponse({
@@ -46,6 +54,10 @@ export async function persistTerminalTurnError(
     timestamp: isoNow(),
   }) as AcpJsonRpcMessage;
 
+  if (options.appendToStream) {
+    await options.appendToStream(message);
+    return;
+  }
   const writer = await SessionEventWriter.open(record);
   try {
     await writer.appendMessage(message, { checkpoint: false });

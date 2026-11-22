@@ -142,6 +142,31 @@ export const NO_RUNTIME_INFO_PATH = "/nonexistent/acpx-test/runtime-info.json";
 export const OS_COMPAT_LINK_ENV = "ACPX_OS_COMPAT_LINK";
 export const NO_OS_COMPAT_LINK_PATH = "/nonexistent/acpx-test/operating-system-compat-link";
 
+/**
+ * brick b479441f — pod mode (`ACPX_OWNER_PLACEMENT=pod`, C1.1) is BOX state: a box that sets it in
+ * its control Deployment would hand it to every suite started there, and the pod identity with it.
+ * The suite removes them, so "pod mode off" is a property of the repo; a row that needs pod mode
+ * sets them in its own child env through the product's seam (`ACPX_POD_TEST_HOME`, C1.1 A-6).
+ *
+ * brick 8d85cb47 — and THE POD IDENTITY IS BOX STATE: a process that knows its pod stamps it into
+ * every lock body (C1.1 A-5), and the death proof reads the real service account. After the removal
+ * the service-account seam points at a directory that does not exist, so every proof is `unknown`
+ * and no API call ever leaves the box; a row that wants a pod sets its own (`test/pod-kit/two-pods.ts`).
+ */
+export const POD_PLACEMENT_ENV = [
+  "ACPX_OWNER_PLACEMENT",
+  "ACPX_POD_TEST_HOME",
+  "ACPX_POD_SA_DIR",
+  "ACPX_POD_TEST_PID1_ENVIRON",
+  "ACPX_POD_TEST_HOSTNAME",
+  "NV_POD_NAME",
+  "NV_POD_UID",
+  "NV_NODE_NAME",
+] as const;
+export const POD_IDENTITY_ENV = ["NV_POD_NAME", "NV_POD_UID", "NV_NODE_NAME"] as const;
+export const POD_SA_DIR_ENV = "ACPX_POD_SA_DIR";
+export const NO_POD_SA_DIR = "/nonexistent/acpx-test/serviceaccount";
+
 export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env): string[] {
   const removed: string[] = [];
   for (const name of Object.keys(env)) {
@@ -150,7 +175,8 @@ export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env
       (SESSION_IDENTITY_ENV as readonly string[]).includes(name) ||
       (OS_ROOT_ENV as readonly string[]).includes(name) ||
       name === DEFAULT_OWNER_ENV ||
-      name === SESSION_ROOT_ENV
+      name === SESSION_ROOT_ENV ||
+      (POD_PLACEMENT_ENV as readonly string[]).includes(name)
     ) {
       delete env[name];
       removed.push(name);
@@ -160,5 +186,6 @@ export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env
   env.ACPX_UI_INTERNAL_URL = NOTICE_DELIVERY_DEAD_ORIGIN;
   env[RUNTIME_INFO_PATH_ENV] = NO_RUNTIME_INFO_PATH;
   env[OS_COMPAT_LINK_ENV] = NO_OS_COMPAT_LINK_PATH;
+  env[POD_SA_DIR_ENV] = NO_POD_SA_DIR;
   return removed.toSorted();
 }

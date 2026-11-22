@@ -8,6 +8,7 @@ import type {
   UsageUpdate,
 } from "@agentclientprotocol/sdk";
 import type { TurnAttribution } from "../acp/openrouter-attribution.js";
+import { cloneSleepingPlan } from "../pod/create-plan.js";
 import { textPrompt } from "../prompt-content.js";
 import type {
   AgentProgress,
@@ -718,13 +719,10 @@ export function cloneSessionConversation(
   return cloned;
 }
 
+// C1.3 — the WHOLE plan (`plan`, `fork.cut`, `fork.byway`): copying only `since` + `fork.from` here
+// turned a pinned cut into a whole-source fork on the first re-base.
 function cloneSleeping(sleeping: SessionAcpxState["sleeping"]): SessionAcpxState["sleeping"] {
-  return sleeping
-    ? {
-        since: sleeping.since,
-        ...(sleeping.fork ? { fork: { from: sleeping.fork.from } } : {}),
-      }
-    : undefined;
+  return cloneSleepingPlan(sleeping);
 }
 
 export function cloneSessionAcpxState(
@@ -798,6 +796,8 @@ export function cloneSessionAcpxState(
     // clone; without these the served-truth surface + durable park are dropped on
     // EVERY real turn. Flat objects (all string fields) → spread is a full clone.
     ...cloneFloorState(state),
+    // Block A4: the pod's last end (OOMKilled included) — written by the control pod, re-based by turns.
+    last_pod_end: cloneOptional(state.last_pod_end),
     session_options: cloneSessionOptions(state.session_options),
   };
 }

@@ -17,6 +17,7 @@ export type { McpServer, SessionNotification } from "@agentclientprotocol/sdk";
 import type { AgentSessionContext, EffectiveAccountMetadata } from "./acp/auth-env.js";
 import type { LastTurnProviderBreadcrumb } from "./acp/openrouter-attribution.js";
 import type { RoutingPolicyWarningBreadcrumb } from "./acp/openrouter-provider-policy.js";
+import type { SleepingPlanState } from "./pod/create-plan.js";
 import type { RecordPidIdentity } from "./process-identity.js";
 import type { PromptInput } from "./prompt-content.js";
 
@@ -253,7 +254,10 @@ export type CapacityRefusalReason =
   | "memory_pressure"
   | "node_pressure"
   | "cpu_pressure"
-  | "admission_busy";
+  | "admission_busy"
+  // C7.2 — the pod plane (a pod is on its way / no pod can be started now).
+  | "pod_starting"
+  | "agent_cap";
 
 /**
  * Additive JSON-RPC data of a capacity refusal. `capacity` is the same snapshot `acpx capacity
@@ -273,6 +277,10 @@ export type CapacityRefusalDetail = {
   message?: string;
   /** A WAKE refusal only: the released session that was not started. */
   wake?: { sessionId: string; seatId: string | null };
+  /** `pod_starting` / `agent_cap` only (C7.2): the fields of the token line beyond the common ones. */
+  pod?: { phase?: string; why?: string; live?: number; cap?: number; box?: string };
+  /** The first stderr line, repeated in JSON (`error.data.tokenLine`) like the placement refusals do (C7.2). */
+  tokenLine?: string;
 };
 
 /**
@@ -676,12 +684,10 @@ export type SessionContextFill = {
 /**
  * `acpx.sleeping` (UMQ K7, CONCEPTION §6) — the session exists but no agent has ever run: the record
  * carries `acpSessionId: ""` until the first wake materialises it (`runtime/engine/reconnect.ts`)
- * and deletes this field. `fork.from` = the template record the first wake forks.
+ * and deletes this field. `fork.from` = the template record the first wake forks. In pod mode it
+ * carries the whole create plan (C1.3, `src/pod/create-plan.ts`).
  */
-export type SessionSleepingState = {
-  since: string;
-  fork?: { from: string };
-};
+export type SessionSleepingState = SleepingPlanState;
 
 export type SessionAcpxState = {
   /** See {@link SessionSleepingState}. Present only until the first wake. */
@@ -967,6 +973,22 @@ export type SessionAcpxState = {
     at: string;
     reason: string;
     observed_model?: string;
+  };
+  /**
+   * Block A4 (C3.3): the end of the session's last agent pod, recorded by the control pod when its
+   * death proof said `gone`. `reason` is the pod's terminal reason (`OOMKilled`, `Error`, `Evicted`)
+   * read from the pod object when the API server still held it; absent when the pod was already
+   * gone (nothing left to read). An agent-pod OOM is invisible to the control pod's governor — this
+   * is where it shows. Idempotent per pod uid.
+   */
+  last_pod_end?: {
+    at: string;
+    /** The pod's name (`ag-<key>`). */
+    pod: string;
+    uid: string;
+    proof: "pod-gone" | "pod-terminal";
+    reason?: string;
+    exit_code?: number;
   };
   session_options?: {
     model?: string;
