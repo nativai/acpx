@@ -71,7 +71,15 @@ export const POD_FACT_NAMES = [
   "NV_POD_UID",
   "NV_NODE_NAME",
 ] as const;
-export type PodFacts = Partial<Record<(typeof POD_FACT_NAMES)[number], string>>;
+/**
+ * Two more facts of the pod that A-26's rule covers (program HoD §11 #2): the lease's placement
+ * (`pool` | `home`, C3.1) and the pod's pinned release names (C9 — the staleness token reads them).
+ * They do not decide pod mode, so `podFactValue` reads them on demand; PID 1 is read at most once
+ * per process for all six.
+ */
+export const EXTRA_POD_FACT_NAMES = ["NV_AGENT_PLACEMENT", "NV_RUNTIME_RELEASES"] as const;
+export type ExtraPodFactName = (typeof EXTRA_POD_FACT_NAMES)[number];
+export type PodFacts = Partial<Record<(typeof POD_FACT_NAMES)[number] | ExtraPodFactName, string>>;
 /** The test stand-in for PID 1's environ (a file, NUL-separated like the real one) — seam only. */
 export const PID1_STAND_IN_ENV = "ACPX_POD_TEST_PID1_ENVIRON";
 /** The test stand-in for the kernel hostname (A-28) — seam only; the real one is not read there. */
@@ -147,7 +155,7 @@ export function stateRoot(facts: HostFacts): string {
 }
 
 /**
- * The four facts out of an environ blob, FILTERED AT READ TIME: nothing else of it is kept, and
+ * The named facts out of an environ blob, FILTERED AT READ TIME: nothing else of it is kept, and
  * nothing here ever prints it (PID 1's environ is a credential dump on these boxes).
  */
 function factsOf(blob: string): PodFacts {
@@ -155,7 +163,10 @@ function factsOf(blob: string): PodFacts {
   for (const entry of blob.split("\0")) {
     const eq = entry.indexOf("=");
     const name = eq > 0 ? entry.slice(0, eq) : "";
-    if ((POD_FACT_NAMES as readonly string[]).includes(name)) {
+    if (
+      (POD_FACT_NAMES as readonly string[]).includes(name) ||
+      (EXTRA_POD_FACT_NAMES as readonly string[]).includes(name)
+    ) {
       facts[name as keyof PodFacts] = entry.slice(eq + 1);
     }
   }
@@ -234,6 +245,32 @@ function overlay(env: NodeJS.ProcessEnv, missing: string[], pid1: PodFacts): Nod
     }
   }
   return merged;
+}
+
+/**
+ * A-26's rule for one extra fact (`NV_AGENT_PLACEMENT`, `NV_RUNTIME_RELEASES`): on a control-role
+ * host the process's own value counts first; one that is missing or empty there is taken from PID 1's
+ * environment, read filtered to the named variables and never printed. A workbench, a rig or a suite
+ * (not control-role, no seam) has only its own. Under the honoured seam nothing real is read — the
+ * stand-in or nothing (`HostFacts.pid1`, `ACPX_POD_TEST_PID1_ENVIRON`).
+ */
+export function podFactValue(
+  name: ExtraPodFactName,
+  facts: HostFacts = liveHostFacts(process.env),
+): string | undefined {
+  if (facts.env[name]?.trim()) {
+    return facts.env[name];
+  }
+  return mayAskPid1(facts) ? nonBlank(pid1Of(facts)?.[name]) : undefined;
+}
+
+/** Control-role hosts, and hosts under the honoured seam (its stand-in), may ask PID 1. */
+function mayAskPid1(facts: HostFacts): boolean {
+  return facts.controlRole || testHome(facts.env) !== undefined;
+}
+
+function nonBlank(value: string | undefined): string | undefined {
+  return value?.trim() ? value : undefined;
 }
 
 /** `effectiveEnv` for this host and `env` (live facts) — the env the identity readers should see. */

@@ -11,6 +11,7 @@ import {
   PID1_STAND_IN_ENV,
   agentPodName,
   effectiveEnv,
+  podFactValue,
   placeOf,
   podModeVerdict,
   readAgentPodFile,
@@ -490,4 +491,116 @@ test("A-28: the lock writer's place takes the same two witnesses for ANY state h
   assert.equal(withHost("ag-x"), "agent-pod", "hostname witness alone");
   assert.equal(withHost("dev-server-abc", NAME), "agent-pod", "file witness alone");
   assert.equal(withHost("dev-server-abc"), "control", "neither");
+});
+
+// ---- the two extra facts: NV_AGENT_PLACEMENT and NV_RUNTIME_RELEASES (program HoD §11 #2) ----
+
+const RELEASES = '{"acpx":"rel-from-pid1","claude-agent-acp":"rel-2"}';
+
+test("extra facts: the process's OWN value wins over PID 1's", () => {
+  const box = sandbox(false);
+  const reads = { count: 0 };
+  const facts = hostFacts(
+    box.env({ NV_AGENT_PLACEMENT: "home", NV_RUNTIME_RELEASES: '{"acpx":"own"}' }),
+    { NV_AGENT_PLACEMENT: "pool", NV_RUNTIME_RELEASES: RELEASES },
+    reads,
+  );
+  assert.equal(podFactValue("NV_AGENT_PLACEMENT", facts), "home");
+  assert.equal(podFactValue("NV_RUNTIME_RELEASES", facts), '{"acpx":"own"}');
+  assert.equal(reads.count, 0, "an own value costs no PID 1 read");
+});
+
+test("extra facts: missing or EMPTY in the process → PID 1's; missing in both → undefined", () => {
+  const box = sandbox(false);
+  const pid1 = { NV_AGENT_PLACEMENT: "pool", NV_RUNTIME_RELEASES: RELEASES };
+  for (const own of [{}, { NV_AGENT_PLACEMENT: "", NV_RUNTIME_RELEASES: "  " }]) {
+    const facts = hostFacts(box.env(own), pid1, { count: 0 });
+    assert.equal(podFactValue("NV_AGENT_PLACEMENT", facts), "pool", JSON.stringify(own));
+    assert.equal(podFactValue("NV_RUNTIME_RELEASES", facts), RELEASES, JSON.stringify(own));
+  }
+  assert.equal(
+    podFactValue("NV_AGENT_PLACEMENT", hostFacts(box.env(), {}, { count: 0 })),
+    undefined,
+  );
+  assert.equal(
+    podFactValue("NV_AGENT_PLACEMENT", hostFacts(box.env(), undefined, { count: 0 })),
+    undefined,
+  );
+});
+
+test("extra facts NEVER: a workbench / rig / suite (not control-role, no seam) has only its own value — PID 1 is never asked", () => {
+  const reads = { count: 0 };
+  const facts: HostFacts = {
+    env: {},
+    controlRole: false,
+    homedir: os.homedir(),
+    pid1: () => {
+      reads.count += 1;
+      return { NV_AGENT_PLACEMENT: "pool" };
+    },
+  };
+  assert.equal(podFactValue("NV_AGENT_PLACEMENT", facts), undefined);
+  assert.equal(reads.count, 0);
+  assert.equal(
+    podFactValue("NV_AGENT_PLACEMENT", { ...facts, env: { NV_AGENT_PLACEMENT: "home" } }),
+    "home",
+  );
+});
+
+test("extra facts under the honoured seam: the stand-in file speaks, the REAL PID 1 is never read, and only the named variables survive the read", () => {
+  const box = sandbox(false);
+  const real = fs.readFileSync;
+  let realReads = 0;
+  const spy = mock.method(fs, "readFileSync", ((
+    target: fs.PathOrFileDescriptor,
+    ...rest: unknown[]
+  ) => {
+    if (target === "/proc/1/environ") {
+      realReads += 1;
+    }
+    return (real as (...args: unknown[]) => unknown)(target, ...rest);
+  }) as typeof fs.readFileSync);
+  try {
+    const standIn = path.join(tmp(), "pid1.environ");
+    fs.writeFileSync(
+      standIn,
+      `NV_AGENT_PLACEMENT=home\0NV_RUNTIME_RELEASES=${RELEASES}\0SECRET=hunter2\0`,
+    );
+    const live = (extra: NodeJS.ProcessEnv): HostFacts => ({
+      env: box.env(extra),
+      controlRole: true,
+      homedir: CANONICAL_HOME,
+    });
+    const withFile = { [PID1_STAND_IN_ENV]: standIn };
+    assert.equal(podFactValue("NV_AGENT_PLACEMENT", live(withFile)), "home");
+    assert.equal(
+      podFactValue("NV_RUNTIME_RELEASES", live(withFile)),
+      RELEASES,
+      "a value containing `=` and `:` survives",
+    );
+    assert.equal(podFactValue("NV_AGENT_PLACEMENT", live({})), undefined, "no stand-in: nothing");
+    assert.equal(realReads, 0, "the real /proc/1/environ was never read under the seam");
+    // without the seam a leaked NODE_TEST_CONTEXT leaves the stand-in dead and the real PID 1 in force
+    realReads = 0;
+    podFactValue("NV_AGENT_PLACEMENT", {
+      env: { NODE_TEST_CONTEXT: "child", ...withFile },
+      controlRole: true,
+      homedir: CANONICAL_HOME,
+    });
+    assert.ok(
+      realReads <= 1,
+      "no seam: the real PID 1 (memoised) is the source, the stand-in is ignored",
+    );
+    assert.notEqual(
+      podFactValue("NV_AGENT_PLACEMENT", {
+        env: { NODE_TEST_CONTEXT: "child", ...withFile },
+        controlRole: true,
+        homedir: CANONICAL_HOME,
+      }),
+      "home",
+      "the stand-in's value is not returned without the seam",
+    );
+  } finally {
+    spy.mock.restore();
+  }
 });
