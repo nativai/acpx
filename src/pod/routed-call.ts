@@ -545,6 +545,16 @@ function releasesOrFail(options: RoutedCallOptions, callId: string): Record<stri
       callId,
     });
   }
+  // A-41: `pi` is optional in `releases`, so a Pi session on a box without it is refused HERE — named,
+  // before the broker — instead of getting a pod whose adapter cannot start. Claude and Codex are unaffected.
+  if (options.target.harness === "pi" && releases.releases.pi === undefined) {
+    throw new RoutedCallError({
+      outcome: "not_run",
+      reason: "release_unresolved",
+      tool: "pi",
+      callId,
+    });
+  }
   return releases.releases;
 }
 
@@ -876,22 +886,28 @@ async function settle(run: TransportRun, ctx: SettleContext): Promise<RoutedCall
 
 /**
  * C9: the release directory name each tool's link points to NOW. The required / optional split is
- * `runtime-links.sh`'s `LINKS` table (stream HoD, agreed with infra): only a tool marked `optional`
- * there — today `pi-extensions`, and only it — may be left out; a required one that cannot be
- * resolved fails the call before the broker is asked.
+ * `runtime-links.sh`'s `LINKS` table (stream HoD, agreed with infra; A-12, A-40, A-41): a tool marked
+ * `optional` there — `pi-extensions`, `pi` and `claude-pty-acp` — is named when its control-pod link
+ * resolves and is release-shaped, and OMITTED when the link is absent; a PRESENT link that is not
+ * release-shaped still fails the call, like a required tool's. A required tool that cannot be resolved
+ * fails the call before the broker is asked.
+ *
+ * ⚠️ THE OPTIONAL SET IS HELD IN THREE COPIES THAT MUST AGREE (A-40): the link table's `optional` rows
+ * (the source), the broker's `OPTIONAL_RELEASE_TOOLS` and this one. A box may lack an optional tool's
+ * release only once all three carry it. `test/pod-routed-call.test.ts` ("the three copies") compares this
+ * one with the fake broker kit's.
  */
 export const RELEASE_TOOLS_REQUIRED = [
   "acpx",
   "acpx-ui",
   "claude-agent-acp",
   "codex-acp",
-  "claude-pty-acp",
-  "pi",
   "pi-acp",
 ] as const;
-// C9: `pi` IS required (stream HoD, 2026-11-22: the interim omission is withdrawn; only `pi-extensions`
-// is optional, A-12). `pi-home` is not a release tool and is never sent.
-export const RELEASE_TOOLS_OPTIONAL = ["pi-extensions"] as const;
+// `pi-home` is not a release tool and is never sent. `claude-pty-acp` is optional, NOT dropped (A-40):
+// since A-39 no pod runs the terminal harness, but a failed build of its retired repo must not fail every
+// owner-ensure on the box, and a revival would otherwise have to undo a drop in three places.
+export const RELEASE_TOOLS_OPTIONAL = ["pi-extensions", "pi", "claude-pty-acp"] as const;
 
 export type ResolveReleasesResult =
   | { ok: true; releases: Record<string, string> }
@@ -905,11 +921,12 @@ function releaseNameOf(target: string, tool: string): string | undefined {
   return shaped ? name : undefined;
 }
 
-function readLinkOrUndefined(file: string): string | undefined {
+/** The link's target; `null` when NOTHING is there (ENOENT); `undefined` when something is there that cannot be read as a link. */
+function readLinkOrUndefined(file: string): string | null | undefined {
   try {
     return fs.readlinkSync(file);
-  } catch {
-    return undefined;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? null : undefined;
   }
 }
 
@@ -917,10 +934,12 @@ export function resolveReleases(runtimeDir = "/data/runtime"): ResolveReleasesRe
   const releases: Record<string, string> = {};
   for (const tool of [...RELEASE_TOOLS_REQUIRED, ...RELEASE_TOOLS_OPTIONAL]) {
     const target = readLinkOrUndefined(path.join(runtimeDir, tool));
-    if (target === undefined && (RELEASE_TOOLS_OPTIONAL as readonly string[]).includes(tool)) {
+    // An optional tool is omitted only when its link is ABSENT; a present one that is not release-shaped
+    // (a directory, a foreign link) fails like a required tool's (A-40).
+    if (target === null && (RELEASE_TOOLS_OPTIONAL as readonly string[]).includes(tool)) {
       continue;
     }
-    const name = target === undefined ? undefined : releaseNameOf(target, tool);
+    const name = typeof target === "string" ? releaseNameOf(target, tool) : undefined;
     if (name === undefined) {
       return { ok: false, tool };
     }

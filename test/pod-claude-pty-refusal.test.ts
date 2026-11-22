@@ -154,7 +154,10 @@ function saFixture(): string {
 const READY = `ready ip=10.1.2.3 pod=ag-x-abcde uid=${UID} node=n1 placement=pool`;
 
 /** The control pod in pod mode, no pod anywhere, the fixture record in its store. */
-async function rig(recordCommand: string, options: { withRecord?: boolean } = {}) {
+async function rig(
+  recordCommand: string,
+  options: { withRecord?: boolean; withoutLinks?: string[] } = {},
+) {
   const home = fs.mkdtempSync(path.join(ROOT, "home-"));
   const stubDir = fs.mkdtempSync(path.join(ROOT, "stub-"));
   fs.writeFileSync(path.join(stubDir, "agent-exec"), STUB, { mode: 0o755 });
@@ -168,6 +171,9 @@ async function rig(recordCommand: string, options: { withRecord?: boolean } = {}
     "pi",
     "pi-acp",
   ]) {
+    if (options.withoutLinks?.includes(tool)) {
+      continue;
+    }
     fs.mkdirSync(path.join(runtime, ".releases", tool, "r"), { recursive: true });
     fs.symlinkSync(`.releases/${tool}/r`, path.join(runtime, tool));
   }
@@ -221,6 +227,10 @@ async function rig(recordCommand: string, options: { withRecord?: boolean } = {}
         : 0;
     },
     brokerRequests: () => broker.seen.length,
+    brokerBodies: () =>
+      broker.seen
+        .filter((request) => request.method === "POST")
+        .map((request) => JSON.parse(request.body) as { releases?: Record<string, string> }),
     brokerPosts: () => broker.seen.filter((request) => request.method === "POST").length,
     close: () => {
       api.close();
@@ -413,5 +423,45 @@ test("A-39 create off pod mode: a claude-pty-named agent's create is unchanged �
     assert.equal(pod.brokerRequests(), 0);
   } finally {
     pod.close();
+  }
+});
+
+// ───────────────────────── A-41 / A-42 (rows 41.1, 42.1): a Pi session on a box without `pi` ─────────────────────────
+
+test("A-42 (row 42.1): the control pod's `pi` link absent — a prompt to a PI record is refused `release_unresolved tool=pi` (exit 1), the broker receives no request; the same box routes a Claude record with `releases` lacking `pi` (row 41.1)", async () => {
+  const withoutPi = ["pi"];
+  const piRig = await rig("node /opt/pi-acp/dist/index.js", { withoutLinks: withoutPi });
+  try {
+    const result = await cli(["prompt", "--session-id", PTY_ID, "hello"], piRig.env);
+    assert.equal(result.code, 1, result.stderr);
+    assert.match(
+      result.stderr.split("\n")[0] ?? "",
+      /^acpx: ROUTED outcome=not_run reason=release_unresolved tool=pi call_id=\S+$/,
+    );
+    assert.equal(piRig.brokerRequests(), 0, "the broker was never asked");
+    assert.equal(piRig.calls(), 0, "no pod was asked for or started");
+  } finally {
+    piRig.close();
+  }
+  const claudeRig = await rig(CLAUDE_COMMAND, { withoutLinks: withoutPi });
+  try {
+    const result = await cli(["prompt", "--session-id", PTY_ID, "hello"], claudeRig.env);
+    assert.equal(result.code, 0, result.stderr);
+    const [body, ...rest] = claudeRig.brokerBodies();
+    assert.equal(rest.length, 0);
+    assert.equal(body?.releases !== undefined && "pi" in body.releases, false, "releases lacks pi");
+    assert.equal("acpx" in (body?.releases ?? {}), true, "and still names the others");
+    assert.equal(claudeRig.calls(), 1);
+  } finally {
+    claudeRig.close();
+  }
+  // Control: the Pi record with `pi` linked is routed.
+  const linked = await rig("node /opt/pi-acp/dist/index.js");
+  try {
+    const result = await cli(["prompt", "--session-id", PTY_ID, "hello"], linked.env);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(linked.brokerRequests(), 1);
+  } finally {
+    linked.close();
   }
 });
