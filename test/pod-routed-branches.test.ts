@@ -831,11 +831,19 @@ test("routed_twice (A-8): a command that arrives ROUTED (ACPX_ROUTED=1) is never
   // ONE helper: the lines are exactly the ones A3's pass-through prints.
   assert.deepEqual(ROUTED_TWICE_REFUSAL.lines[0], "acpx: REFUSED reason=routed_twice");
   assert.equal(
-    refuseRoutedTwice("json", () => undefined),
+    refuseRoutedTwice(
+      "json",
+      () => undefined,
+      () => undefined,
+    ),
     2,
   );
   const jsonLines: string[] = [];
-  refuseRoutedTwice("json", (line) => jsonLines.push(line));
+  refuseRoutedTwice(
+    "json",
+    (line) => jsonLines.push(line),
+    () => undefined,
+  );
   assert.deepEqual(jsonLines, [ROUTED_TWICE_REFUSAL.lines[0]], "json: line 1 only");
   // The negative: the same command WITHOUT the marker is routed as usual (and ACPX_ROUTED=0 is no marker).
   for (const env of [{ PATH: "/usr/bin" }, { PATH: "/usr/bin", ACPX_ROUTED: "0" }]) {
@@ -935,6 +943,63 @@ test("CLI pod mode, identity each way: an agent-caused call (identity in the env
     assert.ok(second);
     for (const name of Object.keys(IDENTITY_ENV)) {
       assert.equal(name in second.env, false, `${name} must not travel without an agent cause`);
+    }
+  } finally {
+    pod.closeAll();
+  }
+});
+
+test("L-6: routed_twice honours the output mode like A1's refusals — text: both lines on stderr; json: the error object on stdout and line 1 on stderr; json-strict: stderr empty", async () => {
+  const pod = await podFixture({ api: { items: [POD()] } });
+  try {
+    const base = ["claude", "prompt", "--session-id", SESSION, "hello"];
+    const env = { ...pod.env, ACPX_ROUTED: "1" };
+    const text = await cli(base, env);
+    assert.equal(text.code, 2);
+    assert.equal(text.stdout, "");
+    assert.equal(text.stderr.trim().split("\n").length, 2);
+    for (const [flags, stderrLines] of [
+      [["--format", "json"], 1],
+      [["--format", "json", "--json-strict"], 0],
+    ] as const) {
+      const result = await cli([...flags, ...base], env);
+      assert.equal(result.code, 2, flags.join(" "));
+      const error = (
+        JSON.parse(result.stdout.trim()) as {
+          error: { code: number; data: Record<string, unknown> };
+        }
+      ).error;
+      assert.equal(error.code, -32602);
+      assert.equal(error.data.reason, "routed_twice");
+      assert.equal(error.data.tokenLine, "acpx: REFUSED reason=routed_twice");
+      const lines = result.stderr.trim() === "" ? [] : result.stderr.trim().split("\n");
+      assert.equal(lines.length, stderrLines, flags.join(" "));
+    }
+    assert.equal(pod.calls().length, 0);
+  } finally {
+    pod.closeAll();
+  }
+});
+
+test("G-1 direct call: an agent calling directly on the control pod (identity in its own environment) sends the identity variables; a caller with none sends none", async () => {
+  const pod = await podFixture({ api: { items: [POD()] }, stub: { exit: 0 } });
+  try {
+    const direct = await cli(["claude", "prompt", "--session-id", SESSION, "hi"], {
+      ...pod.env,
+      ...IDENTITY_ENV,
+    });
+    assert.equal(direct.code, 0, direct.stderr);
+    const sent = pod.calls()[0];
+    assert.ok(sent);
+    for (const [name, value] of Object.entries(IDENTITY_ENV)) {
+      assert.equal(sent.env[name], value, name);
+    }
+    const none = await cli(["claude", "prompt", "--session-id", SESSION, "hi"], pod.env);
+    assert.equal(none.code, 0, none.stderr);
+    const second = pod.calls()[1];
+    assert.ok(second);
+    for (const name of Object.keys(IDENTITY_ENV)) {
+      assert.equal(name in second.env, false, name);
     }
   } finally {
     pod.closeAll();
