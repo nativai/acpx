@@ -154,6 +154,14 @@ const re = (want: RegExp) => (o: Observed) =>
 const TURNOVER =
   /^acpx: REFUSED reason=pod_starting nothing_started=true protocol=1 retry_after_s=3 phase=turnover wake=gate-session$/;
 
+// ⚠️ NO ONE-SHOT (UTILITY-SCOPE) CASE HERE, AND WHY (brick 27b28c68, L-557-1). A one-shot's call must carry a
+// utility key (`util-pool` / `util-home`: `assertUtilityTarget`), and the pod-side entry checks that key against
+// the pod's identity marker — but infrastructure's `agent-loopback start` accepts only a 24-hex session key
+// (`--key must be 24 hex characters`, argocd pin and `main` alike), so no loopback can be started under a utility
+// key and a one-shot over the real `agent-exec` has no pod to reach. It needs infrastructure's loopback to learn
+// the two utility keys; until then the one-shot's run, deadline and uid rules are held by
+// `test/pod-routed-call.test.ts` over a stub transport. (A call whose target is a session's pod is NOT a one-shot:
+// the "past its deadline" case below is the `owner-if-pod` call's own.)
 const CASES: Case[] = [
   {
     label: "echo through the pod: exit 0, stdout relayed",
