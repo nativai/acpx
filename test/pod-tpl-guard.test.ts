@@ -260,7 +260,7 @@ test("T3 on the real CLI in an agent pod: `set-parent --children-of <other paren
         agentPodEnv(home, atrium.url),
       );
       assert.notEqual(r.status, 0);
-      assert.match(r.stderr, /target-unresolved|class-not-passable/u, r.stderr);
+      assert.match(r.stderr, /error=class-not-passable detail=target-unresolved/u, r.stderr);
       assert.equal(r.stdout.includes("must-not-run"), false);
     },
   );
@@ -298,9 +298,9 @@ const OWN_ID_INVOCATIONS: Readonly<Record<string, string[]>> = {
   agents: ["agents"],
   "agents list": ["agents", "list"],
   "agents show": ["agents", "show", "claude"],
-  models: ["models", "--offline"],
-  "models list": ["models", "list", "--offline"],
-  "models show": ["models", "show", "claude-subscription:opus", "--offline"],
+  models: ["models"],
+  "models list": ["models", "list"],
+  "models show": ["models", "show", "claude-subscription:opus"],
   "providers list": ["providers", "list"],
   "people list": ["people", "list"],
   "people resolve": ["people", "resolve", "nobody"],
@@ -347,6 +347,64 @@ const OWN_ID_EXEMPT: Readonly<Record<string, string>> = {
   "capacity run-build": "starts a build",
 };
 
+/**
+ * What each invocation must DO for the row to mean anything (brick 27b28c68, L-T2-1): an invocation that dies
+ * before its body — a flag commander does not know, a usage error — passes "no guard, no call" while exercising
+ * nothing. So each names the exit status it reaches and, for a non-zero or silent one, a line that only the BODY
+ * prints (`reached`); `writes` marks the verbs that write the pod's own record (its bytes must move — and for every
+ * other invocation they must NOT).
+ */
+type OwnIdOutcome = { status: number; reached?: RegExp; writes?: true };
+const USAGE = (group: string): RegExp => new RegExp(`Usage: acpx ${group} \\[options\\]`, "u");
+const OWN_ID_OUTCOMES: Readonly<Record<string, OwnIdOutcome>> = {
+  "sessions templates": { status: 0 },
+  "sessions show": { status: 0 },
+  "sessions history": { status: 0 },
+  "sessions read": { status: 0 },
+  "sessions export": { status: 0 },
+  "seats show": { status: 1, reached: /SEAT_ROW_MISSING/u },
+  "seats list": { status: 0 },
+  subscriptions: { status: 0 },
+  "subscriptions list": { status: 0 },
+  "subscriptions usage": { status: 0 },
+  "subscriptions ceiling show": { status: 0 },
+  profiles: { status: 0 },
+  "profiles list": { status: 0 },
+  "profiles show": { status: 1, reached: /profile "nosuch" not found/u },
+  agents: { status: 0 },
+  "agents list": { status: 0 },
+  "agents show": { status: 0 },
+  models: { status: 0 },
+  "models list": { status: 0 },
+  "models show": { status: 0 },
+  "providers list": { status: 0 },
+  "people list": { status: 0, reached: /no people are registered/u },
+  "people resolve": { status: 3, reached: /no person matches/u },
+  "people principal": { status: 6, reached: /not recorded/u },
+  config: { status: 0 },
+  "config show": { status: 0 },
+  cancel: { status: 0 },
+  "set-mode": { status: 1, reached: /Failed to spawn agent command/u, writes: true },
+  set: { status: 1, reached: /Failed to spawn agent command/u, writes: true },
+  status: { status: 0 },
+  "sessions close": { status: 0, writes: true },
+  "sessions recover": { status: 0 },
+  "sessions owner-status": { status: 0 },
+  "output-styles": { status: 0, reached: /does not support output styles/u },
+  sessions: { status: 0 },
+  "sessions list": { status: 0 },
+  seats: { status: 1, reached: USAGE("seats") },
+  "agent-folders": { status: 1, reached: USAGE("agent-folders") },
+  transcripts: { status: 1, reached: USAGE("transcripts") },
+  "subscriptions ceiling": { status: 1, reached: USAGE("subscriptions ceiling") },
+  providers: { status: 0 },
+  people: { status: 2, reached: USAGE("people") },
+  governor: { status: 1, reached: USAGE("governor") },
+  box: { status: 1, reached: USAGE("box") },
+  flow: { status: 1, reached: USAGE("flow") },
+  help: { status: 0 },
+};
+
 const ownIdPaths = (): string[] =>
   Object.entries(COMMAND_TABLE)
     .filter(([, entry]) => (LOCAL_ON_OWN_ID as readonly string[]).includes(entry.class))
@@ -363,6 +421,11 @@ test("T2 conformance: every command of a locally-running class has an own-id inv
     [],
     "a path is driven or exempt, not both",
   );
+  assert.deepEqual(
+    Object.keys(OWN_ID_OUTCOMES).toSorted(),
+    Object.keys(OWN_ID_INVOCATIONS).toSorted(),
+    "every invocation says what it must reach",
+  );
   const fresh = [...ownIdPaths(), "sessions brand-new-read-verb"].toSorted();
   assert.notDeepEqual(fresh, known, "the discovery flags a path the registry lacks");
   // the classes really are the ones that run locally on the own pod (the premise of this row)
@@ -371,16 +434,40 @@ test("T2 conformance: every command of a locally-running class has an own-id inv
   }
 });
 
-test("T2 conformance: no command of a locally-running class about the pod's OWN id trips pod_foreign_write, and none leaves the pod", async () => {
+test("T2 conformance: no command of a locally-running class about the pod's OWN id trips pod_foreign_write or leaves the pod — and each REACHES ITS BODY (its exit status, a body-only line, the own record moved or not)", async () => {
   for (const [commandPath, argv] of Object.entries(OWN_ID_INVOCATIONS)) {
+    const outcome = OWN_ID_OUTCOMES[commandPath];
+    assert.ok(outcome, commandPath);
     const { home } = agentPodHome();
     await addRecord(home, POD_SESSION, "bbbbbbbb-0000-4000-8000-0000000000b2");
+    const ownRecord = path.join(home, ".acpx", "sessions", `${POD_SESSION}.json`);
+    const before = await fs.readFile(ownRecord, "utf8");
     await withAtrium({}, async (atrium) => {
       const r = await runCli(argv, agentPodEnv(home, atrium.url), { cwd: home, timeoutMs: 60_000 });
+      const said = `${r.stdout}\n${r.stderr}`;
       assert.notEqual(r.status, null, `${commandPath}: answered, not killed`);
-      assert.doesNotMatch(r.stderr, GUARD, `${commandPath}: ${r.stderr}`);
-      assert.doesNotMatch(r.stdout, GUARD, `${commandPath}: ${r.stdout}`);
+      assert.doesNotMatch(said, GUARD, `${commandPath}: ${said}`);
       assert.equal(callsOf(atrium).length, 0, `${commandPath} stayed in the pod`);
+      // The body, not the front door: commander's refusal of an unknown flag or a missing operand is not it.
+      assert.doesNotMatch(
+        r.stderr,
+        /unknown option|unknown command|missing required argument|too many arguments/u,
+        `${commandPath} died at commander before its body: ${r.stderr}`,
+      );
+      assert.equal(r.status, outcome.status, `${commandPath}: ${said}`);
+      if (outcome.reached) {
+        assert.match(
+          said,
+          outcome.reached,
+          `${commandPath} did not print what only its body prints`,
+        );
+      }
     });
+    const after = await fs.readFile(ownRecord, "utf8");
+    assert.equal(
+      after !== before,
+      outcome.writes === true,
+      `${commandPath}: the own record ${outcome.writes === true ? "must have been written" : "must be untouched"}`,
+    );
   }
 });
