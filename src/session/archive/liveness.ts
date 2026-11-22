@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { podModeVerdictNow } from "../../pod/placement.js";
 import { loadSqlite } from "../../pod/sqlite-loader.js";
 import { isRecordedPidPossiblyAlive, type RecordPidIdentity } from "../../process-identity.js";
 import { hasActiveSidecar } from "./identity.js";
@@ -68,13 +69,27 @@ export type WakeupLiveness =
  * implementation keying on row PRESENCE keeps a session it should archive. The
  * terminal statuses are `completed`, `cancelled`, `dead_letter`.
  */
-export async function loadWakeupLiveness(hotDir: string): Promise<WakeupLiveness> {
-  const dbPath = wakeupsDbPathFor(hotDir);
+export async function loadWakeupLiveness(
+  hotDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<WakeupLiveness> {
+  const dbPath = wakeupsDbPathFor(hotDir, env);
   try {
     await fs.access(dbPath);
   } catch {
-    // A box with no wakeups store has no wakeups. This is an evaluated "no",
-    // not an unevaluable signal — distinct from the branch below.
+    // ⚠️ IN POD MODE A MISSING DATABASE IS "CANNOT TELL", NOT "NO WAKE-UPS" (C1.2 rule 5, block A7).
+    // The archive job runs on the control pod and finds `wakeups.db` through the directory setting
+    // (`atriumDbDirFor`); there the file is moved or not yet mounted far more often than it is truly
+    // absent, and "no wake-ups" would archive a session atrium is about to wake. Pod mode is asked as
+    // the placement step asks it — `refuse` (a switched host that cannot name its pod) counts as pod
+    // mode: fail closed. Outside pod mode a box with no wakeups store has no wakeups, today's
+    // evaluated "no" — byte-identical to before.
+    if (podModeVerdictNow(env).mode !== "off") {
+      return {
+        status: "unevaluable",
+        detail: `wakeups.db not found at ${dbPath}: in pod mode a missing database is "cannot tell", so every id is treated as live`,
+      };
+    }
     return { status: "absent" };
   }
   try {

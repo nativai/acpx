@@ -13,6 +13,8 @@ import {
   type SqliteDatabaseName,
 } from "../src/pod/sqlite-loader.js";
 import { loadWakeupLiveness } from "../src/session/archive/liveness.js";
+import { createContext, planArchiveRun } from "../src/session/archive/operations.js";
+import { resolveBoundaries } from "../src/session/archive/retention.js";
 import { SpawnLedger } from "../src/spawn-ledger.js";
 
 // block A7 / C1.2 rule 5: no SQLite in an agent pod. The agent pod here is the C1.1 test seam:
@@ -26,6 +28,7 @@ const SAVED = {
   ACPX_POD_TEST_HOME: process.env.ACPX_POD_TEST_HOME,
   ACPX_UI_PREFS_DB: process.env.ACPX_UI_PREFS_DB,
   ACPX_UI_DB_DIR: process.env.ACPX_UI_DB_DIR,
+  ACPX_OWNER_PLACEMENT: process.env.ACPX_OWNER_PLACEMENT,
 };
 
 function sandbox(place: "agent-pod" | "control"): { home: string; acpx: string } {
@@ -37,6 +40,7 @@ function sandbox(place: "agent-pod" | "control"): { home: string; acpx: string }
   delete process.env.ACPX_STATE_HOME;
   delete process.env.ACPX_UI_PREFS_DB;
   delete process.env.ACPX_UI_DB_DIR;
+  delete process.env.ACPX_OWNER_PLACEMENT;
   process.env.ACPX_POD_TEST_HOME = home;
   return { home, acpx: path.join(home, ".acpx") };
 }
@@ -146,6 +150,74 @@ test("an EMPTY NODE_TEST_CONTEXT honours no seam: the same sandbox is not an age
   );
 });
 
+// ---- archive liveness: in pod mode a missing wakeups.db is "cannot tell" (rule 5) ------------------
+
+async function planWith(acpx: string): Promise<{
+  liveness: Awaited<ReturnType<typeof loadWakeupLiveness>>;
+  selected: number;
+  degraded: boolean;
+}> {
+  const hot = path.join(acpx, "sessions");
+  fs.mkdirSync(hot, { recursive: true });
+  const old = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  const closedAt = old.toISOString();
+  const record = path.join(hot, "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa.json");
+  fs.writeFileSync(
+    record,
+    JSON.stringify({
+      acpx_record_id: "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
+      closed: true,
+      closed_at: closedAt,
+      last_used_at: closedAt,
+      cwd: "/tmp",
+    }),
+  );
+  fs.utimesSync(record, old, old);
+  const liveness = await loadWakeupLiveness(hot);
+  const context = createContext(hot, "a7-liveness");
+  const plan = await planArchiveRun(context, resolveBoundaries(context.nowMs), {
+    includeOrphans: false,
+    liveness: { primary: undefined, wakeups: liveness },
+  });
+  return { liveness, selected: plan.selected.length, degraded: plan.livenessDegraded };
+}
+
+test("pod mode on the control pod: a MISSING wakeups.db is 'cannot tell' — the plan is degraded and archives nothing", async () => {
+  const { acpx } = sandbox("control");
+  process.env.ACPX_OWNER_PLACEMENT = "pod"; // the switch; the verdict is `pod` or `refuse`, never `off`
+  const planned = await planWith(acpx);
+  assert.equal(planned.liveness.status, "unevaluable");
+  assert.ok(
+    planned.liveness.status === "unevaluable" &&
+      planned.liveness.detail.includes("a missing database is"),
+    JSON.stringify(planned.liveness),
+  );
+  assert.equal(planned.degraded, true);
+  assert.equal(planned.selected, 0, "every id is treated as LIVE");
+});
+
+test("NEGATIVE: the same box with the switch off keeps today's 'absent' — no wake-ups, the old session IS selected", async () => {
+  const { acpx } = sandbox("control");
+  const planned = await planWith(acpx);
+  assert.equal(planned.liveness.status, "absent");
+  assert.equal(planned.degraded, false);
+  assert.equal(planned.selected, 1);
+});
+
+test("the wakeups.db is found through the directory setting before 'missing' is judged (pod mode, ACPX_UI_DB_DIR)", async () => {
+  const { acpx } = sandbox("control");
+  process.env.ACPX_OWNER_PLACEMENT = "pod";
+  const dbDir = path.join(acpx, "elsewhere");
+  fs.mkdirSync(dbDir, { recursive: true });
+  process.env.ACPX_UI_DB_DIR = dbDir;
+  const hot = path.join(acpx, "sessions");
+  fs.mkdirSync(hot, { recursive: true });
+  const detail = await loadWakeupLiveness(hot);
+  assert.ok(
+    detail.status === "unevaluable" && detail.detail.includes(path.join(dbDir, "wakeups.db")),
+  );
+});
+
 // ---- the structural check: the require lives ONLY in the loader (discovering) --------------------
 
 /** Every non-type load of `node:sqlite` under `root`: a call `("node:sqlite")` or a value import. */
@@ -205,5 +277,3 @@ test("DISCOVERY NEGATIVE: a fresh file that loads node:sqlite is flagged without
       .map((entry) => entry.split("@")[0])
       .toSorted(),
     [path.join("nested", "fourth-loader.ts"), "value-import.ts"],
-  );
-});
