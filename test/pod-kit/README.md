@@ -44,7 +44,9 @@ the pool while `pool.state` is `ready`, else home. Limits come from the script's
 pod terminating during the scripted `delete.delayMs`) deletes and answers 200 empty; no pod of the key answers 200 empty; **an EMPTY `?uid=` is no uid** —
 it deletes the key's Job unconditionally (the real `uid or None`: A-1's hazard, consumers must never send it empty). While a DELETE of a key runs, and
 for every `POST` that began before its answer, the final line is `error deleted` (never re-created); a `POST` that starts after the answer is a new request.
-`delete.status` 504 / 502 answer the real bodies `error timeout` / `error kube_api_error` and the DELETE REMOVED NOTHING: the pod still counts and the next POST follows it.
+`delete.status` 504 / 502 answer the real bodies `error timeout` / `error kube_api_error`. A **504** is a DELETE whose WAIT ran out: broker.py issues `delete_job` (Foreground) first, so the Job is terminating
+— it still counts toward the cap — and the next POST waits for it to go (`delete.goneAfterMs`, default: with the DELETE; `null`: never; bound `delete.goneWaitMs`, default 1000), then creates a NEW Job with a NEW uid, or ends
+`error start_failed`; the old pod is never handed back as ready. A **502** may have deleted nothing: the pod stays and the next POST follows it.
 
 **`error timeout` / `error kube_api_error` end the STREAM, not the Job** (broker.py "the Job continues"): the Job keeps its slot and uid. A later POST follows it from the CURRENT phase
 with a wait of its own and can see it ready: script what the Job does afterwards with `afterTimeout:{steps?, final?, finalDelayMs?, hang?, afterTimeout?}`, and a follower's own wait with
@@ -165,7 +167,7 @@ Broker (`fake-broker.ts`)
 
 - The pool→home overflow after the scheduling wait (an `auto` request is routed once, at admission); a scripted `ready placement=home` does keep occupancy and the line in agreement.
 - A persistent `error start_failed` leaves its Job in the real broker; the kit treats it as an ended Job (the next POST is a new request). `error kube_api_error` is only ever the stream-ending line of an existing Job.
-- A follower is not handed the REPLACEMENT pod when its pod ends; there is no pod-less window for `DELETE ?uid=`; a 504 DELETE removes nothing (modelled), but its delete-wait is not.
+- A follower is not handed the REPLACEMENT pod when its pod ends; there is no pod-less window for `DELETE ?uid=`; the real delete-wait bound is the kit's scripted `delay` / `goneWaitMs`.
 - HTTP/1.0 close-delimited framing (the kit streams HTTP/1.1 chunked); `?uid=&uid=X` and `new URL` dot normalisation.
 - A partial `status.quota` derives `used` from `live`; the real default quota hard is 0 (the kit defaults it to the cap).
 
@@ -183,3 +185,7 @@ API server (`fake-apiserver.ts`)
 - `limit` / `continue`; the death proof's TLS path; one watch semantics (replay by resourceVersion, `410 Expired` after `compact()`).
 
 The kit proves a contract as the real code implements it today, not the real services (no file system, scheduler, admission or network policy: tier 1).
+
+Added in round 5 (also not modelled): the tombstone's 900 s expiry (a DELETE's mark here lasts until its answer, then only for POSTs that began before it); an ABSENT `agentWaitMs` makes a follower wait for ever
+(the real `agent_wait` is bounded); the replay-mismatch sentence is atrium's own wording (the pass-through) and the one the kit also uses for acpx's `CREATE_REPLAY_MISMATCH`, not acpx's exact text; atrium's `inherit`
+check runs BEFORE the class table, as the real handler does, so a call with a disallowed `inherit` name is refused even when its command would not be passable.

@@ -783,18 +783,57 @@ test("K-R3-5: at cap an explicit `pool` request is REFUSED (retryable), not `tem
   );
 });
 
-test("K-R3-7: a DELETE that FAILED (504 / 502) removed nothing — the pod still counts and the next POST follows it", async () => {
-  for (const status of [504, 502]) {
-    await withBroker({ delete: { status } }, async (broker) => {
-      const { key, body } = wellFormedAgentRequest(`session-delete-${String(status)}`);
-      const first = (await postAgent(broker, key, body)).lines.at(-1) ?? "";
-      assert.equal((await deleteAgent(broker, key)).status, status);
-      assert.equal((await getAgents(broker)).live, 1, "the pod is still there");
-      const again = await postAgent(broker, key, body);
-      assert.equal(again.lines.at(-1), first, "the same pod, the same uid");
-      assert.equal(broker.requestsFor("POST", key)[1]?.joinedExistingJob, true);
-    });
-  }
+test("K-R3-7 / K-R4-1: a 502 DELETE may have removed nothing (the next POST follows the pod); a 504 DELETE already deleted the Job — only the WAIT timed out", async () => {
+  await withBroker({ delete: { status: 502 } }, async (broker) => {
+    const { key, body } = wellFormedAgentRequest("session-delete-502");
+    const first = (await postAgent(broker, key, body)).lines.at(-1) ?? "";
+    assert.equal((await deleteAgent(broker, key)).status, 502);
+    assert.equal((await getAgents(broker)).live, 1, "the pod is still there");
+    assert.equal(
+      (await postAgent(broker, key, body)).lines.at(-1),
+      first,
+      "the same pod, the same uid",
+    );
+    assert.equal(broker.requestsFor("POST", key)[1]?.joinedExistingJob, true);
+  });
+  // 504: the Job is terminating; it still counts; the next POST WAITS for it to go, then makes a NEW Job with a NEW uid
+  await withBroker({ delete: { status: 504, goneAfterMs: 300 } }, async (broker) => {
+    const { key, body } = wellFormedAgentRequest("session-delete-504");
+    const first = (await postAgent(broker, key, body)).lines.at(-1) ?? "";
+    const answer = await deleteAgent(broker, key);
+    assert.deepEqual(answer, { status: 504, text: "error timeout\n" });
+    assert.equal(
+      (await getAgents(broker)).live,
+      1,
+      "the terminating pod still counts toward the cap",
+    );
+    const started = Date.now();
+    const next = await postAgent(broker, key, body);
+    assert.ok(Date.now() - started >= 200, "the next POST waited for the old pod to go");
+    assert.match(next.lines.at(-1) ?? "", READY_LINE);
+    assert.notEqual(
+      /uid=(\S+)/.exec(next.lines.at(-1) ?? "")?.[1],
+      /uid=(\S+)/.exec(first)?.[1],
+      "a NEW uid — never the old pod handed back as ready",
+    );
+    const posts = broker.requestsFor("POST", key);
+    assert.equal(posts[1]?.joinedExistingJob, false);
+    assert.notEqual(posts[1]?.jobSeq, posts[0]?.jobSeq);
+    assert.equal((await getAgents(broker)).live, 1, "one pod: the new one");
+  });
+  // 504 and the pod never goes: the next POST ends `start_failed` after its gone-wait, the old pod still counts
+  await withBroker(
+    { delete: { status: 504, goneAfterMs: null, goneWaitMs: 150 } },
+    async (broker) => {
+      const { key, body } = wellFormedAgentRequest("session-delete-504-stuck");
+      await postAgent(broker, key, body);
+      assert.equal((await deleteAgent(broker, key)).status, 504);
+      const started = Date.now();
+      assert.deepEqual((await postAgent(broker, key, body)).lines, ["error start_failed"]);
+      assert.ok(Date.now() - started >= 120);
+      assert.equal((await getAgents(broker)).live, 1, "the stuck pod still counts");
+    },
+  );
 });
 
 test("K-R2-4: `ready` prints the placement the Job was ROUTED to — an `auto` request with the pool not ready goes home, and home.live counts it", async () => {

@@ -105,7 +105,17 @@ export interface BrokerScript {
   keys?: Record<string, BrokerBehavior>;
   default?: BrokerBehavior;
   /** DELETE: delay before answering, and the status (default 200). */
-  delete?: { delayMs?: number; status?: number };
+  delete?: {
+    delayMs?: number;
+    status?: number;
+    /**
+     * For a 504 (the DELETE's wait ran out): how long AFTER the DELETE began the terminating pod really goes away
+     * (default: with the DELETE's own delay; `null`: never). A POST that meets a terminating pod waits for it, up to
+     * `goneWaitMs` (default 1000), then ends `error start_failed`.
+     */
+    goneAfterMs?: number | null;
+    goneWaitMs?: number;
+  };
   /**
    * The box's limits, as `GET /v1/agents` reports them AND as admission applies them (cap, reserve,
    * quota, home cap, pool state). Defaults: cap 100, reserve 1, home cap 0 (as the real broker), quota hard
@@ -721,9 +731,32 @@ export class FakeBroker {
     // — and every one that starts before the answer — ends `error deleted`.
     this.deleteActive.set(key, (this.deleteActive.get(key) ?? 0) + 1);
     try {
-      if (live !== undefined && (this.script.delete?.status ?? 200) !== 200) {
-        // a DELETE that FAILED (504: the delete wait ran out, 502: the kube API failed): the pod is still there — it
-        // still counts and the next POST follows it; nothing was removed
+      const failing = (this.script.delete?.status ?? 200) !== 200;
+      if (live !== undefined && failing && this.script.delete?.status === 504) {
+        // broker.py issues `delete_job` (Foreground) BEFORE its wait, and only the WAIT times out: the Job carries a
+        // deletionTimestamp, the terminating pod still counts toward the cap, and the next POST waits for it to go
+        // (then creates a NEW Job with a NEW uid) or ends `start_failed` — it never follows the old pod as ready.
+        this.jobs.delete(key);
+        this.cancelJob(live);
+        const delay = this.script.delete?.delayMs ?? 0;
+        const goneAfter = this.script.delete?.goneAfterMs;
+        const done = new Promise<void>((resolve) => {
+          if (goneAfter !== null) {
+            setTimeout(resolve, Math.max(delay, delay + (goneAfter ?? 0)));
+          }
+        });
+        this.terminating.set(key, { job: live, done });
+        void done.then(() => {
+          if (this.terminating.get(key)?.job === live) {
+            this.terminating.delete(key);
+          }
+        });
+        await new Promise<void>((resolve) => setTimeout(resolve, delay));
+        answer("delete_failed", "");
+        return;
+      }
+      if (live !== undefined && failing) {
+        // 502: the kube API failed — it may have deleted nothing: the pod is still there and the next POST follows it
         await new Promise<void>((resolve) => setTimeout(resolve, this.script.delete?.delayMs ?? 0));
         answer("delete_failed", "");
         return;
@@ -809,6 +842,24 @@ export class FakeBroker {
     let follower = true;
     if (job === undefined) {
       follower = false;
+      // "never created while another pod of the key is terminating" (K4): wait for it to go, bounded; a pod that
+      // does not go ends the request `start_failed` (broker.py ensure_job / wait_gone)
+      const dying = this.terminating.get(key);
+      if (dying !== undefined) {
+        const waitMs = this.script.delete?.goneWaitMs ?? 1000;
+        await Promise.race([
+          dying.done,
+          new Promise<void>((resolve) => setTimeout(resolve, waitMs)),
+        ]);
+        if (this.terminating.get(key) === dying) {
+          finishWith("error start_failed", "error_start_failed");
+          return;
+        }
+        if (this.tombstoned(key, answeredAtStart)) {
+          finishWith("error deleted", "error_deleted");
+          return;
+        }
+      }
       const klass = body.class as string;
       const asked = body.placement as string;
       const target =
