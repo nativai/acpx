@@ -182,4 +182,4 @@ API server (`fake-apiserver.ts`)
 
 - `limit` / `continue`; the death proof's TLS path; one watch semantics (replay by resourceVersion, `410 Expired` after `compact()`).
 
-The kit proves a contract as the real code implements it today, not the real services (no file system, scheduler, admission or network policy: tier 1
+The kit proves a contract as the real code implements it today, not the real services (no file system, scheduler, admission or network policy: tier 1).
