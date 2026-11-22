@@ -105,6 +105,35 @@ const FORMS: Form[] = [
     argv: ["sessions", "set-parent", "--children-of", GHOST, "--parent-id", PARENT],
     parent: true,
   },
+  // K5 round 3, R2-F2: a leaf `--format` too — with a program-level one (the loop's) the PROGRAM-level wins
+  {
+    name: "sessions set-parent --children-of … --format json (leaf)",
+    argv: [
+      "sessions",
+      "set-parent",
+      "--children-of",
+      GHOST,
+      "--parent-id",
+      PARENT,
+      "--format",
+      "json",
+    ],
+    parent: true,
+  },
+  {
+    name: "sessions set-parent --session-id … --format text (leaf)",
+    argv: [
+      "sessions",
+      "set-parent",
+      "--session-id",
+      GHOST,
+      "--parent-id",
+      PARENT,
+      "--format",
+      "text",
+    ],
+    parent: true,
+  },
   {
     name: "people set-owner --session",
     argv: ["people", "set-owner", "<person>", "--session", GHOST],
@@ -537,10 +566,61 @@ const REFUSED_LINES: Refused[] = [
     control: /seat/iu,
   },
   {
-    name: "F5 (named limit): no selector at all — control exit 4 `No acpx session found: no session id was given`, pod exit 2",
-    form: { name: "none", argv: ["claude", "status"] },
+    name: "F5 (named limit): the AGENT-LESS no-selector form names the config's default agent, which the pod does not read — control exit 4, pod exit 2",
+    form: { name: "none-agentless", argv: ["status"] },
     controlExit: 4,
     control: /No acpx session found/u,
+  },
+  {
+    name: "F5 (named limit): `sessions close` with no selector — the default agent again, control exit 4, pod exit 2",
+    form: { name: "none-close", argv: ["sessions", "close"] },
+    controlExit: 4,
+    control: /No acpx session found/u,
+  },
+  {
+    name: "R2-F1: set-parent with NO parent flag (usage, exit 2, before any session lookup)",
+    form: { name: "no-parent-flag", argv: ["sessions", "set-parent", "--session-id", GHOST] },
+    controlExit: 2,
+    control: /set-parent requires exactly one of/u,
+  },
+  {
+    name: "R2-F1: set-parent with an EMPTY --parent-id (PARENT_DETACH_UNSUPPORTED, exit 2)",
+    form: {
+      name: "empty-parent",
+      argv: ["sessions", "set-parent", "--session-id", GHOST, "--parent-id", ""],
+    },
+    controlExit: 2,
+    control: /PARENT_DETACH_UNSUPPORTED/u,
+  },
+  {
+    name: "R2-F1: set-os with a RELATIVE OS choice (refused before the session is looked up, exit 2)",
+    form: { name: "relative-os", argv: ["sessions", "set-os", GHOST, "relative/os"] },
+    controlExit: 2,
+    control: /not under \/workspace\/ or \/opt\/atrium-os\//u,
+  },
+  {
+    name: "R2-F1: set-metadata with an EMPTY key (commander's argument parser, exit 1)",
+    form: { name: "empty-key", argv: ["sessions", "set-metadata", "", "v", "--session-id", GHOST] },
+    controlExit: 1,
+    control: /Metadata key must not be empty/u,
+  },
+  {
+    name: "R2-F1: set-metadata with an EMPTY value (exit 1)",
+    form: {
+      name: "empty-value",
+      argv: ["sessions", "set-metadata", "k", "", "--session-id", GHOST],
+    },
+    controlExit: 1,
+    control: /Metadata value must not be empty/u,
+  },
+  {
+    name: "R2-F3 (named limit): `--dry-run=true` on a boolean option — commander refuses it (exit 1); both refuse, the codes differ",
+    form: {
+      name: "dry-run-value",
+      argv: ["sessions", "set-os", GHOST, "default", "--dry-run=true"],
+    },
+    controlExit: 1,
+    control: /dry-run/u,
   },
 ];
 
@@ -935,4 +1015,103 @@ test("A-52 resolveTargetRecordId keeps its type (an id or null) for the routed p
       }
     }
   }
+});
+
+// ---- K5 round 3 (R2-F3, F5): shapes the control pod RESOLVES, once refused, now mapped — parity, measured ------------
+// Each argv is given whole (no `--format` is prefixed): the first row needs a bare program-level `--json-strict`.
+
+const EXTRA_FORMS: Form[] = [
+  {
+    name: "owner-status <id> with a bare program-level --json-strict (JSON not-found, exit 4)",
+    argv: ["--json-strict", "sessions", "owner-status", GHOST],
+  },
+  {
+    name: "set-os with `--` before the operands",
+    argv: ["sessions", "set-os", "--", GHOST, "default"],
+  },
+  { name: "the agent-less `acpx status --session-id`", argv: ["status", "--session-id", GHOST] },
+  {
+    name: "the agent-less `acpx cancel --session-url`",
+    argv: ["cancel", "--session-url", URL_OF(GHOST)],
+  },
+  // F5 (my call: MAPPED for an explicit agent): no selector → `No acpx session found: no session id was given …`
+  { name: "claude cancel — no selector", argv: ["claude", "cancel"] },
+  { name: "claude status — no selector", argv: ["claude", "status"] },
+  { name: "claude set-mode plan — no selector", argv: ["claude", "set-mode", "plan"] },
+  { name: "claude set effort low — no selector", argv: ["claude", "set", "effort", "low"] },
+  {
+    name: "codex status — no selector (the agent is named in the sentence)",
+    argv: ["codex", "status"],
+  },
+  {
+    name: "--format json claude status — no selector",
+    argv: ["--format", "json", "claude", "status"],
+  },
+  {
+    name: "--format quiet claude status — no selector",
+    argv: ["--format", "quiet", "claude", "status"],
+  },
+];
+
+test("K5 round 3: forms the control pod resolves — `--`, the agent-less verbs, a bare --json-strict on owner-status, and NO selector with an explicit agent — answer as the control pod does, byte for byte", async () => {
+  const mismatches: string[] = [];
+  for (const form of EXTRA_FORMS) {
+    const control = await controlAnswer(form, "text");
+    assert.equal(
+      control.status,
+      4,
+      `${form.name}: the measure is a not-found (${control.stderr}${control.stdout})`,
+    );
+    const pod = await podAnswer(form, "text");
+    assert.equal(pod.calls, 1, `${form.name}: one call home`);
+    assert.deepEqual(pod.written, [], `${form.name}: nothing written`);
+    if (
+      pod.run.status !== control.status ||
+      pod.run.stdout !== control.stdout ||
+      pod.run.stderr !== control.stderr
+    ) {
+      mismatches.push(
+        `${form.name}\n  control: exit ${control.status} out=${JSON.stringify(control.stdout)} err=${JSON.stringify(control.stderr)}\n  pod:     exit ${pod.run.status} out=${JSON.stringify(pod.run.stdout)} err=${JSON.stringify(pod.run.stderr)}`,
+      );
+    }
+  }
+  assert.deepEqual(mismatches, []);
+});
+
+test("K5 round 3 (R2-F2): with BOTH a program-level and a leaf `--format` the program-level one decides, as on the control pod — all nine pairs, measured", async () => {
+  const formats = ["text", "json", "quiet"];
+  const mismatches: string[] = [];
+  for (const top of formats) {
+    for (const leaf of formats) {
+      const form: Form = {
+        name: `top ${top} / leaf ${leaf}`,
+        argv: [
+          "--format",
+          top,
+          "sessions",
+          "set-parent",
+          "--children-of",
+          GHOST,
+          "--parent-id",
+          PARENT,
+          "--format",
+          leaf,
+        ],
+        parent: true,
+      };
+      const control = await controlAnswer(form, "text");
+      assert.equal(control.status, 4, `${form.name}: ${control.stderr}`);
+      const pod = await podAnswer(form, "text");
+      if (
+        pod.run.status !== control.status ||
+        pod.run.stdout !== control.stdout ||
+        pod.run.stderr !== control.stderr
+      ) {
+        mismatches.push(
+          `${form.name}: control out=${JSON.stringify(control.stdout)} err=${JSON.stringify(control.stderr)} | pod out=${JSON.stringify(pod.run.stdout)} err=${JSON.stringify(pod.run.stderr)}`,
+        );
+      }
+    }
+  }
+  assert.deepEqual(mismatches, []);
 });
