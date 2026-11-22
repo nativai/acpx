@@ -87,7 +87,12 @@ export interface BrokerScript {
   default?: BrokerBehavior;
   /** DELETE: delay before answering, and the status (default 200). */
   delete?: { delayMs?: number; status?: number };
-  /** GET /v1/agents; whatever is not scripted is derived from the live Jobs. */
+  /**
+   * The box's limits, as `GET /v1/agents` reports them AND as admission applies them (cap, reserve,
+   * quota, home cap, pool state). Defaults: cap 100, reserve 1, home cap 0 (as the real broker), quota hard
+   * = cap (a box WITH its quota patch — the real default hard 0 refuses every create as `quota`; script
+   * `quota:{used:0,hard:0}` to see that), `live` and `used` derived from the live Jobs unless scripted.
+   */
   status?: BrokerStatus;
 }
 
@@ -104,9 +109,10 @@ export interface BrokerRequestRecord {
   /** Parsed JSON body, or null when absent / not JSON. */
   body: Record<string, unknown> | null;
   /**
-   * Departures from C4's request shape, by name — the fake never rejects for these (the contract
-   * names no answer), a test asserts the list is empty: `invalid_json`, `contract_missing`,
-   * `field_missing:<f>`, `field_invalid:<f>`, `releases_missing:<tool>` (a required tool; `pi-extensions` may be left out), `releases_invalid:<tool>`, `key_mismatch`.
+   * What the REAL broker refuses (`error invalid_request` / `error unsupported_contract`, no Job), in the real
+   * broker's own words — e.g. `seat must be a label value`, `releases.pi-acp missing`, `body too large`; plus
+   * `field_present:seat` for a utility request that sends a seat (the real broker ignores it). A well-formed
+   * request has an empty list.
    */
   problems: string[];
   /** The Job this request created or followed; null for a request that reached no Job. */
@@ -125,7 +131,11 @@ interface Job {
   behavior: BrokerBehavior;
   lines: string[];
   done: boolean;
+  /** The pod ended or the final line was not `ready`: a later POST creates a NEW Job (new uid). */
+  ended: boolean;
   deleted: boolean;
+  /** pool | home — where this Job's pod runs (admission counts it). */
+  target: string;
   dropsLeft: number;
   timers: Set<NodeJS.Timeout>;
   wake: Set<() => void>;
@@ -198,72 +208,123 @@ function readBody(request: IncomingMessage): Promise<string> {
   });
 }
 
-function validateRequest(body: Record<string, unknown>, key: string): string[] {
-  const problems: string[] = [];
-  const stringField = (name: string): string | null => {
+// The real broker's field rules (broker.py `parse_agent_body`, argocd ap/agent-pods 401c4558) — a request
+// that breaks one is answered `error invalid_request` and creates nothing.
+const AGENT_KEY_RE = /^([0-9a-f]{24}|util-pool|util-home)$/;
+const LABEL_VALUE_RE = /^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$/;
+const SESSION_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+const RELEASE_NAME_RE = /^[A-Za-z0-9._+-]{1,128}$/;
+const RELEASES_MAX = 4096;
+const BODY_MAX = 65536;
+
+type ParsedAgentBody =
+  | { ok: true; body: Record<string, unknown>; problems: string[] }
+  | { ok: false; line: string; reason: string };
+
+function parseAgentBody(bodyText: string, key: string): ParsedAgentBody {
+  const invalid = (reason: string): ParsedAgentBody => ({
+    ok: false,
+    line: "error invalid_request",
+    reason,
+  });
+  if (Buffer.byteLength(bodyText, "utf8") > BODY_MAX) {
+    return invalid("body too large");
+  }
+  let parsed: unknown = null;
+  try {
+    parsed = bodyText.length > 0 ? JSON.parse(bodyText) : null;
+  } catch {
+    parsed = null;
+  }
+  if (!isRecord(parsed)) {
+    return invalid("body must be a JSON object");
+  }
+  const body = parsed;
+  const contract = body.contract;
+  if (typeof contract !== "number" || contract !== 1) {
+    // Rule 1 of the contracts: a version this side does not know is refused by name, nothing started.
+    return {
+      ok: false,
+      line: "error unsupported_contract",
+      reason: `contract ${JSON.stringify(contract)}`,
+    };
+  }
+  if (!AGENT_KEY_RE.test(key)) {
+    return invalid("key must be 24 lower-case hex characters, util-pool or util-home");
+  }
+  const text: Record<string, string> = {};
+  for (const name of ["sessionId", "seat", "harness", "placement", "class"]) {
     const value = body[name];
-    if (value === undefined) {
-      problems.push(`field_missing:${name}`);
-      return null;
-    }
-    if (typeof value !== "string" || value.length === 0) {
-      problems.push(`field_invalid:${name}`);
-      return null;
-    }
-    return value;
-  };
-  const harness = stringField("harness");
-  // C4: a utility request (harness `utility`) carries no `seat` and no `sessionId` — their absence is
-  // right and their PRESENCE is the problem; every other harness must carry both.
-  let sessionId: string | null = null;
-  if (harness === "utility") {
-    for (const name of ["seat", "sessionId"]) {
-      if (body[name] !== undefined) {
-        problems.push(`field_present:${name}`);
+    if (typeof value !== "string") {
+      // a utility pod has no session and no seat: both may be absent
+      if (
+        (name === "sessionId" || name === "seat") &&
+        value === undefined &&
+        body.harness === "utility"
+      ) {
+        text[name] = "";
+        continue;
       }
+      return invalid(`${name} must be a string`);
+    }
+    text[name] = value;
+  }
+  for (const name of ["sessionUrl", "sessionName", "brick"]) {
+    if (body[name] !== undefined && body[name] !== null && typeof body[name] !== "string") {
+      return invalid(`${name} must be a string`);
+    }
+  }
+  if (!(HARNESSES as readonly string[]).includes(text.harness ?? "")) {
+    return invalid("unknown harness");
+  }
+  if (!(PLACEMENTS as readonly string[]).includes(text.placement ?? "")) {
+    return invalid("unknown placement");
+  }
+  if (!(CLASSES as readonly string[]).includes(text.class ?? "")) {
+    return invalid("unknown class");
+  }
+  const problems: string[] = [];
+  if (key.startsWith("util-")) {
+    // a sent seat is ignored by the real broker (no seat label on a utility pod); the kit names it
+    if (body.seat !== undefined) {
+      problems.push("field_present:seat");
+    }
+    if (text.harness !== "utility" || text.sessionId !== "" || text.placement !== key.slice(5)) {
+      return invalid("a utility key takes harness utility, no sessionId and its own placement");
     }
   } else {
-    sessionId = stringField("sessionId");
-    stringField("seat");
-  }
-  const placement = stringField("placement");
-  const klass = stringField("class");
-  if (harness !== null && !(HARNESSES as readonly string[]).includes(harness)) {
-    problems.push("field_invalid:harness");
-  }
-  if (placement !== null && !(PLACEMENTS as readonly string[]).includes(placement)) {
-    problems.push("field_invalid:placement");
-  }
-  if (klass !== null && !(CLASSES as readonly string[]).includes(klass)) {
-    problems.push("field_invalid:class");
-  }
-  for (const optional of ["sessionUrl", "sessionName", "brick"]) {
-    if (body[optional] !== undefined && typeof body[optional] !== "string") {
-      problems.push(`field_invalid:${optional}`);
+    if (!LABEL_VALUE_RE.test(text.seat ?? "")) {
+      return invalid("seat must be a label value");
+    }
+    if (text.harness === "utility" || !SESSION_ID_RE.test(text.sessionId ?? "")) {
+      return invalid("sessionId missing or invalid");
+    }
+    if (sessionKey(text.sessionId ?? "") !== key) {
+      return invalid("key is not sha256(sessionId)[:24]");
     }
   }
   const releases = body.releases;
-  if (releases === undefined) {
-    problems.push("field_missing:releases");
-  } else if (!isRecord(releases)) {
-    problems.push("field_invalid:releases");
-  } else {
-    for (const tool of RELEASE_TOOLS) {
-      const value = releases[tool];
-      if (value === undefined) {
-        if (!OPTIONAL_RELEASE_TOOLS.includes(tool)) {
-          problems.push(`releases_missing:${tool}`);
-        }
-      } else if (typeof value !== "string" || value.length === 0) {
-        problems.push(`releases_invalid:${tool}`);
-      }
+  if (!isRecord(releases)) {
+    return invalid("releases must be an object");
+  }
+  for (const tool of RELEASE_TOOLS) {
+    if (OPTIONAL_RELEASE_TOOLS.includes(tool) && !(tool in releases)) {
+      continue;
+    }
+    const value = releases[tool];
+    if (typeof value !== "string" || value.length === 0) {
+      return invalid(`releases.${tool} missing`);
     }
   }
-  // C2: <key> = SHA-256 of the session id in hex, first 24 characters. A utility pod's key is its own.
-  if (sessionId !== null && sessionKey(sessionId) !== key) {
-    problems.push("key_mismatch");
+  for (const [tool, name] of Object.entries(releases)) {
+    if (typeof name !== "string" || !RELEASE_NAME_RE.test(name) || !RELEASE_NAME_RE.test(tool)) {
+      return invalid(`releases.${tool.slice(0, 40)} is not a release directory name`);
+    }
   }
-  return problems;
+  if (JSON.stringify(releases).length > RELEASES_MAX) {
+    return invalid("releases too large");
+  }
+  return { ok: true, body, problems };
 }
 
 export class FakeBroker {
@@ -274,6 +335,9 @@ export class FakeBroker {
   private readonly jobs = new Map<string, Job>();
   /** Jobs being deleted (the scripted DELETE delay): the pod is terminating — still there, still addressable by uid. */
   private readonly terminating = new Map<string, { job: Job; done: Promise<void> }>();
+  /** DELETEs of a key in progress / answered so far (the real broker's tombstone: `delete_begins`, `delete_ends`). */
+  private readonly deleteActive = new Map<string, number>();
+  private readonly deleteAnswered = new Map<string, number>();
   private readonly startedAt = Date.now();
   private jobCounter = 0;
   private nextScripted = 0;
@@ -336,6 +400,8 @@ export class FakeBroker {
     }
     this.jobs.clear();
     this.terminating.clear();
+    this.deleteActive.clear();
+    this.deleteAnswered.clear();
     this.requests.length = 0;
     this.jobCounter = 0;
     this.nextScripted = 0;
@@ -442,9 +508,36 @@ export class FakeBroker {
     if (job.deleted) {
       return;
     }
-    job.lines.push(this.finalLine(job, job.key));
+    const line = this.finalLine(job, job.key);
+    job.lines.push(line);
     job.done = true;
+    // A final that is not `ready` leaves no pod behind: the next POST of the key is a new request —
+    // admission is evaluated again and a Job with a new uid is created (never a replay of this line).
+    job.ended = !line.startsWith("ready ");
     this.notify(job);
+  }
+
+  /**
+   * The pod of `key` ends by itself (an idle exit, a failure): a stream still following it ends
+   * `error start_failed`, and the next POST creates a NEW Job with a new uid (the real broker deletes
+   * the ended Job and re-creates). Returns false when the key has no Job.
+   */
+  endPod(key: string): boolean {
+    const job = this.jobs.get(key);
+    if (job === undefined) {
+      return false;
+    }
+    if (!job.done) {
+      for (const timer of job.timers) {
+        clearTimeout(timer);
+      }
+      job.timers.clear();
+      job.lines.push("error start_failed");
+      job.done = true;
+    }
+    job.ended = true;
+    this.notify(job);
+    return true;
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -455,6 +548,7 @@ export class FakeBroker {
       await this.handleControl(method, path, request, response);
       return;
     }
+    const arrivedAnswered = new Map(this.deleteAnswered);
     const bodyText = await readBody(request);
     const headers: Record<string, string> = {};
     for (const [name, value] of Object.entries(request.headers)) {
@@ -486,11 +580,13 @@ export class FakeBroker {
       return;
     }
     if (key !== null && KEY_PATTERN.test(key) && method === "DELETE") {
-      await this.handleDelete(key, url.searchParams.get("uid"), record, response);
+      // `uid or None` (broker.py do_DELETE): an EMPTY uid is no uid — it deletes the key's Job unconditionally.
+      const uid = url.searchParams.get("uid");
+      await this.handleDelete(key, uid === null || uid === "" ? null : uid, record, response);
       return;
     }
     if (key !== null && KEY_PATTERN.test(key) && method === "POST") {
-      await this.handlePost(key, record, request, response);
+      await this.handlePost(key, record, request, response, arrivedAnswered.get(key) ?? 0);
       return;
     }
     const knownPath = path === "/v1/agents" || key !== null;
@@ -500,19 +596,51 @@ export class FakeBroker {
     });
   }
 
-  private statusBody(): Record<string, unknown> {
+  /** The limits in force (script `status`, else the defaults named at `BrokerScript.status`). */
+  private limits(excludeKey?: string): {
+    live: number;
+    cap: number;
+    reserve: number;
+    quota: { used: number; hard: number };
+    home: { live: number; cap: number };
+    pool: { state: string };
+  } {
     const scripted = this.script.status ?? {};
-    const live = [...this.jobs.values()].filter((job) => !job.deleted);
+    const occupying = [...this.jobs.values(), ...[...this.terminating.values()].map((t) => t.job)]
+      .filter((job) => !job.ended && job.key !== excludeKey)
+      .filter((job, index, all) => all.indexOf(job) === index);
+    const live = scripted.live ?? occupying.length;
     const cap = scripted.cap ?? 100;
-    const homeLive = live.filter((job) => job.request?.placement === "home").length;
     return {
-      live: scripted.live ?? live.length,
+      live,
       cap,
       reserve: scripted.reserve ?? 1,
-      quota: scripted.quota ?? { used: scripted.live ?? live.length, hard: cap },
-      home: scripted.home ?? { live: homeLive, cap: 10 },
+      quota: scripted.quota ?? { used: live, hard: cap },
+      home: scripted.home ?? {
+        live: occupying.filter((job) => job.target === "home").length,
+        cap: 0,
+      },
       pool: scripted.pool ?? { state: "ready" },
     };
+  }
+
+  private statusBody(): Record<string, unknown> {
+    return { ...this.limits() };
+  }
+
+  /** broker.py `admission_refusal`: the cap and the reserve, then the box quota, then the home cap. */
+  private admissionRefusal(klass: string, target: string): string | null {
+    const cap = this.limits();
+    if (cap.live >= cap.cap || (klass !== "interactive" && cap.live >= cap.cap - cap.reserve)) {
+      return "agent_cap";
+    }
+    if (cap.quota.used >= cap.quota.hard) {
+      return "quota";
+    }
+    if (target === "home" && cap.home.live >= cap.home.cap) {
+      return "home_full";
+    }
+    return null;
   }
 
   private sendJson(response: ServerResponse, status: number, body: unknown): void {
@@ -535,34 +663,49 @@ export class FakeBroker {
       response.writeHead(this.script.delete?.status ?? 200, { "content-type": "text/plain" });
       response.end(body);
     };
-    if (target === undefined) {
-      // No pod of the key — with or without a uid — is a plain empty 200.
+    if (uid !== null && target === undefined) {
+      // With a uid: no pod of the key at all is a plain empty 200 — nothing to delete.
       answer("deleted_nothing", "");
       return;
     }
-    if (uid !== null && uid !== target.uid) {
+    if (uid !== null && target !== undefined && uid !== target.uid) {
       // A wrong uid deletes nothing and says so in the one line C4 defines, still HTTP 200.
       answer("uid_mismatch", "refused reason=uid_mismatch\n");
       return;
     }
-    if (live !== undefined) {
-      this.jobs.delete(key);
-      this.cancelJob(live);
-      // The broker "answers when no pod of the key remains" — the fake answers after the scripted delay;
-      // until then the pod is terminating: still there, and a DELETE with its uid still matches.
-      const done = new Promise<void>((resolve) =>
-        setTimeout(resolve, this.script.delete?.delayMs ?? 0),
-      );
-      this.terminating.set(key, { job: live, done });
-      await done;
-      if (this.terminating.get(key)?.job === live) {
-        this.terminating.delete(key);
+    // From here the DELETE's mark is up (broker.py `delete_begins`): every POST of the key that is running
+    // — and every one that starts before the answer — ends `error deleted`.
+    this.deleteActive.set(key, (this.deleteActive.get(key) ?? 0) + 1);
+    try {
+      if (live !== undefined) {
+        this.jobs.delete(key);
+        this.cancelJob(live);
+        // The broker "answers when no pod of the key remains" — the fake answers after the scripted delay;
+        // until then the pod is terminating: still there, still occupying a slot, a uid still matches.
+        const done = new Promise<void>((resolve) =>
+          setTimeout(resolve, this.script.delete?.delayMs ?? 0),
+        );
+        this.terminating.set(key, { job: live, done });
+        await done;
+        if (this.terminating.get(key)?.job === live) {
+          this.terminating.delete(key);
+        }
+        answer("deleted", "");
+        return;
       }
-      answer("deleted", "");
-      return;
+      await dying?.done;
+      answer(dying === undefined ? "deleted_nothing" : "deleted_terminating", "");
+    } finally {
+      this.deleteActive.set(key, Math.max(0, (this.deleteActive.get(key) ?? 1) - 1));
+      this.deleteAnswered.set(key, (this.deleteAnswered.get(key) ?? 0) + 1);
     }
-    await dying?.done;
-    answer("deleted_terminating", "");
+  }
+
+  /** broker.py `tombstoned`: a DELETE of the key runs, or one answered after this POST began. */
+  private tombstoned(key: string, answeredAtStart: number): boolean {
+    return (
+      (this.deleteActive.get(key) ?? 0) > 0 || (this.deleteAnswered.get(key) ?? 0) > answeredAtStart
+    );
   }
 
   private async handlePost(
@@ -570,15 +713,14 @@ export class FakeBroker {
     record: BrokerRequestRecord,
     request: IncomingMessage,
     response: ServerResponse,
+    answeredAtStart: number,
   ): Promise<void> {
-    let body: Record<string, unknown> | null = null;
     try {
-      const parsed: unknown = JSON.parse(record.bodyText);
-      body = isRecord(parsed) ? parsed : null;
+      const parsedJson: unknown = JSON.parse(record.bodyText);
+      record.body = isRecord(parsedJson) ? parsedJson : null;
     } catch {
-      body = null;
+      record.body = null;
     }
-    record.body = body;
     const stream = (): void => {
       response.writeHead(200, {
         "content-type": "text/plain; charset=utf-8",
@@ -592,27 +734,44 @@ export class FakeBroker {
       record.outcome = outcome;
       response.end(`${line}\n`);
     };
-    if (body === null) {
-      record.problems.push("invalid_json");
-      finishWith("error invalid_request", "error_invalid_request");
+    const parsed = parseAgentBody(record.bodyText, key);
+    if (!parsed.ok) {
+      record.problems.push(parsed.reason);
+      finishWith(parsed.line, parsed.line.replace(" ", "_"));
       return;
     }
-    if (body.contract === undefined) {
-      record.problems.push("contract_missing");
-    }
-    if (body.contract !== 1) {
-      // Rule 1 of the contracts: a side that meets a version it does not know refuses with a named
-      // reason and starts nothing. No Job is created.
-      finishWith("error unsupported_contract", "error_unsupported_contract");
-      return;
-    }
-    record.problems.push(...validateRequest(body, key));
+    record.problems.push(...parsed.problems);
+    const body = parsed.body;
 
-    // C4 "never created while another pod of the key is still terminating": a POST that arrives during
-    // a DELETE's termination waits for it, then creates a fresh Job as usual.
-    await this.terminating.get(key)?.done;
+    // broker.py `honour_delete`: a DELETE of the key runs, or answered after this POST began — end now.
+    if (this.tombstoned(key, answeredAtStart)) {
+      finishWith("error deleted", "error_deleted");
+      return;
+    }
     let job = this.jobs.get(key);
+    // An ended Job (its final line was not `ready`, or its pod ended by itself) is not followed: the old one is
+    // dropped and a new request is admitted afresh — a new Job, a new uid.
+    if (job !== undefined && job.ended) {
+      this.jobs.delete(key);
+      job = undefined;
+    }
+    let follower = true;
     if (job === undefined) {
+      follower = false;
+      const klass = body.class as string;
+      const asked = body.placement as string;
+      const target =
+        asked === "auto" ? (this.limits().pool.state === "ready" ? "pool" : "home") : asked;
+      const refusal = this.admissionRefusal(klass, target);
+      if (refusal !== null) {
+        const cap = this.limits();
+        // No Job is created: the next POST is evaluated again.
+        finishWith(
+          `refused reason=${refusal} live=${String(cap.live)} cap=${String(cap.cap)}`,
+          "refused",
+        );
+        return;
+      }
       const behavior = this.behaviorFor(key);
       if (behavior.respond !== undefined) {
         const { status, body: answer, headers } = behavior.respond;
@@ -629,7 +788,9 @@ export class FakeBroker {
         behavior,
         lines: [],
         done: false,
+        ended: false,
         deleted: false,
+        target,
         dropsLeft: behavior.drop?.times ?? 1,
         timers: new Set(),
         wake: new Set(),
@@ -637,11 +798,10 @@ export class FakeBroker {
       };
       this.jobs.set(key, job);
       this.runJob(job).catch(() => undefined);
-    } else {
-      record.joinedExistingJob = true;
     }
+    record.joinedExistingJob = follower;
     record.jobSeq = job.seq;
-    await this.streamJob(job, record, request, response, stream);
+    await this.streamJob(job, record, request, response, stream, follower, answeredAtStart);
   }
 
   private async streamJob(
@@ -650,6 +810,8 @@ export class FakeBroker {
     request: IncomingMessage,
     response: ServerResponse,
     openStream: () => void,
+    follower: boolean,
+    answeredAtStart: number,
   ): Promise<void> {
     const drop = job.behavior.drop;
     let wantDrop = drop !== undefined && job.dropsLeft > 0;
@@ -666,9 +828,12 @@ export class FakeBroker {
       gone.value = true;
       this.notify(job);
     });
-    let sent = 0;
+    // A follower starts a fresh tracker at the Job's CURRENT phase (broker.py `follow`): it is told where the
+    // pod is now — the last step, or the final line — never the history; a step it already sent is not repeated.
+    let sent = follower ? Math.max(0, job.lines.length - 1) : 0;
+    let lastStep: string | null = null;
     const dropNow = (): boolean => {
-      if (wantDrop && drop !== undefined && sent >= drop.afterLines) {
+      if (wantDrop && drop !== undefined && record.linesSent.length >= drop.afterLines) {
         wantDrop = false;
         job.dropsLeft -= 1;
         record.outcome = "dropped";
@@ -683,7 +848,12 @@ export class FakeBroker {
     while (!gone.value) {
       while (sent < job.lines.length) {
         const line = job.lines[sent] ?? "";
+        const isFinal = job.done && sent === job.lines.length - 1;
         sent += 1;
+        if (!isFinal && line === lastStep) {
+          continue;
+        }
+        lastStep = isFinal ? null : line;
         record.linesSent.push(line);
         response.write(`${line}\n`);
         if (dropNow()) {
@@ -695,7 +865,7 @@ export class FakeBroker {
         response.end();
         return;
       }
-      if (job.deleted) {
+      if (job.deleted || this.tombstoned(job.key, answeredAtStart)) {
         // C4 (BR1): the pod this POST was following was deleted by a concurrent DELETE — the final
         // line is `error deleted`, and the Job is never re-created for a POST that was following it.
         const line = "error deleted";
@@ -732,6 +902,11 @@ export class FakeBroker {
     if (method === "POST" && path === "/_kit/script") {
       this.setScript(JSON.parse(text) as BrokerScript);
       this.sendJson(response, 200, { ok: true });
+      return;
+    }
+    if (method === "POST" && path === "/_kit/end-pod") {
+      const key = (JSON.parse(text) as { key: string }).key;
+      this.sendJson(response, 200, { ok: this.endPod(key) });
       return;
     }
     if (method === "POST" && path === "/_kit/reset") {

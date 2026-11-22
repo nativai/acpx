@@ -203,12 +203,16 @@ test("a never-finishing stream sends its steps and then nothing, until DELETE en
   );
 });
 
-test("a dropped connection is cut mid-stream, and a second POST follows the SAME Job", async () => {
+test("a dropped connection is cut mid-stream, and a second POST follows the SAME Job from its CURRENT phase", async () => {
   await withBroker(
     {
       default: {
-        steps: [{ line: "scheduling" }, { line: "starting", delayMs: 100 }],
-        finalDelayMs: 200,
+        steps: [
+          { line: "scheduling" },
+          { line: "pulling", delayMs: 40 },
+          { line: "starting", delayMs: 40 },
+        ],
+        finalDelayMs: 400,
         drop: { afterLines: 1 },
       },
     },
@@ -217,13 +221,15 @@ test("a dropped connection is cut mid-stream, and a second POST follows the SAME
       const first = await postAgent(broker, key, body);
       assert.equal(first.clean, false, "the first stream is cut, not ended");
       assert.ok(!first.lines.some((line) => line.startsWith("ready")));
+      await new Promise((resolve) => setTimeout(resolve, 200));
       const second = await postAgent(broker, key, body);
       assert.equal(second.clean, true);
-      assert.deepEqual(
-        second.lines.slice(0, 2),
-        ["scheduling", "starting"],
-        "the second POST gets the whole history",
+      assert.equal(
+        second.lines.length,
+        2,
+        "a follower is told where the pod is NOW, not the history (F9)",
       );
+      assert.equal(second.lines[0], "starting");
       assert.match(second.lines.at(-1) ?? "", READY_LINE);
       const posts = broker.requestsFor("POST", key);
       assert.equal(posts.length, 2);
@@ -232,6 +238,21 @@ test("a dropped connection is cut mid-stream, and a second POST follows the SAME
       assert.equal(posts[1]?.jobSeq, posts[0]?.jobSeq);
       assert.equal(posts[0]?.outcome, "dropped");
       assert.equal((await getAgents(broker)).live, 1, "one Job, not two");
+    },
+  );
+});
+
+test("F9: a follower of a READY pod gets exactly one `ready` line", async () => {
+  await withBroker(
+    { default: { steps: ["scheduling", "pulling", "starting"] } },
+    async (broker) => {
+      const { key, body } = wellFormedAgentRequest("session-follow-ready");
+      const first = await postAgent(broker, key, body);
+      assert.equal(first.lines.length, 4);
+      const second = await postAgent(broker, key, body);
+      assert.equal(second.lines.length, 1);
+      assert.match(second.lines[0] ?? "", READY_LINE);
+      assert.equal(second.lines[0], first.lines.at(-1), "the same pod, the same uid");
     },
   );
 });
@@ -255,41 +276,103 @@ test("an unknown contract version is refused by name and starts nothing", async 
     assert.equal((await getAgents(broker)).live, 0, "no Job was created");
     const missing = await postAgent(broker, key, { ...body, contract: undefined });
     assert.deepEqual(missing.lines, ["error unsupported_contract"]);
-    assert.ok(broker.requestsFor("POST", key)[1]?.problems.includes("contract_missing"));
+    const asString = await postAgent(broker, key, { ...body, contract: "1" });
     assert.deepEqual(
-      broker.requestsFor("POST", key)[0]?.problems,
-      [],
-      "contract 2 is a scripted case, not a malformed request",
+      asString.lines,
+      ["error unsupported_contract"],
+      "the string 1 is not the number 1",
     );
+    assert.equal(broker.requestsFor("POST", key)[0]?.problems[0], "contract 2");
+    // the contract is judged BEFORE the key and the fields (the real broker's order)
+    const both = await postAgent(broker, "not-a-key", { ...body, contract: 2 });
+    assert.deepEqual(both.lines, ["error unsupported_contract"]);
   });
 });
 
-test("departures from C4's request shape are recorded by name, never silently accepted", async () => {
+test("F3: what the REAL broker refuses is `error invalid_request` and creates nothing", async () => {
   await withBroker({}, async (broker) => {
     const { key, body } = wellFormedAgentRequest("session-shape");
     const releases = { ...(body.releases as Record<string, string>) };
-    delete releases["pi-acp"];
-    const cases: Array<[string, Record<string, unknown>, string]> = [
-      ["unknown harness", { harness: "gemini" }, "field_invalid:harness"],
-      ["unknown placement", { placement: "cloud" }, "field_invalid:placement"],
-      ["unknown class", { class: "batch" }, "field_invalid:class"],
-      ["no seat", { seat: undefined }, "field_missing:seat"],
-      ["no releases", { releases: undefined }, "field_missing:releases"],
-      ["one tool short in releases", { releases }, "releases_missing:pi-acp"],
-      ["key is not the session's", { sessionId: "another" }, "key_mismatch"],
+    const lessPiAcp = { ...releases };
+    delete lessPiAcp["pi-acp"];
+    const cases: Array<[string, string, Record<string, unknown>, string]> = [
+      ["unknown harness", key, { harness: "gemini" }, "unknown harness"],
+      ["unknown placement", key, { placement: "cloud" }, "unknown placement"],
+      ["unknown class", key, { class: "batch" }, "unknown class"],
+      ["no seat", key, { seat: undefined }, "seat must be a string"],
+      [
+        "seat that is no label value",
+        key,
+        { seat: "has space/slash" },
+        "seat must be a label value",
+      ],
+      ["seat too long", key, { seat: "a".repeat(64) }, "seat must be a label value"],
+      [
+        "sessionId with a bad character",
+        key,
+        { sessionId: "bad id" },
+        "sessionId missing or invalid",
+      ],
+      [
+        "key is not the session's",
+        key,
+        { sessionId: "another" },
+        "key is not sha256(sessionId)[:24]",
+      ],
+      ["no releases", key, { releases: undefined }, "releases must be an object"],
+      ["a required tool missing", key, { releases: lessPiAcp }, "releases.pi-acp missing"],
+      [
+        "a release key with a bad charset",
+        key,
+        { releases: { ...releases, "evil key!": "x" } },
+        "releases.evil key! is not a release directory name",
+      ],
+      [
+        "a release value with a bad charset",
+        key,
+        { releases: { ...releases, acpx: "../etc" } },
+        "releases.acpx is not a release directory name",
+      ],
+      [
+        "releases over 4096 bytes",
+        key,
+        {
+          releases: {
+            ...releases,
+            "pi-extensions": "x".repeat(128),
+            ...Object.fromEntries(
+              Array.from({ length: 40 }, (_, i) => [`t${String(i)}`, "r".repeat(120)]),
+            ),
+          },
+        },
+        "releases too large",
+      ],
+      [
+        "a key outside the key regex",
+        "SESSION-KEY-UPPER",
+        {},
+        "key must be 24 lower-case hex characters, util-pool or util-home",
+      ],
     ];
-    for (const [name, overrides, problem] of cases) {
-      await postAgent(broker, key, { ...body, ...overrides });
-      const last = broker.requests.at(-1);
-      assert.ok(
-        last?.problems.includes(problem),
-        `${name}: expected ${problem}, got ${JSON.stringify(last?.problems)}`,
-      );
-      await fetch(`${broker.url}/v1/agents/${key}`, { method: "DELETE" });
+    for (const [name, atKey, overrides, reason] of cases) {
+      const answer = await postAgent(broker, atKey, { ...body, ...overrides });
+      assert.deepEqual(answer.lines, ["error invalid_request"], name);
+      assert.deepEqual(broker.requests.at(-1)?.problems, [reason], name);
     }
-    const answer = await postAgent(broker, key, "{not json");
-    assert.deepEqual(answer.lines, ["error invalid_request"]);
-    assert.deepEqual(broker.requests.at(-1)?.problems, ["invalid_json"]);
+    assert.equal((await getAgents(broker)).live, 0, "none of them created a Job");
+    const notJson = await postAgent(broker, key, "{not json");
+    assert.deepEqual(notJson.lines, ["error invalid_request"]);
+    assert.deepEqual(broker.requests.at(-1)?.problems, ["body must be a JSON object"]);
+    const big = await postAgent(
+      broker,
+      key,
+      JSON.stringify({ ...body, sessionName: "x".repeat(70_000) }),
+    );
+    assert.deepEqual(big.lines, ["error invalid_request"], "a body over 64 KiB");
+    assert.deepEqual(broker.requests.at(-1)?.problems, ["body too large"]);
+    // and a well-formed one still works
+    assert.match((await postAgent(broker, key, body)).lines.at(-1) ?? "", READY_LINE);
+    assert.deepEqual(broker.requests.at(-1)?.problems, []);
   });
 });
 
@@ -298,18 +381,26 @@ test("C9: only an optional tool (pi-extensions) may be left out of releases; a r
     const { key, body } = wellFormedAgentRequest("session-releases");
     const releases = { ...(body.releases as Record<string, string>) };
     delete releases["pi-extensions"];
-    await postAgent(broker, key, { ...body, releases });
+    assert.match(
+      (await postAgent(broker, key, { ...body, releases })).lines.at(-1) ?? "",
+      READY_LINE,
+    );
     assert.deepEqual(broker.requests.at(-1)?.problems, [], "pi-extensions absent is no problem");
     await fetch(`${broker.url}/v1/agents/${key}`, { method: "DELETE" });
     delete releases["claude-agent-acp"];
-    await postAgent(broker, key, { ...body, releases });
-    assert.deepEqual(broker.requests.at(-1)?.problems, ["releases_missing:claude-agent-acp"]);
-    await fetch(`${broker.url}/v1/agents/${key}`, { method: "DELETE" });
-    await postAgent(broker, key, {
+    assert.deepEqual((await postAgent(broker, key, { ...body, releases })).lines, [
+      "error invalid_request",
+    ]);
+    assert.deepEqual(broker.requests.at(-1)?.problems, ["releases.claude-agent-acp missing"]);
+    const empty = await postAgent(broker, key, {
       ...body,
       releases: { ...(body.releases as object), "pi-extensions": "" },
     });
-    assert.deepEqual(broker.requests.at(-1)?.problems, ["releases_invalid:pi-extensions"]);
+    assert.deepEqual(
+      empty.lines,
+      ["error invalid_request"],
+      "a present value must be a release name",
+    );
   });
 });
 
@@ -340,18 +431,164 @@ test("C4 `error deleted`: a POST that was following the key when a DELETE ran en
   });
 });
 
-test("C4 `never created while another pod of the key is still terminating`: a POST during the termination waits for it", async () => {
+test("F1: a POST that starts WHILE a DELETE of its key runs ends `error deleted` and creates no Job", async () => {
   await withBroker({ delete: { delayMs: 400 } }, async (broker) => {
     const { key, body } = wellFormedAgentRequest("session-terminating-post");
     await postAgent(broker, key, body);
+    const jobsBefore = broker.requestsFor("POST", key).length;
     const deleting = deleteAgent(broker, key);
     await new Promise((resolve) => setTimeout(resolve, 80));
     const started = Date.now();
-    const fresh = await postAgent(broker, key, body);
-    assert.ok(Date.now() - started >= 250, "the new Job waited for the old pod to be gone");
-    assert.match(fresh.lines.at(-1) ?? "", READY_LINE);
+    const during = await postAgent(broker, key, body);
+    assert.deepEqual(during.lines, ["error deleted"]);
+    assert.ok(Date.now() - started < 300, "it does not wait for the termination");
+    assert.equal(
+      broker.requestsFor("POST", key)[jobsBefore]?.jobSeq,
+      null,
+      "no Job was followed or created",
+    );
     await deleting;
-    assert.equal(broker.requestsFor("POST", key)[1]?.joinedExistingJob, false);
+    assert.equal((await getAgents(broker)).live, 0);
+    const after = await postAgent(broker, key, body);
+    assert.match(
+      after.lines.at(-1) ?? "",
+      READY_LINE,
+      "a POST started after the answer is a new request",
+    );
+  });
+});
+
+test("F1: a POST that began before a DELETE's answer is a follower and ends `error deleted` even if the pod never existed for it", async () => {
+  await withBroker(
+    { default: { steps: ["scheduling"], hang: true }, delete: { delayMs: 100 } },
+    async (broker) => {
+      const { key, body } = wellFormedAgentRequest("session-follower-deleted");
+      const controller = new AbortController();
+      const creator = postAgent(broker, key, body, { signal: controller.signal });
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      const follower = postAgent(broker, key, body);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      await deleteAgent(broker, key);
+      assert.deepEqual((await follower).lines.slice(-1), ["error deleted"]);
+      assert.deepEqual((await creator).lines.slice(-1), ["error deleted"]);
+    },
+  );
+});
+
+test("F2: a refused or failed POST is never replayed to the next one — admission is evaluated again, a Job is re-created with a new uid", async () => {
+  await withBroker(
+    {
+      jobs: [{ final: { error: "start_failed" } }, { final: { error: "start_failed" } }],
+      default: { steps: ["starting"] },
+    },
+    async (broker) => {
+      const { key, body } = wellFormedAgentRequest("session-ended");
+      const first = await postAgent(broker, key, body);
+      assert.deepEqual(first.lines, ["error start_failed"]);
+      const second = await postAgent(broker, key, body);
+      assert.deepEqual(
+        second.lines,
+        ["error start_failed"],
+        "the 2nd scripted Job, not a replay of the 1st",
+      );
+      const third = await postAgent(broker, key, body);
+      assert.match(third.lines.at(-1) ?? "", READY_LINE, "the 3rd takes the default");
+      const posts = broker.requestsFor("POST", key);
+      assert.deepEqual(
+        posts.map((entry) => entry.joinedExistingJob),
+        [false, false, false],
+      );
+      assert.equal(new Set(posts.map((entry) => entry.jobSeq)).size, 3, "three Jobs");
+    },
+  );
+  // admission refusal: room frees up, the very next POST gets in
+  await withBroker({ status: { live: 99, cap: 100, reserve: 1 } }, async (broker) => {
+    const { key, body } = wellFormedAgentRequest("session-room");
+    const refused = await postAgent(broker, key, { ...body, class: "spawn" });
+    assert.deepEqual(refused.lines, ["refused reason=agent_cap live=99 cap=100"]);
+    broker.setScript({ status: { live: 3, cap: 100 } });
+    assert.match(
+      (await postAgent(broker, key, { ...body, class: "spawn" })).lines.at(-1) ?? "",
+      READY_LINE,
+    );
+  });
+});
+
+test("F2: a pod that ended by itself is not followed — the next POST creates a NEW Job with a new uid", async () => {
+  await withBroker({}, async (broker) => {
+    const { key, body } = wellFormedAgentRequest("session-idle-exit");
+    const first = (await postAgent(broker, key, body)).lines.at(-1) ?? "";
+    assert.equal(broker.endPod(key), true);
+    assert.equal((await getAgents(broker)).live, 0, "an ended pod holds no slot");
+    const second = (await postAgent(broker, key, body)).lines.at(-1) ?? "";
+    assert.match(second, READY_LINE);
+    assert.notEqual(/uid=(\S+)/.exec(second)?.[1], /uid=(\S+)/.exec(first)?.[1], "a new uid");
+    const posts = broker.requestsFor("POST", key);
+    assert.equal(posts[1]?.joinedExistingJob, false);
+    assert.equal(broker.endPod("no-such-key"), false);
+  });
+});
+
+test("F10: cap, reserve, quota and home cap are applied in the real order; the real GET defaults", async () => {
+  await withBroker({}, async (broker) => {
+    const defaults = await getAgents(broker);
+    assert.deepEqual(defaults, {
+      live: 0,
+      cap: 100,
+      reserve: 1,
+      quota: { used: 0, hard: 100 },
+      home: { live: 0, cap: 0 },
+      pool: { state: "ready" },
+    });
+    const ask = async (id: string, overrides: Record<string, unknown> = {}) => {
+      const { key, body } = wellFormedAgentRequest(id, overrides);
+      return (await postAgent(broker, key, body)).lines.at(-1) ?? "";
+    };
+    // home cap 0 (the real default): a home request is refused, auto goes to the pool
+    assert.equal(
+      await ask("s-home", { placement: "home" }),
+      "refused reason=home_full live=0 cap=100",
+    );
+    assert.match(await ask("s-pool"), READY_LINE);
+    broker.setScript({ status: { live: 99 } });
+    assert.equal(
+      await ask("s-spawn", { class: "spawn" }),
+      "refused reason=agent_cap live=99 cap=100",
+      "the reserve is the person's",
+    );
+    assert.match(
+      await ask("s-person", { class: "interactive" }),
+      READY_LINE,
+      "interactive may use the reserve",
+    );
+    broker.setScript({ status: { live: 100 } });
+    assert.equal(
+      await ask("s-full", { class: "interactive" }),
+      "refused reason=agent_cap live=100 cap=100",
+    );
+    broker.setScript({ status: { quota: { used: 5, hard: 5 } } });
+    assert.match(await ask("s-quota"), /^refused reason=quota /);
+    broker.setScript({ status: { quota: { used: 0, hard: 0 } } });
+    assert.match(
+      await ask("s-noquota"),
+      /^refused reason=quota /,
+      "a box without its quota starts no agent pod",
+    );
+    broker.setScript({ status: { home: { live: 0, cap: 2 } } });
+    assert.match(await ask("s-home-ok", { placement: "home" }), /placement=home$/);
+  });
+});
+
+test("F4: DELETE ?uid= with an EMPTY value is no uid — it deletes the key's Job unconditionally (the real `uid or None`)", async () => {
+  await withBroker({}, async (broker) => {
+    const { key, body } = wellFormedAgentRequest("session-empty-uid");
+    await postAgent(broker, key, body);
+    assert.equal((await getAgents(broker)).live, 1);
+    const answer = await fetch(`${broker.url}/v1/agents/${key}?uid=`, { method: "DELETE" });
+    assert.equal(answer.status, 200);
+    assert.equal(await answer.text(), "", "not `refused reason=uid_mismatch`");
+    assert.equal((await getAgents(broker)).live, 0, "the Job is gone");
+    assert.equal(broker.requestsFor("DELETE", key)[0]?.outcome, "deleted");
   });
 });
 
@@ -460,37 +697,55 @@ test("DELETE of a key with no pod answers 200 with an empty body, with or withou
   });
 });
 
-test("a utility request carries no seat and no sessionId: their absence is fine, their presence is flagged", async () => {
+test("a utility request carries no seat and no sessionId; the real broker's utility rules are enforced", async () => {
   await withBroker({}, async (broker) => {
     for (const placement of ["pool", "home"] as const) {
       const { key, body } = wellFormedUtilityRequest(placement);
       assert.equal(key, `util-${placement}`);
+      broker.setScript({ status: { home: { live: 0, cap: 2 } } });
       const answer = await postAgent(broker, key, body);
       assert.match(answer.lines.at(-1) ?? "", /^ready /);
       assert.deepEqual(broker.requests.at(-1)?.problems, [], `utility ${placement}`);
     }
     const { key, body } = wellFormedUtilityRequest("pool");
     await deleteAgent(broker, key);
-    await postAgent(broker, key, { ...body, seat: "seat-0001" });
+    // a sent seat is ignored by the real broker (flagged by the kit, not refused)
+    assert.match(
+      (await postAgent(broker, key, { ...body, seat: "seat-0001" })).lines.at(-1) ?? "",
+      /^ready /,
+    );
     assert.deepEqual(broker.requests.at(-1)?.problems, ["field_present:seat"]);
     await deleteAgent(broker, key);
-    await postAgent(broker, key, { ...body, sessionId: "s-1", seat: "x" });
-    assert.deepEqual(broker.requests.at(-1)?.problems, [
-      "field_present:seat",
-      "field_present:sessionId",
+    // a sessionId on a utility request is refused
+    assert.deepEqual((await postAgent(broker, key, { ...body, sessionId: "s-1" })).lines, [
+      "error invalid_request",
     ]);
+    // util-pool with placement home is refused
+    assert.deepEqual((await postAgent(broker, key, { ...body, placement: "home" })).lines, [
+      "error invalid_request",
+    ]);
+    assert.deepEqual(broker.requests.at(-1)?.problems, [
+      "a utility key takes harness utility, no sessionId and its own placement",
+    ]);
+    // a utility key with another harness is refused
+    assert.deepEqual((await postAgent(broker, key, { ...body, harness: "claude" })).lines, [
+      "error invalid_request",
+    ]);
+    // an ordinary request still needs both
     const agent = wellFormedAgentRequest("session-needs-both");
-    await postAgent(broker, agent.key, { ...agent.body, seat: undefined, sessionId: undefined });
-    assert.ok(
-      broker.requests.at(-1)?.problems.includes("field_missing:seat"),
-      "an ordinary request still needs both",
+    assert.deepEqual(
+      (await postAgent(broker, agent.key, { ...agent.body, seat: undefined })).lines,
+      ["error invalid_request"],
     );
-    assert.ok(broker.requests.at(-1)?.problems.includes("field_missing:sessionId"));
+    assert.deepEqual(
+      (await postAgent(broker, agent.key, { ...agent.body, sessionId: undefined })).lines,
+      ["error invalid_request"],
+    );
   });
 });
 
 test("GET /v1/agents answers the C4 shape, derived from the Jobs unless scripted", async () => {
-  await withBroker({}, async (broker) => {
+  await withBroker({ status: { home: { live: 0, cap: 10 } } }, async (broker) => {
     const shape = await getAgents(broker);
     assert.deepEqual(Object.keys(shape).toSorted(), [
       "cap",
@@ -500,12 +755,12 @@ test("GET /v1/agents answers the C4 shape, derived from the Jobs unless scripted
       "quota",
       "reserve",
     ]);
-    assert.deepEqual(shape.quota, { used: 0, hard: 100 });
     const { key, body } = wellFormedAgentRequest("session-status");
     await postAgent(broker, key, { ...body, placement: "home" });
     const after = await getAgents(broker);
     assert.equal(after.live, 1);
-    assert.deepEqual(after.home, { live: 1, cap: 10 });
+    assert.deepEqual(after.quota, { used: 1, hard: 100 });
+    assert.equal((after.home as { cap: number }).cap, 10);
     broker.setScript({
       status: {
         live: 7,
@@ -587,30 +842,4 @@ test("run as a process from its TypeScript source: prints its port, honours --sc
           resolve(text.slice(0, text.indexOf("\n")));
         }
       });
-      child.once("exit", (code) =>
-        reject(new Error(`fake broker exited early rc=${String(code)}`)),
-      );
-    });
-    const announced = JSON.parse(firstLine) as { fake: string; port: number };
-    assert.equal(announced.fake, "broker");
-    assert.ok(announced.port > 0);
-    const { key, body } = wellFormedAgentRequest("session-process");
-    const response = await fetch(`http://127.0.0.1:${String(announced.port)}/v1/agents/${key}`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
-    assert.equal(await response.text(), "scheduling\nerror start_failed\n");
-    const record = (await (
-      await fetch(`http://127.0.0.1:${String(announced.port)}/_kit/record`)
-    ).json()) as {
-      requests: Array<{ method: string; key: string }>;
-    };
-    assert.deepEqual(
-      record.requests.map((entry) => [entry.method, entry.key]),
-      [["POST", key]],
-    );
-  } finally {
-    child.kill("SIGTERM");
-    await new Promise((resolve) => child.once("exit", resolve));
-  }
-});
+      c
