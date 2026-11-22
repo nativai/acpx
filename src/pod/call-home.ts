@@ -98,8 +98,13 @@ const PROGRESS_EVERY_MS = 30_000;
 
 /**
  * The progress line (stderr): the attempt count and the seconds left of the budget. ⚠️ IT STARTS WITH
- * `[acpx]`, NEVER `acpx:` — the first `acpx:` line on stderr must stay the C7.2 token after any wait
- * (R2-F5; a reader of the refusal takes the first `acpx:` line).
+ * `[acpx]`, NEVER with a TOKEN HEAD (`acpx: REFUSED `, `acpx: ROUTED `, `acpx: CALL_HOME `): a reader finds the
+ * C7.2 token by its head and the exit code, never by its place (A-53) — it is the first line that begins with
+ * the head its exit code names (75 or 2 → REFUSED; 1 → ROUTED / CALL_HOME). Progress lines therefore come
+ * BEFORE the token in text mode, and the contract tells readers to skip them. ⚠️ "The first line that begins
+ * `acpx:`" is NOT the rule either: config load can write `acpx: ignoring project config …` first. Pinned by
+ * `test/pod-model-prefs-call-home.test.ts` ("A-53 / row 53.1"). Under `--json-strict` nothing is written
+ * during the wait (the shipped strict contract is empty stderr); the token is `error.data.tokenLine`.
  */
 export function waitingLine(info: WaitInfo): string {
   return `[acpx] still waiting for atrium (attempt ${info.attempts}, ${Math.round(info.remainingMs / 1000)} s of the ${Math.round((info.elapsedMs + info.remainingMs) / 1000)} s call-home budget left); the command is not lost — it is retried until atrium answers.`;
@@ -241,6 +246,7 @@ function jsonRpcError(
   message: string,
   fields: Record<string, string | number | boolean>,
   detailCode: string,
+  retryable: boolean,
 ): string {
   return JSON.stringify({
     jsonrpc: "2.0",
@@ -248,7 +254,7 @@ function jsonRpcError(
     error: {
       code,
       message,
-      data: { acpxCode, detailCode, origin: "cli", retryable: false, tokenLine, ...fields },
+      data: { acpxCode, detailCode, origin: "cli", retryable, tokenLine, ...fields },
     },
   });
 }
@@ -275,6 +281,9 @@ export function atriumAwayFailure(waitedMs: number): CallHomeFailure {
         waited_s: waitedS,
       },
       "atrium-away",
+      // F-12: the token says `retry_after_s=60` and the sentence says "Repeat the command once atrium
+      // answers" — a JSON consumer keying on `retryable` must be told the same thing.
+      true,
     ),
   };
 }
@@ -303,6 +312,7 @@ export function doorRefusedFailure(
       `${tokenLine}\n${sentence}`,
       { reason: "pass_through_refused", nothing_started: true, protocol: 1, status, error },
       "pass-through-refused",
+      false, // the door refused it: final
     ),
   };
 }
@@ -313,18 +323,25 @@ export function doorRefusedFailure(
  *    `--created-by-call`), so the printed command is an IDENTICAL request that answers with the first
  *    attempt's record and creates nothing twice;
  *  - `check`: nothing de-duplicates a repeat, so none is advised; the text says how to find out
- *    whether the command ran.
+ *    whether the command ran;
+ *  - `repeat`: the command only reads, or sets a value to what it already says (`repeatSafe` in the class
+ *    table), so running it again is harmless and needs no id.
  */
 export type UnknownAdvice =
   | { kind: "retry"; command: string; recordId: string }
+  | { kind: "repeat" }
   | { kind: "check"; how: string };
 
 const UNKNOWN_PREFIX = "the call was sent to atrium and its answer never came, so ";
 
 function unknownSentence(advice: UnknownAdvice): string {
-  return advice.kind === "retry"
-    ? `${UNKNOWN_PREFIX}it may or may not have run. Repeat exactly this command — the control pod finds what the first attempt made and answers with it, creating nothing twice: ${advice.command}`
-    : `${UNKNOWN_PREFIX}it is unknown whether the command ran. Nothing de-duplicates a repeat of this command, so do not simply run it again: ${advice.how}`;
+  if (advice.kind === "retry") {
+    return `${UNKNOWN_PREFIX}it may or may not have run. Repeat exactly this command — the control pod finds what the first attempt made and answers with it, creating nothing twice: ${advice.command}`;
+  }
+  if (advice.kind === "repeat") {
+    return `${UNKNOWN_PREFIX}it may or may not have run. This command only reads, or sets a value to what it already says, so running it again is harmless: repeat it.`;
+  }
+  return `${UNKNOWN_PREFIX}it is unknown whether the command ran. Nothing de-duplicates a repeat of this command, so do not simply run it again: ${advice.how}`;
 }
 
 /** `acpx: CALL_HOME outcome=unknown …` — exit 1. */
@@ -349,9 +366,13 @@ export function callHomeUnknownFailure(
         call_id: callId,
         ...(advice.kind === "retry"
           ? { record_id: advice.recordId, retry_command: advice.command }
-          : { check: advice.how }),
+          : advice.kind === "repeat"
+            ? { repeat_safe: true }
+            : { check: advice.how }),
       },
       "call-home-unknown",
+      // F-12: repeating is advised (an identical request that de-duplicates, or a harmless one) ⇒ retryable.
+      advice.kind !== "check",
     ),
   };
 }

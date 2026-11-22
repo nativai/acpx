@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { PASS_THROUGH_DEADLINE_MS, type UnknownAdvice } from "./call-home.js";
-import { PASS_THROUGH_INHERIT, type CommandClass } from "./command-classes.js";
+import { COMMAND_TABLE, PASS_THROUGH_INHERIT, type CommandClass } from "./command-classes.js";
 import { resolvedPath } from "./placement.js";
 
 /**
@@ -372,6 +372,11 @@ export const BOX_RUNTIME_STATUS_FILE = "/data/runtime/runtime-status.v1";
  * command may run twice, so the line says it is unknown whether it ran and how to find out.
  */
 export function checkAdvice(commandPath: string, env: NodeJS.ProcessEnv): UnknownAdvice {
+  // F-13: a command that only reads, or sets a value to what it already says, is harmless to repeat — the
+  // class table says which (`repeatSafe`); "may apply twice" and "look at seats show" do not fit it.
+  if (COMMAND_TABLE[commandPath]?.repeatSafe === true) {
+    return { kind: "repeat" };
+  }
   if (commandPath === "box refresh") {
     return {
       kind: "check",
