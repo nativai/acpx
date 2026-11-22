@@ -265,7 +265,8 @@ test("T3 on the real CLI in an agent pod: `set-parent --children-of <other paren
       assert.equal(r.status, 4, r.stderr);
       assert.match(
         r.stderr,
-        /^set-parent: SESSION_NOT_FOUND: --children-of refers to unknown session: cccccccc-0000-4000-8000-0000000000ee\n/u,
+        // (a pod home with no index prints the one-time rebuild note first; the answer is the control pod's own)
+        /^(?:\[acpx\] full session-index rebuild[^\n]*\n)*set-parent: SESSION_NOT_FOUND: --children-of refers to unknown session: cccccccc-0000-4000-8000-0000000000ee\n/u,
         r.stderr,
       );
       assert.doesNotMatch(r.stderr, /pass_through_refused|class-not-passable/u);

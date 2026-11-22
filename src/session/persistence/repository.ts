@@ -10,6 +10,7 @@ import {
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { isBoxWideFileInAgentPod } from "../../pod/foreign-write-guard.js";
 import { SPAWN_STATE_SUFFIX } from "../../pod/spawn-state.js";
+import { armedTargetVerdict, tellParent, type TargetVerdict } from "../../pod/target-verdict.js";
 import {
   openSpawnLedgerForRecord,
   type DiskRecord,
@@ -161,7 +162,16 @@ async function resolveArchivedSessionRecord(sessionId: string): Promise<SessionR
 }
 
 async function ensureSessionDir(): Promise<void> {
-  await fs.mkdir(sessionBaseDir(), { recursive: true });
+  // A stat first, because `mkdir -p` on a directory that EXISTS is still a write to a permission-checked runtime —
+  // and the pod's read-only verdict child (`pod/target-verdict.ts`) must be able to resolve. A missing directory is
+  // created exactly as before; a path that is not a directory still fails in `mkdir`.
+  const exists = await fs.stat(sessionBaseDir()).then(
+    (stat) => stat.isDirectory(),
+    () => false,
+  );
+  if (!exists) {
+    await fs.mkdir(sessionBaseDir(), { recursive: true });
+  }
 }
 
 /**
@@ -1543,7 +1553,37 @@ async function loadUniqueRecordFromIndexEntries(
   }
 }
 
+/**
+ * K5 (brick 46b827ba): in a pod's verdict child (`pod/target-verdict.ts`) atrium has said this value names no session
+ * (or names two). The lookup is run FOR REAL, read-only, and must agree: it fails with the resolver's OWN error, which is
+ * the control pod's answer by construction, and the command never goes further. If the pod's own view DISAGREES —
+ * the record is there, two records became one, the read failed otherwise — the parent is told (`differs`) and keeps the
+ * door's refusal: never a "not found" the pod's own disk contradicts. Inert in every ordinary process (nothing armed).
+ */
+async function resolveArmedVerdict(verdict: TargetVerdict, sessionId: string): Promise<never> {
+  let own: unknown;
+  try {
+    await resolveSessionRecordFromDisk(sessionId);
+  } catch (error) {
+    own = error;
+  }
+  const agrees =
+    verdict.kind === "ambiguous"
+      ? own instanceof SessionResolutionError && own.message === verdict.message
+      : own instanceof SessionNotFoundError;
+  tellParent(agrees ? "verdict" : "differs");
+  throw own ?? new SessionNotFoundError(sessionId);
+}
+
 export async function resolveSessionRecord(sessionId: string): Promise<SessionRecord> {
+  const verdict = armedTargetVerdict();
+  if (verdict?.values.includes(sessionId)) {
+    return await resolveArmedVerdict(verdict, sessionId);
+  }
+  return await resolveSessionRecordFromDisk(sessionId);
+}
+
+async function resolveSessionRecordFromDisk(sessionId: string): Promise<SessionRecord> {
   await ensureSessionDir();
 
   const directPath = sessionFilePath(sessionId);

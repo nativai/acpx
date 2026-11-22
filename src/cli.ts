@@ -54,15 +54,50 @@ function placementArgv(argv: string[]): string[] {
     : raw;
 }
 
+/**
+ * K5 (brick 46b827ba): a pod's verdict re-run — the child the pass-through branch starts under the Node permission
+ * model. Honoured ONLY in a process the runtime made read-only; anywhere else the variable is ignored and the
+ * command is placed as always. In the armed child the placement step is skipped: acpx runs its real local path,
+ * which stops at the resolver (`target-verdict.ts`).
+ */
+async function armedVerdictRun(): Promise<boolean> {
+  if (!process.env.ACPX_POD_TARGET_VERDICT) {
+    return false; // every ordinary invocation: nothing to load
+  }
+  const {
+    VERDICT_ENV,
+    armTargetVerdict,
+    installNetworkBarrier,
+    isReadOnlyProcess,
+    parseVerdict,
+    tellExit,
+    tellParent,
+  } = await import("./pod/target-verdict.js");
+  const verdict = parseVerdict(process.env[VERDICT_ENV]);
+  if (verdict === undefined || !isReadOnlyProcess()) {
+    return false;
+  }
+  delete process.env[VERDICT_ENV];
+  armTargetVerdict(verdict);
+  installNetworkBarrier();
+  // The child's own word on how it ended: a normal end says so with its code; an uncaught exception says `crashed`.
+  process.on("exit", (code) => tellExit(code));
+  process.on("uncaughtExceptionMonitor", () => tellParent("crashed"));
+  tellParent("readonly");
+  return true;
+}
+
 async function start(): Promise<void> {
   registerRoutedBranches();
   registerUtilityBranch();
-  const outcome = await runPlacementStep({
-    argv: placementArgv(process.argv),
-    builtInAgents: () => listBuiltInAgents(),
-    write: (line) => process.stderr.write(`${line}\n`),
-    writeStdout: (line) => process.stdout.write(`${line}\n`),
-  });
+  const outcome = (await armedVerdictRun())
+    ? "proceed"
+    : await runPlacementStep({
+        argv: placementArgv(process.argv),
+        builtInAgents: () => listBuiltInAgents(),
+        write: (line) => process.stderr.write(`${line}\n`),
+        writeStdout: (line) => process.stdout.write(`${line}\n`),
+      });
   if (outcome !== "proceed") {
     process.exitCode = outcome.exitCode;
     return;
