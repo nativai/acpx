@@ -660,8 +660,12 @@ export class FakeBroker {
     record.jobSeq = target?.seq ?? null;
     const answer = (outcome: string, body: string): void => {
       record.outcome = outcome;
-      response.writeHead(this.script.delete?.status ?? 200, { "content-type": "text/plain" });
-      response.end(body);
+      const status = this.script.delete?.status ?? 200;
+      // the real broker's failure bodies: 504 after the delete wait, 502 when the kube API failed
+      const failure =
+        status === 504 ? "error timeout\n" : status === 502 ? "error kube_api_error\n" : null;
+      response.writeHead(status, { "content-type": "text/plain" });
+      response.end(failure !== null && status !== 200 ? failure : body);
     };
     if (uid !== null && target === undefined) {
       // With a uid: no pod of the key at all is a plain empty 200 — nothing to delete.

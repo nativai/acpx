@@ -568,6 +568,13 @@ export class RecordedAtrium {
 
   async listen(port = 0, host = "127.0.0.1"): Promise<number> {
     this.hostName = host;
+    // Warm the class table: its first use loads acpx's resolver and session store, which would otherwise be paid
+    // inside the first call's answer time — a client with a 600 ms answer bound then reads a kit delay as "unknown".
+    if (this.classifyOverride === undefined) {
+      await (
+        await defaultClassify()
+      )(["sessions", "set-os", "warm-up", "x"]).catch(() => undefined);
+    }
     await this.bind(port);
     this.boundPort = (this.server.address() as AddressInfo).port;
     this.applyScript(this.script);

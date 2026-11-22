@@ -684,6 +684,18 @@ test("DELETE ?uid= on a terminating pod: the matching uid still matches, a wrong
   });
 });
 
+test("F14: a scripted DELETE failure carries the real body — 504 `error timeout`, 502 `error kube_api_error`", async () => {
+  for (const [status, body] of [
+    [504, "error timeout\n"],
+    [502, "error kube_api_error\n"],
+  ] as const) {
+    await withBroker({ delete: { status } }, async (broker) => {
+      const key = "abcdef012345abcdef012345";
+      assert.deepEqual(await deleteAgent(broker, key), { status, text: body });
+    });
+  }
+});
+
 test("DELETE of a key with no pod answers 200 with an empty body, with or without a uid", async () => {
   await withBroker({}, async (broker) => {
     assert.deepEqual(await deleteAgent(broker, "abcdef012345abcdef012345"), {
