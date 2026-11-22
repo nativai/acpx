@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
+import { callHomeBudgetMs, CALL_HOME_BUDGET_MS } from "../src/pod/call-home.js";
 import { agentPodEnv, agentPodHome, runCli, snapshot } from "./pod-a3-helpers.js";
 import { startRecordedAtrium } from "./pod-kit/recorded-atrium.js";
 import type { AtriumScript, RecordedAtrium } from "./pod-kit/recorded-atrium.js";
@@ -99,3 +100,46 @@ test("NEGATIVE: `models list` is the catalogue, still local in a pod — it show
   });
   assert.deepEqual(prefsFiles(home), []);
 });
+
+// ---- the "hang": `models fav` with atrium unreachable is NOT unbounded — it ends at the call-home budget ----
+//
+// brick 74cd1715: the TE saw `models fav` wait more than 60 s with atrium unreachable and read it as a hang.
+// It is the contract (C6.1): the pod client retries for the 600 s call-home budget, saying so on stderr
+// ("still waiting for atrium … the command is not lost"), then fails with the NAMED refusal, exit 75. A
+// real 600 s run ended there (see verification/PLAN.md); these rows time the same path with the budget
+// compressed (honoured only under NODE_TEST_CONTEXT) and pin the constant.
+
+test("the call-home budget is the contract's 600 s, and only a test context may compress it", () => {
+  assert.equal(CALL_HOME_BUDGET_MS, 600_000);
+  assert.equal(
+    callHomeBudgetMs({ ACPX_CALL_HOME_BUDGET_MS: "1500" }),
+    600_000,
+    "no test context ⇒ no override",
+  );
+  assert.equal(
+    callHomeBudgetMs({ ACPX_CALL_HOME_BUDGET_MS: "1500", NODE_TEST_CONTEXT: "child" }),
+    1500,
+  );
+});
+
+for (const argv of [
+  ["models", "fav"],
+  ["models", "last-used"],
+] as const) {
+  test(`\`${argv.join(" ")}\` in an agent pod with NOTHING listening ends at the call-home deadline with atrium_away (75), not later and not never`, async () => {
+    const { home } = agentPodHome();
+    const budgetMs = 2500;
+    // 127.0.0.1:1 refuses at once: every attempt fails fast, so only the budget can end the wait
+    const env = agentPodEnv(home, "http://127.0.0.1:1", {
+      ACPX_CALL_HOME_BUDGET_MS: String(budgetMs),
+      ACPX_CALL_HOME_RETRY_MS: "100",
+    });
+    const r = await runCli([...argv], env);
+    assert.equal(r.status, 75, r.stderr);
+    assert.match(r.stderr, /^acpx: REFUSED reason=atrium_away nothing_started=true/mu);
+    assert.equal(r.stdout, "");
+    assert.ok(r.ms >= budgetMs - 200, `it waited the budget, not less: ${r.ms} ms`);
+    assert.ok(r.ms <= budgetMs + 8000, `and ended at it (no unbounded wait): ${r.ms} ms`);
+    assert.deepEqual(prefsFiles(home), []);
+  });
+}

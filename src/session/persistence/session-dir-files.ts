@@ -39,10 +39,12 @@
  *   protection `RESERVED_ID_PARTS`'s own header says must not be relied on. `seats` is
  *   named there explicitly for that reason; this registry is the other half.
  *
- * ⚠️ Kept byte-identical to acpx-ui's `server/sessionStoreFiles.ts`. The two repos are
- * separate deployables with no shared import — the same hand-kept duplication
- * `index-lock.ts` already carries for the lock protocol, and for the same reason.
- * **Change one, change both.**
+ * ⚠️ acpx-ui is a separate deployable with no shared import, and it writes some of these files. Its
+ * delivery store keeps its own list of the delivery family (`ACTIVE_SIDECAR_SUFFIXES` in
+ * `server/delivery-store.ts`), which {@link DELIVERY_SIDECAR_SUFFIXES} below mirrors by hand. A mirror of THIS
+ * registry in acpx-ui (`server/sessionStoreFiles.ts`) is planned (atrium brick d40ab22a) but is not on acpx-ui's
+ * integrated branches yet; when it lands it must mirror these lists, and a new family written by acpx-ui
+ * must be added here too — nothing in acpx's suite can see acpx-ui's writers.
  */
 
 /** The session-index projection acpx maintains beside the records. */
@@ -73,7 +75,7 @@ export function isNonSessionRecordFile(filename: string): boolean {
 /**
  * acpx-ui's delivery store's files, which share the sessions directory and ALL end in `.json`:
  * `<id>.delivery.json` (390 on devbox) and its legacy siblings `<id>.queue.json`, `<id>.inflight.json`
- * (`ACTIVE_SIDECAR_SUFFIXES` in acpx-ui `server/delivery-store.ts` — keep in step). Archive identity reads
+ * (`ACTIVE_SIDECAR_SUFFIXES` in acpx-ui `server/delivery-store.ts` — mirrored by hand; keep in step). Archive identity reads
  * the same list for its `active-delivery-sidecar` blocker, so there is one list here.
  */
 export const DELIVERY_SIDECAR_SUFFIXES: readonly string[] = [
