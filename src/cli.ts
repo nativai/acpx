@@ -93,6 +93,11 @@ if (isCliEntrypoint(process.argv)) {
     // The atrium server's loader for the index projection (index-projection.ts; block A8 → S5,
     // brick 88112988 reports/EXPORT-projection.md).
     process.stdout.write(`${new URL("./index-projection.js", import.meta.url).href}\n`);
+  } else if (process.argv[2] === "__scratch-reap") {
+    // One pass of the 14-day scratch reaper, for the control pod's janitor (block A8, TE F7).
+    void import("./cli/scratch-reap.js").then(({ runScratchReap }) =>
+      runScratchReap(process.argv.slice(3)),
+    );
   } else if (process.argv[2] === "__pod-lock-sweep") {
     // One pass of the pod lock sweep over this state home (+ named dirs), for the idle loop (C3.2).
     // A DYNAMIC import: this entry's static graph stays light (see the ⚠️ above).
