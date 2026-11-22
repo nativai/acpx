@@ -250,9 +250,6 @@ export async function listSessionIndexEntries(): Promise<SessionIndexEntry[]> {
 /** A session-record file the reader could not turn into a record, and why — see `listUnlistedRecordFiles`. */
 export type UnlistedRecordFile = { file: string; reason: string };
 
-// A record file is `<id>.json`; the dir also holds dotted sidecars (`<id>.delivery.json`) that are NOT records and never
-// get an index entry, so only this positive shape can be called "a record that went missing".
-
 function describeRejectedRecord(raw: unknown): string {
   const metadata = (raw as { metadata?: unknown } | null)?.metadata;
   if (typeof metadata === "object" && metadata !== null && !Array.isArray(metadata)) {
@@ -298,6 +295,7 @@ export async function listUnlistedRecordFiles(): Promise<UnlistedRecordFile[]> {
   const indexed = new Set(index.entries.map((entry) => entry.file));
   const unlisted: UnlistedRecordFile[] = [];
   for (const file of index.files) {
+    // Only a record-file NAME can be "a record that went missing": sidecars never get an index entry.
     if (isSessionRecordFileName(file) && !indexed.has(file)) {
       unlisted.push({ file, reason: await explainUnloadableRecordFile(file) });
     }
