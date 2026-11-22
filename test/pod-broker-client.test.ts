@@ -10,42 +10,37 @@ import {
   type BrokerAgentRequest,
   type BrokerStep,
 } from "../src/pod/broker-client.js";
-import { startBroker } from "./pod-local-fake-broker.js";
+import { startFakeBroker, wellFormedAgentRequest } from "./pod-kit/fake-broker.js";
+import { rawHttp } from "./pod-raw-http.js";
 
-// A6.0 / C4 — the broker client against a scripted local fake (until X1's test/pod-kit fake broker
-// lands on agent-pods: then this file's `startBroker` is replaced by the kit's).
-
-const KEY = "0123456789abcdef01234567";
-const REQUEST: BrokerAgentRequest = {
-  contract: AGENT_BROKER_CONTRACT,
-  sessionId: "11111111-1111-4111-8111-111111111111",
-  seat: "22222222-2222-4222-8222-222222222222",
-  harness: "claude",
-  placement: "auto",
-  class: "interactive",
-  releases: { acpx: "abc-1" },
-};
-const READY =
-  "ready ip=10.1.2.3 pod=ag-0123456789abcdef01234567 uid=33333333-3333-4333-8333-333333333333 node=n1 placement=pool";
+// A6.0 / C4 — the broker client against X1's fake broker (`test/pod-kit/fake-broker.ts`), which follows the real
+// `broker.py`: it judges every request as the real broker does, so the body here is a WELL-FORMED C4 body and its
+// key is the one the real broker derives (sha256(sessionId)[:24]). A few rows need a misbehaving server the kit does
+// not model (no headers at all, a malformed or failing `GET /v1/agents`, a DELETE answering 503 or an odd body):
+// they use `rawHttp` and are listed as KIT GAPS in brick 557fb3e7's report.
+const WELL = wellFormedAgentRequest("11111111-1111-4111-8111-111111111111");
+const KEY = WELL.key;
+const REQUEST = { ...WELL.body, contract: AGENT_BROKER_CONTRACT } as unknown as BrokerAgentRequest;
+const READY = `ready ip=10.1.2.3 pod=ag-${KEY} uid=33333333-3333-4333-8333-333333333333 node=n1 placement=pool`;
 
 test("C4: the wake bound is 20 s (spike g)", () => {
   assert.equal(WAKE_BOUND_MS, 20_000);
 });
 
 test("ensure: streamed steps then ready; the request is the C4 body on POST /v1/agents/<key>", async () => {
-  const broker = await startBroker({
-    lines: ["scheduling", "pulling", "pulling", "starting", READY],
+  const broker = await startFakeBroker({
+    default: { steps: ["scheduling", "pulling", "pulling", "starting"], final: READY },
   });
   try {
     const steps: BrokerStep[] = [];
     const result = await ensureAgentPod(KEY, REQUEST, {
-      origin: broker.origin,
+      origin: broker.url,
       onStep: (step) => steps.push(step),
     });
     assert.deepEqual(result, {
       kind: "ready",
       ip: "10.1.2.3",
-      pod: "ag-0123456789abcdef01234567",
+      pod: `ag-${KEY}`,
       uid: "33333333-3333-4333-8333-333333333333",
       node: "n1",
       placement: "pool",
@@ -55,110 +50,114 @@ test("ensure: streamed steps then ready; the request is the C4 body on POST /v1/
       ["scheduling", "pulling", "starting"],
       "a repeated step is reported once",
     );
-    assert.equal(broker.seen[0]?.method, "POST");
-    assert.equal(broker.seen[0]?.url, `/v1/agents/${KEY}`);
-    assert.deepEqual(JSON.parse(broker.seen[0]?.body ?? ""), REQUEST);
+    assert.equal(broker.requests[0]?.method, "POST");
+    assert.equal(broker.requests[0]?.path, `/v1/agents/${KEY}`);
+    assert.deepEqual(JSON.parse(broker.requests[0]?.bodyText ?? ""), REQUEST);
+    assert.deepEqual(broker.requests[0]?.problems, [], "the real broker would accept this body");
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
 
 test("ensure: each refusal reason of C4 maps with its live/cap figures", async () => {
   for (const reason of ["agent_cap", "quota", "home_full", "too_big"] as const) {
-    const broker = await startBroker({
-      lines: ["scheduling", `refused reason=${reason} live=7 cap=9`],
+    const broker = await startFakeBroker({
+      default: { steps: ["scheduling"], final: `refused reason=${reason} live=7 cap=9` },
     });
     try {
-      assert.deepEqual(await ensureAgentPod(KEY, REQUEST, { origin: broker.origin }), {
+      assert.deepEqual(await ensureAgentPod(KEY, REQUEST, { origin: broker.url }), {
         kind: "refused",
         reason,
         live: 7,
         cap: 9,
       });
     } finally {
-      broker.close();
+      await broker.close();
     }
   }
 });
 
 test("ensure: `error <reason>` is a named failure, not a refusal", async () => {
-  const broker = await startBroker({
-    lines: ["error unsupported_contract -- contract 2 is not served"],
+  const broker = await startFakeBroker({
+    default: { final: "error unsupported_contract -- contract 2 is not served" },
   });
   try {
-    assert.deepEqual(await ensureAgentPod(KEY, REQUEST, { origin: broker.origin }), {
+    assert.deepEqual(await ensureAgentPod(KEY, REQUEST, { origin: broker.url }), {
       kind: "error",
       reason: "unsupported_contract",
       detail: "contract 2 is not served",
     });
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
 
 test("ensure: stops reading at the wake bound and names the last step; the connection is closed (the Job continues)", async () => {
-  const broker = await startBroker({ lines: ["scheduling", "pulling"], stall: true });
+  const broker = await startFakeBroker({
+    default: { steps: ["scheduling", "pulling"], hang: true },
+  });
   try {
     const started = Date.now();
-    const result = await ensureAgentPod(KEY, REQUEST, { origin: broker.origin, wakeBoundMs: 300 });
+    const result = await ensureAgentPod(KEY, REQUEST, { origin: broker.url, wakeBoundMs: 300 });
     assert.deepEqual(result, { kind: "wake_bound", phase: "pulling" });
     assert.ok(Date.now() - started < 2_000, "did not wait past the bound");
     await new Promise((resolve) => setTimeout(resolve, 100));
     assert.equal(
-      broker.seen[0]?.closedEarly,
-      true,
+      broker.requests[0]?.outcome,
+      "client_closed_while_hung",
       "the caller left; the broker's Job is not ours to wait for",
     );
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
 
 test("ensure: a bound reached before any step names no phase", async () => {
-  const broker = await startBroker({ lines: [], stall: true });
+  const broker = await startFakeBroker({ default: { hang: true } });
   try {
     assert.deepEqual(
-      await ensureAgentPod(KEY, REQUEST, { origin: broker.origin, wakeBoundMs: 1500 }),
+      await ensureAgentPod(KEY, REQUEST, { origin: broker.url, wakeBoundMs: 1500 }),
       {
         kind: "wake_bound",
         phase: undefined,
       },
     );
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
 
 test("ensure: a broker that never answers, refuses the connection, or answers 5xx is `unavailable`", async () => {
-  const silent = await startBroker({ noHeaders: true });
+  // KIT GAP 1: a server that never sends response headers (the kit's `hang` sends the 200 first).
+  const silent = await rawHttp(() => undefined);
   try {
-    const result = await ensureAgentPod(KEY, REQUEST, { origin: silent.origin, wakeBoundMs: 200 });
+    const result = await ensureAgentPod(KEY, REQUEST, { origin: silent.url, wakeBoundMs: 200 });
     assert.equal(result.kind, "unavailable");
   } finally {
     silent.close();
   }
-  const down = await startBroker({});
-  const deadOrigin = down.origin;
-  down.close();
+  const down = await startFakeBroker({});
+  const deadOrigin = down.url;
+  await down.close();
   assert.equal((await ensureAgentPod(KEY, REQUEST, { origin: deadOrigin })).kind, "unavailable");
-  const broken = await startBroker({ status: 503, lines: ["upstream unavailable"] });
+  const broken = await startFakeBroker({
+    default: { respond: { status: 503, body: "upstream unavailable" } },
+  });
   try {
-    assert.equal(
-      (await ensureAgentPod(KEY, REQUEST, { origin: broken.origin })).kind,
-      "unavailable",
-    );
+    assert.equal((await ensureAgentPod(KEY, REQUEST, { origin: broken.url })).kind, "unavailable");
   } finally {
-    broken.close();
+    await broken.close();
   }
 });
 
 test("ensure: an answer that ends without a final line is `unavailable`, never a guess", async () => {
-  const broker = await startBroker({ lines: ["scheduling", "starting"] });
+  // KIT GAP 2: the kit's stream always ends with exactly one final line; this answer has progress lines only.
+  const broker = await rawHttp((_request, response) => {
+    response.writeHead(200, { "content-type": "text/plain" });
+    response.end("scheduling\nstarting\n");
+  });
   try {
-    assert.equal(
-      (await ensureAgentPod(KEY, REQUEST, { origin: broker.origin })).kind,
-      "unavailable",
-    );
+    assert.equal((await ensureAgentPod(KEY, REQUEST, { origin: broker.url })).kind, "unavailable");
   } finally {
     broker.close();
   }
@@ -173,39 +172,41 @@ test("ensure: a ready line missing what the call needs is an error, not a pod", 
     "refused reason=because live=1 cap=2", // unknown reason
   ];
   for (const line of lines) {
-    const broker = await startBroker({ lines: [line] });
+    const broker = await startFakeBroker({ default: { final: line } });
     try {
-      const result = await ensureAgentPod(KEY, REQUEST, { origin: broker.origin });
+      const result = await ensureAgentPod(KEY, REQUEST, { origin: broker.url });
       assert.equal(result.kind, "error", line);
     } finally {
-      broker.close();
+      await broker.close();
     }
   }
 });
 
 test("ensure: unknown progress lines are ignored (C4 rule 2: new fields and steps are additive)", async () => {
-  const broker = await startBroker({ lines: ["warming-cache eta=3", "scheduling extra=1", READY] });
+  const broker = await startFakeBroker({
+    default: { steps: ["warming-cache eta=3", "scheduling extra=1"], final: READY },
+  });
   try {
-    assert.equal((await ensureAgentPod(KEY, REQUEST, { origin: broker.origin })).kind, "ready");
+    assert.equal((await ensureAgentPod(KEY, REQUEST, { origin: broker.url })).kind, "ready");
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
 
 test("ensure: a 4xx that names nothing is a named failure; a key that is not a key never connects", async () => {
-  const broker = await startBroker({ status: 400, lines: [] });
+  const broker = await startFakeBroker({ default: { respond: { status: 400 } } });
   try {
-    assert.deepEqual(await ensureAgentPod(KEY, REQUEST, { origin: broker.origin }), {
+    assert.deepEqual(await ensureAgentPod(KEY, REQUEST, { origin: broker.url }), {
       kind: "error",
       reason: "http_400",
       detail: "the broker refused the request",
     });
-    const before = broker.seen.length;
-    const bad = await ensureAgentPod("../etc/passwd", REQUEST, { origin: broker.origin });
+    const before = broker.requests.length;
+    const bad = await ensureAgentPod("../etc/passwd", REQUEST, { origin: broker.url });
     assert.equal(bad.kind, "error");
-    assert.equal(broker.seen.length, before, "nothing was sent for a bad key");
+    assert.equal(broker.requests.length, before, "nothing was sent for a bad key");
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
 
@@ -218,25 +219,36 @@ test("GET /v1/agents: the C4 snapshot; a malformed or failing answer is `ok:fals
     home: { live: 1, cap: 4 },
     pool: { state: "ready" },
   };
-  const broker = await startBroker({ json: good });
+  const broker = await startFakeBroker({
+    status: {
+      live: 3,
+      cap: 100,
+      reserve: 1,
+      quota: { used: 3, hard: 100 },
+      home: { live: 1, cap: 4 },
+    },
+  });
   try {
-    assert.deepEqual(await getAgents({ origin: broker.origin }), { ok: true, agents: good });
-    assert.equal(broker.seen[0]?.method, "GET");
-    assert.equal(broker.seen[0]?.url, "/v1/agents");
+    assert.deepEqual(await getAgents({ origin: broker.url }), { ok: true, agents: good });
+    assert.equal(broker.requests[0]?.method, "GET");
+    assert.equal(broker.requests[0]?.path, "/v1/agents");
   } finally {
-    broker.close();
+    await broker.close();
   }
-  const malformed = await startBroker({ json: { ...good, cap: "100" } });
-  try {
-    assert.equal((await getAgents({ origin: malformed.origin })).ok, false);
-  } finally {
-    malformed.close();
-  }
-  const failing = await startBroker({ status: 500, json: {} });
-  try {
-    assert.equal((await getAgents({ origin: failing.origin })).ok, false);
-  } finally {
-    failing.close();
+  // KIT GAP 3: the kit's `GET /v1/agents` is always well-formed and always 200.
+  for (const answer of [
+    { status: 200, body: JSON.stringify({ ...good, cap: "100" }) },
+    { status: 500, body: "{}" },
+  ]) {
+    const server = await rawHttp((_request, response) => {
+      response.writeHead(answer.status, { "content-type": "application/json" });
+      response.end(answer.body);
+    });
+    try {
+      assert.equal((await getAgents({ origin: server.url })).ok, false, answer.body);
+    } finally {
+      server.close();
+    }
   }
 });
 
@@ -263,48 +275,81 @@ test("origin: built from the namespace; NV_AGENT_BROKER_URL steers only under NO
 
 test("DELETE /v1/agents/<key>?uid=<uid>: 200 empty = deleted; 200 `refused reason=uid_mismatch` = refused; the uid is always sent", async () => {
   const UID = "33333333-3333-4333-8333-333333333333";
-  const ok = await startBroker({ del: { body: "" } });
+  // Nothing to delete (no pod of the key): the real broker answers a plain empty 200.
+  const ok = await startFakeBroker({});
   try {
-    assert.deepEqual(await deleteAgent(KEY, { uid: UID, origin: ok.origin }), { kind: "deleted" });
-    assert.equal(ok.seen[0]?.method, "DELETE");
-    assert.equal(ok.seen[0]?.url, `/v1/agents/${KEY}?uid=${UID}`);
+    assert.deepEqual(await deleteAgent(KEY, { uid: UID, origin: ok.url }), { kind: "deleted" });
+    assert.equal(ok.requests[0]?.method, "DELETE");
+    assert.equal(ok.requests[0]?.path, `/v1/agents/${KEY}`);
+    assert.equal(ok.requests[0]?.query, `uid=${UID}`);
   } finally {
-    ok.close();
+    await ok.close();
   }
-  const mismatch = await startBroker({ del: { body: "refused reason=uid_mismatch\n" } });
+  // A live pod whose uid is another: the real answer is `refused reason=uid_mismatch`, and nothing is deleted.
+  const mismatch = await startFakeBroker({ default: { final: { ready: { uid: UID } } } });
   try {
-    assert.deepEqual(await deleteAgent(KEY, { uid: UID, origin: mismatch.origin }), {
+    await ensureAgentPod(KEY, REQUEST, { origin: mismatch.url });
+    const other = "44444444-4444-4444-8444-444444444444";
+    assert.deepEqual(await deleteAgent(KEY, { uid: other, origin: mismatch.url }), {
       kind: "refused",
       reason: "uid_mismatch",
     });
+    assert.deepEqual(await deleteAgent(KEY, { uid: UID, origin: mismatch.url }), {
+      kind: "deleted",
+    });
   } finally {
-    mismatch.close();
+    await mismatch.close();
   }
 });
 
 test("DELETE: a 5xx, a body that is no answer, a dead broker and a missing uid are never `deleted`", async () => {
   const UID = "33333333-3333-4333-8333-333333333333";
-  for (const del of [{ status: 503, body: "" }, { body: "something odd" }]) {
-    const broker = await startBroker({ del });
+  // The kit's DELETE failures are the real 504 / 502 bodies, on a pod that exists.
+  for (const status of [504, 502]) {
+    const broker = await startFakeBroker({
+      default: { final: { ready: { uid: UID } } },
+      delete: { status },
+    });
     try {
+      await ensureAgentPod(KEY, REQUEST, { origin: broker.url });
       assert.equal(
-        (await deleteAgent(KEY, { uid: UID, origin: broker.origin })).kind,
+        (await deleteAgent(KEY, { uid: UID, origin: broker.url })).kind,
         "unavailable",
+        String(status),
       );
     } finally {
-      broker.close();
+      await broker.close();
     }
   }
-  const dead = await startBroker({});
-  const origin = dead.origin;
-  dead.close();
+  // KIT GAP 4: a DELETE answering 503, or 200 with a body that is no C4 answer — neither exists on the real broker.
+  for (const answer of [
+    { status: 503, body: "" },
+    { status: 200, body: "something odd" },
+  ]) {
+    const server = await rawHttp((_request, response) => {
+      response.writeHead(answer.status, { "content-type": "text/plain" });
+      response.end(answer.body);
+    });
+    try {
+      assert.equal(
+        (await deleteAgent(KEY, { uid: UID, origin: server.url })).kind,
+        "unavailable",
+        JSON.stringify(answer),
+      );
+    } finally {
+      server.close();
+    }
+  }
+  const dead = await startFakeBroker({});
+  const origin = dead.url;
+  await dead.close();
   assert.equal((await deleteAgent(KEY, { uid: UID, origin })).kind, "unavailable");
   // Negative: without a well-formed uid nothing is sent (the broker would delete whatever pod the key has).
-  const broker = await startBroker({ del: { body: "" } });
+  const broker = await startFakeBroker({});
   try {
-    assert.equal((await deleteAgent(KEY, { uid: "", origin: broker.origin })).kind, "unavailable");
-    assert.equal(broker.seen.length, 0);
+    assert.equal((await deleteAgent(KEY, { uid: "", origin: broker.url })).kind, "unavailable");
+    assert.equal(broker.requests.length, 0);
   } finally {
-    broker.close();
+    await broker.close();
   }
 });

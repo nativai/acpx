@@ -11,7 +11,14 @@ import { terminateQueueOwnerForSession } from "../src/cli/queue/lease-store.js";
 import { queueLockFilePath } from "../src/cli/queue/paths.js";
 import { sessionKey } from "../src/pod/placement.js";
 import { sessionBaseDir } from "../src/session/persistence/session-base-dir.js";
-import { startFakeApi } from "./pod-lock-fake-api.js";
+import {
+  clearPods,
+  failWith,
+  putNode,
+  putPod,
+  requestLines,
+  startKitApi,
+} from "./pod-kit-api-helpers.js";
 import { makeWorld, withEnv, worldEnv } from "./pod-owner-helpers.js";
 
 // Block A4 (brick 30df3a5b), A-16 through the REAL CLI (TE finding F4, brick 30df3a5b TE-7b): in local
@@ -73,7 +80,7 @@ function run(env: NodeJS.ProcessEnv, cwd: string, args: string[]): Promise<Run> 
 }
 
 test("A-16 on the real CLI: prompt, cancel, set-mode, sessions close and sessions template answer pod_starting turnover (75) for an existing pod, a failed delete and an unknown API; a gone pod wakes locally", async () => {
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
     const owner = makeWorld("a16-cli");
     const control = makeWorld("a16-cli-control");
@@ -154,24 +161,24 @@ test("A-16 on the real CLI: prompt, cancel, set-mode, sessions close and session
       {
         name: "pod exists, fresh heartbeat",
         heartbeat: new Date().toISOString(),
-        setup: () => api.state.pods.set(podName, { uid: pod.uid, phase: "Running" }),
+        setup: () => putPod(api, podName, { uid: pod.uid, phase: "Running" }),
       },
       {
         name: "pod exists, stale heartbeat (its delete failed)",
         heartbeat: STALE,
-        setup: () => api.state.pods.set(podName, { uid: pod.uid, phase: "Running" }),
+        setup: () => putPod(api, podName, { uid: pod.uid, phase: "Running" }),
       },
       {
         name: "API server unknown (500), stale heartbeat",
         heartbeat: STALE,
         setup: () => {
-          api.state.pods.clear();
-          api.state.failure = "500";
+          clearPods(api);
+          failWith(api, "500");
         },
       },
     ];
     for (const scenario of scenarios) {
-      api.state.failure = undefined;
+      failWith(api, undefined);
       scenario.setup();
       const leaseBefore = plant(scenario.heartbeat);
       for (const verb of [
@@ -204,9 +211,9 @@ test("A-16 on the real CLI: prompt, cancel, set-mode, sessions close and session
     }
 
     // The pod is proven gone (no pod of the name, its node Ready): the wake proceeds locally.
-    api.state.failure = undefined;
-    api.state.pods.clear();
-    api.state.nodes.set(pod.node, "True");
+    failWith(api, undefined);
+    clearPods(api);
+    putNode(api, pod.node, "True");
     plant(STALE);
     const gone = await run(env, cwd, [
       "--format",
@@ -228,7 +235,7 @@ test("A-16 on the real CLI: prompt, cancel, set-mode, sessions close and session
 });
 
 test("A-16 backstop: connectToQueueOwner — the one door to an owner's socket — never connects to a pod's lease unless the pod is proven gone", async () => {
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
     const owner = makeWorld("a16-door");
     const control = makeWorld("a16-door-control");
@@ -260,22 +267,22 @@ test("A-16 backstop: connectToQueueOwner — the one door to an owner's socket �
     });
     try {
       await withEnv(env, async () => {
-        api.state.pods.set("ag-door", { uid: "uid-door", phase: "Running" });
+        putPod(api, "ag-door", { uid: "uid-door", phase: "Running" });
         await assert.rejects(connectToQueueOwner(lease, 1), { stderrLine: TOKEN });
         assert.equal(connections, 0, "no socket attempt while the pod exists");
-        api.state.pods.clear();
-        api.state.failure = "500";
+        clearPods(api);
+        failWith(api, "500");
         await assert.rejects(connectToQueueOwner(lease, 1), { stderrLine: TOKEN });
         assert.equal(connections, 0, "no socket attempt while the proof is unknown");
         // Negative: a lease WITHOUT a pod field is today's — it connects, and the API is not asked.
-        api.state.failure = undefined;
-        api.state.requests.length = 0;
+        failWith(api, undefined);
+        api.reset();
         const { pod: _pod, ...podless } = lease;
         const socket = await connectToQueueOwner(podless, 1);
         socket?.destroy();
-        assert.equal(api.state.requests.length, 0);
+        assert.equal(requestLines(api).length, 0);
         // The pod proven gone: the door opens.
-        api.state.nodes.set("n-door", "True");
+        putNode(api, "n-door", "True");
         (await connectToQueueOwner(lease, 1))?.destroy();
       });
       assert.ok(connections >= 2, "the podless lease and the gone pod both connected");
