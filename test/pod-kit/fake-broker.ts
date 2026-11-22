@@ -32,9 +32,10 @@ export const RELEASE_TOOLS = [
   "pi-acp",
   "pi-extensions",
 ] as const;
-// C9 as ruled 2026-11-21: only a tool marked `optional` in runtime-links.sh's LINKS table may be
-// left out of `releases` — today `pi-extensions`, and only it. Any other absent tool is a problem.
-export const OPTIONAL_RELEASE_TOOLS: readonly string[] = ["pi-extensions"];
+// C9 (A-12, A-40, A-41): only a tool marked `optional` in runtime-links.sh's LINKS table may be left out of
+// `releases` — `pi-extensions`, `pi` and `claude-pty-acp`. Any other absent tool is a problem. This is the
+// BROKER's copy of the set (broker.py `OPTIONAL_RELEASE_TOOLS`); acpx's own is `RELEASE_TOOLS_OPTIONAL`.
+export const OPTIONAL_RELEASE_TOOLS: readonly string[] = ["pi-extensions", "pi", "claude-pty-acp"];
 
 export type BrokerStep = string | { line: string; delayMs?: number };
 

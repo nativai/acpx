@@ -640,7 +640,11 @@ test("utility branch, C1.2 placement per harness: Codex → ag-util-home; claude
     await dispatchUtility(decisionFor(argv), context(d.out), d.deps);
     assert.equal(d.runs[0]?.key, key, `${command}`);
   }
-  assert.equal(utilityKeyFor("claude-pty"), "util-home");
+  assert.equal(
+    utilityKeyFor("claude-pty"),
+    "util-pool",
+    "A-39: the terminal harness is not home-placed",
+  );
   assert.equal(utilityKeyFor("codex"), "util-home");
   assert.equal(utilityKeyFor("claude"), "util-pool");
   assert.equal(utilityKeyFor("pi"), "util-pool");

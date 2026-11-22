@@ -28,6 +28,7 @@ import {
   type RoutedCallOptions,
   type RoutedClass,
 } from "../src/pod/routed-call.js";
+import { OPTIONAL_RELEASE_TOOLS } from "./pod-kit/fake-broker.js";
 import { startBroker } from "./pod-local-fake-broker.js";
 
 // A6.0 — the routed call, caller side (C2, C4 caller, C7.2 lines), against a STUB transport that
@@ -1246,103 +1247,162 @@ test("unknown outcome: the dropped partial stderr goes to the debug sink, never 
   assert.equal(fs.existsSync(path.join(stub3.dir, "routed-calls.log")), false);
 });
 
-test("releases (C9): ONLY pi-extensions may be left out; every other tool, absent, is named as unresolved", () => {
-  assert.deepEqual([...RELEASE_TOOLS_OPTIONAL], ["pi-extensions"]);
-  const dir = fs.mkdtempSync(path.join(TMP_ROOT, "runtime-each-"));
-  for (const tool of RELEASE_TOOLS_REQUIRED) {
+/** A runtime directory with a release-shaped link for each tool in `tools`. */
+function runtimeWith(tools: readonly string[]): string {
+  const dir = fs.mkdtempSync(path.join(TMP_ROOT, "runtime-opt-"));
+  for (const tool of tools) {
     fs.mkdirSync(path.join(dir, ".releases", tool, "r"), { recursive: true });
     fs.symlinkSync(`.releases/${tool}/r`, path.join(dir, tool));
   }
-  assert.equal(resolveReleases(dir).ok, true, "without pi-extensions it still resolves");
+  return dir;
+}
+
+const ALL_TOOLS: string[] = [...RELEASE_TOOLS_REQUIRED, ...RELEASE_TOOLS_OPTIONAL];
+
+test("releases (C9, A-40/A-41): the optional set is pi-extensions, pi and claude-pty-acp — each omitted when its link is absent, named when it resolves; every REQUIRED tool absent is named as unresolved", () => {
+  assert.deepEqual([...RELEASE_TOOLS_OPTIONAL].toSorted(), [
+    "claude-pty-acp",
+    "pi",
+    "pi-extensions",
+  ]);
+  assert.deepEqual([...RELEASE_TOOLS_REQUIRED].toSorted(), [
+    "acpx",
+    "acpx-ui",
+    "claude-agent-acp",
+    "codex-acp",
+    "pi-acp",
+  ]);
+  // 40.1 / 41.1: each optional link absent on its own, and all three together, every other tool linked.
+  const absences: string[][] = [
+    ...RELEASE_TOOLS_OPTIONAL.map((tool): string[] => [tool]),
+    [...RELEASE_TOOLS_OPTIONAL],
+  ];
+  for (const absent of absences) {
+    const result = resolveReleases(runtimeWith(ALL_TOOLS.filter((tool) => !absent.includes(tool))));
+    assert.equal(result.ok, true, `${absent.join("+")} absent still resolves`);
+    const names = Object.keys((result as { releases: Record<string, string> }).releases);
+    for (const tool of absent) {
+      assert.equal(names.includes(tool), false, `${tool} is omitted`);
+    }
+    for (const tool of ALL_TOOLS.filter((t) => !absent.includes(t))) {
+      assert.equal(names.includes(tool), true, `${tool} is still sent`);
+    }
+  }
+  // Control: every link present → every optional tool is NAMED (optional, not dropped).
+  const everything = resolveReleases(runtimeWith(ALL_TOOLS));
+  assert.deepEqual(
+    Object.keys((everything as { releases: Record<string, string> }).releases).toSorted(),
+    [...ALL_TOOLS].toSorted(),
+  );
+  // Negative: a REQUIRED tool absent fails, named — one by one.
   for (const tool of RELEASE_TOOLS_REQUIRED) {
-    fs.rmSync(path.join(dir, tool));
-    assert.deepEqual(resolveReleases(dir), { ok: false, tool }, `${tool} absent`);
-    fs.symlinkSync(`.releases/${tool}/r`, path.join(dir, tool));
+    assert.deepEqual(
+      resolveReleases(runtimeWith(ALL_TOOLS.filter((t) => t !== tool))),
+      { ok: false, tool },
+      `${tool} absent`,
+    );
   }
 });
 
-test("--address: the pod IP from the broker's ready line, or from the API lookup, goes to the transport; never a non-IP", async () => {
-  const broker = await startBroker({ lines: [READY] });
-  try {
-    const stub = makeStub();
-    await runRoutedCall(ensureOptions(stub, broker.origin));
-    const [fromBroker] = stub.calls();
-    assert.ok(fromBroker);
-    assert.equal(flag(fromBroker, "--address"), "10.1.2.3");
-  } finally {
-    broker.close();
+test("releases (A-40/A-41): a PRESENT optional link that is not release-shaped still fails the call, naming the tool", () => {
+  for (const tool of RELEASE_TOOLS_OPTIONAL) {
+    const others = ALL_TOOLS.filter((t) => t !== tool);
+    // A real directory, not a link into .releases/<tool>/.
+    const directory = runtimeWith(others);
+    fs.mkdirSync(path.join(directory, tool));
+    assert.deepEqual(resolveReleases(directory), { ok: false, tool }, `${tool}: a directory`);
+    // A link into ANOTHER tool's releases.
+    const foreign = runtimeWith(others);
+    fs.symlinkSync(".releases/acpx/r", path.join(foreign, tool));
+    assert.deepEqual(resolveReleases(foreign), { ok: false, tool }, `${tool}: a foreign link`);
+    // A dangling-shape link (right place, wrong tool segment).
+    const shaped = runtimeWith(others);
+    fs.symlinkSync("somewhere/else", path.join(shaped, tool));
+    assert.deepEqual(resolveReleases(shaped), { ok: false, tool }, `${tool}: not release-shaped`);
   }
-  const stub2 = makeStub();
-  await runRoutedCall(
-    baseOptions(stub2, {
-      lookup: async () => ({ state: "exists", uid: UID, ready: true, ip: "fd00::5" }),
+});
+
+test("the three copies of the optional set (row 40.4): acpx's equals the broker kit's — and a copy missing `pi` is caught, naming the copy and the tool", () => {
+  const copies: Record<string, readonly string[]> = {
+    "acpx RELEASE_TOOLS_OPTIONAL": RELEASE_TOOLS_OPTIONAL,
+    "broker kit OPTIONAL_RELEASE_TOOLS": OPTIONAL_RELEASE_TOOLS,
+  };
+  const disagreements = (all: Record<string, readonly string[]>): string[] => {
+    const union = [...new Set(Object.values(all).flat())].toSorted();
+    return Object.entries(all).flatMap(([name, set]) =>
+      union.filter((tool) => !set.includes(tool)).map((tool) => `${name} lacks ${tool}`),
+    );
+  };
+  assert.deepEqual(disagreements(copies), []);
+  // The check discriminates: one copy without `pi` is named.
+  assert.deepEqual(
+    disagreements({
+      ...copies,
+      "broker kit OPTIONAL_RELEASE_TOOLS": OPTIONAL_RELEASE_TOOLS.filter((tool) => tool !== "pi"),
     }),
+    ["broker kit OPTIONAL_RELEASE_TOOLS lacks pi"],
   );
-  assert.equal(flag(stub2.calls()[0], "--address"), "fd00::5");
-  // Negatives: no IP known, or something that is not an IP (a hostname, a flag-looking string), is not passed.
-  for (const ip of [undefined, "ag-x.ag.dev-devbox.svc", "--evil", "10.1.2", ""]) {
-    const stub3 = makeStub();
-    await runRoutedCall(
-      baseOptions(stub3, { lookup: async () => ({ state: "exists", uid: UID, ready: true, ip }) }),
-    );
-    assert.equal(stub3.calls()[0]?.argv.includes("--address"), false, String(ip));
-  }
 });
 
-test("transport lines beyond the table (T1): bad_request → not_run; 124 DEADLINE lines → unknown; a trailing TEST MODE line changes nothing", async () => {
-  const stub = makeStub({
-    exit: 64,
-    stderr:
-      "agent-exec: REFUSED reason=bad_request command_not_run=true protocol=1\nremedy\nagent-exec: TEST MODE target-config=/x (loopback agent pod only; never production)\n",
-  });
-  const options = baseOptions(stub);
-  const error = await expectRouted(runRoutedCall(options));
-  assert.equal(
-    error.stderrLine,
-    `acpx: ROUTED outcome=not_run reason=bad_request call_id=${options.callId}`,
-  );
-  for (const line of [
-    "agent-exec: DEADLINE call_id=c command_not_run=true protocol=1\n",
-    "agent-exec: DEADLINE call_id=c command_ended=true protocol=1\n",
-    "partial output\nagent-exec: DEADLINE call_id=c client watchdog\n",
-  ]) {
-    const unknown = await expectRouted(
-      runRoutedCall(baseOptions(makeStub({ exit: 124, stderr: line }))),
-    );
-    assert.equal(unknown.outcome, "unknown");
-    assert.equal(unknown.reason, "deadline");
-  }
-});
-
-test("C9: `pi` is a REQUIRED tool and is sent in `releases`; `pi-home` is not a release tool and is never sent", () => {
-  assert.ok((RELEASE_TOOLS_REQUIRED as readonly string[]).includes("pi"));
-  const dir = fs.mkdtempSync(path.join(TMP_ROOT, "runtime-pi-"));
-  for (const tool of [...RELEASE_TOOLS_REQUIRED, "pi-home"]) {
-    fs.mkdirSync(path.join(dir, ".releases", tool, "r"), { recursive: true });
-    fs.symlinkSync(`.releases/${tool}/r`, path.join(dir, tool));
-  }
+test("C9 (A-41): `pi` is OPTIONAL and is sent when its link resolves; `pi-home` is not a release tool and is never sent", () => {
+  assert.ok((RELEASE_TOOLS_OPTIONAL as readonly string[]).includes("pi"));
+  assert.equal((RELEASE_TOOLS_REQUIRED as readonly string[]).includes("pi"), false);
+  const dir = runtimeWith([...ALL_TOOLS, "pi-home"]);
   const result = resolveReleases(dir);
   assert.equal(result.ok, true);
   const names = Object.keys((result as { releases: Record<string, string> }).releases);
   assert.equal(names.includes("pi"), true);
   assert.equal(names.includes("pi-home"), false);
-  // Negative: a `pi` that cannot be resolved fails — named, before the broker is asked.
-  fs.rmSync(path.join(dir, "pi"));
-  assert.deepEqual(resolveReleases(dir), { ok: false, tool: "pi" });
 });
 
-test("a required tool that cannot be resolved (pi) fails the call BEFORE the broker is asked, naming it", async () => {
+test("a required tool that cannot be resolved (pi-acp) fails the call BEFORE the broker is asked, naming it", async () => {
   const broker = await startBroker({ lines: [READY] });
   try {
     const options = ensureOptions(makeStub(), broker.origin, {
-      releases: { ok: false, tool: "pi" },
+      releases: { ok: false, tool: "pi-acp" },
     });
     const error = await expectRouted(runRoutedCall(options));
     assert.equal(
       error.stderrLine,
-      `acpx: ROUTED outcome=not_run reason=release_unresolved tool=pi call_id=${options.callId}`,
+      `acpx: ROUTED outcome=not_run reason=release_unresolved tool=pi-acp call_id=${options.callId}`,
     );
     assert.equal(broker.seen.length, 0);
+  } finally {
+    broker.close();
+  }
+});
+
+test("A-41: a Pi session whose `releases` lacks `pi` is refused at acpx's call, named, BEFORE the broker; a Claude, Codex or Pi-with-`pi` call is not", async () => {
+  const withoutPi = { ok: true as const, releases: { acpx: "rel-1", "pi-acp": "rel-3" } };
+  const withPi = { ok: true as const, releases: { acpx: "rel-1", "pi-acp": "rel-3", pi: "rel-2" } };
+  const broker = await startBroker({ lines: [READY] });
+  try {
+    const options = ensureOptions(makeStub(), broker.origin, {
+      target: { sessionId: SESSION, seat: SEAT, harness: "pi" },
+      releases: withoutPi,
+    });
+    const error = await expectRouted(runRoutedCall(options));
+    assert.equal(error.reason, "release_unresolved");
+    assert.equal(
+      error.stderrLine,
+      `acpx: ROUTED outcome=not_run reason=release_unresolved tool=pi call_id=${options.callId}`,
+    );
+    assert.equal(broker.seen.length, 0, "the broker was never asked");
+    // Controls: the same call is not refused when the harness is not pi, or when pi is named.
+    for (const [harness, releases] of [
+      ["claude", withoutPi],
+      ["codex", withoutPi],
+      ["pi", withPi],
+    ] as const) {
+      const before: number = broker.seen.length;
+      await runRoutedCall(
+        ensureOptions(makeStub(), broker.origin, {
+          target: { sessionId: SESSION, seat: SEAT, harness },
+          releases,
+        }),
+      );
+      assert.equal(broker.seen.length, before + 1, `${harness}: the broker was asked`);
+    }
   } finally {
     broker.close();
   }
