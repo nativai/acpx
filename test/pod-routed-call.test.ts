@@ -930,7 +930,8 @@ test("owner-ensure: the bound with the pool at its maximum → agent_cap why=poo
   } finally {
     await broker.close();
   }
-  // KIT GAP 3: a `GET /v1/agents` whose answer carries no usable figures — the kit's snapshot is always well-formed.
+  // A `GET /v1/agents` whose answer carries no usable figures — a shape the real broker never produces (it builds the
+  // figures itself), so a raw row for acpx's own strictness.
   const noFigures = await rawHttp((request, response) => {
     if (request.method === "GET") {
       response.writeHead(200, { "content-type": "application/json" });
@@ -1491,7 +1492,8 @@ test("C4 `error deleted`: the pod was deleted by a concurrent DELETE → pod_sta
 });
 
 test("L-3: the wake bound covers the WHOLE ensure — pool-at-maximum with a `GET /v1/agents` that never answers is admission_busy WITHIN the bound, not after it", async () => {
-  // KIT GAP 3: a `GET /v1/agents` that never answers (the kit's always answers).
+  // A `GET /v1/agents` that never answers. A REAL shape under a slow kube API (up to three sequential 10 s kube calls
+  // against acpx's 20 s bound); the kit has no delayed GET, so this row stays raw for THAT reason.
   const broker = await rawHttp((request, response) => {
     if (request.method === "GET") {
       return;

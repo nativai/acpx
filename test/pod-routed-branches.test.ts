@@ -485,7 +485,8 @@ test("lookup NEGATIVES — any failure is `unknown`, NEVER `absent` (an API outa
       await api.close();
     }
   }
-  // KIT GAP 5: a 200 whose body is no pod list (no `items`, or `items` not a list) — the kit's list is always well-formed.
+  // A 200 whose body is no pod list (no `items`, or `items` not a list) — the real API always sends a list, so this is a raw
+  // row for acpx's own strictness.
   for (const raw of [JSON.stringify({ kind: "PodList" }), JSON.stringify({ items: "nope" })]) {
     const api = await rawHttp((_request, response) => {
       response.writeHead(200, { "content-type": "application/json" });

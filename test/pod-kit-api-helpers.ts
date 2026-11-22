@@ -29,26 +29,21 @@ export type PutPod = {
   uid: string;
   phase: string;
   node?: string;
-  /** Terminal detail (`state.terminated.reason`…): the kit's `PodSeed` carries none, so it is set on the pod `addPod` returns. KIT GAP 6. */
+  /** Terminal detail (`state.terminated.reason` …) — the kit's `PodSeed` carries it. */
   containerStatuses?: unknown[];
   reason?: string;
 };
 
 export function putPod(api: FakeApiServer, name: string, pod: PutPod): void {
   known(api).pods.add(name);
-  const object = api.addPod({
+  api.addPod({
     name,
     uid: pod.uid,
     phase: pod.phase,
     ...(pod.node === undefined ? {} : { node: pod.node }),
+    ...(pod.containerStatuses === undefined ? {} : { containerStatuses: pod.containerStatuses }),
+    ...(pod.reason === undefined ? {} : { reason: pod.reason }),
   });
-  const status = object.status as Record<string, unknown>;
-  if (pod.reason !== undefined) {
-    status.reason = pod.reason;
-  }
-  if (pod.containerStatuses !== undefined) {
-    status.containerStatuses = pod.containerStatuses;
-  }
 }
 
 export function putNode(
