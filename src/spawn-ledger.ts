@@ -369,11 +369,16 @@ function rebindsReservedDestination(writer: DiskRecord, current: DiskRecord): bo
     Boolean(metadataValue(current, "spawn_key")) && current.acp_session_id !== writer.acp_session_id
   );
 }
+/**
+ * `ownerMayRebind` is a THUNK, evaluated ONLY when the write really rebinds the reserved destination
+ * (F-19). It reads the session's queue lease; evaluated eagerly it made a transient errno on that read refuse an
+ * ordinary adopted checkpoint that needs no rebind at all — the common write, on every spawn-owned session.
+ */
 function assertRecordIdentity(
   id: string,
   writer: DiskRecord,
   current: DiskRecord | undefined,
-  ownerMayRebind = false,
+  ownerMayRebind: () => boolean = () => false,
 ): void {
   if (writer.acpx_record_id !== id) {
     throw new SpawnLedgerError("record-ownership", "record id does not own destination");
@@ -391,7 +396,7 @@ function assertRecordIdentity(
   // record an attempt owns. The one legitimate rebind is the session's OWN owner after its
   // cold session/resume misses and falls back to session/new (brick d36c222f) — see
   // `SpawnLedger.ownerMayRebind`.
-  if (rebindsReservedDestination(writer, current) && !ownerMayRebind) {
+  if (rebindsReservedDestination(writer, current) && !ownerMayRebind()) {
     throw new SpawnLedgerError("record-ownership", "destination belongs to another ACP session");
   }
 }
@@ -532,7 +537,7 @@ export class PodSpawnRecordWriter implements SpawnRecordWriter {
       id,
       record,
       current,
-      stateAllowsRebind(read.state) && leaseNamesThisProcess(id),
+      () => stateAllowsRebind(read.state) && leaseNamesThisProcess(id),
     );
     preserveSpawnState(record, current);
     writeRecordAtomic(file, record, options.beforePublish);
@@ -938,7 +943,7 @@ export class SpawnLedger {
       id,
       writer,
       current,
-      Boolean(attempt) && this.ownerMayRebind(id, attempt!),
+      () => Boolean(attempt) && this.ownerMayRebind(id, attempt!),
     );
     if (!key) {
       return;

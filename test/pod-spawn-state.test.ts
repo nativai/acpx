@@ -88,7 +88,7 @@ function diskRecord(home: string, metadata: Record<string, string>): DiskRecord 
 }
 
 /** The control pod's side: a real ledger takes the attempt to `adopted`; then the home becomes an agent pod. */
-function adoptedAgentPod(options: { adopt?: boolean } = {}): Fixture {
+function adoptedAgentPod(options: { adopt?: boolean; controlPod?: boolean } = {}): Fixture {
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "acpx-spawnstate-")));
   roots.push(home);
   process.env.HOME = home;
@@ -146,10 +146,13 @@ function adoptedAgentPod(options: { adopt?: boolean } = {}): Fixture {
     fs.writeFileSync(stateFile, typeof state === "string" ? state : JSON.stringify(state));
   };
   writeState(published);
-  // From here on this home is an agent pod, and it has no ledger database at all.
-  fs.writeFileSync(path.join(home, ".nv-agent"), "ag-spawnstate\n");
-  for (const suffix of ["", "-wal", "-shm"]) {
-    fs.rmSync(path.join(home, ".acpx", `brick-outbox.db${suffix}`), { force: true });
+  // From here on this home is an agent pod, and it has no ledger database at all — unless `controlPod`: the
+  // control pod with pod mode OFF (every brick-trigger-spawned session's checkpoint today), ledger kept.
+  if (options.controlPod !== true) {
+    fs.writeFileSync(path.join(home, ".nv-agent"), "ag-spawnstate\n");
+    for (const suffix of ["", "-wal", "-shm"]) {
+      fs.rmSync(path.join(home, ".acpx", `brick-outbox.db${suffix}`), { force: true });
+    }
   }
   const recordFile = path.join(sessions, `${ID}.json`);
   return {
@@ -644,4 +647,69 @@ test("F-8: fd exhaustion (or a mount's hiccup) TAKING the record lock is the RET
     fs.readdirSync(f.sessions).filter((name) => name.includes(".lock")),
     [],
   );
+});
+
+// ---- F-19: the lease is read ONLY when the write rebinds the ACP id ------------------------------------------
+
+const LEASE_NAME = () => path.basename(queueLockFilePath(ID));
+const LEASE_ERRNOS = [...TRANSIENT, "EACCES"];
+
+test("F-19 (pod writer): an ORDINARY adopted checkpoint — no rebind — still WRITES under any lease-read errno", async () => {
+  const f = adoptedAgentPod();
+  for (const code of LEASE_ERRNOS) {
+    await withReadFailure(LEASE_NAME(), code, async () => {
+      await podWrite(f, { ...f.record, last_request_id: `ordinary ${code}` });
+    });
+    assert.equal((JSON.parse(f.recordBytes()) as DiskRecord).last_request_id, `ordinary ${code}`);
+  }
+});
+
+test("F-19 (writeSessionRecord, pod mode OFF — a brick-trigger-spawned session's checkpoint on the control pod, through the SQLite ledger): an ordinary adopted checkpoint still WRITES under any lease-read errno", async () => {
+  const f = adoptedAgentPod({ controlPod: true });
+  const parsed = parsedRecord(f);
+  for (const code of LEASE_ERRNOS) {
+    await withReadFailure(LEASE_NAME(), code, async () => {
+      await writeSessionRecord({ ...parsed, lastRequestId: `control ${code}` });
+    });
+    assert.equal((JSON.parse(f.recordBytes()) as DiskRecord).last_request_id, `control ${code}`);
+  }
+});
+
+test("F-19 (SpawnLedger.saveRecord, atrium's in-process writer): an ordinary adopted checkpoint still WRITES; a REBIND under a transient lease errno is the retried refusal (F-6 on this writer too)", async () => {
+  const f = adoptedAgentPod({ controlPod: true });
+  const ledger = new SpawnLedger();
+  try {
+    for (const code of LEASE_ERRNOS) {
+      await withReadFailure(LEASE_NAME(), code, async () => {
+        ledger.saveRecord({ ...f.record, last_request_id: `in-process ${code}` });
+      });
+      assert.equal(
+        (JSON.parse(f.recordBytes()) as DiskRecord).last_request_id,
+        `in-process ${code}`,
+      );
+    }
+    const rebound = {
+      ...(JSON.parse(f.recordBytes()) as DiskRecord),
+      acp_session_id: "fresh-after-resume-miss",
+    };
+    const before = f.recordBytes();
+    for (const code of TRANSIENT) {
+      await withReadFailure(LEASE_NAME(), code, async () => {
+        assert.throws(() => ledger.saveRecord(rebound), refusedWith("spawn-state-missing"), code);
+      });
+    }
+    assert.equal(f.recordBytes(), before);
+    // a permanent errno on a rebind keeps its old meaning; with no failure and the lease held, it lands
+    await withReadFailure(LEASE_NAME(), "EACCES", async () => {
+      assert.throws(() => ledger.saveRecord(rebound), refusedWith("record-ownership"));
+    });
+    holdOwnLease();
+    ledger.saveRecord(rebound);
+    assert.equal(
+      (JSON.parse(f.recordBytes()) as DiskRecord).acp_session_id,
+      "fresh-after-resume-miss",
+    );
+  } finally {
+    ledger.close();
+  }
 });
