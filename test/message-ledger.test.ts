@@ -23,6 +23,7 @@ import {
 import { textPrompt } from "../src/prompt-content.js";
 import { sessionBaseDir } from "../src/session/persistence.js";
 import { withTempHome } from "./runtime-test-helpers.js";
+import { removeTempHome } from "./temp-home.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -649,7 +650,7 @@ async function asLedgerPod<T>(
         process.env[name] = value;
       }
     }
-    await fs.rm(root, { recursive: true, force: true });
+    await removeTempHome(root);
   }
 }
 

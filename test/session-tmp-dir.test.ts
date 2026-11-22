@@ -20,6 +20,7 @@ import {
   sessionTmpDirFor,
 } from "../src/acp/session-tmp-dir.js";
 import { setPodLockDepsForTests } from "../src/session/persistence/identity-file-lock.js";
+import { removeTempHome } from "./temp-home.js";
 
 function withScopedRoot<T>(fn: (root: string) => T): T {
   const root = mkdtempSync(join(tmpdir(), "acpx-session-tmp-dir-test-"));
@@ -132,7 +133,7 @@ async function asPlace<T>(
         process.env[name] = value;
       }
     }
-    rmSync(home, { recursive: true, force: true });
+    await removeTempHome(home);
   }
 }
 
