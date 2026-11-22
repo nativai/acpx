@@ -10,7 +10,16 @@ import {
 import { queueLockFilePath } from "../src/cli/queue/paths.js";
 import { recordPodEnd } from "../src/pod/pod-end.js";
 import { parseSessionRecord } from "../src/session/persistence.js";
-import { startFakeApi } from "./pod-lock-fake-api.js";
+import {
+  bare404,
+  clearNodes,
+  clearPods,
+  failWith,
+  putNode,
+  putPod,
+  requestLines,
+  startKitApi,
+} from "./pod-kit-api-helpers.js";
 import { makeWorld, withEnv, worldEnv } from "./pod-owner-helpers.js";
 import {
   makeSessionRecord,
@@ -88,10 +97,10 @@ test("recordPodEnd never throws and invents no record: a missing session is no w
 
 test("end to end: the control pod proves an OOMKilled pod gone, reaps its lease, and the record names OOMKilled", async () => {
   const owner = makeWorld("podend-e2e");
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
     await writeRecord(owner.home);
-    api.state.pods.set(owner.pod.name, {
+    putPod(api, owner.pod.name, {
       uid: owner.pod.uid,
       phase: "Failed",
       containerStatuses: [
@@ -134,10 +143,10 @@ test("end to end: the control pod proves an OOMKilled pod gone, reaps its lease,
 
 test("negative: an unknown proof reaps nothing and records nothing", async () => {
   const owner = makeWorld("podend-unknown");
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
     await writeRecord(owner.home);
-    api.state.failure = "500";
+    failWith(api, "500");
     await withEnv(worldEnv(owner, { place: "agent-pod", podMode: true }), async () => {
       assert(await tryAcquireQueueOwnerLease(SESSION));
       const file = queueLockFilePath(SESSION);
@@ -173,10 +182,10 @@ test("negative: an unknown proof reaps nothing and records nothing", async () =>
 for (const verb of ["recover", "close"] as const) {
   test(`F1: ${verb} reaps a proven-gone OOMKilled pod's lease and the record names OOMKilled`, async () => {
     const owner = makeWorld(`podend-${verb}`);
-    const api = await startFakeApi("dev-kit");
+    const api = await startKitApi("dev-kit");
     try {
       await writeRecord(owner.home);
-      api.state.pods.set(owner.pod.name, {
+      putPod(api, owner.pod.name, {
         uid: owner.pod.uid,
         phase: "Failed",
         containerStatuses: [

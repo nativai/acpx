@@ -21,7 +21,9 @@ import {
 } from "../src/pod/routed-branches.js";
 import { agentPodKey, type RoutedCallOptions } from "../src/pod/routed-call.js";
 import { refuseRoutedTwice, ROUTED_TWICE_REFUSAL } from "../src/pod/routed-twice.js";
-import { startBroker } from "./pod-local-fake-broker.js";
+import { startFakeApiServer, type ApiScript, type PodSeed } from "./pod-kit/fake-apiserver.js";
+import { startFakeBroker, type BrokerScript } from "./pod-kit/fake-broker.js";
+import { rawHttp } from "./pod-raw-http.js";
 import { makeSessionRecord, writeSessionRecordFile } from "./runtime-test-helpers.js";
 
 // A6.1 — the routed-ensure / routed-if-pod branches (C1.2) on A1's placement step: unit rows with
@@ -381,32 +383,6 @@ test("routedArgv: the same normalization as cli.ts (a lifecycle `--` is dropped)
 
 // ───────────────────────── the pod lookup against a fake API server (C3.3) ─────────────────────────
 
-type ApiScript = { status?: number; items?: unknown[]; raw?: string; hang?: boolean };
-
-async function startApi(
-  script: ApiScript,
-): Promise<{ url: string; seen: string[]; close(): void }> {
-  const seen: string[] = [];
-  const server = http.createServer((req, res) => {
-    seen.push(`${req.method} ${req.url} auth=${req.headers.authorization ?? ""}`);
-    if (script.hang) {
-      return;
-    }
-    res.writeHead(script.status ?? 200, { "content-type": "application/json" });
-    res.end(script.raw ?? JSON.stringify({ kind: "PodList", items: script.items ?? [] }));
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const { port } = server.address() as AddressInfo;
-  return {
-    url: `http://127.0.0.1:${port}`,
-    seen,
-    close: () => {
-      server.closeAllConnections();
-      server.close();
-    },
-  };
-}
-
 function saFixture(): string {
   const dir = fs.mkdtempSync(path.join(ROOT, "sa-"));
   fs.writeFileSync(path.join(dir, "namespace"), "dev-devbox\n");
@@ -414,23 +390,26 @@ function saFixture(): string {
   return dir;
 }
 
-const POD = (over: Record<string, unknown> = {}, statusOver: Record<string, unknown> = {}) => ({
-  metadata: { uid: UID, name: `ag-${KEY}-abcde` },
-  status: {
-    phase: "Running",
-    podIP: "10.9.8.7",
-    conditions: [{ type: "Ready", status: "True", lastTransitionTime: "2026-11-21T12:00:00Z" }],
-    ...statusOver,
-  },
+/** The pod the kit's API server shows for `KEY` (it filters by the session-key label, as the real API does). */
+const readyPod = (over: Partial<PodSeed> = {}): PodSeed => ({
+  name: `ag-${KEY}-abcde`,
+  uid: UID,
+  podIP: "10.9.8.7",
+  readyTransitionTime: "2026-11-21T12:00:00Z",
+  labels: { "workbench.nativai.de/session-key": KEY },
   ...over,
 });
+
+/** The kit's API server for the lookup rows: namespace `dev-devbox`, the token the service-account fixture holds. */
+const kitApi = (script: ApiScript = {}) =>
+  startFakeApiServer({ namespace: "dev-devbox", token: "tok-1", ...script });
 
 function lookupEnv(url: string, sa: string): NodeJS.ProcessEnv {
   return { NODE_TEST_CONTEXT: "child", ACPX_POD_API_URL: url, ACPX_POD_SA_DIR: sa };
 }
 
 test("lookup: a Ready pod → exists{ready, readyAtMs from the Ready condition, ip}; the key's label is the selector, the token is sent", async () => {
-  const api = await startApi({ items: [POD()] });
+  const api = await kitApi({ pods: [readyPod()] });
   try {
     const answer = await createAgentPodLookup(lookupEnv(api.url, saFixture()))(KEY);
     assert.deepEqual(answer, {
@@ -440,41 +419,42 @@ test("lookup: a Ready pod → exists{ready, readyAtMs from the Ready condition, 
       readyAtMs: Date.parse("2026-11-21T12:00:00Z"),
       ip: "10.9.8.7",
     });
+    const [request] = api.requests;
+    assert.equal(request?.method, "GET");
+    assert.equal(request?.path, "/api/v1/namespaces/dev-devbox/pods");
     assert.match(
-      api.seen[0] ?? "",
-      /^GET \/api\/v1\/namespaces\/dev-devbox\/pods\?labelSelector=workbench\.nativai\.de%2Fsession-key%3D[0-9a-f]{24} auth=Bearer tok-1$/,
+      request?.query ?? "",
+      /^labelSelector=workbench\.nativai\.de%2Fsession-key%3D[0-9a-f]{24}$/,
     );
+    assert.equal(request?.headers.authorization, "Bearer tok-1");
   } finally {
-    api.close();
+    await api.close();
   }
 });
 
 test("lookup: not Ready, terminating, terminal, several — each says what it is", async () => {
-  const notReady = POD({}, { conditions: [{ type: "Ready", status: "False" }] });
-  const terminating = POD({ metadata: { uid: UID, deletionTimestamp: "2026-11-21T12:01:00Z" } });
-  const terminal = POD({}, { phase: "Succeeded" });
-  const cases: Array<[unknown[], string, boolean?]> = [
+  const OTHER_UID = "44444444-4444-4444-8444-444444444444";
+  const notReady = readyPod({ ready: "False" });
+  const terminating = readyPod({ deleting: true });
+  const terminal = readyPod({ phase: "Succeeded" });
+  const cases: Array<[PodSeed[], string, boolean?]> = [
     [[notReady], "exists", false],
     [[terminating], "exists", false],
     [[terminal], "absent"],
     [[], "absent"],
     // A terminating pod beside its Ready successor: the Ready one wins.
-    [
-      [terminating, POD({ metadata: { uid: "44444444-4444-4444-8444-444444444444" } })],
-      "exists",
-      true,
-    ],
+    [[terminating, readyPod({ name: `ag-${KEY}-fghij`, uid: OTHER_UID })], "exists", true],
   ];
-  for (const [items, state, ready] of cases) {
-    const api = await startApi({ items });
+  for (const [pods, state, ready] of cases) {
+    const api = await kitApi({ pods });
     try {
       const answer = await createAgentPodLookup(lookupEnv(api.url, saFixture()))(KEY);
-      assert.equal(answer.state, state, JSON.stringify(items));
+      assert.equal(answer.state, state, JSON.stringify(pods));
       if (answer.state === "exists") {
         assert.equal(answer.ready, ready);
       }
     } finally {
-      api.close();
+      await api.close();
     }
   }
   assert.equal(podFacts({ status: {} }), undefined, "an object with no uid is not a pod");
@@ -482,23 +462,21 @@ test("lookup: not Ready, terminating, terminal, several — each says what it is
 
 test("lookup NEGATIVES — any failure is `unknown`, NEVER `absent` (an API outage must not send a prompt to the broker as if the pod were gone)", async () => {
   const sa = saFixture();
-  const scripts: ApiScript[] = [
-    { status: 500, raw: "{}" },
-    { status: 403, raw: JSON.stringify({ kind: "Status", status: "Failure" }) },
-    { status: 200, raw: "not json" },
-    { status: 200, raw: JSON.stringify({ kind: "PodList" }) }, // 200 but no items list
-    { status: 200, raw: JSON.stringify({ items: "nope" }) },
-    // A5 round 1 (death-proof's 404 rule): a 404 — even a well-formed Status NotFound — is never `absent`
+  const faults: ApiScript[] = [
+    { faults: [{ mode: "status", status: 500 }] },
+    { faults: [{ mode: "status", status: 403 }] },
+    { faults: [{ mode: "status", status: 429 }] },
+    { faults: [{ mode: "malformed" }] }, // 200, not JSON
+    // A5 round 1 (death-proof's 404 rule): a 404 — in every wrong shape the kit models — is never `absent`
     // for a LIST (only a 200 with an items list can say so); a proxy answering 404 to every path would
     // otherwise send every prompt to the broker.
-    {
-      status: 404,
-      raw: JSON.stringify({ kind: "Status", reason: "NotFound", details: { kind: "pods" } }),
-    },
-    { status: 404, raw: "404 page not found" },
+    ...(["text", "empty", "other_reason", "other_name", "other_kind"] as const).map(
+      (variant): ApiScript => ({ faults: [{ mode: "notfound", variant }] }),
+    ),
+    { faults: [{ mode: "reset" }] },
   ];
-  for (const script of scripts) {
-    const api = await startApi(script);
+  for (const script of faults) {
+    const api = await kitApi(script);
     try {
       assert.equal(
         (await createAgentPodLookup(lookupEnv(api.url, sa))(KEY)).state,
@@ -506,36 +484,48 @@ test("lookup NEGATIVES — any failure is `unknown`, NEVER `absent` (an API outa
         JSON.stringify(script),
       );
     } finally {
+      await api.close();
+    }
+  }
+  // KIT GAP 5: a 200 whose body is no pod list (no `items`, or `items` not a list) — the kit's list is always well-formed.
+  for (const raw of [JSON.stringify({ kind: "PodList" }), JSON.stringify({ items: "nope" })]) {
+    const api = await rawHttp((_request, response) => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(raw);
+    });
+    try {
+      assert.equal((await createAgentPodLookup(lookupEnv(api.url, sa))(KEY)).state, "unknown", raw);
+    } finally {
       api.close();
     }
   }
   // Connection refused.
-  const dead = await startApi({});
+  const dead = await kitApi();
   const url = dead.url;
-  dead.close();
+  await dead.close();
   assert.equal((await createAgentPodLookup(lookupEnv(url, sa))(KEY)).state, "unknown");
   // No credentials / no namespace / a key that is not a key.
   const noToken = fs.mkdtempSync(path.join(ROOT, "sa-empty-"));
   assert.equal((await createAgentPodLookup(lookupEnv(url, noToken))(KEY)).state, "unknown");
-  const live = await startApi({ items: [] });
+  const live = await kitApi({ pods: [] });
   try {
     assert.equal((await createAgentPodLookup(lookupEnv(live.url, sa))("../x")).state, "unknown");
-    assert.equal(live.seen.length, 0, "a bad key is never sent");
+    assert.equal(live.requests.length, 0, "a bad key is never sent");
     // The control: the same server with a good key says `absent` — so `unknown` above was not a blanket.
     assert.equal((await createAgentPodLookup(lookupEnv(live.url, sa))(KEY)).state, "absent");
   } finally {
-    live.close();
+    await live.close();
   }
 });
 
 test("lookup: the API address seam is honoured only under node --test (production reads the in-pod service)", async () => {
-  const api = await startApi({ items: [] });
+  const api = await kitApi({ pods: [] });
   try {
     const env = { ACPX_POD_API_URL: api.url, ACPX_POD_SA_DIR: saFixture() }; // no NODE_TEST_CONTEXT
     assert.equal((await createAgentPodLookup(env)(KEY)).state, "unknown");
-    assert.equal(api.seen.length, 0);
+    assert.equal(api.requests.length, 0);
   } finally {
-    api.close();
+    await api.close();
   }
 });
 
@@ -559,7 +549,7 @@ type Pod = {
   home: string;
   env: NodeJS.ProcessEnv;
   calls(): Array<{ argv: string[]; payload?: string; env: Record<string, string> }>;
-  closeAll(): void;
+  closeAll(): Promise<void>;
   brokerSeen: () => number;
   brokerBodies: () => Array<Record<string, unknown>>;
 };
@@ -567,8 +557,9 @@ type Pod = {
 async function podFixture(opts: {
   /** The record's agent command (default: the Claude SDK adapter). */
   command?: string;
+  /** The kit API server's script: the pods it shows and its faults. */
   api: ApiScript;
-  broker?: Parameters<typeof startBroker>[0];
+  broker?: BrokerScript;
   stub?: { exit?: number; stdout?: string };
 }): Promise<Pod> {
   const home = fs.mkdtempSync(path.join(ROOT, "home-"));
@@ -588,8 +579,8 @@ async function podFixture(opts: {
     fs.mkdirSync(path.join(runtime, ".releases", tool, "r"), { recursive: true });
     fs.symlinkSync(`.releases/${tool}/r`, path.join(runtime, tool));
   }
-  const api = await startApi(opts.api);
-  const broker = await startBroker(opts.broker ?? { lines: [] });
+  const api = await kitApi(opts.api);
+  const broker = await startFakeBroker(opts.broker ?? {});
   await writeSessionRecordFile(
     home,
     makeSessionRecord({
@@ -610,7 +601,7 @@ async function podFixture(opts: {
     NV_NODE_NAME: "node-a",
     ACPX_POD_SA_DIR: saFixture(),
     ACPX_POD_API_URL: api.url,
-    NV_AGENT_BROKER_URL: broker.origin,
+    NV_AGENT_BROKER_URL: broker.url,
     ACPX_AGENT_EXEC: path.join(stubDir, "agent-exec"),
     ACPX_TEST_RUNTIME_DIR: runtime,
   };
@@ -643,15 +634,15 @@ async function podFixture(opts: {
             )
         : [];
     },
-    closeAll: () => {
-      api.close();
-      broker.close();
+    closeAll: async () => {
+      await api.close();
+      await broker.close();
     },
-    brokerSeen: () => broker.seen.length,
+    brokerSeen: () => broker.requests.length,
     brokerBodies: () =>
-      broker.seen
+      broker.requests
         .filter((r) => r.method === "POST")
-        .map((r) => JSON.parse(r.body) as Record<string, unknown>),
+        .map((r) => (r.body ?? {}) as Record<string, unknown>),
   };
 }
 
@@ -677,8 +668,8 @@ const READY = `ready ip=10.1.2.3 pod=ag-${KEY}-abcde uid=${UID} node=n1 placemen
 
 test("CLI pod mode: a prompt with no pod → the broker is asked, the call goes to the broker's uid and IP; the pod command's exit code is the CLI's", async () => {
   const pod = await podFixture({
-    api: { items: [] },
-    broker: { lines: ["scheduling", READY] },
+    api: {},
+    broker: { default: { steps: ["scheduling"], final: READY } },
     stub: { exit: 0, stdout: "queued\n" },
   });
   try {
@@ -702,12 +693,12 @@ test("CLI pod mode: a prompt with no pod → the broker is asked, the call goes 
     assert.equal(call.argv[call.argv.indexOf("--address") + 1], "10.1.2.3");
     assert.equal(call.argv[call.argv.indexOf("--key") + 1], KEY);
   } finally {
-    pod.closeAll();
+    await pod.closeAll();
   }
 });
 
 test("CLI pod mode: a READY pod never touches the broker; `--file -` travels as the payload file", async () => {
-  const pod = await podFixture({ api: { items: [POD()] }, stub: { exit: 0 } });
+  const pod = await podFixture({ api: { pods: [readyPod()] }, stub: { exit: 0 } });
   try {
     const result = await cli(
       ["claude", "prompt", "--session-id", SESSION, "--file", "-"],
@@ -737,12 +728,15 @@ test("CLI pod mode: a READY pod never touches the broker; `--file -` travels as 
     // The payload files are gone once the calls returned.
     assert.deepEqual(fs.readdirSync(path.join(pod.home, ".acpx", "routed")), []);
   } finally {
-    pod.closeAll();
+    await pod.closeAll();
   }
 });
 
 test("CLI pod mode: an API server that does not answer → admission_busy (exit 75), the broker is NOT asked, nothing is sent", async () => {
-  const pod = await podFixture({ api: { status: 500, raw: "{}" }, broker: { lines: [READY] } });
+  const pod = await podFixture({
+    api: { faults: [{ mode: "status", status: 500 }] },
+    broker: { default: { final: READY } },
+  });
   try {
     const result = await cli(["claude", "prompt", "--session-id", SESSION, "hello"], pod.env);
     assert.equal(result.code, 75);
@@ -753,12 +747,15 @@ test("CLI pod mode: an API server that does not answer → admission_busy (exit 
     assert.equal(pod.brokerSeen(), 0);
     assert.equal(pod.calls().length, 0);
   } finally {
-    pod.closeAll();
+    await pod.closeAll();
   }
 });
 
 test("CLI pod mode: the pod is not ready within the wake bound → the first stderr line is the pod_starting token, exit 75", async () => {
-  const pod = await podFixture({ api: { items: [] }, broker: { lines: ["pulling"], stall: true } });
+  const pod = await podFixture({
+    api: {},
+    broker: { default: { steps: ["pulling"], hang: true } },
+  });
   try {
     // The wake bound is 20 s in production; the test seam shortens it for the stalled broker.
     const env = { ...pod.env, ACPX_TEST_WAKE_BOUND_MS: "400" };
@@ -770,13 +767,13 @@ test("CLI pod mode: the pod is not ready within the wake bound → the first std
     );
     assert.equal(pod.calls().length, 0);
   } finally {
-    pod.closeAll();
+    await pod.closeAll();
   }
 });
 
 test("CLI pod mode: owner-if-pod with a pod goes to it (cancel); with NO pod it runs LOCALLY and its exit code and output are the local command's", async () => {
   const withPod = await podFixture({
-    api: { items: [POD()] },
+    api: { pods: [readyPod()] },
     stub: { exit: 0, stdout: "cancelled-in-pod\n" },
   });
   try {
@@ -793,10 +790,10 @@ test("CLI pod mode: owner-if-pod with a pod goes to it (cancel); with NO pod it 
     ]);
     assert.equal(withPod.brokerSeen(), 0, "owner-if-pod never asks the broker");
   } finally {
-    withPod.closeAll();
+    await withPod.closeAll();
   }
   const noPod = await podFixture({
-    api: { items: [] },
+    api: {},
     stub: { exit: 9, stdout: "must-not-run\n" },
   });
   try {
@@ -810,12 +807,12 @@ test("CLI pod mode: owner-if-pod with a pod goes to it (cancel); with NO pod it 
     assert.equal(local.code, reference.code);
     assert.equal(local.stdout, reference.stdout);
   } finally {
-    noPod.closeAll();
+    await noPod.closeAll();
   }
 });
 
 test("CLI pod mode: a session acpx cannot resolve → `ROUTED outcome=not_run reason=target_unresolved`, exit 1, nothing asked", async () => {
-  const pod = await podFixture({ api: { items: [] }, broker: { lines: [READY] } });
+  const pod = await podFixture({ api: {}, broker: { default: { final: READY } } });
   try {
     const result = await cli(
       ["claude", "prompt", "--session-id", "00000000-0000-4000-8000-00000000dead", "hi"],
@@ -829,15 +826,15 @@ test("CLI pod mode: a session acpx cannot resolve → `ROUTED outcome=not_run re
     assert.equal(pod.brokerSeen(), 0);
     assert.equal(pod.calls().length, 0);
   } finally {
-    pod.closeAll();
+    await pod.closeAll();
   }
 });
 
 test("A-39 CLI pod mode: a REAL claude-pty record's prompt gives ROUTED not_run harness_unsupported (exit 1); the broker sees zero requests, nothing reaches a pod", async () => {
   const pod = await podFixture({
     command: "node /opt/claude-pty-acp/dist/index.js",
-    api: { items: [] },
-    broker: { lines: ["scheduling", READY] },
+    api: {},
+    broker: { default: { steps: ["scheduling"], final: READY } },
     stub: { exit: 0, stdout: "must-not-run\n" },
   });
   try {
@@ -852,7 +849,7 @@ test("A-39 CLI pod mode: a REAL claude-pty record's prompt gives ROUTED not_run 
     assert.equal(pod.calls().length, 0);
     assert.equal(result.stdout.includes("must-not-run"), false);
   } finally {
-    pod.closeAll();
+    await pod.closeAll();
   }
 });
 
@@ -864,8 +861,10 @@ test("A-39 CLI pod mode, the controls in the same rig: claude, codex and pi reco
   ]) {
     const pod = await podFixture({
       command,
-      api: { items: [] },
-      broker: { lines: ["scheduling", READY] },
+      api: {},
+      // The kit's home cap is the real broker's default, 0: a home-placed wake (Codex, and Pi before P1 —
+      // A-45) is `home_full` unless the box has a home cap. A rollout fact, named in brick 557fb3e7's report.
+      broker: { default: { steps: ["scheduling"], final: READY }, status: { home: { cap: 5 } } },
       stub: { exit: 0, stdout: "queued\n" },
     });
     try {
@@ -875,7 +874,7 @@ test("A-39 CLI pod mode, the controls in the same rig: claude, codex and pi reco
       assert.equal(pod.brokerSeen(), 1, command);
       assert.equal(pod.calls().length, 1, command);
     } finally {
-      pod.closeAll();
+      await pod.closeAll();
     }
   }
 });
@@ -883,8 +882,8 @@ test("A-39 CLI pod mode, the controls in the same rig: claude, codex and pi reco
 test("A-39 off pod mode: a claude-pty record behaves exactly as today — no harness refusal, no broker, the local path runs", async () => {
   const pod = await podFixture({
     command: "node /opt/claude-pty-acp/dist/index.js",
-    api: { items: [] },
-    broker: { lines: [READY] },
+    api: {},
+    broker: { default: { final: READY } },
   });
   try {
     const off = { ...pod.env };
@@ -896,7 +895,7 @@ test("A-39 off pod mode: a claude-pty record behaves exactly as today — no har
     assert.equal(pod.brokerSeen(), 0);
     assert.equal(pod.calls().length, 0);
   } finally {
-    pod.closeAll();
+    await pod.closeAll();
   }
 });
 
@@ -904,8 +903,10 @@ test("A-45 rows 45.1/45.2 (CLI, pod mode): the wake of a Codex session posts `pl
   const wake = async (command: string, extra: NodeJS.ProcessEnv = {}) => {
     const pod = await podFixture({
       command,
-      api: { items: [] },
-      broker: { lines: ["scheduling", READY] },
+      api: {},
+      // The kit's home cap is the real broker's default, 0: a home-placed wake (Codex, and Pi before P1 —
+      // A-45) is `home_full` unless the box has a home cap. A rollout fact, named in brick 557fb3e7's report.
+      broker: { default: { steps: ["scheduling"], final: READY }, status: { home: { cap: 5 } } },
       stub: { exit: 0, stdout: "queued\n" },
     });
     try {
@@ -918,7 +919,7 @@ test("A-45 rows 45.1/45.2 (CLI, pod mode): the wake of a Codex session posts `pl
       assert.equal(rest.length, 0, command);
       return body?.placement;
     } finally {
-      pod.closeAll();
+      await pod.closeAll();
     }
   };
   assert.equal(await wake("node /opt/codex-acp/dist/index.js"), "home", "45.1");
@@ -936,7 +937,7 @@ test("A-45 rows 45.1/45.2 (CLI, pod mode): the wake of a Codex session posts `pl
 });
 
 test("seams: the release directory and payload directory seams are honoured only under node --test", async () => {
-  const pod = await podFixture({ api: { items: [] }, broker: { lines: [READY] } });
+  const pod = await podFixture({ api: {}, broker: { default: { final: READY } } });
   try {
     const env = { ...pod.env };
     delete env.NODE_TEST_CONTEXT;
@@ -947,12 +948,12 @@ test("seams: the release directory and payload directory seams are honoured only
     assert.equal(pod.calls().length, 0);
     assert.equal(pod.brokerSeen(), 0);
   } finally {
-    pod.closeAll();
+    await pod.closeAll();
   }
 });
 
 test("CLI pod mode: the failure keeps the command's output mode — json: error object on stdout AND the ROUTED line first on stderr; --json-strict: stderr empty", async () => {
-  const pod = await podFixture({ api: { items: [] } });
+  const pod = await podFixture({ api: {} });
   try {
     const target = ["--session-id", "00000000-0000-4000-8000-00000000dead"];
     const json = await cli(["--format", "json", "claude", "prompt", ...target, "hi"], pod.env);
@@ -973,7 +974,7 @@ test("CLI pod mode: the failure keeps the command's output mode — json: error 
     assert.equal(strict.stderr, "");
     assert.ok(JSON.parse(strict.stdout.trim().split("\n")[0] ?? "{}").error);
   } finally {
-    pod.closeAll();
+    await pod.closeAll();
   }
 });
 
@@ -1017,7 +1018,10 @@ test("routed_twice (A-8): a command that arrives ROUTED (ACPX_ROUTED=1) is never
 });
 
 test("CLI pod mode: ACPX_ROUTED=1 → `acpx: REFUSED reason=routed_twice` first line, exit 2, nothing asked, nothing sent", async () => {
-  const pod = await podFixture({ api: { items: [POD()] }, broker: { lines: [READY] } });
+  const pod = await podFixture({
+    api: { pods: [readyPod()] },
+    broker: { default: { final: READY } },
+  });
   try {
     const result = await cli(["claude", "prompt", "--session-id", SESSION, "hello"], {
       ...pod.env,
@@ -1032,14 +1036,14 @@ test("CLI pod mode: ACPX_ROUTED=1 → `acpx: REFUSED reason=routed_twice` first 
     assert.equal(routed.code, 0, routed.stderr);
     assert.equal(pod.calls().length, 1);
   } finally {
-    pod.closeAll();
+    await pod.closeAll();
   }
 });
 
 test("C4 request: sessionUrl (the target's URL on the box's base URL) is sent; `seat` and `sessionId` too", async () => {
   const pod = await podFixture({
-    api: { items: [] },
-    broker: { lines: ["scheduling", READY] },
+    api: {},
+    broker: { default: { steps: ["scheduling"], final: READY } },
     stub: { exit: 0 },
   });
   try {
@@ -1050,7 +1054,7 @@ test("C4 request: sessionUrl (the target's URL on the box's base URL) is sent; `
     assert.equal(body?.sessionUrl, `https://atrium.test.invalid/?session=${SESSION}`);
     assert.equal(body?.sessionId, SESSION);
   } finally {
-    pod.closeAll();
+    await pod.closeAll();
   }
 });
 
@@ -1082,7 +1086,7 @@ test("caller identity (C2): handed to the call exactly when the environment carr
 });
 
 test("CLI pod mode, identity each way: an agent-caused call (identity in the environment) carries it into the pod; a call without it carries none", async () => {
-  const pod = await podFixture({ api: { items: [POD()] }, stub: { exit: 0 } });
+  const pod = await podFixture({ api: { pods: [readyPod()] }, stub: { exit: 0 } });
   try {
     const withIdentity = await cli(["cancel", "--session-id", SESSION], {
       ...pod.env,
@@ -1108,12 +1112,12 @@ test("CLI pod mode, identity each way: an agent-caused call (identity in the env
       assert.equal(name in second.env, false, `${name} must not travel without an agent cause`);
     }
   } finally {
-    pod.closeAll();
+    await pod.closeAll();
   }
 });
 
 test("L-6: routed_twice honours the output mode like A1's refusals — text: both lines on stderr; json: the error object on stdout and line 1 on stderr; json-strict: stderr empty", async () => {
-  const pod = await podFixture({ api: { items: [POD()] } });
+  const pod = await podFixture({ api: { pods: [readyPod()] } });
   try {
     const base = ["claude", "prompt", "--session-id", SESSION, "hello"];
     const env = { ...pod.env, ACPX_ROUTED: "1" };
@@ -1140,12 +1144,12 @@ test("L-6: routed_twice honours the output mode like A1's refusals — text: bot
     }
     assert.equal(pod.calls().length, 0);
   } finally {
-    pod.closeAll();
+    await pod.closeAll();
   }
 });
 
 test("G-1 direct call: an agent calling directly on the control pod (identity in its own environment) sends the identity variables; a caller with none sends none", async () => {
-  const pod = await podFixture({ api: { items: [POD()] }, stub: { exit: 0 } });
+  const pod = await podFixture({ api: { pods: [readyPod()] }, stub: { exit: 0 } });
   try {
     const direct = await cli(["claude", "prompt", "--session-id", SESSION, "hi"], {
       ...pod.env,
@@ -1165,6 +1169,6 @@ test("G-1 direct call: an agent calling directly on the control pod (identity in
       assert.equal(name in second.env, false, name);
     }
   } finally {
-    pod.closeAll();
+    await pod.closeAll();
   }
 });

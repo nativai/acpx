@@ -14,8 +14,17 @@ import { queueLockFilePath, queueSharedSocketDir } from "../src/cli/queue/paths.
 import { LEASE_ROUTED_CONTRACT, leasePodFields, podSocketPath } from "../src/pod/owner-pod.js";
 import { sessionKey } from "../src/pod/placement.js";
 import { ROUTED_CONTRACT_VERSION } from "../src/pod/routed-call.js";
+import {
+  bare404,
+  clearNodes,
+  clearPods,
+  failWith,
+  putNode,
+  putPod,
+  requestLines,
+  startKitApi,
+} from "./pod-kit-api-helpers.js";
 import { makePod } from "./pod-kit/two-pods.js";
-import { startFakeApi } from "./pod-lock-fake-api.js";
 import { makeWorld, withEnv, worldEnv, writePlaceFile } from "./pod-owner-helpers.js";
 
 // Block A4 (brick 30df3a5b), C3.1: the lease's pod fields, the pod-local socket, the judging of a lease
@@ -229,9 +238,9 @@ function readerEnv(
 
 test("control pod, stale heartbeat, the pod exists → alive, and the lease is untouched", async () => {
   const owner = makeWorld("judge-exists");
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
-    api.state.pods.set(owner.pod.name, { uid: owner.pod.uid, phase: "Running" });
+    putPod(api, owner.pod.name, { uid: owner.pod.uid, phase: "Running" });
     await leaseFromPod(owner, "judge-exists-session", STALE);
     await withEnv(readerEnv(owner, "control", api.url), async () => {
       const state = await readQueueOwnerState("judge-exists-session");
@@ -247,9 +256,9 @@ test("control pod, stale heartbeat, the pod exists → alive, and the lease is u
 
 test("control pod, stale heartbeat, the pod is gone (node Ready) → dead_owner by `pod-gone`", async () => {
   const owner = makeWorld("judge-gone");
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
-    api.state.nodes.set(owner.pod.node, "True");
+    putNode(api, owner.pod.node, "True");
     await leaseFromPod(owner, "judge-gone-session", STALE);
     await withEnv(readerEnv(owner, "control", api.url), async () => {
       const state = await readQueueOwnerState("judge-gone-session");
@@ -270,9 +279,9 @@ test("control pod, stale heartbeat, the pod is gone (node Ready) → dead_owner 
 
 test("control pod, a terminal pod → dead_owner, and the OOMKilled reason is read from the pod object", async () => {
   const owner = makeWorld("judge-oom");
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
-    api.state.pods.set(owner.pod.name, {
+    putPod(api, owner.pod.name, {
       uid: owner.pod.uid,
       phase: "Failed",
       containerStatuses: [
@@ -293,9 +302,9 @@ test("control pod, a terminal pod → dead_owner, and the OOMKilled reason is re
 
 test("control pod, the API server answers nothing useful → NOT dead: unknown is alive, the lease stays", async () => {
   const owner = makeWorld("judge-unknown");
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
-    api.state.failure = "500";
+    failWith(api, "500");
     await leaseFromPod(owner, "judge-unknown-session", STALE);
     await withEnv(readerEnv(owner, "control", api.url), async () => {
       const state = await readQueueOwnerState("judge-unknown-session");
@@ -310,9 +319,9 @@ test("control pod, the API server answers nothing useful → NOT dead: unknown i
 
 test("control pod, the pod is gone but its node is NotReady → unknown, not dead (a partitioned node may still run it)", async () => {
   const owner = makeWorld("judge-notready");
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
-    api.state.nodes.set(owner.pod.node, "False");
+    putNode(api, owner.pod.node, "False");
     await leaseFromPod(owner, "judge-notready-session", STALE);
     await withEnv(readerEnv(owner, "control", api.url), async () => {
       const state = await readQueueOwnerState("judge-notready-session");
@@ -326,10 +335,10 @@ test("control pod, the pod is gone but its node is NotReady → unknown, not dea
 
 test("a lease whose pod uid is not the uid of the pod now under that name is dead (a replaced pod)", async () => {
   const owner = makeWorld("judge-replaced");
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
-    api.state.nodes.set(owner.pod.node, "True");
-    api.state.pods.set(owner.pod.name, {
+    putNode(api, owner.pod.node, "True");
+    putPod(api, owner.pod.name, {
       uid: "00000000-0000-4000-8000-000000000000",
       phase: "Running",
     });
@@ -344,13 +353,13 @@ test("a lease whose pod uid is not the uid of the pod now under that name is dea
 
 test("a fresh heartbeat is alive and asks the API server nothing", async () => {
   const owner = makeWorld("judge-fresh");
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
     await leaseFromPod(owner, "judge-fresh-session");
     await withEnv(readerEnv(owner, "control", api.url), async () => {
       const state = await readQueueOwnerState("judge-fresh-session");
       assert.equal(state.alive, true);
-      assert.deepEqual(api.state.requests, []);
+      assert.deepEqual(requestLines(api), []);
     });
   } finally {
     await api.close();
@@ -359,15 +368,15 @@ test("a fresh heartbeat is alive and asks the API server nothing", async () => {
 
 test("negative: an agent pod reading ANOTHER pod's stale lease never asks the API server and never calls it dead", async () => {
   const owner = makeWorld("judge-other");
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
-    api.state.nodes.set(owner.pod.node, "True"); // were it asked, the answer would be `gone`
+    putNode(api, owner.pod.node, "True"); // were it asked, the answer would be `gone`
     await leaseFromPod(owner, "judge-other-session", STALE);
     await withEnv(readerEnv(owner, "other-pod", api.url), async () => {
       const state = await readQueueOwnerState("judge-other-session");
       assert.equal(state.state, "foreign_owner");
       assert.equal(state.alive, null);
-      assert.deepEqual(api.state.requests, [], "an agent pod never asks about a lease holder");
+      assert.deepEqual(requestLines(api), [], "an agent pod never asks about a lease holder");
     });
   } finally {
     await api.close();
@@ -376,14 +385,14 @@ test("negative: an agent pod reading ANOTHER pod's stale lease never asks the AP
 
 test("a lease naming THIS pod is judged by pid, as today — never by the API server", async () => {
   const owner = makeWorld("judge-own");
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
     await leaseFromPod(owner, "judge-own-session", STALE);
     const env = worldEnv(owner, { place: "agent-pod", podMode: true });
     await withEnv({ ...env, ACPX_POD_API_URL: api.url }, async () => {
       const state = await readQueueOwnerState("judge-own-session");
       assert.equal(state.scope, "local");
-      assert.deepEqual(api.state.requests, []);
+      assert.deepEqual(requestLines(api), []);
     });
   } finally {
     await api.close();
@@ -421,7 +430,7 @@ function replacementEnv(
 
 test("R2-F3: production name shape — while the predecessor's heartbeat is FRESH the replacement waits, and nothing is reaped, asked or written", async () => {
   const { old, replacement } = await replacementWorlds();
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
     await leaseFromPod(old, "replace-session"); // fresh, naming ag-<key>-old12
     const file = await withEnv({ ACPX_STATE_HOME: old.home }, () =>
@@ -440,7 +449,7 @@ test("R2-F3: production name shape — while the predecessor's heartbeat is FRES
         "the predecessor's lease is byte-identical",
       );
       assert.deepEqual(
-        api.state.requests,
+        requestLines(api),
         [],
         "an agent pod never asks the API about a lease holder",
       );
@@ -452,10 +461,10 @@ test("R2-F3: production name shape — while the predecessor's heartbeat is FRES
 
 test("R2-F3: production name shape — a STALE predecessor is still not reaped by the replacement itself (stale without proof is alive, C3.1); the control pod's proof frees the lease and the replacement then takes it", async () => {
   const { old, replacement } = await replacementWorlds();
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
     // The old pod is still Terminating with a live owner: it exists, so no proof of death.
-    api.state.pods.set(old.pod.name, { uid: old.pod.uid, phase: "Running" });
+    putPod(api, old.pod.name, { uid: old.pod.uid, phase: "Running" });
     await leaseFromPod(old, "replace-session", STALE);
     const file = await withEnv({ ACPX_STATE_HOME: old.home }, () =>
       queueLockFilePath("replace-session"),
@@ -469,11 +478,11 @@ test("R2-F3: production name shape — a STALE predecessor is still not reaped b
         true,
         "no second owner can start beside a possibly live one",
       );
-      assert.deepEqual(api.state.requests, []);
+      assert.deepEqual(requestLines(api), []);
     });
     // The control pod proves the old pod gone (and its node Ready): it reaps; the replacement takes over.
-    api.state.pods.clear();
-    api.state.nodes.set(old.pod.node, "True");
+    clearPods(api);
+    putNode(api, old.pod.node, "True");
     await withEnv(readerEnv(old, "control", api.url), async () => {
       assert.equal(await readQueueOwnerStatus("replace-session"), undefined, "reaped on proof");
     });
@@ -511,12 +520,12 @@ test("R2-F3 negatives: another key's pod is foreign, this pod's own lease is jud
     assert.equal(state.scope, "local", "same uid: this pod's own lease, judged by pid");
   });
   const old = makeWorld("replace-ctl", { podName: `ag-${KEY}-old12` });
-  const api = await startFakeApi("dev-kit");
+  const api = await startKitApi("dev-kit");
   try {
     await leaseFromPod(old, "replace-ctl-session");
     await withEnv(readerEnv(old, "control", api.url), async () => {
       assert.equal((await readQueueOwnerState("replace-ctl-session")).alive, true);
-      assert.deepEqual(api.state.requests, []);
+      assert.deepEqual(requestLines(api), []);
     });
   } finally {
     await api.close();

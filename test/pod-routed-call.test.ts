@@ -29,7 +29,8 @@ import {
   type RoutedClass,
 } from "../src/pod/routed-call.js";
 import { OPTIONAL_RELEASE_TOOLS } from "./pod-kit/fake-broker.js";
-import { startBroker } from "./pod-local-fake-broker.js";
+import { RELEASE_TOOLS, startFakeBroker } from "./pod-kit/fake-broker.js";
+import { rawHttp } from "./pod-raw-http.js";
 
 // A6.0 — the routed call, caller side (C2, C4 caller, C7.2 lines), against a STUB transport that
 // implements exactly the agent-exec CLI of reports/TRANSPORT-INTERFACE.md with scripted outcomes.
@@ -41,6 +42,10 @@ const UID = "33333333-3333-4333-8333-333333333333";
 const KEY = agentPodKey(SESSION);
 const READY = `ready ip=10.1.2.3 pod=ag-${KEY} uid=${UID} node=n1 placement=pool`;
 const TMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "a6-routed-"));
+/** A `releases` the real broker accepts: every tool C9 names (the kit judges the body as `broker.py` does). */
+const FULL_RELEASES: Record<string, string> = Object.fromEntries(
+  RELEASE_TOOLS.map((tool) => [tool, "rel-1"]),
+);
 
 type StubScript = {
   exit?: number;
@@ -650,7 +655,7 @@ test("agent_unreachable with no Ready time known (a pod that already existed, AP
 test("agent_unreachable: the bound is counted from the API server's Ready time (A-1), never from the broker's `ready` line", async () => {
   // The broker's ready line is fresh (this call saw it), but the API server says the pod became Ready
   // two minutes ago: past the bound, so not_run — the broker line does not extend it.
-  const broker = await startBroker({ lines: ["scheduling", READY] });
+  const broker = await startFakeBroker({ default: { steps: ["scheduling"], final: READY } });
   try {
     let asked = 0;
     const lookup: AgentPodLookup = async () =>
@@ -658,15 +663,15 @@ test("agent_unreachable: the bound is counted from the API server's Ready time (
         ? { state: "absent" }
         : { state: "exists", uid: UID, ready: true, readyAtMs: Date.now() - 120_000 };
     const stub = makeStub(UNREACHABLE);
-    const options = ensureOptions(stub, broker.origin, { lookup });
+    const options = ensureOptions(stub, broker.url, { lookup });
     const error = await expectRouted(runRoutedCall(options));
     assert.equal(error.reason, "agent_unreachable");
     assert.equal(asked, 2, "the pod's Ready time was read from the API server after the refusal");
   } finally {
-    broker.close();
+    await broker.close();
   }
   // And inside the bound by the API server's time → held as pod_starting phase=starting.
-  const broker2 = await startBroker({ lines: [READY] });
+  const broker2 = await startFakeBroker({ default: { final: READY } });
   try {
     let asked = 0;
     const lookup: AgentPodLookup = async () =>
@@ -674,11 +679,11 @@ test("agent_unreachable: the bound is counted from the API server's Ready time (
         ? { state: "absent" }
         : { state: "exists", uid: UID, ready: true, readyAtMs: Date.now() - 5_000 };
     const refusal = await expectRefusal(
-      runRoutedCall(ensureOptions(makeStub(UNREACHABLE), broker2.origin, { lookup })),
+      runRoutedCall(ensureOptions(makeStub(UNREACHABLE), broker2.url, { lookup })),
     );
     assert.match(refusal.stderrLine, /reason=pod_starting .* phase=starting wake=/);
   } finally {
-    broker2.close();
+    await broker2.close();
   }
 });
 
@@ -717,7 +722,7 @@ function ensureOptions(stub: Stub, origin: string, overrides: Partial<RoutedCall
   return baseOptions(stub, {
     class: "owner-ensure" as RoutedClass,
     lookup: ABSENT,
-    releases: { ok: true, releases: { acpx: "rel-1", pi: "rel-2" } },
+    releases: { ok: true, releases: FULL_RELEASES },
     broker: { origin },
     argv: ["prompt", "--file", "-"],
     ...overrides,
@@ -732,16 +737,16 @@ function oneShotOptions(stub: Stub, overrides: Partial<RoutedCallOptions> = {}) 
     target: { sessionId: "", seat: "", harness: "utility" },
     deadlineMs: 5_000,
     argv: ["acpx", "exec", "hello"],
-    releases: { ok: true, releases: { acpx: "rel-1", pi: "rel-2" } },
+    releases: { ok: true, releases: FULL_RELEASES },
     ...overrides,
   });
 }
 
 test("owner-ensure: no pod → the broker is asked (C4 body incl. releases), then the call goes to the uid the broker named", async () => {
-  const broker = await startBroker({ lines: ["scheduling", READY] });
+  const broker = await startFakeBroker({ default: { steps: ["scheduling"], final: READY } });
   try {
     const stub = makeStub({ exit: 0 });
-    const options = ensureOptions(stub, broker.origin, {
+    const options = ensureOptions(stub, broker.url, {
       target: {
         sessionId: SESSION,
         seat: SEAT,
@@ -752,7 +757,7 @@ test("owner-ensure: no pod → the broker is asked (C4 body incl. releases), the
       },
     });
     assert.equal((await runRoutedCall(options)).kind, "completed");
-    const body = JSON.parse(broker.seen[0]?.body ?? "{}") as Record<string, unknown>;
+    const body = broker.requests[0]?.body ?? {};
     assert.deepEqual(body, {
       contract: 1,
       sessionId: SESSION,
@@ -760,7 +765,7 @@ test("owner-ensure: no pod → the broker is asked (C4 body incl. releases), the
       harness: "pi",
       placement: "auto",
       class: "spawn",
-      releases: { acpx: "rel-1", pi: "rel-2" },
+      releases: FULL_RELEASES,
       sessionUrl: "https://h/?session=1",
       brick: "b1",
     });
@@ -769,46 +774,46 @@ test("owner-ensure: no pod → the broker is asked (C4 body incl. releases), the
     const delta = Number(flag(call, "--deadline-ms")) - Date.now();
     assert.ok(delta > 40_000 && delta <= OWNER_ENSURE_DEADLINE_MS);
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
 
 test("owner-ensure: a READY pod never touches the broker (C4: asked only when the API server shows no pod)", async () => {
-  const broker = await startBroker({ lines: [READY] });
+  const broker = await startFakeBroker({ default: { final: READY } });
   try {
     const stub = makeStub();
-    await runRoutedCall(ensureOptions(stub, broker.origin, { lookup: PRESENT }));
-    assert.equal(broker.seen.length, 0);
+    await runRoutedCall(ensureOptions(stub, broker.url, { lookup: PRESENT }));
+    assert.equal(broker.requests.length, 0);
     assert.equal(stub.calls().length, 1);
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
 
 test("owner-ensure: an API server that does not answer → admission_busy, nothing asked, nothing sent", async () => {
-  const broker = await startBroker({ lines: [READY] });
+  const broker = await startFakeBroker({ default: { final: READY } });
   try {
     const stub = makeStub();
     const refusal = await expectRefusal(
       runRoutedCall(
-        ensureOptions(stub, broker.origin, { lookup: async () => ({ state: "unknown" }) }),
+        ensureOptions(stub, broker.url, { lookup: async () => ({ state: "unknown" }) }),
       ),
     );
     assert.match(
       refusal.stderrLine,
       /^acpx: REFUSED reason=admission_busy nothing_started=true protocol=1 /,
     );
-    assert.equal(broker.seen.length, 0);
+    assert.equal(broker.requests.length, 0);
     assert.equal(stub.calls().length, 0);
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
 
 test("owner-ensure: a broker that does not answer → admission_busy; nothing sent", async () => {
-  const dead = await startBroker({});
-  const origin = dead.origin;
-  dead.close();
+  const dead = await startFakeBroker({});
+  const origin = dead.url;
+  await dead.close();
   const stub = makeStub();
   const refusal = await expectRefusal(runRoutedCall(ensureOptions(stub, origin)));
   assert.match(refusal.stderrLine, /reason=admission_busy/);
@@ -823,13 +828,13 @@ test("owner-ensure: the pod is not ready within the wake bound → pod_starting 
     ["scaling-up", 60],
   ];
   for (const [phase, retry] of phases) {
-    const broker = await startBroker({ lines: [phase], stall: true });
+    const broker = await startFakeBroker({ default: { steps: [phase], hang: true } });
     try {
       const stub = makeStub();
       const refusal = await expectRefusal(
         runRoutedCall(
-          ensureOptions(stub, broker.origin, {
-            broker: { origin: broker.origin, wakeBoundMs: 1000 },
+          ensureOptions(stub, broker.url, {
+            broker: { origin: broker.url, wakeBoundMs: 1000 },
           }),
         ),
       );
@@ -840,25 +845,25 @@ test("owner-ensure: the pod is not ready within the wake bound → pod_starting 
       assert.equal(exitCodeForOutputErrorCode(normalizeOutputError(refusal).code), 75);
       assert.equal(stub.calls().length, 0, "nothing sent to a pod that is not ready");
     } finally {
-      broker.close();
+      await broker.close();
     }
   }
 });
 
 test("owner-ensure: the bound before any step → pod_starting phase=scheduling", async () => {
-  const broker = await startBroker({ lines: [], stall: true });
+  const broker = await startFakeBroker({ default: { hang: true } });
   try {
     const stub = makeStub();
     const refusal = await expectRefusal(
       runRoutedCall(
-        ensureOptions(stub, broker.origin, {
-          broker: { origin: broker.origin, wakeBoundMs: 1000 },
+        ensureOptions(stub, broker.url, {
+          broker: { origin: broker.url, wakeBoundMs: 1000 },
         }),
       ),
     );
     assert.match(refusal.stderrLine, /phase=scheduling wake=/);
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
 
@@ -869,10 +874,12 @@ test("owner-ensure: refused by the broker → agent_cap with live/cap/box/why, r
     ["home_full", "home_full"],
   ];
   for (const [reason, why] of cases) {
-    const broker = await startBroker({ lines: [`refused reason=${reason} live=99 cap=100`] });
+    const broker = await startFakeBroker({
+      default: { final: `refused reason=${reason} live=99 cap=100` },
+    });
     try {
       const stub = makeStub();
-      const refusal = await expectRefusal(runRoutedCall(ensureOptions(stub, broker.origin)));
+      const refusal = await expectRefusal(runRoutedCall(ensureOptions(stub, broker.url)));
       assert.match(
         refusal.stderrLine,
         new RegExp(
@@ -881,7 +888,7 @@ test("owner-ensure: refused by the broker → agent_cap with live/cap/box/why, r
       );
       assert.equal(stub.calls().length, 0);
     } finally {
-      broker.close();
+      await broker.close();
     }
   }
 });
@@ -895,17 +902,23 @@ test("owner-ensure: the bound with the pool at its maximum → agent_cap why=poo
     home: { live: 0, cap: 4 },
     pool: { state: "at-max" },
   };
-  const broker = await startBroker({
-    lines: ["scaling-up", "pool-at-maximum"],
-    stall: true,
-    agents,
+  const broker = await startFakeBroker({
+    default: { steps: ["scaling-up", "pool-at-maximum"], hang: true },
+    status: {
+      live: agents.live,
+      cap: agents.cap,
+      reserve: agents.reserve,
+      quota: agents.quota,
+      home: agents.home,
+      pool: agents.pool,
+    },
   });
   try {
     const stub = makeStub();
     const refusal = await expectRefusal(
       runRoutedCall(
-        ensureOptions(stub, broker.origin, {
-          broker: { origin: broker.origin, wakeBoundMs: 1000 },
+        ensureOptions(stub, broker.url, {
+          broker: { origin: broker.url, wakeBoundMs: 1000 },
         }),
       ),
     );
@@ -914,18 +927,23 @@ test("owner-ensure: the bound with the pool at its maximum → agent_cap why=poo
       /reason=agent_cap .* live=12 cap=100 box=\S+ why=pool-at-maximum wake=/,
     );
   } finally {
-    broker.close();
+    await broker.close();
   }
-  const noFigures = await startBroker({
-    lines: ["pool-at-maximum"],
-    stall: true,
-    agents: { live: "x" },
+  // KIT GAP 3: a `GET /v1/agents` whose answer carries no usable figures — the kit's snapshot is always well-formed.
+  const noFigures = await rawHttp((request, response) => {
+    if (request.method === "GET") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ live: "x" }));
+      return;
+    }
+    response.writeHead(200, { "content-type": "text/plain" });
+    response.write("pool-at-maximum\n");
   });
   try {
     const refusal = await expectRefusal(
       runRoutedCall(
-        ensureOptions(makeStub(), noFigures.origin, {
-          broker: { origin: noFigures.origin, wakeBoundMs: 1000 },
+        ensureOptions(makeStub(), noFigures.url, {
+          broker: { origin: noFigures.url, wakeBoundMs: 1000 },
         }),
       ),
     );
@@ -942,10 +960,10 @@ test("owner-ensure: broker `error <reason>` and `too_big` are named failures (ex
     ["error start_failed", "broker_start_failed"],
     ["refused reason=too_big live=1 cap=2", "broker_too_big"],
   ] as const) {
-    const broker = await startBroker({ lines: [line] });
+    const broker = await startFakeBroker({ default: { final: line } });
     try {
       const stub = makeStub();
-      const options = ensureOptions(stub, broker.origin);
+      const options = ensureOptions(stub, broker.url);
       const error = await expectRouted(runRoutedCall(options));
       assert.equal(
         error.stderrLine,
@@ -953,37 +971,35 @@ test("owner-ensure: broker `error <reason>` and `too_big` are named failures (ex
       );
       assert.equal(stub.calls().length, 0);
     } finally {
-      broker.close();
+      await broker.close();
     }
   }
 });
 
 test("the broker is asked by owner-ensure for a session's pod, and by a one-shot for its utility pod only (A-7): owner-if-pod never, a one-shot that is handed its pod's uid never", async () => {
-  const broker = await startBroker({ lines: [READY] });
+  const broker = await startFakeBroker({ default: { final: READY } });
   try {
     const stub = makeStub();
     await runRoutedCall(
       baseOptions(stub, {
         class: "owner-if-pod",
         lookup: PRESENT,
-        broker: { origin: broker.origin },
+        broker: { origin: broker.url },
       }),
     );
     await runRoutedCall(
       oneShotOptions(stub, {
         key: "util-home",
         expectUid: UID,
-        broker: { origin: broker.origin },
+        broker: { origin: broker.url },
       }),
     );
     // A READY utility pod needs no broker either: the API server answers first, as for a session's pod.
-    await runRoutedCall(
-      oneShotOptions(stub, { lookup: PRESENT, broker: { origin: broker.origin } }),
-    );
-    assert.equal(broker.seen.length, 0);
+    await runRoutedCall(oneShotOptions(stub, { lookup: PRESENT, broker: { origin: broker.url } }));
+    assert.equal(broker.requests.length, 0);
     assert.equal(stub.calls().length, 3);
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
 
@@ -992,13 +1008,17 @@ test("A-7: a one-shot with no utility pod starts it through the broker — no se
     ["util-pool", "pool"],
     ["util-home", "home"],
   ] as const) {
-    const broker = await startBroker({ lines: ["scheduling", READY] });
+    // The kit's home cap is the real broker's default, 0: `util-home` is `home_full` unless the box has one.
+    const broker = await startFakeBroker({
+      default: { steps: ["scheduling"], final: READY },
+      status: { home: { cap: 5 } },
+    });
     try {
       const stub = makeStub({ exit: 0, stdout: "styles\n" });
       const options = oneShotOptions(stub, {
         key,
         lookup: ABSENT,
-        broker: { origin: broker.origin },
+        broker: { origin: broker.url },
         target: { sessionId: "", seat: "", harness: "utility", admissionClass: "interactive" },
       });
       assert.deepEqual(await runRoutedCall(options), {
@@ -1006,24 +1026,24 @@ test("A-7: a one-shot with no utility pod starts it through the broker — no se
         exitCode: 0,
         callId: options.callId,
       });
-      const body = JSON.parse(broker.seen[0]?.body ?? "{}") as Record<string, unknown>;
+      const body = broker.requests[0]?.body ?? {};
       assert.equal(body.harness, "utility");
       assert.equal(body.class, "utility");
       assert.equal(body.placement, placement);
       assert.equal("sessionId" in body, false);
       assert.equal("seat" in body, false);
-      assert.match(broker.seen[0]?.url ?? "", new RegExp(`/v1/agents/${key}$`));
+      assert.match(broker.requests[0]?.path ?? "", new RegExp(`/v1/agents/${key}$`));
       const [call] = stub.calls();
       assert.equal(flag(call, "--key"), key);
       assert.equal(flag(call, "--expect-uid"), UID, "the call goes to the uid the broker named");
     } finally {
-      broker.close();
+      await broker.close();
     }
   }
 });
 
 test("A-7 (negative): a one-shot may start the utility pod and NOTHING else — a session's harness, a session's key, an unknown key are refused with nothing sent and the broker never asked; owner-ensure never reaches a utility pod", async () => {
-  const broker = await startBroker({ lines: [READY] });
+  const broker = await startFakeBroker({ default: { final: READY } });
   try {
     const stub = makeStub();
     const refused = async (options: RoutedCallOptions) => {
@@ -1036,7 +1056,7 @@ test("A-7 (negative): a one-shot may start the utility pod and NOTHING else — 
         return true;
       });
     };
-    const viaBroker = { lookup: ABSENT, broker: { origin: broker.origin } };
+    const viaBroker = { lookup: ABSENT, broker: { origin: broker.url } };
     // a one-shot aimed at a SESSION's pod (the session's harness, a session's key)…
     await refused(
       oneShotOptions(stub, {
@@ -1051,28 +1071,28 @@ test("A-7 (negative): a one-shot may start the utility pod and NOTHING else — 
     await refused(oneShotOptions(stub, { ...viaBroker, key: KEY, expectUid: UID }));
     // The reverse: owner-ensure never starts a utility pod.
     await refused(
-      ensureOptions(stub, broker.origin, {
+      ensureOptions(stub, broker.url, {
         key: "util-pool",
         target: { sessionId: SESSION, seat: SEAT, harness: "utility" },
       }),
     );
-    await refused(ensureOptions(stub, broker.origin, { key: "util-home" }));
-    assert.equal(broker.seen.length, 0, "the broker was never asked");
+    await refused(ensureOptions(stub, broker.url, { key: "util-home" }));
+    assert.equal(broker.requests.length, 0, "the broker was never asked");
     assert.equal(stub.calls().length, 0, "nothing was sent");
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
 
 test("A-7: a utility pod that is not ready within the wake bound is pod_starting WITHOUT `wake=` (no message waits for it), exit 75; a full box is agent_cap without `wake=`", async () => {
-  const broker = await startBroker({ lines: ["pulling"], stall: true });
+  const broker = await startFakeBroker({ default: { steps: ["pulling"], hang: true } });
   try {
     const stub = makeStub();
     const refusal = await expectRefusal(
       runRoutedCall(
         oneShotOptions(stub, {
           lookup: ABSENT,
-          broker: { origin: broker.origin, wakeBoundMs: 500 },
+          broker: { origin: broker.url, wakeBoundMs: 500 },
         }),
       ),
     );
@@ -1083,22 +1103,24 @@ test("A-7: a utility pod that is not ready within the wake bound is pod_starting
     assert.equal(exitCodeForOutputErrorCode(normalizeOutputError(refusal).code), 75);
     assert.equal(stub.calls().length, 0);
   } finally {
-    broker.close();
+    await broker.close();
   }
-  const full = await startBroker({ lines: ["refused reason=agent_cap live=7 cap=7"] });
+  const full = await startFakeBroker({
+    default: { final: "refused reason=agent_cap live=7 cap=7" },
+  });
   try {
     const refusal = await expectRefusal(
       runRoutedCall(
         oneShotOptions(makeStub(), {
           lookup: ABSENT,
-          broker: { origin: full.origin, wakeBoundMs: 500 },
+          broker: { origin: full.url, wakeBoundMs: 500 },
         }),
       ),
     );
     assert.match(refusal.stderrLine, /^acpx: REFUSED reason=agent_cap .* why=cap$/);
     assert.equal(exitCodeForOutputErrorCode(normalizeOutputError(refusal).code), 75);
   } finally {
-    full.close();
+    await full.close();
   }
 });
 
@@ -1114,10 +1136,10 @@ test("owner-if-pod: no pod → `no_pod` (answered from the record) with nothing 
 });
 
 test("owner-ensure: a required tool whose link cannot be resolved fails BEFORE the broker, naming it", async () => {
-  const broker = await startBroker({ lines: [READY] });
+  const broker = await startFakeBroker({ default: { final: READY } });
   try {
     const stub = makeStub();
-    const options = ensureOptions(stub, broker.origin, {
+    const options = ensureOptions(stub, broker.url, {
       releases: { ok: false, tool: "claude-agent-acp" },
     });
     const error = await expectRouted(runRoutedCall(options));
@@ -1126,18 +1148,18 @@ test("owner-ensure: a required tool whose link cannot be resolved fails BEFORE t
       `acpx: ROUTED outcome=not_run reason=release_unresolved tool=claude-agent-acp call_id=${options.callId}`,
     );
     assert.equal(exitCodeForOutputErrorCode(normalizeOutputError(error).code), 1);
-    assert.equal(broker.seen.length, 0, "the broker was not called");
+    assert.equal(broker.requests.length, 0, "the broker was not called");
     assert.equal(stub.calls().length, 0);
     // A READY pod needs no releases at all: the failure belongs to the broker call only.
     await runRoutedCall(
-      ensureOptions(stub, broker.origin, {
+      ensureOptions(stub, broker.url, {
         lookup: PRESENT,
         releases: { ok: false, tool: "acpx" },
       }),
     );
     assert.equal(stub.calls().length, 1);
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
 
@@ -1199,20 +1221,20 @@ test("releases (C9): the directory name each tool's link points to now; a missin
 });
 
 test("deadline counts from the CALL START: a 20 s wake leaves a 25 s deadline in the per-call values", async () => {
-  const broker = await startBroker({ lines: ["scheduling", READY] });
+  const broker = await startFakeBroker({ default: { steps: ["scheduling"], final: READY } });
   try {
     const stub = makeStub();
     const base = 1_800_000_000_000;
     let reads = 0;
     // The first read is the call start; every later read is 20 s on (the wake took 20 s).
     const now = () => base + (reads++ === 0 ? 0 : 20_000);
-    await runRoutedCall(ensureOptions(stub, broker.origin, { now }));
+    await runRoutedCall(ensureOptions(stub, broker.url, { now }));
     const [call] = stub.calls();
     assert.ok(call);
     assert.equal(Number(flag(call, "--deadline-ms")), base + OWNER_ENSURE_DEADLINE_MS);
     assert.equal(Number(flag(call, "--deadline-ms")) - (base + 20_000), 25_000);
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
 
@@ -1359,9 +1381,9 @@ test("C9 (A-41): `pi` is OPTIONAL and is sent when its link resolves; `pi-home` 
 });
 
 test("a required tool that cannot be resolved (pi-acp) fails the call BEFORE the broker is asked, naming it", async () => {
-  const broker = await startBroker({ lines: [READY] });
+  const broker = await startFakeBroker({ default: { final: READY } });
   try {
-    const options = ensureOptions(makeStub(), broker.origin, {
+    const options = ensureOptions(makeStub(), broker.url, {
       releases: { ok: false, tool: "pi-acp" },
     });
     const error = await expectRouted(runRoutedCall(options));
@@ -1369,18 +1391,19 @@ test("a required tool that cannot be resolved (pi-acp) fails the call BEFORE the
       error.stderrLine,
       `acpx: ROUTED outcome=not_run reason=release_unresolved tool=pi-acp call_id=${options.callId}`,
     );
-    assert.equal(broker.seen.length, 0);
+    assert.equal(broker.requests.length, 0);
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
 
 test("A-41: a Pi session whose `releases` lacks `pi` is refused at acpx's call, named, BEFORE the broker; a Claude, Codex or Pi-with-`pi` call is not", async () => {
-  const withoutPi = { ok: true as const, releases: { acpx: "rel-1", "pi-acp": "rel-3" } };
-  const withPi = { ok: true as const, releases: { acpx: "rel-1", "pi-acp": "rel-3", pi: "rel-2" } };
-  const broker = await startBroker({ lines: [READY] });
+  const { pi: _pi, ...fullWithoutPi } = FULL_RELEASES;
+  const withoutPi = { ok: true as const, releases: fullWithoutPi };
+  const withPi = { ok: true as const, releases: FULL_RELEASES };
+  const broker = await startFakeBroker({ default: { final: READY } });
   try {
-    const options = ensureOptions(makeStub(), broker.origin, {
+    const options = ensureOptions(makeStub(), broker.url, {
       target: { sessionId: SESSION, seat: SEAT, harness: "pi" },
       releases: withoutPi,
     });
@@ -1390,90 +1413,97 @@ test("A-41: a Pi session whose `releases` lacks `pi` is refused at acpx's call, 
       error.stderrLine,
       `acpx: ROUTED outcome=not_run reason=release_unresolved tool=pi call_id=${options.callId}`,
     );
-    assert.equal(broker.seen.length, 0, "the broker was never asked");
+    assert.equal(broker.requests.length, 0, "the broker was never asked");
     // Controls: the same call is not refused when the harness is not pi, or when pi is named.
     for (const [harness, releases] of [
       ["claude", withoutPi],
       ["codex", withoutPi],
       ["pi", withPi],
     ] as const) {
-      const before: number = broker.seen.length;
+      const before: number = broker.requests.length;
       await runRoutedCall(
-        ensureOptions(makeStub(), broker.origin, {
+        ensureOptions(makeStub(), broker.url, {
           target: { sessionId: SESSION, seat: SEAT, harness },
           releases,
         }),
       );
-      assert.equal(broker.seen.length, before + 1, `${harness}: the broker was asked`);
+      assert.equal(broker.requests.length, before + 1, `${harness}: the broker was asked`);
     }
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
 
 test("A-10: a utility pod's POST carries neither seat nor sessionId; a session's carries both", async () => {
-  const broker = await startBroker({ lines: [READY] });
+  const broker = await startFakeBroker({ default: { final: READY } });
   try {
     await runRoutedCall(
       oneShotOptions(makeStub(), {
         lookup: ABSENT,
-        broker: { origin: broker.origin },
+        broker: { origin: broker.url },
         target: { sessionId: SESSION, seat: SEAT, harness: "utility" },
       }),
     );
-    const utility = JSON.parse(broker.seen[0]?.body ?? "{}") as Record<string, unknown>;
+    const utility = broker.requests[0]?.body ?? {};
     assert.equal("seat" in utility, false);
     assert.equal("sessionId" in utility, false);
     assert.equal(utility.harness, "utility");
-    await runRoutedCall(ensureOptions(makeStub(), broker.origin, { lookup: ABSENT }));
-    const session = JSON.parse(broker.seen[1]?.body ?? "{}") as Record<string, unknown>;
+    await runRoutedCall(ensureOptions(makeStub(), broker.url, { lookup: ABSENT }));
+    const session = broker.requests[1]?.body ?? {};
     assert.equal(session.seat, SEAT);
     assert.equal(session.sessionId, SESSION);
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
 
 test("C4 `error deleted`: the pod was deleted by a concurrent DELETE → pod_starting phase=turnover (exit 75), never retried inside acpx; a NEW call after the DELETE wakes a fresh pod", async () => {
-  const broker = await startBroker({
-    perPost: [
-      ["scheduling", "error deleted"],
-      ["scheduling", READY],
+  const broker = await startFakeBroker({
+    jobs: [
+      { steps: ["scheduling"], final: "error deleted" },
+      { steps: ["scheduling"], final: READY },
     ],
   });
   try {
     const stub = makeStub({ exit: 0, stdout: "woken\n" });
-    const refusal = await expectRefusal(runRoutedCall(ensureOptions(stub, broker.origin)));
+    const refusal = await expectRefusal(runRoutedCall(ensureOptions(stub, broker.url)));
     assert.equal(
       refusal.stderrLine,
       `acpx: REFUSED reason=pod_starting nothing_started=true protocol=1 retry_after_s=3 phase=turnover wake=${SESSION}`,
     );
     assert.equal(exitCodeForOutputErrorCode(normalizeOutputError(refusal).code), 75);
     assert.equal(
-      broker.seen.filter((r) => r.method === "POST").length,
+      broker.requests.filter((r) => r.method === "POST").length,
       1,
       "the request was not retried",
     );
     assert.equal(stub.calls().length, 0, "nothing was sent to a pod");
     // Atrium re-drives it as a NEW call (recover: DELETE answered, then a new POST): a fresh pod is woken.
-    const options = ensureOptions(stub, broker.origin);
+    const options = ensureOptions(stub, broker.url);
     assert.equal((await runRoutedCall(options)).kind, "completed");
-    assert.equal(broker.seen.filter((r) => r.method === "POST").length, 2);
+    assert.equal(broker.requests.filter((r) => r.method === "POST").length, 2);
     assert.equal(stub.calls().length, 1);
     assert.equal(options.out.text, "woken\n");
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
 
 test("L-3: the wake bound covers the WHOLE ensure — pool-at-maximum with a `GET /v1/agents` that never answers is admission_busy WITHIN the bound, not after it", async () => {
-  const broker = await startBroker({ lines: ["pool-at-maximum"], stall: true, agentsHang: true });
+  // KIT GAP 3: a `GET /v1/agents` that never answers (the kit's always answers).
+  const broker = await rawHttp((request, response) => {
+    if (request.method === "GET") {
+      return;
+    }
+    response.writeHead(200, { "content-type": "text/plain" });
+    response.write("pool-at-maximum\n");
+  });
   try {
     const started = Date.now();
     const refusal = await expectRefusal(
       runRoutedCall(
-        ensureOptions(makeStub(), broker.origin, {
-          broker: { origin: broker.origin, wakeBoundMs: 1000 },
+        ensureOptions(makeStub(), broker.url, {
+          broker: { origin: broker.url, wakeBoundMs: 1000 },
         }),
       ),
     );

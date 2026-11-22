@@ -6,6 +6,17 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  bare404,
+  clearNodes,
+  clearPods,
+  failWith,
+  putNode,
+  putPod,
+  requestLines,
+  startKitApi,
+  type FakeApiServer,
+} from "./pod-kit-api-helpers.js";
+import {
   KIT_NAMESPACE,
   makePod,
   makeServiceAccountDir,
@@ -15,7 +26,6 @@ import {
   type KitPod,
   type PodEnvOptions,
 } from "./pod-kit/two-pods.js";
-import { startFakeApi, type FakeApi } from "./pod-lock-fake-api.js";
 
 // C3.2 as amended (A-4) across REAL processes with pod identities over one directory (brick
 // 8d85cb47, TEST-PLAN NG-K7.2a/b/c at U). A control pod and agent pods are told apart by the C1.1
@@ -24,7 +34,7 @@ import { startFakeApi, type FakeApi } from "./pod-lock-fake-api.js";
 
 const CHILD = fileURLToPath(new URL("./fixtures/pod-lock-child.js", import.meta.url));
 
-let api: FakeApi;
+let api: FakeApiServer;
 let root: string;
 let saDir: string;
 let control: KitPod;
@@ -32,7 +42,7 @@ let controlHome: string;
 test.before(async () => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-twopods-"));
   saDir = makeServiceAccountDir(root);
-  api = await startFakeApi(KIT_NAMESPACE);
+  api = await startKitApi(KIT_NAMESPACE);
   control = makePod("control");
   controlHome = makeTestHome(root, "control");
 });
@@ -40,10 +50,10 @@ test.after(async () => {
   await api.close();
 });
 test.beforeEach(() => {
-  api.state.pods.clear();
-  api.state.nodes.clear();
-  api.state.failure = undefined;
-  api.state.requests.length = 0;
+  clearPods(api);
+  clearNodes(api);
+  failWith(api, undefined);
+  api.reset();
 });
 
 function asControl(): PodEnvOptions {
@@ -59,8 +69,8 @@ function asAgentPod(pod: KitPod): PodEnvOptions {
 }
 function registerLive(...pods: KitPod[]): void {
   for (const pod of pods) {
-    api.state.pods.set(pod.name, { uid: pod.uid, phase: "Running" });
-    api.state.nodes.set(pod.node, "True");
+    putPod(api, pod.name, { uid: pod.uid, phase: "Running" });
+    putNode(api, pod.node, "True");
   }
 }
 function deadBodyOf(pod: KitPod): string {
@@ -113,33 +123,33 @@ test("NG-K7.2a: a LIVE holder in agent pod A, its lock aged 10 min, is not broke
 test("NEVER: a waiter in agent pod B does not break pod A's lock although A is proven gone — and never asks the API", async () => {
   const a = makePod("a");
   const b = makePod("b");
-  api.state.nodes.set(a.node, "True"); // A absent, its node Ready ⇒ gone, if anyone asked
+  putNode(api, a.node, "True"); // A absent, its node Ready ⇒ gone, if anyone asked
   const lock = path.join(fs.mkdtempSync(path.join(root, "agent-never-")), "x.json.lock");
   const raw = deadBodyOf(a);
   fs.writeFileSync(lock, raw);
   const run = await runInPod(b, CHILD, ["acquire", lock, "1500"], asAgentPod(b));
   assert.equal(JSON.parse(run.stdout).timeout, true, run.stdout + run.stderr);
   assert.equal(fs.readFileSync(lock, "utf8"), raw);
-  assert.deepEqual(api.state.requests, [], "no request from an agent pod");
+  assert.deepEqual(requestLines(api), [], "no request from an agent pod");
   assert.deepEqual(ledger(b), []);
 });
 
 test("NG-K7.2b: pod A gone but its node NotReady → the control pod does not break (unknown is alive)", async () => {
   const a = makePod("a");
-  api.state.nodes.set(a.node, "False");
+  putNode(api, a.node, "False");
   const lock = path.join(fs.mkdtempSync(path.join(root, "notready-")), "x.json.lock");
   const raw = deadBodyOf(a);
   fs.writeFileSync(lock, raw);
   const run = await runInPod(control, CHILD, ["acquire", lock, "1500"], asControl());
   assert.equal(JSON.parse(run.stdout).timeout, true);
   assert.equal(fs.readFileSync(lock, "utf8"), raw);
-  assert.ok(api.state.requests.length >= 2, "the control pod asked");
+  assert.ok(requestLines(api).length >= 2, "the control pod asked");
 });
 
 test("NG-K7.2c: 20 rounds × (6 control-pod + 6 agent-pod-B racers) on a proven-dead pod-A holder — one break per round, by the control pod, never two inside", async () => {
   const a = makePod("a");
   const b = makePod("b");
-  api.state.nodes.set(a.node, "True"); // pod A absent from the API, its node Ready ⇒ gone
+  putNode(api, a.node, "True"); // pod A absent from the API, its node Ready ⇒ gone
   registerLive(b, control); // the racers' own pods exist: a racer holding the lock is a LIVE holder
   const bOptions = asAgentPod(b);
   for (let round = 0; round < 20; round += 1) {
