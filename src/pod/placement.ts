@@ -56,6 +56,8 @@ export type HostFacts = {
   homedir: string;
   /** PID 1's environment, the four named facts only (A-26). Injected by tests; absent ⇒ the real one. */
   pid1?: () => PodFacts | undefined;
+  /** The kernel hostname (A-28's second witness). Injected by tests; absent ⇒ the real one. */
+  hostname?: () => string;
 };
 
 /**
@@ -72,6 +74,10 @@ export const POD_FACT_NAMES = [
 export type PodFacts = Partial<Record<(typeof POD_FACT_NAMES)[number], string>>;
 /** The test stand-in for PID 1's environ (a file, NUL-separated like the real one) — seam only. */
 export const PID1_STAND_IN_ENV = "ACPX_POD_TEST_PID1_ENVIRON";
+/** The test stand-in for the kernel hostname (A-28) — seam only; the real one is not read there. */
+export const HOSTNAME_STAND_IN_ENV = "ACPX_POD_TEST_HOSTNAME";
+/** An agent pod's hostname is `ag-<key>` or `ag-util-<placement>` (C4); a control pod's never is. */
+export const AGENT_HOSTNAME_PREFIX = "ag-";
 
 /**
  * ⚠️ A NON-EMPTY `NODE_TEST_CONTEXT` (node's runner sets `child` / `child-v8`), the same test as
@@ -228,6 +234,45 @@ export function effectivePodEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.Pr
 }
 
 /**
+ * ⚠️ UNDER THE HONOURED SEAM THE REAL HOSTNAME IS NOT READ (A-28), like the real place file and PID 1:
+ * the stand-in (`facts.hostname`, or `ACPX_POD_TEST_HOSTNAME`) or nothing. `NODE_TEST_CONTEXT` alone
+ * is no seam.
+ */
+function kernelHostname(env: NodeJS.ProcessEnv, injected?: () => string): string {
+  if (injected) {
+    return injected();
+  }
+  return testHome(env) !== undefined ? (env[HOSTNAME_STAND_IN_ENV] ?? "") : os.hostname();
+}
+
+/**
+ * A-28: this host's place from its TWO witnesses — the place file and the kernel hostname. A mount
+ * protects the file against the pod's user, not against a process with a file tree of its own, so
+ * `ag-…` as the hostname also says agent pod:
+ *
+ *   place file names a pod            → that pod (any hostname)
+ *   missing/empty/unreadable + `ag-…` → `place-missing`: an agent pod that cannot say which
+ *   empty/unreadable + other hostname → `unreadable`: another agent pod, as in A-25
+ *   missing + other hostname          → `absent`: the control pod
+ */
+export function resolvePodFile(file: AgentPodFile, hostname: string): AgentPodFile {
+  if (file.kind === "pod") {
+    return file;
+  }
+  return hostname.startsWith(AGENT_HOSTNAME_PREFIX) ? { kind: "place-missing" } : file;
+}
+
+/** The place file read, then resolved by the hostname witness. Control-role hosts only call this. */
+export function readPodFileWithWitness(
+  env: NodeJS.ProcessEnv = process.env,
+  hostname?: () => string,
+): AgentPodFile {
+  const file = readAgentPodFile(agentPodFilePath(env));
+  // Read the hostname only where it can change the answer: a place that names a pod needs none.
+  return file.kind === "pod" ? file : resolvePodFile(file, kernelHostname(env, hostname));
+}
+
+/**
  * C1.1 (with A-5, A-6, A-26): pod mode is decided from the POD's facts.
  * - A workbench, a rig or a suite (not control-role, no seam): `off`, nothing read.
  * - On a control-role host that carries the place file (an agent pod) the place file stands for the
@@ -243,7 +288,8 @@ export function podModeVerdict(facts: HostFacts): PodModeVerdict {
     const claimed = facts.env[OWNER_PLACEMENT_ENV] === OWNER_PLACEMENT_POD;
     return { mode: "off", why: claimed ? "not-control-role" : "switch-unset" };
   }
-  const carriesPlaceFile = readAgentPodFile(agentPodFilePath(facts.env)).kind !== "absent";
+  // A-28: an agent pod by EITHER witness — the place file exists, or the hostname starts with `ag-`.
+  const carriesPlaceFile = readPodFileWithWitness(facts.env, facts.hostname).kind !== "absent";
   const env = effectiveEnv(facts, !carriesPlaceFile);
   if (!carriesPlaceFile && env[OWNER_PLACEMENT_ENV] !== OWNER_PLACEMENT_POD) {
     return { mode: "off", why: "switch-unset" };
@@ -316,10 +362,18 @@ export function isPodMode(): boolean {
 export type AgentPodFile =
   | { kind: "absent" }
   | { kind: "pod"; name: string }
-  | { kind: "unreadable" };
+  | { kind: "unreadable" }
+  /**
+   * A-28: the kernel hostname says agent pod (`ag-…`) but the place file is missing, empty or
+   * unreadable — an agent pod that cannot say WHICH. Only `readPodFileWithWitness` produces it.
+   */
+  | { kind: "place-missing" };
 
 export function readAgentPodFile(file: string): AgentPodFile {
   try {
+    // A-28: readers compare the place file with SURROUNDING WHITESPACE stripped — the downward API
+    // writes no trailing newline, the ssh entry strips the same way, and the two must agree. An
+    // existing but EMPTY file is still an agent pod (`unreadable`, the fail-safe side).
     const name = fs.readFileSync(file, "utf8").trim();
     return name ? { kind: "pod", name } : { kind: "unreadable" };
   } catch (error) {
@@ -337,7 +391,7 @@ let memoPodFile: AgentPodFile | undefined;
 
 /** Read once per process (C1.1). */
 export function thisPodFile(): AgentPodFile {
-  memoPodFile ??= readAgentPodFile(agentPodFilePath());
+  memoPodFile ??= readPodFileWithWitness();
   return memoPodFile;
 }
 

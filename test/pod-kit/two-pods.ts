@@ -56,6 +56,8 @@ export function makeTestHome(root: string, place: KitPlace, pod?: KitPod): strin
 export type PodEnvOptions = {
   /** `ACPX_POD_TEST_HOME` — from `makeTestHome`; decides control pod vs agent pod. */
   testHome?: string;
+  /** `ACPX_POD_TEST_HOSTNAME` — the stand-in for the kernel hostname (A-28), honoured under the seam. */
+  hostname?: string;
   saDir: string;
   /** Base URL of a fake API server (`ACPX_POD_API_URL`). */
   apiUrl?: string;
@@ -74,6 +76,7 @@ export function podEnv(pod: KitPod | undefined, options: PodEnvOptions): NodeJS.
     "NV_NODE_NAME",
     "ACPX_OWNER_PLACEMENT",
     "ACPX_POD_TEST_HOME",
+    "ACPX_POD_TEST_HOSTNAME",
   ]) {
     delete env[name];
   }
@@ -89,6 +92,9 @@ export function podEnv(pod: KitPod | undefined, options: PodEnvOptions): NodeJS.
   }
   if (options.testHome) {
     env.ACPX_POD_TEST_HOME = options.testHome;
+  }
+  if (options.hostname !== undefined) {
+    env.ACPX_POD_TEST_HOSTNAME = options.hostname;
   }
   if (pod) {
     env.NV_POD_NAME = pod.name;

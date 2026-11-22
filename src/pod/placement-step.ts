@@ -98,6 +98,7 @@ type DecisionCore =
   | { kind: "branch"; branch: PodBranch; classification: Classification; place: Place }
   | { kind: "refuse-unclassified"; path: string }
   | { kind: "refuse-pod-identity" }
+  | { kind: "refuse-pod-place" }
   | { kind: "refuse-seam-sandbox" }
   | { kind: "refuse-control-pod-only"; path: string };
 
@@ -137,6 +138,9 @@ export function decidePlacement(params: {
         : ({ kind: "refuse-seam-sandbox" } as const);
     return { ...core, output };
   }
+  if (params.podFile.kind === "place-missing") {
+    return { ...decideWithoutPlace(classification), output };
+  }
   if (classification.kind === "unclassified") {
     return { kind: "refuse-unclassified", path: classification.path, output };
   }
@@ -154,6 +158,21 @@ function decideWithoutIdentity(classification: Classification): DecisionCore {
   return diagnosable
     ? { kind: "local", classification, place: "control" }
     : { kind: "refuse-pod-identity" };
+}
+
+/**
+ * `pod_place_missing` (A-28): the kernel hostname says agent pod and the place file is missing,
+ * empty or unreadable — an agent pod that cannot say WHICH. Every command that is not class `local`
+ * refuses (never local mode, never the control pod's place); class `local` and a help request run,
+ * as for the identity refusal, so an operator can still diagnose.
+ */
+function decideWithoutPlace(classification: Classification): DecisionCore {
+  const diagnosable =
+    classification.kind === "classified" &&
+    (classification.class === "local" || classification.help);
+  return diagnosable
+    ? { kind: "local", classification, place: "other-pod" }
+    : { kind: "refuse-pod-place" };
 }
 
 /** Help runs nothing; control-pod maintenance refuses in an agent pod (A-7). */
@@ -195,6 +214,7 @@ export type Refusal = { exitCode: number; lines: [string, string] };
 export const UNCLASSIFIED_EXIT_CODE = 2;
 export const POD_IDENTITY_EXIT_CODE = 2;
 export const CONTROL_POD_ONLY_EXIT_CODE = 2;
+export const POD_PLACE_EXIT_CODE = 2;
 /** A branch a later block builds: 2, like `unclassified_command` — a usage-level refusal. */
 export const UNBUILT_BRANCH_EXIT_CODE = 2;
 
@@ -203,6 +223,14 @@ const POD_IDENTITY_REFUSAL: Refusal = {
   lines: [
     "acpx: REFUSED reason=pod_identity_missing",
     "ACPX_OWNER_PLACEMENT=pod is set on this control-role host but the pod identity (NV_POD_NAME, NV_POD_UID, NV_NODE_NAME, the service-account namespace) is incomplete; acpx refuses rather than run in either mode.",
+  ],
+};
+
+const POD_PLACE_REFUSAL: Refusal = {
+  exitCode: POD_PLACE_EXIT_CODE,
+  lines: [
+    "acpx: REFUSED reason=pod_place_missing",
+    "This host's kernel hostname says it is an agent pod (ag-…) but its place file (/home/node/.nv-agent) is missing, empty or unreadable, so acpx cannot say which pod it is; it refuses rather than run in either mode.",
   ],
 };
 
@@ -247,6 +275,8 @@ export function refusalFor(decision: PlacementDecision): Refusal | undefined {
       };
     case "refuse-pod-identity":
       return POD_IDENTITY_REFUSAL;
+    case "refuse-pod-place":
+      return POD_PLACE_REFUSAL;
     case "refuse-seam-sandbox":
       return SEAM_SANDBOX_REFUSAL;
     case "branch":

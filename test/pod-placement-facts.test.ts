@@ -3,16 +3,23 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test, { mock } from "node:test";
-import { lockPodIdentity, podModeRequested } from "../src/pod/identity.js";
+import { fileURLToPath } from "node:url";
+import { lockHostPlace, lockPodIdentity, podModeRequested } from "../src/pod/identity.js";
+import { decidePlacement, refusalFor } from "../src/pod/placement-step.js";
 import {
   CANONICAL_HOME,
   PID1_STAND_IN_ENV,
+  agentPodName,
   effectiveEnv,
+  placeOf,
   podModeVerdict,
+  readAgentPodFile,
+  readPodFileWithWitness,
   type HostFacts,
   type PodFacts,
   type PodModeVerdict,
 } from "../src/pod/placement.js";
+import { makeServiceAccountDir, makeTestHome, runInPod } from "./pod-kit/two-pods.js";
 
 // A-26 (brick a25b06e8, built in A5's lane): the switch and the pod's identity are FACTS OF THE POD,
 // not of the calling process. (a) On a control-role host that carries the place file, the place file
@@ -20,6 +27,8 @@ import {
 // NV_POD_NAME, NV_POD_UID and NV_NODE_NAME is read from PID 1's environment — own value first, only
 // the value `pod` is the switch. Under the honoured seam nothing real is read (a test gives PID 1 a
 // stand-in). The six committed cases of CONTRACTS-r4 C1.1 A-26 are the rows headed "CASE n".
+
+const CHILD = fileURLToPath(new URL("./fixtures/pod-lock-child.js", import.meta.url));
 
 function tmp(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "acpx-a26-"));
@@ -285,3 +294,200 @@ function lockPodIdentityFrom(env: NodeJS.ProcessEnv) {
   // so `env` is the whole world — which is what these rows want.
   return lockPodIdentity(env);
 }
+
+// ---- the place file's content: SURROUNDING WHITESPACE is stripped (A-28; the ssh entry does the same) ----
+
+const SESSION = "11111111-1111-4111-8111-111111111111";
+
+function placeOfContent(content: string): { kind: string; own: string } {
+  const file = path.join(tmp(), ".nv-agent");
+  fs.writeFileSync(file, content);
+  const read = readAgentPodFile(file);
+  return { kind: read.kind, own: placeOf(read, SESSION) };
+}
+
+test("place file: `ag-<key>` (a downwardAPI mount writes no newline), with a newline, and with any surrounding whitespace all read as the session's own pod", () => {
+  const name = agentPodName(SESSION);
+  for (const content of [name, `${name}\n`, `${name}\n\n`, ` ${name}`, `\t${name} \r\n`]) {
+    assert.deepEqual(
+      placeOfContent(content),
+      { kind: "pod", own: "own-pod" },
+      JSON.stringify(content),
+    );
+  }
+});
+
+test("place file NEVER: whitespace INSIDE the name or another name matches nothing — it reads as another agent pod, never the own pod or the control pod", () => {
+  const name = agentPodName(SESSION);
+  for (const content of [`${name} x`, `x${name}`, `ag-${"0".repeat(24)}`, name.slice(0, -1)]) {
+    const read = placeOfContent(content);
+    assert.equal(read.kind, "pod", JSON.stringify(content));
+    assert.equal(read.own, "other-pod", JSON.stringify(content));
+  }
+});
+
+test("place file: an empty or whitespace-only file is an agent pod that is unreadable (the fail-safe side); a MISSING file is absent — no fallback", () => {
+  for (const content of ["", "\n", "  \n\t "]) {
+    assert.equal(placeOfContent(content).kind, "unreadable", JSON.stringify(content));
+  }
+  assert.deepEqual(readAgentPodFile(path.join(tmp(), "no-such-file")), { kind: "absent" });
+});
+
+// ---- A-28: the kernel hostname is a SECOND WITNESS for "this is an agent pod" ----
+
+const NAME = agentPodName(SESSION);
+
+/** A seam host whose hostname is `host`; the place file per `placeFile` (undefined ⇒ missing). */
+function witnessHost(host: string, placeFile: string | undefined | { directory: true }) {
+  const box = sandbox(false);
+  const file = path.join(box.home, ".nv-agent");
+  if (typeof placeFile === "object") {
+    fs.mkdirSync(file); // unreadable: a directory where the file should be
+  } else if (placeFile !== undefined) {
+    fs.writeFileSync(file, placeFile);
+  }
+  return { box, hostname: () => host };
+}
+
+const argvNotLocal = ["sessions", "list"]; // any command that is not class `local`
+
+function decisionFor(
+  host: ReturnType<typeof witnessHost>,
+  own: NodeJS.ProcessEnv,
+  argv: readonly string[] = argvNotLocal,
+) {
+  const env = host.box.env(own);
+  const reads = { count: 0 };
+  const facts = hostFacts(env, undefined, reads, { hostname: host.hostname });
+  const verdict = podModeVerdict(facts);
+  const podFile = readPodFileWithWitness(env, host.hostname);
+  return {
+    verdict,
+    podFile,
+    decision: decidePlacement({ argv, verdict, podFile, builtInAgents: ["claude"] }),
+  };
+}
+
+const IDENTITY_OWN = { NV_POD_NAME: "n", NV_POD_UID: "u", NV_NODE_NAME: "k" };
+
+test("A-28 CASE 1: hostname `ag-…` and NO place file → pod_place_missing (exit 2), no local mode, nothing started", () => {
+  for (const host of [`ag-${"a".repeat(24)}`, "ag-util-pool"]) {
+    const { podFile, decision } = decisionFor(witnessHost(host, undefined), IDENTITY_OWN);
+    assert.deepEqual(podFile, { kind: "place-missing" }, host);
+    assert.equal(decision.kind, "refuse-pod-place", host);
+    const refusal = refusalFor(decision);
+    assert.equal(refusal?.exitCode, 2);
+    assert.equal(refusal?.lines[0], "acpx: REFUSED reason=pod_place_missing");
+  }
+});
+
+test("A-28 CASE 2: the same with an EMPTY (or unreadable) place file → pod_place_missing", () => {
+  for (const content of ["", "\n", { directory: true }] as const) {
+    const { podFile, decision } = decisionFor(witnessHost("ag-abc", content), IDENTITY_OWN);
+    assert.deepEqual(podFile, { kind: "place-missing" }, JSON.stringify(content));
+    assert.equal(decision.kind, "refuse-pod-place", JSON.stringify(content));
+  }
+});
+
+test("A-28 CASE 3: hostname `ag-…` and a place file that NAMES the pod → as before (its own session's pod, by the key)", () => {
+  const { podFile, verdict, decision } = decisionFor(
+    witnessHost("ag-x", `${NAME}\n`),
+    IDENTITY_OWN,
+    ["status"],
+  );
+  assert.deepEqual(podFile, { kind: "pod", name: NAME });
+  assert.equal(mode(verdict), "pod");
+  assert.notEqual(decision.kind, "refuse-pod-place");
+  // and a place file naming a pod beats ANY hostname, `ag-` or not
+  assert.deepEqual(decisionFor(witnessHost("dev-server-abc", NAME), IDENTITY_OWN).podFile, {
+    kind: "pod",
+    name: NAME,
+  });
+});
+
+test("A-28 CASE 4: ANOTHER hostname and no place file → the control pod, byte-identical to today (unswitched ⇒ off, switched ⇒ the control place)", () => {
+  const unswitched = decisionFor(witnessHost("dev-server-bddbc4b49-wjpr6", undefined), {});
+  assert.deepEqual(unswitched.podFile, { kind: "absent" });
+  assert.deepEqual(unswitched.verdict, { mode: "off", why: "switch-unset" });
+  assert.deepEqual(unswitched.decision, { kind: "off" });
+  const switched = decisionFor(witnessHost("dev-server-bddbc4b49-wjpr6", undefined), {
+    ...IDENTITY_OWN,
+    ACPX_OWNER_PLACEMENT: "pod",
+  });
+  assert.deepEqual(switched.podFile, { kind: "absent" });
+  assert.equal(placeOf(switched.podFile, undefined), "control");
+});
+
+test("A-28: a place file that EXISTS but is empty under a non-`ag-` hostname stays 'another agent pod' (A-25), not a refusal", () => {
+  const { podFile, decision } = decisionFor(witnessHost("dev-server-abc", ""), IDENTITY_OWN);
+  assert.deepEqual(podFile, { kind: "unreadable" });
+  assert.notEqual(decision.kind, "refuse-pod-place");
+  assert.equal(placeOf(podFile, SESSION), "other-pod");
+});
+
+test("A-28: `ag-…` under pod_place_missing still lets a class `local` command and a help request run, so an operator can diagnose", () => {
+  const host = witnessHost("ag-abc", undefined);
+  const local = decisionFor(host, IDENTITY_OWN, ["agent-folders"]);
+  assert.equal(local.decision.kind, "local");
+  const help = decisionFor(host, IDENTITY_OWN, ["sessions", "list", "--help"]);
+  assert.equal(help.decision.kind, "local");
+});
+
+test("A-28 CASE 5: a rig's own state home, hostname `ag-…`, no place file, no identity → the lock writer refuses pod_identity_missing (any state home)", async () => {
+  const dir = tmp();
+  const record = path.join(dir, "state", "rec.json");
+  fs.mkdirSync(path.dirname(record), { recursive: true });
+  const run = await runInPod(undefined, CHILD, ["record-acquire", record], {
+    saDir: makeServiceAccountDir(dir),
+    testHome: makeTestHome(dir, "control"), // no place file: the file witness says control …
+    hostname: "ag-0123456789abcdef01234567", // … the hostname witness says agent pod
+    stateHome: path.join(dir, "state"), // a rig's own state home, not the canonical one
+    timeoutMs: 20_000,
+  });
+  assert.equal(JSON.parse(run.stdout).code, "pod_identity_missing", run.stdout + run.stderr);
+  assert.deepEqual(fs.readdirSync(path.dirname(record)), [], "nothing was written");
+  // positive control: the same host with an ordinary hostname writes today's body
+  const control = await runInPod(undefined, CHILD, ["record-acquire", record], {
+    saDir: makeServiceAccountDir(dir),
+    testHome: makeTestHome(dir, "control"),
+    hostname: "dev-server-bddbc4b49-wjpr6",
+    stateHome: path.join(dir, "state"),
+    timeoutMs: 20_000,
+  });
+  assert.deepEqual(JSON.parse(control.stdout), { acquired: true }, control.stdout + control.stderr);
+});
+
+test("A-28 CASE 6: with the seam honoured the REAL hostname is not read; NODE_TEST_CONTEXT alone leaves it in force", () => {
+  const real = os.hostname;
+  let reads = 0;
+  const spy = mock.method(os, "hostname", () => {
+    reads += 1;
+    return real.call(os);
+  });
+  try {
+    const box = sandbox(false);
+    // seam honoured, no stand-in: nothing is read, and the answer is the control pod's
+    assert.deepEqual(readPodFileWithWitness(box.env()), { kind: "absent" });
+    assert.equal(reads, 0, "the real hostname was never read under the seam");
+    // the stand-in variable speaks under the seam …
+    assert.deepEqual(readPodFileWithWitness(box.env({ ACPX_POD_TEST_HOSTNAME: "ag-x" })), {
+      kind: "place-missing",
+    });
+    assert.equal(reads, 0);
+    // … and is dead without it: a leaked context alone reads the REAL hostname
+    readPodFileWithWitness({ NODE_TEST_CONTEXT: "child", ACPX_POD_TEST_HOSTNAME: "ag-x" });
+    assert.equal(reads, 1, "no seam: the real hostname is read, the stand-in ignored");
+  } finally {
+    spy.mock.restore();
+  }
+});
+
+test("A-28: the lock writer's place takes the same two witnesses for ANY state home", () => {
+  const withHost = (host: string, placeFile?: string) => {
+    const h = witnessHost(host, placeFile);
+    return lockHostPlace(h.box.env({ ACPX_POD_TEST_HOSTNAME: host }));
+  };
+  assert.equal(withHost("ag-x"), "agent-pod", "hostname witness alone");
+  assert.equal(withHost("dev-server-abc", NAME), "agent-pod", "file witness alone");
+  assert.equal(withHost("dev-server-abc"), "control", "neither");
+});

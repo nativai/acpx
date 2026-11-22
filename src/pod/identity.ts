@@ -3,11 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { isControlPod } from "../config/control-pod.js";
 import {
-  AGENT_POD_FILE_NAME,
-  CANONICAL_HOME,
   effectivePodEnv,
   podModeVerdict,
-  readAgentPodFile,
+  readPodFileWithWitness,
   TEST_HOME_ENV,
 } from "./placement.js";
 
@@ -98,9 +96,9 @@ export function lockHostPlace(env: NodeJS.ProcessEnv = process.env): LockHostPla
   if (!seam && !isControlPod(env)) {
     return "elsewhere";
   }
-  // The path is built here, under the rule above, rather than through `agentPodFilePath`.
-  const file = path.join(seam ?? CANONICAL_HOME, AGENT_POD_FILE_NAME);
-  return readAgentPodFile(file).kind === "absent" ? "control" : "agent-pod";
+  // A-28: an agent pod by EITHER witness (the place file, the kernel hostname `ag-…`), for ANY state
+  // home — the lock and lease writer's rule (A-25) takes both. The seam is honoured inside.
+  return readPodFileWithWitness(env).kind === "absent" ? "control" : "agent-pod";
 }
 
 /**
