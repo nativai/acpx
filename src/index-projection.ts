@@ -16,7 +16,10 @@ export const INDEX_PROJECTION_API_VERSION = 1 as const;
 
 export { type SessionIndexEntry } from "./session/persistence/index.js";
 export { sessionIndexPath, readSessionIndex } from "./session/persistence/index.js";
-export { projectRecordFilesIntoIndex } from "./session/persistence/index-update-queue.js";
+export {
+  projectRecordFilesIntoIndex,
+  reconcileSessionIndexFromDisk,
+} from "./session/persistence/index-update-queue.js";
 export { isIndexLockTimeoutError as isIndexLockTimeout } from "./session/persistence/index-lock.js";
 
 /**
