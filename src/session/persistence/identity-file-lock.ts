@@ -613,7 +613,6 @@ function sameHolder(
 /** Inside the mutex: read again (open-and-read, never `stat`), unlink only the judged holder. */
 async function removeJudgedHolder(
   lockPath: string,
-  plan: DecidedBreak,
   judged: ReadHolder,
 ): Promise<"broken" | "gone" | "changed"> {
   await deps.insideBreakMutex();
@@ -633,11 +632,16 @@ async function removeJudgedHolder(
   } catch (error) {
     return isGoneError(error) ? "gone" : "changed";
   }
-  await writeBreakLine(lockPath, judged.body, plan.proof);
   return "broken";
 }
 
-/** Carries out a decided break inside the break mutex. True when the lock is gone after it. */
+/**
+ * Carries out a decided break inside the break mutex. True when the lock is gone after it.
+ * ⚠️ THE LEDGER LINE IS WRITTEN AFTER THE MUTEX IS RELEASED (C1, test-engineer): the append is NFS
+ * I/O, and inside the critical section it widens the window for EVERY lock of the pod (the mutex is
+ * one name per pod). Same content, same call — only after `withBreakMutex` returned. It is still
+ * written before `executeBreak` returns, so the caller (acquire, the sweep) sees the line first.
+ */
 async function executeBreak(
   lockPath: string,
   policy: IdentityLockPolicy,
@@ -645,8 +649,9 @@ async function executeBreak(
   judged: ReadHolder,
   waitMs: number,
 ): Promise<boolean> {
-  const outcome = await withBreakMutex(waitMs, () => removeJudgedHolder(lockPath, plan, judged));
+  const outcome = await withBreakMutex(waitMs, () => removeJudgedHolder(lockPath, judged));
   if (outcome === "broken") {
+    await writeBreakLine(lockPath, judged.body, plan.proof);
     reportBreak(policy, lockPath, plan, judged.raw);
   }
   return outcome === "broken" || outcome === "gone";
