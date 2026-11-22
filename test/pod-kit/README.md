@@ -54,13 +54,14 @@ with a wait of its own and can see it ready: script what the Job does afterwards
 — checked AFTER admission, so at cap it is the retryable `refused reason=agent_cap`.
 
 Script (`BrokerScript`): `default` · `jobs[]` (the 1st Job CREATED gets `jobs[0]`, the 2nd `jobs[1]`, …; a refused POST consumes none) · `keys{<key>: behaviour}` (wins) ·
-`delete{delayMs,status}` · `status{…}`. A behaviour:
+`delete{delayMs,status}` · `status{…}` · `statusFails` (`GET /v1/agents` answers the real 502 `{"error":"kube_api_error"}`). A behaviour:
 
 ```
 { steps: ["scheduling", {line:"pulling", delayMs:300}],      // progress lines, per-step delay
   final: {ready:{ip,pod,uid,node,placement}} | {refused:{reason,live,cap}} | {error:"start_failed"} | "<raw line>",
   finalDelayMs: 100,
   hang: true,                                  // the steps, then never a final line (until DELETE / close)
+  truncate: true,                              // the steps, then the stream ENDS with no final line (broker.py run() raising past its catches)
   drop: {afterLines:1, times:1, beforeHeaders:false}, // cut the stream; the Job goes on
   respond: {status:503, body:"busy"} }         // a plain HTTP failure instead of a stream
 ```
@@ -86,7 +87,7 @@ Measured against the real API (TE, 2026-11-22): list items carry no `kind`/`apiV
 `limit` / `continue`.
 
 Script (`ApiScript`): `namespace` (default `"default"`) · `pods[{name, namespace?, uid?, node?, serviceAccount?, phase?, podIP?, labels?,
-annotations?, deleting?, ready?, readyTransitionTime?}]` (the pod's Ready condition and its `lastTransitionTime`, A-1) ·
+annotations?, containerStatuses?, reason?, deleting?, ready?, readyTransitionTime?}]` (`containerStatuses` / `reason`: the terminal detail a real pod carries, e.g. `state.terminated.reason: "OOMKilled"`) (the pod's Ready condition and its `lastTransitionTime`, A-1) ·
 `nodes[{name, ready: "True"|"False"|"Unknown"|null, readyTransitionTime?, unschedulable?}]` (`null` = no Ready condition) · `token`
 (then a missing / wrong bearer is a 401 `Status`) · `faults[{mode, path?, method?, status?, delayMs?, variant?, times?}]`.
 

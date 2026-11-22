@@ -1050,3 +1050,54 @@ test("run as a process from its TypeScript source: prints its port, honours --sc
     await new Promise((resolve) => child.once("exit", resolve));
   }
 });
+
+// ---- brick 27b28c68 (L-557-2/3): the real broker's other failure shapes ----
+
+test("truncate: the stream ENDS after its steps with no final line (broker.py run() raising past its catches); the Job goes on and a later POST follows it", async () => {
+  const broker = await startFakeBroker({
+    default: { steps: ["scheduling", "pulling"], truncate: true },
+  });
+  try {
+    const { key, body } = wellFormedAgentRequest("11111111-1111-4111-8111-111111111111");
+    const first = await postAgent(broker, key, body);
+    assert.equal(first.status, 200);
+    assert.deepEqual(first.lines, ["scheduling", "pulling"], "steps only: no final line");
+    assert.equal(first.clean, true, "the body ended, the connection was not cut");
+    assert.equal(broker.requests[0]?.outcome, "truncated");
+    // The Job went on: a later POST for the key joins it (it is not a new request).
+    const again = await postAgent(broker, key, body);
+    assert.equal(broker.requests[1]?.joinedExistingJob, true);
+    assert.deepEqual(again.lines, ["pulling"], "told where the pod is NOW, never the history");
+    // negative: without `truncate` the same behaviour ends with a final line
+    const plain = await startFakeBroker({ default: { steps: ["scheduling"] } });
+    try {
+      const done = await postAgent(plain, key, body);
+      assert.match(done.lines.at(-1) ?? "", READY_LINE);
+    } finally {
+      await plain.close();
+    }
+  } finally {
+    await broker.close();
+  }
+});
+
+test('statusFails: GET /v1/agents answers the real 502 {"error":"kube_api_error"}; POSTs are not affected; without it the snapshot is 200', async () => {
+  const broker = await startFakeBroker({ statusFails: true });
+  try {
+    const failed = await fetch(`${broker.url}/v1/agents`);
+    assert.equal(failed.status, 502);
+    assert.deepEqual(await failed.json(), { error: "kube_api_error" });
+    assert.equal(broker.requests[0]?.outcome, "status_failed");
+    const { key, body } = wellFormedAgentRequest("11111111-1111-4111-8111-111111111111");
+    const post = await postAgent(broker, key, body);
+    assert.match(post.lines.at(-1) ?? "", READY_LINE, "admission and POSTs still work");
+  } finally {
+    await broker.close();
+  }
+  const healthy = await startFakeBroker({});
+  try {
+    assert.equal((await fetch(`${healthy.url}/v1/agents`)).status, 200);
+  } finally {
+    await healthy.close();
+  }
+});

@@ -67,6 +67,12 @@ export interface BrokerBehavior {
   /** The stream never finishes: the steps are sent, then nothing, until DELETE or close. */
   hang?: boolean;
   /**
+   * The stream ENDS after the steps with NO final line — the real broker's `AgentEnsure.run()` catches only `Done` and
+   * `KubeError`, so anything else (a restart, an OOM) escapes after the 200 and some steps (broker.py `run()`). The Job
+   * goes on; a later POST follows it.
+   */
+  truncate?: boolean;
+  /**
    * Cut the connection of an attached stream once `afterLines` lines went out on it. The Job goes
    * on (C4: "the caller may stop reading at any time; the Job continues"), so a later POST for the
    * same key follows it. `times` streams are cut (default 1); `beforeHeaders` resets the connection
@@ -93,6 +99,7 @@ export interface BrokerThen {
   final?: BrokerFinal;
   finalDelayMs?: number;
   hang?: boolean;
+  truncate?: boolean;
   afterTimeout?: BrokerThen;
 }
 
@@ -130,6 +137,11 @@ export interface BrokerScript {
    * `quota:{used:0,hard:0}` to see that), `live` and `used` derived from the live Jobs unless scripted.
    */
   status?: BrokerStatus;
+  /**
+   * `GET /v1/agents` fails the way the real one does when the kube API does (broker.py `do_GET`): `502`
+   * `{"error":"kube_api_error"}`. Admission and POSTs are not affected.
+   */
+  statusFails?: boolean;
 }
 
 export interface BrokerRequestRecord {
@@ -168,6 +180,8 @@ interface Job {
   lines: string[];
   /** The line the CREATOR's stream ends with while the Job goes on (`error timeout`, `error kube_api_error`). */
   creatorEnd: string | undefined;
+  /** The creator's stream ended with NO final line (`truncate`); the Job goes on. */
+  truncated: boolean;
   done: boolean;
   /** The pod ended or the final line was not `ready`: a later POST creates a NEW Job (new uid). */
   ended: boolean;
@@ -543,6 +557,11 @@ export class FakeBroker {
       if (spec.hang === true) {
         return;
       }
+      if (spec.truncate === true) {
+        job.truncated = true;
+        this.notify(job);
+        return;
+      }
       await this.sleep(job, spec.finalDelayMs ?? 0);
       if (job.deleted) {
         return;
@@ -629,6 +648,11 @@ export class FakeBroker {
     this.requests.push(record);
 
     if (path === "/v1/agents" && method === "GET") {
+      if (this.script.statusFails === true) {
+        record.outcome = "status_failed";
+        this.sendJson(response, 502, { error: "kube_api_error" });
+        return;
+      }
       record.outcome = "status";
       this.sendJson(response, 200, this.statusBody());
       return;
@@ -907,6 +931,7 @@ export class FakeBroker {
         behavior,
         lines: [],
         creatorEnd: undefined,
+        truncated: false,
         done: false,
         ended: false,
         deleted: false,
@@ -994,6 +1019,11 @@ export class FakeBroker {
       }
       if (job.done) {
         record.outcome = "final";
+        response.end();
+        return;
+      }
+      if (job.truncated) {
+        record.outcome = "truncated";
         response.end();
         return;
       }

@@ -5,8 +5,9 @@ import type { AddressInfo } from "node:net";
  * A bare HTTP server for the few rows that need a counterpart MISBEHAVING in a way the X1 kit's fakes do not
  * model (no response headers at all, a malformed or failing `GET /v1/agents`, a DELETE answering 503 or an odd
  * body). It is not a fake of the broker or of anything else: it answers what the row hands it, and the row says
- * why the kit cannot. Each such row is a KIT GAP in brick 557fb3e7's report — when the kit learns the case, the
- * row moves to it.
+ * why the kit does not. After brick 27b28c68 every shape a REAL service produces is in the kit (`truncate`,
+ * `statusFails`, `PodSeed.containerStatuses`); what remains here are shapes no real service produces, kept to pin
+ * acpx's own strictness.
  */
 export type RawRequest = { method: string; url: string; body: string };
 
