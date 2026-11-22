@@ -396,6 +396,7 @@ function parseAcpxState(raw: unknown, neverRan: boolean): SessionAcpxState | und
   assignServedState(state, record.served);
   assignServedBelowFloor(state, record.served_below_floor);
   assignFloorParked(state, record.floor_parked);
+  assignLastPodEnd(state, record.last_pod_end);
   // B3: the depth-projection outcome MUST round-trip for the same reason the
   // served block does. It is the ONLY record of what a --reasoning-effort request
   // actually produced (three of its six outcomes send no value at all, so
@@ -473,6 +474,29 @@ function assignServedBelowFloor(state: SessionAcpxState, raw: unknown): void {
   copyStringField(parsed, crumb, "pinned_model");
   copyStringField(parsed, crumb, "pinned_effort");
   state.served_below_floor = parsed as NonNullable<SessionAcpxState["served_below_floor"]>;
+}
+
+/** The four required strings of `last_pod_end`; undefined when any is missing or `proof` is unknown. */
+function podEndCore(end: Record<string, unknown>): Record<string, unknown> | undefined {
+  const { at, pod, uid, proof } = end;
+  const named = [at, pod, uid].every((value) => typeof value === "string");
+  return named && (proof === "pod-gone" || proof === "pod-terminal")
+    ? { at, pod, uid, proof }
+    : undefined;
+}
+
+/** A4: a pod's end survives a cold reload, or the OOM it names is forgotten at the next owner respawn. */
+function assignLastPodEnd(state: SessionAcpxState, raw: unknown): void {
+  const end = asRecord(raw);
+  const parsed = end ? podEndCore(end) : undefined;
+  if (!end || !parsed) {
+    return;
+  }
+  copyStringField(parsed, end, "reason");
+  if (typeof end.exit_code === "number" && Number.isFinite(end.exit_code)) {
+    parsed.exit_code = end.exit_code;
+  }
+  state.last_pod_end = parsed as NonNullable<SessionAcpxState["last_pod_end"]>;
 }
 
 function assignFloorParked(state: SessionAcpxState, raw: unknown): void {

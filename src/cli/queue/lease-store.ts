@@ -194,7 +194,11 @@ export type QueueOwnerLiveness = {
   /** Why a foreign owner reads dead: `foreign-stale-no-listener` (row F4), `pod-gone`, `pod-terminal`. */
   deathReason?: string;
   /** C3.3 + A4: the pod whose death was proven, and (when its object was still readable) why it ended. */
-  podEnd?: { pod: PodRef; terminal?: PodTerminal };
+  podEnd?: {
+    pod: PodRef;
+    proof: "pod-gone" | "pod-terminal";
+    terminal?: PodTerminal;
+  };
 };
 
 export type QueueOwnerSkipReason = "foreign-owner" | "identity-unverified";
@@ -816,7 +820,7 @@ function podLeaseRow(proof: Extract<DeathProofDetail, { answer: "gone" }>, pod: 
     recoverable: true,
     alive: false as const,
     deathReason: proof.proof,
-    podEnd: { pod, ...(proof.terminal ? { terminal: proof.terminal } : {}) },
+    podEnd: { pod, proof: proof.proof, ...(proof.terminal ? { terminal: proof.terminal } : {}) },
   };
 }
 
@@ -930,7 +934,19 @@ async function cleanupRecoverableQueueOwner(
   }
   // INVARIANT (North Star): cleanup NEVER signals a process, and removes only the generation that
   // was judged provably gone.
-  return await reapJudgedLease(sessionId, owner);
+  const reaped = await reapJudgedLease(sessionId, owner);
+  if (reaped) {
+    await recordProvenPodEnd(sessionId, state);
+  }
+  return reaped;
+}
+
+/** A4: a pod proven gone leaves its end (OOMKilled included) on the session record. Never throws. */
+async function recordProvenPodEnd(sessionId: string, state: QueueOwnerLiveness): Promise<void> {
+  if (state.podEnd) {
+    const { recordPodEnd } = await import("../../pod/pod-end.js");
+    await recordPodEnd(sessionId, state.podEnd);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,8 +1116,8 @@ async function acquireUnderGuard(
     await removeUnparsableLeaseIfStale(lease.lockPath);
   } else if (existing.kind === "ok") {
     const { liveness } = await judgeLease(sessionId, existing.record);
-    if (liveness.recoverable) {
-      await reapJudgedLeaseUnderGuard(sessionId, existing.record);
+    if (liveness.recoverable && (await reapJudgedLeaseUnderGuard(sessionId, existing.record))) {
+      await recordProvenPodEnd(sessionId, liveness);
     }
   }
   return undefined; // the caller's existing handshake retries
