@@ -254,15 +254,15 @@ async function writePendingEntries(sessionDir: string, state: DirState): Promise
 function entryToWrite(
   fresh: SessionIndexEntry | undefined,
   existing: SessionIndexEntry | undefined,
-  snapshot: SessionIndexEntry,
-): SessionIndexEntry {
+  snapshot: SessionIndexEntry | undefined,
+): SessionIndexEntry | undefined {
   return fresh ?? existing ?? snapshot;
 }
 
 async function writeEntriesUnderLock(
   sessionDir: string,
   state: DirState,
-  pending: Map<string, SessionIndexEntry>,
+  pending: Map<string, SessionIndexEntry | undefined>,
 ): Promise<void> {
   await withSessionIndexLock(sessionDir, async () => {
     // 🛑 THE MERGE RULE (brick 19ee17ab, M2): the entry written is the record's
@@ -293,7 +293,10 @@ async function writeEntriesUnderLock(
       // A pending file pruned by another process between queue and flush
       // stays dropped — never resurrect an index row for a vanished file.
       if (diskFiles.has(file)) {
-        entries.push(entryToWrite(fresh.get(file), existing.get(file), snapshot));
+        const entry = entryToWrite(fresh.get(file), existing.get(file), snapshot);
+        if (entry) {
+          entries.push(entry);
+        }
       }
     }
     await writeSessionIndex(sessionDir, { files: index.files, entries });
@@ -340,6 +343,26 @@ export async function updateSessionIndexForRecordWrite(
     timer.unref?.();
     state.timer = timer;
   }
+}
+
+/**
+ * THE PROJECTION EXPORT (block A8, `src/index-projection.ts`): the atrium server's batch entry.
+ * Re-projects every named record file from the record as it stands on disk — read INSIDE the index
+ * lock, the same merge rule as this module's own flush — and rewrites the index ONCE for the whole
+ * batch. A file that cannot be read keeps the index's existing row (no snapshot exists here). A
+ * lock timeout throws `IndexLockTimeoutError` (the caller retries with its next batch): nothing is
+ * written unlocked.
+ */
+export async function projectRecordFilesIntoIndex(
+  sessionDir: string,
+  files: readonly string[],
+): Promise<{ files: number }> {
+  if (files.length === 0) {
+    return { files: 0 };
+  }
+  const state = stateFor(sessionDir);
+  await writeEntriesUnderLock(sessionDir, state, new Map(files.map((file) => [file, undefined])));
+  return { files: files.length };
 }
 
 /**

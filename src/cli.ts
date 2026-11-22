@@ -89,6 +89,10 @@ if (isCliEntrypoint(process.argv)) {
   } else if (process.argv.length === 3 && process.argv[2] === "__pod-lock-module") {
     // The atrium server's loader for the lock module (pod-lock.ts; EXPORT-lock-module.md, brick 8d85cb47).
     process.stdout.write(`${new URL("./pod-lock.js", import.meta.url).href}\n`);
+  } else if (process.argv.length === 3 && process.argv[2] === "__index-projection-module") {
+    // The atrium server's loader for the index projection (index-projection.ts; block A8 → S5,
+    // brick 88112988 reports/EXPORT-projection.md).
+    process.stdout.write(`${new URL("./index-projection.js", import.meta.url).href}\n`);
   } else if (process.argv[2] === "__pod-lock-sweep") {
     // One pass of the pod lock sweep over this state home (+ named dirs), for the idle loop (C3.2).
     // A DYNAMIC import: this entry's static graph stays light (see the ⚠️ above).
