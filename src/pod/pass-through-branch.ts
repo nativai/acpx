@@ -57,23 +57,11 @@ export {
   type PassThroughInput,
 } from "./pass-through-args.js";
 
-// ─── the marker: a routed command is never routed twice (A-8) ─────────────────────────────────
+// ─── the marker: a routed command is never routed twice (A-8) — one helper, shared with block A6 ──
 
-/** C2's per-call marker: set on every command the control pod's routed call runs in an agent pod. */
-export const ROUTED_MARKER_ENV = "ACPX_ROUTED";
+import { isRoutedCall, ROUTED_MARKER_ENV, ROUTED_TWICE_REFUSAL } from "./routed-twice.js";
 
-export function isRoutedCall(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env[ROUTED_MARKER_ENV] === "1";
-}
-
-/** `acpx: REFUSED reason=routed_twice` — exit 2: a command that was routed would be routed again. */
-export const ROUTED_TWICE_REFUSAL = {
-  exitCode: 2,
-  lines: [
-    "acpx: REFUSED reason=routed_twice",
-    "This command arrived over the control pod's routed channel (ACPX_ROUTED=1) and would be routed again; it is refused rather than looped. Nothing was started.",
-  ] as [string, string],
-};
+export { isRoutedCall, ROUTED_MARKER_ENV, ROUTED_TWICE_REFUSAL };
 
 // ─── the handler ──────────────────────────────────────────────────────────────────────────────
 

@@ -254,7 +254,10 @@ export type CapacityRefusalReason =
   | "memory_pressure"
   | "node_pressure"
   | "cpu_pressure"
-  | "admission_busy";
+  | "admission_busy"
+  // C7.2 — the pod plane (a pod is on its way / no pod can be started now).
+  | "pod_starting"
+  | "agent_cap";
 
 /**
  * Additive JSON-RPC data of a capacity refusal. `capacity` is the same snapshot `acpx capacity
@@ -274,6 +277,8 @@ export type CapacityRefusalDetail = {
   message?: string;
   /** A WAKE refusal only: the released session that was not started. */
   wake?: { sessionId: string; seatId: string | null };
+  /** `pod_starting` / `agent_cap` only (C7.2): the fields of the token line beyond the common ones. */
+  pod?: { phase?: string; why?: string; live?: number; cap?: number; box?: string };
 };
 
 /**

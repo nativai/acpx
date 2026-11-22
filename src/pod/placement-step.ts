@@ -293,12 +293,12 @@ export function refusalJson(refusal: Refusal): string {
 
 /**
  * The branch implementations later blocks plug in. Until a block registers its branch, the branch
- * refuses with `pod_branch_unbuilt`. A handler returns the process exit code.
+ * refuses with `pod_branch_unbuilt`. A handler returns the process exit code, or `"proceed"` to run the command locally.
  */
 export type BranchHandler = (
   decision: PlacementDecision & { kind: "branch" },
   context: BranchContext,
-) => Promise<number>;
+) => Promise<number | "proceed">;
 
 /**
  * What a branch handler is handed beyond the decision (brick 7eb9686f): the argv the decision was
@@ -354,6 +354,16 @@ export async function runPlacementStep(params: {
   return await act(decision, params.argv, params.write, params.writeStdout ?? params.write);
 }
 
+/** A registered handler's outcome: `"proceed"` (A6, C1.2 "answered from the record") runs today's local path. */
+async function runHandler(
+  decision: PlacementDecision & { kind: "branch" },
+  handler: BranchHandler,
+  context: BranchContext,
+): Promise<"proceed" | { exitCode: number }> {
+  const outcome = await handler(decision, context);
+  return outcome === "proceed" ? "proceed" : { exitCode: outcome };
+}
+
 async function act(
   decision: PlacementDecision,
   argv: readonly string[],
@@ -365,7 +375,7 @@ async function act(
   }
   const handler = decision.kind === "branch" ? branchHandler(decision.branch) : undefined;
   if (handler && decision.kind === "branch") {
-    return { exitCode: await handler(decision, { argv, write, writeStdout }) };
+    return await runHandler(decision, handler, { argv, write, writeStdout });
   }
   // A decision with no refusal is unreachable by the type; fail closed rather than proceed.
   const refusal = refusalFor(decision) ?? {
