@@ -124,7 +124,14 @@ function ledgerLines(uid = OWN.uid): Record<string, unknown>[] {
 
 let stderr: string[];
 const realWrite = process.stderr.write.bind(process.stderr);
+// ⚠️ THE IN-PROCESS ROWS RUN UNDER THE EXPLICIT TEST-POD SEAM. The production break mutex is ONE name
+// per network namespace (H1), and every test file of one `node --test` run shares this namespace: a
+// row that stalls inside it (the F2 stall holds it for seconds) would make a concurrent file's
+// ordinary break wait — measured: `session-index-lock` T15 "taken over at once" read 1.7 s. With the
+// seam the name carries the pod uid, so these rows only contend with themselves.
+const savedTestHome = process.env.ACPX_POD_TEST_HOME;
 test.beforeEach(() => {
+  process.env.ACPX_POD_TEST_HOME = tmpDir();
   process.env.ACPX_STATE_HOME = tmpDir();
   stderr = [];
   process.stderr.write = ((chunk: string | Uint8Array) => {
@@ -133,6 +140,11 @@ test.beforeEach(() => {
   }) as typeof process.stderr.write;
 });
 test.afterEach(() => {
+  if (savedTestHome === undefined) {
+    delete process.env.ACPX_POD_TEST_HOME;
+  } else {
+    process.env.ACPX_POD_TEST_HOME = savedTestHome;
+  }
   process.stderr.write = realWrite;
   setPodLockDepsForTests(undefined);
   if (savedStateHome === undefined) {
@@ -246,7 +258,13 @@ for (const proof of [GONE, TERMINAL]) {
       v: 1,
       ts: lines[0].ts,
       lock,
-      holder: { pod: OTHER, pid: judged.pid, token: judged.token },
+      holder: {
+        pod: OTHER,
+        pid: judged.pid,
+        token: judged.token,
+        host: "elsewhere",
+        boot: null,
+      },
       breaker: { pod: OWN, pid: process.pid },
       proof: proof.answer === "gone" ? proof.proof : "",
     });
@@ -415,8 +433,10 @@ test("the break mutex is released by the KERNEL when its holder dies (SIGKILL)",
     process.execPath,
     [
       "-e",
-      'require("net").createServer().listen({ path: "\\0acpx-lock-break." + process.argv[1] }, () => console.log("bound"))',
-      OWN.uid,
+      // The PRODUCTION name: no suffix outside the explicit test-pod seam (H1).
+      // (argv cannot carry a NUL byte: the abstract name's leading NUL is added in the child.)
+      'require("net").createServer().listen({ path: "\\0" + process.argv[1] }, () => console.log("bound"))',
+      `${BREAK_MUTEX_NAME.slice(1)}.${OWN.uid}`, // the seam's name: this row runs under it
     ],
     { stdio: ["ignore", "pipe", "inherit"] },
   );
@@ -536,18 +556,38 @@ test("F2 NEVER: a process without its own identity never breaks a lock that carr
   assert.equal(proofCalls, 0, "it does not even ask");
 });
 
-test("F2: the PRODUCTION break-mutex name is one fixed string, whatever the environment; only node --test appends the uid", () => {
+test("F2: the PRODUCTION break-mutex name is one fixed string, whatever the environment; only the explicit test-pod seam appends the uid", () => {
   assert.equal(breakMutexNameFor({}, OWN), BREAK_MUTEX_NAME);
   assert.equal(breakMutexNameFor({}, undefined), BREAK_MUTEX_NAME);
   assert.equal(breakMutexNameFor({ NV_POD_UID: "x", HOSTNAME: "h" }, OTHER), BREAK_MUTEX_NAME);
-  assert.equal(
-    breakMutexNameFor({ NODE_TEST_CONTEXT: "child" }, OWN),
-    `${BREAK_MUTEX_NAME}.${OWN.uid}`,
-  );
+  const seam = { NODE_TEST_CONTEXT: "child", ACPX_POD_TEST_HOME: "/tmp/some-test-home" };
+  assert.equal(breakMutexNameFor(seam, OWN), `${BREAK_MUTEX_NAME}.${OWN.uid}`);
   assert.notEqual(
-    breakMutexNameFor({ NODE_TEST_CONTEXT: "child" }, OWN),
-    breakMutexNameFor({ NODE_TEST_CONTEXT: "child" }, OTHER),
+    breakMutexNameFor(seam, OWN),
+    breakMutexNameFor(seam, OTHER),
     "two test pods in one network namespace stay apart",
+  );
+});
+
+test("H1 NEVER: a leaked NODE_TEST_CONTEXT alone (` `, 0, false, child) never changes the mutex name — only the explicit test-pod seam does", () => {
+  for (const leaked of [" ", "0", "false", "child", "1"]) {
+    assert.equal(breakMutexNameFor({ NODE_TEST_CONTEXT: leaked }, OWN), BREAK_MUTEX_NAME, leaked);
+    assert.equal(
+      breakMutexNameFor({ NODE_TEST_CONTEXT: leaked }, undefined),
+      BREAK_MUTEX_NAME,
+      leaked,
+    );
+  }
+  // the seam variable without a test context is dead, as for every seam
+  assert.equal(
+    breakMutexNameFor({ ACPX_POD_TEST_HOME: "/tmp/x" }, OWN),
+    BREAK_MUTEX_NAME,
+    "no NODE_TEST_CONTEXT, no seam",
+  );
+  assert.equal(
+    breakMutexNameFor({ NODE_TEST_CONTEXT: "", ACPX_POD_TEST_HOME: "/tmp/x" }, OWN),
+    BREAK_MUTEX_NAME,
+    "an EMPTY NODE_TEST_CONTEXT honours no seam",
   );
 });
 
@@ -637,5 +677,144 @@ test("an EMPTY NODE_TEST_CONTEXT honours no seam: neither the place seam nor the
     "positive control",
   );
   assert.notEqual(lockHostPlace({ ...base, NODE_TEST_CONTEXT: "" }), "agent-pod");
-  assert.equal(breakMutexNameFor({ NODE_TEST_CONTEXT: "" }, OWN), BREAK_MUTEX_NAME);
+  assert.equal(
+    breakMutexNameFor({ NODE_TEST_CONTEXT: "", ACPX_POD_TEST_HOME: home }, OWN),
+    BREAK_MUTEX_NAME,
+  );
+});
+
+// ---- P1 (HoD ruling, test-engineer 0b53d599): in an agent pod a body without `pod` is never written ----
+
+test("P1 NEVER: in an AGENT POD (place file) a writer without a complete identity refuses pod_identity_missing and holds nothing — whatever the switch says", async () => {
+  // The test-engineer's repro: ACPX_OWNER_PLACEMENT lost (podModeRequested false) and the identity gone.
+  setPodLockDepsForTests({
+    ownPod: () => undefined,
+    lockPod: () => undefined,
+    podModeRequested: () => false,
+    place: () => "agent-pod",
+  });
+  const lock = path.join(tmpDir(), "x.json.lock");
+  await assert.rejects(acquireIdentityFileLock(lock, policy()), { code: "pod_identity_missing" });
+  assert.equal(fs.existsSync(lock), false, "nothing written");
+  assert.equal(
+    fs.readdirSync(path.dirname(lock)).filter((name) => name.endsWith(".tmp")).length,
+    0,
+  );
+});
+
+test("P1 positive controls: the same writer with its identity, or outside an agent pod without one, writes as before", async () => {
+  asPod("agent-pod", EXISTS);
+  const withIdentity = identityLockBody({ pid: 1 });
+  assert.deepEqual(withIdentity.pod, OWN);
+  for (const place of ["control", "elsewhere"] as const) {
+    setPodLockDepsForTests({
+      ownPod: () => undefined,
+      lockPod: () => undefined,
+      place: () => place,
+    });
+    assert.equal(
+      Object.hasOwn(identityLockBody({ pid: 1 }), "pod"),
+      false,
+      `${place}: today's body`,
+    );
+  }
+});
+
+test("P1 end to end: a live agent-pod holder cannot be taken over by the control pod as a pod-less body — the lost-identity process refuses, the holder's lock stays", async () => {
+  const dir = tmpDir();
+  const lock = path.join(dir, "x.json.lock");
+  asPod("agent-pod", EXISTS);
+  const held = await acquireIdentityFileLock(lock, policy());
+  assert.deepEqual((JSON.parse(held) as { pod: unknown }).pod, OWN);
+  // A second process of the SAME agent pod that lost its identity: refuses, writes nothing.
+  setPodLockDepsForTests({
+    ownPod: () => undefined,
+    lockPod: () => undefined,
+    place: () => "agent-pod",
+  });
+  await assert.rejects(acquireIdentityFileLock(lock, policy(300)), {
+    code: "pod_identity_missing",
+  });
+  assert.equal(fs.readFileSync(lock, "utf8"), held, "the live holder's lock is untouched");
+  // The control pod, with proof `exists` for the agent pod, cannot break it either.
+  asPod("control", EXISTS, { ownPod: () => THIRD, lockPod: () => THIRD });
+  await expectNotBroken(lock, held, 400);
+});
+
+// ---- L1: every ledger line carries the broken holder's host and boot ----
+
+test("L1: a break line carries the holder's host and boot — also for a body without `pod`, so a cross-pod break is readable", async () => {
+  asPod("control", UNKNOWN);
+  const lock = path.join(tmpDir(), "x.json.lock");
+  const boot = "11111111-2222-4333-8444-555555555555";
+  plant(lock, JSON.stringify({ pid: deadPid(), host: "wb-elsewhere", boot }), 0);
+  await releaseIdentityFileLock(lock, await acquireIdentityFileLock(lock, policy()));
+  const [line] = ledgerLines();
+  assert.deepEqual(line.holder, {
+    pod: null,
+    pid: (line.holder as { pid: number }).pid,
+    token: null,
+    host: "wb-elsewhere",
+    boot,
+  });
+});
+
+test("L1: with only a birth identity the holder's boot is its processIdentity.bootId; neither ⇒ null", async () => {
+  asPod("control", UNKNOWN);
+  const dir = tmpDir();
+  const a = path.join(dir, "a.json.lock");
+  const bootId = "99999999-2222-4333-8444-555555555555";
+  plant(
+    a,
+    JSON.stringify({
+      pid: deadPid(),
+      host: "h",
+      processIdentity: {
+        kind: "linux-proc-stat-starttime",
+        startTimeTicks: "1",
+        bootId,
+        pidNamespace: "pid:[1]",
+        timeNamespace: "time:[1]",
+      },
+    }),
+    0,
+  );
+  await releaseIdentityFileLock(a, await acquireIdentityFileLock(a, policy()));
+  assert.equal((ledgerLines().at(-1)!.holder as { boot: unknown }).boot, bootId);
+  const b = path.join(dir, "b.json.lock");
+  plant(b, JSON.stringify({ pid: deadPid() }), 0);
+  await releaseIdentityFileLock(b, await acquireIdentityFileLock(b, policy()));
+  const last = ledgerLines().at(-1)!.holder as { host: unknown; boot: unknown };
+  assert.deepEqual([last.host, last.boot], [null, null]);
+});
+
+test("A-25: on a host with the place file NO body is written without `pod` — an isolated state home, no switch, no identity, in a seam agent pod: refused before any file exists", async () => {
+  const dir = tmpDir();
+  const record = path.join(dir, "state", "rec.json");
+  fs.mkdirSync(path.dirname(record), { recursive: true });
+  const run = await runInPod(undefined, CHILD, ["record-acquire", record], {
+    saDir: makeServiceAccountDir(dir),
+    testHome: makeTestHome(dir, "agent-pod"), // the place file says: agent pod
+    stateHome: path.join(dir, "state"), // an ISOLATED state home: not the canonical one
+    timeoutMs: 20_000,
+  });
+  assert.equal(JSON.parse(run.stdout).code, "pod_identity_missing", run.stdout + run.stderr);
+  assert.deepEqual(
+    fs.readdirSync(path.dirname(record)),
+    [],
+    "no lock file and no temp file was created",
+  );
+});
+
+test("A-25 positive control: the same isolated state home in a seam CONTROL pod without an identity writes today's body (no place file)", async () => {
+  const dir = tmpDir();
+  const record = path.join(dir, "state", "rec.json");
+  fs.mkdirSync(path.dirname(record), { recursive: true });
+  const run = await runInPod(undefined, CHILD, ["record-acquire", record], {
+    saDir: makeServiceAccountDir(dir),
+    testHome: makeTestHome(dir, "control"),
+    stateHome: path.join(dir, "state"),
+    timeoutMs: 20_000,
+  });
+  assert.deepEqual(JSON.parse(run.stdout), { acquired: true }, run.stdout + run.stderr);
 });
