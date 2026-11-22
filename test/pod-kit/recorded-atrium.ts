@@ -14,7 +14,8 @@
 //   normal   answers from the script;
 //   away     the in-pod forwarder's answer: 503, `Retry-After: 5`, body {"error":"atrium-away"};
 //   refused  the port refuses connections (the listener is closed; open connections are cut);
-//   hang     accepts and never answers.
+//   hang     accepts and never answers;
+//   forbidden the caller gate's final 403 (C6.1: no client retries it) — `{"error":"forbidden"}` on every route.
 // A script is a list of phases, each for a time (`forMs`) or a number of answered requests
 // (`forRequests`), the last one for ever — "away for N seconds, then back" is
 // `[{mode:"away", forMs:N}, {mode:"normal"}]`; "away for the first 3 attempts" is
@@ -28,7 +29,7 @@ import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import type { AddressInfo, Socket } from "node:net";
 import { fileURLToPath } from "node:url";
 
-export type AtriumMode = "normal" | "away" | "refused" | "hang";
+export type AtriumMode = "normal" | "away" | "refused" | "hang" | "forbidden";
 
 export interface AtriumPhase {
   mode: AtriumMode;
@@ -67,24 +68,36 @@ export interface AtriumScript {
 }
 
 /**
- * `"queued"` — accepted: 200 `{"delivery_id", "status":"queued"}`.
- * `"held"` / `{held:{reason}}` — queued for room: 202 `{"delivery_id", "status":"held", "held":{"reason"}}`
- * (reason default `pod_starting`; the shape inside `held` is the kit's assumption, see README).
- * `{status, body}` — any other answer, verbatim.
+ * Atrium's message answer (acpx-ui `server/message-routes.ts` `messageAnswer`, as the atrium sub-HoD gave it):
+ * EVERY accepted message is **202** `{delivery_id, from, to, to_seat?, status:"queued"}` — `status` is always
+ * "queued". `"held"` / `{held:{reason, ahead?}}`: the same, ALSO carrying `held:{reason, ahead?}` and
+ * `message:"<sentence>"` (reason default `pod_starting`, or `agent_cap`). `{status, body}` — any other
+ * answer, verbatim (a 403 `caller-mismatch`, …).
  */
 export type MessageAnswer =
   | "queued"
   | "held"
-  | { held: { reason: string } }
+  | { held: { reason: string; ahead?: number } }
   | { status: number; body: unknown };
 
 /**
  * The names a create may inherit from its creator's environment (C6.2 `inherit`): a closed list kept in
- * acpx. Source: A1's export on the command-classes surface (branch `ap/a1-classes`, src/pod/command-classes.ts) —
- * until that is on `agent-pods` this is a copy, start `ACPX_SUBSCRIPTION`, `ATRIUM_OS`. Replace it by the
- * import when the export lands.
+ * acpx — `PASS_THROUGH_INHERIT` in src/pod/command-classes.ts. A COPY, on purpose: this file must run as a bare
+ * Node process (`node recorded-atrium.ts`), where it cannot import acpx's `.js`-specifier sources. The
+ * self-test `INHERIT_ALLOWED equals PASS_THROUGH_INHERIT` goes red if they drift.
  */
 export const INHERIT_ALLOWED: readonly string[] = ["ACPX_SUBSCRIPTION", "ATRIUM_OS"];
+
+/**
+ * The create paths that take `--record-id` and `--created-by-call` — `RECORD_ID_CREATE_PATHS` in
+ * src/pod/pass-through-args.ts, copied for the same reason and guarded by the same kind of self-test.
+ * `sessions handover` is the create form that carries neither flag, by design (C6.2).
+ */
+export const RECORD_ID_CREATE_PATHS: readonly string[] = [
+  "sessions new",
+  "sessions copy",
+  "sessions import",
+];
 
 export type AtriumRoute =
   | "call"
@@ -132,7 +145,6 @@ function isString(value: unknown): value is string {
 
 const MAX_STDIN_BYTES = 8 * 1024 * 1024;
 const MAX_DEADLINE_MS = 60_000;
-const ENDED_REASONS = new Set(["idle", "closed", "stale-release", "deadline", "term"]);
 
 function validateCall(body: Record<string, unknown>): string[] {
   const problems: string[] = [];
@@ -152,19 +164,22 @@ function validateCall(body: Record<string, unknown>): string[] {
       problems.push("stdin_b64_too_large");
     }
   }
-  if (!isString(body.cwd)) {
-    problems.push("cwd");
+  // A-9: the pass-through carries NO cwd. Atrium ignores one if sent; the kit still names it, so a
+  // client that sends it is visible to the test.
+  if (body.cwd !== undefined) {
+    problems.push("cwd_present");
   }
   const caller = body.caller;
   if (!isRecord(caller)) {
     problems.push("caller");
   } else {
-    for (const field of ["session_url", "seat_url", "record_id"]) {
+    for (const field of ["session_url", "record_id"]) {
       if (!isString(caller[field])) {
         problems.push(`caller.${field}`);
       }
     }
-    for (const field of ["parent_session_url", "parent_seat_url"]) {
+    // seat_url, like the parents, is optional (a session without a seat) — as atrium's parser has it.
+    for (const field of ["seat_url", "parent_session_url", "parent_seat_url"]) {
       if (caller[field] !== undefined && !isString(caller[field])) {
         problems.push(`caller.${field}`);
       }
@@ -172,19 +187,6 @@ function validateCall(body: Record<string, unknown>): string[] {
   }
   if (!isString(body.admission_class)) {
     problems.push("admission_class");
-  }
-  // `inherit`: what a create inherits, by name -> value (the server puts the values in the child's
-  // environment). Absent is fine. Whether a NAME is allowed is the server's answer, not a shape problem.
-  if (body.inherit !== undefined) {
-    if (!isRecord(body.inherit)) {
-      problems.push("inherit");
-    } else {
-      for (const [name, value] of Object.entries(body.inherit)) {
-        if (typeof value !== "string") {
-          problems.push(`inherit.${name}`);
-        }
-      }
-    }
   }
   if (
     typeof body.deadline_ms !== "number" ||
@@ -216,7 +218,8 @@ function validateHint(kind: "ready" | "ended", body: Record<string, unknown>): s
     if (!isRecord(pod) || !isString(pod.uid)) {
       problems.push("pod");
     }
-    if (typeof body.reason !== "string" || !ENDED_REASONS.has(body.reason)) {
+    // C6.3: an open set (`idle`, `closed`, `stale-release`, `deadline`, `term`, `unused`, …): any non-empty string.
+    if (!isString(body.reason)) {
       problems.push("reason");
     }
   }
@@ -436,6 +439,12 @@ export class RecordedAtrium {
       this.afterAnswer();
       return;
     }
+    if (record.mode === "forbidden") {
+      record.outcome = "forbidden";
+      this.sendJson(response, record, 403, { error: "forbidden" });
+      this.afterAnswer();
+      return;
+    }
     if (record.mode === "away") {
       record.outcome = "away";
       this.sendJson(response, record, 503, { error: "atrium-away" }, { "retry-after": "5" });
@@ -479,15 +488,31 @@ export class RecordedAtrium {
       const answer = messages.answers?.[this.messagesAnswered] ?? messages.default ?? "queued";
       this.messagesAnswered += 1;
       const deliveryId = randomUUID();
-      if (answer === "queued") {
-        this.sendJson(response, record, 200, { delivery_id: deliveryId, status: "queued" });
-      } else if (answer === "held" || "held" in answer) {
-        const reason = answer === "held" ? "pod_starting" : answer.held.reason;
-        record.outcome = "held";
+      if (answer === "queued" || answer === "held" || "held" in answer) {
+        const sent = record.body ?? {};
+        const seats = record.route === "seat_message";
+        const target = record.target ?? "";
+        const held =
+          answer === "queued"
+            ? undefined
+            : answer === "held"
+              ? { reason: "pod_starting" }
+              : answer.held;
+        if (held !== undefined) {
+          record.outcome = "held";
+        }
         this.sendJson(response, record, 202, {
           delivery_id: deliveryId,
-          status: "held",
-          held: { reason },
+          from: typeof sent.from === "string" ? sent.from : "anonymous",
+          to: seats ? `session-of-${target}` : target,
+          ...(seats ? { to_seat: target } : {}),
+          status: "queued",
+          ...(held === undefined
+            ? {}
+            : {
+                held,
+                message: `Held (${held.reason}): delivery ${deliveryId} waits for room and goes out by itself.`,
+              }),
         });
       } else {
         this.sendJson(response, record, answer.status, answer.body);
@@ -524,14 +549,12 @@ export class RecordedAtrium {
     }
     const callId = typeof body.call_id === "string" ? body.call_id : null;
     record.callId = callId;
-    // C6.2: a name outside acpx's closed list is refused, and nothing runs — no rule is consumed, no
-    // answer is remembered for the call id.
-    const notAllowed = isRecord(body.inherit)
-      ? Object.keys(body.inherit).find((name) => !INHERIT_ALLOWED.includes(name))
-      : undefined;
-    if (notAllowed !== undefined) {
-      record.outcome = "inherit_not_allowed";
-      this.sendJson(response, record, 400, { error: "inherit-not-allowed", name: notAllowed });
+    // atrium's own refusals, before anything runs (no rule consumed, no answer remembered for the call id):
+    // C6.2 `inherit` (a name -> string object, names from the closed list) and the at-most-once flags.
+    const refusal = this.refuseCall(body, callId);
+    if (refusal !== null) {
+      record.outcome = refusal.outcome;
+      this.sendJson(response, record, 400, refusal.body);
       return;
     }
     // C6.2 "at most once": the same call_id finds what the first one made and returns it.
@@ -564,6 +587,62 @@ export class RecordedAtrium {
     }
     record.outcome = "answered";
     this.answerCall(response, record, answer);
+  }
+
+  private refuseCall(
+    body: Record<string, unknown>,
+    callId: string | null,
+  ): { outcome: string; body: Record<string, unknown> } | null {
+    const refuse = (error: string, extra: Record<string, unknown> = {}) => ({
+      outcome: error.replaceAll("-", "_"),
+      body: { error, ...extra },
+    });
+    if (body.inherit !== undefined) {
+      if (!isRecord(body.inherit)) {
+        return refuse("bad-inherit");
+      }
+      for (const [name, value] of Object.entries(body.inherit)) {
+        if (typeof value !== "string") {
+          return refuse("inherit-not-string", { name });
+        }
+      }
+      const notAllowed = Object.keys(body.inherit).find((name) => !INHERIT_ALLOWED.includes(name));
+      if (notAllowed !== undefined) {
+        return refuse("inherit-not-allowed", { name: notAllowed });
+      }
+    }
+    const argv = Array.isArray(body.argv)
+      ? (body.argv as unknown[]).filter((a) => typeof a === "string")
+      : [];
+    const end = argv.indexOf("--");
+    const words = end < 0 ? argv : argv.slice(0, end);
+    const path = words.findIndex((word, index) => word === "sessions" && index + 1 < words.length);
+    const isCreate =
+      path >= 0 && RECORD_ID_CREATE_PATHS.includes(`sessions ${words[path + 1] ?? ""}`);
+    if (!isCreate) {
+      return null;
+    }
+    const flag = (name: string): Array<string | undefined> =>
+      words.flatMap((word, index) =>
+        word === name
+          ? [words[index + 1]]
+          : word.startsWith(`${name}=`)
+            ? [word.slice(name.length + 1)]
+            : [],
+      );
+    const ids = flag("--record-id");
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (ids.length !== 1 || ids[0] === undefined || !uuid.test(ids[0])) {
+      return refuse("record-id-required");
+    }
+    // A-27: the client owns both flags; a --created-by-call that is not this call's id is refused.
+    if (flag("--created-by-call").some((value) => value?.toLowerCase() !== callId?.toLowerCase())) {
+      return refuse("call-id-mismatch");
+    }
+    if (flag("--prompt").length + flag("--prompt-file").length > 1) {
+      return refuse("more-than-one-first-message");
+    }
+    return null;
   }
 
   private answerCall(

@@ -196,7 +196,7 @@ test("a never-finishing stream sends its steps and then nothing, until DELETE en
       const deleted = await fetch(`${broker.url}/v1/agents/${key}`, { method: "DELETE" });
       assert.equal(deleted.status, 200);
       const answer = await pending;
-      assert.deepEqual(answer.lines, ["scheduling", "pulling"]);
+      assert.deepEqual(answer.lines, ["scheduling", "pulling", "error deleted"]);
       assert.equal(record?.outcome, "job_deleted");
       assert.equal((await getAgents(broker)).live, 0);
     },
@@ -310,6 +310,48 @@ test("C9: only an optional tool (pi-extensions) may be left out of releases; a r
       releases: { ...(body.releases as object), "pi-extensions": "" },
     });
     assert.deepEqual(broker.requests.at(-1)?.problems, ["releases_invalid:pi-extensions"]);
+  });
+});
+
+test("C4 `error deleted`: a POST that was following the key when a DELETE ran ends with it; a POST after the DELETE gets a fresh Job", async () => {
+  await withBroker({ default: { steps: ["scheduling"], finalDelayMs: 5_000 } }, async (broker) => {
+    const { key, body } = wellFormedAgentRequest("session-deleted");
+    const following = postAgent(broker, key, body);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal((await deleteAgent(broker, key)).status, 200);
+    const answer = await following;
+    assert.deepEqual(
+      answer.lines,
+      ["scheduling", "error deleted"],
+      "the follower is told, not left hanging",
+    );
+    assert.equal(answer.clean, true);
+    assert.ok(
+      !answer.lines.some((line) => line.startsWith("ready")),
+      "never re-created for the follower",
+    );
+    assert.equal((await getAgents(broker)).live, 0);
+    broker.setScript({ default: { steps: ["scheduling"] } });
+    const fresh = await postAgent(broker, key, body);
+    assert.match(fresh.lines.at(-1) ?? "", READY_LINE, "recover = delete, then wake");
+    const posts = broker.requestsFor("POST", key);
+    assert.equal(posts[1]?.joinedExistingJob, false);
+    assert.notEqual(posts[1]?.jobSeq, posts[0]?.jobSeq);
+  });
+});
+
+test("C4 `never created while another pod of the key is still terminating`: a POST during the termination waits for it", async () => {
+  await withBroker({ delete: { delayMs: 400 } }, async (broker) => {
+    const { key, body } = wellFormedAgentRequest("session-terminating-post");
+    await postAgent(broker, key, body);
+    const deleting = deleteAgent(broker, key);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const started = Date.now();
+    const fresh = await postAgent(broker, key, body);
+    assert.ok(Date.now() - started >= 250, "the new Job waited for the old pod to be gone");
+    assert.match(fresh.lines.at(-1) ?? "", READY_LINE);
+    await deleting;
+    assert.equal(broker.requestsFor("POST", key)[1]?.joinedExistingJob, false);
   });
 });
 

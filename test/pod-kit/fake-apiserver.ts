@@ -33,6 +33,13 @@ export interface PodSeed {
   node?: string;
   /** Default `Running`. `Succeeded` and `Failed` are the terminal phases (C3.3). */
   phase?: string;
+  /** The pod's Ready condition status; default "True" while Running, else "False". */
+  ready?: ReadyStatus;
+  /**
+   * `status.conditions[type=Ready].lastTransitionTime` (A-1): acpx counts its `agent_unreachable` bound from
+   * it. An ISO time; default: now.
+   */
+  readyTransitionTime?: string;
   podIP?: string;
   labels?: Record<string, string>;
   annotations?: Record<string, string>;
@@ -44,10 +51,19 @@ export interface NodeSeed {
   name: string;
   /** The Ready condition's status. `null`: the node reports no Ready condition at all. Default "True". */
   ready?: ReadyStatus | null;
+  /** The Ready condition's `lastTransitionTime` (ISO); default: now. */
+  readyTransitionTime?: string;
   labels?: Record<string, string>;
 }
 
-export type FaultMode = "hang" | "reset" | "status" | "slow" | "malformed";
+export type FaultMode = "hang" | "reset" | "status" | "slow" | "malformed" | "notfound";
+
+/**
+ * A 404 that is NOT the proof of absence (DEATH-PROOF-QUERIES.md v1.1, "NotFound"): acpx must read each as
+ * `unknown`. `text` — `text/plain`; `empty` — no body; `other_reason` — a Status with another reason;
+ * `other_name` — details naming another object; `other_kind` — details of another kind.
+ */
+export type NotFoundVariant = "text" | "empty" | "other_reason" | "other_name" | "other_kind";
 
 export interface ApiFault {
   mode: FaultMode;
@@ -56,6 +72,8 @@ export interface ApiFault {
   method?: string;
   /** For `status`: the HTTP status (default 503). */
   status?: number;
+  /** For `notfound`: which wrong 404 (default `text`). The fault answers 404 even where the object exists. */
+  variant?: NotFoundVariant;
   /** For `slow`: wait this long, then answer normally. */
   delayMs?: number;
   /** The fault applies to this many requests, then is spent (default: for ever). */
@@ -339,7 +357,11 @@ export class FakeApiServer {
         phase: seed.phase ?? "Running",
         ...(seed.podIP === undefined ? {} : { podIP: seed.podIP }),
         conditions: [
-          { type: "Ready", status: (seed.phase ?? "Running") === "Running" ? "True" : "False" },
+          {
+            type: "Ready",
+            status: seed.ready ?? ((seed.phase ?? "Running") === "Running" ? "True" : "False"),
+            lastTransitionTime: seed.readyTransitionTime ?? new Date().toISOString(),
+          },
         ],
       },
     };
@@ -357,6 +379,28 @@ export class FakeApiServer {
     }
     this.resourceVersion += 1;
     (pod.status as Record<string, unknown>).phase = phase;
+    pod.metadata.resourceVersion = String(this.resourceVersion);
+    this.emit("MODIFIED", pod);
+  }
+
+  /** Flip the pod's Ready condition; `lastTransitionTime` moves with it (now unless given). */
+  setPodReady(
+    name: string,
+    ready: ReadyStatus,
+    transitionTime?: string,
+    namespace = this.defaultNamespace,
+  ): void {
+    const pod = this.pods.get(`${namespace}/${name}`);
+    if (pod === undefined) {
+      throw new Error(`fake-apiserver: no pod ${namespace}/${name}`);
+    }
+    this.resourceVersion += 1;
+    const conditions = (pod.status as { conditions: Array<Record<string, unknown>> }).conditions;
+    const entry = conditions.find((condition) => condition.type === "Ready");
+    if (entry !== undefined) {
+      entry.status = ready;
+      entry.lastTransitionTime = transitionTime ?? new Date().toISOString();
+    }
     pod.metadata.resourceVersion = String(this.resourceVersion);
     this.emit("MODIFIED", pod);
   }
@@ -392,6 +436,7 @@ export class FakeApiServer {
                   status: ready,
                   reason: ready === "True" ? "KubeletReady" : "NodeStatusUnknown",
                   lastHeartbeatTime: new Date().toISOString(),
+                  lastTransitionTime: seed.readyTransitionTime ?? new Date().toISOString(),
                 },
               ],
       },
@@ -512,6 +557,8 @@ export class FakeApiServer {
         this.sendStatus(response, record, fault.status ?? 503, "scripted failure");
       } else if (fault.mode === "malformed") {
         this.send(response, record, 200, "<html>upstream gateway</html>");
+      } else if (fault.mode === "notfound") {
+        this.wrongNotFound(url.pathname, fault.variant ?? "text", response, record);
       }
       // hang: no answer, ever
       return;
@@ -522,6 +569,47 @@ export class FakeApiServer {
       return;
     }
     this.route(method, url, response, record);
+  }
+
+  private wrongNotFound(
+    path: string,
+    variant: NotFoundVariant,
+    response: ServerResponse,
+    record: ApiRequestRecord,
+  ): void {
+    const asked = /\/(pods|nodes)\/([^/]+)$/.exec(path);
+    const kind = asked?.[1] ?? "pods";
+    const name = asked?.[2] ?? "x";
+    if (variant === "text") {
+      record.status = 404;
+      response.writeHead(404, { "content-type": "text/plain" });
+      response.end("404 page not found\n");
+    } else if (variant === "empty") {
+      record.status = 404;
+      response.writeHead(404);
+      response.end();
+    } else if (variant === "other_reason") {
+      this.send(
+        response,
+        record,
+        404,
+        statusBody(404, `${kind} "${name}" gone`, "Gone", { name, kind }),
+      );
+    } else if (variant === "other_name") {
+      this.send(
+        response,
+        record,
+        404,
+        statusBody(404, `${kind} "other" not found`, "NotFound", { name: `${name}-other`, kind }),
+      );
+    } else {
+      this.send(
+        response,
+        record,
+        404,
+        statusBody(404, `services "${name}" not found`, "NotFound", { name, kind: "services" }),
+      );
+    }
   }
 
   private route(
@@ -700,6 +788,9 @@ export class FakeApiServer {
       case "setPodPhase":
         this.setPodPhase(op.name, op.phase, op.namespace);
         break;
+      case "setPodReady":
+        this.setPodReady(op.name, op.ready, op.transitionTime, op.namespace);
+        break;
       case "addNode":
         this.addNode(op.node);
         break;
@@ -721,6 +812,13 @@ export type KitOp =
   | { op: "addPod"; pod: PodSeed }
   | { op: "removePod"; name: string; namespace?: string }
   | { op: "setPodPhase"; name: string; phase: string; namespace?: string }
+  | {
+      op: "setPodReady";
+      name: string;
+      ready: ReadyStatus;
+      transitionTime?: string;
+      namespace?: string;
+    }
   | { op: "addNode"; node: NodeSeed }
   | { op: "removeNode"; name: string }
   | { op: "setNodeReady"; name: string; ready: ReadyStatus | null }

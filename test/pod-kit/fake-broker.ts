@@ -608,6 +608,9 @@ export class FakeBroker {
     }
     record.problems.push(...validateRequest(body, key));
 
+    // C4 "never created while another pod of the key is still terminating": a POST that arrives during
+    // a DELETE's termination waits for it, then creates a fresh Job as usual.
+    await this.terminating.get(key)?.done;
     let job = this.jobs.get(key);
     if (job === undefined) {
       const behavior = this.behaviorFor(key);
@@ -693,8 +696,12 @@ export class FakeBroker {
         return;
       }
       if (job.deleted) {
+        // C4 (BR1): the pod this POST was following was deleted by a concurrent DELETE — the final
+        // line is `error deleted`, and the Job is never re-created for a POST that was following it.
+        const line = "error deleted";
+        record.linesSent.push(line);
         record.outcome = "job_deleted";
-        response.end();
+        response.end(`${line}\n`);
         return;
       }
       await new Promise<void>((resolve) => {

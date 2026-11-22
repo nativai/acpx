@@ -3,7 +3,13 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { INHERIT_ALLOWED, startRecordedAtrium } from "./pod-kit/recorded-atrium.js";
+import { PASS_THROUGH_INHERIT } from "../src/pod/command-classes.js";
+import { RECORD_ID_CREATE_PATHS as REAL_RECORD_ID_CREATE_PATHS } from "../src/pod/pass-through-args.js";
+import {
+  INHERIT_ALLOWED,
+  RECORD_ID_CREATE_PATHS,
+  startRecordedAtrium,
+} from "./pod-kit/recorded-atrium.js";
 import type { AtriumScript, RecordedAtrium } from "./pod-kit/recorded-atrium.js";
 
 // Self-test of the X1 recorded atrium (CONTRACTS-r4.md C6): the wire shapes it answers, what it
@@ -18,12 +24,13 @@ async function withAtrium(script: AtriumScript, run: (atrium: RecordedAtrium) =>
   }
 }
 
+const RECORD = "3f1c1e1a-2b3c-4d5e-8f60-7a8b9c0d1e2f";
+
 function callBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     contract: 1,
     call_id: randomUUID(),
-    argv: ["sessions", "new", "--name", "x"],
-    cwd: "/workspace",
+    argv: ["sessions", "new", "--name", "x", "--record-id", RECORD],
     caller: {
       session_url: "https://atrium.invalid/?session=s1",
       seat_url: "https://atrium.invalid/?seat=t1",
@@ -67,7 +74,7 @@ test("POST /api/acpx/call answers {exit, stdout, stderr} and records the request
     assert.deepEqual(record?.problems, []);
     assert.equal(record?.callId, body.call_id);
     assert.equal(record?.stdin, "a brief\n");
-    assert.deepEqual(record?.body?.argv, ["sessions", "new", "--name", "x"]);
+    assert.deepEqual(record?.body?.argv, ["sessions", "new", "--name", "x", "--record-id", RECORD]);
     assert.equal(record?.mode, "normal");
   });
 });
@@ -81,12 +88,16 @@ test("departures from C6.2's request shape are recorded by name, never silently 
       ["argv with a non-string", { argv: ["a", 1] }, "argv"],
       ["stdin not base64", { stdin_b64: "not base64!" }, "stdin_b64"],
       ["stdin over 8 MiB", { stdin_b64: huge }, "stdin_b64_too_large"],
-      ["no cwd", { cwd: undefined }, "cwd"],
+      [
+        "a cwd that IS present (A-9: the pass-through carries none)",
+        { cwd: "/workspace" },
+        "cwd_present",
+      ],
       ["no caller", { caller: undefined }, "caller"],
       [
-        "caller without seat_url",
-        { caller: { session_url: "x", record_id: "r" } },
-        "caller.seat_url",
+        "caller without record_id",
+        { caller: { session_url: "x", seat_url: "y" } },
+        "caller.record_id",
       ],
       ["no admission_class", { admission_class: undefined }, "admission_class"],
       ["deadline over 60 s", { deadline_ms: 60_001 }, "deadline_ms"],
@@ -189,7 +200,7 @@ test("message routes record their target and body; default answer is a queued de
     });
     const seat = await post(atrium, "/api/seats/seat-1/message", { message: "yo" });
     for (const answer of [session, seat]) {
-      assert.equal(answer.status, 200);
+      assert.equal(answer.status, 202, "EVERY accepted message answers 202, never 200");
       const parsed = JSON.parse(answer.text) as { delivery_id: string; status: string };
       assert.equal(parsed.status, "queued");
       assert.match(parsed.delivery_id, /^[0-9a-f-]{36}$/);
@@ -212,7 +223,7 @@ test("message routes: both answers — 200 queued when accepted, 202 held when q
   await withAtrium(
     {
       messages: {
-        answers: ["queued", "held", { held: { reason: "agent_cap" } }],
+        answers: ["queued", "held", { held: { reason: "agent_cap", ahead: 2 } }],
         default: "queued",
       },
     },
@@ -231,16 +242,31 @@ test("message routes: both answers — 200 queued when accepted, 202 held when q
         });
       }
       assert.deepEqual(
-        answers.map((entry) => [entry.status, entry.body.status]),
+        answers.map((entry) => [entry.status, entry.body.status, "held" in entry.body]),
         [
-          [200, "queued"],
-          [202, "held"],
-          [202, "held"],
-          [200, "queued"],
+          [202, "queued", false],
+          [202, "queued", true],
+          [202, "queued", true],
+          [202, "queued", false],
         ],
+        "202 always, status STAYS queued; a hold is marked by `held` + `message`, never by a status",
       );
       assert.deepEqual(answers[1]?.body.held, { reason: "pod_starting" });
-      assert.deepEqual(answers[2]?.body.held, { reason: "agent_cap" });
+      assert.deepEqual(answers[2]?.body.held, { reason: "agent_cap", ahead: 2 });
+      for (const index of [1, 2]) {
+        assert.equal(typeof answers[index]?.body.message, "string");
+      }
+      assert.equal(answers[0]?.body.message, undefined);
+      assert.deepEqual(
+        [answers[0]?.body.from, answers[0]?.body.to, answers[0]?.body.to_seat],
+        ["anonymous", "a", undefined],
+        "a session route: to = the session, no to_seat",
+      );
+      assert.deepEqual(
+        [answers[1]?.body.to, answers[1]?.body.to_seat],
+        ["session-of-b", "b"],
+        "a seat route: to_seat = the seat",
+      );
       for (const entry of answers) {
         assert.match(String(entry.body.delivery_id), /^[0-9a-f-]{36}$/);
       }
@@ -290,12 +316,109 @@ test("inherit is validated: a name outside the closed list is 400 inherit-not-al
   );
 });
 
-test("inherit shape: not an object, or a non-string value, is a recorded problem", async () => {
-  await withAtrium({}, async (atrium) => {
-    await post(atrium, "/api/acpx/call", callBody({ inherit: ["ACPX_SUBSCRIPTION"] }));
-    assert.deepEqual(atrium.requests.at(-1)?.problems, ["inherit"]);
-    await post(atrium, "/api/acpx/call", callBody({ inherit: { ACPX_SUBSCRIPTION: 7 } }));
-    assert.deepEqual(atrium.requests.at(-1)?.problems, ["inherit.ACPX_SUBSCRIPTION"]);
+test("inherit: not an object is 400 bad-inherit; a non-string value is 400 inherit-not-string naming it — nothing runs", async () => {
+  await withAtrium({ calls: [{ answer: { exit: 0, stdout: "ran\n" } }] }, async (atrium) => {
+    const a = await post(atrium, "/api/acpx/call", callBody({ inherit: ["ACPX_SUBSCRIPTION"] }));
+    assert.deepEqual([a.status, JSON.parse(a.text)], [400, { error: "bad-inherit" }]);
+    const b = await post(atrium, "/api/acpx/call", callBody({ inherit: { ACPX_SUBSCRIPTION: 7 } }));
+    assert.deepEqual(
+      [b.status, JSON.parse(b.text)],
+      [400, { error: "inherit-not-string", name: "ACPX_SUBSCRIPTION" }],
+    );
+    const c = await post(atrium, "/api/acpx/call", callBody({ inherit: { PATH: 7 } }));
+    assert.equal(
+      JSON.parse(c.text).error,
+      "inherit-not-string",
+      "the shape is checked before the name",
+    );
+    assert.deepEqual(
+      atrium.requests.map((entry) => entry.outcome),
+      ["bad_inherit", "inherit_not_string", "inherit_not_string"],
+    );
+    assert.equal(
+      atrium.requestsFor("call").every((entry) => entry.stdin === null),
+      true,
+    );
+    const ok = JSON.parse((await post(atrium, "/api/acpx/call", callBody())).text);
+    assert.equal(ok.stdout, "ran\n", "no call was consumed by the refusals");
+  });
+});
+
+test("INHERIT_ALLOWED and RECORD_ID_CREATE_PATHS equal acpx's own exports (the kit's copies cannot drift)", () => {
+  assert.deepEqual([...INHERIT_ALLOWED], [...PASS_THROUGH_INHERIT]);
+  assert.deepEqual([...RECORD_ID_CREATE_PATHS], [...REAL_RECORD_ID_CREATE_PATHS]);
+});
+
+test("A-27: a create's --created-by-call must be call_id (400 call-id-mismatch); --record-id must be one uuid; one first message", async () => {
+  await withAtrium({ calls: [{ answer: { exit: 0, stdout: "ran\n" } }] }, async (atrium) => {
+    const callId = randomUUID();
+    const create = (extra: string[], id = callId) =>
+      callBody({ call_id: id, argv: ["sessions", "new", ...extra] });
+    const refusal = async (body: Record<string, unknown>) => {
+      const answer = await post(atrium, "/api/acpx/call", body);
+      return [answer.status, JSON.parse(answer.text)] as const;
+    };
+    assert.deepEqual(
+      await refusal(create(["--record-id", RECORD, "--created-by-call", randomUUID()])),
+      [400, { error: "call-id-mismatch" }],
+    );
+    assert.deepEqual(await refusal(create(["--created-by-call", callId])), [
+      400,
+      { error: "record-id-required" },
+    ]);
+    assert.deepEqual(await refusal(create(["--record-id", "not-a-uuid"])), [
+      400,
+      { error: "record-id-required" },
+    ]);
+    assert.deepEqual(
+      await refusal(create(["--record-id", RECORD, "--record-id", RECORD])),
+      [400, { error: "record-id-required" }],
+      "more than one --record-id",
+    );
+    assert.deepEqual(
+      await refusal(create(["--record-id", RECORD, "--prompt", "a", "--prompt-file", "-"])),
+      [400, { error: "more-than-one-first-message" }],
+    );
+    assert.equal(atrium.requests.length, 5);
+    assert.equal(
+      atrium.requests.every((entry) => entry.outcome !== "answered"),
+      true,
+      "nothing ran",
+    );
+    // the same shapes that are right: both flags with call_id (also the `=` form and any case), a create
+    // without --created-by-call runs as sent, and handover carries neither flag by design
+    for (const argv of [
+      ["sessions", "new", "--record-id", RECORD, "--created-by-call", callId.toUpperCase()],
+      [
+        "sessions",
+        "copy",
+        `--record-id=${RECORD}`,
+        `--created-by-call=${callId}`,
+        "--prompt",
+        "hi",
+      ],
+      ["sessions", "import", "--record-id", RECORD],
+      ["sessions", "handover", "--brief", "-"],
+      ["sessions", "list"],
+    ]) {
+      const answer = await post(atrium, "/api/acpx/call", callBody({ call_id: callId, argv }));
+      assert.equal(answer.status, 200, argv.join(" "));
+      atrium.setScript({ calls: [{ answer: { exit: 0, stdout: "ran\n" } }] });
+    }
+  });
+});
+
+test("the caller gate's final 403 (C6.1): mode forbidden answers 403 on every route, and it is not away", async () => {
+  await withAtrium({ phases: [{ mode: "forbidden" }] }, async (atrium) => {
+    for (const [path, body] of [
+      ["/api/acpx/call", callBody()],
+      ["/api/sessions/s/message", {}],
+      ["/api/agent-pods/k/ready", readyHint],
+    ] as const) {
+      const answer = await post(atrium, path, body);
+      assert.deepEqual([answer.status, JSON.parse(answer.text)], [403, { error: "forbidden" }]);
+      assert.equal(answer.headers.get("retry-after"), null, "a 403 carries no Retry-After");
+    }
   });
 });
 
@@ -320,7 +443,7 @@ test("hints: well-formed ready and ended are recorded clean; departures are name
       ["ready", "ready: placement", { ...readyHint, placement: "auto" }, "placement"],
       ["ready", "ready: releases", { ...readyHint, releases: undefined }, "releases"],
       ["ended", "ended: no uid", { pod: {}, reason: "idle" }, "pod"],
-      ["ended", "ended: reason", { pod: { uid: "u" }, reason: "tired" }, "reason"],
+      ["ended", "ended: reason not a string", { pod: { uid: "u" }, reason: 5 }, "reason"],
     ];
     for (const [kind, name, body, problem] of bad) {
       await post(atrium, `/api/agent-pods/k/${kind}`, body);
@@ -329,7 +452,15 @@ test("hints: well-formed ready and ended are recorded clean; departures are name
         `${name}: ${JSON.stringify(atrium.requests.at(-1)?.problems)}`,
       );
     }
-    for (const reason of ["idle", "closed", "stale-release", "deadline", "term"]) {
+    for (const reason of [
+      "idle",
+      "closed",
+      "stale-release",
+      "deadline",
+      "term",
+      "unused",
+      "anything-new",
+    ]) {
       await post(atrium, "/api/agent-pods/k/ended", { pod: { uid: "u" }, reason });
       assert.deepEqual(atrium.requests.at(-1)?.problems, [], reason);
     }
@@ -368,7 +499,7 @@ test("away for the first N requests, then back — counted in requests, no clock
       for (let index = 0; index < 5; index += 1) {
         statuses.push((await post(atrium, "/api/seats/t/message", {})).status);
       }
-      assert.deepEqual(statuses, [503, 503, 503, 200, 200]);
+      assert.deepEqual(statuses, [503, 503, 503, 202, 202]);
       assert.deepEqual(
         atrium.requests.map((entry) => entry.mode),
         ["away", "away", "away", "normal", "normal"],
@@ -383,7 +514,7 @@ test("away for N ms, then back — the stub changes state on its own clock, the 
     async (atrium) => {
       assert.equal((await post(atrium, "/api/seats/t/message", {})).status, 503);
       await new Promise((resolve) => setTimeout(resolve, 350));
-      assert.equal((await post(atrium, "/api/seats/t/message", {})).status, 200);
+      assert.equal((await post(atrium, "/api/seats/t/message", {})).status, 202);
       const [first, second] = atrium.requests;
       assert.ok((second?.atMs ?? 0) - (first?.atMs ?? 0) >= 300);
       assert.equal(atrium.mode, "normal");
@@ -396,7 +527,7 @@ test("refused: a real ECONNREFUSED on the same port, open connections cut, then 
     const { port } = atrium;
     assert.equal(
       (await post(atrium, "/api/seats/t/message", {})).status,
-      200,
+      202,
       "keep-alive connection is open",
     );
     atrium.setMode("refused", 400);
@@ -414,7 +545,7 @@ test("refused: a real ECONNREFUSED on the same port, open connections cut, then 
     assert.equal(atrium.port, port);
     assert.equal(
       (await post(atrium, "/api/seats/t/message", {})).status,
-      200,
+      202,
       "back on the same port",
     );
   });

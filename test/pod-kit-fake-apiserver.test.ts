@@ -221,6 +221,106 @@ test("faults: reset cuts the connection; malformed answers 200 with a body that 
   });
 });
 
+test("A-1: the pod's Ready lastTransitionTime is scriptable, defaults to now, moves with setPodReady", async () => {
+  await withApi(
+    {
+      pods: [
+        {
+          name: "ag-a",
+          ready: "False",
+          readyTransitionTime: "2026-11-21T10:00:00.000Z",
+          node: "n1",
+        },
+        { name: "ag-b" },
+      ],
+      nodes: [{ name: "n1", ready: "Unknown", readyTransitionTime: "2026-11-21T09:00:00.000Z" }],
+    },
+    async (api) => {
+      const ready = async (name: string) => {
+        const { body } = await getJson(api, podPath(name));
+        return (body.status.conditions as Array<Record<string, string>>).find(
+          (condition) => condition.type === "Ready",
+        );
+      };
+      assert.deepEqual(await ready("ag-a"), {
+        type: "Ready",
+        status: "False",
+        lastTransitionTime: "2026-11-21T10:00:00.000Z",
+      });
+      const before = Date.now();
+      const defaulted = await ready("ag-b");
+      assert.equal(defaulted?.status, "True");
+      assert.ok(Date.parse(defaulted?.lastTransitionTime ?? "") >= before - 5_000);
+      api.setPodReady("ag-a", "True", "2026-11-21T11:30:00.000Z", NS);
+      assert.deepEqual(await ready("ag-a"), {
+        type: "Ready",
+        status: "True",
+        lastTransitionTime: "2026-11-21T11:30:00.000Z",
+      });
+      const node = (await getJson(api, "/api/v1/nodes/n1")).body;
+      assert.equal(node.status.conditions[0].lastTransitionTime, "2026-11-21T09:00:00.000Z");
+      assert.equal(node.status.conditions[0].status, "Unknown");
+    },
+  );
+});
+
+test("v1.1 NotFound: the real 404 names the asked object; each other 404 shape is scriptable and differs in exactly one respect", async () => {
+  await withApi({ pods: [{ name: "ag-a" }], nodes: [{ name: "n1" }] }, async (api) => {
+    for (const [path, kind, name] of [
+      [podPath("ag-nope"), "pods", "ag-nope"],
+      ["/api/v1/nodes/n-nope", "nodes", "n-nope"],
+    ] as const) {
+      const { status, body } = await getJson(api, path);
+      assert.equal(status, 404);
+      assert.deepEqual(
+        [body.kind, body.reason, body.details.kind, body.details.name, body.code],
+        ["Status", "NotFound", kind, name, 404],
+      );
+    }
+  });
+  const wrong = async (variant: string) => {
+    const api = await startFakeApiServer({
+      namespace: NS,
+      pods: [{ name: "ag-a" }],
+      faults: [{ mode: "notfound", variant: variant as "text" }],
+    });
+    try {
+      const response = await fetch(`${api.url}${podPath("ag-a")}`);
+      const text = await response.text();
+      let body: Record<string, any> | null = null;
+      try {
+        body = JSON.parse(text) as Record<string, any>;
+      } catch {
+        body = null;
+      }
+      return { status: response.status, type: response.headers.get("content-type"), text, body };
+    } finally {
+      await api.close();
+    }
+  };
+  const text = await wrong("text");
+  assert.deepEqual([text.status, text.type, text.body], [404, "text/plain", null]);
+  const empty = await wrong("empty");
+  assert.deepEqual([empty.status, empty.text], [404, ""]);
+  const reason = await wrong("other_reason");
+  assert.deepEqual(
+    [reason.body?.kind, reason.body?.reason, reason.body?.details.kind, reason.body?.details.name],
+    ["Status", "Gone", "pods", "ag-a"],
+  );
+  const name = await wrong("other_name");
+  assert.deepEqual(
+    [name.body?.reason, name.body?.details.kind, name.body?.details.name],
+    ["NotFound", "pods", "ag-a-other"],
+  );
+  const kind = await wrong("other_kind");
+  assert.deepEqual(
+    [kind.body?.reason, kind.body?.details.kind, kind.body?.details.name],
+    ["NotFound", "services", "ag-a"],
+  );
+  // the fault answers 404 even though the pod exists — that is what makes it a wrong 404
+  assert.equal(text.status, 404);
+});
+
 test("faults: slow answers normally, after the delay", async () => {
   await withApi(
     { faults: [{ mode: "slow", delayMs: 250 }], pods: [{ name: "ag-a" }] },
