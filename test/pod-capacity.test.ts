@@ -351,6 +351,23 @@ test("pod mode: text output names the broker's figures and what binds", async ()
   }
 });
 
+test("pod mode: `--need-build` stays the control pod's own answer (a release build runs there); the broker decides `--need` only", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  const broker = await BROKER({ live: 9, cap: 10 }); // the broker says full ...
+  try {
+    const run = await capacity(f, broker.url, ["--need-build"]);
+    const json = lastJson(run.stdout);
+    const build = json.build as { fits: boolean; reason: string };
+    // ... and `--need-build` still reads the box's memory: its verdict is `build.fits`, whatever the broker says.
+    assert.equal(json.needBuildMet, build.fits);
+    assert.equal(run.code, build.fits ? 0 : 75);
+    assert.equal(json.need, undefined, "no --need was asked");
+    assert.equal(json.basis, "pod");
+  } finally {
+    await broker.close();
+  }
+});
+
 // ── admit-wake ──────────────────────────────────────────────────────────────────────────────────
 
 const wake = async (f: Fixture, url: string, id: string) =>
