@@ -1,6 +1,8 @@
 import { lstatSync, readdirSync, rmSync } from "node:fs";
+import fs from "node:fs/promises";
 import path from "node:path";
 import { readQueueOwnerState } from "../cli/queue/lease-store.js";
+import { queueLockFilePath } from "../cli/queue/paths.js";
 import { AcpxOperationalError } from "../errors.js";
 import { lockHostPlace } from "../pod/identity.js";
 import { acpxStateRoot } from "./persistence/session-base-dir.js";
@@ -70,11 +72,25 @@ function newestMtimeMs(dir: string): number | undefined {
   return newest;
 }
 
+/**
+ * ⚠️ ONLY A MISSING LEASE (ENOENT) MEANS "GONE" (TE finding F8). A lease file that EXISTS but cannot be
+ * read (EACCES, any I/O error) or parsed (garbage, a torn write) names an owner this reader cannot judge:
+ * `readLeaseFile` maps those to "unparsable", which the lease store's other callers rightly read as "no
+ * usable owner" — and which would read here as "no owner", deleting a live session's scratch. So the
+ * reaper looks at the file itself first; everything but ENOENT is `unknown`, and unknown is kept.
+ * (`readLeaseFile`'s own answer is untouched.)
+ */
 async function ownerStateOf(sessionId: string): Promise<ScratchOwnerState> {
   try {
+    try {
+      await fs.readFile(queueLockFilePath(sessionId), "utf8");
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT" ? "gone" : "unknown";
+    }
+    // The file exists and reads. A lease the store cannot parse is "not found" to it — here: unknown.
     const liveness = await readQueueOwnerState(sessionId);
     if (!liveness.ownerFound) {
-      return "gone";
+      return "unknown";
     }
     return liveness.alive === false ? "gone" : liveness.alive === true ? "live" : "unknown";
   } catch {

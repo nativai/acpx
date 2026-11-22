@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { tryAcquireQueueOwnerLease, releaseQueueOwnerLease } from "../src/cli/queue/lease-store.js";
+import { queueLockFilePath } from "../src/cli/queue/paths.js";
 import { reapSessionScratch, type ScratchOwnerState } from "../src/session/scratch-reaper.js";
 import { removeTempHome } from "./temp-home.js";
 
@@ -146,6 +147,72 @@ test("the owner is judged by the REAL lease as everywhere else: a live lease kee
     } finally {
       await releaseQueueOwnerLease(lease);
     }
+  });
+});
+
+// ---- F8: only a MISSING lease means gone — a lease that exists but cannot be read or parsed is UNKNOWN ----
+
+function plantLease(sessionId: string, body: string, mode?: number): string {
+  const file = queueLockFilePath(sessionId);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, body);
+  if (mode !== undefined) {
+    fs.chmodSync(file, mode);
+  }
+  return file;
+}
+
+test("F8 NEGATIVE: a lease that EXISTS but is unreadable (EACCES) keeps the scratch — judged by the real reaper path", async (t) => {
+  if (process.getuid?.() === 0) {
+    t.skip("root reads a mode-000 file");
+    return;
+  }
+  await withHome(async (_home, root) => {
+    const dir = entry(root, "lease-eacces", 30);
+    const file = plantLease("lease-eacces", '{"pid": 1}', 0o000);
+    try {
+      const result = await reapSessionScratch();
+      assert.deepEqual(result.removed, []);
+      assert.deepEqual(result.keptLiveOwner, ["acpx-lease-eacces"]);
+      assert.equal(fs.existsSync(dir), true);
+    } finally {
+      fs.chmodSync(file, 0o600);
+    }
+  });
+});
+
+test("F8 NEGATIVE: a lease that exists but is garbage (torn JSON, empty, wrong shape) keeps the scratch", async () => {
+  await withHome(async (_home, root) => {
+    const bodies = ['{"pid": 12', "", "[]", JSON.stringify({ hello: "world" })];
+    for (const [index, body] of bodies.entries()) {
+      const id = `lease-garbage-${index}`;
+      entry(root, id, 30);
+      plantLease(id, body);
+    }
+    const result = await reapSessionScratch();
+    assert.deepEqual(result.removed, [], "no garbage lease read as 'no owner'");
+    assert.equal(result.keptLiveOwner.length, bodies.length);
+  });
+});
+
+test("F8: a MISSING lease is still gone — removed; and so is a well-formed lease of a dead process", async () => {
+  await withHome(async (_home, root) => {
+    const missing = entry(root, "lease-missing", 30);
+    const dead = entry(root, "lease-dead", 30);
+    const lease = await tryAcquireQueueOwnerLease("lease-dead");
+    assert.ok(lease);
+    const file = queueLockFilePath("lease-dead");
+    const record = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+    delete record.processIdentity;
+    delete record.host;
+    fs.writeFileSync(file, JSON.stringify({ ...record, pid: 999_999 }));
+    const result = await reapSessionScratch();
+    assert.equal(fs.existsSync(missing), false, "no lease file at all");
+    assert.equal(fs.existsSync(dead), false, "a lease whose owner process is provably gone");
+    assert.deepEqual(
+      result.removed.toSorted((a, b) => a.localeCompare(b)),
+      ["acpx-lease-dead", "acpx-lease-missing"],
+    );
   });
 });
 
