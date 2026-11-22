@@ -1592,12 +1592,11 @@ test("A-46 a control-pod link whose release name is bad fails resolveReleases, n
 });
 
 test("A-46 a `releases` that names a bad release for one tool is refused release_unresolved tool=<that tool> BEFORE the broker; with every name real, the broker is asked", async () => {
-  const broker = await startBroker({ lines: [READY] });
+  const broker = await startFakeBroker({ default: { final: READY } });
   try {
-    const good = { acpx: "rel-1", "pi-acp": "rel-3", pi: "rel-2" };
     for (const bad of [".", "..", ".hidden", "a+b", "previous", "a".repeat(129)]) {
-      const options = ensureOptions(makeStub(), broker.origin, {
-        releases: { ok: true, releases: { ...good, "claude-agent-acp": bad } },
+      const options = ensureOptions(makeStub(), broker.url, {
+        releases: { ok: true, releases: { ...FULL_RELEASES, "claude-agent-acp": bad } },
       });
       const error = await expectRouted(runRoutedCall(options));
       assert.equal(error.reason, "release_unresolved", bad);
@@ -1605,18 +1604,23 @@ test("A-46 a `releases` that names a bad release for one tool is refused release
         error.stderrLine,
         `acpx: ROUTED outcome=not_run reason=release_unresolved tool=claude-agent-acp call_id=${options.callId}`,
       );
-      assert.equal(broker.seen.length, 0, `${JSON.stringify(bad)}: the broker was never asked`);
+      assert.equal(broker.requests.length, 0, `${JSON.stringify(bad)}: the broker was never asked`);
     }
     for (const real of REAL_NAMES) {
-      const before: number = broker.seen.length;
+      const before: number = broker.requests.length;
       await runRoutedCall(
-        ensureOptions(makeStub(), broker.origin, {
-          releases: { ok: true, releases: { ...good, "claude-agent-acp": real } },
+        ensureOptions(makeStub(), broker.url, {
+          releases: { ok: true, releases: { ...FULL_RELEASES, "claude-agent-acp": real } },
         }),
       );
-      assert.equal(broker.seen.length, before + 1, `${real}: the broker was asked`);
+      assert.equal(broker.requests.length, before + 1, `${real}: the broker was asked`);
+      assert.deepEqual(
+        broker.requests[before]?.problems,
+        [],
+        `${real}: the broker accepts the body`,
+      );
     }
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
