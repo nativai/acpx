@@ -504,7 +504,15 @@ function exportedValues(text: string): string[] {
  * Kinds: a non-literal `import(x)`; `createRequire` however it is reached — a named import (aliased or not), a
  * `node:module` default or namespace binding's `.createRequire`, `process.getBuiltinModule(…).createRequire`;
  * `getBuiltinModule(…)` itself; `new Function(…)` / `Function(…)` / `eval(…)`; a non-literal `require(x)`; and a custom
- * loader's `.import(…)` / `.require(…)`, also as `loader["import"](…)`.
+ * loader's `.import(…)` / `.require(…)`, also as `loader["import"](…)`; and `new Worker(…)` of `node:worker_threads`
+ * (aliased, or reached as `wt.Worker`) — a worker loads whatever it likes, by path or as `eval: true` code (lows-r3 FN-2a).
+ *
+ * NOT seen — named so nobody reads the registry as a proof of absence: indirect eval `(0, eval)(…)`, `globalThis.eval` /
+ * `globalThis.Function` / `(() => {}).constructor(…)`; `node:vm` (`runInThisContext`, `new vm.Script`, `compileFunction`);
+ * a `createRequire` held in a variable or destructured / renamed out of a DYNAMIC `node:module` load (`const { createRequire:
+ * mk } = await import("node:module")`), `createRequire.call(…)`; a loader member not called directly (`loader.import.call(…)`,
+ * `Reflect.apply(loader.import, …)`, a computed key); `module.register(…)` (loader hooks); `child_process.fork(modulePath)`.
+ * None of those is in `src/` today (`grep -rnE` over src/, lows-r3 TE).
  */
 function unfollowableSites(files: Iterable<[string, string]>): Map<string, number> {
   const found = new Map<string, number>();
@@ -513,7 +521,30 @@ function unfollowableSites(files: Iterable<[string, string]>): Map<string, numbe
     // bindings of `node:module` / `module`: the aliases of createRequire, and the names of the module object itself
     const createRequireNames = new Set<string>(["createRequire"]);
     const moduleObjects = new Set<string>();
+    // bindings of `node:worker_threads`: the aliases of `Worker`, and the names of the module object itself
+    const workerNames = new Set<string>();
+    const workerModules = new Set<string>();
     for (const statement of sf.statements) {
+      if (
+        ts.isImportDeclaration(statement) &&
+        ["node:worker_threads", "worker_threads"].includes(
+          stringOf(statement.moduleSpecifier) ?? "",
+        )
+      ) {
+        const bindings = statement.importClause?.namedBindings;
+        if (statement.importClause?.name) {
+          workerModules.add(statement.importClause.name.text);
+        }
+        if (bindings && ts.isNamespaceImport(bindings)) {
+          workerModules.add(bindings.name.text);
+        } else if (bindings && ts.isNamedImports(bindings)) {
+          for (const element of bindings.elements) {
+            if ((element.propertyName ?? element.name).text === "Worker") {
+              workerNames.add(element.name.text);
+            }
+          }
+        }
+      }
       if (
         ts.isImportDeclaration(statement) &&
         ["node:module", "module"].includes(stringOf(statement.moduleSpecifier) ?? "")
@@ -551,6 +582,15 @@ function unfollowableSites(files: Iterable<[string, string]>): Map<string, numbe
         node.expression.text === "Function"
       ) {
         note("new Function", node);
+      } else if (
+        ts.isNewExpression(node) &&
+        ((ts.isIdentifier(node.expression) && workerNames.has(node.expression.text)) ||
+          (ts.isPropertyAccessExpression(node.expression) &&
+            node.expression.name.text === "Worker" &&
+            ts.isIdentifier(node.expression.expression) &&
+            workerModules.has(node.expression.expression.text)))
+      ) {
+        note("new Worker", node);
       } else if (ts.isCallExpression(node)) {
         const callee = node.expression;
         const member = memberName(callee);
@@ -609,6 +649,9 @@ const KNOWN_NON_LEDGER_UNFOLLOWABLE: Readonly<Record<string, number>> = {
   "flows/cli.ts | custom loader .import() | loader.import(flowUrl, import.meta.url)": 1,
   "flows/cli.ts | custom loader .require() | loader.require(flowUrl, import.meta.url)": 1,
   "flows/cli.ts | non-literal import() | import(flowUrl)": 1,
+  // the capacity governor's /proc readers: a worker run from a template-literal source (`READER_SOURCE`) that requires only node:fs / node:os /
+  // node:worker_threads and reads /proc/<pid>/stat — not a ledger use
+  "capacity/governor/scan.ts | new Worker | new Worker(READER_SOURCE, { eval: true, workerData: { ctl, port: port2, index, count: options.readers, procRoot, nice: options.nice }, transferList: [port2], re": 1,
   // `node:sqlite`, loaded once by `loadSqlite`
   "pod/sqlite-loader.ts | createRequire | createRequire(import.meta.url)": 1,
 };
@@ -891,6 +934,20 @@ test("K4-2 / FN-2: every way to load a module this discovery cannot follow is fo
     ["const m = require(spec);", ["non-literal require()"]],
     ['const m = await loader["import"](url);', ["custom loader .import()"]],
     ["const m = loader.require(url, base);", ["custom loader .require()"]],
+    // FN-2a: a worker, by path or as eval code, aliased or reached through the module object
+    [
+      'import { Worker } from "node:worker_threads";\nconst w = new Worker(new URL("./x.js", import.meta.url));',
+      ["new Worker"],
+    ],
+    [
+      'import { Worker as W } from "node:worker_threads";\nconst w = new W(code, { eval: true });',
+      ["new Worker"],
+    ],
+    [
+      'import * as wt from "node:worker_threads";\nconst w = new wt.Worker(code, { eval: true });',
+      ["new Worker"],
+    ],
+    ['import wt from "worker_threads";\nconst w = new wt.Worker(file);', ["new Worker"]],
     ['const m = loader["require"](url);', ["custom loader .require()"]],
   ];
   for (const [text, want] of cases) {
@@ -899,6 +956,9 @@ test("K4-2 / FN-2: every way to load a module this discovery cannot follow is fo
   // controls: a LITERAL import() / require(), a plain file, a createRequire-named local that is not called, are not flagged
   assert.deepEqual(siteKinds('const m = await import("./a.js");'), []);
   assert.deepEqual(siteKinds('const m = require("./a.js");'), []);
+  // a `Worker` that is not node's (no `node:worker_threads` import), and an import of it that is never constructed
+  assert.deepEqual(siteKinds("class Worker {}\nconst w = new Worker();"), []);
+  assert.deepEqual(siteKinds('import { Worker } from "node:worker_threads";\nlet x: Worker;'), []);
   assert.deepEqual(siteKinds("const x = 1; const createRequireLater = 2;"), []);
 });
 

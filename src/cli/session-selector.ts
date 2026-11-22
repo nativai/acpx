@@ -1,5 +1,5 @@
 import { InvalidArgumentError, type Command } from "commander";
-import { DEFAULT_AGENT_NAME, listKnownAgentSelectorNames } from "../agent-registry.js";
+import { listKnownAgentSelectorNames, normalizeAgentName } from "../agent-registry.js";
 import {
   normalizeName,
   parseSeatRefOrThrow,
@@ -235,24 +235,23 @@ export class NoSessionError extends Error {
 export type NoSessionAgentContext = {
   /** `config.agents`: agents the user configured beyond the built-in registry. */
   agents?: Record<string, string>;
-  /** `config.defaultAgent`: the agent a bare `acpx <text>` resolves to. */
-  defaultAgent?: string;
 };
 
 // The bare form `acpx hello` reads its first word as the agent. When that word is no agent at all (not built in, not an
 // alias, not configured) the create line must not advise `acpx hello sessions new` — that is `Failed to spawn agent
-// command: hello` and writes nothing (lows-r2 TE FN-1, measured) — it names a REAL agent: the configured default, else the
-// built-in default.
-function adviseableAgentName(agentName: string, context: NoSessionAgentContext): string {
-  const known = new Set([
-    ...listKnownAgentSelectorNames(context.agents),
-    ...Object.keys(context.agents ?? {}),
-  ]);
-  if (known.has(agentName)) {
-    return agentName;
-  }
-  const fallback = context.defaultAgent ?? DEFAULT_AGENT_NAME;
-  return known.has(fallback) ? fallback : DEFAULT_AGENT_NAME;
+// command: hello` and writes nothing (lows-r2 TE FN-1, measured). It names NO agent: `acpx sessions new` takes the PARENT
+// session's agent inside a session and the configured default (else codex) outside one, so it is right in both places
+// (lows-r3 TE FN-1c). A real agent is matched the way acpx resolves agent names (`normalizeAgentName`: `Claude` is claude,
+// FN-1b) and is advised as written, because that command runs.
+function createLine(agentName: string, context: NoSessionAgentContext): string {
+  const known = new Set(
+    [...listKnownAgentSelectorNames(context.agents), ...Object.keys(context.agents ?? {})].map(
+      normalizeAgentName,
+    ),
+  );
+  return known.has(normalizeAgentName(agentName))
+    ? `acpx ${agentName} sessions new`
+    : "acpx sessions new";
 }
 
 export function noSessionIdMessage(agentName: string, context: NoSessionAgentContext = {}): string {
@@ -260,7 +259,7 @@ export function noSessionIdMessage(agentName: string, context: NoSessionAgentCon
     `⚠ No acpx session found: no session id was given. Every acpx call names its session by id — ` +
     `pass --session-id <id> (or --session-url <url>) AFTER the agent name, as in ` +
     `acpx <agent> --session-id <id> <text> (the bare form takes no such flag: it reads its first word as the agent).` +
-    `\nNo session yet? Create one: acpx ${adviseableAgentName(agentName, context)} sessions new`
+    `\nNo session yet? Create one: ${createLine(agentName, context)}`
   );
 }
 
