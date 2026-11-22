@@ -328,6 +328,11 @@ function dynamicImportEntries(call: ts.CallExpression, sf: ts.SourceFile, add: A
   }
   if (ts.isArrayLiteralExpression(parent)) {
     // `await Promise.all([import(a), import(b)])`, destructured at once
+    // A spread anywhere in the array shifts the indexes the destructuring is read against: not followed → everything (K4-2).
+    if (parent.elements.some((element) => ts.isSpreadElement(element))) {
+      add(undefined);
+      return;
+    }
     const index = parent.elements.indexOf(node as ts.Expression);
     const combinator = parent.parent;
     if (
@@ -433,39 +438,105 @@ function ledgerCallers(files: Iterable<[string, string]>): Map<string, Set<strin
   return found;
 }
 
-/** The values a module exports: `export function|const|class|let|var` declarations and `export { … }` lists. */
+/** Every identifier a binding name declares (`{ a, b: [c, ...d] }` → a, c, d). */
+function bindingNames(name: ts.BindingName): string[] {
+  if (ts.isIdentifier(name)) {
+    return [name.text];
+  }
+  return name.elements.flatMap((element) =>
+    ts.isBindingElement(element) ? bindingNames(element.name) : [],
+  );
+}
+
+/**
+ * The values a module exports, in EVERY form (K4-1). A form it cannot enumerate is returned as a marker that no set
+ * contains (`*:<specifier>` for `export * from` / `export * as ns from`), so the completeness row is RED on it —
+ * "classify or enumerate" — instead of passing blind: a ledger function re-exported through `export *` from a submodule
+ * was invisible to the first version. Forms: `export function|class|enum|namespace|const|let|var` (destructuring
+ * included), `export default <declaration or expression>`, `export { a as b }`, `export * from`, `export * as ns from`
+ * and `export =`. Type-only forms export no value and are skipped.
+ */
 function exportedValues(text: string): string[] {
   const sf = ts.createSourceFile("m.ts", text, ts.ScriptTarget.Latest, true);
   const out: string[] = [];
   for (const statement of sf.statements) {
-    const exported = ts.canHaveModifiers(statement)
-      ? ts.getModifiers(statement)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword)
-      : false;
-    if (
+    const modifiers = ts.canHaveModifiers(statement) ? (ts.getModifiers(statement) ?? []) : [];
+    const exported = modifiers.some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+    const isDefault = modifiers.some((m) => m.kind === ts.SyntaxKind.DefaultKeyword);
+    if (ts.isExportAssignment(statement)) {
+      out.push(statement.isExportEquals === true ? "export=" : "default");
+    } else if (exported && isDefault) {
+      out.push("default");
+    } else if (
       exported &&
-      (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
-      statement.name
+      (ts.isFunctionDeclaration(statement) ||
+        ts.isClassDeclaration(statement) ||
+        ts.isEnumDeclaration(statement) ||
+        ts.isModuleDeclaration(statement)) &&
+      statement.name &&
+      ts.isIdentifier(statement.name)
     ) {
       out.push(statement.name.text);
     } else if (exported && ts.isVariableStatement(statement)) {
       for (const declaration of statement.declarationList.declarations) {
-        if (ts.isIdentifier(declaration.name)) {
-          out.push(declaration.name.text);
-        }
+        out.push(...bindingNames(declaration.name));
       }
-    } else if (
-      ts.isExportDeclaration(statement) &&
-      statement.exportClause &&
-      ts.isNamedExports(statement.exportClause) &&
-      !statement.isTypeOnly
-    ) {
-      out.push(
-        ...statement.exportClause.elements.filter((e) => !e.isTypeOnly).map((e) => e.name.text),
-      );
+    } else if (ts.isExportDeclaration(statement) && !statement.isTypeOnly) {
+      const clause = statement.exportClause;
+      if (clause && ts.isNamedExports(clause)) {
+        out.push(...clause.elements.filter((e) => !e.isTypeOnly).map((e) => e.name.text));
+      } else {
+        const from = ts.isStringLiteralLike(statement.moduleSpecifier ?? sf)
+          ? (statement.moduleSpecifier as ts.StringLiteral).text
+          : "?";
+        out.push(`*:${from}`); // `export * from` / `export * as ns from`: not enumerable here
+      }
     }
   }
   return out;
 }
+
+/**
+ * Uses of a module system this discovery cannot follow (K4-2): a non-literal `import(x)`, `createRequire(…)`, and a
+ * custom loader's `x.import(…)`. They could load the ledger under a name no specifier shows, so each is a use it
+ * cannot see — and the row's own rule is that such a use is not nothing. The sites that exist today are REGISTERED below
+ * as known non-ledger; a NEW one is red until someone reads it and registers it.
+ */
+function unfollowableUses(files: Iterable<[string, string]>): Map<string, string[]> {
+  const found = new Map<string, string[]>();
+  for (const [rel, text] of files) {
+    const sf = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true);
+    const kinds = new Set<string>();
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node)) {
+        const callee = node.expression;
+        if (
+          callee.kind === ts.SyntaxKind.ImportKeyword &&
+          stringOf(node.arguments[0]) === undefined
+        ) {
+          kinds.add("non-literal import()");
+        } else if (ts.isIdentifier(callee) && callee.text === "createRequire") {
+          kinds.add("createRequire");
+        } else if (ts.isPropertyAccessExpression(callee) && callee.name.text === "import") {
+          kinds.add("custom loader .import()");
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sf);
+    if (kinds.size > 0) {
+      found.set(rel, [...kinds].toSorted());
+    }
+  }
+  return found;
+}
+
+/** The unfollowable uses in `src/` today, each READ and none of them the ledger (K4-2). */
+const KNOWN_NON_LEDGER_UNFOLLOWABLE: Readonly<Record<string, readonly string[]>> = {
+  "acp/claude-fork-index.ts": ["non-literal import()"], // loads the harness's own fork-index module by a specifier it computes
+  "flows/cli.ts": ["custom loader .import()", "non-literal import()"], // a flow file's URL, loaded by the flow runner
+  "pod/sqlite-loader.ts": ["createRequire"], // `node:sqlite`, loaded once by `loadSqlite`
+};
 
 function* srcFiles(dir: string): Generator<[string, string]> {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -634,4 +705,114 @@ test("CONFORMANCE negative cases: a fresh caller is flagged; a local-class calle
     false,
     "a ticket writes the ledger: not safe in an agent pod",
   );
+});
+
+// ── K4-1: the completeness row reads EVERY export form, and is red on one it cannot enumerate ─────────────
+
+/** What the completeness row calls unclassified: an exported name in neither set. */
+const unclassifiedOf = (exported: string[]): string[] =>
+  exported.filter((name) => !LEDGER_ENTRIES.has(name) && !NOT_LEDGER_ENTRIES.has(name));
+
+test("K4-1: exportedValues reads destructured consts, enums, namespaces, defaults and aliases; `export *` comes back as a marker no set contains", () => {
+  const cases: Array<[string, string[]]> = [
+    ["export const { a, b: c, ...rest } = source;", ["a", "c", "rest"]],
+    ["export const [first, , third] = list;", ["first", "third"]],
+    ["export enum Mode { A, B }", ["Mode"]],
+    ["export namespace Space { export const inner = 1; }", ["Space"]],
+    ["export default function main() {}", ["default"]],
+    ["export default class {}", ["default"]],
+    ["export default 41 + 1;", ["default"]],
+    ["const v = 1; export { v as renamed, v };", ["renamed", "v"]],
+    ['export * from "./split.js";', ["*:./split.js"]],
+    ['export * as ns from "./split.js";', ["*:./split.js"]],
+    ["export = something;", ["export="]],
+    // type-only forms export no VALUE
+    ["export type T = 1; export interface I {} export type { T as U };", []],
+    ['export type * from "./types.js";', []],
+  ];
+  for (const [text, want] of cases) {
+    assert.deepEqual(exportedValues(text), want, text);
+  }
+});
+
+test("K4-1 NEGATIVE: a ledger function re-exported through `export *` (or `export * as`) is flagged UNCLASSIFIED — the first row passed it", () => {
+  for (const text of [
+    'export * from "./ledger-split.js";\nexport const ok = 1;',
+    'export * as split from "./ledger-split.js";',
+  ]) {
+    const flagged = unclassifiedOf(exportedValues(text));
+    assert.ok(
+      flagged.includes("*:./ledger-split.js"),
+      `the unenumerable export is red until classified: ${text}`,
+    );
+  }
+  // the OLD reader dropped these forms entirely (so the row stayed green): the same texts read as nothing there
+  const oldReader = (text: string): string[] => {
+    const sf = ts.createSourceFile("m.ts", text, ts.ScriptTarget.Latest, true);
+    return sf.statements.flatMap((statement) =>
+      ts.isExportDeclaration(statement) &&
+      statement.exportClause &&
+      ts.isNamedExports(statement.exportClause)
+        ? statement.exportClause.elements.map((e) => e.name.text)
+        : [],
+    );
+  };
+  assert.deepEqual(oldReader('export * from "./ledger-split.js";'), []);
+  // control: a plain classified export is not flagged
+  assert.deepEqual(unclassifiedOf(["ticketFor"]), []);
+  assert.deepEqual(unclassifiedOf(["teSneakyDestructured"]), ["teSneakyDestructured"]);
+});
+
+// ── K4-2: an array with a spread, and the module systems this discovery cannot follow ──────────────────────
+
+test("K4-2: a `Promise.all` array with a spread anywhere counts as the WHOLE entry set (the index it is read against is gone)", () => {
+  const spread = `const [a, b] = await Promise.all([...pre, import("${ADM}"), import("${LED}")]);\nb.releaseWake();`;
+  assert.deepEqual(entriesOf(spread), ALL_ENTRIES);
+  // the same without the spread is read precisely (control: the spread, not the form, makes it everything)
+  const plain = `const [a, b] = await Promise.all([import("${ADM}"), import("${LED}")]);\na.admitCreate();`;
+  assert.notDeepEqual(entriesOf(plain), ALL_ENTRIES);
+  assert.deepEqual(entriesOf(plain), ["admitCreate"]);
+  // a spread AFTER the import shifts nothing, but is as unreadable as one before: also everything
+  const after = `const [a] = await Promise.all([import("${ADM}"), ...rest]);\na.admitCreate();`;
+  assert.deepEqual(entriesOf(after), ALL_ENTRIES);
+});
+
+test("K4-2: uses of a module system the discovery cannot follow are found — a non-literal import(), createRequire, a loader's .import() — and each is red unless registered", () => {
+  const kinds = (text: string): string[] =>
+    unfollowableUses([["cli/x.ts", text]]).get("cli/x.ts") ?? [];
+  assert.deepEqual(kinds("const m = await import(specifier);"), ["non-literal import()"]);
+  assert.deepEqual(kinds("const m = await import(`./${name}.js`);"), ["non-literal import()"]);
+  assert.deepEqual(
+    kinds(
+      'import { createRequire } from "node:module";\nconst r = createRequire(import.meta.url);',
+    ),
+    ["createRequire"],
+  );
+  assert.deepEqual(kinds("const m = await loader.import(url, base);"), ["custom loader .import()"]);
+  // controls: a LITERAL import(), a plain require-free file and an ordinary `.import` of nothing are not flagged
+  assert.deepEqual(kinds('const m = await import("./a.js");'), []);
+  assert.deepEqual(kinds("const x = 1;"), []);
+});
+
+test("K4-2: the unfollowable uses in src/ today are exactly the registered ones, none of them the ledger; a fresh one is red", () => {
+  const found = unfollowableUses(srcFiles(SRC));
+  const actual = Object.fromEntries(
+    [...found.entries()].toSorted(([a], [b]) => a.localeCompare(b)),
+  );
+  assert.deepEqual(actual, KNOWN_NON_LEDGER_UNFOLLOWABLE);
+  // none of the registered files is a ledger caller (so "known non-ledger" is checked, not asserted)
+  const callers = ledgerCallers(srcFiles(SRC));
+  for (const rel of Object.keys(KNOWN_NON_LEDGER_UNFOLLOWABLE)) {
+    assert.equal(
+      callers.has(rel),
+      false,
+      `${rel} is registered as non-ledger but calls a ledger entry`,
+    );
+  }
+  // NEGATIVE: a new file with a non-literal import() is found and is in no registry
+  const fresh = unfollowableUses([
+    ["cli/brand-new.ts", "export const load = (s: string) => import(s);"],
+  ]);
+  assert.deepEqual([...fresh.keys()], ["cli/brand-new.ts"]);
+  assert.equal("cli/brand-new.ts" in KNOWN_NON_LEDGER_UNFOLLOWABLE, false);
 });
