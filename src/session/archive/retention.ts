@@ -2,7 +2,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { SPAWN_STATE_SUFFIX } from "../../pod/spawn-state.js";
 import { SEAT_STORE_FILE, seatFromStore, type SeatStore } from "../persistence/seat-store.js";
-import { isNonSessionRecordFile } from "../persistence/session-dir-files.js";
+import {
+  isNonSessionRecordFile,
+  isSessionRecordFileName,
+} from "../persistence/session-dir-files.js";
 import {
   claimFileSets,
   claimOrphanFileSets,
@@ -286,7 +289,8 @@ async function readRecordCandidates(
   const unreadableRecords = new Map<string, string>();
   await Promise.all(
     files
-      .filter((file) => file.endsWith(".json"))
+      // The ONE predicate: a `<id>.delivery.json` sidecar is not read as a record candidate (brick 99bf1c0d).
+      .filter(isSessionRecordFileName)
       .map(async (file) => {
         const token = file.slice(0, -".json".length);
         if (token.length === 0) {

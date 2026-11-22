@@ -75,6 +75,7 @@ import { copySeatHolderFields, copySeatLinkageFields } from "./seat-fields.js";
 import { findHolderlessSeats, reapHolderlessSeats } from "./seat-holderless.js";
 import { serializeSessionRecordForDisk } from "./serialize.js";
 import { sessionBaseDir } from "./session-base-dir.js";
+import { isSessionRecordFileName } from "./session-dir-files.js";
 import { dropStaleSleepingForPersist } from "./sleeping-merge.js";
 import {
   canonicalMarkBase,
@@ -251,7 +252,6 @@ export type UnlistedRecordFile = { file: string; reason: string };
 
 // A record file is `<id>.json`; the dir also holds dotted sidecars (`<id>.delivery.json`) that are NOT records and never
 // get an index entry, so only this positive shape can be called "a record that went missing".
-const RECORD_FILE_SHAPE = /^[^.]+\.json$/;
 
 function describeRejectedRecord(raw: unknown): string {
   const metadata = (raw as { metadata?: unknown } | null)?.metadata;
@@ -298,7 +298,7 @@ export async function listUnlistedRecordFiles(): Promise<UnlistedRecordFile[]> {
   const indexed = new Set(index.entries.map((entry) => entry.file));
   const unlisted: UnlistedRecordFile[] = [];
   for (const file of index.files) {
-    if (RECORD_FILE_SHAPE.test(file) && !indexed.has(file)) {
+    if (isSessionRecordFileName(file) && !indexed.has(file)) {
       unlisted.push({ file, reason: await explainUnloadableRecordFile(file) });
     }
   }
