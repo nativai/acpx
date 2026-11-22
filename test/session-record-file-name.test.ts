@@ -108,6 +108,9 @@ const JSON_SUFFIX_EXEMPT: Readonly<Record<string, Exemption>> = {
   "capacity/governor/record.ts::pendingPeaksDays::/^\\d{4}-\\d{2}-\\d{2}\\.json$/u": {
     why: "the governor's dated peak files",
   },
+  "session/persistence/session-dir-files.ts::isSessionRecordFileName::filename.endsWith(suffix)": {
+    why: "the predicate iterates its OWN list, DELIVERY_SIDECAR_SUFFIXES — the one list a name may be tested against",
+  },
   'flows/json.ts::extractFencedJsonText::text.slice(contentStart, contentStart + 4).toLowerCase() === "json"':
     { why: "a Markdown code-fence language tag, not a file name (an accepted over-fire)" },
 };
@@ -301,6 +304,88 @@ test("the old line-based scan MISSED these spellings (F-C5a) — and the parse s
       `the parse missed: ${name}`,
     );
   }
+});
+
+/**
+ * Round 3 (F-14, F-15): a suffix test through a CONSTANT LIST — the idiom the predicate itself uses
+ * (`DELIVERY_SIDECAR_SUFFIXES.some((suffix) => filename.endsWith(suffix))`). A developer writing the next
+ * sessions-dir filter "like the predicate" must not get a green scan.
+ */
+const LIST_SPELLINGS: Readonly<Record<string, string>> = {
+  "F-14 some over a const list":
+    'const EXTS = [".json", ".yaml"];\nexport const f = (n: string) => EXTS.some((e) => n.endsWith(e));',
+  "F-14 find over a const list":
+    'const EXTS = [".json"];\nexport const f = (n: string) => EXTS.find((e) => n.endsWith(e));',
+  "F-14 every / filter over a const list":
+    'const EXTS = [".json"] as const;\nexport const f = (n: string) => EXTS.every((e) => n.endsWith(e)) || EXTS.filter((e) => n.endsWith(e));',
+  "F-14 some over an inline list":
+    'export const f = (n: string) => [".json", ".yaml"].some((e) => n.endsWith(e));',
+  "F-14 some over a Set built from a list":
+    'const EXTS = new Set([".json"]);\nexport const f = (n: string) => [...EXTS].some((e) => n.endsWith(e));',
+  "F-14 for…of over a const list":
+    'const EXTS = [".json"];\nexport const f = (n: string) => {\n  for (const e of EXTS) {\n    if (n.endsWith(e)) {\n      return true;\n    }\n  }\n  return false;\n};',
+  "F-14 an alias of the list":
+    'const A = [".json"];\nconst B = A;\nexport const f = (n: string) => B.some((e) => n.endsWith(e));',
+  "F-14 a list imported from ANOTHER file":
+    'import { EXTS } from "./exts.js";\nexport const f = (n: string) => EXTS.some((e) => n.endsWith(e));',
+  "F-14 a function expression callback":
+    'const EXTS = [".json"];\nexport const f = (n: string) => EXTS.some(function (e) {\n  return n.endsWith(e);\n});',
+  "F-15 includes on a const list":
+    'import path from "node:path";\nconst EXTS = [".json", ".yaml"];\nexport const f = (n: string) => EXTS.includes(path.extname(n));',
+  "F-15 has on a const Set":
+    'import path from "node:path";\nconst SET = new Set([".json"]);\nexport const f = (n: string) => SET.has(path.extname(n));',
+  "F-15 has on a const Set, through a local (the flows/cli.ts shape)":
+    'import path from "node:path";\nconst SET = new Set([".json"]);\nexport const f = (n: string) => {\n  const ext = path.extname(n).toLowerCase();\n  return SET.has(ext);\n};',
+  "F-15 has on a Set literal receiver":
+    'import path from "node:path";\nexport const f = (n: string) => new Set([".json"]).has(path.extname(n));',
+};
+
+const LIST_FILES: Readonly<Record<string, string>> = {
+  "exts.ts": 'export const EXTS = [".json"];',
+};
+
+/** Look-alikes that must stay quiet — including the `OUTPUT_FORMATS.includes(value)` shape that over-fired while locals were file-wide. */
+const LIST_CONTROLS: Readonly<Record<string, string>> = {
+  "iterating a non-json suffix list":
+    'const EXTS = [".zst", ".ndjson"];\nexport const f = (n: string) => EXTS.some((e) => n.endsWith(e));',
+  "includes on a non-json list with an extname":
+    'import path from "node:path";\nconst EXTS = [".md", ".txt"];\nexport const f = (n: string) => EXTS.includes(path.extname(n));',
+  'a list holding "json" tested with a value from ANOTHER function (locals are scoped)':
+    'const FORMATS = ["text", "json"];\nexport const a = (v: string) => FORMATS.includes(v);\nexport const b = (raw: string) => {\n  const v = raw.slice(0, 4);\n  return v;\n};',
+  "a json list whose element is never used as a suffix":
+    'const EXTS = [".json"];\nexport const f = (n: string) => EXTS.some((e) => n === e);',
+};
+
+test("CONFORMANCE NEGATIVE (F-14/F-15): a suffix test through a constant list is flagged, in every form, without being registered", () => {
+  for (const [name, text] of Object.entries(LIST_SPELLINGS)) {
+    const sites = scanFresh({ "fresh.ts": text, ...LIST_FILES });
+    assert.equal(sites.length >= 1, true, `not seen: ${name}`);
+    assert.equal(unexemptedSuffixTests(sites, {}).length >= 1, true, name);
+  }
+});
+
+test("CONFORMANCE (F-14/F-15): the old line-based scan saw NONE of the constant-list forms — red on yesterday's scan", () => {
+  for (const [name, text] of Object.entries(LIST_SPELLINGS)) {
+    assert.equal(legacyCatches(text), false, `the old scan already caught: ${name}`);
+  }
+});
+
+test("CONFORMANCE CONTROLS (F-14/F-15): look-alikes over constant lists stay quiet", () => {
+  for (const [name, text] of Object.entries(LIST_CONTROLS)) {
+    assert.deepEqual(scanFresh({ "fresh.ts": text }), [], name);
+  }
+});
+
+test("CONFORMANCE (F-14): the predicate's own list iteration is found on the REAL tree and exempted, with its reason — and no other site changed", () => {
+  const sites = jsonSuffixSites(parsed, constants);
+  const own = sites.filter((site) => site.text === "filename.endsWith(suffix)");
+  assert.deepEqual(own.map(key), [
+    "session/persistence/session-dir-files.ts::isSessionRecordFileName::filename.endsWith(suffix)",
+  ]);
+  assert.equal(
+    sites.length,
+    Object.values(JSON_SUFFIX_EXEMPT).reduce((sum, entry) => sum + (entry.count ?? 1), 0),
+  );
 });
 
 test("CONFORMANCE CONTROLS: the same scan stays quiet on every non-`.json` look-alike, comments and prose included", () => {
