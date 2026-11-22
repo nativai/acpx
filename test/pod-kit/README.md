@@ -114,4 +114,5 @@ override itself belongs to the client under test (honoured only under `NODE_TEST
 switch at once. `refused` cannot be left over HTTP (nothing is listening): give it a `forMs`.
 Record entry: `route` (`call|session_message|seat_message|hint_ready|hint_ended`), `target`, `body`, `stdin` (a call's decoded
 `stdin_b64`), `problems` (departures from C6.2 / C6.3's shapes — `contract`, `call_id`, `argv`, `stdin_b64`, `stdin_b64_too_large`,
-`caller.<f>`, `deadline_ms`…,
+`caller.<f>`, `deadline_ms`…, never rejected), `mode` at the time, `outcome`, `callId`, `replayed`. An away call is still recorded
+as a `call` with the client's `call_id`, so a test can assert the retries reuse it.
