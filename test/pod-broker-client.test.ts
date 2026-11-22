@@ -128,7 +128,8 @@ test("ensure: a bound reached before any step names no phase", async () => {
 });
 
 test("ensure: a broker that never answers, refuses the connection, or answers 5xx is `unavailable`", async () => {
-  // KIT GAP 1: a server that never sends response headers (the kit's `hang` sends the 200 first).
+  // A server that never sends response headers: a wedged or frozen real broker does (not by protocol); the kit's
+  // `hang` sends the 200 first.
   const silent = await rawHttp(() => undefined);
   try {
     const result = await ensureAgentPod(KEY, REQUEST, { origin: silent.url, wakeBoundMs: 200 });
@@ -151,15 +152,20 @@ test("ensure: a broker that never answers, refuses the connection, or answers 5x
 });
 
 test("ensure: an answer that ends without a final line is `unavailable`, never a guess", async () => {
-  // KIT GAP 2: the kit's stream always ends with exactly one final line; this answer has progress lines only.
-  const broker = await rawHttp((_request, response) => {
-    response.writeHead(200, { "content-type": "text/plain" });
-    response.end("scheduling\nstarting\n");
+  // The kit's `truncate`: the real broker's run() can raise past its catches after the 200 and some steps.
+  const broker = await startFakeBroker({
+    default: { steps: ["scheduling", "starting"], truncate: true },
   });
   try {
     assert.equal((await ensureAgentPod(KEY, REQUEST, { origin: broker.url })).kind, "unavailable");
+    assert.equal(broker.requests[0]?.outcome, "truncated");
+    assert.deepEqual(
+      broker.requests[0]?.linesSent,
+      ["scheduling", "starting"],
+      "no final line was sent",
+    );
   } finally {
-    broker.close();
+    await broker.close();
   }
 });
 
@@ -239,20 +245,24 @@ test("GET /v1/agents: the C4 snapshot; a malformed or failing answer is `ok:fals
   } finally {
     await broker.close();
   }
-  // KIT GAP 3: the kit's `GET /v1/agents` is always well-formed and always 200.
-  for (const answer of [
-    { status: 200, body: JSON.stringify({ ...good, cap: "100" }) },
-    { status: 500, body: "{}" },
-  ]) {
-    const server = await rawHttp((_request, response) => {
-      response.writeHead(answer.status, { "content-type": "application/json" });
-      response.end(answer.body);
-    });
-    try {
-      assert.equal((await getAgents({ origin: server.url })).ok, false, answer.body);
-    } finally {
-      server.close();
-    }
+  // The real failure: `GET /v1/agents` answers 502 `{"error":"kube_api_error"}` when the kube API does.
+  const failing = await startFakeBroker({ statusFails: true });
+  try {
+    assert.equal((await getAgents({ origin: failing.url })).ok, false);
+    assert.equal(failing.requests[0]?.outcome, "status_failed");
+  } finally {
+    await failing.close();
+  }
+  // A 200 whose body is malformed is a shape NO real service produces (the broker builds the figures itself): kept
+  // as a raw row for acpx's own strictness, with nothing in the kit to move it to.
+  const malformed = await rawHttp((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ...good, cap: "100" }));
+  });
+  try {
+    assert.equal((await getAgents({ origin: malformed.url })).ok, false);
+  } finally {
+    malformed.close();
   }
 });
 
@@ -325,7 +335,7 @@ test("DELETE: a 5xx, a body that is no answer, a dead broker and a missing uid a
       await broker.close();
     }
   }
-  // KIT GAP 4: a DELETE answering 503, or 200 with a body that is no C4 answer — neither exists on the real broker.
+  // A DELETE answering 503, or 200 with a body that is no C4 answer — neither exists on the real broker.
   for (const answer of [
     { status: 503, body: "" },
     { status: 200, body: "something odd" },
