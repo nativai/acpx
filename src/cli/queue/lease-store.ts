@@ -8,7 +8,6 @@ import {
 import { lockHostPlace, parsePodRef, type PodRef } from "../../pod/identity.js";
 import {
   isOwnPod,
-  isReplacedPredecessor,
   leasePodFields,
   podSocketDir,
   podSocketPath,
@@ -790,9 +789,6 @@ async function judgePodLease(
   pod: PodRef,
 ): Promise<LeaseJudgement> {
   const base = baseLiveness(sessionId, owner, "foreign");
-  if (isReplacedPredecessor(pod)) {
-    return { liveness: { ...base, ...replacedPredecessorRow() } };
-  }
   const fresh = isFresh(base.heartbeatAgeMs, QUEUE_OWNER_STALE_HEARTBEAT_MS);
   const proof = fresh ? undefined : await proofFromControlPod(pod);
   if (proof?.answer === "gone") {
@@ -820,17 +816,6 @@ const NO_LOCAL_FACTS = {
   socketReachable: null,
   processIdentityMatched: null,
 } as const;
-
-/** NG-K4.5: a dead predecessor under this pod's own name — dead at once, whatever its heartbeat says. */
-function replacedPredecessorRow() {
-  return {
-    ...NO_LOCAL_FACTS,
-    state: "dead_owner" as const,
-    recoverable: true,
-    alive: false as const,
-    deathReason: "pod-replaced",
-  };
-}
 
 function podLeaseRow(proof: Extract<DeathProofDetail, { answer: "gone" }>, pod: PodRef) {
   return {

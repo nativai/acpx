@@ -169,22 +169,6 @@ export function isOwnPod(pod: PodRef, env: NodeJS.ProcessEnv = process.env): boo
 }
 
 /**
- * NG-K4.5 (ruled by the acpx sub-HoD, F3): in an AGENT POD, a lease whose `pod.name` is THIS pod's own
- * name under a DIFFERENT uid is the lease of a dead predecessor — a pod name is held by one pod at a
- * time, and the broker never starts a Job while the key's pod is not terminal. It needs no API call
- * and no 15 s wait: the replacement owner takes over at once. (On the control pod a fresh heartbeat
- * stays "alive, no API call", C3.1 — the control pod cannot know the name is now another uid's.)
- * ⚠️ Same name AND same uid is the pod's own lease (judged by pid); a different name is another pod's.
- */
-export function isReplacedPredecessor(pod: PodRef, env: NodeJS.ProcessEnv = process.env): boolean {
-  if (lockHostPlace(env) !== "agent-pod") {
-    return false;
-  }
-  const own = lockPodIdentity(env);
-  return own !== undefined && own.name === pod.name && own.uid !== pod.uid;
-}
-
-/**
  * C2 "What the owner inherits": in pod mode the owner spawn REMOVES every `ACPX_ROUTED` /
  * `ACPX_ROUTED_*` variable and the caller's identity variables, so an owner's environment — and the
  * adapter and every command the agent runs under it — never depends on who woke it. Left in place,

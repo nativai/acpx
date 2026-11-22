@@ -242,6 +242,7 @@ import {
   withInheritedWorktree,
 } from "./session/inherited-metadata.js";
 import { refuseCloseOverOpenPersonRequests } from "./session/open-person-requests-guard.js";
+import { refuseWakeWhilePodNotGone } from "./session/pod-wake-guard.js";
 import { mergeSessionMetadata, validateSessionMetadataValue } from "./session/session-metadata.js";
 import type {
   SetParentRefusalCode,
@@ -3589,6 +3590,12 @@ export async function handleSessionsClose(
 
   const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
   const record = await requireExplicitSessionRecord(selector, agent.agentName);
+
+  // A-16 (R2-1): in local mode a session whose lease names a pod not proven gone is NOT closed here —
+  // `pod_starting … phase=turnover` (exit 75), decided before anything is touched: no drain, no
+  // `close_session`, no `closed` / `closed_at` / pid fields written. (`set-metadata` is class `record`
+  // and stays as it is.)
+  await refuseWakeWhilePodNotGone(record.acpxRecordId);
 
   // Brick 6867bbfc D6 — AFTER the record resolves (so `--seat` targets are covered) and BEFORE
   // anything is touched: a refusal drains nothing, stops no owner, writes no record.

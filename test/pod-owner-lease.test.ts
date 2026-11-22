@@ -6,6 +6,7 @@ import {
   matchesQueueOwner,
   readQueueOwnerRecord,
   readQueueOwnerState,
+  readQueueOwnerStatus,
   tryAcquireQueueOwnerLease,
   type QueueOwnerRecord,
 } from "../src/cli/queue/lease-store.js";
@@ -390,61 +391,126 @@ test("a lease naming THIS pod is judged by pid, as today — never by the API se
 });
 
 // ---------------------------------------------------------------------------------------------
-// NG-K4.5 / F3: the replacement pod's owner takes over at once
+// A replacement pod and its predecessor's lease (R2-F3: NO instant takeover)
 // ---------------------------------------------------------------------------------------------
 
-test("F3: in an agent pod, a predecessor's lease under THIS pod's own name with another uid is dead at once — fresh heartbeat, no API call, no wait", async () => {
-  const old = makeWorld("replace-old");
+// The broker names the Job `ag-<key>`, so each pod is `ag-<key>-<random>`: a replacement never shares
+// its predecessor's NAME. And a Job can create the replacement while the old pod is still Terminating
+// with a live owner, so a takeover keyed on the key or the name could run two owners. One owner matters
+// more than 15 s: a predecessor's lease is judged by its heartbeat, and by the death proof on the control pod.
+
+const KEY = sessionKey("replace-session");
+
+async function replacementWorlds() {
+  const old = makeWorld("replace-old", { podName: `ag-${KEY}-old12` });
+  const replacement = makeWorld("replace-new", { podName: `ag-${KEY}-new34` });
+  return { old, replacement };
+}
+
+function replacementEnv(
+  old: ReturnType<typeof makeWorld>,
+  replacement: ReturnType<typeof makeWorld>,
+  apiUrl: string,
+) {
+  return worldEnv(replacement, {
+    place: "agent-pod",
+    podMode: true,
+    extra: { ACPX_STATE_HOME: old.home, ACPX_POD_API_URL: apiUrl },
+  });
+}
+
+test("R2-F3: production name shape — while the predecessor's heartbeat is FRESH the replacement waits, and nothing is reaped, asked or written", async () => {
+  const { old, replacement } = await replacementWorlds();
   const api = await startFakeApi("dev-kit");
   try {
-    await leaseFromPod(old, "replace-session"); // fresh heartbeat, naming old.pod
-    // The replacement: same pod NAME, a new uid, same state directory.
-    const fresh = makeWorld("replace-new");
-    fresh.pod = { ...fresh.pod, name: old.pod.name };
-    const env = worldEnv(fresh, {
-      place: "agent-pod",
-      podMode: true,
-      extra: { ACPX_STATE_HOME: old.home, ACPX_POD_API_URL: api.url },
-    });
-    await withEnv(env, async () => {
+    await leaseFromPod(old, "replace-session"); // fresh, naming ag-<key>-old12
+    const file = await withEnv({ ACPX_STATE_HOME: old.home }, () =>
+      queueLockFilePath("replace-session"),
+    );
+    const before = fs.readFileSync(file, "utf8");
+    await withEnv(replacementEnv(old, replacement, api.url), async () => {
       const state = await readQueueOwnerState("replace-session");
-      assert.equal(state.state, "dead_owner");
-      assert.equal(state.deathReason, "pod-replaced");
-      assert.equal(state.alive, false);
-      // The owner's existing handshake: the first acquire reaps the dead lease, the retry takes it.
+      assert.equal(state.state, "foreign_owner");
+      assert.equal(state.alive, true, "a fresh predecessor is alive: the replacement waits");
       assert.equal(await tryAcquireQueueOwnerLease("replace-session"), undefined);
-      assert(await tryAcquireQueueOwnerLease("replace-session"));
-      const record = await readQueueOwnerRecord("replace-session");
-      assert.equal(record?.pod?.uid, fresh.pod.uid, "the lease now names the replacement");
-      assert.deepEqual(api.state.requests, [], "no API call");
+      assert.equal(await tryAcquireQueueOwnerLease("replace-session"), undefined, "still waiting");
+      assert.equal(
+        fs.readFileSync(file, "utf8"),
+        before,
+        "the predecessor's lease is byte-identical",
+      );
+      assert.deepEqual(
+        api.state.requests,
+        [],
+        "an agent pod never asks the API about a lease holder",
+      );
     });
   } finally {
     await api.close();
   }
 });
 
-test("F3 negative: another pod's fresh lease (a different NAME) and this pod's own lease (same uid) are not predecessors", async () => {
-  const other = makeWorld("replace-other");
+test("R2-F3: production name shape — a STALE predecessor is still not reaped by the replacement itself (stale without proof is alive, C3.1); the control pod's proof frees the lease and the replacement then takes it", async () => {
+  const { old, replacement } = await replacementWorlds();
+  const api = await startFakeApi("dev-kit");
+  try {
+    // The old pod is still Terminating with a live owner: it exists, so no proof of death.
+    api.state.pods.set(old.pod.name, { uid: old.pod.uid, phase: "Running" });
+    await leaseFromPod(old, "replace-session", STALE);
+    const file = await withEnv({ ACPX_STATE_HOME: old.home }, () =>
+      queueLockFilePath("replace-session"),
+    );
+    await withEnv(replacementEnv(old, replacement, api.url), async () => {
+      const state = await readQueueOwnerState("replace-session");
+      assert.equal(state.alive, null, "stale without proof: cannot be told, never dead");
+      assert.equal(await tryAcquireQueueOwnerLease("replace-session"), undefined);
+      assert.equal(
+        fs.existsSync(file),
+        true,
+        "no second owner can start beside a possibly live one",
+      );
+      assert.deepEqual(api.state.requests, []);
+    });
+    // The control pod proves the old pod gone (and its node Ready): it reaps; the replacement takes over.
+    api.state.pods.clear();
+    api.state.nodes.set(old.pod.node, "True");
+    await withEnv(readerEnv(old, "control", api.url), async () => {
+      assert.equal(await readQueueOwnerStatus("replace-session"), undefined, "reaped on proof");
+    });
+    assert.equal(fs.existsSync(file), false);
+    await withEnv(replacementEnv(old, replacement, api.url), async () => {
+      assert(await tryAcquireQueueOwnerLease("replace-session"));
+      assert.equal(
+        (await readQueueOwnerRecord("replace-session"))?.pod?.name,
+        replacement.pod.name,
+      );
+    });
+  } finally {
+    await api.close();
+  }
+});
+
+test("R2-F3 negatives: another key's pod is foreign, this pod's own lease is judged by pid, the control pod keeps a fresh lease alive with no API call", async () => {
+  const other = makeWorld("replace-other-key", {
+    podName: `ag-${sessionKey("some-other-session")}-zzz99`,
+  });
   await leaseFromPod(other, "replace-other-session");
-  const reader = makeWorld("replace-reader");
+  const reader = makeWorld("replace-reader", {
+    podName: `ag-${sessionKey("replace-other-session")}-new34`,
+  });
   await withEnv(
     worldEnv(reader, { place: "agent-pod", podMode: true, extra: { ACPX_STATE_HOME: other.home } }),
     async () => {
       const state = await readQueueOwnerState("replace-other-session");
       assert.equal(state.state, "foreign_owner");
-      assert.equal(state.alive, true, "a different pod name: another pod's live lease");
+      assert.equal(state.alive, true);
     },
   );
-  // Same name, same uid: this pod's own lease — judged by pid, never as a predecessor.
   await withEnv(worldEnv(other, { place: "agent-pod", podMode: true }), async () => {
     const state = await readQueueOwnerState("replace-other-session");
-    assert.equal(state.scope, "local");
-    assert.notEqual(state.deathReason, "pod-replaced");
+    assert.equal(state.scope, "local", "same uid: this pod's own lease, judged by pid");
   });
-});
-
-test("F3 negative: the control pod keeps a fresh heartbeat alive with no API call (C3.1)", async () => {
-  const old = makeWorld("replace-ctl");
+  const old = makeWorld("replace-ctl", { podName: `ag-${KEY}-old12` });
   const api = await startFakeApi("dev-kit");
   try {
     await leaseFromPod(old, "replace-ctl-session");
