@@ -216,20 +216,16 @@ test("deadlines by class: owner-ensure 45 s, owner-if-pod 20 s, one-shot the cal
   assert.equal(OWNER_ENSURE_DEADLINE_MS, 45_000);
   assert.equal(OWNER_IF_POD_DEADLINE_MS, 20_000);
   const stub = makeStub();
-  await runRoutedCall(
-    baseOptions(stub, { class: "one-shot", key: "util-pool", expectUid: UID, deadlineMs: 7_000 }),
-  );
+  await runRoutedCall(oneShotOptions(stub, { expectUid: UID, deadlineMs: 7_000 }));
   const [call] = stub.calls();
   assert.ok(call);
   const delta = Number(flag(call, "--deadline-ms")) - Date.now();
   assert.ok(delta > 5_000 && delta <= 7_000, `one-shot deadline is its own: ${delta}`);
-  // Negative: a one-shot without a deadline of its own, or without the pod's uid, is a programming error — never defaulted.
-  await assert.rejects(
-    runRoutedCall(baseOptions(stub, { class: "one-shot", key: "util-pool", expectUid: UID })),
-  );
-  await assert.rejects(
-    runRoutedCall(baseOptions(stub, { class: "one-shot", key: "util-pool", deadlineMs: 5_000 })),
-  );
+  // Negative: a one-shot without a deadline of its own is a programming error — never defaulted.
+  const { deadlineMs: _own, ...withoutDeadline } = oneShotOptions(stub, { expectUid: UID });
+  await assert.rejects(runRoutedCall(withoutDeadline));
+  // Negative: neither the pod's uid nor a lookup to find it by.
+  await assert.rejects(runRoutedCall(oneShotOptions(stub, { lookup: undefined })));
 });
 
 test("cwd: under a shared root, or refused with nothing run — never re-rooted", async () => {
@@ -727,6 +723,19 @@ function ensureOptions(stub: Stub, origin: string, overrides: Partial<RoutedCall
   });
 }
 
+/** A-7: a one-shot's target is a utility pod — no session, no seat (A-10). */
+function oneShotOptions(stub: Stub, overrides: Partial<RoutedCallOptions> = {}) {
+  return baseOptions(stub, {
+    class: "one-shot",
+    key: "util-pool",
+    target: { sessionId: "", seat: "", harness: "utility" },
+    deadlineMs: 5_000,
+    argv: ["acpx", "exec", "hello"],
+    releases: { ok: true, releases: { acpx: "rel-1", pi: "rel-2" } },
+    ...overrides,
+  });
+}
+
 test("owner-ensure: no pod → the broker is asked (C4 body incl. releases), then the call goes to the uid the broker named", async () => {
   const broker = await startBroker({ lines: ["scheduling", READY] });
   try {
@@ -948,7 +957,7 @@ test("owner-ensure: broker `error <reason>` and `too_big` are named failures (ex
   }
 });
 
-test("only owner-ensure may ask the broker: owner-if-pod and one-shot never do", async () => {
+test("the broker is asked by owner-ensure for a session's pod, and by a one-shot for its utility pod only (A-7): owner-if-pod never, a one-shot that is handed its pod's uid never", async () => {
   const broker = await startBroker({ lines: [READY] });
   try {
     const stub = makeStub();
@@ -960,18 +969,135 @@ test("only owner-ensure may ask the broker: owner-if-pod and one-shot never do",
       }),
     );
     await runRoutedCall(
-      baseOptions(stub, {
-        class: "one-shot",
+      oneShotOptions(stub, {
         key: "util-home",
         expectUid: UID,
-        deadlineMs: 5_000,
         broker: { origin: broker.origin },
       }),
     );
+    // A READY utility pod needs no broker either: the API server answers first, as for a session's pod.
+    await runRoutedCall(
+      oneShotOptions(stub, { lookup: PRESENT, broker: { origin: broker.origin } }),
+    );
     assert.equal(broker.seen.length, 0);
-    assert.equal(stub.calls().length, 2);
+    assert.equal(stub.calls().length, 3);
   } finally {
     broker.close();
+  }
+});
+
+test("A-7: a one-shot with no utility pod starts it through the broker — no sessionId, no seat, class utility, the key's placement (never auto) — then runs in it", async () => {
+  for (const [key, placement] of [
+    ["util-pool", "pool"],
+    ["util-home", "home"],
+  ] as const) {
+    const broker = await startBroker({ lines: ["scheduling", READY] });
+    try {
+      const stub = makeStub({ exit: 0, stdout: "styles\n" });
+      const options = oneShotOptions(stub, {
+        key,
+        lookup: ABSENT,
+        broker: { origin: broker.origin },
+        target: { sessionId: "", seat: "", harness: "utility", admissionClass: "interactive" },
+      });
+      assert.deepEqual(await runRoutedCall(options), {
+        kind: "completed",
+        exitCode: 0,
+        callId: options.callId,
+      });
+      const body = JSON.parse(broker.seen[0]?.body ?? "{}") as Record<string, unknown>;
+      assert.equal(body.harness, "utility");
+      assert.equal(body.class, "utility");
+      assert.equal(body.placement, placement);
+      assert.equal("sessionId" in body, false);
+      assert.equal("seat" in body, false);
+      assert.match(broker.seen[0]?.url ?? "", new RegExp(`/v1/agents/${key}$`));
+      const [call] = stub.calls();
+      assert.equal(flag(call, "--key"), key);
+      assert.equal(flag(call, "--expect-uid"), UID, "the call goes to the uid the broker named");
+    } finally {
+      broker.close();
+    }
+  }
+});
+
+test("A-7 (negative): a one-shot may start the utility pod and NOTHING else — a session's harness, a session's key, an unknown key are refused with nothing sent and the broker never asked; owner-ensure never reaches a utility pod", async () => {
+  const broker = await startBroker({ lines: [READY] });
+  try {
+    const stub = makeStub();
+    const refused = async (options: RoutedCallOptions) => {
+      await assert.rejects(runRoutedCall(options), (error: Error) => {
+        assert.equal(error.name, "UtilityScopeError");
+        assert.match(
+          error.message,
+          /A-7: class one-shot may start the box's utility pod and nothing else/,
+        );
+        return true;
+      });
+    };
+    const viaBroker = { lookup: ABSENT, broker: { origin: broker.origin } };
+    // a one-shot aimed at a SESSION's pod (the session's harness, a session's key)…
+    await refused(
+      oneShotOptions(stub, {
+        ...viaBroker,
+        target: { sessionId: SESSION, seat: SEAT, harness: "claude" },
+      }),
+    );
+    await refused(oneShotOptions(stub, { ...viaBroker, key: KEY }));
+    // …at a key that is not one of the two utility pods, even with a utility harness…
+    await refused(oneShotOptions(stub, { ...viaBroker, key: "util-elsewhere" }));
+    // …and even when it is handed a uid (no uid short-cut around the scope).
+    await refused(oneShotOptions(stub, { ...viaBroker, key: KEY, expectUid: UID }));
+    // The reverse: owner-ensure never starts a utility pod.
+    await refused(
+      ensureOptions(stub, broker.origin, {
+        key: "util-pool",
+        target: { sessionId: SESSION, seat: SEAT, harness: "utility" },
+      }),
+    );
+    await refused(ensureOptions(stub, broker.origin, { key: "util-home" }));
+    assert.equal(broker.seen.length, 0, "the broker was never asked");
+    assert.equal(stub.calls().length, 0, "nothing was sent");
+  } finally {
+    broker.close();
+  }
+});
+
+test("A-7: a utility pod that is not ready within the wake bound is pod_starting WITHOUT `wake=` (no message waits for it), exit 75; a full box is agent_cap without `wake=`", async () => {
+  const broker = await startBroker({ lines: ["pulling"], stall: true });
+  try {
+    const stub = makeStub();
+    const refusal = await expectRefusal(
+      runRoutedCall(
+        oneShotOptions(stub, {
+          lookup: ABSENT,
+          broker: { origin: broker.origin, wakeBoundMs: 500 },
+        }),
+      ),
+    );
+    assert.equal(
+      refusal.stderrLine,
+      "acpx: REFUSED reason=pod_starting nothing_started=true protocol=1 retry_after_s=15 phase=pulling",
+    );
+    assert.equal(exitCodeForOutputErrorCode(normalizeOutputError(refusal).code), 75);
+    assert.equal(stub.calls().length, 0);
+  } finally {
+    broker.close();
+  }
+  const full = await startBroker({ lines: ["refused reason=agent_cap live=7 cap=7"] });
+  try {
+    const refusal = await expectRefusal(
+      runRoutedCall(
+        oneShotOptions(makeStub(), {
+          lookup: ABSENT,
+          broker: { origin: full.origin, wakeBoundMs: 500 },
+        }),
+      ),
+    );
+    assert.match(refusal.stderrLine, /^acpx: REFUSED reason=agent_cap .* why=cap$/);
+    assert.equal(exitCodeForOutputErrorCode(normalizeOutputError(refusal).code), 75);
+  } finally {
+    full.close();
   }
 });
 
@@ -1226,8 +1352,9 @@ test("A-10: a utility pod's POST carries neither seat nor sessionId; a session's
   const broker = await startBroker({ lines: [READY] });
   try {
     await runRoutedCall(
-      ensureOptions(makeStub(), broker.origin, {
-        key: "util-pool",
+      oneShotOptions(makeStub(), {
+        lookup: ABSENT,
+        broker: { origin: broker.origin },
         target: { sessionId: SESSION, seat: SEAT, harness: "utility" },
       }),
     );

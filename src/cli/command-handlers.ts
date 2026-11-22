@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import type { SessionModelState } from "@agentclientprotocol/sdk";
 import { Command, InvalidArgumentError } from "commander";
 import { acpAdapterKind, resolveClaudeDefaultDisallowedTools } from "../acp/agent-command.js";
 import {
@@ -431,6 +432,7 @@ export async function handleListOutputStyles(
       supported: result.supported,
       current: result.current ?? null,
       available: result.available,
+      ...recordSourceFields(result),
     })
   ) {
     return;
@@ -458,9 +460,50 @@ export async function handleModelCatalogue(
 ): Promise<void> {
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const { models, served } = await readModelAdvertisement(agent.agentCommand, globalFlags, config);
+  const families = models ? projectAdvertisedComposedModels(models) : [];
+  if (
+    emitJsonResult(globalFlags.format, {
+      action: "model_catalogue",
+      agent: agent.agentName,
+      currentModelId: models?.currentModelId ?? null,
+      advertisedModelCatalogue: advertisedCatalogue(families),
+      ...recordSourceFields(served),
+    })
+  ) {
+    return;
+  }
+  for (const family of families) {
+    process.stdout.write(`${family.family}: ${family.efforts.join(", ")}\n`);
+  }
+}
+
+/**
+ * The adapter's model advertisement: from a session record where probes are served from records
+ * (A10: the control pod in pod mode — no bridge), else a transient session as always.
+ */
+async function readModelAdvertisement(
+  agentCommand: string,
+  globalFlags: ReturnType<typeof resolveGlobalFlags>,
+  config: ResolvedAcpxConfig,
+): Promise<{
+  models: SessionModelState | undefined;
+  served: { source: string; recordId: string; adapterMatch: string } | undefined;
+}> {
+  const fromRecords = await modelCatalogueFromRecords(agentCommand, globalFlags.profile);
+  if (fromRecords) {
+    return {
+      models: fromRecords.models,
+      served: {
+        source: "records",
+        recordId: fromRecords.recordId,
+        adapterMatch: fromRecords.adapterMatch,
+      },
+    };
+  }
   const { readTransientAdvertisement } = await import("../acp/transient-advertisement.js");
   const { models } = await readTransientAdvertisement({
-    agentCommand: agent.agentCommand,
+    agentCommand,
     cwd: globalFlags.cwd,
     authCredentials: config.auth,
     authPolicy: globalFlags.authPolicy,
@@ -470,20 +513,66 @@ export async function handleModelCatalogue(
       ? { sessionContext: { acpxRecordId: "", profileId: globalFlags.profile } }
       : {}),
   });
-  const families = models ? projectAdvertisedComposedModels(models) : [];
-  if (
-    emitJsonResult(globalFlags.format, {
-      action: "model_catalogue",
-      agent: agent.agentName,
-      currentModelId: models?.currentModelId ?? null,
-      advertisedModelCatalogue: advertisedCatalogue(families),
-    })
-  ) {
-    return;
+  return { models, served: undefined };
+}
+
+/** A10 (additive JSON fields): present only when the answer was served from a session record. */
+function recordSourceFields(
+  served:
+    | {
+        source?: string;
+        recordId?: string;
+        adapterMatch?: string;
+      }
+    | undefined
+    | false,
+): Record<string, string> {
+  return served
+    ? {
+        ...(served.source ? { source: served.source } : {}),
+        ...(served.recordId ? { record_id: served.recordId } : {}),
+        ...(served.adapterMatch ? { adapter_match: served.adapterMatch } : {}),
+      }
+    : {};
+}
+
+/**
+ * A10: the model list of a harness, from the newest session record that carries one — only where
+ * probes are served from records (the control pod in pod mode); `undefined` everywhere else.
+ * Throws `RecordsCannotAnswerError` there when no record can answer (the placement step routes to
+ * the utility pod before this is reached).
+ */
+async function modelCatalogueFromRecords(
+  agentCommand: string,
+  profile: string | undefined,
+): Promise<
+  | {
+      models: SessionModelState;
+      recordId: string;
+      adapterMatch: "exact" | "harness";
+    }
+  | undefined
+> {
+  const records = await import("../pod/probe-records.js");
+  if (!records.probesServedFromRecordsHere()) {
+    return undefined;
   }
-  for (const family of families) {
-    process.stdout.write(`${family.family}: ${family.efforts.join(", ")}\n`);
+  const found = await records.newestRecordAdvertisement({
+    agentCommand,
+    need: "available_models",
+    ...(profile ? { profile } : {}),
+  });
+  if (!found) {
+    throw new records.RecordsCannotAnswerError("a model list for this agent");
   }
+  return {
+    models: {
+      currentModelId: found.currentModelId ?? "",
+      availableModels: found.availableModels.map((modelId) => ({ modelId, name: modelId })),
+    },
+    recordId: found.recordId,
+    adapterMatch: found.match,
+  };
 }
 
 /** The `status` JSON shape (`advertisedModelCatalogue`), so one parser reads both. */

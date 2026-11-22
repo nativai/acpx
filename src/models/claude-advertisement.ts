@@ -38,6 +38,11 @@ import path from "node:path";
 import { CLAUDE_ACP_FORK_COMMAND, resolveClaudeAcpCommand } from "../agent-registry.js";
 import { defaultBoxRuntimeInfoPath } from "../box-runtime-info.js";
 import {
+  newestRecordAdvertisement,
+  probesServedFromRecordsHere,
+  type RecordAdvertisement,
+} from "../pod/probe-records.js";
+import {
   advertisedModelOptions,
   parseAdvertisedOptions,
   type AdvertisedModelOption,
@@ -70,7 +75,7 @@ export type ClaudeAdvertKey = {
   agentCommand: string;
 };
 
-export type ClaudeAdvertSource = "probe" | "fixture";
+export type ClaudeAdvertSource = "probe" | "fixture" | "records";
 
 /**
  * `retryAfter` is the end of the failed key's backoff window, WRITTEN INTO THE
@@ -120,6 +125,10 @@ export type ClaudeAdvertDeps = {
 
 export type EnsureClaudeAdvertisementOptions = ClaudeAdvertDeps & {
   mode: ClaudeProbeMode;
+  /** A10 test seam: replaces `probesServedFromRecordsHere` (the control pod in pod mode). */
+  servedFromRecords?: () => boolean;
+  /** A10 test seam: replaces the record read. */
+  recordAdvertisement?: (agentCommand: string) => Promise<RecordAdvertisement | undefined>;
   /** Injected in tests; default {@link probeClaudeAdvertisement}. */
   probe?: (key: ClaudeAdvertKey) => Promise<ClaudeProbeResult>;
 };
@@ -260,7 +269,7 @@ function parseKey(value: unknown): ClaudeAdvertKey | null {
 }
 
 function parseSource(value: unknown): ClaudeAdvertSource | null {
-  return value === "probe" || value === "fixture" ? value : null;
+  return value === "probe" || value === "fixture" || value === "records" ? value : null;
 }
 
 function parseFailure(value: unknown): ClaudeAdvertFailure | null {
@@ -622,6 +631,52 @@ function viewOf(cache: ClaudeAdvertCache | null, key: ClaudeAdvertKey): ClaudeAd
   };
 }
 
+/**
+ * A10 — the advertisement where no bridge may start: the file cache when its good probe is for the
+ * DEPLOYED key (`fresh`), else the model select the newest record of the harness carries. Read-only:
+ * nothing is written, no probe is claimed. A record of the very adapter command the box launches is
+ * `fresh`; one of the same harness but another command is `stale` (labelled with the key it came
+ * from, as an older probe is). No record at all: the cache's own view, i.e. `none` or `stale`.
+ */
+async function viewFromRecords(
+  cache: ClaudeAdvertCache | null,
+  key: ClaudeAdvertKey,
+  read: EnsureClaudeAdvertisementOptions["recordAdvertisement"],
+): Promise<ClaudeAdvertisementView> {
+  const own = viewOf(cache, key);
+  if (own.status.state === "fresh") {
+    return own;
+  }
+  const found = await (
+    read ??
+    ((command) => newestRecordAdvertisement({ agentCommand: command, need: "config_options" }))
+  )(key.agentCommand);
+  const options = found ? advertisedModelOptions(found.configOptions) : undefined;
+  if (!found || options === undefined || options.length === 0) {
+    return own;
+  }
+  const snapshot: ClaudeAdvertisementSnapshot = {
+    options,
+    adapterSha: null,
+    sdkVersion: null,
+    probedAt: found.lastUsedAt,
+    source: "records",
+  };
+  return {
+    snapshot,
+    status: {
+      state: found.match === "exact" ? "fresh" : "stale",
+      probedAt: snapshot.probedAt,
+      adapterSha: null,
+      sdkVersion: null,
+      source: "records",
+      deployedAdapterSha: key.adapterSha,
+      deployedSdkVersion: key.sdkVersion,
+      error: null,
+    },
+  };
+}
+
 /** The envelope for a catalogue built with no advertisement information at all. */
 export const CLAUDE_ADVERTISEMENT_UNKNOWN: ClaudeAdvertisementStatus = {
   state: "none",
@@ -646,6 +701,11 @@ export async function ensureClaudeAdvertisement(
   const cachePath = options.cachePath ?? defaultClaudeAdvertCachePath(env);
   const key = currentClaudeAdvertKey({ ...options, env });
   const cache = readClaudeAdvertCache(cachePath);
+  // A10: on the control pod in pod mode NO probe runs, whatever `mode` says (no bridge there): the
+  // names come from the cache when it is current for the deployed key, else from what owners recorded.
+  if ((options.servedFromRecords ?? probesServedFromRecordsHere)()) {
+    return await viewFromRecords(cache, key, options.recordAdvertisement);
+  }
   if (!shouldProbe(options.mode, cache, key, cachePath, now())) {
     return viewOf(cache, key);
   }

@@ -29,6 +29,11 @@ import {
   forkSourceSleepingError,
   type SleepingForkCut,
 } from "../../pod/create-plan.js";
+import {
+  newestRecordAdvertisement,
+  probesServedFromRecordsHere,
+  RecordsCannotAnswerError,
+} from "../../pod/probe-records.js";
 import { bindDefaultAccountToSessionOptionsAsync } from "../../runtime/engine/default-account-binding.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
 import { persistSessionOptions } from "../../runtime/engine/session-options.js";
@@ -1549,6 +1554,24 @@ export async function listAgentOutputStyles(
   if (options.sessionId) {
     const record = await resolveSessionRecord(options.sessionId);
     return outputStyleListFromAdvertised(record.acpx?.config_options);
+  }
+
+  // A10: on the control pod in pod mode no bridge starts for a probe — the answer is what owners
+  // already recorded (the placement step routes to the utility pod when no record can answer).
+  if (probesServedFromRecordsHere()) {
+    const found = await newestRecordAdvertisement({
+      agentCommand: options.agentCommand,
+      need: "config_options",
+    });
+    if (!found) {
+      throw new RecordsCannotAnswerError("an output-style advertisement for this agent");
+    }
+    return {
+      ...outputStyleListFromAdvertised(found.configOptions),
+      source: "records",
+      recordId: found.recordId,
+      adapterMatch: found.match,
+    };
   }
 
   // The transient open/read/close is shared with the Claude model-advertisement

@@ -196,8 +196,8 @@ export type AdvertisedBy = {
   sdkVersion: string | null;
   /** ISO-8601 of the probe the advertisement came from. */
   probedAt: string;
-  /** `"probe"` = a real transient session; `"fixture"` = `ACPX_TEST_CLAUDE_ADVERT_JSON`. */
-  source: "probe" | "fixture";
+  /** `"probe"` = a real transient session; `"fixture"` = `ACPX_TEST_CLAUDE_ADVERT_JSON`; `"records"` = a session record (A10, pod mode). */
+  source: "probe" | "fixture" | "records";
 };
 
 export type SelectabilityCounts = {
@@ -276,7 +276,7 @@ export type ClaudeAdvertisementStatus = {
   probedAt: string | null;
   adapterSha: string | null;
   sdkVersion: string | null;
-  source: "probe" | "fixture" | null;
+  source: "probe" | "fixture" | "records" | null;
   /** The key deployed now. */
   deployedAdapterSha: string | null;
   deployedSdkVersion: string | null;

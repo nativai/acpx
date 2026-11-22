@@ -77,7 +77,9 @@ export type BranchDeps = {
   stderr: (text: string) => void;
 };
 
-const PROMPT_PATHS = new Set(["", "<agent>", "prompt"]);
+// `exec` reads its prompt from stdin like `prompt` does; its payload travels the same way (A10, the
+// utility-pod branch is the only caller that reaches `planPayload` with it).
+const PROMPT_PATHS = new Set(["", "<agent>", "prompt", "exec"]);
 const HARNESSES: ReadonlySet<string> = new Set(["claude", "pi", "codex", "claude-pty"]);
 
 /** The same normalization `src/cli.ts` applies to `process.argv` before the placement step. */
@@ -357,7 +359,7 @@ export function routedBranchHandlers(
   };
 }
 
-async function failLikeAcpx(error: unknown, output: OutputMode): Promise<number> {
+export async function failLikeAcpx(error: unknown, output: OutputMode): Promise<number> {
   const { normalizeOutputError, exitCodeForOutputErrorCode } =
     await import("../acp/error-normalization.js");
   const normalized = normalizeOutputError(error, { origin: "cli" });
@@ -386,11 +388,11 @@ async function failLikeAcpx(error: unknown, output: OutputMode): Promise<number>
  * sandbox. ⚠️ DO NOT read either unconditionally — on a box they would redirect what a pod is pinned
  * to and where a prompt's text is written. Held by test/pod-routed-branches.test.ts.
  */
-function testRuntimeDir(env: NodeJS.ProcessEnv): string | undefined {
+export function testRuntimeDir(env: NodeJS.ProcessEnv): string | undefined {
   return env.NODE_TEST_CONTEXT ? env.ACPX_TEST_RUNTIME_DIR?.trim() || undefined : undefined;
 }
 
-function testPayloadDir(env: NodeJS.ProcessEnv): string | undefined {
+export function testPayloadDir(env: NodeJS.ProcessEnv): string | undefined {
   const home = env.NODE_TEST_CONTEXT ? env.ACPX_POD_TEST_HOME?.trim() : undefined;
   return home ? `${home}/.acpx/routed` : undefined;
 }

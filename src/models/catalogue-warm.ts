@@ -45,6 +45,7 @@ import fs from "node:fs";
 import { realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { podMode } from "../pod/placement.js";
 import { claudeAdvertisementNeedsProbe } from "./claude-advertisement.js";
 import { CATALOGUE_TTL_MS, defaultCatalogueCachePath } from "./openrouter-catalogue.js";
 import { defaultEntitlementCachePath, ENTITLEMENT_TTL_MS } from "./openrouter-entitlement.js";
@@ -78,6 +79,8 @@ export interface WarmDeps {
    * term decides, so OpenRouter's warm behaviour is unchanged by those kicks.
    */
   scope?: WarmScope;
+  /** A10 test seam: the process's pod-mode verdict. */
+  podMode?: () => { mode: "pod" | "off" | "refuse" };
 }
 
 export type WarmScope = "all" | "claude-advertisement";
@@ -235,6 +238,16 @@ function resolveAcpxCliEntry(entry: string | undefined): string | null {
 }
 
 /**
+ * A10: NO detached warm in pod mode — in any place. The refresh child is a process nobody owns: on
+ * the control pod it would be the very bridge-less probe the pod design removes (its Claude
+ * advertisement leg spawns an adapter), and in an agent pod it would outlive the call it was kicked
+ * from. The caches are filled by an explicit `acpx models --refresh` and read from records.
+ */
+function inPodMode(deps: WarmDeps): boolean {
+  return (deps.podMode ?? podMode)().mode !== "off";
+}
+
+/**
  * Every reason NOT to warm, in one place — it returns the resolved CLI entry to
  * spawn, or null. None of these ever throws: a create must not fail over the
  * decision not to refresh a list.
@@ -246,7 +259,7 @@ function resolveWarmTarget(params: {
   entry: string | undefined;
   deps: WarmDeps;
 }): string | null {
-  if (params.env[DISABLE_ENV]) {
+  if (params.env[DISABLE_ENV] || inPodMode(params.deps)) {
     return null;
   }
   // Not acpx, or no self-entry to re-invoke — nothing to do, nothing to report.

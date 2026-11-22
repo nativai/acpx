@@ -20,7 +20,7 @@ import { placeOf, podMode, thisPodFile, type AgentPodFile, type Place } from "./
  *   record-only-create A2 — every create form writes a record and nothing else (C1.3)
  *   pass-through       A3 — POST /api/acpx/call on the control pod (C6.2)
  *   message-route      A3 — a prompt for another session goes to atrium's message routes
- *   utility-pod        a one-shot run that cannot be answered from records (K2): the utility pod
+ *   utility-pod        a one-shot run (A10): from records where possible, else the box's utility pod (A-7)
  *
  * ⚠️ ONLY `routed-ensure` MAY EVER ASK THE BROKER FOR A POD (C1.2 fixed consequence) — and it is
  * reached only from class `owner-ensure`. Held by `test/pod-placement-step.test.ts`.
@@ -45,7 +45,7 @@ export const BRANCH_OWNER: Readonly<Record<PodBranch, string>> = {
   "record-only-create": "A2",
   "pass-through": "A3",
   "message-route": "A3",
-  "utility-pod": "K2-utility-pod",
+  "utility-pod": "A10",
 };
 
 export type Route = { kind: "local" } | { kind: "branch"; branch: PodBranch };

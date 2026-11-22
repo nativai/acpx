@@ -45,17 +45,21 @@ const PHASE_SENTENCE: Record<PodStartingPhase, string> = {
 
 export function podStartingRefusal(input: {
   phase: PodStartingPhase;
-  wake: string;
+  /** Absent for a utility pod (A-10): it belongs to no session, so no message waits for it. */
+  wake?: string;
   sessionId?: string;
   seatId?: string | null;
 }): CapacityRefusedError {
   const retryAfterS = podStartingRetryAfterS(input.phase);
   const tokenLine =
     `acpx: REFUSED reason=pod_starting nothing_started=true protocol=1 ` +
-    `retry_after_s=${retryAfterS} phase=${input.phase} wake=${input.wake}`;
+    `retry_after_s=${retryAfterS} phase=${input.phase}` +
+    (input.wake === undefined ? "" : ` wake=${input.wake}`);
   const sentence =
-    `acpx: the session's agent pod ${PHASE_SENTENCE[input.phase]}. Nothing was run; the message ` +
-    `stays queued and is delivered when the pod is ready.`;
+    input.wake === undefined
+      ? `acpx: the box's utility pod ${PHASE_SENTENCE[input.phase]}. Nothing was run; this is not available right now.`
+      : `acpx: the session's agent pod ${PHASE_SENTENCE[input.phase]}. Nothing was run; the message ` +
+        `stays queued and is delivered when the pod is ready.`;
   return new CapacityRefusedError({
     tokenLine,
     sentence,
@@ -65,7 +69,9 @@ export function podStartingRefusal(input: {
       retryAfterS,
       queuedAhead: 0,
       message: sentence,
-      wake: { sessionId: input.sessionId ?? input.wake, seatId: input.seatId ?? null },
+      ...(input.wake === undefined
+        ? {}
+        : { wake: { sessionId: input.sessionId ?? input.wake, seatId: input.seatId ?? null } }),
       pod: { phase: input.phase },
     },
   });

@@ -170,6 +170,41 @@ export function brokerClassOf(
   return "interactive";
 }
 
+/**
+ * A-7 / C4: the box's two utility pods, by the key of their routed-call address (`ag-util-pool`,
+ * `ag-util-home`). Class `one-shot` may start these and NOTHING else; they belong to no session and
+ * no seat (A-10).
+ */
+export const UTILITY_KEYS = ["util-pool", "util-home"] as const;
+export type UtilityKey = (typeof UTILITY_KEYS)[number];
+
+export function isUtilityKey(key: string): key is UtilityKey {
+  return (UTILITY_KEYS as readonly string[]).includes(key);
+}
+
+/** The placement a utility pod's key names — never `auto` (a probe never waits for a new machine). */
+export function utilityPlacementOf(key: string): AgentPlacement {
+  if (!isUtilityKey(key)) {
+    throw new UtilityScopeError(`key ${JSON.stringify(key)} is not a utility pod`);
+  }
+  return key === "util-pool" ? "pool" : "home";
+}
+
+/** The refusal of C1.2's A-7: a one-shot asked for anything but its utility pod — a programming error, nothing is sent. */
+export class UtilityScopeError extends Error {
+  constructor(what: string) {
+    super(`A-7: class one-shot may start the box's utility pod and nothing else (${what})`);
+    this.name = "UtilityScopeError";
+  }
+}
+
+function assertUtilityTarget(options: RoutedCallOptions): void {
+  if (options.target.harness !== "utility") {
+    throw new UtilityScopeError(`harness ${options.target.harness}`);
+  }
+  utilityPlacementOf(options.key);
+}
+
 export function agentPodKey(sessionId: string): string {
   return createHash("sha256").update(sessionId).digest("hex").slice(0, 24);
 }
@@ -382,6 +417,14 @@ function sessionUrlField(value: RoutedCallTarget["sessionUrl"]): { sessionUrl?: 
   return url ? { sessionUrl: url } : {};
 }
 
+/**
+ * C7.2's `wake=<record id>`: the session whose message waits. A utility pod belongs to no session
+ * (A-10), so its refusals carry no `wake` — a probe is not a message that stays queued.
+ */
+function wakeOf(options: RoutedCallOptions): string | undefined {
+  return options.target.harness === "utility" ? undefined : options.target.sessionId;
+}
+
 function brokerRequestOf(
   options: RoutedCallOptions,
   releases: Record<string, string>,
@@ -394,7 +437,8 @@ function brokerRequestOf(
     contract: AGENT_BROKER_CONTRACT,
     ...owner,
     harness: target.harness,
-    placement: target.placement ?? "auto",
+    placement:
+      target.harness === "utility" ? utilityPlacementOf(options.key) : (target.placement ?? "auto"),
     class: brokerClassOf(target.admissionClass, options.class),
     releases,
     ...sessionUrlField(target.sessionUrl),
@@ -408,7 +452,7 @@ type BrokerContext = {
   agents: () => BrokerAgentsResult | undefined;
   brokerOptions: { origin: string; fetchImpl?: typeof fetch; wakeBoundMs: number };
   box: string;
-  wake: string;
+  wake: string | undefined;
   callId: string;
 };
 
@@ -533,7 +577,7 @@ async function askBroker(options: RoutedCallOptions, callId: string): Promise<En
     agents: () => agentsRead,
     brokerOptions,
     box: boxOfNamespace(namespaceFromSources(sources)),
-    wake: options.target.sessionId,
+    wake: wakeOf(options),
     callId,
   };
   return await brokerAnswerOutcome(answer, ctx);
@@ -557,19 +601,29 @@ async function ensureOwnerPod(options: RoutedCallOptions, callId: string): Promi
   return await askBroker(options, callId);
 }
 
+/**
+ * The classes that may START a pod: `owner-ensure` a session's, `one-shot` its utility pod (A-7) —
+ * never the other's. Both ask the API server first and the broker only when it shows no ready pod.
+ */
+async function resolveEnsured(options: RoutedCallOptions, callId: string): Promise<EnsuredPod> {
+  if (options.class === "one-shot") {
+    assertUtilityTarget(options);
+    return options.expectUid ? { uid: options.expectUid } : await ensureOwnerPod(options, callId);
+  }
+  // A utility pod belongs to no session: only a one-shot reaches it.
+  if (options.target.harness === "utility" || isUtilityKey(options.key)) {
+    throw new UtilityScopeError("owner-ensure asked for a utility pod");
+  }
+  return await ensureOwnerPod(options, callId);
+}
+
 /** The pod the call goes to, by class — or `no_pod` for `owner-if-pod` with none. */
 async function resolvePod(
   options: RoutedCallOptions,
   callId: string,
 ): Promise<EnsuredPod | "no_pod"> {
-  if (options.class === "owner-ensure") {
-    return await ensureOwnerPod(options, callId);
-  }
-  if (options.class === "one-shot") {
-    if (!options.expectUid) {
-      throw new Error("a routed one-shot needs the pod's uid");
-    }
-    return { uid: options.expectUid };
+  if (options.class !== "owner-if-pod") {
+    return await resolveEnsured(options, callId);
   }
   if (!options.lookup) {
     throw new Error("routed owner-if-pod needs a pod lookup");
@@ -664,7 +718,7 @@ async function dispatch(
   });
   return await settle(run, {
     callId: ctx.callId,
-    wake: options.target.sessionId,
+    wake: wakeOf(options),
     stderr,
     readyAt: async () => {
       const found = await options.lookup?.(options.key);
@@ -745,7 +799,7 @@ function defaultTransportPath(env: NodeJS.ProcessEnv): string {
 
 type SettleContext = {
   callId: string;
-  wake: string;
+  wake: string | undefined;
   stderr: NodeJS.WritableStream;
   /**
    * When this pod became Ready, read from the API server on demand (only a transport

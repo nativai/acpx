@@ -5,6 +5,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { listBuiltInAgents } from "./agent-registry.js";
 import { runPlacementStep } from "./pod/placement-step.js";
 import { registerRoutedBranches } from "./pod/routed-branches.js";
+import { registerUtilityBranch } from "./pod/utility-branch.js";
 // Block A2 registers the `record-only-create` branch (C1.3); a light module, see its header.
 import "./pod/record-only-create-branch.js";
 // Block A3 registers the `pass-through` and `message-route` branches (C6); a light module too.
@@ -55,6 +56,7 @@ function placementArgv(argv: string[]): string[] {
 
 async function start(): Promise<void> {
   registerRoutedBranches();
+  registerUtilityBranch();
   const outcome = await runPlacementStep({
     argv: placementArgv(process.argv),
     builtInAgents: () => listBuiltInAgents(),
