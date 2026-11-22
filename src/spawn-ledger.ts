@@ -1,11 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
-import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { queueLockFilePath } from "./cli/queue/paths.js";
-import { isSqliteExperimentalWarning } from "./models/ui-prefs-store.js";
+import { loadSqlite } from "./pod/sqlite-loader.js";
 import {
   classifyRecordedIdentity,
   compareProcessBirthIdentity,
@@ -31,40 +30,6 @@ import {
  * acpx-ui loads this module dynamically through `acpx __spawn-ledger-module` and checks
  * `SPAWN_LEDGER_API_VERSION`; change the surface only in lockstep with acpx-ui `server/brickOutbox.ts`.
  */
-
-type SqliteModule = { DatabaseSync: new (path: string) => DatabaseSync };
-let sqliteModule: SqliteModule | undefined;
-
-/**
- * node:sqlite must NOT load at CLI-module time: importing it emits an
- * ExperimentalWarning on stderr, and --version/--help/non-writing commands
- * promise clean stderr. The module is required lazily, on first SpawnLedger
- * construction — i.e. only on a path that actually opens the ledger. The
- * filter installed around the require drops exactly the one SQLite
- * ExperimentalWarning (name+message matched by the shared, tested predicate
- * in ui-prefs-store) and is removed immediately; every other warning flows
- * to the original handler. NEVER widen this to --no-warnings or
- * removeAllListeners — the ui-prefs-store comment explains the blast radius.
- */
-function requireSqlite(): SqliteModule {
-  if (sqliteModule) {
-    return sqliteModule;
-  }
-  const original = process.emitWarning.bind(process);
-  const filtered = (warning: unknown, ...rest: unknown[]): void => {
-    if (isSqliteExperimentalWarning(warning, rest)) {
-      return;
-    }
-    (original as (...args: unknown[]) => void)(warning, ...rest);
-  };
-  process.emitWarning = filtered as typeof process.emitWarning;
-  try {
-    sqliteModule = createRequire(import.meta.url)("node:sqlite") as SqliteModule;
-  } finally {
-    process.emitWarning = original;
-  }
-  return sqliteModule;
-}
 
 export const SPAWN_LEDGER_API_VERSION = 2;
 
@@ -436,13 +401,15 @@ export class SpawnLedger {
 
   constructor() {
     const directory = path.join(os.homedir(), ".acpx");
-    fs.mkdirSync(directory, { recursive: true });
-    this.sessionsDir = path.join(directory, "sessions");
-    fs.mkdirSync(this.sessionsDir, { recursive: true });
     // The file keeps its pre-ledger name: renaming a live WAL database while old-code processes
     // still hold it open across a deploy is not safe.
     this.dbPath = path.join(directory, "brick-outbox.db");
-    this.db = new (requireSqlite().DatabaseSync)(this.dbPath);
+    // First: in an agent pod nothing below runs — no directory is made, no module is loaded.
+    const { DatabaseSync: Database } = loadSqlite("spawn-ledger", this.dbPath);
+    fs.mkdirSync(directory, { recursive: true });
+    this.sessionsDir = path.join(directory, "sessions");
+    fs.mkdirSync(this.sessionsDir, { recursive: true });
+    this.db = new Database(this.dbPath);
     try {
       // busy_timeout=0: every busy site is retried by retryOnBusy, so the loop owns the waiting
       // and the budget accounting stays exact.

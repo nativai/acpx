@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -767,6 +768,69 @@ test("A-8: no classified command that touches box-wide stores runs locally in an
   assert.equal(reachesBoxWideLocally("control-store", { kind: "local" }), true);
   assert.equal(reachesBoxWideLocally("create", { kind: "local" }), true);
   assert.equal(reachesBoxWideLocally("read", { kind: "local" }), false);
+});
+
+// block A7 / C1.2 rule 5 — NO SQLITE IN AN AGENT POD. Two halves, both discovered (no hand list of
+// modules): (a) `node:sqlite` is required in ONE place, the guarded loader (`src/pod/sqlite-loader.ts`),
+// so a command that runs locally in an agent pod and reaches a database meets the guard; (b) every
+// CLI handler module that reaches a SQLite-opening module is named below with the verbs that open it,
+// and each such verb PASSES THROUGH in an agent pod — it never runs there. A fresh handler that
+// imports a database module is flagged until it is named here. The loader's own behaviour (refusal
+// before load, per database, with its negative cases) is `test/pod-no-sqlite.test.ts`.
+test("A7: the one loader is guarded, and every verb that opens a database passes through in an agent pod", () => {
+  const SQLITE_MODULES = [
+    "models/ui-prefs-store.js",
+    "session/archive/liveness.js",
+    "spawn-ledger.js",
+    "pod/sqlite-loader.js",
+  ];
+  const HANDLER_VERBS: Record<string, readonly string[]> = {
+    "cli/models-command.ts": [
+      "models fav",
+      "models fav add",
+      "models fav rm",
+      "models last-used",
+      "models last-used set",
+    ],
+    "cli/archive-command.ts": ["sessions archive", "sessions restore", "sessions prune"],
+  };
+  const importers = (root: string): string[] =>
+    fs
+      .readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".ts"))
+      .map((entry) => entry.name)
+      .filter((name) =>
+        SQLITE_MODULES.some((module) =>
+          new RegExp(`from "\\.\\./${module.replace(/[.]/g, "\\.")}"`).test(
+            fs.readFileSync(path.join(root, name), "utf8"),
+          ),
+        ),
+      )
+      .map((name) => `cli/${name}`)
+      .toSorted();
+  const cliRoot = path.resolve("src", "cli");
+  assert.deepEqual(importers(cliRoot), Object.keys(HANDLER_VERBS).toSorted());
+  // negative: a fresh handler importing a database module is flagged by the same discovery.
+  const fresh = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-a7-handlers-"));
+  fs.writeFileSync(
+    path.join(fresh, "fresh-command.ts"),
+    'import { openUiPrefsStore } from "../models/ui-prefs-store.js";\n',
+  );
+  fs.writeFileSync(path.join(fresh, "unrelated.ts"), 'import fs from "node:fs";\n');
+  assert.deepEqual(importers(fresh), ["cli/fresh-command.ts"]);
+  for (const [handler, verbs] of Object.entries(HANDLER_VERBS)) {
+    for (const verb of verbs) {
+      const entry = COMMAND_TABLE[verb];
+      assert.ok(entry, `${handler}: ${verb} has no class entry`);
+      for (const place of ["own-pod", "other-pod"] as const) {
+        assert.notEqual(
+          routeFor(entry.class, place).kind,
+          "local",
+          `${verb} (${entry.class}) runs locally in an agent pod (${place}) and opens a database`,
+        );
+      }
+    }
+  }
 });
 
 test("C6.2's inherit list is exported, closed, and exactly the contract's start", async () => {

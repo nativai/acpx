@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
-import { createRequire } from "node:module";
 import path from "node:path";
+import { loadSqlite } from "../../pod/sqlite-loader.js";
 import { isRecordedPidPossiblyAlive, type RecordPidIdentity } from "../../process-identity.js";
 import { hasActiveSidecar } from "./identity.js";
 
@@ -15,42 +15,6 @@ import { hasActiveSidecar } from "./identity.js";
  */
 
 export type LivenessVerdict = { live: boolean; signal?: string };
-
-type SqliteModule = {
-  DatabaseSync: new (
-    path: string,
-    options?: { readOnly?: boolean },
-  ) => {
-    prepare: (sql: string) => { all: (...params: unknown[]) => unknown[] };
-    close: () => void;
-  };
-};
-
-/**
- * Copied deliberately from `models/ui-prefs-store.ts`: `node:sqlite` is flagged
- * experimental in node 22 and emits ONE `ExperimentalWarning` on stderr, which
- * would break `--json-strict`'s promise of machine-clean stderr. The filter is
- * installed around the require and removed immediately, so an unrelated warning
- * in the same window still gets through.
- */
-function requireSqlite(): SqliteModule {
-  const original = process.emitWarning.bind(process);
-  const filtered = (warning: unknown, ...rest: unknown[]): void => {
-    const name = typeof warning === "string" ? rest[0] : (warning as Error | undefined)?.name;
-    const text =
-      typeof warning === "string" ? warning : ((warning as Error | undefined)?.message ?? "");
-    if (name === "ExperimentalWarning" && text.includes("SQLite")) {
-      return;
-    }
-    (original as (...args: unknown[]) => void)(warning, ...rest);
-  };
-  process.emitWarning = filtered as typeof process.emitWarning;
-  try {
-    return createRequire(import.meta.url)("node:sqlite") as SqliteModule;
-  } finally {
-    process.emitWarning = original;
-  }
-}
 
 /** The pointer atrium writes when its databases live outside the state home: `<root>/.db-dir.json`. */
 export const DB_DIR_POINTER_FILE = ".db-dir.json";
@@ -114,7 +78,7 @@ export async function loadWakeupLiveness(hotDir: string): Promise<WakeupLiveness
     return { status: "absent" };
   }
   try {
-    const { DatabaseSync: Database } = requireSqlite();
+    const { DatabaseSync: Database } = loadSqlite("wakeups", dbPath);
     const db = new Database(dbPath, { readOnly: true });
     try {
       const rows = db

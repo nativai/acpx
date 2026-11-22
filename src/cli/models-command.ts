@@ -38,6 +38,7 @@ import {
 } from "../models/openrouter-endpoints.js";
 import type { CatalogueModel, ModelCatalogue } from "../models/types.js";
 import { getUiPrefsStore } from "../models/ui-prefs-store.js";
+import { PodNoSqliteError } from "../pod/sqlite-loader.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 
 type ModelsFlags = {
@@ -112,7 +113,13 @@ async function readCatalogue(
   try {
     favorites = getUiPrefsStore().listFavorites();
   } catch (error) {
-    diag(`[acpx] warning: could not read the favorites store: ${asMessage(error)}\n`);
+    // An agent pod opens no SQLite (C1.2 rule 5): the catalogue is the same, only the stars are
+    // absent — one plain line, not a failure.
+    diag(
+      error instanceof PodNoSqliteError
+        ? "[acpx] note: favorites are kept on the control pod; none are shown in an agent pod\n"
+        : `[acpx] warning: could not read the favorites store: ${asMessage(error)}\n`,
+    );
   }
   return decorateFavorites(catalogue, favorites);
 }
