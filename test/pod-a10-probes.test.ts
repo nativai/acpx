@@ -83,6 +83,7 @@ type Seed = {
   configOptions?: unknown[];
   models?: string[];
   profile?: string;
+  startedAt?: string;
 };
 
 function store(seeds: Seed[]) {
@@ -103,6 +104,7 @@ function store(seeds: Seed[]) {
     const seed = seeds.find((s) => s.id === id);
     assert.ok(seed);
     return {
+      ...(seed.startedAt ? { agentStartedAt: seed.startedAt } : {}),
       acpx: {
         config_options: seed.configOptions,
         available_models: seed.models,
@@ -134,7 +136,8 @@ test("records: the NEWEST session of the same harness that carries the advertise
     { entries: s.entries as never, load: s.load },
   );
   assert.equal(found?.recordId, "new");
-  assert.deepEqual(s.loaded, ["new"], "the older record is never opened once the newest answers");
+  // ranking by the adapter's start time needs every candidate of the tier opened (at most the read bound)
+  assert.deepEqual(s.loaded.toSorted(), ["new", "old"]);
 });
 
 test("records (negative): a sleeping record, a sub-agent, another harness and a record without the advertisement never answer", async () => {
@@ -302,6 +305,153 @@ test("round 2 / F-A: a Codex record with NO profile (what a default-profile sess
   );
 });
 
+test("rank by agent_started_at: a session that started BEFORE an update does not look new although it was used last; a record with no start time ranks last and is still served when it is the only one", async () => {
+  const s = store([
+    {
+      id: "long-running",
+      command: CLAUDE,
+      lastUsedAt: "2026-11-22T00:00:00Z", // used a minute ago …
+      startedAt: "2026-11-01T00:00:00Z", // … but its adapter started three weeks ago
+      configOptions: [styleOption("old")],
+    },
+    {
+      id: "recent-start",
+      command: CLAUDE,
+      lastUsedAt: "2026-11-15T00:00:00Z",
+      startedAt: "2026-11-20T00:00:00Z",
+      configOptions: [styleOption("new")],
+    },
+    {
+      id: "no-start-time",
+      command: CLAUDE,
+      lastUsedAt: "2026-11-22T12:00:00Z", // the newest use of all
+      configOptions: [styleOption("unknown")],
+    },
+  ]);
+  const query = { agentCommand: CLAUDE, need: "config_options" as const };
+  const served = await newestRecordAdvertisement(query, {
+    entries: s.entries as never,
+    load: s.load,
+  });
+  assert.equal(served?.recordId, "recent-start");
+  assert.equal(served?.agentStartedAt, "2026-11-20T00:00:00Z");
+  assert.equal(
+    served?.lastUsedAt,
+    "2026-11-15T00:00:00Z",
+    "record_last_used_at stays the record's own",
+  );
+  // negative twin: with the start times swapped the other record wins — the order is the start time
+  const swapped = store([
+    {
+      id: "a",
+      command: CLAUDE,
+      lastUsedAt: "2026-11-01T00:00:00Z",
+      startedAt: "2026-11-20T00:00:00Z",
+      configOptions: [styleOption("x")],
+    },
+    {
+      id: "b",
+      command: CLAUDE,
+      lastUsedAt: "2026-11-22T00:00:00Z",
+      startedAt: "2026-11-02T00:00:00Z",
+      configOptions: [styleOption("y")],
+    },
+  ]);
+  assert.equal(
+    (
+      await newestRecordAdvertisement(query, {
+        entries: swapped.entries as never,
+        load: swapped.load,
+      })
+    )?.recordId,
+    "a",
+  );
+  // a record without the field alone is an answer — without a start time, and never ahead of one that has it
+  const only = store([
+    {
+      id: "only",
+      command: CLAUDE,
+      lastUsedAt: "2026-11-22T12:00:00Z",
+      configOptions: [styleOption("z")],
+    },
+  ]);
+  const alone = await newestRecordAdvertisement(query, {
+    entries: only.entries as never,
+    load: only.load,
+  });
+  assert.equal(alone?.recordId, "only");
+  assert.equal(alone?.agentStartedAt, undefined);
+  // ties on the start time fall back to the newest use
+  const tie = store([
+    {
+      id: "t1",
+      command: CLAUDE,
+      lastUsedAt: "2026-11-10T00:00:00Z",
+      startedAt: "2026-11-05T00:00:00Z",
+      configOptions: [styleOption("x")],
+    },
+    {
+      id: "t2",
+      command: CLAUDE,
+      lastUsedAt: "2026-11-12T00:00:00Z",
+      startedAt: "2026-11-05T00:00:00Z",
+      configOptions: [styleOption("y")],
+    },
+  ]);
+  assert.equal(
+    (await newestRecordAdvertisement(query, { entries: tie.entries as never, load: tie.load }))
+      ?.recordId,
+    "t2",
+  );
+});
+
+test("rank by agent_started_at never lifts a `harness` record over an `exact` one: the tier comes first", async () => {
+  const s = store([
+    {
+      id: "exact-old-start",
+      command: CLAUDE,
+      lastUsedAt: "2026-11-01T00:00:00Z",
+      startedAt: "2026-10-01T00:00:00Z",
+      configOptions: [styleOption("e")],
+    },
+    {
+      id: "rig-new-start",
+      command: "node /workspace/projects/claude-agent-acp/sdk-1/dist/index.js",
+      lastUsedAt: "2026-11-22T00:00:00Z",
+      startedAt: "2026-11-22T00:00:00Z",
+      configOptions: [styleOption("r")],
+    },
+  ]);
+  const served = await newestRecordAdvertisement(
+    { agentCommand: CLAUDE, need: "config_options" },
+    { entries: s.entries as never, load: s.load },
+  );
+  assert.equal(served?.recordId, "exact-old-start");
+  assert.equal(served?.match, "exact");
+});
+
+test("claude advertisement from records: an `exact` record WITHOUT agent_started_at is `stale`, never fresh; with it, `fresh` and the start time is on the status", async () => {
+  const where = claudeAdvertDir();
+  const unknownAge = await ensureClaudeAdvertisement({
+    ...where,
+    env: {},
+    mode: "never",
+    servedFromRecords: () => true,
+    recordAdvertisement: async () => recordOf("exact", null),
+  });
+  assert.equal(unknownAge.status.state, "stale");
+  assert.equal(unknownAge.status.recordAgentStartedAt, undefined);
+  const known = await ensureClaudeAdvertisement({
+    ...where,
+    env: {},
+    mode: "never",
+    servedFromRecords: () => true,
+    recordAdvertisement: async () => recordOf("exact"),
+  });
+  assert.equal(known.status.state, "fresh");
+  assert.equal(known.status.recordAgentStartedAt, "2026-11-20T00:00:00.000Z");
+});
+
 test("round 2 / F-B + F-G: a record of the box's own adapter command answers even when a NEWER record of another command (a dev or rig adapter) exists — a newer rig record never hides the deployed adapter's output styles", async () => {
   const s = store([
     {
@@ -378,10 +528,14 @@ function claudeAdvertDir() {
   };
 }
 
-const recordOf = (match: "exact" | "harness"): RecordAdvertisement => ({
+const recordOf = (
+  match: "exact" | "harness",
+  started: string | null = "2026-11-20T00:00:00.000Z",
+): RecordAdvertisement => ({
   recordId: "rec-1",
   agentCommand: CLAUDE,
   lastUsedAt: "2026-11-21T00:00:00.000Z",
+  agentStartedAt: started ?? undefined,
   match,
   configOptions: [modelOption("opus", "sonnet")] as never,
   availableModels: [],
@@ -854,7 +1008,9 @@ const record = (
   command: string,
   acpx: Record<string, unknown>,
   lastUsedAt = "2026-11-10T00:00:00.000Z",
+  agentStartedAt?: string,
 ) => ({
+  ...(agentStartedAt ? { agentStartedAt } : {}),
   acpxRecordId: id,
   acpSessionId: `acp-${id}`,
   agentCommand: command,
@@ -1054,22 +1210,30 @@ test("REAL CLI, pod mode (A-7 negatives): a call that is already routed is refus
   }
 });
 
-function writeRegistry(home: string): void {
+/**
+ * `devbox`: one chatgpt profile on the native `~/.codex`. `s1` (F-A2): the same, plus `codexalt` on a
+ * home of its own, BOUND AS THE DEFAULT — so a create with no profile writes `profile:"codexalt"`, and
+ * a record with none ran on the native home.
+ */
+function writeRegistry(home: string, shape: "devbox" | "s1" = "devbox"): void {
   const dir = path.join(home, ".acpx", "subscriptions");
   fs.mkdirSync(dir, { recursive: true });
+  const chatgpt = (id: string, codexHome: string) => ({
+    id,
+    label: id,
+    authMode: "chatgpt",
+    adapter: "codex",
+    account: id,
+    codexHome,
+  });
   fs.writeFileSync(
     path.join(dir, "registry.json"),
     JSON.stringify({
       version: 3,
+      ...(shape === "s1" ? { default: "codexalt" } : {}),
       profiles: [
-        {
-          id: "codexgpt",
-          label: "Codex ChatGPT (native ~/.codex)",
-          authMode: "chatgpt",
-          adapter: "codex",
-          account: "codexgpt",
-          codexHome: path.join(home, ".codex"),
-        },
+        chatgpt("codexgpt", path.join(home, ".codex")),
+        ...(shape === "s1" ? [chatgpt("codexalt", path.join(home, "alt-codex-home"))] : []),
       ],
     }),
   );
@@ -1146,6 +1310,95 @@ test("REAL CLI, round 2 / F-A (negative): an explicit OTHER profile on the only 
     assert.equal(r.calls().length, 1);
   } finally {
     await r.close();
+  }
+});
+
+test("REAL CLI, F-A2 (shape S1: the default is bound to a NON-native profile): a no-profile Codex record ran on the native home — it answers the native profile and NOT the bound one", async () => {
+  const noProfile = record("77777777-7777-4777-8777-777777777771", CODEX, {
+    available_models: ["gpt-5[low]"],
+  });
+  const r = await rig({ records: [noProfile], stub: { exit: 0, stdout: "{}\n" } });
+  try {
+    writeRegistry(r.home, "s1");
+    const cwd = fs.mkdtempSync(path.join(ROOT, "empty-"));
+    // the profile the create path binds (codexalt): the record does NOT answer for it — one record, one account
+    const bound = await cli(ATRIUM_CODEX_ARGV(cwd, "codexalt"), r.env);
+    assert.equal(bound.code, 0, bound.stderr);
+    assert.equal(
+      r.broker.requests.find((q) => q.method === "POST")?.key,
+      "util-home",
+      "routed to the home utility pod, not served from the native-home record",
+    );
+    assert.equal(r.calls().length, 1);
+    // the native profile: served from that very record, exact
+    const native = await cli(ATRIUM_CODEX_ARGV(cwd, "codexgpt"), r.env);
+    assert.equal(native.code, 0, native.stderr);
+    const json = JSON.parse(native.stdout.trim().split("\n").at(-1) ?? "{}") as Record<
+      string,
+      unknown
+    >;
+    assert.equal(json.source, "records");
+    assert.equal(json.record_id, "77777777-7777-4777-8777-777777777771");
+    assert.equal(r.calls().length, 1, "no second routed call: the native profile did not need one");
+  } finally {
+    await r.close();
+  }
+});
+
+test("REAL CLI: the answer carries record_agent_started_at, and the record whose adapter started LAST answers although another was used later; a record without the field adds none", async () => {
+  const r = await rig({
+    records: [
+      record(
+        "88888888-8888-4888-8888-888888888881",
+        CLAUDE,
+        { config_options: [styleOption("default", "Long")] },
+        "2026-11-22T00:00:00.000Z", // used most recently …
+        "2026-11-01T00:00:00.000Z", // … adapter started three weeks ago
+      ),
+      record(
+        "88888888-8888-4888-8888-888888888882",
+        CLAUDE,
+        { config_options: [styleOption("default", "Fresh")] },
+        "2026-11-15T00:00:00.000Z",
+        "2026-11-20T00:00:00.000Z",
+      ),
+    ],
+  });
+  try {
+    const result = await cli(["--agent", CLAUDE, "--format", "json", "output-styles"], r.env);
+    assert.equal(result.code, 0, result.stderr);
+    const json = JSON.parse(result.stdout.trim().split("\n").at(-1) ?? "{}") as Record<
+      string,
+      unknown
+    >;
+    assert.equal(json.record_id, "88888888-8888-4888-8888-888888888882");
+    assert.equal(json.record_agent_started_at, "2026-11-20T00:00:00.000Z");
+    assert.equal(json.record_last_used_at, "2026-11-15T00:00:00.000Z");
+  } finally {
+    await r.close();
+  }
+  const bare = await rig({
+    records: [
+      record("88888888-8888-4888-8888-888888888883", CLAUDE, {
+        config_options: [styleOption("default", "NoStart")],
+      }),
+    ],
+  });
+  try {
+    const result = await cli(["--agent", CLAUDE, "--format", "json", "output-styles"], bare.env);
+    assert.equal(result.code, 0, result.stderr);
+    const json = JSON.parse(result.stdout.trim().split("\n").at(-1) ?? "{}") as Record<
+      string,
+      unknown
+    >;
+    assert.equal(json.source, "records");
+    assert.equal(
+      "record_agent_started_at" in json,
+      false,
+      "no field, not a null or an empty string",
+    );
+  } finally {
+    await bare.close();
   }
 });
 
