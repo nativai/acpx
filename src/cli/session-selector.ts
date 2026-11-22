@@ -228,12 +228,15 @@ export class NoSessionError extends Error {
 
 // The refusal for a call that names no session — with the create form named, because
 // `acpx <agent> "<prompt>"` is what a caller who forgot the id wrote, and the create is the
-// one thing they may actually want (AC-ID2).
+// one thing they may actually want (AC-ID2). The ADVISED form is one that runs: `acpx <agent> --session-id <id> <text>`
+// (measured; `test/no-session-hint.test.ts` runs it). The root takes no `--session-id` — `acpx --session-id X <text>` is
+// `unknown option` — so the hint must never advise the flag before the agent (brick 56f5d869).
 export function noSessionIdMessage(agentName: string): string {
   return (
     `⚠ No acpx session found: no session id was given. Every acpx call names its session by id — ` +
-    `pass --session-id <id> ` +
-    `(or --session-url <url>).\nNo session yet? Create one: acpx ${agentName} sessions new`
+    `pass --session-id <id> (or --session-url <url>) AFTER the agent name, as in ` +
+    `acpx <agent> --session-id <id> <text> (the bare form takes no such flag: it reads its first word as the agent).` +
+    `\nNo session yet? Create one: acpx ${agentName} sessions new`
   );
 }
 
