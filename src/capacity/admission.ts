@@ -3,6 +3,7 @@ import path from "node:path";
 import { acpAdapterKind } from "../acp/agent-command.js";
 import { CapacityRefusedError } from "../errors.js";
 import { assertBoxWideWriteAllowed, PodForeignWriteError } from "../pod/foreign-write-guard.js";
+import { lockHostPlace } from "../pod/identity.js";
 import { isControlPlaneInPodMode, podRoom, readAgentsFigures } from "../pod/pod-capacity.js";
 import { admissionBusyRefusal, agentCapRefusal } from "../pod/pod-refusal.js";
 import type { CapacityRefusalReason } from "../types.js";
@@ -1260,6 +1261,20 @@ export async function releaseAdmittedWake(
 }
 
 /**
+ * ⚠️ IN AN AGENT POD THE WAKE GATE HAS NOTHING TO DECIDE (block A9, A9 TE finding K1). A `prompt` or a
+ * live `set` of a pod session in ITS OWN pod is LOCAL (`owner-ensure` / `owner-if-pod`, own-pod cell):
+ * the first prompt of every pod arrives here with no owner yet, because the broker has just started the
+ * pod. The pod exists; whether it may exist is the broker's cap and the cluster's quota, decided when it
+ * was asked for (C4). So the answer is `not-gated` — named, and with NO ledger, lock or log I/O: not a
+ * refusal (the first A9 build threw `pod_foreign_write` from here and so refused every first message of
+ * every pod session, a person's included) and not a fail-open through the lock (the build before it).
+ * Held by `test/pod-wake-own-pod.test.ts` (real CLI) and `test/pod-admission-guard.test.ts`.
+ * `admitCreate`, `releaseAdmittedWake` and the ticket keep the A-8 guard: nothing classified reaches
+ * them in an agent pod, and one that is not classified is a defect to see.
+ */
+const AGENT_POD_WAKE: WakeDecision = { decision: "not-gated", why: "agent-pod" };
+
+/**
  * Admit the wake of a session whose owner is not running, or refuse it. Never throws for a
  * decision: a refusal is `{decision: "refused", error, refusal}` — `sendSession` throws the error
  * (exit 75), `admit-wake` prints the refusal. The caller has already found no live or starting owner.
@@ -1268,7 +1283,9 @@ export async function admitWake(
   request: WakeAdmissionRequest,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<WakeDecision> {
-  assertLedgerWriteAllowed(env);
+  if (lockHostPlace(env) === "agent-pod") {
+    return AGENT_POD_WAKE;
+  }
   const cls = wakeClassOf(request, env);
   if (cls === undefined) {
     return { decision: "not-gated", why: "no-class" };
