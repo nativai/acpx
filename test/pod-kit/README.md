@@ -38,7 +38,7 @@ new Job with a new uid, the next scripted behaviour. **Admission** is `admission
 `live ≥ cap − reserve`) → `refused reason=agent_cap`; quota used ≥ hard → `quota`; target `home` with home live ≥ home cap → `home_full`. `auto` goes to
 the pool while `pool.state` is `ready`, else home. Limits come from the script's `status` (`cap` 100, `reserve` 1, `home.cap` **0** as the real default,
 `quota.hard` = cap — a box WITH its quota patch; the real default hard 0 refuses every create as `quota`, script `quota:{used:0,hard:0}` to see it;
-`live` / `used` derived from the Jobs unless scripted); `GET /v1/agents` reports the same numbers.
+`live` / `used` derived from the Jobs unless scripted); `GET /v1/agents` reports the same numbers, and — A-49 — `placement: {forced}` (`status.placement.forced: "home"` places EVERY request home, `pool` ones included, as broker.py:2766; `status.placement.omit` serves a GET without the field, an older broker).
 
 **DELETE**: `?uid=<pod uid>`: a wrong uid deletes nothing and answers 200 with the body exactly `refused reason=uid_mismatch\n`; a matching uid (also on a
 pod terminating during the scripted `delete.delayMs`) deletes and answers 200 empty; no pod of the key answers 200 empty; **an EMPTY `?uid=` is no uid** —

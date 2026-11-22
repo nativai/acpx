@@ -220,7 +220,11 @@ test("GET /v1/agents: the C4 snapshot; a malformed or failing answer is `ok:fals
   };
   const broker = await startBroker({ json: good });
   try {
-    assert.deepEqual(await getAgents({ origin: broker.origin }), { ok: true, agents: good });
+    // an older broker serves no `placement`: it reads as `{forced: null}` (A-49)
+    assert.deepEqual(await getAgents({ origin: broker.origin }), {
+      ok: true,
+      agents: { ...good, placement: { forced: null } },
+    });
     assert.equal(broker.seen[0]?.method, "GET");
     assert.equal(broker.seen[0]?.url, "/v1/agents");
   } finally {

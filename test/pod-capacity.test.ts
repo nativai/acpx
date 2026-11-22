@@ -3,10 +3,16 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
+import { type BrokerAgentRequest, ensureAgentPod, getAgents } from "../src/pod/broker-client.js";
 import { podCapacitySnapshot, podRoom, WAITING_LINE_FACTOR } from "../src/pod/pod-capacity.js";
 import { waitingLineRefusal, waitingLineRefusalError } from "../src/pod/waiting-line.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence/serialize.js";
-import { type BrokerStatus, startFakeBroker } from "./pod-kit/fake-broker.js";
+import {
+  type BrokerStatus,
+  startFakeBroker,
+  wellFormedAgentRequest,
+  wellFormedUtilityRequest,
+} from "./pod-kit/fake-broker.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
 import {
   admissionDir,
@@ -36,6 +42,7 @@ function base() {
     quota: { used: 3, hard: 10 },
     home: { live: 0, cap: 2 },
     pool: { state: "ready" },
+    placement: { forced: null as "home" | null },
   };
 }
 const room = (a: ReturnType<typeof base>, extra: Partial<Parameters<typeof podRoom>[1]> = {}) =>
@@ -526,4 +533,240 @@ test("create-plan.ts (imported by the record parser) imports nothing from the ca
     HEAVY_IMPORT.test(`${text}\nimport { agentCapRefusal } from "./pod-refusal.js";\n`),
     true,
   );
+});
+
+// ── A-49 / K2: the capacity answer judges a request by where the broker will PLACE it ─────────────────
+// Rows 49.2 and 49.3 of TEST-PLAN-ROWS-A29-A36 §5. Guarantee: it never reports room the broker will refuse for
+// where it puts the pod. Each row below is red on 42912ef2 (which ignored `pool.state` and `placement`).
+
+test("A-49 podRoom: forced home binds EVERY request to the home cap — pool and auto, any harness", () => {
+  const forced = agents({ placement: { forced: "home" }, home: { live: 1, cap: 1 } });
+  for (const harness of ["claude", "codex", "pi"] as const) {
+    const out = room(forced, { harness });
+    assert.deepEqual([out.slots, out.why, out.placedAt], [0, "home_full", "home"], harness);
+  }
+  const pool = room(forced, { asked: "pool" });
+  assert.deepEqual(
+    [pool.slots, pool.placedAt],
+    [0, "home"],
+    "a `pool` request goes home too (broker.py:2766)",
+  );
+  // NEGATIVE of the same input: not forced → the pool answers with room; `placement` absent reads as null
+  assert.equal(room(agents({ home: { live: 1, cap: 1 } })).slots, 6);
+  assert.equal(room(agents({ home: { live: 1, cap: 1 } }), { asked: "pool" }).placedAt, "pool");
+});
+
+test("A-49 podRoom: `auto` goes home while the pool is not ready (every `pool.state` but `ready`); a ready pool does not", () => {
+  const full = { home: { live: 1, cap: 1 } };
+  for (const state of ["no-template", "template-gaps:node-selector", ""]) {
+    const out = room(agents({ ...full, pool: { state } }));
+    assert.deepEqual([out.slots, out.why, out.placedAt], [0, "home_full", "home"], state);
+  }
+  assert.equal(
+    room(agents({ ...full, pool: { state: "ready" } })).slots,
+    6,
+    "the pool ready: room",
+  );
+  // home room left: the home cap, not the pool's figures, is the number
+  assert.equal(
+    room(agents({ home: { live: 0, cap: 2 }, pool: { state: "no-template" } })).slots,
+    2,
+  );
+});
+
+const reads = async (body: unknown) =>
+  await getAgents({
+    origin: "http://broker.test",
+    fetchImpl: (async () => new Response(JSON.stringify(body))) as typeof fetch,
+  });
+
+test("A-49 GET: `placement.forced` is read; absent (an older broker) is null; anything else is not an answer", async () => {
+  const { placement: _drop, ...older } = base();
+  const absent = await reads(older);
+  assert.ok(absent.ok && absent.agents.placement.forced === null, "absent → null");
+  const forced = await reads({ ...base(), placement: { forced: "home" } });
+  assert.ok(forced.ok && forced.agents.placement.forced === "home");
+  const nulled = await reads({ ...base(), placement: { forced: null } });
+  assert.ok(nulled.ok && nulled.agents.placement.forced === null);
+  // NEGATIVE: a value this build cannot name must not be read as "not forced" — the GET is malformed
+  for (const bad of [{ forced: "pool" }, { forced: 1 }, 5, null, "home"]) {
+    const out = await reads({ ...base(), placement: bad });
+    assert.equal(out.ok, false, JSON.stringify(bad));
+  }
+});
+
+test("A-49 K2: the verdict equals the real broker's POST verdict for the same document, for every harness and for a `util-pool` one-shot (kit broker)", async () => {
+  const sessionId = "0f0e0d0c-0b0a-4909-8807-060504030201";
+  const docs: Array<{ name: string; status: BrokerStatus }> = [
+    {
+      name: "forced home, home full, pool ready",
+      status: { live: 1, cap: 10, home: { live: 1, cap: 1 }, placement: { forced: "home" } },
+    },
+    {
+      name: "forced home, home has room",
+      status: { live: 1, cap: 10, home: { live: 0, cap: 2 }, placement: { forced: "home" } },
+    },
+    {
+      name: "pool not ready, home full",
+      status: { live: 1, cap: 10, home: { live: 1, cap: 1 }, pool: { state: "no-template" } },
+    },
+    {
+      name: "pool not ready, home room",
+      status: { live: 1, cap: 10, home: { live: 0, cap: 1 }, pool: { state: "no-template" } },
+    },
+    { name: "pool ready, home full", status: { live: 1, cap: 10, home: { live: 1, cap: 1 } } },
+    {
+      name: "older broker (no field), pool ready",
+      status: { live: 1, cap: 10, home: { live: 0, cap: 0 }, placement: { omit: true } },
+    },
+  ];
+  const requests = [
+    { label: "claude auto", harness: "claude" as const, util: false, asked: "auto" as const },
+    { label: "codex home", harness: "codex" as const, util: false, asked: "home" as const },
+    { label: "util-pool", harness: "claude" as const, util: true, asked: "pool" as const },
+  ];
+  const seen = new Set<string>();
+  for (const doc of docs) {
+    for (const r of requests) {
+      if (r.util && doc.status.pool?.state !== undefined) {
+        continue; // an explicit pool request on an unusable template is `template_rejected`, not room
+      }
+      const broker = await startFakeBroker({
+        status: doc.status,
+        default: {
+          final: {
+            ready: {
+              ip: "10.1.2.3",
+              pod: "ag-x",
+              uid: "44444444-4444-4444-8444-444444444444",
+              node: "n1",
+              placement: "pool",
+            },
+          },
+        },
+      });
+      try {
+        const built = r.util
+          ? wellFormedUtilityRequest("pool")
+          : wellFormedAgentRequest(sessionId, {
+              harness: r.harness,
+              placement: r.asked,
+              class: "spawn",
+            });
+        const verdict = await ensureAgentPod(built.key, built.body as BrokerAgentRequest, {
+          origin: broker.url,
+          wakeBoundMs: 2_000,
+        });
+        const got = await getAgents({ origin: broker.url });
+        assert.ok(got.ok, doc.name);
+        const roomNow = podRoom(got.agents, {
+          harness: r.harness,
+          admissionClass: "spawn",
+          waitingCount: 0,
+          asked: r.asked,
+        });
+        assert.notEqual(
+          verdict.kind,
+          "error",
+          `${doc.name} / ${r.label}: ${JSON.stringify(verdict)}`,
+        );
+        const brokerRefuses = verdict.kind === "refused";
+        assert.equal(
+          roomNow.slots >= 1,
+          !brokerRefuses,
+          `${doc.name} / ${r.label}: capacity says ${roomNow.slots} slot(s), the broker says ${verdict.kind}`,
+        );
+        seen.add(brokerRefuses ? "refused" : "admitted");
+      } finally {
+        await broker.close();
+      }
+    }
+  }
+  assert.deepEqual([...seen].toSorted(), ["admitted", "refused"], "both outcomes were exercised");
+});
+
+test("A-49 row 49.2: forced home, home 1/1, a ready pool with room ⇒ `--need 1` no room (`home_full`); admit-wake the same; not forced / absent ⇒ room", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  writeRecord(f, "wake-49", CLAUDE);
+  const forced = await BROKER({
+    live: 1,
+    cap: 10,
+    home: { live: 1, cap: 1 },
+    placement: { forced: "home" },
+  });
+  try {
+    const need = await capacity(f, forced.url, ["--need", "1"]);
+    assert.equal(need.code, 75, need.stderr);
+    const json = lastJson(need.stdout);
+    assert.equal((json.bindingGuard as Json).claude, "home_full");
+    assert.equal((json.placedAt as Json).claude, "home");
+    assert.match(String(json.needMetReason), /forces every pod home/u);
+    const w = await wake(f, forced.url, "wake-49");
+    assert.equal(w.code, 75, w.stderr);
+    assert.match(
+      w.stderr.split("\n")[0],
+      /^acpx: REFUSED reason=agent_cap .* why=home_full wake=wake-49$/u,
+    );
+  } finally {
+    await forced.close();
+  }
+  for (const placement of [{ forced: null }, { omit: true }] as const) {
+    const open = await BROKER({ live: 1, cap: 10, home: { live: 1, cap: 1 }, placement });
+    try {
+      assert.equal(
+        (await capacity(f, open.url, ["--need", "1"])).code,
+        0,
+        JSON.stringify(placement),
+      );
+      assert.equal((await wake(f, open.url, "wake-49")).code, 0, JSON.stringify(placement));
+    } finally {
+      await open.close();
+    }
+  }
+});
+
+test("A-49 row 49.3: `pool.state` not ready, not forced, home full ⇒ no room for `auto` (`home_full`); the pool ready ⇒ room", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  writeRecord(f, "wake-493", CLAUDE);
+  const notReady = await BROKER({
+    live: 1,
+    cap: 10,
+    home: { live: 1, cap: 1 },
+    pool: { state: "no-template" },
+  });
+  try {
+    const need = await capacity(f, notReady.url, ["--need", "1"]);
+    assert.equal(need.code, 75, need.stderr);
+    assert.match(String(lastJson(need.stdout).needMetReason), /pool is not ready \(no-template\)/u);
+    const w = await wake(f, notReady.url, "wake-493");
+    assert.equal(w.code, 75, w.stderr);
+    assert.match(w.stderr.split("\n")[0], /why=home_full wake=wake-493$/u);
+  } finally {
+    await notReady.close();
+  }
+  const ready = await BROKER({ live: 1, cap: 10, home: { live: 1, cap: 1 } });
+  try {
+    assert.equal((await capacity(f, ready.url, ["--need", "1"])).code, 0);
+    assert.equal((await wake(f, ready.url, "wake-493")).code, 0);
+  } finally {
+    await ready.close();
+  }
+});
+
+test("K3: the pod-plane `admission_busy` token carries the REAL count of waiting items, as the JSON does", async () => {
+  const f = makeBox({});
+  writeRecord(f, "wake-k3", CLAUDE);
+  writeWaiting(f, 4);
+  const run = await wake(f, await refusedUrl(), "wake-k3");
+  assert.equal(run.code, 75, run.stderr);
+  assert.match(
+    run.stderr.split("\n")[0],
+    /^acpx: REFUSED reason=admission_busy .* queued_ahead=4$/u,
+  );
+  assert.equal((lastJson(run.stdout).refusal as Json).queuedAhead, 4);
+  // NEGATIVE: with nothing waiting the same refusal says 0
+  const none = makeBox({});
+  writeRecord(none, "wake-k3", CLAUDE);
+  const quiet = await wake(none, await refusedUrl(), "wake-k3");
+  assert.match(quiet.stderr.split("\n")[0], /queued_ahead=0$/u);
 });

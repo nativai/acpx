@@ -10,6 +10,7 @@ import {
   readAgentBrokerOriginSources,
   resolveAgentBrokerOrigin,
 } from "./broker-client.js";
+import type { AgentPlacement } from "./broker-client.js";
 import { isHomeOnlyHarness } from "./home-only.js";
 import { podMode, thisPodFile } from "./placement.js";
 import type { AgentCapWhy } from "./pod-refusal.js";
@@ -65,11 +66,35 @@ export type PodRoom = {
   /** What binds when `gross` is 0 (`cap` also when only the waiting items take the last slot). */
   readonly why: AgentCapWhy | undefined;
   readonly room: { readonly cap: number; readonly quota: number; readonly home: number | null };
+  /** Where the broker will put the pod — the home cap binds exactly when this is `home`. */
+  readonly placedAt: "pool" | "home";
 };
+
+/** What acpx asks the broker for (A-45): `home` for a home-only harness, `auto` otherwise. */
+export function placementAsked(harness: Harness): AgentPlacement {
+  return isHomeOnlyHarness(harness) ? "home" : "auto";
+}
+
+/**
+ * WHERE THE BROKER WILL PUT THE POD (A-49, `broker.py` `target_for`): everything goes home while it forces
+ * `placement.forced = "home"` — `pool` requests included; `auto` goes home while the pool template is not
+ * usable (`pool.state ≠ ready`), else to the pool; an explicit `home` or `pool` stays as asked.
+ * ⚠️ THE CAPACITY ANSWER MUST NEVER REPORT ROOM THE BROKER WILL REFUSE FOR THIS PLACEMENT: the home cap
+ * binds every request placed home, whatever harness it is. Rows: `test/pod-capacity.test.ts` "A-49".
+ */
+export function placedAt(agents: BrokerAgentsSnapshot, asked: AgentPlacement): "pool" | "home" {
+  if (agents.placement.forced === "home") {
+    return "home";
+  }
+  if (asked === "auto") {
+    return agents.pool.state === "ready" ? "pool" : "home";
+  }
+  return asked;
+}
 
 /**
  * C4: a request of any class but `interactive` is refused at `live ≥ cap − reserve`; the namespace's
- * quota counts pods; a home-only harness also needs room under the home cap. The binding one names the
+ * quota counts pods; a request placed home also needs room under the home cap. The binding one names the
  * `why` of C7.2's `agent_cap` line. `spawn` slots are net of the items waiting for room (they start
  * first, as in `readCapacity`); `automation` is gross.
  */
@@ -79,12 +104,15 @@ export function podRoom(
     harness: Harness;
     admissionClass: CapacityClass | "interactive";
     waitingCount: number;
+    /** What the request asks for; default: what acpx asks for this harness (`placementAsked`). */
+    asked?: AgentPlacement;
   },
 ): PodRoom {
   const reserve = options.admissionClass === "interactive" ? 0 : agents.reserve;
   const cap = agents.cap - reserve - agents.live;
   const quota = agents.quota.hard - agents.quota.used;
-  const home = isHomeOnlyHarness(options.harness) ? agents.home.cap - agents.home.live : null;
+  const target = placedAt(agents, options.asked ?? placementAsked(options.harness));
+  const home = target === "home" ? agents.home.cap - agents.home.live : null;
   const gross = Math.max(0, Math.min(cap, quota, home ?? Number.POSITIVE_INFINITY));
   const deduction = options.admissionClass === "spawn" ? options.waitingCount : 0;
   const slots = Math.max(0, gross - deduction);
@@ -93,6 +121,7 @@ export function podRoom(
     gross,
     why: slots > 0 ? undefined : whyOf(gross, cap, quota),
     room: { cap, quota, home },
+    placedAt: target,
   };
 }
 
@@ -123,7 +152,21 @@ export function podNeedReason(
     `live ${agents.live} of cap ${agents.cap} (${agents.reserve} kept for people), ` +
     `quota ${agents.quota.used}/${agents.quota.hard}, home ${agents.home.live}/${agents.home.cap}`;
   const why = room.why === undefined ? "" : ` — ${WHY_SENTENCE[room.why]}`;
-  return `${room.slots} new ${harness} session(s) fit; ${need} needed (${figures})${why}`;
+  return `${room.slots} new ${harness} session(s) fit; ${need} needed (${figures})${why}${homePlacementClause(agents, harness, room)}`;
+}
+
+/** Said only when the pod goes home although the harness could use the pool: the home cap binds it, and why. */
+function homePlacementClause(
+  agents: BrokerAgentsSnapshot,
+  harness: Harness,
+  room: PodRoom,
+): string {
+  if (room.placedAt !== "home" || isHomeOnlyHarness(harness)) {
+    return "";
+  }
+  return agents.placement.forced === "home"
+    ? "; the broker forces every pod home, so the home cap applies"
+    : `; the pool is not ready (${agents.pool.state}), so the broker places it home and the home cap applies`;
 }
 
 export function podNeedMet(room: PodRoom, need: number): boolean {
@@ -147,6 +190,8 @@ export type PodCapacitySnapshot = {
   /** There is no make-room step in the pod plane: the same as `freeSlots`. */
   readonly slotsAfterMakeRoom: Record<Harness, number>;
   readonly bindingGuard: Record<Harness, AgentCapWhy | null>;
+  /** Where the broker will put a pod of each harness (A-49): the home cap binds those placed home. */
+  readonly placedAt: Record<Harness, "pool" | "home">;
   readonly pod: BrokerAgentsSnapshot;
   readonly warnings: readonly string[];
 };
@@ -194,6 +239,7 @@ export function podCapacitySnapshot(input: {
     freeSlotsInteractive: interactive,
     slotsAfterMakeRoom: freeSlots,
     bindingGuard: perHarness((harness) => rooms[harness].why ?? null),
+    placedAt: perHarness((harness) => rooms[harness].placedAt),
     pod: input.agents,
     warnings: [],
   };

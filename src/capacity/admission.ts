@@ -1195,7 +1195,11 @@ async function decideWakeInPodPlane(ctx: WakeContext): Promise<WakeDecision> {
       detail: figures.detail,
       waiting: waiting.count,
     });
-    return podWakeRefusal(admissionBusyRefusal(), { box: figures.box, live: null }, waiting.count);
+    return podWakeRefusal(
+      admissionBusyRefusal({ queuedAhead: waiting.count }),
+      { box: figures.box, live: null },
+      waiting.count,
+    );
   }
   const room = podRoom(figures.agents, {
     harness: ctx.harness,

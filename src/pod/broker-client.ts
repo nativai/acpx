@@ -74,6 +74,8 @@ export type BrokerAgentsSnapshot = {
   quota: { used: number; hard: number };
   home: { live: number; cap: number };
   pool: { state: string };
+  /** A-49: `"home"` while the broker's safe harbour forces every request home; an absent field is an older broker. */
+  placement: { forced: "home" | null };
 };
 
 export type BrokerAgentsResult =
@@ -435,12 +437,34 @@ const AGENT_COUNT_PATHS = [
   ["home", "cap"],
 ] as const;
 
+/**
+ * A-49: `placement.forced` is `"home"` or `null`; ABSENT (an older broker) reads as `null`. Any other
+ * value is not an answer this build understands — `undefined` makes the whole GET malformed, so the verbs
+ * hold (`admission_busy`) rather than report room for a placement they cannot name.
+ */
+function forcedPlacementOf(body: unknown): "home" | null | undefined {
+  const placement = objOf(body)?.placement;
+  if (placement === undefined) {
+    return null;
+  }
+  const fields = objOf(placement);
+  if (fields === undefined) {
+    return undefined;
+  }
+  const forced = fields.forced;
+  if (forced === undefined || forced === null) {
+    return null;
+  }
+  return forced === "home" ? "home" : undefined;
+}
+
 function parseAgents(body: unknown): BrokerAgentsSnapshot | undefined {
   const at = (path: readonly string[]) =>
     path.reduce<unknown>((value, key) => objOf(value)?.[key], body);
   const counts = AGENT_COUNT_PATHS.map(at);
   const poolState = at(["pool", "state"]);
-  if (!counts.every(isCount) || typeof poolState !== "string") {
+  const forced = forcedPlacementOf(body);
+  if (!counts.every(isCount) || typeof poolState !== "string" || forced === undefined) {
     return undefined;
   }
   const [live, cap, reserve, used, hard, homeLive, homeCap] = counts;
@@ -451,6 +475,7 @@ function parseAgents(body: unknown): BrokerAgentsSnapshot | undefined {
     quota: { used, hard },
     home: { live: homeLive, cap: homeCap },
     pool: { state: poolState },
+    placement: { forced },
   };
 }
 

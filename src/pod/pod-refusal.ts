@@ -123,8 +123,11 @@ export function agentCapRefusal(input: {
  * table), with a sentence that says so: the shared builder's sentence blames the admission lock and
  * says "nothing queued", neither of which is true in the pod plane (TE L-2).
  */
-export function admissionBusyRefusal(options: { utility?: boolean } = {}): CapacityRefusedError {
-  const base = capacityRefusal("admission_busy");
+export function admissionBusyRefusal(
+  options: { utility?: boolean; queuedAhead?: number } = {},
+): CapacityRefusedError {
+  // `queued_ahead=` is the real count of items waiting, as on the box (A9 TE K3): the JSON said it already.
+  const base = capacityRefusal("admission_busy", undefined, options.queuedAhead ?? 0);
   // A utility pod belongs to no session and no message waits for it (A-10): its sentence says so.
   const sentence = options.utility
     ? "acpx: the broker or the Kubernetes API server did not answer, so the box's utility pod could not be checked or started. " +

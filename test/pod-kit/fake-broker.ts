@@ -103,6 +103,12 @@ export interface BrokerStatus {
   quota?: { used?: number; hard?: number };
   home?: { live?: number; cap?: number };
   pool?: { state: string };
+  /**
+   * A-49: `BROKER_AGENT_FORCE_PLACEMENT=home` — `{forced: "home"}` makes the broker place EVERY request home,
+   * `pool` ones included (broker.py:2766), and `GET /v1/agents` says so. Default `{forced: null}`.
+   * `omit: true` serves a GET WITHOUT the field: an older broker, which acpx reads as `null`.
+   */
+  placement?: { forced?: "home" | null; omit?: boolean };
 }
 
 export interface BrokerScript {
@@ -658,6 +664,7 @@ export class FakeBroker {
     quota: { used: number; hard: number };
     home: { live: number; cap: number };
     pool: { state: string };
+    placement?: { forced: "home" | null };
   } {
     const scripted = this.script.status ?? {};
     const occupying = [...this.jobs.values(), ...[...this.terminating.values()].map((t) => t.job)]
@@ -675,11 +682,22 @@ export class FakeBroker {
         cap: scripted.home?.cap ?? 0,
       },
       pool: scripted.pool ?? { state: "ready" },
+      ...(scripted.placement?.omit === true
+        ? {}
+        : { placement: { forced: scripted.placement?.forced ?? null } }),
     };
   }
 
   private statusBody(): Record<string, unknown> {
     return { ...this.limits() };
+  }
+
+  /** broker.py `target_for` and the force rule (:2766): where a request of this placement will run. */
+  private targetFor(asked: string): string {
+    if (this.script.status?.placement?.forced === "home") {
+      return "home";
+    }
+    return asked === "auto" ? (this.limits().pool.state === "ready" ? "pool" : "home") : asked;
   }
 
   /** broker.py `admission_refusal`: the cap and the reserve, then the box quota, then the home cap. */
@@ -869,8 +887,7 @@ export class FakeBroker {
       }
       const klass = body.class as string;
       const asked = body.placement as string;
-      const target =
-        asked === "auto" ? (this.limits().pool.state === "ready" ? "pool" : "home") : asked;
+      const target = this.targetFor(asked);
       const refusal = this.admissionRefusal(klass, target);
       if (refusal !== null) {
         const cap = this.limits();
@@ -881,7 +898,7 @@ export class FakeBroker {
         );
         return;
       }
-      if (asked === "pool" && this.limits().pool.state !== "ready") {
+      if (target === "pool" && this.limits().pool.state !== "ready") {
         // an explicit pool request when the pool template is not usable: broker.py create() -> template_rejected
         finishWith("error template_rejected", "error_template_rejected");
         return;

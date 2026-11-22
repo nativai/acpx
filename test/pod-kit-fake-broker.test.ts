@@ -539,6 +539,7 @@ test("F10: cap, reserve, quota and home cap are applied in the real order; the r
       quota: { used: 0, hard: 100 },
       home: { live: 0, cap: 0 },
       pool: { state: "ready" },
+      placement: { forced: null },
     });
     const ask = async (id: string, overrides: Record<string, unknown> = {}) => {
       const { key, body } = wellFormedAgentRequest(id, overrides);
@@ -925,6 +926,41 @@ test("a utility request carries no seat and no sessionId; the real broker's util
   });
 });
 
+test("A-49: `placement.forced: home` is served, and EVERY request is placed home — `pool` and `auto` included (broker.py:2766); `omit` serves an older broker's GET", async () => {
+  await withBroker(
+    { status: { home: { live: 1, cap: 1 }, placement: { forced: "home" } } },
+    async (broker) => {
+      assert.deepEqual((await getAgents(broker)).placement, { forced: "home" });
+      for (const placement of ["pool", "auto"] as const) {
+        const { key, body } = wellFormedAgentRequest(`session-forced-${placement}`, { placement });
+        assert.equal(
+          (await postAgent(broker, key, body)).lines.at(-1),
+          "refused reason=home_full live=0 cap=100",
+          `${placement} was judged against the home cap`,
+        );
+      }
+      const util = wellFormedUtilityRequest("pool");
+      assert.match(
+        (await postAgent(broker, util.key, util.body)).lines.at(-1) ?? "",
+        /^refused reason=home_full/u,
+        "a util-pool one-shot goes home too",
+      );
+    },
+  );
+  await withBroker({ status: { home: { live: 1, cap: 1 } } }, async (broker) => {
+    assert.deepEqual((await getAgents(broker)).placement, { forced: null });
+    const { key, body } = wellFormedAgentRequest("session-not-forced", { placement: "pool" });
+    assert.match(
+      (await postAgent(broker, key, body)).lines.at(-1) ?? "",
+      /^ready /u,
+      "NEGATIVE: not forced, the pool answers",
+    );
+  });
+  await withBroker({ status: { placement: { omit: true } } }, async (broker) => {
+    assert.equal("placement" in (await getAgents(broker)), false);
+  });
+});
+
 test("GET /v1/agents answers the C4 shape, derived from the Jobs unless scripted", async () => {
   await withBroker({ status: { home: { live: 0, cap: 10 } } }, async (broker) => {
     const shape = await getAgents(broker);
@@ -932,6 +968,7 @@ test("GET /v1/agents answers the C4 shape, derived from the Jobs unless scripted
       "cap",
       "home",
       "live",
+      "placement",
       "pool",
       "quota",
       "reserve",
