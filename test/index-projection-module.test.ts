@@ -393,3 +393,31 @@ test("the index rewrite keeps its order contract: newest-first by lastUsedAt, ti
     assert.deepEqual(await order(), ["o-b", "o-a", "o-c", "o-d"]);
   });
 });
+
+test("F1: a named SYMLINK to a record outside the directory is never indexed, and a row it had is removed", async () => {
+  await withTempHome("acpx-projection-symlink-", async (homeDir) => {
+    const dir = path.join(homeDir, ".acpx", "sessions");
+    await fsp.mkdir(dir, { recursive: true });
+    const outside = path.join(homeDir, "elsewhere");
+    await fsp.mkdir(outside, { recursive: true });
+    await fsp.writeFile(path.join(outside, "linked.json"), recordText("linked"));
+    await fsp.writeFile(path.join(dir, "real.json"), recordText("real"));
+    await fsp.symlink(path.join(outside, "linked.json"), path.join(dir, "linked.json"));
+    const { projectRecordFilesIntoIndex, readSessionIndex } =
+      await import("../src/index-projection.js");
+    await projectRecordFilesIntoIndex(dir, ["real.json"]); // builds the index (no link named yet)
+    await projectRecordFilesIntoIndex(dir, ["real.json", "linked.json"]);
+    const index = await readSessionIndex(dir);
+    assert.equal(
+      index?.entries.some((entry) => entry.file === "linked.json"),
+      false,
+      "no row for the link",
+    );
+    assert.equal(index?.files.includes("linked.json"), false, "not a member");
+    assert.equal(
+      index?.entries.some((entry) => entry.file === "real.json"),
+      true,
+      "NEGATIVE CONTROL: a regular file named in the same batch is indexed",
+    );
+  });
+});
