@@ -842,4 +842,30 @@ test("run as a process from its TypeScript source: prints its port, honours --sc
           resolve(text.slice(0, text.indexOf("\n")));
         }
       });
-      c
+      child.once("exit", (code) =>
+        reject(new Error(`fake broker exited early rc=${String(code)}`)),
+      );
+    });
+    const announced = JSON.parse(firstLine) as { fake: string; port: number };
+    assert.equal(announced.fake, "broker");
+    assert.ok(announced.port > 0);
+    const { key, body } = wellFormedAgentRequest("session-process");
+    const response = await fetch(`http://127.0.0.1:${String(announced.port)}/v1/agents/${key}`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    assert.equal(await response.text(), "scheduling\nerror start_failed\n");
+    const record = (await (
+      await fetch(`http://127.0.0.1:${String(announced.port)}/_kit/record`)
+    ).json()) as {
+      requests: Array<{ method: string; key: string }>;
+    };
+    assert.deepEqual(
+      record.requests.map((entry) => [entry.method, entry.key]),
+      [["POST", key]],
+    );
+  } finally {
+    child.kill("SIGTERM");
+    await new Promise((resolve) => child.once("exit", resolve));
+  }
+});
