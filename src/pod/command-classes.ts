@@ -299,10 +299,16 @@ export const COMMAND_TABLE: Readonly<Record<string, CommandEntry>> = {
   "models list": { class: "read", reason: "the model catalogue" },
   "models show": { class: "read", reason: "the model catalogue" },
   "models endpoints": { class: "read", reason: "OpenRouter endpoints (HTTP, cache)" },
-  "models fav": { class: "read", reason: "lists favourites" },
+  "models fav": {
+    class: "control-store",
+    reason: "reads model preferences — a SQLite database, opened on the control pod only (A7)",
+  },
   "models fav add": { class: "control-store", reason: "model preferences (C1.2 list)" },
   "models fav rm": { class: "control-store", reason: "model preferences" },
-  "models last-used": { class: "read", reason: "reads model preferences" },
+  "models last-used": {
+    class: "control-store",
+    reason: "reads model preferences — a SQLite database, opened on the control pod only (A7)",
+  },
   "models last-used set": { class: "control-store", reason: "model preferences" },
   providers: { class: "local", reason: "group: help only" },
   "providers list": { class: "read", reason: "reads providers.json" },

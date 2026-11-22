@@ -21,10 +21,10 @@
  */
 
 import fs from "node:fs";
-import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import type { DatabaseSync, StatementSync } from "node:sqlite";
+import type { StatementSync } from "node:sqlite";
+import { loadSqlite } from "../pod/sqlite-loader.js";
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS favorite_models (
@@ -76,51 +76,17 @@ export function defaultUiPrefsDbPath(): string {
   return path.join(process.env.ACPX_STATE_HOME || os.homedir(), ".acpx", "ui-prefs.db");
 }
 
-type SqliteModule = { DatabaseSync: new (path: string) => DatabaseSync };
-
-/**
- * `node:sqlite` is still flagged experimental in node 22, so importing it emits
- * ONE `ExperimentalWarning` on stderr — which would break `--json-strict`'s
- * promise of machine-clean stderr.
- *
- * ⚠️ DO NOT "fix" this with `--no-warnings`, a tsdown banner, or
- * `process.removeAllListeners('warning')`. acpx runs for every agent on every
- * box in the fleet; a blanket suppression there would silence genuine
- * deprecation and security warnings everywhere, forever, to hide one line.
- * The filter below is installed around the require call and removed
- * immediately, and it drops exactly one warning — an unrelated warning emitted
- * in the same window still gets through (there is a test for that half; it is
- * the positive control that proves this suppressed one warning, not all of them).
- */
-export function isSqliteExperimentalWarning(warning: unknown, rest: unknown[]): boolean {
-  const name = typeof warning === "string" ? rest[0] : (warning as Error | undefined)?.name;
-  const text =
-    typeof warning === "string" ? warning : ((warning as Error | undefined)?.message ?? "");
-  return name === "ExperimentalWarning" && text.includes("SQLite");
-}
-
-function requireSqlite(): SqliteModule {
-  const original = process.emitWarning.bind(process);
-  const filtered = (warning: unknown, ...rest: unknown[]): void => {
-    if (isSqliteExperimentalWarning(warning, rest)) {
-      return;
-    }
-    (original as (...args: unknown[]) => void)(warning, ...rest);
-  };
-  process.emitWarning = filtered as typeof process.emitWarning;
-  try {
-    return createRequire(import.meta.url)("node:sqlite") as SqliteModule;
-  } finally {
-    process.emitWarning = original;
-  }
-}
+// The one `node:sqlite` loader (and its agent-pod refusal) lives in `pod/sqlite-loader.ts`; the
+// warning predicate is re-exported from here because tests and older callers import it from this file.
+export { isSqliteExperimentalWarning } from "../pod/sqlite-loader.js";
 
 function toIso(epochMs: number): string {
   return new Date(epochMs).toISOString();
 }
 
 export function openUiPrefsStore(dbPath: string = defaultUiPrefsDbPath()): UiPrefsStore {
-  const { DatabaseSync: Database } = requireSqlite();
+  // Before the directory is created: an agent pod's refusal leaves nothing behind.
+  const { DatabaseSync: Database } = loadSqlite("ui-prefs", dbPath);
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new Database(dbPath);
   // WAL is what makes the two-writer case safe for concurrent readers.
