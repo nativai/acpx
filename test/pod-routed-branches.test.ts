@@ -216,6 +216,34 @@ test("a session on an adapter the broker has no harness for is refused before an
   assert.equal(failure.reason, "harness_unsupported");
 });
 
+// A-39 (brick b69eeecf): the terminal harness is not in phase 1.
+test("A-39: a `claude-pty` harness is refused by name before anything is asked — even if the adapter classifier ever names it; claude, codex and pi still route", async () => {
+  const classifiedAs = (kind: string) =>
+    harness({
+      record: { acpxRecordId: SESSION, agentCommand: `node /opt/${kind}/dist/index.js` },
+      harnessOf: () => kind,
+    });
+  const refused = classifiedAs("claude-pty");
+  await routedBranchHandlers(refused.deps)["routed-ensure"](
+    decisionFor(["claude", "prompt", "--session-id", SESSION, "x"]),
+    ctx(),
+  );
+  assert.equal(refused.runs.length, 0, "nothing was routed, so nothing was asked");
+  const failure = refused.failures[0];
+  assert.ok(failure instanceof RoutedCallError);
+  assert.equal(failure.reason, "harness_unsupported");
+  assert.equal(failure.outcome, "not_run");
+  for (const kind of ["claude", "codex", "pi"]) {
+    const routed = classifiedAs(kind);
+    await routedBranchHandlers(routed.deps)["routed-ensure"](
+      decisionFor(["claude", "prompt", "--session-id", SESSION, "x"]),
+      ctx(),
+    );
+    assert.equal(routed.failures.length, 0, kind);
+    assert.equal(routed.runs.length, 1, `${kind} still routes`);
+  }
+});
+
 // ───────────────────────── stdin (the routed command has none) ─────────────────────────
 
 async function plan(argv: string[], over: { tty?: boolean } = {}) {
@@ -506,6 +534,8 @@ type Pod = {
 };
 
 async function podFixture(opts: {
+  /** The record's agent command (default: the Claude SDK adapter). */
+  command?: string;
   api: ApiScript;
   broker?: Parameters<typeof startBroker>[0];
   stub?: { exit?: number; stdout?: string };
@@ -534,7 +564,7 @@ async function podFixture(opts: {
     makeSessionRecord({
       acpxRecordId: SESSION,
       acpSessionId: SESSION,
-      agentCommand: CLAUDE,
+      agentCommand: opts.command ?? CLAUDE,
       cwd: "/workspace",
     }),
   );
@@ -765,6 +795,73 @@ test("CLI pod mode: a session acpx cannot resolve → `ROUTED outcome=not_run re
       result.stderr.split("\n")[0] ?? "",
       /^acpx: ROUTED outcome=not_run reason=target_unresolved call_id=\S+$/,
     );
+    assert.equal(pod.brokerSeen(), 0);
+    assert.equal(pod.calls().length, 0);
+  } finally {
+    pod.closeAll();
+  }
+});
+
+test("A-39 CLI pod mode: a REAL claude-pty record's prompt gives ROUTED not_run harness_unsupported (exit 1); the broker sees zero requests, nothing reaches a pod", async () => {
+  const pod = await podFixture({
+    command: "node /opt/claude-pty-acp/dist/index.js",
+    api: { items: [] },
+    broker: { lines: ["scheduling", READY] },
+    stub: { exit: 0, stdout: "must-not-run\n" },
+  });
+  try {
+    const result = await cli(["claude", "prompt", "--session-id", SESSION, "hello"], pod.env);
+    assert.equal(result.code, 1, result.stderr);
+    assert.match(
+      result.stderr.split("\n")[0] ?? "",
+      /^acpx: ROUTED outcome=not_run reason=harness_unsupported call_id=\S+$/,
+    );
+    assert.equal(pod.brokerSeen(), 0, "no broker request");
+    assert.equal(pod.brokerBodies().length, 0, "not even a POST");
+    assert.equal(pod.calls().length, 0);
+    assert.equal(result.stdout.includes("must-not-run"), false);
+  } finally {
+    pod.closeAll();
+  }
+});
+
+test("A-39 CLI pod mode, the controls in the same rig: claude, codex and pi records still route — the broker is asked once and the call reaches the pod", async () => {
+  for (const command of [
+    CLAUDE,
+    "node /opt/codex-acp/dist/index.js",
+    "node /opt/pi-acp/dist/index.js",
+  ]) {
+    const pod = await podFixture({
+      command,
+      api: { items: [] },
+      broker: { lines: ["scheduling", READY] },
+      stub: { exit: 0, stdout: "queued\n" },
+    });
+    try {
+      const result = await cli(["claude", "prompt", "--session-id", SESSION, "hello"], pod.env);
+      assert.equal(result.code, 0, `${command}: ${result.stderr}`);
+      assert.equal(result.stdout, "queued\n", command);
+      assert.equal(pod.brokerSeen(), 1, command);
+      assert.equal(pod.calls().length, 1, command);
+    } finally {
+      pod.closeAll();
+    }
+  }
+});
+
+test("A-39 off pod mode: a claude-pty record behaves exactly as today — no harness refusal, no broker, the local path runs", async () => {
+  const pod = await podFixture({
+    command: "node /opt/claude-pty-acp/dist/index.js",
+    api: { items: [] },
+    broker: { lines: [READY] },
+  });
+  try {
+    const off = { ...pod.env };
+    delete off.ACPX_OWNER_PLACEMENT;
+    // `cancel` is local without a pod: it answers from the record and never mentions the harness.
+    const result = await cli(["cancel", "--session-id", SESSION], off);
+    assert.equal(result.stderr.includes("harness_unsupported"), false, result.stderr);
+    assert.equal(result.stderr.includes("ROUTED"), false, result.stderr);
     assert.equal(pod.brokerSeen(), 0);
     assert.equal(pod.calls().length, 0);
   } finally {

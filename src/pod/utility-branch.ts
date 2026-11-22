@@ -62,8 +62,8 @@ export const UTILITY_PROBE_DEADLINE_MS = 30_000;
 export const UTILITY_RUN_DEADLINE_MS = 15 * 60_000;
 export const UTILITY_TIMEOUT_GRACE_MS = 15_000;
 
-/** Harnesses whose utility pod is the HOME one: Codex's home is mounted directly in home-placed pods; the terminal harness is home-placed (CONCEPTION r4 K2). */
-const HOME_HARNESSES: ReadonlySet<string> = new Set(["codex", "claude-pty"]);
+/** Harnesses whose utility pod is the HOME one: Codex's home is mounted directly in home-placed pods. (The terminal harness was home-placed too until A-39 took it out of phase 1.) */
+const HOME_HARNESSES: ReadonlySet<string> = new Set(["codex"]);
 
 export function utilityKeyFor(harness: string | undefined): UtilityKey {
   return harness !== undefined && HOME_HARNESSES.has(harness) ? "util-home" : "util-pool";

@@ -80,7 +80,13 @@ export type BranchDeps = {
 // `exec` reads its prompt from stdin like `prompt` does; its payload travels the same way (A10, the
 // utility-pod branch is the only caller that reaches `planPayload` with it).
 const PROMPT_PATHS = new Set(["", "<agent>", "prompt", "exec"]);
-const HARNESSES: ReadonlySet<string> = new Set(["claude", "pi", "codex", "claude-pty"]);
+/**
+ * The harnesses a pod may host. ⚠️ `claude-pty` IS NOT ONE (A-39, brick b69eeecf): the terminal harness is
+ * not in phase 1 and C12.1 (A-30, the screen lease) is withdrawn. A pod-mode `claude-pty` record is
+ * refused BY NAME — `ROUTED outcome=not_run reason=harness_unsupported` — before any broker request.
+ * Do not "restore" it here: `test/pod-routed-branches.test.ts` (A-39 rows) goes red if you do.
+ */
+const HARNESSES: ReadonlySet<string> = new Set(["claude", "pi", "codex"]);
 
 /** The same normalization `src/cli.ts` applies to `process.argv` before the placement step. */
 export function routedArgv(argv: readonly string[], env: NodeJS.ProcessEnv): string[] {
