@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { callerIdentityFrom } from "./caller-identity.js";
 import type { Classification, OutputMode } from "./command-classes.js";
 import { isClaudePtyCommand } from "./harness-support.js";
+import { isHomeOnlyHarness, readBoxFacts } from "./home-only.js";
 import {
   registerBranchHandler,
   type BranchContext,
@@ -193,12 +194,18 @@ export const ROUTED_PROGRAM = "acpx";
 
 function sessionTarget(record: RoutedRecord, deps: BranchDeps) {
   const admissionClass = deps.admissionClass();
+  const harness = deps.harnessOf(record.agentCommand) as AgentHarness;
   const sessionUrl = deps.sessionUrl;
   return {
     sessionId: record.acpxRecordId,
     ...(sessionUrl ? { sessionUrl: () => sessionUrl(record.acpxRecordId) } : {}),
     seat: record.seatId ?? record.acpxRecordId,
-    harness: deps.harnessOf(record.agentCommand) as AgentHarness,
+    harness,
+    // A-45 (C4): a home-only harness is placed `home`, anything else `auto`. The SAME function decides the
+    // utility pod's key (`home-only.ts`, A-44), so sessions and one-shots switch together when P1 lands.
+    placement: isHomeOnlyHarness(harness, readBoxFacts(deps.env))
+      ? ("home" as const)
+      : ("auto" as const),
     ...(admissionClass ? { admissionClass } : {}),
   };
 }

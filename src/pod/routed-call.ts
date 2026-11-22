@@ -79,6 +79,11 @@ export type AgentPodLookup = (key: string) => Promise<
       readyAtMs?: number;
       /** The pod's IP, when the API server gave it: the transport connects to it (`--address`). */
       ip?: string;
+      /**
+       * The pod's `runtime.nativai.de/releases` annotation, parsed (A-43 (b)). ABSENT = the pod has none or
+       * it cannot be read — which counts as lacking every optional tool.
+       */
+      releases?: Record<string, string>;
     }
   | { state: "absent" }
   | { state: "unknown" }
@@ -103,6 +108,11 @@ export type RoutedCallOptions = {
   /** The target's key: `agentPodKey(sessionId)`, or `util-pool` / `util-home` for a one-shot. */
   key: string;
   target: RoutedCallTarget;
+  /**
+   * A-43: the AGENT the call is about is Pi although its target is a utility pod (a one-shot, a probe). Sessions
+   * name Pi in `target.harness`; this is the one-shot's way to say it. See {@link needsPi}.
+   */
+  agentIsPi?: boolean;
   /** acpx's arguments, executed in the pod. A function when the argv names the payload file. */
   argv: string[] | ((payloadPath: string | undefined) => string[]);
   cwd: string;
@@ -547,15 +557,42 @@ function releasesOrFail(options: RoutedCallOptions, callId: string): Record<stri
   }
   // A-41: `pi` is optional in `releases`, so a Pi session on a box without it is refused HERE — named,
   // before the broker — instead of getting a pod whose adapter cannot start. Claude and Codex are unaffected.
-  if (options.target.harness === "pi" && releases.releases.pi === undefined) {
-    throw new RoutedCallError({
-      outcome: "not_run",
-      reason: "release_unresolved",
-      tool: "pi",
-      callId,
-    });
+  if (needsPi(options) && releases.releases.pi === undefined) {
+    throw piUnresolved(callId);
   }
   return releases.releases;
+}
+
+/** A-43 (a): a call whose AGENT is Pi — a Pi session, or a one-shot on the Pi harness — needs `pi` in the pod's releases. */
+function needsPi(options: RoutedCallOptions): boolean {
+  return options.target.harness === "pi" || options.agentIsPi === true;
+}
+
+/** A-43 (b): a Pi one-shot is not routed to a Ready utility pod whose releases annotation lacks `pi` (or cannot be read). */
+function refuseReadyPodWithoutPi(
+  options: RoutedCallOptions,
+  releases: Record<string, string> | undefined,
+  callId: string,
+): void {
+  if (options.class === "one-shot" && needsPi(options) && !isReleaseName(releases?.pi)) {
+    throw piUnresolved(callId);
+  }
+}
+
+/** A release directory name, as the broker validates one: a plain token. An empty or odd value is NOT a release — it counts as absent. */
+const RELEASE_NAME = /^[A-Za-z0-9._+-]{1,128}$/;
+function isReleaseName(value: string | undefined): boolean {
+  return value !== undefined && RELEASE_NAME.test(value);
+}
+
+/** The one named line for a Pi call that cannot have `pi` (A-42/A-43): no new public reason. */
+function piUnresolved(callId: string): RoutedCallError {
+  return new RoutedCallError({
+    outcome: "not_run",
+    reason: "release_unresolved",
+    tool: "pi",
+    callId,
+  });
 }
 
 async function askBroker(options: RoutedCallOptions, callId: string): Promise<EnsuredPod> {
@@ -606,6 +643,10 @@ async function ensureOwnerPod(options: RoutedCallOptions, callId: string): Promi
     throw admissionBusyRefusal({ utility: options.target.harness === "utility" });
   }
   if (found.state === "exists" && found.ready) {
+    // A-43 (b): a READY utility pod serves the key, so the broker is skipped and the release check in
+    // `releasesOrFail` never runs. If that pod's annotation lacks `pi` (or cannot be read) a Pi call is not
+    // routed to it. A session's own pod needs no such check: the pod is not replaced, its idle loop ends it.
+    refuseReadyPodWithoutPi(options, found.releases, callId);
     return { uid: found.uid, ip: found.ip };
   }
   return await askBroker(options, callId);
