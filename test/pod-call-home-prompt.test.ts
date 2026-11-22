@@ -309,7 +309,7 @@ test("O-4: a prompt's call-home wait prints progress lines on stderr — and non
     assert.equal(text.status, 75, text.stderr);
     assert.match(
       text.stderr,
-      /^acpx: still waiting for atrium \(attempt \d+, \d+ s of the \d+ s call-home budget left\)/mu,
+      /^\[acpx\] still waiting for atrium \(attempt \d+, \d+ s of the \d+ s call-home budget left\)/mu,
     );
     const strict = await runCli(
       [

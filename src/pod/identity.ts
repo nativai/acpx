@@ -88,12 +88,12 @@ export type LockHostPlace = "control" | "agent-pod" | "elsewhere";
  * `serviceAccountDir` and the death proof's `ACPX_POD_API_URL`. Pinned by
  * `test/pod-lock-primitive.test.ts` "an EMPTY NODE_TEST_CONTEXT honours no seam".
  */
-function testHome(env: NodeJS.ProcessEnv): string | undefined {
+export function podTestHome(env: NodeJS.ProcessEnv = process.env): string | undefined {
   return env.NODE_TEST_CONTEXT ? nonEmpty(env[TEST_HOME_ENV]) : undefined;
 }
 
 export function lockHostPlace(env: NodeJS.ProcessEnv = process.env): LockHostPlace {
-  const seam = testHome(env);
+  const seam = podTestHome(env);
   if (!seam && !isControlPod(env)) {
     return "elsewhere";
   }

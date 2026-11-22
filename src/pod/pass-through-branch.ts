@@ -257,6 +257,18 @@ registerBranchHandler("pass-through", async (decision, context) => {
  */
 const NOT_ROUTABLE_PROMPT_OPTIONS = ["--batch-file", "--message-id"] as const;
 
+/**
+ * The first of atrium's own delivery options among the argv's OPTIONS, or undefined. Only options
+ * count: everything after `--` is prompt text (O-1).
+ */
+export function notRoutableOption(argv: readonly string[]): string | undefined {
+  const end = argv.indexOf("--");
+  const options = end === -1 ? argv : argv.slice(0, end);
+  return NOT_ROUTABLE_PROMPT_OPTIONS.find((flag) =>
+    options.some((token) => token === flag || token.startsWith(`${flag}=`)),
+  );
+}
+
 registerBranchHandler("message-route", async (decision, context) => {
   const refuseWith = (lines: readonly [string, string], exitCode: number): number =>
     refuseLines(decision, context, lines, exitCode);
@@ -265,9 +277,7 @@ registerBranchHandler("message-route", async (decision, context) => {
   }
   // atrium's own delivery spawns (`--message-id`, `--batch-file`) run in the RECIPIENT's pod, over the
   // routed channel; one reaching another pod's message route is a misroute, not a caller's prompt.
-  const option = NOT_ROUTABLE_PROMPT_OPTIONS.find((flag) =>
-    context.argv.some((token) => token === flag || token.startsWith(`${flag}=`)),
-  );
+  const option = notRoutableOption(context.argv);
   if (option !== undefined) {
     return refuseWith(
       [
