@@ -2271,7 +2271,7 @@ async function handleBatchPrompt(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const { printPromptSessionBanner, printQueuedPromptByFormat } = await loadOutputRenderModule();
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName, config);
   await printPromptSessionBanner(record, agent.cwd, outputPolicy.format, outputPolicy.jsonStrict);
   const result = await deliverPrompt({
     sessionId: record.acpxRecordId,
@@ -2371,7 +2371,7 @@ export async function handlePrompt(
   warnOutputStyleNotSupported(globalFlags, agent.agentName);
   const { printPromptSessionBanner } = await loadOutputRenderModule();
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName, config);
   await assertExplicitSubscriptionMatchesExistingSession({
     globalFlags,
     record,
@@ -2782,7 +2782,7 @@ export async function handleCancel(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const { cancelSessionPrompt } = await loadSessionModule();
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName, config);
 
   const result = await cancelSessionPrompt({
     sessionId: record.acpxRecordId,
@@ -2802,7 +2802,7 @@ export async function handleSetMode(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const { setSessionMode } = await loadSessionModule();
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName, config);
   const result = await setSessionMode({
     sessionId: record.acpxRecordId,
     modeId,
@@ -2835,7 +2835,7 @@ export async function handleSetModel(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const { setSessionModel } = await loadSessionModule();
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName, config);
   const result = await setSessionModel({
     sessionId: record.acpxRecordId,
     modelId,
@@ -2927,7 +2927,7 @@ export async function handleSetConfigOption(
   const resolvedConfigId = resolveCompatibleConfigId(agent, configId);
   const { setSessionConfigOption } = await loadSessionModule();
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName, config);
   const result = await setSessionConfigOption({
     sessionId: record.acpxRecordId,
     configId: resolvedConfigId,
@@ -3017,7 +3017,7 @@ async function tryHandleDepthConfigKey(
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName, config);
   const mechanism = depthMechanismForAgentCommand(record.agentCommand);
   if (mechanism !== "mode" || !acpxRoutesDepthMechanism(mechanism)) {
     return false;
@@ -3119,7 +3119,7 @@ export async function handleSetOutputStyle(
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName, config);
   // Throws OutputStyleNotSupportedError / OutputStyleUnknownError. Claude Code
   // itself validates nothing here, so this refusal is the only thing standing
   // between a typo and a session that reports a style it does not have.
@@ -3165,7 +3165,7 @@ export async function handleSetAutoFailover(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const autoFailover = parseAutoFailoverValue(value);
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName, config);
   const { setSessionAutoFailover } = await loadSessionModule();
   const result = await setSessionAutoFailover({
     sessionId: record.acpxRecordId,
@@ -3231,7 +3231,7 @@ export async function handleSetAutoSubscription(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const autoSubscription = parseOnOffValue(value, "auto-subscription");
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName, config);
   const { setSessionAutoSubscription } = await loadSessionModule();
   const result = await setSessionAutoSubscription({
     sessionId: record.acpxRecordId,
@@ -3275,7 +3275,7 @@ export async function handleSetFableDegrade(
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const fableDegradeOk = parseOnOffValue(value, "fable-degrade");
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName, config);
   const { setSessionFableDegrade } = await loadSessionModule();
   const result = await setSessionFableDegrade({
     sessionId: record.acpxRecordId,
@@ -3352,7 +3352,7 @@ export async function handleSetSubscription(
     throw new SubscriptionLockedError(trimmedId);
   }
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName, config);
   const { setSessionSubscription } = await loadSessionModule();
   const result = await setSessionSubscription({
     sessionId: record.acpxRecordId,
@@ -3461,7 +3461,7 @@ export async function handleSetProfile(
   }
   assertProfileUnlocked(target, registry);
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName, config);
   assertSameCredentialClass(record, target, registry);
 
   const { setSessionProfile } = await loadSessionModule();
@@ -3554,7 +3554,7 @@ export async function handleSessionsSetMetadata(
     );
   }
   const selector = resolveSessionTargetSelector({ flags, command });
-  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName, config);
   if (key === "brick") {
     // The brick link has ONE writer (fb1a7a9c): a seated record's SEAT is re-pointed and the cache
     // follows with its validation word; a seat-less record's cache is written the same way.
@@ -3710,7 +3710,7 @@ export async function handleSessionsClose(
   const mode = sessionCloseMode(flags);
 
   const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
-  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName, config);
 
   // A-16 (R2-1): in local mode a session whose lease names a pod not proven gone is NOT closed here —
   // `pod_starting … phase=turnover` (exit 75), decided before anything is touched: no drain, no
@@ -5616,7 +5616,7 @@ export async function handleSessionsShow(
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
-  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName, config);
 
   printSessionDetailsByFormat(record, globalFlags.format);
 }
@@ -5631,7 +5631,7 @@ export async function handleSessionsHistory(
   const globalFlags = resolveGlobalFlags(command, config);
   const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
   const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
-  const record = await requireExplicitSessionRecord(selector, agent.agentName);
+  const record = await requireExplicitSessionRecord(selector, agent.agentName, config);
 
   printSessionHistoryByFormat(record, flags.limit, globalFlags.format);
 }
@@ -5648,7 +5648,7 @@ export async function handleSessionsExport(
   const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
   const explicitSessionId = (await resolveExplicitSessionRecord(selector))?.acpxRecordId;
   if (explicitSessionId === undefined) {
-    throw new NoSessionError(noSessionIdMessage(agent.agentName));
+    throw new NoSessionError(noSessionIdMessage(agent.agentName, config));
   }
 
   await exportSession({ sessionId: explicitSessionId }, flags.output);
