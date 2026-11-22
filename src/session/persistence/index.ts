@@ -9,6 +9,10 @@ import {
   resolvedModelLabelForRecord,
   servedModelOf,
 } from "../../models/claude-advertised-label.js";
+import {
+  assertBoxWideWriteAllowed,
+  isBoxWideFileInAgentPod,
+} from "../../pod/foreign-write-guard.js";
 import type { SessionRecord } from "../../types.js";
 import { modelSetMethodKnownUnsupported } from "../mode-preference.js";
 import { isIndexLockTimeoutError, withSessionIndexLock } from "./index-lock.js";
@@ -926,6 +930,7 @@ export async function writeSessionIndex(
   },
 ): Promise<void> {
   const filePath = sessionIndexPath(sessionDir);
+  assertBoxWideWriteAllowed("index", filePath);
   const entries = await projectSeatNames(sessionDir, index.entries);
   // Per-call randomUUID: `${pid}.${Date.now()}` alone is NOT unique. Two writes
   // from this process in the same millisecond build the identical temp path, so
@@ -1011,6 +1016,11 @@ export async function rebuildSessionIndex(
   // rebuilds on new-file creation" target (VERIFICATION-ANNEX S4 greps for it).
   if (!rebuildLogSuppressed) {
     process.stderr.write(`[acpx] full session-index rebuild (reason: ${reason})\n`);
+  }
+  // C10 / A8: in an agent pod the index is the control pod's file — a read there builds the answer
+  // in memory and persists nothing (never the guard's throw on a plain read).
+  if (isBoxWideFileInAgentPod(sessionIndexPath(sessionDir))) {
+    return await buildSessionIndexFromDisk(sessionDir);
   }
   // Lock (re-entrant under a caller already holding it). The rebuild only PROJECTS durable
   // record files, so a lock timeout (brick ae547131 §6.2: the lock never proceeds unlocked) is not

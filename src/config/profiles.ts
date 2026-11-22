@@ -8,6 +8,7 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { isBoxWideFileInAgentPod } from "../pod/foreign-write-guard.js";
 import {
   normalizeSubscriptionPolicy,
   subscriptionRegistryPath,
@@ -572,6 +573,11 @@ function writeV3Migration(
   migratedJson: Record<string, unknown>,
   migrationMessages: readonly string[],
 ): void {
+  // A read-triggered write: in an agent pod the migrated document serves from memory and the control
+  // pod's registry file stays as it is (never the guard's throw on a plain read).
+  if (isBoxWideFileInAgentPod(registryPath)) {
+    return;
+  }
   try {
     const backupPath = `${registryPath}.pre-v3.bak`;
     if (!existsSync(backupPath)) {

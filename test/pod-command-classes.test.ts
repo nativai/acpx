@@ -14,6 +14,7 @@ import {
   classifyArgv,
   COMMAND_CLASSES,
   COMMAND_TABLE,
+  PRE_COMMANDER_PATHS,
   type Classification,
   type CommandClass,
 } from "../src/pod/command-classes.js";
@@ -738,9 +739,35 @@ test("the SHIPPED bundle: dist/cli.js and dist/pod/command-classes.js statically
   }
 });
 
-// TODO(A8, brick 88112988): when A8's `pod_foreign_write` guard lands at the box-wide writers (C1.2
-// A-8), add the row "every classified command, run in an agent pod, trips no foreign-write guard" —
-// the conformance proof A-8 asks of this test. Agreed with the stream HoD 2026-11-21.
+// A-8 (block A8, brick 88112988): "every classified command, run in an agent pod, trips no
+// foreign-write guard". The guard (`src/pod/foreign-write-guard.ts`) throws at the writers of the
+// index, the seat store, the registries and the admission ledger. A command can reach one only by
+// running LOCALLY in an agent pod with a class that may touch box-wide stores (C1.2's "What it may
+// touch": `create` and `control-store`). Discovered from the real table and the real route table,
+// not a hand list: every entry's class, in both agent-pod places.
+// The classes that DO run locally in an agent pod write the session's own record only; that no index
+// half and no box-wide write comes with it is `test/pod-foreign-write-guard.test.ts` (an own record
+// write in an agent pod writes no index; a plain read persists nothing).
+test("A-8: no classified command that touches box-wide stores runs locally in an agent pod", () => {
+  const BOX_WIDE_CLASSES = new Set<CommandClass>(["create", "control-store"]);
+  const reachesBoxWideLocally = (cls: CommandClass, route: { kind: string }): boolean =>
+    BOX_WIDE_CLASSES.has(cls) && route.kind === "local";
+  const entries = [...Object.entries(COMMAND_TABLE), ...Object.entries(PRE_COMMANDER_PATHS)];
+  assert.ok(entries.length >= 90, `positive control: ${entries.length} entries`);
+  const offenders: string[] = [];
+  for (const [commandPath, entry] of entries) {
+    for (const place of ["own-pod", "other-pod"] as const) {
+      if (reachesBoxWideLocally(entry.class, routeFor(entry.class, place))) {
+        offenders.push(`${commandPath} (${entry.class}, ${place})`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, []);
+  // negative case: the predicate flags a box-wide class given a local route, and not a plain read.
+  assert.equal(reachesBoxWideLocally("control-store", { kind: "local" }), true);
+  assert.equal(reachesBoxWideLocally("create", { kind: "local" }), true);
+  assert.equal(reachesBoxWideLocally("read", { kind: "local" }), false);
+});
 
 test("C6.2's inherit list is exported, closed, and exactly the contract's start", async () => {
   const { PASS_THROUGH_INHERIT } = await import("../src/pod/command-classes.js");

@@ -8,6 +8,7 @@ import {
   SessionResolutionError,
 } from "../../errors.js";
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
+import { isBoxWideFileInAgentPod } from "../../pod/foreign-write-guard.js";
 import { SpawnLedger, openSpawnLedgerForRecord, type DiskRecord } from "../../spawn-ledger.js";
 import type {
   PersistedActor,
@@ -50,6 +51,7 @@ import {
 import {
   loadOrRebuildSessionIndex,
   rebuildSessionIndex,
+  sessionIndexPath,
   toSessionIndexEntry,
   type SessionIndexEntry,
 } from "./index.js";
@@ -1188,6 +1190,11 @@ async function updateIndexForWrittenRecord(
   },
 ): Promise<void> {
   if (options.skipIndexUpdate === true) {
+    return;
+  }
+  // C10 / block A8: NO INDEX HALF in an agent pod's record write. The index is the control pod's
+  // file (K7 rule 1); the atrium server projects this record into it (`src/index-projection.ts`).
+  if (isBoxWideFileInAgentPod(sessionIndexPath(sessionDir))) {
     return;
   }
   await updateSessionIndexForRecordWrite(sessionDir, toSessionIndexEntry(record, fileName), {

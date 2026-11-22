@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { AcpxOperationalError } from "../../errors.js";
+import { assertBoxWideWriteAllowed } from "../../pod/foreign-write-guard.js";
 import { isContextAlarmLevel } from "../context-alarm.js";
 import { withIdentityFileLock } from "./identity-file-lock.js";
 import { isSessionIndexLockHeld, withSessionIndexLock } from "./index-lock.js";
@@ -745,6 +746,7 @@ async function reprojectChangedSeatNames(
     if (!Array.isArray(index.entries) || !patchEntryNames(index.entries, changed)) {
       return;
     }
+    assertBoxWideWriteAllowed("index", indexPath);
     const tempFile = `${indexPath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
     await fs.writeFile(tempFile, `${JSON.stringify(index)}\n`, "utf8");
     await fs.rename(tempFile, indexPath);
@@ -879,6 +881,7 @@ async function writeSeatStoreAtomically(
   unparsedRows: ReadonlyMap<string, unknown>,
 ): Promise<void> {
   const filePath = seatStorePath(sessionDir);
+  assertBoxWideWriteAllowed("seat-store", filePath);
   // Per-call randomUUID for the reason `writeSessionIndex` documents:
   // `${pid}.${Date.now()}` alone is NOT unique, so two writes from this process in
   // the same millisecond build the identical temp path, the first rename wins and
@@ -939,6 +942,8 @@ export async function withSeatStoreWrite<T>(
   sessionDir: string,
   mutate: (store: SeatStore) => { mutation: SeatStoreMutation; result: T },
 ): Promise<T> {
+  // A-8: before ANY byte — the lock file below is a write too.
+  assertBoxWideWriteAllowed("seat-store", seatStorePath(sessionDir));
   // OUTSIDE the hold, deliberately: directory creation is I/O, and the hold's body
   // is operations on one file and nothing else.
   await fs.mkdir(sessionDir, { recursive: true });
