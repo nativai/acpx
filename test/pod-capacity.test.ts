@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
-import { waitingLineRefusal, waitingLineRefusalError } from "../src/pod/create-plan.js";
 import { podCapacitySnapshot, podRoom, WAITING_LINE_FACTOR } from "../src/pod/pod-capacity.js";
+import { waitingLineRefusal, waitingLineRefusalError } from "../src/pod/waiting-line.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence/serialize.js";
 import { type BrokerStatus, startFakeBroker } from "./pod-kit/fake-broker.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
@@ -507,4 +507,23 @@ test("pod mode create: a broker that does not answer never refuses a create (the
   const run = await newSession(f, await refusedUrl());
   assert.equal(run.code, 0, run.stderr);
   assert.equal(createdRecordIds(f).length, 1);
+});
+
+// ── the module-graph rule A9's first full suite taught: create-plan.ts stays light ──────────────────
+
+const HEAVY_IMPORT =
+  /from\s+"\.\.?\/(?:capacity\/|pod\/)?(?:[\w-]+\/)*(?:pod-capacity|pod-refusal|reading|ledger|admission|waiting)\.js"/u;
+
+test("create-plan.ts (imported by the record parser) imports nothing from the capacity side — that cycle reds 37 files", () => {
+  const text = fs.readFileSync(new URL("../../src/pod/create-plan.ts", import.meta.url), "utf8");
+  assert.equal(HEAVY_IMPORT.test(text), false);
+  // NEGATIVE: the same file with the import that broke the first run is flagged by the same pattern.
+  assert.equal(
+    HEAVY_IMPORT.test(`${text}\nimport { admissionDir } from "../capacity/ledger.js";\n`),
+    true,
+  );
+  assert.equal(
+    HEAVY_IMPORT.test(`${text}\nimport { agentCapRefusal } from "./pod-refusal.js";\n`),
+    true,
+  );
 });

@@ -60,13 +60,13 @@ import { validateSessionModelFlags } from "../models/model-slug-validation.js";
 import { loadPermissionPolicySpec } from "../permission-policy.js";
 import { inCallHomeMode } from "../pod/call-home.js";
 import {
-  admitRecordOnlyCreate,
   createReplayMismatchError,
   createRequestFingerprint,
   fileArgumentDigests,
   forkSourceSleepingError,
   isRecordOnlyCreate,
 } from "../pod/create-plan.js";
+import { admitRecordOnlyCreate } from "../pod/waiting-line.js";
 import { publicReap, type ReapReport } from "../process-tree-reap.js";
 import {
   mergePromptSourceWithText,
