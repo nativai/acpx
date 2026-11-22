@@ -265,3 +265,122 @@ test("T3 on the real CLI in an agent pod: `set-parent --children-of <other paren
     },
   );
 });
+
+// ---- T2 (brick c2b7358d): every class that runs LOCALLY on the pod's own id, not only `record` ----
+
+/**
+ * The classes whose own-pod route is LOCAL (`routeFor(class, "own-pod")`): they run in the pod on the pod's own id
+ * and must never trip the foreign-write guard (A-8). Measured when this row was written: none does — this pins it.
+ * DISCOVERED like the `record` row: the paths come from the real class table, and a path with neither an invocation
+ * nor a named exemption fails the first assertion, so a new command cannot slip in unexercised. An invocation is
+ * not asked to SUCCEED (a read of nothing may exit non-zero); it is asked not to trip the guard and not to leave
+ * the pod (no passed-through call).
+ */
+const LOCAL_ON_OWN_ID = ["read", "owner-ensure", "owner-if-pod", "one-shot", "local"] as const;
+const NONE = "00000000-0000-4000-8000-00000000000a";
+
+const OWN_ID_INVOCATIONS: Readonly<Record<string, string[]>> = {
+  // read
+  "sessions templates": ["sessions", "templates"],
+  "sessions show": ["sessions", "show", "--session-id", POD_SESSION],
+  "sessions history": ["sessions", "history", "--session-id", POD_SESSION],
+  "sessions read": ["sessions", "read", "--session-id", POD_SESSION],
+  "sessions export": ["sessions", "export", "--session-id", POD_SESSION, "--output", "export.json"],
+  "seats show": ["seats", "show", NONE],
+  "seats list": ["seats", "list"],
+  subscriptions: ["subscriptions"],
+  "subscriptions list": ["subscriptions", "list"],
+  "subscriptions usage": ["subscriptions", "usage"],
+  "subscriptions ceiling show": ["subscriptions", "ceiling", "show"],
+  profiles: ["profiles"],
+  "profiles list": ["profiles", "list"],
+  "profiles show": ["profiles", "show", "nosuch"],
+  agents: ["agents"],
+  "agents list": ["agents", "list"],
+  "agents show": ["agents", "show", "claude"],
+  models: ["models", "--offline"],
+  "models list": ["models", "list", "--offline"],
+  "models show": ["models", "show", "claude-subscription:opus", "--offline"],
+  "providers list": ["providers", "list"],
+  "people list": ["people", "list"],
+  "people resolve": ["people", "resolve", "nobody"],
+  "people principal": ["people", "principal", "--session", POD_SESSION],
+  config: ["config"],
+  "config show": ["config", "show"],
+  // owner-if-pod, about the pod's own session
+  cancel: ["cancel", "--session-id", POD_SESSION],
+  "set-mode": ["set-mode", "--session-id", POD_SESSION, "default"],
+  set: ["set", "--session-id", POD_SESSION, "model", "opus"],
+  status: ["status", "--session-id", POD_SESSION],
+  "sessions close": ["sessions", "close", "--session-id", POD_SESSION],
+  "sessions recover": ["sessions", "recover", POD_SESSION],
+  "sessions owner-status": ["sessions", "owner-status", POD_SESSION],
+  // one-shot: the forms that answer from records and start no adapter
+  "output-styles": ["output-styles", "--session-id", POD_SESSION],
+  sessions: ["sessions", "--local"],
+  "sessions list": ["sessions", "list", "--local"],
+  // local: groups print their help
+  seats: ["seats"],
+  "agent-folders": ["agent-folders"],
+  transcripts: ["transcripts"],
+  "subscriptions ceiling": ["subscriptions", "ceiling"],
+  providers: ["providers"],
+  people: ["people"],
+  governor: ["governor"],
+  box: ["box"],
+  flow: ["flow"],
+  help: ["seats", "help"],
+};
+
+/** Paths that cannot be driven here, each with the reason — and where the own-id rule for them is held instead. */
+const OWN_ID_EXEMPT: Readonly<Record<string, string>> = {
+  "": "bare `acpx <text>` is a prompt: it starts the pod's owner and an adapter (see `prompt`)",
+  prompt:
+    "starts the pod's owner and an adapter; the owner-entry guard is held by pod-owner-guard.test.ts",
+  "<agent>": "the same prompt, through the agent form",
+  exec: "spawns an adapter for a one-shot",
+  "model-catalogue": "spawns an adapter unless a record answers (held by pod-a10-probes.test.ts)",
+  "flow run": "runs ACP nodes: spawns an adapter",
+  "models endpoints": "an HTTP fetch from a vendor; no store write",
+  "governor status": "reads the box's process table (control-pod machinery)",
+  "governor scan": "walks the box's process table (control-pod machinery)",
+  "capacity run-build": "starts a build",
+};
+
+const ownIdPaths = (): string[] =>
+  Object.entries(COMMAND_TABLE)
+    .filter(([, entry]) => (LOCAL_ON_OWN_ID as readonly string[]).includes(entry.class))
+    .map(([commandPath]) => commandPath)
+    .toSorted();
+
+test("T2 conformance: every command of a locally-running class has an own-id invocation or a named exemption (a fresh one is flagged)", () => {
+  const known = [...Object.keys(OWN_ID_INVOCATIONS), ...Object.keys(OWN_ID_EXEMPT)].toSorted();
+  assert.deepEqual(ownIdPaths(), known);
+  assert.deepEqual(
+    Object.keys(OWN_ID_EXEMPT).filter(
+      (commandPath) => OWN_ID_INVOCATIONS[commandPath] !== undefined,
+    ),
+    [],
+    "a path is driven or exempt, not both",
+  );
+  const fresh = [...ownIdPaths(), "sessions brand-new-read-verb"].toSorted();
+  assert.notDeepEqual(fresh, known, "the discovery flags a path the registry lacks");
+  // the classes really are the ones that run locally on the own pod (the premise of this row)
+  for (const cls of LOCAL_ON_OWN_ID) {
+    assert.equal(routeFor(cls, "own-pod", cls === "one-shot").kind, "local", cls);
+  }
+});
+
+test("T2 conformance: no command of a locally-running class about the pod's OWN id trips pod_foreign_write, and none leaves the pod", async () => {
+  for (const [commandPath, argv] of Object.entries(OWN_ID_INVOCATIONS)) {
+    const { home } = agentPodHome();
+    await addRecord(home, POD_SESSION, "bbbbbbbb-0000-4000-8000-0000000000b2");
+    await withAtrium({}, async (atrium) => {
+      const r = await runCli(argv, agentPodEnv(home, atrium.url), { cwd: home, timeoutMs: 60_000 });
+      assert.notEqual(r.status, null, `${commandPath}: answered, not killed`);
+      assert.doesNotMatch(r.stderr, GUARD, `${commandPath}: ${r.stderr}`);
+      assert.doesNotMatch(r.stdout, GUARD, `${commandPath}: ${r.stdout}`);
+      assert.equal(callsOf(atrium).length, 0, `${commandPath} stayed in the pod`);
+    });
+  }
+});
