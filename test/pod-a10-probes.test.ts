@@ -39,7 +39,7 @@ import {
   type UtilityDeps,
 } from "../src/pod/utility-branch.js";
 import type { SessionRecord } from "../src/types.js";
-import { startFakeApiServer } from "./pod-kit/fake-apiserver.js";
+import { startFakeApiServer, type PodSeed } from "./pod-kit/fake-apiserver.js";
 import { startFakeBroker } from "./pod-kit/fake-broker.js";
 import { makeSessionRecord, writeSessionRecordFile } from "./runtime-test-helpers.js";
 
@@ -617,11 +617,11 @@ test("utility branch: records cannot answer → ONE routed call to the utility p
   assert.equal(run.payload, undefined);
 });
 
-test("utility branch, C1.2 placement per harness: Codex → ag-util-home; claude and pi → ag-util-pool; an agent no detector knows → pool; the terminal harness → home", async () => {
+test("utility branch, C1.2 placement per harness: Codex and Pi → ag-util-home (Pi until P1, A-44); claude → ag-util-pool; an agent no detector knows → pool; the terminal harness → pool (A-39)", async () => {
   const cases: Array<[string | undefined, string]> = [
     [resolveAgentCommand("codex"), "util-home"],
     [resolveAgentCommand("claude"), "util-pool"],
-    [resolveAgentCommand("pi"), "util-pool"],
+    [resolveAgentCommand("pi"), "util-home"],
     [undefined, "util-pool"],
   ];
   for (const [command, key] of cases) {
@@ -647,7 +647,11 @@ test("utility branch, C1.2 placement per harness: Codex → ag-util-home; claude
   );
   assert.equal(utilityKeyFor("codex"), "util-home");
   assert.equal(utilityKeyFor("claude"), "util-pool");
-  assert.equal(utilityKeyFor("pi"), "util-pool");
+  assert.equal(
+    utilityKeyFor("pi"),
+    "util-home",
+    "A-44: Pi one-shots go home until P1 gives pool pods a Pi store",
+  );
   assert.equal(utilityKeyFor(undefined), "util-pool");
 });
 
@@ -736,6 +740,10 @@ async function rig(opts: {
   brokerReady?: boolean;
   stub?: { exit?: number; stdout?: string };
   place?: "control" | "agent-pod";
+  /** Tools whose control-pod release link is left out (C9). */
+  withoutLinks?: string[];
+  /** Pods the kit's API server already shows (a Ready utility pod, A-43 (b)). */
+  pods?: PodSeed[];
 }): Promise<Rig> {
   const home = fs.mkdtempSync(path.join(ROOT, "home-"));
   const stubDir = fs.mkdtempSync(path.join(ROOT, "stub-"));
@@ -751,13 +759,16 @@ async function rig(opts: {
     "pi",
     "pi-acp",
   ]) {
+    if (opts.withoutLinks?.includes(tool)) {
+      continue;
+    }
     fs.mkdirSync(path.join(runtime, ".releases", tool, "r"), { recursive: true });
     fs.symlinkSync(`.releases/${tool}/r`, path.join(runtime, tool));
   }
   const sa = fs.mkdtempSync(path.join(ROOT, "sa-"));
   fs.writeFileSync(path.join(sa, "namespace"), "dev-devbox\n");
   fs.writeFileSync(path.join(sa, "token"), "tok-1\n");
-  const api = await startFakeApiServer({ namespace: "dev-devbox", pods: [] });
+  const api = await startFakeApiServer({ namespace: "dev-devbox", pods: opts.pods ?? [] });
   const broker = await startFakeBroker({
     // The kit's home cap is the real broker's default, 0: `util-home` then answers `home_full`.
     status: { home: { live: 0, cap: 5 } },
@@ -1205,5 +1216,155 @@ test("REAL CLI, round 2 / F-F: a utility refusal in JSON carries tokenLine == st
     assert.doesNotMatch(String(error.data.message), /session|message|queued/i);
   } finally {
     await r.close();
+  }
+});
+
+// ───────────────────────── A-43 / A-44: a Pi one-shot without `pi` (rows 43.1–43.3), Pi goes home ─────────────────────────
+
+const PI = "node /opt/pi-acp/dist/index.js";
+const PI_LINE = /^acpx: ROUTED outcome=not_run reason=release_unresolved tool=pi call_id=\S+$/;
+
+/** A Ready utility pod for `util-pool`, as the broker would have started it, with the given releases annotation. */
+function utilityPod(releases: string | undefined): PodSeed {
+  return {
+    name: "ag-util-pool-abcde",
+    uid: "55555555-5555-4555-8555-555555555555",
+    podIP: "10.1.2.9",
+    labels: { "workbench.nativai.de/session-key": "util-pool" },
+    ...(releases === undefined ? {} : { annotations: { "runtime.nativai.de/releases": releases } }),
+  };
+}
+
+const POSTS = (r: Rig) => r.broker.requests.filter((q) => q.method === "POST");
+
+test("A-43 row 43.1: no utility pod, the control pod's `pi` link absent — a Pi `exec` is refused `release_unresolved tool=pi`, the broker receives no request; a Claude `exec` in the same rig is routed to util-pool with `releases` lacking `pi`", async () => {
+  const r = await rig({ withoutLinks: ["pi"], stub: { exit: 0, stdout: "ran\n" } });
+  try {
+    const pi = await cli(["--agent", PI, "exec", "hi"], r.env);
+    assert.equal(pi.code, 1, pi.stderr);
+    assert.match(pi.stderr.split("\n")[0] ?? "", PI_LINE);
+    assert.equal(r.broker.requests.length, 0, "the broker was never asked");
+    assert.equal(r.calls().length, 0);
+    const claude = await cli(["--agent", CLAUDE, "exec", "hi"], r.env);
+    assert.equal(claude.code, 0, claude.stderr);
+    const [post, ...more] = POSTS(r);
+    assert.equal(more.length, 0);
+    assert.equal(post?.key, "util-pool");
+    const releases = (post?.body?.releases ?? {}) as Record<string, string>;
+    assert.equal("pi" in releases, false, "releases lacks pi");
+    assert.equal("acpx" in releases, true);
+    assert.equal(r.calls().length, 1);
+  } finally {
+    await r.close();
+  }
+});
+
+test("A-43 row 43.1, the positive side: with `pi` linked a Pi `exec` is routed — to the HOME utility pod (A-44)", async () => {
+  const r = await rig({ stub: { exit: 0, stdout: "ran\n" } });
+  try {
+    const pi = await cli(["--agent", PI, "exec", "hi"], r.env);
+    assert.equal(pi.code, 0, pi.stderr);
+    assert.equal(POSTS(r)[0]?.key, "util-home");
+    assert.equal(POSTS(r)[0]?.body?.placement, "home");
+    assert.equal("pi" in ((POSTS(r)[0]?.body?.releases ?? {}) as object), true);
+  } finally {
+    await r.close();
+  }
+});
+
+test("A-43 row 43.2: a Ready utility pod whose releases annotation lacks `pi` (or cannot be read) is never reached by a Pi call; with `pi` in the annotation it is", async () => {
+  // The pod serves util-home for Pi: the key the Pi one-shot goes to (A-44).
+  const home = (releases: string | undefined): PodSeed => ({
+    ...utilityPod(releases),
+    name: "ag-util-home-abcde",
+    labels: { "workbench.nativai.de/session-key": "util-home" },
+  });
+  const full = JSON.stringify({ acpx: "r", "pi-acp": "r", pi: "r" });
+  const cases: Array<[string, string | undefined]> = [
+    ["lacking pi", JSON.stringify({ acpx: "r", "pi-acp": "r" })],
+    ["no annotation at all", undefined],
+    ["unparseable", "{not json"],
+    ["not an object of strings", JSON.stringify({ pi: 7 })],
+  ];
+  for (const [label, annotation] of cases) {
+    const r = await rig({ pods: [home(annotation)] });
+    try {
+      const result = await cli(["--agent", PI, "exec", "hi"], r.env);
+      assert.equal(result.code, 1, `${label}: ${result.stderr}`);
+      assert.match(result.stderr.split("\n")[0] ?? "", PI_LINE, label);
+      assert.equal(r.broker.requests.length, 0, `${label}: the broker was not asked`);
+      assert.equal(r.calls().length, 0, `${label}: the call was not routed`);
+    } finally {
+      await r.close();
+    }
+  }
+  const named = await rig({ pods: [home(full)], stub: { exit: 0, stdout: "ran\n" } });
+  try {
+    const result = await cli(["--agent", PI, "exec", "hi"], named.env);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(named.calls().length, 1, "routed to the Ready pod");
+    assert.equal(named.broker.requests.length, 0, "a Ready pod needs no broker");
+  } finally {
+    await named.close();
+  }
+  // The same lacking-pi pod does NOT stop a Claude call: it is the Pi call that needs `pi`.
+  const claudeRig = await rig({
+    pods: [utilityPod(JSON.stringify({ acpx: "r" }))],
+    stub: { exit: 0, stdout: "ran\n" },
+  });
+  try {
+    const result = await cli(["--agent", CLAUDE, "exec", "hi"], claudeRig.env);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(claudeRig.calls().length, 1);
+  } finally {
+    await claudeRig.close();
+  }
+});
+
+test("A-43 row 43.3: a Pi `model-catalogue` that no record answers must be routed — and with the `pi` link absent it is refused (exit 1, nothing started); a usable Pi record answers it with no line and nothing routed", async () => {
+  const none = await rig({ withoutLinks: ["pi"] });
+  try {
+    const result = await cli(["--agent", PI, "model-catalogue"], none.env);
+    assert.equal(result.code, 1, result.stderr);
+    assert.match(result.stderr.split("\n")[0] ?? "", PI_LINE);
+    assert.equal(none.broker.requests.length, 0);
+    assert.equal(none.calls().length, 0);
+  } finally {
+    await none.close();
+  }
+  const served = await rig({
+    withoutLinks: ["pi"],
+    records: [
+      record("66666666-6666-4666-8666-666666666661", PI, {
+        available_models: ["pi-a", "pi-b"],
+        current_model_id: "pi-a",
+      }),
+    ],
+  });
+  try {
+    const result = await cli(["--agent", PI, "model-catalogue"], served.env);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stderr.includes("release_unresolved"), false, result.stderr);
+    assert.equal(served.broker.requests.length, 0, "answered from the record: nothing routed");
+    assert.equal(served.calls().length, 0);
+  } finally {
+    await served.close();
+  }
+});
+
+test("A-43 unit: a call whose agent is Pi carries `agentIsPi`; a Claude or Codex one-shot does not", async () => {
+  for (const [command, expected] of [
+    [PI, true],
+    [CLAUDE, false],
+    [CODEX, false],
+  ] as const) {
+    const argv = ["exec", "hi"];
+    const d = dispatcher(argv, {
+      agentCommand: command,
+      harnessOf: (c) => (c.includes("pi-acp") ? "pi" : c.includes("codex") ? "codex" : "claude"),
+    });
+    await dispatchUtility(decisionFor(argv), context(d.out), d.deps);
+    assert.equal(d.runs[0]?.agentIsPi === true, expected, command);
+    assert.equal(d.runs[0]?.target.harness, "utility", "the pod's harness stays utility");
   }
 });

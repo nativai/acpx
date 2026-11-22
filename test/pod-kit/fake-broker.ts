@@ -33,8 +33,14 @@ export const RELEASE_TOOLS = [
   "pi-extensions",
 ] as const;
 // C9 (A-12, A-40, A-41): only a tool marked `optional` in runtime-links.sh's LINKS table may be left out of
-// `releases` — `pi-extensions`, `pi` and `claude-pty-acp`. Any other absent tool is a problem. This is the
-// BROKER's copy of the set (broker.py `OPTIONAL_RELEASE_TOOLS`); acpx's own is `RELEASE_TOOLS_OPTIONAL`.
+// `releases` — `pi-extensions`, `pi` and `claude-pty-acp`. Any other absent tool is a problem.
+//
+// ⚠️ THIS IS THE A-40/A-41 CONTRACT SET, NOT YET THE REAL BROKER'S: broker.py `OPTIONAL_RELEASE_TOOLS` at
+// argocd db6f1050 (line 558) still reads `('pi-extensions',)`. The kit is AHEAD of it on purpose, so acpx's
+// rows hold the contract; the real broker's copy (and infra's link table) are infrastructure's change (BR1).
+// Row 40.4 ("the three copies are equal") is therefore only HALF checked here — acpx's copy against this one
+// (`test/pod-routed-call.test.ts` "the three copies"); against the REAL broker and the link table it stays
+// OPEN for the integration gate.
 export const OPTIONAL_RELEASE_TOOLS: readonly string[] = ["pi-extensions", "pi", "claude-pty-acp"];
 
 export type BrokerStep = string | { line: string; delayMs?: number };

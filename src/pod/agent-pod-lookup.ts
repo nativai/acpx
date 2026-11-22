@@ -125,7 +125,28 @@ type PodFacts = {
   ready: boolean;
   readyAtMs: number | undefined;
   ip: string | undefined;
+  /** `runtime.nativai.de/releases`, parsed; undefined when absent or unreadable (A-43 (b)). */
+  releases: Record<string, string> | undefined;
 };
+
+export const RELEASES_ANNOTATION = "runtime.nativai.de/releases";
+
+/** The pod's releases annotation as `{tool: release}`; undefined for a missing, unparseable or non-string-valued one. */
+function releasesOf(pod: Obj): Record<string, string> | undefined {
+  const raw = obj(obj(pod.metadata)?.annotations)?.[RELEASES_ANNOTATION];
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  try {
+    const parsed = obj(JSON.parse(raw));
+    const entries = parsed ? Object.entries(parsed) : [];
+    return parsed && entries.every(([, value]) => typeof value === "string")
+      ? (parsed as Record<string, string>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 function readyCondition(status: Obj | undefined): Obj | undefined {
   const conditions = Array.isArray(status?.conditions) ? (status.conditions as unknown[]) : [];
@@ -165,7 +186,13 @@ export function podFacts(item: unknown): PodFacts | undefined {
     return undefined;
   }
   const ready = isReady(pod, status);
-  return { uid, ready, readyAtMs: ready ? readyAt(status) : undefined, ip: str(status?.podIP) };
+  return {
+    uid,
+    ready,
+    readyAtMs: ready ? readyAt(status) : undefined,
+    ip: str(status?.podIP),
+    releases: releasesOf(pod),
+  };
 }
 
 /** Several non-terminal pods of one key (a terminating one beside its successor): a Ready one wins. */
@@ -180,7 +207,11 @@ type LookupAnswer = Awaited<ReturnType<AgentPodLookup>>;
 
 function answerOf(items: unknown[]): LookupAnswer {
   const chosen = choosePod(items);
-  return chosen ? { state: "exists", ...chosen } : { state: "absent" };
+  if (!chosen) {
+    return { state: "absent" };
+  }
+  const { releases, ...rest } = chosen;
+  return { state: "exists", ...rest, ...(releases ? { releases } : {}) };
 }
 
 /**

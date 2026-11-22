@@ -1322,6 +1322,9 @@ test("releases (A-40/A-41): a PRESENT optional link that is not release-shaped s
   }
 });
 
+// ⚠️ ROW 40.4 IS ONLY HALF CHECKED HERE: acpx's copy against the FAKE broker kit's (which carries the A-40/A-41
+// set ahead of the real broker). The REAL broker's `OPTIONAL_RELEASE_TOOLS` (broker.py:558 at argocd db6f1050 is
+// still `('pi-extensions',)`) and infra's link table stay OPEN for the integration gate.
 test("the three copies of the optional set (row 40.4): acpx's equals the broker kit's — and a copy missing `pi` is caught, naming the copy and the tool", () => {
   const copies: Record<string, readonly string[]> = {
     "acpx RELEASE_TOOLS_OPTIONAL": RELEASE_TOOLS_OPTIONAL,

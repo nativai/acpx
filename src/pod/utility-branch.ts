@@ -63,8 +63,16 @@ export const UTILITY_PROBE_DEADLINE_MS = 30_000;
 export const UTILITY_RUN_DEADLINE_MS = 15 * 60_000;
 export const UTILITY_TIMEOUT_GRACE_MS = 15_000;
 
-/** Harnesses whose utility pod is the HOME one: Codex's home is mounted directly in home-placed pods. (The terminal harness was home-placed too until A-39 took it out of phase 1.) */
-const HOME_HARNESSES: ReadonlySet<string> = new Set(["codex"]);
+/**
+ * Harnesses whose utility pod is the HOME one: Codex's home is mounted directly in home-placed pods. (The
+ * terminal harness was home-placed too until A-39 took it out of phase 1.)
+ *
+ * ⚠️ `pi` IS HERE UNTIL BLOCK P1 IS ON THE BOX (A-44, brick b3879529): pi writes its session JSONL under its
+ * data and session directory even for a one-shot `exec` (`PI_CODING_AGENT_DIR` is pi's data dir; a missing
+ * session dir hangs pi), and pool pods have no read-write Pi store before P1. P1 REMOVES `pi` from this set.
+ * `test/pod-a10-probes.test.ts` ("utilityKeyFor") pins it.
+ */
+const HOME_HARNESSES: ReadonlySet<string> = new Set(["codex", "pi"]);
 
 export function utilityKeyFor(harness: string | undefined): UtilityKey {
   return harness !== undefined && HOME_HARNESSES.has(harness) ? "util-home" : "util-pool";
@@ -159,6 +167,11 @@ function utilityCallOptions(
   return {
     class: "one-shot",
     key,
+    // A-43: the call is about a Pi AGENT even though its pod is a utility one — `routed-call` then refuses it,
+    // named, when `pi` is not in the releases it would send or in the Ready pod it would reach.
+    ...(agentCommand !== undefined && deps.harnessOf(agentCommand) === "pi"
+      ? { agentIsPi: true }
+      : {}),
     // A-10: a utility pod belongs to no session and no seat — the routed call sends neither.
     target: {
       sessionId: "",
