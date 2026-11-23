@@ -1,5 +1,8 @@
 import childProcess from "node:child_process";
+import dgram from "node:dgram";
+import dns from "node:dns";
 import fs from "node:fs";
+import inspector from "node:inspector";
 import { syncBuiltinESMExports } from "node:module";
 import net from "node:net";
 import os from "node:os";
@@ -280,9 +283,85 @@ function refuseNetwork(): never {
   );
 }
 
+/** The same refusal for a Promise API: a rejection, so `.catch` and `await` see it as they would a failed call. */
+function refuseNetworkAsync(): Promise<never> {
+  try {
+    refuseNetwork();
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  return Promise.reject(new Error("unreachable"));
+}
+
+/** Names that send a UDP packet or a name query, DISCOVERED by name on each dns surface (a new `resolveX` is covered). */
+const DNS_QUERY = /^(lookup|resolve|reverse)/u;
+
+function barDnsSurface(target: object, refusal: () => unknown, undo: Restore[]): void {
+  for (const name of Object.keys(target)) {
+    if (typeof record(target)[name] === "function" && DNS_QUERY.test(name)) {
+      swap(target, name, refusal, undo);
+    }
+  }
+}
+
+/** The names a Resolver class gets on its prototype (`resolve4`, `reverse`, …). */
+function barResolver(resolver: unknown, refusal: () => unknown, undo: Restore[]): void {
+  const prototype = (resolver as { prototype?: object } | undefined)?.prototype;
+  if (prototype !== undefined) {
+    for (const name of Object.getOwnPropertyNames(prototype)) {
+      if (typeof record(prototype)[name] === "function" && DNS_QUERY.test(name)) {
+        swap(prototype, name, refusal, undo);
+      }
+    }
+  }
+}
+
+/** The native handles behind sockets and name resolution, by their (deprecated) `process.binding` names. */
+const NETWORK_BINDINGS = new Set([
+  "udp_wrap",
+  "tcp_wrap",
+  "cares_wrap",
+  "pipe_wrap",
+  "tls_wrap",
+  "stream_wrap",
+]);
+
+/**
+ * The network, in the armed child. TCP: `connect` (every client, `fetch`, `http`, `tls`, and a connect to a HOSTNAME, which is
+ * refused before it resolves) and `listen`. UDP: every dgram socket (`createSocket`, the `Socket` class, `bind`, `send`,
+ * `connect`). DNS: `lookup`, `lookupService`, `resolve*`, `reverse` on `dns`, `dns.promises`, and both `Resolver` classes.
+ * Also `inspector.open` (an inbound listener) and the native handles behind `process.binding`. Node 22's permission model
+ * restricts none of these (v25's does); each attempt tells `network` and fails with `ERR_ACCESS_DENIED`. COULD NOT BE BARRED:
+ * nothing in userland reaches a raw socket without one of these; a module loaded BEFORE the guards (none: they install first)
+ * would have kept its own references.
+ */
 function watchNetwork(undo: Restore[]): void {
   swap(net.Socket.prototype, "connect", refuseNetwork, undo);
   swap(net.Server.prototype, "listen", refuseNetwork, undo);
+  swap(dgram, "createSocket", refuseNetwork, undo);
+  swap(dgram, "Socket", refuseNetwork, undo);
+  for (const name of ["bind", "send", "connect"]) {
+    swap(dgram.Socket.prototype, name, refuseNetwork, undo);
+  }
+  barDnsSurface(dns, refuseNetwork, undo);
+  barDnsSurface(dns.promises, refuseNetworkAsync, undo);
+  barResolver(dns.Resolver, refuseNetwork, undo);
+  barResolver(dns.promises.Resolver, refuseNetworkAsync, undo);
+  swap(inspector, "open", refuseNetwork, undo);
+  const binding = record(process).binding as ((name: string) => unknown) | undefined;
+  if (typeof binding === "function") {
+    swap(
+      process,
+      "binding",
+      function (this: unknown, name: string) {
+        if (NETWORK_BINDINGS.has(name)) {
+          refuseNetwork();
+        }
+        return binding.call(this, name);
+      },
+      undo,
+    );
+  }
 }
 
 /** Installs every guard; returns the function that removes them (the in-process rows). */
