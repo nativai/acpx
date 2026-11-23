@@ -1,17 +1,16 @@
 import { randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type {
   SessionAgentContent,
-  SessionConversation,
   SessionMessage,
   SessionMessagesLogState,
   SessionRecord,
   SessionToolResultContent,
   SessionUserContent,
 } from "../types.js";
-import { trimConversationForRuntime } from "./conversation-model.js";
-import { markAllMessagesLogged, setLoggedMessageCount } from "./messages-log-bookkeeping.js";
+import { markLoadedInlineEntries, setLoggedMessageCount } from "./messages-log-bookkeeping.js";
 
 export const MESSAGES_LOG_COMPACT_BYTES = 32 * 1024 * 1024;
 
@@ -458,6 +457,8 @@ async function hydrateFromLogReader(
   const logTail = await reader.tail(effectiveBytes, logTailLimit);
   record.messages = [...logTail, ...inlineMessages];
   setLoggedMessageCount(record, logTail.length);
+  // C3.5 (i): the inline entries came from disk, so they are their publisher's, not this copy's.
+  markLoadedInlineEntries(inlineMessages);
   return record;
 }
 
@@ -599,6 +600,101 @@ export function resolveMessagesLogCompactBytes(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : MESSAGES_LOG_COMPACT_BYTES;
 }
 
+export type MeasuredAppend = {
+  /** The log's pointer as measured under the lock: at a line boundary, past every complete line. */
+  state: SessionMessagesLogState;
+  /** Complete lines found past the published watermark and adopted into it (a writer that died after its append). */
+  adopted: number;
+};
+
+const EMPTY_LOG_STATE: SessionMessagesLogState = { v: 1, count: 0, base_index: 0, bytes: 0 };
+
+async function readHandleRange(handle: fs.FileHandle, start: number, end: number): Promise<Buffer> {
+  const buffer = Buffer.alloc(Math.max(0, end - start));
+  let filled = 0;
+  while (filled < buffer.length) {
+    const { bytesRead } = await handle.read(buffer, filled, buffer.length - filled, start + filled);
+    if (bytesRead === 0) {
+      return buffer.subarray(0, filled);
+    }
+    filled += bytesRead;
+  }
+  return buffer;
+}
+
+/** The nearest line boundary at or before `position`: a pointer never stands inside a line. */
+async function lineBoundaryAtOrBefore(handle: fs.FileHandle, position: number): Promise<number> {
+  let end = position;
+  while (end > 0) {
+    const from = Math.max(0, end - TAIL_READ_CHUNK_BYTES);
+    const chunk = await readHandleRange(handle, from, end);
+    if (end === position && chunk.at(-1) === NEWLINE) {
+      return position;
+    }
+    const lastNewline = chunk.lastIndexOf(NEWLINE);
+    if (lastNewline !== -1) {
+      return from + lastNewline + 1;
+    }
+    end = from;
+  }
+  return 0;
+}
+
+/**
+ * C3.5 (i): append `messages` at the log's MEASURED end — never at a writer's remembered watermark.
+ * The caller holds the record's lock, so this is the only writer. `published` is the pointer on disk.
+ *
+ * - Complete lines past the published watermark are adopted into the pointer, the way a reader adopts
+ *   them (`hydrateFromLogReader`): a writer that died after its append left them.
+ * - An incomplete tail (bytes after the last newline) is cut back to that newline. **A complete line
+ *   is never cut.** The old truncate to the writer's in-memory watermark was P0 of the c917d9c9 probe:
+ *   it erased whatever another writer had appended after this writer read.
+ * - The entries go at the measured end by position, so a network mount's cached size never places
+ *   them, and the file is closed before the caller releases the lock.
+ */
+export async function appendAtMeasuredEnd(
+  logPath: string,
+  published: SessionMessagesLogState | undefined,
+  messages: readonly SessionMessage[],
+): Promise<MeasuredAppend> {
+  const base = published ?? EMPTY_LOG_STATE;
+  await fs.mkdir(path.dirname(logPath), { recursive: true });
+  const handle = await fs.open(logPath, fsConstants.O_RDWR | fsConstants.O_CREAT, 0o666);
+  try {
+    const size = (await handle.stat()).size;
+    if (base.bytes > size) {
+      warn(`messages log shorter than watermark for ${logPath}; measuring from its own end`);
+    }
+    // A pointer inside a line (a torn watermark an older build published) is moved back to the line.
+    const start = await lineBoundaryAtOrBefore(handle, Math.min(base.bytes, size));
+    const past = await readHandleRange(handle, start, size);
+    const complete = parseCompleteMessageLines(past);
+    const end = start + complete.bytes;
+    if (size > end) {
+      await handle.truncate(end);
+    }
+    let written = 0;
+    if (messages.length > 0) {
+      const payload = Buffer.from(`${messages.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+      while (written < payload.length) {
+        written += (await handle.write(payload, written, payload.length - written, end + written))
+          .bytesWritten;
+      }
+    }
+    const adopted = start >= base.bytes ? complete.messages.length : 0;
+    return {
+      adopted,
+      state: {
+        ...base,
+        count: base.count + adopted + messages.length,
+        bytes: end + written,
+      },
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
 export async function appendFinalizedMessagesToLog(
   record: SessionRecord,
   logPath: string,
@@ -607,36 +703,56 @@ export async function appendFinalizedMessagesToLog(
   if (messages.length === 0) {
     return record.messagesLog;
   }
-
-  const current = record.messagesLog ?? {
-    v: 1,
-    count: 0,
-    base_index: 0,
-    bytes: 0,
-  };
-  await fs.mkdir(path.dirname(logPath), { recursive: true });
-  await fs.truncate(logPath, current.bytes).catch((error: NodeJS.ErrnoException) => {
-    if (error.code !== "ENOENT") {
-      throw error;
-    }
-  });
-
-  const payload = Buffer.from(`${messages.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
-  const handle = await fs.open(logPath, "a");
-  try {
-    await handle.write(payload, 0, payload.length);
-  } finally {
-    await handle.close();
-  }
-
-  record.messagesLog = {
-    ...current,
-    count: current.count + messages.length,
-    bytes: current.bytes + payload.length,
-  };
+  record.messagesLog = (await appendAtMeasuredEnd(logPath, record.messagesLog, messages)).state;
   return record.messagesLog;
 }
 
+/** The raw lines of the last `maxMessages` parseable entries of `log[0, endByte)`, oldest first. */
+async function readMessagesLogTailLines(
+  logPath: string,
+  endByte: number,
+  maxMessages: number,
+): Promise<Buffer[]> {
+  const handle = await fs.open(logPath, "r");
+  try {
+    const kept: Buffer[] = [];
+    let carry: Buffer = Buffer.alloc(0);
+    let position = endByte;
+    while (position > 0 && kept.length < maxMessages) {
+      const from = Math.max(0, position - TAIL_READ_CHUNK_BYTES);
+      const lines = splitBufferLines(
+        Buffer.concat([await readHandleRange(handle, from, position), carry]),
+      );
+      position = from;
+      // The first piece may be the end of a line that starts before this chunk: carry it back.
+      carry = position > 0 ? (lines.shift() ?? Buffer.alloc(0)) : Buffer.alloc(0);
+      keepParseableLinesNewestFirst(lines, kept, maxMessages);
+    }
+    return kept.toReversed();
+  } finally {
+    await handle.close();
+  }
+}
+
+function keepParseableLinesNewestFirst(lines: Buffer[], kept: Buffer[], maxMessages: number): void {
+  for (let index = lines.length - 1; index >= 0 && kept.length < maxMessages; index -= 1) {
+    if (lines[index].length === 0) {
+      continue;
+    }
+    if (parseMessageLine(lines[index])) {
+      kept.push(lines[index]);
+    } else {
+      warn("ignoring malformed messages log line");
+    }
+  }
+}
+
+/**
+ * Compaction above `thresholdBytes`, in the same lock span as the append (C3.5 (i)). It keeps the
+ * last entries AS THEY ARE IN THE FILE — the runtime trim's count of complete lines, read from disk —
+ * never a rewrite from a writer's memory: an entry another writer appended after this writer read is
+ * in the kept tail. `base_index` advances by the lines dropped.
+ */
 export async function compactMessagesLog(
   record: SessionRecord,
   logPath: string,
@@ -656,24 +772,10 @@ export async function compactMessagesLog(
     return false;
   }
 
-  const previous = record.messagesLog ?? {
-    v: 1,
-    count: 0,
-    base_index: 0,
-    bytes: 0,
-  };
-  const conversation: SessionConversation = {
-    title: record.title,
-    messages: structuredClone(record.messages),
-    updated_at: record.updated_at,
-    cumulative_token_usage: record.cumulative_token_usage,
-    request_token_usage: record.request_token_usage,
-  };
-  trimConversationForRuntime(conversation);
-  const kept = conversation.messages;
-  const payload = Buffer.from(
-    kept.length === 0 ? "" : `${kept.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
-  );
+  const previous = record.messagesLog ?? EMPTY_LOG_STATE;
+  const kept = await readMessagesLogTailLines(logPath, previous.bytes, MAX_RUNTIME_MESSAGES);
+  const newline = Buffer.from("\n");
+  const payload = Buffer.concat(kept.flatMap((line) => [line, newline]));
   // Unique per call, not per millisecond — same collision as the record write
   // in persistence/repository.ts, and on the SAME call path (writeSessionRecord
   // calls this immediately before writing the record), so fixing only one of
@@ -683,13 +785,11 @@ export async function compactMessagesLog(
   await fs.rename(tempFile, logPath);
 
   const dropped = Math.max(0, previous.count - kept.length);
-  record.messages = kept;
   record.messagesLog = {
     v: 1,
     count: kept.length,
     base_index: previous.base_index + dropped,
     bytes: payload.length,
   };
-  markAllMessagesLogged(record);
   return true;
 }

@@ -52,6 +52,7 @@ export {
   writeSessionRecordWithLifecycle,
 } from "./persistence/repository.js";
 export type {
+  MessageWriteMode,
   MigrateSlugsResult,
   PersistedSessionLifecycle,
   PruneCandidateCounts,

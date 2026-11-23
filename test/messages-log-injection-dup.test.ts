@@ -174,22 +174,47 @@ async function runParkedInjectionScenario(scenario: Scenario): Promise<LogEntry[
     control.emitSessionUpdate(agentChunk(record.acpSessionId, "partial answer x"));
     await sleep(CHECKPOINT_SETTLE_MS);
 
-    // Park every record write on the record lock (the log append is NOT under it).
-    const lockPath = `${recordFile}.lock`;
-    await fs.writeFile(lockPath, "{}");
-    for (const [index, messageId] of scenario.injections.entries()) {
-      midTurnHandler?.([makeTask(`req-inj-${index}`, INJECTED_PROMPT_TEXT, messageId)]);
-      // The injection's boundary append has landed, and its record write is now parked.
-      await waitFor(
-        async () => (await readLog(logPath)).some((e) => e.kind === "User" && e.key === messageId),
-        `log append of ${messageId}`,
-      );
+    // Park the first injection's record PUBLISH (the rename of `<id>.json`). Since A-60 (C3.5 (i)) the
+    // log append and the publish are ONE span inside the record's lock, so the window this scenario
+    // was written for — "the append landed, the record write is pending, a checkpoint interleaves" —
+    // is closed by construction: the checkpoint and the second injection queue on the lock instead.
+    // The scenario stays as the regression row for what they then see once it is released.
+    const originalRename = fs.rename;
+    const parked = createDeferred<void>();
+    const release = createDeferred<void>();
+    let armed = true;
+    fs.rename = (async (...args: Parameters<typeof originalRename>) => {
+      if (armed && String(args[1]) === recordFile) {
+        armed = false;
+        parked.resolve();
+        await release.promise;
+      }
+      return await originalRename(...args);
+    }) as typeof originalRename;
+    try {
+      for (const [index, messageId] of scenario.injections.entries()) {
+        midTurnHandler?.([makeTask(`req-inj-${index}`, INJECTED_PROMPT_TEXT, messageId)]);
+        if (index === 0) {
+          await parked.promise;
+          // The injection's boundary append has landed, and its record publish is parked.
+          await waitFor(
+            async () =>
+              (await readLog(logPath)).some((e) => e.kind === "User" && e.key === messageId),
+            `log append of ${messageId}`,
+          );
+        } else {
+          // The queued injection pushes its User entry, then waits on the lock behind the parked one.
+          await sleep(100);
+        }
+      }
+      if (scenario.updateInsideWindow) {
+        control.emitSessionUpdate(agentChunk(record.acpSessionId, "continued answer y"));
+        await sleep(CHECKPOINT_SETTLE_MS); // the checkpoint queues behind the lock in here
+      }
+    } finally {
+      release.resolve();
+      fs.rename = originalRename;
     }
-    if (scenario.updateInsideWindow) {
-      control.emitSessionUpdate(agentChunk(record.acpSessionId, "continued answer y"));
-      await sleep(CHECKPOINT_SETTLE_MS); // the checkpoint's applyConversation runs in here
-    }
-    await fs.rm(lockPath, { force: true });
     for (const deferred of injectedInFlight) {
       await deferred.promise;
     }

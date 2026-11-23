@@ -899,9 +899,36 @@ export function addPromptInputOption(command: Command): Command {
   return command.option("-f, --file <path>", "Read prompt text from file path (use - for stdin)");
 }
 
+/**
+ * THE one precedence for the output format a verb runs with — every verb family reads it here (brick 3bc340d5, O1):
+ * the NEAREST command that states one wins — the verb's own `--format` / `--json`, then its group's, then the
+ * program's — then the config file's `format`, then text. The leaf wins. (`optsWithGlobals()` lets an ANCESTOR
+ * overwrite the leaf, so `profiles`, `providers` and `governor` used to let the program's `--format` beat the
+ * verb's own, while `models` kept its own rule.) Within ONE command `--json` is `--format json` and beats a
+ * `--format` beside it. A verb-level `--json` therefore counts for `--json-strict` on every verb that has one.
+ * ⚠️ Read the format ONLY through here: a second reader of `opts.format` is a second precedence.
+ */
+export function resolveRequestedFormat(command: Command, config: ResolvedAcpxConfig): OutputFormat {
+  for (let node: Command | null = command; node; node = node.parent) {
+    // (a caller that hands this a bare object with only `optsWithGlobals` — `test/cli-flags.test.ts` does — has no tree)
+    const own =
+      asRecord(
+        (typeof node.opts === "function" ? node.opts() : node.optsWithGlobals()) as unknown,
+      ) ?? {};
+    if (own.json === true) {
+      return "json";
+    }
+    const word = stringOption(own.format);
+    if (word !== undefined) {
+      return parseOutputFormat(word);
+    }
+  }
+  return parseOutputFormat(config.format ?? "text");
+}
+
 export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig): GlobalFlags {
   const opts = asRecord(command.optsWithGlobals() as unknown) ?? {};
-  const format = parseOutputFormat(stringOption(opts.format) ?? config.format ?? "text");
+  const format = resolveRequestedFormat(command, config);
   const jsonStrict = opts.jsonStrict === true;
   const verbose = opts.verbose === true;
   assertOutputFlagCompatibility(format, jsonStrict, verbose);

@@ -3,9 +3,10 @@ import { removeSessionTmpDir } from "../../acp/session-tmp-dir.js";
 import {
   isoNow,
   readRawRecordClosedState,
+  resolveSessionRecord,
   writeSessionRecordAtBoundaryWithLifecycle,
 } from "../../session/persistence.js";
-import type { RawRecordFieldState } from "../../session/persistence.js";
+import type { MessageWriteMode, RawRecordFieldState } from "../../session/persistence.js";
 import type { SessionRecord } from "../../types.js";
 
 // The two steps of a terminal close that every close arm shares: the CLI's non-self close and
@@ -41,13 +42,47 @@ export async function readBackRecordClosedState(
  */
 export async function writeTerminalCloseRecord(
   record: SessionRecord,
+  messageWrite?: MessageWriteMode,
 ): Promise<SessionCloseRecordState> {
   record.pid = undefined;
   record.pidIdentity = undefined;
   record.closed = true;
   record.closedAt = isoNow();
-  await writeSessionRecordAtBoundaryWithLifecycle(record);
+  await writeSessionRecordAtBoundaryWithLifecycle(record, { messageWrite });
   return await readBackRecordClosedState(record.acpxRecordId);
+}
+
+/**
+ * C3.5 (ii), A-60 — THE TERMINAL WRITE OF A CLOSE OF ANOTHER SESSION, after the stop. `closeSession`
+ * reads the record at its start, to know which owner generation to drain and stop; it then waits for
+ * the turn, `close_session` and the stop, and the owner writes its turn's output meanwhile. Writing
+ * that early read back is what replaced a mid-turn session's final reply with the partial the close
+ * had read (the probe's LEAD).
+ *
+ * - Owner STOPPED (`stopped: true` — `stopped`, `already-gone`, `released`, `no-owner`): the close is the
+ *   only writer left. It reads the record AGAIN, so the owner's last output is in it, and its write may
+ *   log the dead owner's last inline partial, at the log's true end (`adopt`).
+ * - Owner NOT proven stopped (`successor`, `survived`, `identity-unverified`, …): a live writer may
+ *   still append. The close writes the scalars only — `closed`, `closed_at`, the adapter pid cleared —
+ *   keeps the watermark and the inline entries as they are on disk, and says why on stderr (`keep`).
+ *
+ * ⚠️ DO NOT "SIMPLIFY" THIS BACK TO `writeTerminalCloseRecord(record)` WITH THE EARLY COPY. That copy is
+ * the stale one. Rows 60.1, 60.5 and 60.10 (test/writer-rules-a60*.test.ts) go red if you do.
+ * A self-close and a deferred close are the owner's own writes and keep `writeTerminalCloseRecord`.
+ */
+export async function writeTerminalCloseAfterOwnerStop(
+  record: SessionRecord,
+  ownerStop: { stopped: boolean; reason?: string },
+): Promise<{ record: SessionRecord; state: SessionCloseRecordState }> {
+  if (!ownerStop.stopped) {
+    process.stderr.write(
+      `[acpx] close: owner of ${record.acpxRecordId} not proven stopped (${ownerStop.reason ?? "unknown"}); ` +
+        `wrote the record's scalars only — its messages log and inline entries are left to the owner\n`,
+    );
+    return { record, state: await writeTerminalCloseRecord(record, "keep") };
+  }
+  const afterStop = await resolveSessionRecord(record.acpxRecordId);
+  return { record: afterStop, state: await writeTerminalCloseRecord(afterStop, "adopt") };
 }
 
 /**

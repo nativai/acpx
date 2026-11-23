@@ -1222,6 +1222,51 @@ test("releases (C9): the directory name each tool's link points to now; a missin
   assert.deepEqual(resolveReleases(dir), { ok: false, tool: "codex-acp" });
 });
 
+test("M1 F-B fix round 1: a one-shot's deadline counts from `startedAtMs` when the caller gives one (work before the call is the call's own) — and from the call start when it does not", async () => {
+  const stub = makeStub();
+  const startedAtMs = Date.now() - 4_000; // the caller's capacity read took 4 s before it called
+  await runRoutedCall(oneShotOptions(stub, { expectUid: UID, deadlineMs: 7_000, startedAtMs }));
+  const [call] = stub.calls();
+  assert.ok(call);
+  assert.equal(Number(flag(call, "--deadline-ms")), startedAtMs + 7_000);
+  // Negative: without it the deadline is 7 s from NOW, i.e. later than the one above by the 4 s.
+  const plain = makeStub();
+  await runRoutedCall(oneShotOptions(plain, { expectUid: UID, deadlineMs: 7_000 }));
+  const [other] = plain.calls();
+  assert.ok(other);
+  assert.ok(Number(flag(other, "--deadline-ms")) > startedAtMs + 7_000 + 3_000);
+});
+
+test("M1 F-B fix round 2: the broker's WAKE BOUND is what is left after the caller's work before the call (`startedAtMs`); without it the whole bound; never below zero", async () => {
+  const hang = async (overrides: Partial<RoutedCallOptions>) => {
+    const broker = await startFakeBroker({ default: { steps: ["scheduling"], hang: true } });
+    try {
+      const stub = makeStub();
+      const t0 = Date.now();
+      const refusal = await expectRefusal(
+        runRoutedCall(
+          oneShotOptions(stub, {
+            lookup: ABSENT, // no Ready pod: the broker is asked
+            broker: { origin: broker.url, wakeBoundMs: 1_500 },
+            ...overrides,
+          }),
+        ),
+      );
+      // pod_starting once a step was seen; a bound spent to zero never hears one: the broker "did not answer"
+      assert.match(refusal.stderrLine, /^acpx: REFUSED reason=(pod_starting|admission_busy) /);
+      return Date.now() - t0;
+    } finally {
+      await broker.close();
+    }
+  };
+  const spent = await hang({ startedAtMs: Date.now() - 1_000 }); // 1 s of the 1.5 s bound already spent
+  assert.ok(spent < 1_200, `the bound left is ~0.5 s: ${spent}`);
+  const whole = await hang({}); // negative: no clock start given → the whole bound
+  assert.ok(whole >= 1_400, `without startedAtMs the whole bound: ${whole}`);
+  const over = await hang({ startedAtMs: Date.now() - 5_000 }); // more spent than the bound: zero, not negative
+  assert.ok(over < 1_000, `a spent bound ends the wait at once: ${over}`);
+});
+
 test("deadline counts from the CALL START: a 20 s wake leaves a 25 s deadline in the per-call values", async () => {
   const broker = await startFakeBroker({ default: { steps: ["scheduling"], final: READY } });
   try {

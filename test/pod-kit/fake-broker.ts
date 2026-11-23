@@ -151,6 +151,8 @@ export interface BrokerScript {
    * `{"error":"kube_api_error"}`. Admission and POSTs are not affected.
    */
   statusFails?: boolean;
+  /** `GET /v1/agents` is never answered (a hung broker): the caller's own bound ends it. POSTs are not affected. */
+  statusHangs?: boolean;
 }
 
 export interface BrokerRequestRecord {
@@ -664,6 +666,10 @@ export class FakeBroker {
       if (this.script.statusFails === true) {
         record.outcome = "status_failed";
         this.sendJson(response, 502, { error: "kube_api_error" });
+        return;
+      }
+      if (this.script.statusHangs === true) {
+        record.outcome = "status_hung";
         return;
       }
       record.outcome = "status";

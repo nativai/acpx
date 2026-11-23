@@ -35,9 +35,15 @@ import {
   ZstdUnavailable,
 } from "../archive/compressed.js";
 import { sessionArchiveDirFor } from "../archive/paths.js";
-import { getLoggedMessageCount, setLoggedMessageCount } from "../messages-log-bookkeeping.js";
 import {
-  appendFinalizedMessagesToLog,
+  getLoggedMessageCount,
+  getOwnInlinePublished,
+  isForeignInlineEntry,
+  setLoggedMessageCount,
+  setOwnInlinePublished,
+} from "../messages-log-bookkeeping.js";
+import {
+  appendAtMeasuredEnd,
   clearMissingMessagesLogPointerForWrite,
   compactMessagesLog,
   hydrateSessionMessagesFromBuffer,
@@ -361,6 +367,10 @@ export type PersistedSessionLifecycle = {
   /** Travels with `pid` on every leg (brick ae547131 §4.2). */
   pidIdentity: SessionRecord["pidIdentity"];
   acpx: SessionRecord["acpx"];
+  /** The messages log's pointer and the inline entries as they stand on disk — what a write under
+   * the record's lock measures against (C3.5 (i)). */
+  messagesLog: SessionRecord["messagesLog"];
+  inlineMessages: SessionRecord["messages"];
   /** THE SEAT GROUP — all four fields, read-preserved as TWO independently
    * authorised halves (D1, brick b64dfbb3). They are on this type for one
    * blunt reason: without them here there is nothing for either preserve to
@@ -407,6 +417,8 @@ export async function readPersistedLifecycle(
       pid: parsed.pid,
       pidIdentity: parsed.pidIdentity,
       acpx: parsed.acpx,
+      messagesLog: parsed.messagesLog,
+      inlineMessages: parsed.messages,
       seatId: parsed.seatId,
       holderOrdinal: parsed.holderOrdinal,
       holderActive: parsed.holderActive,
@@ -485,7 +497,7 @@ export async function writeSessionRecord(record: SessionRecord): Promise<void> {
 /**
  * `logThrough` bounds the messages-log append to entries up to and including that entry
  * (found by identity), for a boundary written while the turn still streams — see
- * `appendMessagesLogBoundary`.
+ * `publishMessagesUnderLock`.
  */
 export async function writeSessionRecordAtBoundary(
   record: SessionRecord,
@@ -527,10 +539,12 @@ export async function writeSessionRecordWithLifecycle(record: SessionRecord): Pr
 
 export async function writeSessionRecordAtBoundaryWithLifecycle(
   record: SessionRecord,
+  options: { messageWrite?: MessageWriteMode } = {},
 ): Promise<void> {
   await writeSessionRecordInternal(record, {
     messagePersistence: "boundary",
     preserveLifecycle: false,
+    ...(options.messageWrite === undefined ? {} : { messageWrite: options.messageWrite }),
   });
 }
 
@@ -1239,6 +1253,8 @@ async function writeSessionRecordInternal(
     skipIndexUpdate?: true;
     /** Boundary writes only: see `writeSessionRecordAtBoundary`. */
     logThrough?: SessionMessage;
+    /** How the write treats the messages log and the inline entries (C3.5 (ii)): see `MessageWriteMode`. */
+    messageWrite?: MessageWriteMode;
   },
 ): Promise<void> {
   // ⚠️ THE ARCHIVED-RECORD WRITE GUARD, PLACED HERE **BY CONSTRUCTION**. All four
@@ -1259,12 +1275,6 @@ async function writeSessionRecordInternal(
 
     const sessionDir = sessionBaseDir();
     const logPath = messagesLogPath(sessionDir, record.acpxRecordId);
-    await writeMessagesSidecar(
-      record,
-      logPath,
-      options.messagePersistence === "boundary",
-      options.logThrough,
-    );
 
     const file = sessionFilePath(record.acpxRecordId);
     // 🛑 READ -> MERGE -> RENAME RUNS UNDER THE RECORD'S OWN LOCK FILE (`record-file-lock.ts`), and
@@ -1272,6 +1282,11 @@ async function writeSessionRecordInternal(
     // re-read alone still lost 3-4 of 20 cross-process ops per pair under load; the lock is what
     // takes that to zero for every writer that goes through this function.
     // C3.2 A-4: a publish that finds its lock broken under it publishes nothing and starts again.
+    const sidecar: SidecarOptions = {
+      boundary: options.messagePersistence === "boundary",
+      logThrough: options.logThrough,
+      mode: options.messageWrite ?? "own",
+    };
     await retryOnLostRecordLock(file, () =>
       withRecordFileLock(file, async (lock) => {
         // 🛑 THE DISK READ THAT EVERY MERGE BELOW USES IS TAKEN HERE — AFTER THE MESSAGES-LOG FLUSH,
@@ -1285,6 +1300,17 @@ async function writeSessionRecordInternal(
         // read -> rename. Do not hoist it back above the flush, and do not feed it a caller's snapshot.
         const freshPersisted = await readPersistedLifecycle(record.acpxRecordId);
         const persistedMetadata = freshPersisted?.metadata;
+        // 🛑 C3.5 (i), A-60: THE MESSAGES-LOG WORK RUNS HERE, INSIDE THE RECORD'S LOCK, ON THE LOG AS IT
+        // IS NOW — never before the lock from a copy read earlier. The old flush ran above the lock and
+        // truncated the log to this writer's remembered watermark, which erased whatever another writer
+        // appended after the read (the c917d9c9 probe: a default close of a mid-turn session replaced
+        // the turn's final reply with the partial the close had read). Do not hoist it back out.
+        const inlineMessages = await publishMessagesUnderLock(
+          record,
+          logPath,
+          freshPersisted,
+          sidecar,
+        );
 
         if (options.preserveLifecycle) {
           applyPersistedLifecycleForWrite(record, freshPersisted);
@@ -1367,7 +1393,10 @@ async function writeSessionRecordInternal(
         try {
           // The snake_case key policy is asserted INSIDE serializeSessionRecordForDisk
           // (brick://48aca560) so test fixtures cannot bypass it; do not re-walk here.
-          const persistedRecord = serializeSessionRecordForDisk(record, { messages: "split-tail" });
+          const persistedRecord = serializeSessionRecordForDisk(record, {
+            messages: "split-tail",
+            inlineMessages,
+          });
 
           // The temp name must be unique PER CALL, not per millisecond: two writes
           // from this process in the same millisecond used to build the identical
@@ -1394,19 +1423,6 @@ async function writeSessionRecordInternal(
     rememberSessionModelBaseline(record);
     rememberSessionDurableOptionsBaseline(record);
   });
-}
-
-async function writeMessagesSidecar(
-  record: SessionRecord,
-  logPath: string,
-  boundary: boolean,
-  logThrough: SessionMessage | undefined,
-): Promise<void> {
-  if (boundary) {
-    await writeMessagesLogBoundary(record, logPath, logThrough);
-  } else {
-    await clearMissingMessagesLogPointerForWrite(record, logPath);
-  }
 }
 
 async function persistRecordFile(
@@ -1448,24 +1464,34 @@ async function retryOnLostRecordLock(file: string, write: () => Promise<void>): 
   throw new RecordLockLostError(file, RECORD_LOCK_LOST_ATTEMPTS);
 }
 
+/**
+ * How a write treats the messages log and the inline entries (C3.5):
+ * - `own` (the default): it appends only the entries it created, at the log's measured end, and
+ *   keeps every other writer's inline entry as it finds it on disk.
+ * - `adopt`: the writer is the ONLY one left — a close after the owner was proven stopped — so the
+ *   inline entries its fresh read loaded are the dead owner's last output, and it logs them too.
+ * - `keep`: the writer may not touch the log or the inline entries — a close whose owner was not
+ *   proven stopped. The record's scalars are written; the pointer and the inline entries stay as on disk.
+ */
+export type MessageWriteMode = "own" | "adopt" | "keep";
+
 // One boundary append per log file at a time in this process (brick://5b608eaa). Two
 // overlapping boundary writes of one record — two injections drained in one tick — would
-// each slice from the same logged count before either advanced it, append the same entries
-// twice, and truncate to a watermark the other had already moved. The slice is taken INSIDE
-// the critical section. Per process only: the record write (lock + rename) stays outside it.
+// each slice from the same logged count before either advanced it and append the same entries
+// twice. The slice is taken INSIDE the critical section. Since A-60 the whole span also sits inside
+// the record's lock, which orders two processes; this chain keeps the order inside one.
 const messagesLogBoundaryChains = new Map<string, Promise<void>>();
 
-async function writeMessagesLogBoundary(
-  record: SessionRecord,
-  logPath: string,
-  logThrough: SessionMessage | undefined,
-): Promise<void> {
+async function inMessagesLogBoundaryChain<T>(logPath: string, work: () => Promise<T>): Promise<T> {
   const previous = messagesLogBoundaryChains.get(logPath) ?? Promise.resolve();
-  const current = previous.then(() => appendMessagesLogBoundary(record, logPath, logThrough));
-  const settled = current.catch(() => {});
+  const current = previous.then(work);
+  const settled = current.then(
+    () => {},
+    () => {},
+  );
   messagesLogBoundaryChains.set(logPath, settled);
   try {
-    await current;
+    return await current;
   } finally {
     if (messagesLogBoundaryChains.get(logPath) === settled) {
       messagesLogBoundaryChains.delete(logPath);
@@ -1487,31 +1513,97 @@ function boundaryLogEnd(
   return Math.max(loggedCount, messages.lastIndexOf(logThrough) + 1);
 }
 
-async function appendMessagesLogBoundary(
+type SidecarOptions = {
+  boundary: boolean;
+  logThrough: SessionMessage | undefined;
+  mode: MessageWriteMode;
+};
+
+/**
+ * The messages-log half of a record write, INSIDE the record's lock (C3.5 (i)). The disk's pointer and
+ * inline entries (`fresh`) are the authority; the writer's memory only says which entries it created.
+ * Returns the inline entries to publish — `undefined` when the record has no split log and every
+ * message is serialized inline as before.
+ *
+ * 1. The pointer is the disk's. A log moved aside or a missing one reset is decided from the disk
+ *    record, never from the writer's memory.
+ * 2. A boundary append adds only this writer's own entries, at the log's MEASURED end, adopting
+ *    complete lines past the watermark and cutting only an incomplete tail. Compaction runs here too.
+ * 3. The published pointer is the measured one; a write that appends nothing republishes the disk's.
+ * 4. The inline entries published are this writer's own unfinished ones, plus every other writer's
+ *    inline entry as it stands on disk (the way `closed` and the parent linkage are kept).
+ */
+async function publishMessagesUnderLock(
   record: SessionRecord,
   logPath: string,
-  logThrough: SessionMessage | undefined,
-): Promise<void> {
-  await prepareMessagesLogForBoundary(record, logPath);
+  fresh: PersistedSessionLifecycle | undefined,
+  options: SidecarOptions,
+): Promise<readonly SessionMessage[] | undefined> {
+  if (fresh) {
+    record.messagesLog = fresh.messagesLog;
+  }
+  if (options.mode === "keep" && fresh) {
+    return fresh.inlineMessages;
+  }
+  return await inMessagesLogBoundaryChain(logPath, async () => {
+    // Inline entries on a record with NO split log are the whole conversation of a pre-split record,
+    // not another writer's unfinished ones: a conversion logs them all.
+    const diskIsSplit = fresh?.messagesLog !== undefined;
+    if (options.boundary) {
+      await prepareMessagesLogForBoundary(record, logPath);
+    } else {
+      await clearMissingMessagesLogPointerForWrite(record, logPath);
+    }
+    const everythingIsOwn = options.mode === "adopt" || record.messagesLog === undefined;
+    const isOwn = (entry: SessionMessage): boolean =>
+      everythingIsOwn || !isForeignInlineEntry(record, entry);
 
-  // ⚠️ A boundary written while the turn streams must not log past its own entry: output
-  // that arrived during the awaits above (or the KD2 wait) opens a NEW trailing Agent entry,
-  // still in progress. Logged now it counts as logged, and every word streamed into it after
-  // this slice never reaches the log (test/messages-log-injection-dup.test.ts, the pre-slice
-  // row). It stays unlogged here and goes out with the next unbounded boundary.
-  const loggedCount = getLoggedMessageCount(record);
-  const messagesToAppend = record.messages.slice(
-    loggedCount,
-    boundaryLogEnd(record.messages, loggedCount, logThrough),
-  );
-  await appendFinalizedMessagesToLog(record, logPath, messagesToAppend);
-  // ⚠️ COUNT WHAT WAS APPENDED — DO NOT "SIMPLIFY" THIS TO markAllMessagesLogged.
+    const adopted = await appendOwnEntries(record, logPath, isOwn, options);
+    if (options.boundary && !options.logThrough) {
+      await finishBoundaryLog(record, logPath);
+    }
+    if (!record.messagesLog) {
+      setOwnInlinePublished(record, new Set());
+      return undefined;
+    }
+    return inlineEntriesToPublish(record, fresh, {
+      isOwn,
+      adopted,
+      keepsOthers: options.mode !== "adopt" && diskIsSplit,
+    });
+  });
+}
+
+/** Appends this writer's own entries up to the boundary's end, at the measured end; returns lines adopted. */
+async function appendOwnEntries(
+  record: SessionRecord,
+  logPath: string,
+  isOwn: (entry: SessionMessage) => boolean,
+  options: SidecarOptions,
+): Promise<number> {
+  const loggedBefore = getLoggedMessageCount(record);
+  const end = options.boundary
+    ? boundaryLogEnd(record.messages, loggedBefore, options.logThrough)
+    : loggedBefore;
+  const toAppend = record.messages.slice(loggedBefore, end).filter(isOwn);
+  let adopted = 0;
+  if (toAppend.length > 0) {
+    const measured = await appendAtMeasuredEnd(logPath, record.messagesLog, toAppend);
+    record.messagesLog = measured.state;
+    adopted = measured.adopted;
+  }
+  // ⚠️ COUNT WHAT WAS HANDLED — DO NOT "SIMPLIFY" THIS TO markAllMessagesLogged.
   // The record is live: the sub-agent tailer pushes onto it while this append
   // awaits, and marking everything logged would skip those pushes in the log
   // and in the split tail, for good (brick://5e7c2a85;
-  // test/messages-log-boundary-concurrent-push.test.ts).
-  setLoggedMessageCount(record, getLoggedMessageCount(record) + messagesToAppend.length);
+  // test/messages-log-boundary-concurrent-push.test.ts). The range up to `end`
+  // is handled: logged, or another writer's inline entry that stays on disk.
+  setLoggedMessageCount(record, getLoggedMessageCount(record) + (end - loggedBefore));
+  return adopted;
+}
 
+/** The unbounded boundary's last steps: converge a zero-message record, then compact. */
+async function finishBoundaryLog(record: SessionRecord, logPath: string): Promise<void> {
   // Converge the zero-message case. Guarded on `messages.length` rather than on
   // "did the append set a pointer", so it cannot mis-fire on a record that has
   // messages: with messages present there is always something to append here
@@ -1520,13 +1612,31 @@ async function appendMessagesLogBoundary(
   if (!record.messagesLog && record.messages.length === 0) {
     await initializeEmptyMessagesLog(record, logPath);
   }
-
-  // Never on a bounded write: compaction rewrites the log from ALL of `record.messages`,
-  // which would log the in-progress tail the bound just held back. The next unbounded
+  // Never on a bounded write: the bound holds the in-progress tail back, and the next unbounded
   // boundary (the turn's close) compacts.
-  if (record.messagesLog && !logThrough) {
+  if (record.messagesLog) {
     await compactMessagesLog(record, logPath, resolveMessagesLogCompactBytes());
   }
+}
+
+/**
+ * This writer's own unfinished entries, and every other writer's inline entry as it stands on disk.
+ * What this writer published inline last time is replaced, not kept. Complete lines found past the
+ * watermark are a writer that died after its append: its inline copies are those lines, and a reader
+ * drops them the same way (`hydrateFromLogReader`).
+ */
+function inlineEntriesToPublish(
+  record: SessionRecord,
+  fresh: PersistedSessionLifecycle | undefined,
+  how: { isOwn: (entry: SessionMessage) => boolean; adopted: number; keepsOthers: boolean },
+): readonly SessionMessage[] {
+  const heldBack = record.messages.slice(getLoggedMessageCount(record)).filter(how.isOwn);
+  const mine = getOwnInlinePublished(record);
+  const others = how.keepsOthers
+    ? (fresh?.inlineMessages ?? []).filter((entry) => !mine.has(JSON.stringify(entry)))
+    : [];
+  setOwnInlinePublished(record, new Set(heldBack.map((entry) => JSON.stringify(entry))));
+  return [...others.slice(Math.min(how.adopted, others.length)), ...heldBack];
 }
 
 /**

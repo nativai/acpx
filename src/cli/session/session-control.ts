@@ -110,6 +110,7 @@ import {
   releaseConfigDirOnTerminalClose,
   removeScratchOnTerminalClose,
   type SessionCloseRecordState,
+  writeTerminalCloseAfterOwnerStop,
   writeTerminalCloseRecord,
 } from "./terminal-close.js";
 import { gateSetConnect } from "./wake-gate.js";
@@ -1024,11 +1025,15 @@ export async function closeSession(
   }
 
   const adapterAtClose = { pid: record.pid, pidIdentity: record.pidIdentity };
-  // The privileged terminal write + its read-back (`terminal-close.ts`, shared by every close arm).
-  const recordClosedState = await writeTerminalCloseRecord(record);
+  // The privileged terminal write + its read-back (`terminal-close.ts`). C3.5 (ii): it is written AFTER
+  // the stop, from a record read after it — the early copy above only decided which owner to stop.
+  const { record: closedRecord, state: recordClosedState } = await writeTerminalCloseAfterOwnerStop(
+    record,
+    ownerStop,
+  );
 
-  releaseConfigDirOnTerminalClose(record);
-  removeScratchOnTerminalClose(record);
+  releaseConfigDirOnTerminalClose(closedRecord);
+  removeScratchOnTerminalClose(closedRecord);
 
   // brick 1e77037f D5 — the LAST step: remove the copy this session left in another subscription,
   // now that the record is durably closed and the owner, its group and the adapter are proven gone.
@@ -1046,7 +1051,7 @@ export async function closeSession(
   // The close landed either way (an owner refuses turns on a closed record); whether the owner was
   // actually stopped is reported, never assumed. Phase 1b stops a foreign owner via its launcher.
   return {
-    record,
+    record: closedRecord,
     drain,
     recordClosedState,
     ownerStopped: ownerStop.stopped,
