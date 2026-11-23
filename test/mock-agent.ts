@@ -1651,6 +1651,34 @@ class MockAgent implements Agent {
       throw weeklyLimitError(limited[1] === "weekly-limited-on");
     }
 
+    // A-60 TE (brick f67e0ff1) — `stream-then-limit-on <dir> <text>`: on the adapter whose
+    // CLAUDE_CONFIG_DIR ends with `<dir>`, stream `<text>` (the live checkpoint publishes it inline),
+    // wait until `<text>` is in the session's record file (`$A60_RECORD_FILE`, when set), then fail
+    // with the subscription limit: REACTIVE failover AFTER a streamed partial. Served elsewhere.
+    const streamThenLimit = /^stream-then-limit-on (\S+) (.+)$/u.exec(text);
+    if (
+      streamThenLimit &&
+      (process.env.CLAUDE_CONFIG_DIR ?? "").endsWith(streamThenLimit[1] ?? "")
+    ) {
+      const partial = streamThenLimit[2] ?? "";
+      await this.sendAssistantMessage(params.sessionId, partial);
+      const recordFile = process.env.A60_RECORD_FILE;
+      const isInline = (): boolean =>
+        recordFile === undefined ||
+        (existsSync(recordFile) && readFileSync(recordFile, "utf8").includes(`"${partial}"`));
+      const deadline = Date.now() + 60_000;
+      while (!isInline() && Date.now() < deadline) {
+        await sleepWithCancel(25, promptAbort.signal);
+      }
+      if (session.pendingPrompt === promptAbort) {
+        session.pendingPrompt = undefined;
+      }
+      throw new RequestError(-32603, "Internal error", {
+        errorKind: "rate_limit",
+        details: "You've hit your usage limit",
+      });
+    }
+
     // brick://3356183e — `rate-limited-on <dir>`: the prompt fails with a subscription
     // limit, but only on the adapter whose CLAUDE_CONFIG_DIR ends with `<dir>`; the
     // handler then serves it normally. Drives REACTIVE failover between subscriptions.
@@ -1966,10 +1994,15 @@ class MockAgent implements Agent {
       say: string;
       holdMs?: number;
       bgTask?: [number, string];
+      /** A-60 TE: streamed before the command runs, so the turn has a live partial when it runs. */
+      streamFirst?: string;
     };
     const [command, ...args] = spec.argv;
     if (!command) {
       throw new Error("run-then-say: empty argv");
+    }
+    if (spec.streamFirst) {
+      await this.sendAssistantMessage(sessionId, spec.streamFirst);
     }
     const output = await new Promise<string>((resolve) => {
       const child = spawn(command, args, { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
@@ -2033,6 +2066,9 @@ class MockAgent implements Agent {
     }
     if (text.startsWith("rate-limited-on ")) {
       return "served after failover";
+    }
+    if (text.startsWith("stream-then-limit-on ")) {
+      return "SERVED-AFTER-FAILOVER";
     }
     if (
       text.startsWith("weekly-limited-on ") ||
@@ -2217,6 +2253,26 @@ class MockAgent implements Agent {
       await this.sendAssistantMessage(sessionId, liveText);
       await holdUntilFile(releaseFile, signal);
       return ` FINAL-AFTER-HOLD ${liveText}`;
+    }
+
+    if (text.startsWith("stream-hold-late ")) {
+      // A-60 TE (brick f67e0ff1), L-cancel: stream `<text>`, hold until <file>; then stream a LATE chunk
+      // and hold again until the turn is cancelled (it never settles on its own: the close's 5 s drain
+      // runs out, and `close_session` / the stop ends it).
+      const [releaseFile, ...liveWords] = text
+        .slice("stream-hold-late ".length)
+        .trim()
+        .split(/\s+/);
+      if (!releaseFile || liveWords.length === 0) {
+        throw new Error("Usage: stream-hold-late <release file path> <text>");
+      }
+      const liveText = liveWords.join(" ");
+      await this.sendAssistantMessage(sessionId, liveText);
+      await holdUntilFile(releaseFile, signal);
+      await this.sendAssistantMessage(sessionId, ` LATE-STREAM-${liveText}`);
+      writeFileSync(`${releaseFile}.late-sent`, "");
+      await holdUntilFile(`${releaseFile}.never`, signal);
+      return " SETTLED-ON-ITS-OWN";
     }
 
     if (text.startsWith("stream-sleep ")) {
