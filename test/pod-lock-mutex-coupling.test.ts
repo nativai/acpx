@@ -246,20 +246,28 @@ test("L2: a break's ledger `ts` is the time of ITS unlink, not of its write — 
   // The seam's own mutex name (carries the pod uid): this row only contends with itself.
   process.env.ACPX_POD_TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-coupling-ts-home-"));
   const fsp = await import("node:fs/promises");
-  const realAppend = fsp.default.appendFile.bind(fsp.default);
+  const realMkdir = fsp.default.mkdir.bind(fsp.default);
   const lockX = path.join(stateHome, "x.json.lock");
   const lockY = path.join(stateHome, "y.json.lock");
-  let appendOfX!: () => void;
-  const xAppending = new Promise<void>((resolve) => (appendOfX = resolve));
+  let xAtLedger!: () => void;
+  const xAppending = new Promise<void>((resolve) => (xAtLedger = resolve));
   let letXLand!: () => void;
   const xMayLand = new Promise<void>((resolve) => (letXLand = resolve));
   const { mock } = await import("node:test");
-  const spy = mock.method(fsp.default, "appendFile", async (file: string, ...rest: unknown[]) => {
-    if (file.endsWith(".ndjson") && String(rest[0]).includes(lockX)) {
-      appendOfX(); // X has unlinked and released the mutex; its append is now a slow NFS write
-      await xMayLand;
+  // ⚠️ WHERE THE DELAY SITS MATTERS: the ledger line is BUILT when `appendFile` is called, so a delay
+  // inside `appendFile` is too late — a write-time `ts` would already be fixed and the row would stay
+  // green on the old code (measured on 6a49783a). The ledger writer's `mkdir` comes first; holding
+  // the first one holds X's whole ledger write, line construction included.
+  let ledgerWrites = 0;
+  const spy = mock.method(fsp.default, "mkdir", async (dir: string, ...rest: unknown[]) => {
+    if (dir.endsWith("lock-breaks")) {
+      ledgerWrites += 1;
+      if (ledgerWrites === 1) {
+        xAtLedger(); // X has unlinked and released the mutex; its ledger write is a slow NFS call
+        await xMayLand;
+      }
     }
-    return await (realAppend as (...args: unknown[]) => Promise<void>)(file, ...rest);
+    return await (realMkdir as (...args: unknown[]) => Promise<unknown>)(dir, ...rest);
   });
   // A clock the test moves: X breaks at T1, Y at T2, and X's line is finally written at T3.
   const T1 = Date.UTC(2026, 10, 23, 12, 0, 0);
