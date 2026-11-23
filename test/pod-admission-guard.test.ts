@@ -514,11 +514,16 @@ function exportedValues(text: string): string[] {
  * `Reflect.apply(loader.import, …)`, a computed key); `module.register(…)` (loader hooks); `child_process.fork(modulePath)`.
  * Also unseen, for `Worker` itself (R2-I2): a `Worker` destructured out of a dynamic `import("node:worker_threads")` /
  * `require("node:worker_threads")`, held in a variable (`const W = wt.Worker; new W(…)`), re-exported under another name by a
- * local module, reached as `wt["Worker"]`, or built with `Reflect.construct(Worker, […])`.
+ * local module, reached as `wt["Worker"]`, or built with `Reflect.construct(Worker, […])`. Also unseen (TE-7115-2):
+ * `class T extends Worker`; `new (wt.Worker)(…)`; `new (Worker as any)(…)`; a non-destructured namespace from
+ * `await import("node:worker_threads")` / `require(…)`; `import wt = require("node:worker_threads")`;
+ * `import("node:worker_threads").then((m) => new m.Worker(…))`.
  * None of those is in `src/` today (`grep -rnE` over src/, lows-r3 TE).
  *
- * The KEY is the FULL call text as written (whitespace collapsed), never a prefix: an edit anywhere in a registered call —
- * a preload in `execArgv`, a raised `resourceLimits` — is a new key and so red (brick 7115375b).
+ * The KEY is the FULL call text as written, never a prefix, normalised by TOKEN (`normalizedCallText`): an edit anywhere in a
+ * registered call — a preload in `execArgv`, a raised `resourceLimits`, a changed string/template literal, a line moved into or
+ * out of a `//` comment, a line break that ASI reads as a statement end — is a new key and so red (bricks 7115375b, 61de55d6).
+ * What a `new Worker(SRC, { eval: true })` RUNS is pinned separately: `workerSourceModules` / `KNOWN_WORKER_SOURCE_MODULES`.
  */
 function unfollowableSites(files: Iterable<[string, string]>): Map<string, number> {
   const found = new Map<string, number>();
@@ -571,7 +576,7 @@ function unfollowableSites(files: Iterable<[string, string]>): Map<string, numbe
       }
     }
     const note = (kind: string, node: ts.Node): void => {
-      const written = node.getText(sf).replace(/\s+/gu, " ");
+      const written = normalizedCallText(node, sf);
       const key = `${rel} | ${kind} | ${written}`;
       found.set(key, (found.get(key) ?? 0) + 1);
     };
@@ -647,6 +652,110 @@ function unfollowableSites(files: Iterable<[string, string]>): Map<string, numbe
   return found;
 }
 
+/**
+ * A call as written, normalised BY TOKEN (brick 61de55d6, TE-7115-1): string / template / regex literals and comments are kept
+ * VERBATIM; spaces and line breaks between tokens collapse to one space — except a line break that carries meaning, which stays
+ * a "\n": the one that ends a `//` comment (collapsing it would pull the next token INTO the comment), and one where
+ * automatic semicolon insertion could act (the previous token can end a statement and the next is not a continuer: `return\n x`
+ * is not `return x`). A re-wrap after `,` `(` `{` `:` … keys the same; an edit inside a literal or across a comment does not.
+ */
+function normalizedCallText(node: ts.Node, sf: ts.SourceFile): string {
+  const leaves: ts.Node[] = [];
+  const collect = (n: ts.Node): void => {
+    if (n.kind >= ts.SyntaxKind.FirstJSDocNode && n.kind <= ts.SyntaxKind.LastJSDocNode) {
+      return;
+    }
+    const children = n.getChildren(sf);
+    if (children.length === 0) {
+      leaves.push(n);
+    } else {
+      children.forEach(collect);
+    }
+  };
+  collect(node);
+  const text = sf.text;
+  const canEnd = (kind: ts.SyntaxKind): boolean =>
+    !(kind >= ts.SyntaxKind.FirstPunctuation && kind <= ts.SyntaxKind.LastPunctuation) ||
+    [
+      ts.SyntaxKind.CloseParenToken,
+      ts.SyntaxKind.CloseBracketToken,
+      ts.SyntaxKind.CloseBraceToken,
+      ts.SyntaxKind.PlusPlusToken,
+      ts.SyntaxKind.MinusMinusToken,
+    ].includes(kind);
+  const continuers = new Set<ts.SyntaxKind>([
+    ts.SyntaxKind.CommaToken,
+    ts.SyntaxKind.CloseParenToken,
+    ts.SyntaxKind.CloseBracketToken,
+    ts.SyntaxKind.CloseBraceToken,
+    ts.SyntaxKind.DotToken,
+    ts.SyntaxKind.QuestionDotToken,
+    ts.SyntaxKind.QuestionToken,
+    ts.SyntaxKind.ColonToken,
+    ts.SyntaxKind.SemicolonToken,
+    ts.SyntaxKind.EqualsToken,
+    ts.SyntaxKind.EqualsGreaterThanToken,
+  ]);
+  let out = "";
+  let prevKind: ts.SyntaxKind | undefined;
+  let prevLineComment = false;
+  const emit = (piece: string, kind: ts.SyntaxKind | undefined, sep: "" | " " | "\n") => {
+    out += out === "" ? piece : `${sep}${piece}`;
+    prevKind = kind ?? prevKind;
+  };
+  for (const leaf of leaves) {
+    const start = leaf.getStart(sf);
+    const from = leaf.pos;
+    const trivia = text.slice(from, start);
+    let sep: "" | " " | "\n" = "";
+    let broke = false;
+    for (let i = 0; i < trivia.length; ) {
+      const ch = trivia[i] ?? "";
+      if (/\s/u.test(ch)) {
+        let j = i;
+        while (j < trivia.length && /\s/u.test(trivia[j] ?? "")) {
+          j += 1;
+        }
+        broke = broke || trivia.slice(i, j).includes("\n");
+        sep = sep === "" ? " " : sep;
+        i = j;
+      } else if (trivia.startsWith("//", i)) {
+        let j = trivia.indexOf("\n", i);
+        j = j === -1 ? trivia.length : j;
+        emit(trivia.slice(i, j), undefined, prevLineComment || broke ? "\n" : " ");
+        prevLineComment = true;
+        sep = "";
+        broke = false;
+        i = j;
+      } else if (trivia.startsWith("/*", i)) {
+        const j = trivia.indexOf("*/", i) + 2;
+        emit(trivia.slice(i, j), undefined, " ");
+        prevLineComment = false;
+        sep = "";
+        broke = false;
+        i = j;
+      } else {
+        i += 1;
+      }
+    }
+    let gap: "" | " " | "\n" = sep === "" ? "" : " ";
+    if (prevLineComment && out !== "") {
+      gap = "\n";
+    } else if (
+      broke &&
+      prevKind !== undefined &&
+      canEnd(prevKind) &&
+      !continuers.has(leaf.kind) &&
+      out !== ""
+    ) {
+      gap = "\n";
+    }
+    emit(text.slice(start, leaf.end), leaf.kind, gap);
+    prevLineComment = false;
+  }
+  return out;
+}
+
 /** The unfollowable SITES in `src/` today, each READ and none of them the ledger — keyed `<file> | <kind> | <call as written>`, with an exact count. */
 const KNOWN_NON_LEDGER_UNFOLLOWABLE: Readonly<Record<string, number>> = {
   // loads the harness's own fork-index module by a specifier it computes
@@ -660,6 +769,136 @@ const KNOWN_NON_LEDGER_UNFOLLOWABLE: Readonly<Record<string, number>> = {
   "capacity/governor/scan.ts | new Worker | new Worker(READER_SOURCE, { eval: true, workerData: { ctl, port: port2, index, count: options.readers, procRoot, nice: options.nice }, transferList: [port2], resourceLimits: { maxOldGenerationSizeMb: 16, maxYoungGenerationSizeMb: 4 }, })": 1,
   // `node:sqlite`, loaded once by `loadSqlite`
   "pod/sqlite-loader.ts | createRequire | createRequire(import.meta.url)": 1,
+};
+
+/**
+ * What an `eval: true` Worker RUNS (brick 61de55d6, TE-7115-3). The call is keyed above; the code it runs is a string constant
+ * elsewhere in the file. For each `new Worker(IDENT, …)` whose first argument is an identifier bound to a string / template
+ * constant in the same file, return the module loads that source contains — `require("x")` → `require:x`, `import("x")` →
+ * `import:x`, `import … from "x"` → `import:x`, and the unfollowable ones (`require(<non-literal>)`, `getBuiltinModule`,
+ * `createRequire`, `eval` / `Function`, a nested `new Worker`) by name. A first argument that is not such an identifier (a path,
+ * a URL, a call) is returned as `<unresolved: text>`: it is not pinned, so it is red until registered.
+ * Keyed `<file> | <IDENT>`, value the sorted list.
+ */
+function workerSourceModules(files: Iterable<[string, string]>): Map<string, string[]> {
+  const found = new Map<string, string[]>();
+  for (const [rel, text] of files) {
+    const sf = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true);
+    const constants = new Map<string, string>();
+    const bindWorker = new Set<string>();
+    const workerModules = new Set<string>();
+    for (const statement of sf.statements) {
+      if (
+        ts.isImportDeclaration(statement) &&
+        ["node:worker_threads", "worker_threads"].includes(
+          stringOf(statement.moduleSpecifier) ?? "",
+        )
+      ) {
+        const bindings = statement.importClause?.namedBindings;
+        if (statement.importClause?.name) {
+          workerModules.add(statement.importClause.name.text);
+        }
+        if (bindings && ts.isNamespaceImport(bindings)) {
+          workerModules.add(bindings.name.text);
+        } else if (bindings && ts.isNamedImports(bindings)) {
+          for (const element of bindings.elements) {
+            if ((element.propertyName ?? element.name).text === "Worker") {
+              bindWorker.add(element.name.text);
+            }
+          }
+        }
+      }
+    }
+    const textOfConstant = (init: ts.Expression | undefined): string | undefined => {
+      if (init === undefined) {
+        return undefined;
+      }
+      if (ts.isNoSubstitutionTemplateLiteral(init) || ts.isStringLiteral(init)) {
+        return init.text;
+      }
+      if (ts.isTemplateExpression(init)) {
+        return (
+          init.head.text + init.templateSpans.map((span) => `\${}${span.literal.text}`).join("")
+        );
+      }
+      return undefined;
+    };
+    const visitConstants = (node: ts.Node): void => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+        const value = textOfConstant(node.initializer);
+        if (value !== undefined) {
+          constants.set(node.name.text, value);
+        }
+      }
+      ts.forEachChild(node, visitConstants);
+    };
+    visitConstants(sf);
+    const loadsOf = (source: string): string[] => {
+      const loads = new Set<string>();
+      for (const match of source.matchAll(/\brequire\s*\(\s*(["'`])([^"'`]*)\1\s*\)/gu)) {
+        loads.add(`require:${match[2] ?? ""}`);
+      }
+      for (const match of source.matchAll(/\bimport\s*\(\s*(["'`])([^"'`]*)\1\s*\)/gu)) {
+        loads.add(`import:${match[2] ?? ""}`);
+      }
+      for (const match of source.matchAll(/\bimport\b[^;(]*?\bfrom\s*(["'`])([^"'`]*)\1/gu)) {
+        loads.add(`import:${match[2] ?? ""}`);
+      }
+      const total = (re: RegExp): number => [...source.matchAll(re)].length;
+      if (total(/\brequire\s*\(/gu) > [...loads].filter((l) => l.startsWith("require:")).length) {
+        loads.add("<non-literal require>");
+      }
+      if (total(/\bimport\s*\(/gu) > [...loads].filter((l) => l.startsWith("import:")).length) {
+        loads.add("<non-literal import>");
+      }
+      for (const [word, re] of [
+        ["getBuiltinModule", /\bgetBuiltinModule\b/u],
+        ["createRequire", /\bcreateRequire\b/u],
+        ["eval", /\beval\s*\(/u],
+        ["Function", /\bFunction\s*\(/u],
+        ["nested Worker", /\bnew\s+Worker\b/u],
+        ["child_process", /\bchild_process\b/u],
+      ] as const) {
+        if (re.test(source)) {
+          loads.add(`<${word}>`);
+        }
+      }
+      return [...loads].toSorted();
+    };
+    const visit = (node: ts.Node): void => {
+      if (
+        ts.isNewExpression(node) &&
+        ((ts.isIdentifier(node.expression) && bindWorker.has(node.expression.text)) ||
+          (ts.isPropertyAccessExpression(node.expression) &&
+            node.expression.name.text === "Worker" &&
+            ts.isIdentifier(node.expression.expression) &&
+            workerModules.has(node.expression.expression.text)))
+      ) {
+        const first = node.arguments?.[0];
+        const source =
+          first !== undefined && ts.isIdentifier(first) ? constants.get(first.text) : undefined;
+        if (first !== undefined && ts.isIdentifier(first) && source !== undefined) {
+          found.set(`${rel} | ${first.text}`, loadsOf(source));
+        } else {
+          found.set(`${rel} | <unresolved: ${first ? normalizedCallText(first, sf) : ""}>`, [
+            "<unresolved>",
+          ]);
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sf);
+  }
+  return found;
+}
+
+/** The module loads of each Worker source in `src/` today, READ: the capacity governor's /proc readers use node built-ins only — never the ledger. */
+const KNOWN_WORKER_SOURCE_MODULES: Readonly<Record<string, readonly string[]>> = {
+  "capacity/governor/scan.ts | READER_SOURCE": [
+    "require:node:fs",
+    "require:node:os",
+    "require:node:worker_threads",
+  ],
 };
 
 function* srcFiles(dir: string): Generator<[string, string]> {
@@ -1061,5 +1300,133 @@ test("K4-2 / R2-F2: the registry keys the FULL call text — an edit to the regi
     assert.notDeepEqual(keysOf(edited), registered, `${what}: is NOT green`);
   }
   // control: a whitespace-only re-wrap keys the same (the key collapses whitespace)
-  assert.deepEqual(keysOf(source.replace("eval: true,\n", "eval: true,\n\n  ")), registered);
+  const rewrapped = source.replace("eval: true,\n", "eval: true,\n\n  ");
+  assert.notEqual(rewrapped, source, "the re-wrap applied (TE-7115-4)");
+  assert.deepEqual(keysOf(rewrapped), registered);
+});
+
+test("K4-2 / TE-7115-3: the code a registered Worker RUNS is pinned — a ledger require (or any module outside the allowlist) added to READER_SOURCE is red, though the call and ledgerCallers are unchanged", () => {
+  const rel = "capacity/governor/scan.ts";
+  const source = [...srcFiles(SRC)].find(([file]) => file === rel)?.[1] ?? "";
+  const modulesOf = (text: string): Record<string, string[]> =>
+    Object.fromEntries(
+      [...workerSourceModules([[rel, text]]).entries()].toSorted(([a], [b]) => a.localeCompare(b)),
+    );
+  const registered = Object.fromEntries(
+    Object.entries(KNOWN_WORKER_SOURCE_MODULES).map(([key, value]) => [key, [...value]]),
+  );
+  // control: the real src/ equals the registry, and the registry names no ledger
+  assert.deepEqual(
+    Object.fromEntries(workerSourceModules(srcFiles(SRC)).entries()),
+    registered,
+    "the Worker sources in src/ are exactly the registered ones",
+  );
+  assert.deepEqual(modulesOf(source), registered);
+  assert.ok(
+    !JSON.stringify(registered).includes("ledger"),
+    "no registered Worker source loads a ledger module",
+  );
+  const marker = 'const fs = require("node:fs");';
+  const edits: Array<[string, string]> = [
+    [
+      'const fs = require("node:fs");\nconst ledger = require("../capacity/ledger.js");',
+      "a ledger require inside READER_SOURCE",
+    ],
+    [
+      'const fs = require("node:fs");\nrequire("node:child_process");',
+      "a built-in outside the allowlist",
+    ],
+    ['const fs = require("node:fs");\nrequire(process.env.PRELOAD);', "a non-literal require"],
+    ['const fs = require("node:fs");\nimport("../capacity/ledger.js");', "a dynamic import"],
+    [
+      'const fs = require("node:fs");\nprocess.getBuiltinModule("node:module");',
+      "getBuiltinModule",
+    ],
+  ];
+  for (const [to, what] of edits) {
+    const edited = source.replace(marker, to);
+    assert.notEqual(edited, source, `the edit applied: ${what}`);
+    assert.notDeepEqual(modulesOf(edited), registered, `${what}: is NOT green`);
+    // and the CALL's own key is unchanged — which is why the call registry alone could not see it
+    assert.deepEqual(
+      [...unfollowableSites([[rel, edited]]).keys()].toSorted(),
+      [...unfollowableSites([[rel, source]]).keys()].toSorted(),
+      `${what}: the call registry stays green`,
+    );
+  }
+  // controls: a module removed is red too (the allowlist is exact), and a whitespace-only edit of the source is not an edit of its loads
+  const removed = source.replace('const os = require("node:os");\n', "");
+  assert.notEqual(removed, source, "the removal applied");
+  assert.notDeepEqual(modulesOf(removed), registered, "a dropped module: the registry is stale");
+  const spaced = source.replace(marker, 'const fs   =   require( "node:fs" );');
+  assert.notEqual(spaced, source, "the spacing edit applied");
+  assert.deepEqual(modulesOf(spaced), registered);
+  // a Worker whose first argument is a path (loads a FILE) or a call is `<unresolved>` — red until someone reads and registers it
+  const byPath = workerSourceModules([
+    [
+      "x.ts",
+      'import { Worker } from "node:worker_threads";\nconst w = new Worker(new URL("./w.js", import.meta.url));',
+    ],
+  ]);
+  assert.deepEqual([...byPath.values()], [["<unresolved>"]]);
+});
+
+test("K4-2 / TE-7115-1: the call key is normalised by TOKEN — an edit inside a string or template literal, a line moved into a `//` comment, and an ASI-significant line break are each red; a re-wrap after a comma keys the same", () => {
+  const head = 'import { Worker } from "node:worker_threads";\n';
+  const keyOf = (body: string): string[] =>
+    [...unfollowableSites([["x.ts", head + body]]).keys()].map((key) => key.split(" | ")[2] ?? "");
+  const differ = (a: string, b: string, what: string): void => {
+    assert.notDeepEqual(keyOf(a), keyOf(b), `${what}: is NOT green`);
+    assert.equal(keyOf(a).length, 1, `${what}: the call is found`);
+  };
+  // string / template literals keep their whitespace
+  differ(
+    'new Worker("a  b", { eval: true });',
+    'new Worker("a b", { eval: true });',
+    "a string literal",
+  );
+  differ(
+    "new Worker(`a  b`, { eval: true });",
+    "new Worker(`a b`, { eval: true });",
+    "a template literal",
+  );
+  differ(
+    "new Worker(`a ${1}  b`, { eval: true });",
+    "new Worker(`a ${1} b`, { eval: true });",
+    "a template span",
+  );
+  // a line pulled INTO a `//` comment goes dead, with the old key unchanged
+  differ(
+    "new Worker(S, { eval: true, // note\n execArgv: ['--import', 'x'] });",
+    "new Worker(S, { eval: true, // note execArgv: ['--import', 'x'] });",
+    "a line joined into a line comment",
+  );
+  // a commented-out option moved onto its own line (live) vs left in the comment
+  differ(
+    "new Worker(S, { eval: true, // execArgv: ['--import', 'x'],\n });",
+    "new Worker(S, { eval: true,\n execArgv: ['--import', 'x'],\n });",
+    "a commented-out option moved live",
+  );
+  // block comments are kept verbatim
+  differ(
+    "new Worker(S, { eval: true, /* a */ x: 1 });",
+    "new Worker(S, { eval: true, /* b */ x: 1 });",
+    "a block comment",
+  );
+  // ASI: a line break after `return` ends the statement; a space does not
+  differ(
+    "new Worker(S, { f: () => { return\n 1; } });",
+    "new Worker(S, { f: () => { return 1; } });",
+    "an ASI line break",
+  );
+  // controls: whitespace between tokens, and a re-wrap after `,` `(` `{`, key the same
+  assert.deepEqual(
+    keyOf("new Worker(S,   { eval:   true });"),
+    keyOf("new Worker(S, { eval: true });"),
+  );
+  assert.deepEqual(
+    keyOf("new Worker(S, {\n  eval: true,\n\n  x: 1\n});"),
+    keyOf("new Worker(S, { eval: true, x: 1 });"),
+  );
+  // …and the registered real call still keys as registered (the registry test above covers the whole of src/)
 });
