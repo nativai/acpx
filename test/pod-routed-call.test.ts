@@ -1222,6 +1222,21 @@ test("releases (C9): the directory name each tool's link points to now; a missin
   assert.deepEqual(resolveReleases(dir), { ok: false, tool: "codex-acp" });
 });
 
+test("M1 F-B fix round 1: a one-shot's deadline counts from `startedAtMs` when the caller gives one (work before the call is the call's own) — and from the call start when it does not", async () => {
+  const stub = makeStub();
+  const startedAtMs = Date.now() - 4_000; // the caller's capacity read took 4 s before it called
+  await runRoutedCall(oneShotOptions(stub, { expectUid: UID, deadlineMs: 7_000, startedAtMs }));
+  const [call] = stub.calls();
+  assert.ok(call);
+  assert.equal(Number(flag(call, "--deadline-ms")), startedAtMs + 7_000);
+  // Negative: without it the deadline is 7 s from NOW, i.e. later than the one above by the 4 s.
+  const plain = makeStub();
+  await runRoutedCall(oneShotOptions(plain, { expectUid: UID, deadlineMs: 7_000 }));
+  const [other] = plain.calls();
+  assert.ok(other);
+  assert.ok(Number(flag(other, "--deadline-ms")) > startedAtMs + 7_000 + 3_000);
+});
+
 test("deadline counts from the CALL START: a 20 s wake leaves a 25 s deadline in the per-call values", async () => {
   const broker = await startFakeBroker({ default: { steps: ["scheduling"], final: READY } });
   try {

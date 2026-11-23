@@ -120,6 +120,12 @@ export type RoutedCallOptions = {
   payload?: string | Uint8Array;
   /** The caller's own deadline — `one-shot` only. */
   deadlineMs?: number;
+  /**
+   * `one-shot` only: when the caller's clock started (epoch ms), for a caller that did work BEFORE this call
+   * which must count against the deadline — the utility branch's capacity read (M1 F-B). Default: now. The
+   * deadline is `startedAtMs + deadlineMs`, so the work before the call can never push it past that.
+   */
+  startedAtMs?: number;
   /** Caller identity — set ONLY when an agent caused the call through the pass-through (C2). */
   callerIdentity?: CallerIdentity;
   /** The caller's environment: read for `ACPX_LOCKED_BY`, `PATH`, `HOME`; nothing else is forwarded. */
@@ -796,6 +802,11 @@ async function dispatch(
   });
 }
 
+/** The deadline's start: the caller's own clock start when it gave one (`startedAtMs`), else now. */
+function callStartOf(options: RoutedCallOptions, now: () => number): number {
+  return options.startedAtMs ?? now();
+}
+
 /**
  * Runs one routed call. Resolves with the command's exit code once its output has been relayed, or
  * `no_pod` for an `owner-if-pod` call with no pod; THROWS the refusal (`CapacityRefusedError`,
@@ -804,7 +815,7 @@ async function dispatch(
 export async function runRoutedCall(options: RoutedCallOptions): Promise<RoutedCallResult> {
   const callId = options.callId ?? randomUUID();
   const now = options.now ?? Date.now;
-  const callStartMs = now();
+  const callStartMs = callStartOf(options, now);
   const payloadDir = options.payloadDir ?? ROUTED_PAYLOAD_DIR;
 
   if (!isUnderSharedRoot(options.cwd)) {

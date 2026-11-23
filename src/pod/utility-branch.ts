@@ -199,9 +199,10 @@ function utilityCallOptions(
   argv: readonly string[],
   agentCommand: string | undefined,
   plan: Exclude<Awaited<ReturnType<typeof planPayload>>, "prompt_required">,
-  key: UtilityKey,
+  keyed: { key: UtilityKey; startedAtMs: number },
   deps: UtilityDeps,
 ): RoutedCallOptions {
+  const { key, startedAtMs } = keyed;
   const admissionClass = deps.admissionClass();
   return {
     class: "one-shot",
@@ -226,6 +227,8 @@ function utilityCallOptions(
     lookup: deps.lookup,
     callerIdentity: callerIdentityFrom(deps.env),
     deadlineMs: deadlineMsFor(classification.path, argv),
+    // M1 F-B: the capacity read that picked the key ran BEFORE this call; its time is the call's own.
+    startedAtMs,
     releases: deps.releases(),
     ...(plan ? { payload: plan.text } : {}),
     ...(deps.payloadDir ? { payloadDir: deps.payloadDir } : {}),
@@ -268,9 +271,10 @@ export async function dispatchUtility(
     return await usageError(PROMPT_REQUIRED_MESSAGE, classification.output, deps);
   }
   try {
+    const startedAtMs = Date.now();
     const key = await utilityKeyOf(agentCommand, deps);
     const result = await deps.run(
-      utilityCallOptions(classification, argv, agentCommand, plan, key, deps),
+      utilityCallOptions(classification, argv, agentCommand, plan, { key, startedAtMs }, deps),
     );
     return result.kind === "completed" ? result.exitCode : 1;
   } catch (error) {

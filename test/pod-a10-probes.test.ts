@@ -1162,6 +1162,8 @@ async function rig(opts: {
   brokerStatus?: Omit<BrokerStatus, "home">;
   /** `GET /v1/agents` fails (the broker's capacity answer is unreadable) while POST still works (M1 F-B). */
   statusFails?: boolean;
+  /** `GET /v1/agents` is never answered (a hung broker) while POST still works (M1 F-B fix round 1). */
+  statusHangs?: boolean;
 }): Promise<Rig> {
   const home = fs.mkdtempSync(path.join(ROOT, "home-"));
   const stubDir = fs.mkdtempSync(path.join(ROOT, "stub-"));
@@ -1191,6 +1193,7 @@ async function rig(opts: {
     // The kit's home cap is the real broker's default, 0: `util-home` then answers `home_full`.
     status: { ...opts.brokerStatus, home: { live: 0, cap: opts.homeCap ?? 5 } },
     ...(opts.statusFails ? { statusFails: true } : {}),
+    ...(opts.statusHangs ? { statusHangs: true } : {}),
     default: {
       steps: ["scheduling"],
       final: {
@@ -1990,6 +1993,25 @@ test("M1 F-B unit: while the pool is not ready (broker places home) a Claude one
   assert.equal(await keyFor(async () => undefined), "util-pool");
 });
 
+test("M1 F-B fix round 1 unit: the routed call's clock starts BEFORE the capacity read — `startedAtMs` is the time before it, not after, so the read counts against the call's deadline", async () => {
+  const argv = ["exec", "hi"];
+  const before = Date.now();
+  const d = dispatcher(argv, {
+    poolPlacement: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      return "pool";
+    },
+  });
+  await dispatchUtility(decisionFor(argv), context(d.out), d.deps);
+  const run = d.runs[0];
+  assert.ok(run);
+  assert.ok(run.startedAtMs !== undefined, "the clock start is passed");
+  assert.ok(
+    run.startedAtMs >= before && run.startedAtMs < before + 100,
+    `${run.startedAtMs - before}`,
+  );
+});
+
 test("M1 F-B unit: a home-only harness (codex) is util-home and the broker's capacity is never read for it", async () => {
   const argv = ["exec", "hi"];
   let reads = 0;
@@ -2140,6 +2162,31 @@ test("M1 F-B REAL CLI: the capacity answer CANNOT be read (GET fails) — the ke
       POSTS(r).map((post) => post.key),
       ["util-pool"],
     );
+  } finally {
+    await r.close();
+  }
+});
+
+test("M1 F-B fix round 1 REAL CLI: a HANGING capacity read counts against the call's deadline — the routed call's absolute deadline is `--timeout` + grace from the CLI's START, not from after the read; the call still places util-pool and runs (red before the fix: the deadline sat ~5 s later)", async () => {
+  const r = await rig({ statusHangs: true, stub: { exit: 0, stdout: "ran\n" } });
+  try {
+    const startedAt = Date.now();
+    const result = await cli(["--agent", CLAUDE, "--timeout", "1", "exec", "hi"], r.env);
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(
+      POSTS(r).map((post) => post.key),
+      ["util-pool"],
+      "an unreadable answer keeps util-pool and the POST places it",
+    );
+    assert.equal(AGENTS_GETS(r).length, 1);
+    assert.equal(AGENTS_GETS(r)[0]?.outcome, "status_hung");
+    const call = r.calls()[0];
+    assert.ok(call);
+    const deadlineAt = Number(call.argv[call.argv.indexOf("--deadline-ms") + 1]);
+    const own = UTILITY_TIMEOUT_GRACE_MS + 1_000; // `--timeout 1` + the grace
+    // The CLI's own start-up before the clock is a fraction of a second; the 5 s read must NOT be on top of it.
+    assert.ok(deadlineAt - startedAt >= own - 50, `${deadlineAt - startedAt}`);
+    assert.ok(deadlineAt - startedAt < own + 3_000, `${deadlineAt - startedAt}`);
   } finally {
     await r.close();
   }
