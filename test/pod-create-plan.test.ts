@@ -1078,8 +1078,22 @@ function putTurnInProgress(f: Fixture, sourceId: string, userId: string, partial
   fs.writeFileSync(file, JSON.stringify(record));
 }
 
+/**
+ * ⚠️ DO NOT DROP THE `ACPX_OWNER_IDLE_RELEASE_MS=0` BELOW FROM A ROW THAT WRITES A SOURCE RECORD BY HAND.
+ * `putTurnInProgress` writes the source's record BEHIND its live queue owner's back — a real running
+ * turn's inline tail is written by that owner itself, so the writer is the fixture's alone. The suite
+ * wrapper caps owner idle release at 60 s (`scripts/run-tests.mjs`), and a loaded box takes longer
+ * than that between the warm turn and the wake (the row measured 139 s in a full suite at load 36–47,
+ * brick 0e64e3f3): the owner then releases (`idle-memory`) and persists its in-memory record, an
+ * empty inline tail, over the fixture's write — the wake sees a 2-entry source, cut 3 is out of range
+ * and the row reds with a wrong-looking `1 !== 0`. The negative row "an owner that idle-released
+ * rewrote the source" below fails if this ever stops being true of the fixture's premise.
+ */
+const NO_OWNER_RELEASE = { ACPX_OWNER_IDLE_RELEASE_MS: "0" } as const;
+
 test("A-18 (Pi, Codex): a by-the-way cut at the end of a RUNNING turn is moved to before the in-progress agent entry; it survives the entry growing and wakes", async () => {
   const f = makeBox({ requestMib: 4000 });
+  Object.assign(f.env, NO_OWNER_RELEASE);
   const source = await warmTarget(f, 1); // 2 entries, both at a turn boundary (in the log)
   const userId = "a18a18a1-0000-4000-8000-000000000001";
   putTurnInProgress(f, source, userId, "1\n2\n3");
@@ -1117,9 +1131,88 @@ test("A-18 (Pi, Codex): a by-the-way cut at the end of a RUNNING turn is moved t
   );
 
   putTurnInProgress(f, source, userId, "1\n2\n3\n4\n5\n6 — the reply kept growing after create");
+  // The premise, asserted where it can fail loudly instead of surfacing as a wake error: the grown
+  // entry is still on the source's disk record when the wake reads it.
+  assert.equal(
+    (readRecord(f, source) as PlanRecord).messages?.length,
+    2,
+    "precondition: the source record still holds the in-progress turn the fixture wrote",
+  );
   const wake = await runCli([...base(f), "prompt", "--session-id", RECORD_ID, "x"], f.env, f.root);
-  assert.equal(wake.code, 0, `the grown entry is not part of the cut: ${wake.stderr}`);
+  assert.equal(
+    wake.code,
+    0,
+    `the grown entry is not part of the cut: ${wake.stderr}\nSTDOUT ${wake.stdout}`,
+  );
   assert.notEqual((readRecord(f, RECORD_ID) as PlanRecord).acp_session_id, "");
+});
+
+/** Create the A-18 by-the-way copy of a source in a running turn; returns the source id. */
+async function copyAtRunningTurn(f: Fixture, userId: string): Promise<string> {
+  const source = await warmTarget(f, 1);
+  putTurnInProgress(f, source, userId, "1\n2\n3");
+  const run = await runCli(
+    [
+      ...base(f),
+      "sessions",
+      "copy",
+      "--from",
+      source,
+      "--at-log-index",
+      "4",
+      "--ephemeral",
+      "--record-id",
+      RECORD_ID,
+      "--created-by-call",
+      CALL_ID,
+    ],
+    pod(f),
+    f.root,
+  );
+  assert.equal(run.code, 0, run.stderr);
+  return source;
+}
+
+test("A-18 negative: when the CUT's own entry moved (the turn's user message is another one), the wake is refused FORK_CUT_MOVED and the record stays sleeping — only the GROWN entry may differ", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  Object.assign(f.env, NO_OWNER_RELEASE);
+  const userId = "a18a18a1-0000-4000-8000-000000000002";
+  const source = await copyAtRunningTurn(f, userId);
+  const planBefore = (readRecord(f, RECORD_ID) as PlanRecord).acpx.sleeping;
+  putTurnInProgress(f, source, "a18a18a1-0000-4000-8000-0000000000ff", "1\n2\n3\n4");
+  const wake = await runCli([...base(f), "prompt", "--session-id", RECORD_ID, "x"], f.env, f.root);
+  assert.notEqual(wake.code, 0, "the cut entry changed: the wake must refuse");
+  assert.match(wake.stdout + wake.stderr, /FORK_CUT_MOVED/u);
+  const after = readRecord(f, RECORD_ID) as PlanRecord;
+  assert.equal(after.acp_session_id, "", "still never run");
+  assert.deepEqual(after.acpx.sleeping, planBefore, "the plan is unchanged");
+});
+
+test("A-18 negative (the fixture premise): an owner that IDLE-RELEASES after a hand-written in-progress turn persists its own record over it — which is why the A-18 rows switch release off", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  Object.assign(f.env, { ACPX_OWNER_IDLE_RELEASE_MS: "10000" });
+  const source = await warmTarget(f, 1);
+  const ownerLog = recordPath(f, source).replace(/\.json$/u, ".owner.log");
+  const releaseLine = /queue owner releasing session .*reason=idle-memory/u;
+  const logged = (): boolean => {
+    try {
+      return releaseLine.test(fs.readFileSync(ownerLog, "utf8"));
+    } catch {
+      return false;
+    }
+  };
+  putTurnInProgress(f, source, "a18a18a1-0000-4000-8000-000000000003", "1\n2\n3");
+  assert.equal(logged(), false, "precondition: the write landed while the owner was still alive");
+  assert.equal((readRecord(f, source) as PlanRecord).messages?.length, 2, "the fixture's write");
+  // Ordering, not a clock: the owner logs the release line, then persists and exits.
+  const deadline = Date.now() + 120_000;
+  let after = (readRecord(f, source) as PlanRecord).messages?.length;
+  while (after !== 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    after = (readRecord(f, source) as PlanRecord).messages?.length;
+  }
+  assert.ok(logged(), "the owner released");
+  assert.equal(after, 0, "the released owner's persist replaced the hand-written inline tail");
 });
 
 test("A-18 negative: a cut whose last entry is a COMPLETED agent entry (the turn is over) is not moved", async () => {
