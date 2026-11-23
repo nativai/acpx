@@ -4795,7 +4795,181 @@ test("integration: sessions owner-status --descendants-of scans transitive desce
   });
 });
 
+// brick fc9eea92 — the in-flight row is HELD, not timed. Its first form sent `sleep 1500` and gave history
+// a 5 s `waitFor`: the turn's User row is written only after the cold owner's connect (brick 6f461fe4,
+// test/turn-cut-before-prompt.test.ts — by design), so under box load the row appeared after the
+// 1.5 s prompt had finished, or after the bound. A longer bound alone would let the prompt finish before
+// the read and the row would stop proving "in flight". The prompt is now held by the mock agent until
+// the test creates a release file, so the order is: the prompt is accepted -> history shows it ->
+// the test releases it -> the prompt completes. The wait below is an ordering wait: its bound is a
+// hang detector, never a timing assertion, because a held prompt cannot finish before its release.
+// Measured time-to-visible on this box: 8.5–13.8 s unloaded, 19–30 s under 8 busy loops, 36.7–67.6 s
+// while a full suite runs (TE of brick fc9eea92). The bound sits far above that tail; it is the only
+// clock left in the row, and the mock agent's hold cap (300 s) sits above it.
+const HELD_PROMPT_HISTORY_WAIT_MS = 180_000;
+
+async function waitForHistoryToShowPrompt(params: {
+  cwd: string;
+  homeDir: string;
+  marker: string;
+  promptIsRunning: () => boolean;
+  timeoutMs: number;
+}): Promise<string> {
+  const deadline = Date.now() + params.timeoutMs;
+  while (Date.now() < deadline) {
+    if (!params.promptIsRunning()) {
+      // The prompt left before history showed it: not "in flight" any more, and no later read can
+      // change that. Fail at once with the cause (`waitFor` would swallow this and retry to its bound).
+      throw new Error("the prompt process exited before sessions history showed it in flight");
+    }
+    // A read counts only if it STARTED before the deadline and returned the entry (the loop condition
+    // above is the first half; a read begun in time may finish after it and is still accepted).
+    const result = await runCli(
+      [...baseAgentArgs(params.cwd), "--format", "quiet", "sessions", "history"],
+      params.homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    if (result.stdout.includes(params.marker)) {
+      return result.stdout;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error("Timed out waiting for condition");
+}
+
+// The hold has ENGAGED once the mock agent has written `<release>.holding`: only then is "history shows
+// the prompt" a statement about a turn that is held. Same ordering wait, same bound.
+async function waitForHoldToEngage(params: {
+  holdingFile: string;
+  promptIsRunning: () => boolean;
+  timeoutMs: number;
+}): Promise<void> {
+  const deadline = Date.now() + params.timeoutMs;
+  while (Date.now() < deadline) {
+    if (
+      await fs.access(params.holdingFile).then(
+        () => true,
+        () => false,
+      )
+    ) {
+      return;
+    }
+    if (!params.promptIsRunning()) {
+      throw new Error("the prompt process exited before the mock agent engaged the hold");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error("Timed out waiting for the hold to engage");
+}
+
+async function runHeldPromptInFlightScenario(
+  homeDir: string,
+  options: { preCreateReleaseFile: boolean },
+): Promise<void> {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+  const releaseFile = path.join(cwd, "release-held-prompt");
+  const holdingFile = `${releaseFile}.holding`;
+
+  try {
+    if (options.preCreateReleaseFile) {
+      await fs.writeFile(releaseFile, "");
+    }
+    // Only the test creates the release file, and only after the in-flight assertions: one that
+    // already exists means the hold can never engage (the prompt would finish at once, and the row
+    // could still go green off a lucky read — 2 of 10 false greens measured, brick fc9eea92 TE F1).
+    assert.equal(
+      await fs.access(releaseFile).then(
+        () => true,
+        () => false,
+      ),
+      false,
+      "the release file must not exist before the prompt is sent",
+    );
+
+    const created = await runCli(
+      [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+      homeDir,
+    );
+    assert.equal(created.code, 0, created.stderr);
+
+    const promptChild = spawn(
+      process.execPath,
+      [
+        CLI_PATH,
+        ...addressByRememberedId(
+          [...baseAgentArgs(cwd), "--format", "quiet", "prompt", `hold-until-file ${releaseFile}`],
+          homeDir,
+          cwd,
+        ),
+      ],
+      {
+        env: {
+          ...process.env,
+          HOME: homeDir,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    const promptIsRunning = () => promptChild.exitCode == null && promptChild.signalCode == null;
+
+    try {
+      const history = await waitForHistoryToShowPrompt({
+        cwd,
+        homeDir,
+        marker: releaseFile,
+        promptIsRunning,
+        timeoutMs: HELD_PROMPT_HISTORY_WAIT_MS,
+      });
+      await waitForHoldToEngage({
+        holdingFile,
+        promptIsRunning,
+        timeoutMs: HELD_PROMPT_HISTORY_WAIT_MS,
+      });
+
+      assert.match(history, /hold-until-file /);
+      assert.doesNotMatch(history, /No history/);
+      // In flight: the agent is holding the turn (sentinel), so history has the prompt and no answer.
+      assert.equal(promptChild.exitCode, null, "the held prompt must still be running");
+      assert.doesNotMatch(history, /released by file/);
+
+      await fs.writeFile(releaseFile, "");
+      const promptResult = await awaitChildClose(promptChild);
+      assert.equal(promptResult.code, 0, promptResult.stderr);
+      assert.match(promptResult.stdout, /released by file/);
+    } finally {
+      // Release first, so a failing row never leaves the owner on a held turn.
+      await fs.writeFile(releaseFile, "").catch(() => {});
+      if (promptIsRunning()) {
+        promptChild.kill("SIGKILL");
+        await awaitChildClose(promptChild).catch(() => {});
+      }
+    }
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+}
+
 test("integration: sessions history shows in-flight prompt after prompt starts", async () => {
+  await withTempHome(async (homeDir) => {
+    await runHeldPromptInFlightScenario(homeDir, { preCreateReleaseFile: false });
+  });
+});
+
+// Negative control (brick fc9eea92 TE F1): a release file that already exists means the hold never
+// engages; the row must FAIL on it, deterministically, not go green off a lucky read.
+test("integration: in-flight row fails when the release file already exists", async () => {
+  await withTempHome(async (homeDir) => {
+    await assert.rejects(
+      runHeldPromptInFlightScenario(homeDir, { preCreateReleaseFile: true }),
+      /the release file must not exist before the prompt is sent/,
+    );
+  });
+});
+
+// Negative controls for the row above: its wait can FAIL. The same helper, over a session in which the
+// in-flight entry is genuinely absent, must reject — the first with no prompt ever sent (a read issued
+// before the prompt), the second with a prompt process that is already gone.
+test("integration: in-flight history wait rejects when no prompt was ever sent", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
 
@@ -4806,47 +4980,27 @@ test("integration: sessions history shows in-flight prompt after prompt starts",
       );
       assert.equal(created.code, 0, created.stderr);
 
-      const promptChild = spawn(
-        process.execPath,
-        [
-          CLI_PATH,
-          ...addressByRememberedId(
-            [...baseAgentArgs(cwd), "--format", "quiet", "prompt", "sleep 1500"],
-            homeDir,
-            cwd,
-          ),
-        ],
-        {
-          env: {
-            ...process.env,
-            HOME: homeDir,
-          },
-          stdio: ["ignore", "pipe", "pipe"],
-        },
+      await assert.rejects(
+        waitForHistoryToShowPrompt({
+          cwd,
+          homeDir,
+          marker: path.join(cwd, "release-held-prompt"),
+          promptIsRunning: () => true,
+          timeoutMs: 1_500,
+        }),
+        /Timed out waiting for condition/,
       );
 
-      try {
-        const history = await waitFor(async () => {
-          const result = await runCli(
-            [...baseAgentArgs(cwd), "--format", "quiet", "sessions", "history"],
-            homeDir,
-          );
-          assert.equal(result.code, 0, result.stderr);
-          return result.stdout.includes("sleep 1500") ? result.stdout : null;
-        }, 5_000);
-
-        assert.match(history, /sleep 1500/);
-        assert.doesNotMatch(history, /No history/);
-
-        const promptResult = await awaitChildClose(promptChild);
-        assert.equal(promptResult.code, 0, promptResult.stderr);
-        assert.match(promptResult.stdout, /slept 1500ms/);
-      } finally {
-        if (promptChild.exitCode == null && promptChild.signalCode == null) {
-          promptChild.kill("SIGKILL");
-          await awaitChildClose(promptChild).catch(() => {});
-        }
-      }
+      await assert.rejects(
+        waitForHistoryToShowPrompt({
+          cwd,
+          homeDir,
+          marker: path.join(cwd, "release-held-prompt"),
+          promptIsRunning: () => false,
+          timeoutMs: 1_500,
+        }),
+        /exited before sessions history showed it in flight/,
+      );
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
