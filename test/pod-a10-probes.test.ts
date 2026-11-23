@@ -35,6 +35,7 @@ import {
   deadlineMsFor,
   flagValue,
   RECORD_SERVED_PATHS,
+  utilityKeyAfterPool,
   utilityKeyFor,
   UTILITY_PROBE_DEADLINE_MS,
   UTILITY_RUN_DEADLINE_MS,
@@ -44,7 +45,7 @@ import {
 import { serializeSessionRecordForDisk } from "../src/session/persistence/serialize.js";
 import type { SessionRecord } from "../src/types.js";
 import { startFakeApiServer, type PodSeed } from "./pod-kit/fake-apiserver.js";
-import { startFakeBroker } from "./pod-kit/fake-broker.js";
+import { startFakeBroker, type BrokerStatus } from "./pod-kit/fake-broker.js";
 import { makeSessionRecord, writeSessionRecordFile } from "./runtime-test-helpers.js";
 
 // Block A10 (brick a68c45a9): probes from records, the utility pod as a one-shot's only start (A-7),
@@ -955,6 +956,7 @@ function dispatcher(
     agentCommandOf: async () => ("agentCommand" in over ? over.agentCommand : CLAUDE),
     harnessOf: (command) =>
       command.includes("codex") ? "codex" : command.includes("claude") ? "claude" : undefined,
+    poolPlacement: async () => "pool",
     recordsCanAnswer: async () => over.answerable ?? false,
     lookup: async () => ({ state: "absent" }),
     releases: () => ({ ok: true, releases: { acpx: "r1" } }),
@@ -1157,6 +1159,10 @@ async function rig(opts: {
   extraEnv?: NodeJS.ProcessEnv;
   /** Pods the kit's API server already shows (a Ready utility pod, A-43 (b)). */
   pods?: PodSeed[];
+  /** The kit broker's `GET /v1/agents` answer beyond the home cap: the pool state, `forced`, an older broker's missing field (M1 F-B). */
+  brokerStatus?: Omit<BrokerStatus, "home">;
+  /** `GET /v1/agents` fails (the broker's capacity answer is unreadable) while POST still works (M1 F-B). */
+  statusFails?: boolean;
 }): Promise<Rig> {
   const home = fs.mkdtempSync(path.join(ROOT, "home-"));
   const stubDir = fs.mkdtempSync(path.join(ROOT, "stub-"));
@@ -1184,7 +1190,8 @@ async function rig(opts: {
   const api = await startFakeApiServer({ namespace: "dev-devbox", pods: opts.pods ?? [] });
   const broker = await startFakeBroker({
     // The kit's home cap is the real broker's default, 0: `util-home` then answers `home_full`.
-    status: { home: { live: 0, cap: opts.homeCap ?? 5 } },
+    status: { ...opts.brokerStatus, home: { live: 0, cap: opts.homeCap ?? 5 } },
+    ...(opts.statusFails ? { statusFails: true } : {}),
     default: {
       steps: ["scheduling"],
       final: {
@@ -1963,5 +1970,195 @@ test("A-44 row 44.3 (CLI): a Pi one-shot goes home on a box WITHOUT P1's signal 
     );
   } finally {
     await p1.close();
+  }
+});
+
+// ───────────────────────── M1 F-B (brick 8d5b723e): a utility call follows A-49 — home while the pool is not ready ─────────────────────────
+
+// podlab's pool templates carry this annotation (M1 TE, brick f1da52b3): `pool.state` is not `ready`.
+const TEMPLATE_GAPS = { state: "template-gaps:D2-node-selection,M1-state-mounts" };
+const AGENTS_GETS = (r: Rig) => r.broker.requests.filter((q) => q.method === "GET");
+
+test("M1 F-B unit: `utilityKeyAfterPool` moves ONLY the pool key, and only on the broker's positive `home`; a pool answer, an unreadable one and a home key stay as they were", async () => {
+  const where = (answer: "pool" | "home" | undefined) => async () => answer;
+  assert.equal(await utilityKeyAfterPool("util-pool", where("home")), "util-home");
+  assert.equal(await utilityKeyAfterPool("util-pool", where("pool")), "util-pool");
+  assert.equal(await utilityKeyAfterPool("util-pool", where(undefined)), "util-pool");
+  // negative: a home key never asks the broker at all (a home-only harness has nothing to decide)
+  let asked = 0;
+  assert.equal(
+    await utilityKeyAfterPool("util-home", async () => {
+      asked += 1;
+      return "pool";
+    }),
+    "util-home",
+  );
+  assert.equal(asked, 0);
+});
+
+test("M1 F-B unit: while the pool is not ready (broker places home) a Claude one-shot is routed to util-home; ready → util-pool as today; unreadable → util-pool as today", async () => {
+  const argv = ["exec", "hi"];
+  const keyFor = async (poolPlacement: UtilityDeps["poolPlacement"]) => {
+    const d = dispatcher(argv, { poolPlacement });
+    await dispatchUtility(decisionFor(argv), context(d.out), d.deps);
+    return d.runs[0]?.key;
+  };
+  assert.equal(await keyFor(async () => "home"), "util-home");
+  assert.equal(await keyFor(async () => "pool"), "util-pool");
+  assert.equal(await keyFor(async () => undefined), "util-pool");
+});
+
+test("M1 F-B unit: a home-only harness (codex) is util-home and the broker's capacity is never read for it", async () => {
+  const argv = ["exec", "hi"];
+  let reads = 0;
+  const d = dispatcher(argv, {
+    agentCommand: CODEX,
+    poolPlacement: async () => {
+      reads += 1;
+      return "pool";
+    },
+  });
+  await dispatchUtility(decisionFor(argv), context(d.out), d.deps);
+  assert.equal(d.runs[0]?.key, "util-home");
+  assert.equal(reads, 0, "nothing to decide, nothing read");
+});
+
+test("M1 F-B REAL CLI: pool.state not ready (template gaps) — a Claude `exec` posts util-home with placement home and RUNS; it never asks the pool pod (red before the fix: template_rejected, nothing ran)", async () => {
+  const r = await rig({
+    brokerStatus: { pool: TEMPLATE_GAPS },
+    stub: { exit: 0, stdout: "ran\n" },
+  });
+  try {
+    const result = await cli(["--agent", CLAUDE, "exec", "hi"], r.env);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stdout, "ran\n");
+    assert.deepEqual(
+      POSTS(r).map((post) => [post.key, post.body?.placement, post.body?.class]),
+      [["util-home", "home", "utility"]],
+    );
+    assert.deepEqual(POSTS(r)[0]?.problems, []);
+    assert.equal(r.calls().length, 1, "routed");
+    assert.equal(r.calls()[0]?.argv[r.calls()[0].argv.indexOf("--key") + 1], "util-home");
+  } finally {
+    await r.close();
+  }
+});
+
+test("M1 F-B REAL CLI: a utility PROBE no record answers (`output-styles`) goes home too while the pool is not ready", async () => {
+  const r = await rig({
+    brokerStatus: { pool: TEMPLATE_GAPS },
+    stub: { exit: 0, stdout: '{"action":"output_styles_list"}\n' },
+  });
+  try {
+    const result = await cli(["--agent", CLAUDE, "--format", "json", "output-styles"], r.env);
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(
+      POSTS(r).map((post) => post.key),
+      ["util-home"],
+    );
+  } finally {
+    await r.close();
+  }
+});
+
+test("M1 F-B REAL CLI: pool not ready AND home full — refused exit 75 `agent_cap … why=home_full`, nothing started, no wake=; the ask was the HOME pod, so the refusal is attributable to the home cap", async () => {
+  const r = await rig({ brokerStatus: { pool: TEMPLATE_GAPS }, homeCap: 0, stub: { exit: 0 } });
+  try {
+    const result = await cli(["--agent", CLAUDE, "exec", "hi"], r.env);
+    assert.equal(result.code, 75, result.stderr);
+    const first = result.stderr.split("\n")[0] ?? "";
+    assert.match(
+      first,
+      /^acpx: REFUSED reason=agent_cap nothing_started=true protocol=1 .* why=home_full$/,
+    );
+    assert.doesNotMatch(first, /wake=/);
+    assert.equal(r.calls().length, 0, "nothing ran");
+    assert.deepEqual(
+      POSTS(r).map((post) => post.key),
+      ["util-home"],
+      "the pool was never asked",
+    );
+  } finally {
+    await r.close();
+  }
+});
+
+test("M1 F-B REAL CLI: pool ready → util-pool as today (placement pool); a home-only harness (codex) → util-home with NO read of GET /v1/agents", async () => {
+  const r = await rig({ stub: { exit: 0 } });
+  try {
+    await cli(["--agent", CLAUDE, "exec", "hi"], r.env);
+    assert.deepEqual(
+      POSTS(r).map((post) => [post.key, post.body?.placement]),
+      [["util-pool", "pool"]],
+    );
+    assert.equal(AGENTS_GETS(r).length, 1, "the pool-capable harness read the capacity once");
+  } finally {
+    await r.close();
+  }
+  const home = await rig({ brokerStatus: { pool: TEMPLATE_GAPS }, stub: { exit: 0 } });
+  try {
+    await cli(["--agent", CODEX, "exec", "hi"], home.env);
+    assert.deepEqual(
+      POSTS(home).map((post) => [post.key, post.body?.placement]),
+      [["util-home", "home"]],
+    );
+    assert.equal(AGENTS_GETS(home).length, 0, "codex has nothing to decide");
+  } finally {
+    await home.close();
+  }
+});
+
+test("M1 F-B REAL CLI: the broker FORCES home (A-49) while the pool is ready — a Claude `exec` posts util-home, as the capacity answer judges every request against the home cap", async () => {
+  const r = await rig({ brokerStatus: { placement: { forced: "home" } }, stub: { exit: 0 } });
+  try {
+    const result = await cli(["--agent", CLAUDE, "exec", "hi"], r.env);
+    assert.equal(result.code, 0, result.stderr);
+    assert.deepEqual(
+      POSTS(r).map((post) => [post.key, post.body?.placement]),
+      [["util-home", "home"]],
+    );
+  } finally {
+    await r.close();
+  }
+});
+
+test("M1 F-B REAL CLI: an OLDER broker (no `placement` field) with the pool not ready reads as not-forced and the pool unusable → util-home; with the pool ready → util-pool", async () => {
+  const gaps = await rig({
+    brokerStatus: { pool: TEMPLATE_GAPS, placement: { omit: true } },
+    stub: { exit: 0 },
+  });
+  try {
+    await cli(["--agent", CLAUDE, "exec", "hi"], gaps.env);
+    assert.deepEqual(
+      POSTS(gaps).map((post) => post.key),
+      ["util-home"],
+    );
+  } finally {
+    await gaps.close();
+  }
+  const ready = await rig({ brokerStatus: { placement: { omit: true } }, stub: { exit: 0 } });
+  try {
+    await cli(["--agent", CLAUDE, "exec", "hi"], ready.env);
+    assert.deepEqual(
+      POSTS(ready).map((post) => post.key),
+      ["util-pool"],
+    );
+  } finally {
+    await ready.close();
+  }
+});
+
+test("M1 F-B REAL CLI: the capacity answer CANNOT be read (GET fails) — the key stays util-pool and the broker decides at the POST, exactly as a create (which never refuses for a broker it cannot read); no new refusal", async () => {
+  const r = await rig({ statusFails: true, stub: { exit: 0, stdout: "ran\n" } });
+  try {
+    const result = await cli(["--agent", CLAUDE, "exec", "hi"], r.env);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(AGENTS_GETS(r).length, 1, "it did try to read");
+    assert.deepEqual(
+      POSTS(r).map((post) => post.key),
+      ["util-pool"],
+    );
+  } finally {
+    await r.close();
   }
 });

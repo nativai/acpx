@@ -40,6 +40,9 @@ type UtilityKey = import("./routed-call.js").UtilityKey;
  *      agent's placement (`ag-util-pool`, or `ag-util-home` for Codex and the terminal harness).
  *   4. That is the only start a one-shot has (A-7): the call's target is a utility pod and nothing
  *      else — `routed-call.ts` refuses any other (`UtilityScopeError`, nothing sent, broker not asked).
+ *      Which pod: the harness's (`utilityKeyFor`), except that while the broker will not place at the pool
+ *      (`pool.state ≠ ready`, or it forces home) a pool-capable harness goes to the home pod (A-49,
+ *      `utilityKeyAfterPool`).
  *
  * The pod is reached with `placement` fixed to the key's (never `auto`: a probe never waits for a new
  * machine), waits at most the wake bound, and a pod not ready in time is `REFUSED reason=pod_starting`
@@ -72,6 +75,28 @@ export function utilityKeyFor(
   box: BoxFacts = readBoxFacts(),
 ): UtilityKey {
   return isHomeOnlyHarness(harness, box) ? "util-home" : "util-pool";
+}
+
+/**
+ * M1 F-B, A-49 applied to a utility pod: the pool utility pod is `placement: pool`, and the broker keeps an
+ * explicit `pool` as asked — it refuses it (`template_rejected`) while the pool template is not usable
+ * (`pool.state ≠ ready`), with nothing to fall back to. An agent pod asks `auto` and the broker places it
+ * home; a utility key names its placement, so acpx does what `auto` does: while the broker will not place at
+ * the pool (`pool.state ≠ ready`, or it forces home), the call goes to the HOME utility pod. The home cap
+ * then answers for it — a full home is the broker's own `agent_cap … why=home_full`, never a pre-check here:
+ * the home cap counts the ready home utility pod itself, so a pre-check would refuse the very call a Ready
+ * `ag-util-home` can serve. ⚠️ DO NOT "fix" an unreadable answer into a refusal: a create never refuses for a
+ * broker it cannot read (`waiting-line.ts`), and a ready utility pod needs no broker — `undefined` keeps the
+ * key as it was and the broker decides at the POST. Rows: `test/pod-a10-probes.test.ts` "M1 F-B".
+ */
+export async function utilityKeyAfterPool(
+  key: UtilityKey,
+  where: () => Promise<"pool" | "home" | undefined>,
+): Promise<UtilityKey> {
+  if (key !== "util-pool") {
+    return key;
+  }
+  return (await where()) === "home" ? "util-home" : key;
 }
 
 /** The value of a global flag in an argv, `--flag v` or `--flag=v`, up to the `--` terminator. */
@@ -110,6 +135,12 @@ export type UtilityDeps = {
     argv: readonly string[],
   ) => Promise<string | undefined>;
   harnessOf: (agentCommand: string) => string | undefined;
+  /**
+   * Where the broker will place a request that asks `auto` (A-49: home while the pool is not ready or the broker
+   * forces home), read from `GET /v1/agents`; `undefined` when that answer cannot be read. Asked only for a harness
+   * that could use the pool.
+   */
+  poolPlacement: () => Promise<"pool" | "home" | undefined>;
   /** Whether the newest session record can answer this probe (`probe-records.ts`). */
   recordsCanAnswer: (
     path: string,
@@ -151,17 +182,26 @@ async function answerableFromRecords(
   );
 }
 
+/** The utility pod this call goes to: the harness's, then A-49's home fallback for a pool-capable harness. */
+async function utilityKeyOf(
+  agentCommand: string | undefined,
+  deps: UtilityDeps,
+): Promise<UtilityKey> {
+  const harness = agentCommand === undefined ? undefined : deps.harnessOf(agentCommand);
+  return await utilityKeyAfterPool(
+    utilityKeyFor(harness, readBoxFacts(deps.env)),
+    deps.poolPlacement,
+  );
+}
+
 function utilityCallOptions(
   classification: Classified,
   argv: readonly string[],
   agentCommand: string | undefined,
   plan: Exclude<Awaited<ReturnType<typeof planPayload>>, "prompt_required">,
+  key: UtilityKey,
   deps: UtilityDeps,
 ): RoutedCallOptions {
-  const key = utilityKeyFor(
-    agentCommand === undefined ? undefined : deps.harnessOf(agentCommand),
-    readBoxFacts(deps.env),
-  );
   const admissionClass = deps.admissionClass();
   return {
     class: "one-shot",
@@ -228,8 +268,9 @@ export async function dispatchUtility(
     return await usageError(PROMPT_REQUIRED_MESSAGE, classification.output, deps);
   }
   try {
+    const key = await utilityKeyOf(agentCommand, deps);
     const result = await deps.run(
-      utilityCallOptions(classification, argv, agentCommand, plan, deps),
+      utilityCallOptions(classification, argv, agentCommand, plan, key, deps),
     );
     return result.kind === "completed" ? result.exitCode : 1;
   } catch (error) {
@@ -246,6 +287,7 @@ async function liveUtilityDeps(): Promise<UtilityDeps> {
     registry,
     records,
     configModule,
+    capacity,
   ] = await Promise.all([
     import("./agent-pod-lookup.js"),
     import("./routed-call.js"),
@@ -254,6 +296,7 @@ async function liveUtilityDeps(): Promise<UtilityDeps> {
     import("../agent-registry.js"),
     import("./probe-records.js"),
     import("../cli/config.js"),
+    import("./pod-capacity.js"),
   ]);
   // Atrium finds a routed call's token by its head and the exit code (C2, A-53), so a line before it would
   // not break the reader — the index-rebuild notice, which the record read can print, is still kept off a
@@ -286,6 +329,10 @@ async function liveUtilityDeps(): Promise<UtilityDeps> {
       );
     },
     harnessOf: (command) => agentCommand.acpAdapterKind(command),
+    poolPlacement: async () => {
+      const figures = await capacity.readAgentsFigures(process.env);
+      return figures.ok ? capacity.placedAt(figures.agents, "auto") : undefined;
+    },
     recordsCanAnswer: async (path, command, profile) =>
       (await records.newestRecordAdvertisement({
         agentCommand: command,
