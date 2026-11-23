@@ -1,9 +1,18 @@
 import childProcess from "node:child_process";
+import cluster from "node:cluster";
+import dgram from "node:dgram";
+import dns from "node:dns";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
+import http from "node:http";
+import http2 from "node:http2";
+import https from "node:https";
+import inspector from "node:inspector";
 import { syncBuiltinESMExports } from "node:module";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import tls from "node:tls";
 import workerThreads from "node:worker_threads";
 import { sessionArchiveDirFor } from "../session/archive/paths.js";
 import { parseSessionRecord } from "../session/persistence/parse.js";
@@ -27,8 +36,8 @@ import { tellParent } from "./target-verdict.js";
  *                   read saw — the record can be whole by then (the F2 race).
  *   denial watch    ANY `ERR_ACCESS_DENIED` from an fs mutation (sync, callback, promises, streams), a child process or
  *                   a worker, swallowed or printed by its message, tells `denied`.
- *   network         a connection OR a listen is refused and told (`network`). UDP and DNS are not covered: the accepted
- *                   residual (PLAN.md).
+ *   network         a connection, a listen, a datagram socket and a name query are refused and told (`network`), by the
+ *                   public API AND by the raw native handles behind it (`watchNetwork`).
  *
  * Every install returns the function that undoes it, for the in-process rows; production never undoes.
  */
@@ -280,9 +289,199 @@ function refuseNetwork(): never {
   );
 }
 
+/** The same refusal for a Promise API: a rejection, so `.catch` and `await` see it as they would a failed call. */
+function refuseNetworkAsync(): Promise<never> {
+  try {
+    refuseNetwork();
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  return Promise.reject(new Error("unreachable"));
+}
+
+/** Names that send a UDP packet or a name query, DISCOVERED by name on each dns surface (a new `resolveX` is covered). */
+const DNS_QUERY = /^(lookup|resolve|reverse)/u;
+
+function barDnsSurface(target: object, refusal: () => unknown, undo: Restore[]): void {
+  for (const name of Object.keys(target)) {
+    if (typeof record(target)[name] === "function" && DNS_QUERY.test(name)) {
+      swap(target, name, refusal, undo);
+    }
+  }
+}
+
+/** The names a Resolver class gets on its prototype (`resolve4`, `reverse`, …). */
+function barResolver(resolver: unknown, refusal: () => unknown, undo: Restore[]): void {
+  const prototype = (resolver as { prototype?: object } | undefined)?.prototype;
+  if (prototype !== undefined) {
+    for (const name of Object.getOwnPropertyNames(prototype)) {
+      if (typeof record(prototype)[name] === "function" && DNS_QUERY.test(name)) {
+        swap(prototype, name, refusal, undo);
+      }
+    }
+  }
+}
+
+/** The native handles behind sockets and name resolution, by their (deprecated) `process.binding` names. */
+const NETWORK_BINDINGS = new Set([
+  "udp_wrap",
+  "tcp_wrap",
+  "cares_wrap",
+  "pipe_wrap",
+  "tls_wrap",
+  "stream_wrap",
+]);
+
+/** An export that constructs or exposes a native handle, DISCOVERED by name (`net._createServerHandle`, `dgram._createSocketHandle`, and any `_createXHandle` a later Node adds). */
+const HANDLE_EXPORT = /Handle$/u;
+
+/** The modules whose exports are enumerated at install: each function export named like a handle maker is barred. */
+const NETWORK_MODULES: readonly object[] = [
+  net,
+  dgram,
+  dns,
+  dns.promises,
+  tls,
+  http,
+  https,
+  http2,
+  inspector,
+  cluster,
+];
+
+/** The classes of these modules get their `listen`/`connect`/`bind`/`send` family barred on the prototype chain, including the underscore variants (`Server.prototype._listen2` opens a listener without `listen`). */
+const NETWORK_CLASS_MODULES: readonly object[] = [net, dgram, tls, http, https, http2];
+const NETWORK_METHOD = /^_?(listen2?|connect|bind|send|sendto)$/u;
+
+/** The native UDP handle methods that bind, connect or send. */
+const UDP_NATIVE_METHOD = /^(bind6?|connect6?|send6?)$/u;
+
+function barHandleExports(undo: Restore[]): void {
+  for (const surface of NETWORK_MODULES) {
+    for (const name of Object.keys(surface)) {
+      if (typeof record(surface)[name] === "function" && HANDLE_EXPORT.test(name)) {
+        swap(surface, name, refuseNetwork, undo);
+      }
+    }
+  }
+}
+
+/** The prototypes of an exported class, own first, up to (not including) Object's and EventEmitter's. */
+function prototypeChain(exported: unknown): object[] {
+  const chain: object[] = [];
+  let prototype: unknown = typeof exported === "function" ? record(exported).prototype : null;
+  while (
+    typeof prototype === "object" &&
+    prototype !== null &&
+    prototype !== Object.prototype &&
+    prototype !== EventEmitter.prototype
+  ) {
+    chain.push(prototype);
+    prototype = Object.getPrototypeOf(prototype);
+  }
+  return chain;
+}
+
+function barPrototype(prototype: object, pattern: RegExp, undo: Restore[]): void {
+  for (const method of Object.getOwnPropertyNames(prototype)) {
+    if (
+      pattern.test(method) &&
+      typeof Object.getOwnPropertyDescriptor(prototype, method)?.value === "function"
+    ) {
+      swap(prototype, method, refuseNetwork, undo);
+    }
+  }
+}
+
+/** Bars the family on every class prototype the modules export. Called BEFORE `dgram.Socket` is replaced, so it reaches the REAL class (a socket made before the guards cannot send). */
+function barClassMethods(undo: Restore[]): void {
+  const seen = new Set<object>();
+  for (const surface of NETWORK_CLASS_MODULES) {
+    for (const exported of Object.values(surface)) {
+      for (const prototype of prototypeChain(exported)) {
+        if (!seen.has(prototype)) {
+          seen.add(prototype);
+          barPrototype(prototype, NETWORK_METHOD, undo);
+        }
+      }
+    }
+  }
+}
+
+/** The native handle behind a dgram socket: held under a symbol-keyed state object. */
+function nativeHandleOf(socket: object): object | undefined {
+  for (const symbol of Object.getOwnPropertySymbols(socket)) {
+    const state: unknown = Reflect.get(socket, symbol);
+    const handle: unknown =
+      typeof state === "object" && state !== null && Reflect.get(state, "handle");
+    if (typeof handle === "object" && handle !== null) {
+      return handle;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The native UDP handle class, reached through an unbound socket of the REAL class: its `bind`/`connect`/`send` are
+ * barred too, so a handle that already exists (made before the guards) or that some export hands out cannot send.
+ */
+function barNativeUdp(undo: Restore[]): void {
+  const socket = new (dgram.Socket as unknown as new (type: string) => { close(): void })("udp4");
+  try {
+    const handle = nativeHandleOf(socket);
+    const prototype: unknown = handle && Object.getPrototypeOf(handle);
+    if (typeof prototype === "object" && prototype !== null) {
+      barPrototype(prototype, UDP_NATIVE_METHOD, undo);
+    }
+  } finally {
+    socket.close();
+  }
+}
+
+/**
+ * The network, in the armed child. TCP: `connect` (every client, `fetch`, `http`, `tls`, and a connect to a HOSTNAME, which is
+ * refused before it resolves) and `listen`. UDP: every dgram socket (`createSocket`, the `Socket` class, `bind`, `send`,
+ * `connect`). DNS: `lookup`, `lookupService`, `resolve*`, `reverse` on `dns`, `dns.promises`, and both `Resolver` classes.
+ * RAW HANDLES (K5 round 4 TE, brick e8c77d5b): every export of net, dgram, dns, dns.promises, tls, http, https, http2,
+ * inspector and cluster that makes a native handle (`*Handle`: `net._createServerHandle`, `dgram._createSocketHandle`) is
+ * DISCOVERED by name and refused; the class prototypes' `listen`/`_listen2`/`connect`/`bind`/`send`/`sendto` are refused
+ * on the real classes; the native UDP handle methods are refused. Also `inspector.open` (an inbound listener) and the
+ * native handles behind `process.binding`. Node 22's permission model restricts none of these (v25's does); each attempt
+ * tells `network` and fails with `ERR_ACCESS_DENIED`.
+ *
+ * ⚠️ DO NOT move `swap(dgram, "Socket", …)` above `barClassMethods`/`barNativeUdp`: the loop would then patch the
+ * replacement's prototype and leave the REAL `Socket.prototype` native (TE F3; `test/pod-verdict-udp-dns.test.ts`, the
+ * row "a socket created BEFORE the guards sends nothing").
+ *
+ * COULD NOT BE BARRED: a native TCP/pipe handle class reached through some live handle of this process (none is made
+ * before the guards; `process.binding` and `internalBinding` are unreachable, rows below); a reference to a native
+ * UDP handle held in a symbol-keyed socket state is covered only because the native methods themselves are barred.
+ */
 function watchNetwork(undo: Restore[]): void {
-  swap(net.Socket.prototype, "connect", refuseNetwork, undo);
-  swap(net.Server.prototype, "listen", refuseNetwork, undo);
+  barClassMethods(undo);
+  barNativeUdp(undo);
+  barHandleExports(undo);
+  swap(dgram, "createSocket", refuseNetwork, undo);
+  swap(dgram, "Socket", refuseNetwork, undo);
+  barDnsSurface(dns, refuseNetwork, undo);
+  barDnsSurface(dns.promises, refuseNetworkAsync, undo);
+  barResolver(dns.Resolver, refuseNetwork, undo);
+  barResolver(dns.promises.Resolver, refuseNetworkAsync, undo);
+  swap(inspector, "open", refuseNetwork, undo);
+  const binding = record(process).binding as ((name: string) => unknown) | undefined;
+  if (typeof binding === "function") {
+    swap(
+      process,
+      "binding",
+      function (this: unknown, name: string) {
+        if (NETWORK_BINDINGS.has(name)) {
+          refuseNetwork();
+        }
+        return binding.call(this, name);
+      },
+      undo,
+    );
+  }
 }
 
 /** Installs every guard; returns the function that removes them (the in-process rows). */
