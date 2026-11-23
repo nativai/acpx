@@ -96,6 +96,21 @@ test("C1-b: `<group> help [leaf]` is HELP the caller asked for — exit 0 and th
   );
   assert.equal(strict.status, 0);
   assert.equal(strict.stderr, "");
+  // ... and prints NOTHING to stdout either (brick 3bc340d5: the pin the r3 TE found missing) — the same silence as
+  // `--help` under strict, for the leaf form AND the group form. The plain-json twin prints the help on stdout, so
+  // the empty strict stdout is a property of strict, not of a verb that prints no help at all.
+  assert.equal(strict.stdout, "");
+  assert.notEqual(viaHelp.stdout, "");
+  for (const argv of [
+    ["seats", "help"],
+    ["seats", "reconcile-archive", "--help"],
+    ["people", "help", "list"],
+  ]) {
+    const silent = await runCli(["--format", "json", "--json-strict", ...argv], env, { cwd });
+    assert.equal(silent.status, 0, argv.join(" "));
+    assert.equal(silent.stdout, "", argv.join(" "));
+    assert.equal(silent.stderr, "", argv.join(" "));
+  }
 });
 
 test("C1-b negative: a bare group is STILL the 'needs a subcommand' error (exit 2), and `help <unknown>` names the group", async () => {
