@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
+import { listBuiltInAgents } from "../src/agent-registry.js";
 import { callHomeBudgetMs, CALL_HOME_BUDGET_MS } from "../src/pod/call-home.js";
 import { agentPodEnv, agentPodHome, runCli, snapshot } from "./pod-a3-helpers.js";
 import { startRecordedAtrium } from "./pod-kit/recorded-atrium.js";
@@ -308,4 +309,78 @@ test("F-13: CALL_HOME outcome=unknown advises a plain repeat for a read / idempo
     .error.data;
   assert.equal(otherData.retryable, false);
   assert.equal(typeof otherData.check, "string");
+});
+
+// ---- brick 83cd5b52 (F-20): F-13 for every repeat-safe verb, aliases included -----------------------------------
+
+test("F-13 for `fav rm`, `last-used set` and the `star` / `unstar` aliases: CALL_HOME unknown says repeating is harmless — JSON carries repeat_safe and retryable", async () => {
+  const { home } = agentPodHome();
+  const unknown = async (argv: string[]) => {
+    let out: Awaited<ReturnType<typeof runCli>> | undefined;
+    await withAtrium({ phases: [{ mode: "hang" }] }, async (atrium) => {
+      out = await runCli(
+        argv,
+        agentPodEnv(home, atrium.url, {
+          ...FAST,
+          ACPX_CALL_HOME_ANSWER_TIMEOUT_MS: "700",
+          ACPX_CALL_HOME_BUDGET_MS: "20000",
+          ACPX_CALL_HOME_PROGRESS_MS: "100000",
+        }),
+      );
+    });
+    assert.ok(out);
+    return out;
+  };
+  const ref = "openrouter:acme/model-1";
+  const cases: Array<[string, string[]]> = [
+    ["fav rm", ["models", "fav", "rm", ref]],
+    ["fav unstar (alias of rm)", ["models", "fav", "unstar", ref]],
+    ["fav star (alias of add)", ["models", "fav", "star", ref]],
+    ["last-used set", ["models", "last-used", "set", "--agent", "claude", ref]],
+  ];
+  for (const [name, argv] of cases) {
+    const r = await unknown(argv);
+    assert.equal(r.status, 1, `${name}: ${r.stderr}`);
+    assert.match(r.stderr, /running it again is harmless: repeat it\./u, name);
+    assert.doesNotMatch(
+      r.stderr,
+      /may apply twice|seats show|sessions show|do not simply run it again/u,
+      name,
+    );
+    const json = await unknown(["--format", "json", "--json-strict", ...argv]);
+    const data = (JSON.parse(json.stdout) as { error: { data: Record<string, unknown> } }).error
+      .data;
+    assert.equal(data.repeat_safe, true, name);
+    assert.equal(data.retryable, true, name);
+  }
+  // negative: a control-store verb the table does NOT mark repeatSafe keeps "check first"
+  const other = await unknown(["seats", "rename", "11111111-1111-4111-8111-111111111111", "x"]);
+  assert.match(other.stderr, /may apply twice/u);
+});
+
+test("F-13: every `repeatSafe` entry of the class table is a control-store verb with its aliases classified identically", async () => {
+  const { COMMAND_TABLE, classifyArgv } = await import("../src/pod/command-classes.js");
+  const safe = Object.entries(COMMAND_TABLE).filter(([, entry]) => entry.repeatSafe === true);
+  assert.deepEqual(safe.map(([name]) => name).toSorted(), [
+    "models fav",
+    "models fav add",
+    "models fav rm",
+    "models last-used",
+    "models last-used set",
+  ]);
+  for (const [name, entry] of safe) {
+    assert.equal(entry.class, "control-store", name);
+  }
+  // the aliases resolve to the same table entries (so they inherit the flag)
+  for (const [argv, path] of [
+    [["models", "fav", "star", "x:y"], "models fav add"],
+    [["models", "fav", "unstar", "x:y"], "models fav rm"],
+  ] as const) {
+    const classified = classifyArgv([...argv], { builtInAgents: listBuiltInAgents({}) });
+    assert.equal(
+      classified.kind === "classified" ? classified.path : undefined,
+      path,
+      argv.join(" "),
+    );
+  }
 });

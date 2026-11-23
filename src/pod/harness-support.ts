@@ -38,10 +38,9 @@ export async function invocationAgentCommand(
     return override;
   }
   try {
-    const [{ loadResolvedConfig }, registry] = await Promise.all([
-      import("../cli/config.js"),
-      import("../agent-registry.js"),
-    ]);
+    const [{ loadResolvedConfig, suppressProjectConfigWarningForArgv }, registry] =
+      await Promise.all([import("../cli/config.js"), import("../agent-registry.js")]);
+    suppressProjectConfigWarningForArgv(argv);
     const config = await loadResolvedConfig(flagValue(argv, "--cwd") ?? process.cwd());
     return registry.resolveAgentCommand(
       agent ?? config.defaultAgent ?? registry.DEFAULT_AGENT_NAME,

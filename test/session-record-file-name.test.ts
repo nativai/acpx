@@ -342,6 +342,8 @@ const LIST_SPELLINGS: Readonly<Record<string, string>> = {
     'const EXTS = [".json"];\nexport const f = (n: string) => Array.from(EXTS).some((e) => n.endsWith(e));',
   "F-17 a copy of the list (slice / toSorted)":
     'const EXTS = [".json"];\nexport const f = (n: string) => EXTS.slice().some((e) => n.endsWith(e)) || EXTS.toSorted().some((e) => n.endsWith(e));',
+  "F-25 a `let` WITH an initialiser binds a suffix local too":
+    'import path from "node:path";\nexport const f = (n: string) => {\n  let ext = path.extname(n);\n  return ext === ".json";\n};',
   "F-15 includes on a const list":
     'import path from "node:path";\nconst EXTS = [".json", ".yaml"];\nexport const f = (n: string) => EXTS.includes(path.extname(n));',
   "F-15 has on a const Set":
@@ -358,6 +360,8 @@ const LIST_FILES: Readonly<Record<string, string>> = {
 
 /** Look-alikes that must stay quiet — including the `OUTPUT_FORMATS.includes(value)` shape that over-fired while locals were file-wide. */
 const LIST_CONTROLS: Readonly<Record<string, string>> = {
+  "a `let` assigned AFTER its declaration is NOT a bound local (the named limit)":
+    'import path from "node:path";\nexport const f = (n: string) => {\n  let ext: string;\n  ext = path.extname(n);\n  return ext === ".json";\n};',
   "iterating a non-json suffix list":
     'const EXTS = [".zst", ".ndjson"];\nexport const f = (n: string) => EXTS.some((e) => n.endsWith(e));',
   "includes on a non-json list with an extname":

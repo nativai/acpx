@@ -13,7 +13,7 @@ import { takeAdmissionClassFromEnv } from "./capacity/admission.js";
 import { configurePublicCli } from "./cli-public.js";
 import { handlePrompt } from "./cli/command-handlers.js";
 import { registerAgentCommand, registerDefaultCommands } from "./cli/command-registration.js";
-import { loadResolvedConfig } from "./cli/config.js";
+import { loadResolvedConfig, suppressProjectConfigWarningForArgv } from "./cli/config.js";
 import {
   addGlobalFlags,
   parseAllowedTools,
@@ -571,6 +571,7 @@ export async function main(argv: string[] = process.argv): Promise<void> {
 
   await maybeHandleSkillflag(normalizedArgv);
 
+  suppressProjectConfigWarningForArgv(rawArgs); // before the config load below: strict stderr stays empty (F-23)
   const config = await loadResolvedConfig(detectInitialCwd(rawArgs));
   const requestedJsonStrict = detectJsonStrict(rawArgs);
   // --json-strict promises machine-clean stderr: silence the session-index

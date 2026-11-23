@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
@@ -712,4 +713,136 @@ test("F-19 (SpawnLedger.saveRecord, atrium's in-process writer): an ordinary ado
   } finally {
     ledger.close();
   }
+});
+
+// ---- brick 83cd5b52 (F-20): the committed rows round 2 left out ----------------------------------------------
+
+/** `fs/promises.link` failing with `code` for the lock's own link (`<record>.json.lock` as the target). */
+async function withLockLinkFailure<T>(code: string, run: () => Promise<T>): Promise<T> {
+  const real = fsp.link;
+  fsp.link = ((_existing: unknown, target: unknown, ...rest: unknown[]) => {
+    if (typeof target === "string" && target.endsWith(".json.lock")) {
+      return Promise.reject(Object.assign(new Error(`${code}: link failed`), { code }));
+    }
+    return (real as (...args: unknown[]) => Promise<void>)(_existing, target, ...rest);
+  }) as typeof fsp.link;
+  try {
+    return await run();
+  } finally {
+    fsp.link = real;
+  }
+}
+
+test("F-20 / F-7: the SECOND realpath ALONE (the canonical sessions dir, while the writer's own dir resolves fine) is the retried refusal; ENOENT there is still 'not canonical'", async () => {
+  const f = adoptedAgentPod();
+  const elsewhere = path.join(f.home, "elsewhere-sessions");
+  fs.mkdirSync(elsewhere);
+  const metadata = { spawn_key: f.key };
+  const canonical = path.join(".acpx", "sessions");
+  for (const code of TRANSIENT) {
+    await withRealpathFailure(canonical, code, async () => {
+      assert.throws(
+        () => openSpawnLedgerForRecord(metadata, elsewhere),
+        refusedWith("spawn-state-missing"),
+        code,
+      );
+    });
+  }
+  // negative: the canonical dir MISSING is "not this HOME's sessions directory" — undefined, not a refusal
+  await withRealpathFailure(canonical, "ENOENT", async () => {
+    assert.equal(openSpawnLedgerForRecord(metadata, elsewhere), undefined);
+  });
+  // negative: a permanent errno on the canonical side is not relabelled
+  await withRealpathFailure(canonical, "EACCES", async () => {
+    assert.throws(
+      () => openSpawnLedgerForRecord(metadata, elsewhere),
+      (error) => (error as { code?: string }).code === "EACCES",
+    );
+  });
+  // twin: with no failure a directory that is not the canonical one is simply not spawn-owned here
+  assert.equal(openSpawnLedgerForRecord(metadata, elsewhere), undefined);
+});
+
+test("F-20 / F-8: the lock's LINK step failing (a mount's hiccup, fd pressure) is the retried record-lock-unavailable — nothing written, no temp file left", async () => {
+  const f = adoptedAgentPod();
+  podDeps();
+  const record = { ...parsedRecord(f), lastRequestId: "after link" };
+  const before = f.recordBytes();
+  for (const code of TRANSIENT) {
+    await withLockLinkFailure(code, async () => {
+      await assert.rejects(
+        writeSessionRecord(record),
+        (error) => (error as { code?: string }).code === "record-lock-unavailable",
+        code,
+      );
+    });
+    assert.deepEqual(
+      fs.readdirSync(f.sessions).filter((name) => name.includes(".lock")),
+      [],
+      `no lock temp file left behind after ${code}`,
+    );
+  }
+  assert.equal(f.recordBytes(), before, "nothing written");
+  // negative: a permanent errno on link is not relabelled
+  await withLockLinkFailure("EACCES", async () => {
+    await assert.rejects(
+      writeSessionRecord(record),
+      (error) => (error as { code?: string }).code === "EACCES",
+    );
+  });
+  await writeSessionRecord(record);
+  assert.equal((JSON.parse(f.recordBytes()) as DiskRecord).last_request_id, "after link");
+});
+
+test("F-20 / F-8: REAL fd exhaustion (a child under `ulimit -n`, the kernel's own EMFILE) while taking the record lock is the retried record-lock-unavailable — not a raw errno, nothing written", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-emfile-"));
+  roots.push(dir);
+  const recordFile = path.join(dir, `${ID}.json`);
+  fs.writeFileSync(recordFile, "{}\n");
+  const lockModule = new URL("../src/session/persistence/record-file-lock.js", import.meta.url)
+    .href;
+  const script = `
+    import fs from "node:fs";
+    const { withRecordFileLock } = await import(${JSON.stringify(lockModule)});
+    const hold = [];
+    if (process.env.EXHAUST === "1") {
+      try { for (;;) hold.push(fs.openSync("/dev/null", "r")); } catch (error) { if (error.code !== "EMFILE") throw error; }
+    }
+    let outcome;
+    try { await withRecordFileLock(${JSON.stringify(recordFile)}, async () => undefined); outcome = { ok: true }; }
+    catch (error) { outcome = { ok: false, code: error.code, message: String(error.message) }; }
+    process.stdout.write(JSON.stringify({ ...outcome, held: hold.length }));
+  `;
+  const run = (exhaust: boolean) => {
+    const child = spawnSync(
+      "sh",
+      [
+        "-c",
+        `ulimit -n 64 && exec node --input-type=module -e '${script.replaceAll("'", "'\\''")}'`,
+      ],
+      {
+        env: { ...process.env, EXHAUST: exhaust ? "1" : "0" },
+        encoding: "utf8",
+      },
+    );
+    assert.equal(child.status, 0, child.stderr);
+    return JSON.parse(child.stdout) as {
+      ok: boolean;
+      code?: string;
+      message?: string;
+      held: number;
+    };
+  };
+  const exhausted = run(true);
+  assert.ok(exhausted.held > 0, "positive control: the child really did run out of descriptors");
+  assert.equal(exhausted.ok, false);
+  assert.equal(exhausted.code, "record-lock-unavailable", JSON.stringify(exhausted));
+  assert.match(String(exhausted.message), /\(EMFILE\)/u, "and it names the errno");
+  assert.deepEqual(
+    fs.readdirSync(dir).filter((name) => name.includes(".lock")),
+    [],
+    "no lock temp file left",
+  );
+  // twin: the same child with descriptors to spare takes the lock
+  assert.deepEqual(run(false), { ok: true, held: 0 });
 });
