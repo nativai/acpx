@@ -216,3 +216,24 @@ test("NEGATIVE: `--json-strict` WITHOUT `--format json` is refused (exit 2, noth
     }
   });
 });
+
+test("a `--compress` / `--decompress` refusal keeps its OWN envelope as the single document (no second `{refused}` is added), and is stderr-clean under `--json-strict`", async () => {
+  await withTempHome("acpx-archive-format-", async (home) => {
+    await firstRunHome(home);
+    for (const [flag, action] of [
+      ["--compress", "compress"],
+      ["--decompress", "decompress"],
+    ] as const) {
+      const result = await run(
+        ["--format", "json", "--json-strict", "sessions", "archive", flag, "--all"],
+        home,
+      );
+      assert.equal(result.code, 2, result.stderr);
+      assert.equal(result.stderr, "");
+      const doc = oneDocument(result.stdout);
+      assert.equal(doc.action, action);
+      assert.equal(doc.outcome, "refused");
+      assert.equal(doc.refused, undefined, "not wrapped a second time");
+    }
+  });
+});

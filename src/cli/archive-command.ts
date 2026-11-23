@@ -63,6 +63,8 @@ export const ARCHIVE_EXIT_REFUSED = 2;
  * eadfe315, TE-1e13-3). Set once per process by `handleSessionsArchive`.
  */
 let strictOutput = false;
+/** Errors whose OWN document is already on stdout (the sweeps' refusal envelopes): the entrypoint adds no second one. */
+const documented = new WeakSet<object>();
 function errWrite(text: string): void {
   if (!strictOutput) {
     process.stderr.write(text);
@@ -254,11 +256,9 @@ function resolveArchiveOutput(
   command: Command,
   config: { format?: string } | undefined,
 ): { json: boolean; quiet: boolean; strict: boolean; format: string } {
-  const opts = command.optsWithGlobals() as {
-    format?: unknown;
-    jsonStrict?: unknown;
-    json?: unknown;
-  };
+  // (a caller that hands this exported handler a bare object — `test/session-archive-index.test.ts` does — has no globals)
+  const opts: { format?: unknown; jsonStrict?: unknown; json?: unknown } =
+    typeof command.optsWithGlobals === "function" ? command.optsWithGlobals() : {};
   const format = typeof opts.format === "string" ? opts.format : (config?.format ?? "text");
   const json = opts.json === true || format === "json";
   return { json, quiet: format === "quiet" && !json, strict: opts.jsonStrict === true, format };
@@ -291,7 +291,7 @@ export async function handleSessionsArchive(
 /** A refusal is exit 2 (a `{refused, error}` document under JSON); anything else is a `{error}` document, then rethrown. */
 function reportArchiveError(error: unknown, json: boolean): void {
   if (error instanceof ArchiveRefusal) {
-    if (json) {
+    if (json && !documented.has(error)) {
       writeJson({ refused: true, error: { code: error.code, message: error.message } });
     }
     errWrite(`[acpx] refused: ${error.message}\n`);
@@ -958,6 +958,7 @@ async function runCompressVerb(
   } catch (error) {
     if (error instanceof ArchiveRefusal && flags.json) {
       writeJson(refusalEnvelope("compress", context, error));
+      documented.add(error);
     }
     throw error;
   }
@@ -988,6 +989,7 @@ async function runDecompressVerb(
   } catch (error) {
     if (error instanceof ArchiveRefusal && flags.json) {
       writeJson(refusalEnvelope("decompress", context, error));
+      documented.add(error);
     }
     throw error;
   }
