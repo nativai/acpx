@@ -35,7 +35,6 @@ import {
   deadlineMsFor,
   flagValue,
   RECORD_SERVED_PATHS,
-  utilityKeyAfterPool,
   utilityKeyFor,
   UTILITY_PROBE_DEADLINE_MS,
   UTILITY_RUN_DEADLINE_MS,
@@ -1978,23 +1977,6 @@ test("A-44 row 44.3 (CLI): a Pi one-shot goes home on a box WITHOUT P1's signal 
 // podlab's pool templates carry this annotation (M1 TE, brick f1da52b3): `pool.state` is not `ready`.
 const TEMPLATE_GAPS = { state: "template-gaps:D2-node-selection,M1-state-mounts" };
 const AGENTS_GETS = (r: Rig) => r.broker.requests.filter((q) => q.method === "GET");
-
-test("M1 F-B unit: `utilityKeyAfterPool` moves ONLY the pool key, and only on the broker's positive `home`; a pool answer, an unreadable one and a home key stay as they were", async () => {
-  const where = (answer: "pool" | "home" | undefined) => async () => answer;
-  assert.equal(await utilityKeyAfterPool("util-pool", where("home")), "util-home");
-  assert.equal(await utilityKeyAfterPool("util-pool", where("pool")), "util-pool");
-  assert.equal(await utilityKeyAfterPool("util-pool", where(undefined)), "util-pool");
-  // negative: a home key never asks the broker at all (a home-only harness has nothing to decide)
-  let asked = 0;
-  assert.equal(
-    await utilityKeyAfterPool("util-home", async () => {
-      asked += 1;
-      return "pool";
-    }),
-    "util-home",
-  );
-  assert.equal(asked, 0);
-});
 
 test("M1 F-B unit: while the pool is not ready (broker places home) a Claude one-shot is routed to util-home; ready → util-pool as today; unreadable → util-pool as today", async () => {
   const argv = ["exec", "hi"];

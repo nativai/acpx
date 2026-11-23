@@ -89,7 +89,7 @@ export function utilityKeyFor(
  * broker it cannot read (`waiting-line.ts`), and a ready utility pod needs no broker — `undefined` keeps the
  * key as it was and the broker decides at the POST. Rows: `test/pod-a10-probes.test.ts` "M1 F-B".
  */
-export async function utilityKeyAfterPool(
+async function utilityKeyAfterPool(
   key: UtilityKey,
   where: () => Promise<"pool" | "home" | undefined>,
 ): Promise<UtilityKey> {
