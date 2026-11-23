@@ -503,12 +503,14 @@ const REFUSED_LINES: Refused[] = [
     control: /unknown option/u,
   },
   {
-    name: "F1c: a leaf `--format` on a verb that declares none (exit 1)",
+    // exit 2, not 1, since brick bfbb74e3 (N1): the line asks for JSON (`--format json`), and in json mode a usage
+    // error on a subcommand is the top level's USAGE document (exit 2) instead of commander's silent exit 1.
+    name: "F1c: a leaf `--format` on a verb that declares none (usage, exit 2, the JSON USAGE document)",
     form: {
       name: "leaf-format",
       argv: ["claude", "status", "--session-id", GHOST, "--format", "json"],
     },
-    controlExit: 1,
+    controlExit: 2,
     control: /unknown option/u,
   },
   {
