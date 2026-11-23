@@ -517,7 +517,12 @@ function exportedValues(text: string): string[] {
  * local module, reached as `wt["Worker"]`, or built with `Reflect.construct(Worker, […])`. Also unseen (TE-7115-2):
  * `class T extends Worker`; `new (wt.Worker)(…)`; `new (Worker as any)(…)`; a non-destructured namespace from
  * `await import("node:worker_threads")` / `require(…)`; `import wt = require("node:worker_threads")`;
- * `import("node:worker_threads").then((m) => new m.Worker(…))`.
+ * `import("node:worker_threads").then((m) => new m.Worker(…))`. And (TE-61de-5) the namespace used INLINE, never held —
+ * `new (require("node:worker_threads").Worker)(…)`, `new (await import("node:worker_threads")).Worker(…)`; other callee
+ * wrappers — `new Worker!(…)`, `new (<any>Worker)(…)`, `new wt?.Worker(…)`; a `Worker` taken out of a STATIC namespace by
+ * destructuring (`const { Worker: W } = wt`); and the other ways to start a thread or process that is not `Worker` or
+ * `child_process.fork`: `cluster.fork` / `cluster.setupPrimary({ execArgv })` and `spawn(process.execPath, …)`. The lists above
+ * are EXAMPLES of what is unseen, not its boundary: this scan is a guard against the plain forms, not a proof of absence.
  * None of those is in `src/` today (`grep -rnE` over src/, lows-r3 TE).
  *
  * The KEY is the FULL call text as written, never a prefix, normalised by TOKEN (`normalizedCallText`): an edit anywhere in a
@@ -657,8 +662,14 @@ function unfollowableSites(files: Iterable<[string, string]>): Map<string, numbe
  * VERBATIM; spaces and line breaks between tokens collapse to one space — except a line break that carries meaning, which stays
  * a "\n": the one that ends a `//` comment (collapsing it would pull the next token INTO the comment), and one where
  * automatic semicolon insertion could act (the previous token can end a statement and the next is not a continuer: `return\n x`
- * is not `return x`). A re-wrap after `,` `(` `{` `:` … keys the same; an edit inside a literal or across a comment does not.
+ * is not `return x`; likewise before a block comment, and for CR / U+2028 / U+2029). A re-wrap where whitespace ALREADY separates
+ * the tokens (after `,` `:` or at `{ ` / `( ` that carry a space) keys the same; a break introduced where the one-line form has
+ * NO space — `(` / `[` / `{` against its first token — is a different key (a false red, the safe direction: a re-registration),
+ * and so is an added trailing comma. An edit inside a literal or across a comment is red (TE-61de-4).
  */
+/** The JS line terminators: LF, CR, U+2028, U+2029 (TE-61de-3b: not only "\n"). */
+const LINE_TERMINATOR = /[\n\r\u2028\u2029]/u;
+
 function normalizedCallText(node: ts.Node, sf: ts.SourceFile): string {
   const leaves: ts.Node[] = [];
   const collect = (n: ts.Node): void => {
@@ -716,12 +727,12 @@ function normalizedCallText(node: ts.Node, sf: ts.SourceFile): string {
         while (j < trivia.length && /\s/u.test(trivia[j] ?? "")) {
           j += 1;
         }
-        broke = broke || trivia.slice(i, j).includes("\n");
+        broke = broke || LINE_TERMINATOR.test(trivia.slice(i, j));
         sep = sep === "" ? " " : sep;
         i = j;
       } else if (trivia.startsWith("//", i)) {
-        let j = trivia.indexOf("\n", i);
-        j = j === -1 ? trivia.length : j;
+        let j = trivia.slice(i).search(LINE_TERMINATOR);
+        j = j === -1 ? trivia.length : i + j;
         emit(trivia.slice(i, j), undefined, prevLineComment || broke ? "\n" : " ");
         prevLineComment = true;
         sep = "";
@@ -729,7 +740,12 @@ function normalizedCallText(node: ts.Node, sf: ts.SourceFile): string {
         i = j;
       } else if (trivia.startsWith("/*", i)) {
         const j = trivia.indexOf("*/", i) + 2;
-        emit(trivia.slice(i, j), undefined, " ");
+        // a line break BEFORE a block comment still ends a statement (TE-61de-3a): it must survive the comment
+        emit(
+          trivia.slice(i, j),
+          undefined,
+          broke && prevKind !== undefined && canEnd(prevKind) ? "\n" : " ",
+        );
         prevLineComment = false;
         sep = "";
         broke = false;
@@ -772,19 +788,53 @@ const KNOWN_NON_LEDGER_UNFOLLOWABLE: Readonly<Record<string, number>> = {
 };
 
 /**
- * What an `eval: true` Worker RUNS (brick 61de55d6, TE-7115-3). The call is keyed above; the code it runs is a string constant
- * elsewhere in the file. For each `new Worker(IDENT, …)` whose first argument is an identifier bound to a string / template
- * constant in the same file, return the module loads that source contains — `require("x")` → `require:x`, `import("x")` →
- * `import:x`, `import … from "x"` → `import:x`, and the unfollowable ones (`require(<non-literal>)`, `getBuiltinModule`,
- * `createRequire`, `eval` / `Function`, a nested `new Worker`) by name. A first argument that is not such an identifier (a path,
- * a URL, a call) is returned as `<unresolved: text>`: it is not pinned, so it is red until registered.
+ * What an `eval: true` Worker RUNS (bricks 61de55d6, TE-7115-3 / TE-61de-1 / TE-61de-2). The call is keyed above; the code it
+ * runs is a string constant elsewhere in the file. For each `new Worker(SRC, { eval: true, … })` whose first argument is an
+ * identifier bound — by its ONE `const` declaration in the file, never reassigned — to a string / template constant, this
+ * RESOLVES the source (every `${…}` span is evaluated statically: a numeric or string literal, or an identifier bound to a
+ * `const` of those, recursively), PARSES it as code, and walks the syntax tree:
+ *  - `require("x")` → `require:x`; `import("x")` → `import:x`; `import … from "x"` / `import "x"` → `import:x`;
+ *  - FAIL CLOSED, by name: a `require` that is anything but the callee of a call with ONE string-literal argument (an alias,
+ *    `.call`, `Reflect.apply`, `(0, require)`, `require?.(…)`) → `<non-literal require>`; a non-literal `import()`; a computed
+ *    member `x[expr]` whose key is not a literal; and any identifier, property or string named in `WORKER_DENIED_NAMES`
+ *    (`eval`, `Function`, `getBuiltinModule`, `createRequire`, `binding`, `_load`, `process`, `module`, `globalThis`, `Worker`, …);
+ *  - a span that cannot be resolved, a source that does not parse, a `new Worker` whose first argument is not such a constant
+ *    (a path, a URL, a call, a constant declared twice, a `let`, one assigned elsewhere), or one without `eval: true`, is
+ *    `<unresolved …>` — red until read and registered. A span can be allowed by name in `KNOWN_WORKER_SOURCE_SPANS`.
+ * Because the walk is over the PARSED code, a comment, an escaped identifier (`require`) and `require/**\/(` read as what they are.
  * Keyed `<file> | <IDENT>`, value the sorted list.
+ *
+ * NAMED LIMIT (pinned by its own row): what the call hands the worker through `workerData` is not examined here — the call's key
+ * pins it (an edit of `workerData` is an edit of the call, so red there).
  */
-function workerSourceModules(files: Iterable<[string, string]>): Map<string, string[]> {
+const WORKER_DENIED_NAMES: ReadonlySet<string> = new Set([
+  "eval",
+  "Function",
+  "getBuiltinModule",
+  "createRequire",
+  "binding",
+  "_linkedBinding",
+  "dlopen",
+  "_load",
+  "constructor",
+  "globalThis",
+  "global",
+  "module",
+  "exports",
+  "process",
+  "Reflect",
+  "Worker",
+  "child_process",
+  "node:child_process",
+]);
+
+function workerSourceModules(
+  files: Iterable<[string, string]>,
+  allowedSpans: ReadonlySet<string> = KNOWN_WORKER_SOURCE_SPANS,
+): Map<string, string[]> {
   const found = new Map<string, string[]>();
   for (const [rel, text] of files) {
     const sf = ts.createSourceFile(rel, text, ts.ScriptTarget.Latest, true);
-    const constants = new Map<string, string>();
     const bindWorker = new Set<string>();
     const workerModules = new Set<string>();
     for (const statement of sf.statements) {
@@ -809,63 +859,116 @@ function workerSourceModules(files: Iterable<[string, string]>): Map<string, str
         }
       }
     }
-    const textOfConstant = (init: ts.Expression | undefined): string | undefined => {
-      if (init === undefined) {
+    // every declaration of a name, and every name that is assigned, anywhere in the file
+    const declarations = new Map<string, ts.VariableDeclaration[]>();
+    const assigned = new Set<string>();
+    const gather = (node: ts.Node): void => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+        declarations.set(node.name.text, [...(declarations.get(node.name.text) ?? []), node]);
+      } else if (ts.isBinaryExpression(node) && ts.isIdentifier(node.left)) {
+        const op = node.operatorToken.kind;
+        if (op >= ts.SyntaxKind.FirstAssignment && op <= ts.SyntaxKind.LastAssignment) {
+          assigned.add(node.left.text);
+        }
+      }
+      ts.forEachChild(node, gather);
+    };
+    gather(sf);
+    const constantOf = (name: string): ts.Expression | undefined => {
+      const all = declarations.get(name) ?? [];
+      const only = all.length === 1 ? all[0] : undefined;
+      const list = only?.parent;
+      return only !== undefined &&
+        !assigned.has(name) &&
+        list !== undefined &&
+        ts.isVariableDeclarationList(list) &&
+        (list.flags & ts.NodeFlags.Const) !== 0
+        ? only.initializer
+        : undefined;
+    };
+    /** The static text of an expression, or undefined; `unresolved` collects the spans that could not be evaluated. */
+    const valueOf = (
+      expr: ts.Expression | undefined,
+      unresolved: string[],
+      depth = 0,
+    ): string | undefined => {
+      if (expr === undefined || depth > 8) {
         return undefined;
       }
-      if (ts.isNoSubstitutionTemplateLiteral(init) || ts.isStringLiteral(init)) {
-        return init.text;
+      if (ts.isStringLiteralLike(expr)) {
+        return expr.text;
       }
-      if (ts.isTemplateExpression(init)) {
-        return (
-          init.head.text + init.templateSpans.map((span) => `\${}${span.literal.text}`).join("")
-        );
+      if (ts.isNumericLiteral(expr)) {
+        return expr.text;
+      }
+      if (ts.isParenthesizedExpression(expr)) {
+        return valueOf(expr.expression, unresolved, depth + 1);
+      }
+      if (ts.isIdentifier(expr)) {
+        return valueOf(constantOf(expr.text), unresolved, depth + 1);
+      }
+      if (ts.isTemplateExpression(expr)) {
+        let out = expr.head.text;
+        for (const span of expr.templateSpans) {
+          const value = valueOf(span.expression, unresolved, depth + 1);
+          if (value === undefined) {
+            unresolved.push(span.expression.getText(sf));
+          }
+          out += (value ?? "0") + span.literal.text;
+        }
+        return out;
       }
       return undefined;
     };
-    const visitConstants = (node: ts.Node): void => {
-      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
-        const value = textOfConstant(node.initializer);
-        if (value !== undefined) {
-          constants.set(node.name.text, value);
-        }
-      }
-      ts.forEachChild(node, visitConstants);
-    };
-    visitConstants(sf);
     const loadsOf = (source: string): string[] => {
       const loads = new Set<string>();
-      for (const match of source.matchAll(/\brequire\s*\(\s*(["'`])([^"'`]*)\1\s*\)/gu)) {
-        loads.add(`require:${match[2] ?? ""}`);
+      const code = ts.createSourceFile(
+        "worker.js",
+        source,
+        ts.ScriptTarget.Latest,
+        true,
+        ts.ScriptKind.JS,
+      );
+      const syntaxErrors =
+        (code as unknown as { parseDiagnostics?: unknown[] }).parseDiagnostics ?? [];
+      if (syntaxErrors.length > 0) {
+        loads.add("<unparseable source>");
       }
-      for (const match of source.matchAll(/\bimport\s*\(\s*(["'`])([^"'`]*)\1\s*\)/gu)) {
-        loads.add(`import:${match[2] ?? ""}`);
-      }
-      for (const match of source.matchAll(/\bimport\b[^;(]*?\bfrom\s*(["'`])([^"'`]*)\1/gu)) {
-        loads.add(`import:${match[2] ?? ""}`);
-      }
-      const total = (re: RegExp): number => [...source.matchAll(re)].length;
-      if (total(/\brequire\s*\(/gu) > [...loads].filter((l) => l.startsWith("require:")).length) {
-        loads.add("<non-literal require>");
-      }
-      if (total(/\bimport\s*\(/gu) > [...loads].filter((l) => l.startsWith("import:")).length) {
-        loads.add("<non-literal import>");
-      }
-      for (const [word, re] of [
-        ["getBuiltinModule", /\bgetBuiltinModule\b/u],
-        ["createRequire", /\bcreateRequire\b/u],
-        ["eval", /\beval\s*\(/u],
-        ["Function", /\bFunction\s*\(/u],
-        ["nested Worker", /\bnew\s+Worker\b/u],
-        ["child_process", /\bchild_process\b/u],
-      ] as const) {
-        if (re.test(source)) {
-          loads.add(`<${word}>`);
+      const visit = (node: ts.Node): void => {
+        if (ts.isCallExpression(node)) {
+          const callee = node.expression;
+          const argument = node.arguments[0];
+          if (callee.kind === ts.SyntaxKind.ImportKeyword) {
+            const spec = node.arguments.length === 1 ? stringOf(argument) : undefined;
+            loads.add(spec === undefined ? "<non-literal import>" : `import:${spec}`);
+          } else if (ts.isIdentifier(callee) && callee.text === "require") {
+            const spec = node.arguments.length === 1 ? stringOf(argument) : undefined;
+            loads.add(spec === undefined ? "<non-literal require>" : `require:${spec}`);
+          }
+        } else if (ts.isImportDeclaration(node)) {
+          loads.add(`import:${stringOf(node.moduleSpecifier) ?? "?"}`);
+        } else if (ts.isIdentifier(node) && node.text === "require") {
+          // legal only as the callee of a literal call (handled above): anything else is an alias
+          const parent = node.parent;
+          if (!(ts.isCallExpression(parent) && parent.expression === node)) {
+            loads.add("<non-literal require>");
+          }
+        } else if (ts.isElementAccessExpression(node)) {
+          const key = node.argumentExpression;
+          if (!(ts.isStringLiteralLike(key) || ts.isNumericLiteral(key))) {
+            loads.add("<computed member>");
+          }
         }
-      }
+        const named = ts.isIdentifier(node) || ts.isStringLiteralLike(node) ? node.text : undefined;
+        if (named !== undefined && WORKER_DENIED_NAMES.has(named)) {
+          loads.add(`<${named}>`);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(code);
       return [...loads].toSorted();
     };
-    const visit = (node: ts.Node): void => {
+    const walk = (node: ts.Node): void => {
       if (
         ts.isNewExpression(node) &&
         ((ts.isIdentifier(node.expression) && bindWorker.has(node.expression.text)) ||
@@ -875,22 +978,45 @@ function workerSourceModules(files: Iterable<[string, string]>): Map<string, str
             workerModules.has(node.expression.expression.text)))
       ) {
         const first = node.arguments?.[0];
-        const source =
-          first !== undefined && ts.isIdentifier(first) ? constants.get(first.text) : undefined;
-        if (first !== undefined && ts.isIdentifier(first) && source !== undefined) {
-          found.set(`${rel} | ${first.text}`, loadsOf(source));
+        const options = node.arguments?.[1];
+        const evalTrue =
+          options !== undefined &&
+          ts.isObjectLiteralExpression(options) &&
+          options.properties.some(
+            (property) =>
+              ts.isPropertyAssignment(property) &&
+              (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name)) &&
+              property.name.text === "eval" &&
+              property.initializer.kind === ts.SyntaxKind.TrueKeyword,
+          );
+        const unresolved: string[] = [];
+        const source = first !== undefined && evalTrue ? valueOf(first, unresolved) : undefined;
+        const label =
+          first !== undefined && ts.isIdentifier(first) ? first.text : "<inline source>";
+        if (source === undefined) {
+          found.set(
+            `${rel} | <unresolved: ${first ? normalizedCallText(first, sf) : ""}${evalTrue ? "" : " (no eval: true — a file path)"}>`,
+            ["<unresolved>"],
+          );
         } else {
-          found.set(`${rel} | <unresolved: ${first ? normalizedCallText(first, sf) : ""}>`, [
-            "<unresolved>",
-          ]);
+          const loads = loadsOf(source);
+          for (const span of unresolved) {
+            if (!allowedSpans.has(`${rel} | ${label} | ${span}`)) {
+              loads.push(`<unresolved span: ${span}>`);
+            }
+          }
+          found.set(`${rel} | ${label}`, loads.toSorted());
         }
       }
-      ts.forEachChild(node, visit);
+      ts.forEachChild(node, walk);
     };
-    visit(sf);
+    walk(sf);
   }
   return found;
 }
+
+/** Template spans of a registered Worker source that cannot be evaluated statically but were READ and allowed: `<file> | <IDENT> | <span text>`. */
+const KNOWN_WORKER_SOURCE_SPANS: ReadonlySet<string> = new Set<string>();
 
 /** The module loads of each Worker source in `src/` today, READ: the capacity governor's /proc readers use node built-ins only — never the ledger. */
 const KNOWN_WORKER_SOURCE_MODULES: Readonly<Record<string, readonly string[]>> = {
@@ -1429,4 +1555,228 @@ test("K4-2 / TE-7115-1: the call key is normalised by TOKEN — an edit inside a
     keyOf("new Worker(S, { eval: true, x: 1 });"),
   );
   // …and the registered real call still keys as registered (the registry test above covers the whole of src/)
+});
+
+/** The real scan.ts text, and what `workerSourceModules` / `unfollowableSites` say of an edited copy. */
+const SCAN_REL = "capacity/governor/scan.ts";
+/** U+2028 / U+2029, built — never typed — so the file holds no raw line separators. */
+const LS = String.fromCharCode(0x2028);
+const PS = String.fromCharCode(0x2029);
+const scanSource = (): string => [...srcFiles(SRC)].find(([file]) => file === SCAN_REL)?.[1] ?? "";
+const workerLoads = (text: string): Record<string, string[]> =>
+  Object.fromEntries(
+    [...workerSourceModules([[SCAN_REL, text]]).entries()].toSorted(([a], [b]) =>
+      a.localeCompare(b),
+    ),
+  );
+const registeredLoads = (): Record<string, string[]> =>
+  Object.fromEntries(
+    Object.entries(KNOWN_WORKER_SOURCE_MODULES).map(([key, value]) => [key, [...value]]),
+  );
+const ANCHOR = 'const fs = require("node:fs");';
+const LEDGER_REQ = 'require("../capacity/ledger.js")';
+
+test("K4-2 / TE-61de-1,2: EVERY way the TE found to change what READER_SOURCE loads — a template span, an aliased or escaped `require`, `process.binding`, indirect eval, `module.constructor._load`, a shadowing decoy, `let … +=` — turns the module pin red, with the call key unchanged", () => {
+  const source = scanSource();
+  const registered = registeredLoads();
+  assert.equal(
+    source.split(ANCHOR).length - 1,
+    1,
+    "the anchor is unique in the real READER_SOURCE",
+  );
+  assert.deepEqual(workerLoads(source), registered, "control: the real file IS the registry");
+  const callKeys = (text: string): string[] =>
+    [...unfollowableSites([[SCAN_REL, text]]).keys()].toSorted();
+  const inside = (code: string): string => source.replace(ANCHOR, `${ANCHOR}\n${code}`);
+  const edits: Array<[string, string]> = [
+    // what the TE-7115-3 row already holds, now read from the syntax tree
+    ["L1 literal require", inside(`const l = ${LEDGER_REQ};`)],
+    ["L2 bare import", inside('import "../capacity/ledger.js";')],
+    ["L2b import-from", inside('import x from "../capacity/ledger.js";')],
+    ["L3 dynamic import", inside('import("../capacity/ledger.js");')],
+    ["L4 getBuiltinModule", inside('process.getBuiltinModule("node:module");')],
+    [
+      "L4b bracket-built getBuiltinModule",
+      inside('process["getBuiltin" + "Module"]("node:module");'),
+    ],
+    [
+      "L5 module.constructor.createRequire",
+      inside('module.constructor.createRequire(__filename)("../capacity/ledger.js");'),
+    ],
+    // the TE's hidden forms
+    ["L6 process.binding", inside('process.binding("fs");')],
+    ["L6b process.dlopen", inside('process.dlopen(module, "x");')],
+    ["L7 aliased require", inside(`const r = require; r("../capacity/ledger.js");`)],
+    ["L7b require.call", inside('require.call(null, "../capacity/ledger.js");')],
+    ["L7c Reflect.apply", inside('Reflect.apply(require, null, ["../capacity/ledger.js"]);')],
+    ["L7d (0, require)", inside('(0, require)("../capacity/ledger.js");')],
+    ["L7e require?.()", inside('require?.("../capacity/ledger.js");')],
+    ["L7f require/**/(", inside('require/**/("../capacity/ledger.js");')],
+    ["L7g escaped identifier", inside(String.raw`\\u0072equire("../capacity/ledger.js");`)],
+    [
+      "L7h module.constructor._load",
+      inside('module.constructor._load("../capacity/ledger.js", module);'),
+    ],
+    ["L8 eval-built require", inside('eval("req" + "uire")("../capacity/ledger.js");')],
+    ["L8b indirect eval", inside('(0, eval)("req" + "uire")("../capacity/ledger.js");')],
+    ["L8c new Function", inside('new Function("return req" + "uire")()("../capacity/ledger.js");')],
+    ["L8d constructor chain", inside('[].constructor.constructor("return 1")();')],
+    ["L8e globalThis[...]", inside('globalThis["req" + "uire"]("../capacity/ledger.js");')],
+    ["L10 template specifier", inside('require(`../capacity/${"ledger"}.js`);')],
+    ["L14 require(workerData.x)", inside("require(workerData.preload);")],
+    // template SPANS (TE-61de-1)
+    ["L9 span holding a string literal of code", inside(`\${'${LEDGER_REQ};'}`)],
+    [
+      "L9b span holding a const",
+      source
+        .replace(
+          "const READER_SOURCE = `",
+          `const LEDGER = '${LEDGER_REQ};';\nconst READER_SOURCE = \``,
+        )
+        .replace(ANCHOR, `${ANCHOR}\n\${LEDGER}`),
+    ],
+    [
+      "L9c span holding a const of a const (nested template)",
+      source
+        .replace(
+          "const READER_SOURCE = `",
+          `const INNER = '${LEDGER_REQ};';\nconst OUTER = \`\${INNER}\`;\nconst READER_SOURCE = \``,
+        )
+        .replace(ANCHOR, `${ANCHOR}\n\${OUTER}`),
+    ],
+    ["L9d span that cannot be resolved (a call)", inside("${compute()}")],
+    ["L9e span that cannot be resolved (a property)", inside("${options.nice}")],
+    // the declaration games (TE-61de-2)
+    [
+      "L11 shadowing decoy declaration",
+      `${source}\nfunction decoy() { const READER_SOURCE = \`const x = 1;\`; return READER_SOURCE; }\n`,
+    ],
+    [
+      "L12 let + `+=`",
+      `${source.replace("const READER_SOURCE = `", "let READER_SOURCE = `")}\nREADER_SOURCE += '${LEDGER_REQ}';\n`,
+    ],
+    ["L12b const reassigned", `${source}\nREADER_SOURCE += '${LEDGER_REQ}';\n`],
+    [
+      "L13 initializer is no longer a plain template",
+      source.replace("const READER_SOURCE = `", 'const READER_SOURCE = "" + `'),
+    ],
+    [
+      "L15 no `eval: true`: the argument is a file path",
+      source.replace("eval: true,", "eval: false,"),
+    ],
+  ];
+  for (const [what, edited] of edits) {
+    assert.notEqual(edited, source, `the edit applied: ${what}`);
+    assert.notDeepEqual(workerLoads(edited), registered, `${what}: is NOT green`);
+  }
+  // the pure LOAD edits leave the call key where it was — which is why the call registry could not see them
+  for (const [what, edited] of edits.slice(0, 23)) {
+    assert.deepEqual(callKeys(edited), callKeys(source), `${what}: the call key is unchanged`);
+  }
+  // controls: a comment (even one that SAYS require(...)), spacing, a renamed local — are not loads
+  const controls: Array<[string, string]> = [
+    ["a comment naming a ledger require", inside(`// never ${LEDGER_REQ}`)],
+    ["a block comment", inside(`/* ${LEDGER_REQ} */`)],
+    ["extra spacing", source.replace(ANCHOR, 'const   fs   =   require( "node:fs" );')],
+    [
+      "a string that merely contains the words",
+      inside('const note = "see ../capacity/ledger.js";'),
+    ],
+  ];
+  for (const [what, edited] of controls) {
+    assert.notEqual(edited, source, `the control edit applied: ${what}`);
+    assert.deepEqual(workerLoads(edited), registered, `${what}: stays green`);
+  }
+});
+
+test("K4-2 / TE-61de-1: a template span that cannot be evaluated is red UNLESS it is named in the allowlist; spans that resolve (numbers, strings, consts of consts) are SCANNED, not skipped", () => {
+  const head = 'import { Worker } from "node:worker_threads";\n';
+  const loads = (body: string, allowed?: ReadonlySet<string>): string[] =>
+    [...workerSourceModules([["x.ts", head + body]], allowed).values()].flat();
+  // resolved spans: a number is fine, a string const is scanned
+  assert.deepEqual(
+    loads(
+      'const N = 3;\nconst S = `require("node:fs"); post(${N});`;\nnew Worker(S, { eval: true });',
+    ),
+    ["require:node:fs"],
+  );
+  assert.deepEqual(
+    loads(
+      'const C = "require(\\"../capacity/ledger.js\\")";\nconst S = `${C};`;\nnew Worker(S, { eval: true });',
+    ),
+    ["require:../capacity/ledger.js"],
+    "a span that carries a require is read",
+  );
+  // an unresolvable span is red, and the allowlist names it
+  const body = 'const S = `require("node:fs"); ${compute()}`;\nnew Worker(S, { eval: true });';
+  assert.deepEqual(loads(body), ["<unresolved span: compute()>", "require:node:fs"]);
+  assert.deepEqual(loads(body, new Set(["x.ts | S | compute()"])), ["require:node:fs"]);
+  assert.deepEqual(
+    loads(body, new Set(["x.ts | S | somethingElse()"])),
+    ["<unresolved span: compute()>", "require:node:fs"],
+    "an allowlist entry for a DIFFERENT span does not cover it",
+  );
+  // a span bound to something that is not a const literal fails closed too
+  assert.deepEqual(
+    loads('let N = 1;\nconst S = `require("node:fs"); ${N}`;\nnew Worker(S, { eval: true });'),
+    ["<unresolved span: N>", "require:node:fs"],
+  );
+  // the real READER_SOURCE has spans, and every one of them resolves (nothing is allowlisted today)
+  assert.equal(KNOWN_WORKER_SOURCE_SPANS.size, 0);
+  assert.ok(scanSource().includes("${SEQ}"), "the real source has spans");
+  assert.deepEqual(workerLoads(scanSource()), registeredLoads());
+});
+
+test("K4-2 / TE-61de-2: the NAMED limit — what the call hands the worker through `workerData` is not read by the module pin, so it is pinned by the CALL's key: an edit of `workerData` is red there and green here", () => {
+  const source = scanSource();
+  const edited = source.replace(
+    "workerData: { ctl,",
+    'workerData: { preload: "../capacity/ledger.js", ctl,',
+  );
+  assert.notEqual(edited, source, "the edit applied");
+  assert.deepEqual(
+    workerLoads(edited),
+    registeredLoads(),
+    "the module pin does not see workerData",
+  );
+  const registeredKeys = Object.fromEntries(
+    Object.entries(KNOWN_NON_LEDGER_UNFOLLOWABLE).filter(([key]) =>
+      key.startsWith(`${SCAN_REL} | `),
+    ),
+  );
+  assert.deepEqual(
+    Object.fromEntries(unfollowableSites([[SCAN_REL, source]])),
+    registeredKeys,
+    "control",
+  );
+  assert.notDeepEqual(
+    Object.fromEntries(unfollowableSites([[SCAN_REL, edited]])),
+    registeredKeys,
+    "the call's own key is red",
+  );
+});
+
+test("K4-2 / TE-61de-3: ASI — a line break before a block comment survives, and a lone CR, U+2028 and U+2029 are line terminators (the TE's T1, T1b, T2, T2b probes)", () => {
+  const head = 'import { Worker } from "node:worker_threads";\n';
+  const keyOf = (body: string): string[] =>
+    [...unfollowableSites([["x.ts", head + body]]).keys()].map((key) => key.split(" | ")[2] ?? "");
+  const wrap = (inner: string): string => `new Worker(S, { f: () => { ${inner} } });`;
+  const differ = (a: string, b: string, what: string): void => {
+    assert.equal(keyOf(wrap(a)).length, 1, `${what}: the call is found`);
+    assert.notDeepEqual(keyOf(wrap(a)), keyOf(wrap(b)), `${what}: is NOT green`);
+  };
+  differ("return\n /* x */ 1;", "return /* x */ 1;", "T1 a break before a block comment");
+  differ(
+    "return /* a */\n/* b */ 1;",
+    "return /* a */ /* b */ 1;",
+    "T1b a break between two block comments",
+  );
+  differ(`return${LS}1;`, "return 1;", "T2 U+2028");
+  differ(`return${PS}1;`, "return 1;", "U+2029");
+  differ("return\r1;", "return 1;", "T2b a lone CR");
+  differ("a = 1; // note\r b = 2;", "a = 1; // note b = 2;", "a lone CR ends a line comment");
+  differ(`a = 1; // note${LS} b = 2;`, "a = 1; // note b = 2;", "U+2028 ends a line comment");
+  // controls: a comment with the SAME spacing keys the same, and a break after `,` is a re-wrap
+  assert.deepEqual(keyOf(wrap("return /* x */ 1;")), keyOf(wrap("return  /* x */   1;")));
+  assert.deepEqual(keyOf(wrap("f(a,\r\n b);")), keyOf(wrap("f(a, b);")));
 });

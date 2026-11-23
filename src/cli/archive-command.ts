@@ -41,6 +41,8 @@ import { resolveBoundaries, type ArchivePlan } from "../session/archive/retentio
 import { catArchivedFile, thawArchivedSession, thawErrorJson } from "../session/archive/thaw.js";
 import { sessionBaseDir } from "../session/persistence/repository.js";
 import { seatArchiveReportLines } from "../session/persistence/seat-archive.js";
+import type { ResolvedAcpxConfig } from "./config.js";
+import { resolveGlobalFlags } from "./flags.js";
 
 /**
  * `acpx sessions archive` / `acpx sessions restore`.
@@ -250,35 +252,33 @@ async function readExcludeIdsFile(file: string | undefined): Promise<Set<string>
 
 /**
  * The global output flags, honoured like the other verbs: `--format json` is this verb's `--json`; `--format quiet` prints one
- * id per line for the run verb (the ids moved, or that would move); `--json-strict` needs `--format json`.
+ * id per line (the run verb: the ids moved or that would move; `restore`: the ids restored); `--json-strict` needs
+ * `--format json` — without it the answer is the CLI's own USAGE document (`resolveGlobalFlags` throws it, exactly as for every
+ * other verb), never a verb-local line. Sets the process-wide strict flag.
  */
 function resolveArchiveOutput(
   command: Command,
-  config: { format?: string } | undefined,
-): { json: boolean; quiet: boolean; strict: boolean; format: string } {
-  // (a caller that hands this exported handler a bare object — `test/session-archive-index.test.ts` does — has no globals)
-  const opts: { format?: unknown; jsonStrict?: unknown; json?: unknown } =
-    typeof command.optsWithGlobals === "function" ? command.optsWithGlobals() : {};
-  const format = typeof opts.format === "string" ? opts.format : (config?.format ?? "text");
-  const json = opts.json === true || format === "json";
-  return { json, quiet: format === "quiet" && !json, strict: opts.jsonStrict === true, format };
+  config: ResolvedAcpxConfig | undefined,
+  localJson: boolean,
+): { json: boolean; quiet: boolean } {
+  // (a caller that hands these exported handlers a bare object — `test/session-archive-index.test.ts` does — has no globals)
+  const real = typeof command.optsWithGlobals === "function" && config !== undefined;
+  const global = real ? resolveGlobalFlags(command, config) : undefined;
+  const format = global?.format ?? "text";
+  strictOutput = global?.jsonStrict === true;
+  const json = localJson || format === "json";
+  return { json, quiet: format === "quiet" && !json };
 }
 
 export async function handleSessionsArchive(
   rawFlags: SessionsArchiveFlags,
   command: Command,
-  config?: { format?: string },
+  config?: ResolvedAcpxConfig,
 ): Promise<void> {
-  const output = resolveArchiveOutput(command, config);
-  if (output.strict && output.format !== "json") {
-    process.stderr.write("[acpx] refused: --json-strict requires --format json\n");
-    process.exitCode = ARCHIVE_EXIT_REFUSED;
-    return;
-  }
-  strictOutput = output.strict;
+  const output = resolveArchiveOutput(command, config, rawFlags.json === true);
   const flags: SessionsArchiveFlags = {
     ...rawFlags,
-    json: rawFlags.json === true || output.json,
+    json: output.json,
     quietOutput: output.quiet,
   };
   try {
@@ -501,14 +501,15 @@ async function runArchiveVerb(
     // Resolved from the STATED intent, never from a default — see resolveRunIntent.
     dryRun: intent === "dry-run",
     allowFirstRun: flags.allowFirstRun === true || process.env.ACPX_ARCHIVE_ALLOW_FIRST_RUN === "1",
-    // a JSON document has no "above"
+    // a JSON document, and a quiet run, have no plan "above"
     ...(flags.json ? { planRef: "the `plan` field" } : {}),
+    ...(flags.quietOutput ? { planRef: "the plan (see it with --dry-run, or --format json)" } : {}),
   });
 
   if (flags.json) {
     writeJson(archiveRunJson(context, result, intent));
   } else if (flags.quietOutput) {
-    writeArchiveRunQuiet(result);
+    writeArchiveRunQuiet(result, intent);
   } else {
     writeArchiveRunText(context, result);
   }
@@ -589,11 +590,16 @@ function archiveRunJson(
   };
 }
 
-/** `--format quiet`: the ids this run moved (apply) or would move (dry run), one per line; warnings on stderr. */
-function writeArchiveRunQuiet(result: ArchiveRunResult): void {
-  const ids = result.applied
-    ? result.moved.map((entry) => entry.id)
-    : result.plan.selected.map((entry) => entry.candidate.id);
+/**
+ * `--format quiet`: an APPLY prints the ids it MOVED, a dry run the ids that WOULD move — one per line; warnings on stderr.
+ * So a held first-run apply (it moved nothing) prints no ids: its stdout can never be mistaken for a real apply's (brick
+ * d2026e20, TE-eadf-3). The held state is on stderr (the warning) and in the exit code's company, `applied` of the JSON form.
+ */
+function writeArchiveRunQuiet(result: ArchiveRunResult, intent: "dry-run" | "apply"): void {
+  const ids =
+    intent === "apply"
+      ? result.moved.map((entry) => entry.id)
+      : result.plan.selected.map((entry) => entry.candidate.id);
   if (ids.length > 0) {
     process.stdout.write(`${ids.join("\n")}\n`);
   }
@@ -883,6 +889,10 @@ async function runCatVerb(flags: SessionsArchiveFlags): Promise<number> {
     if (!isThawFailure(error)) {
       throw error;
     }
+    if (flags.json) {
+      // ONE document for the refusal (TE-eadf-1); a text caller keeps its stderr line
+      writeJson({ refused: true, error: { code: error.code ?? "error", message: error.message } });
+    }
     errWrite(`[acpx] ${error.message}\n`);
     return ARCHIVE_EXIT_REFUSED;
   }
@@ -1098,29 +1108,44 @@ async function runReindexVerb(
 export async function handleSessionsRestore(
   ids: string[],
   flags: { json?: boolean },
+  command?: Command,
+  config?: ResolvedAcpxConfig,
 ): Promise<void> {
+  // `restore` honours the global --format json / quiet and --json-strict exactly as `archive` does (TE-eadf-2)
+  const output = command
+    ? resolveArchiveOutput(command, config, flags.json === true)
+    : { json: flags.json === true, quiet: false };
   const context = createContext(sessionBaseDir(), "restore");
   warnIfDetached(context);
   try {
     const result = await runRestore(context, ids);
-    if (flags.json) {
+    if (output.json) {
       writeJson(result);
+    } else if (output.quiet) {
+      writeRestoreQuiet(result);
     } else {
       writeRestoreText(result);
     }
     const problems = result.skipped.length + result.failures.length;
     process.exitCode = problems > 0 ? ARCHIVE_EXIT_PROBLEMS : ARCHIVE_EXIT_OK;
   } catch (error) {
-    const refusal = asRestoreRefusal(error);
-    if (!refusal) {
-      writeUnexpectedErrorJson(flags.json === true, error);
-      throw error;
-    }
-    if (flags.json) {
-      writeJson({ refused: true, error: { code: refusal.code, message: refusal.message } });
-    }
-    errWrite(`[acpx] refused: ${refusal.message}\n`);
-    process.exitCode = ARCHIVE_EXIT_REFUSED;
+    reportArchiveError(asRestoreRefusal(error) ?? error, output.json);
+  }
+}
+
+/** `--format quiet`: the ids restored, one per line; what was skipped or failed, and the warnings, on stderr. */
+function writeRestoreQuiet(result: Awaited<ReturnType<typeof runRestore>>): void {
+  if (result.restored.length > 0) {
+    process.stdout.write(`${result.restored.map((entry) => entry.id).join("\n")}\n`);
+  }
+  for (const skipped of result.skipped) {
+    errWrite(`[acpx] skipped ${skipped.id}: ${skipped.reason}\n`);
+  }
+  for (const failure of result.failures) {
+    errWrite(`[acpx] FAILED ${failure.id} ${failure.file}: ${failure.error} — run --repair\n`);
+  }
+  for (const warning of result.warnings) {
+    errWrite(`[acpx] ⚠ ${warning}\n`);
   }
 }
 

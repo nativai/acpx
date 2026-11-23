@@ -202,18 +202,151 @@ test("`--json-strict` also silences the DETACHED-archive-dir warning that text m
   });
 });
 
-test("NEGATIVE: `--json-strict` WITHOUT `--format json` is refused (exit 2, nothing on stdout), as every other verb refuses it", async () => {
+/** The CLI's own USAGE document — what every other verb answers to `--json-strict` without `--format json` (bfbb74e3). */
+function assertUsageDocument(result: Run, what: string): void {
+  assert.equal(result.code, 2, `${what}: ${result.stderr}`);
+  assert.equal(result.stderr, "", `${what}: stderr is empty`);
+  const doc = oneDocument(result.stdout);
+  const error = doc.error as { code?: unknown; message?: unknown; data?: { acpxCode?: unknown } };
+  assert.equal(error.code, -32602, what);
+  assert.equal(error.message, "--json-strict requires --format json", what);
+  assert.equal(error.data?.acpxCode, "USAGE", what);
+}
+
+test("NEGATIVE: `--json-strict` WITHOUT `--format json` answers with the CLI's USAGE document on stdout and an EMPTY stderr (exit 2) — for `archive` and `restore`, exactly as `sessions list` does (TE-eadf-5; this row used to pin a stderr line)", async () => {
   await withTempHome("acpx-archive-format-", async (home) => {
     await firstRunHome(home);
     for (const args of [
       ["--json-strict", "sessions", "archive", "--dry-run"],
       ["--format", "quiet", "--json-strict", "sessions", "archive", "--dry-run"],
+      ["--json-strict", "sessions", "restore", ID],
+      ["--format", "quiet", "--json-strict", "sessions", "restore", ID],
     ]) {
+      assertUsageDocument(await run(args, home), args.join(" "));
+    }
+    // control: the same mistake on a verb that is not ours gives the SAME document
+    assertUsageDocument(await run(["--json-strict", "sessions", "list"], home), "sessions list");
+  });
+});
+
+test("`archive --cat` of a file that is not there: a refusal emits ONE document under `--format json` and `--json-strict` (stderr empty under strict); the text form keeps its stderr line (TE-eadf-1)", async () => {
+  await withTempHome("acpx-archive-format-", async (home) => {
+    await firstRunHome(home);
+    await fs.mkdir(path.join(home, ".acpx", "sessions-archive"), { recursive: true });
+    const text = await run(["sessions", "archive", "--cat", "nope.json"], home);
+    assert.equal(text.code, 2, text.stderr);
+    assert.equal(text.stdout, "", "control: text mode writes no document");
+    assert.match(text.stderr, /nope\.json is absent/u);
+    for (const strict of [false, true]) {
+      const args = [
+        "--format",
+        "json",
+        ...(strict ? ["--json-strict"] : []),
+        "sessions",
+        "archive",
+        "--cat",
+        "nope.json",
+      ];
       const result = await run(args, home);
       assert.equal(result.code, 2, result.stderr);
-      assert.equal(result.stdout, "");
-      assert.match(result.stderr, /--json-strict requires --format json/u);
+      const doc = oneDocument(result.stdout);
+      assert.equal(doc.refused, true);
+      assert.equal((doc.error as { code?: unknown }).code, "absent");
+      if (strict) {
+        assert.equal(result.stderr, "", "strict: stderr empty");
+      }
     }
+  });
+});
+
+/** Archive the planted record for real, so there is something to restore. */
+async function archivedRecordHome(home: string): Promise<void> {
+  await firstRunHome(home, true);
+  const archived = await run(["sessions", "archive", "--apply", "--allow-first-run"], home);
+  assert.equal(archived.code, 0, archived.stderr);
+  await fs.stat(path.join(home, ".acpx", "sessions-archive", `${ID}.json`));
+}
+
+test("`sessions restore` honours `--format json`, `--format quiet` and `--json-strict` like `archive`: one document / the ids, and an empty stderr under strict — success and refusal (TE-eadf-2)", async () => {
+  // each format restores its OWN freshly archived record (a restored record is inside the restore grace window)
+  await withTempHome("acpx-archive-format-", async (home) => {
+    await archivedRecordHome(home);
+    const ok = await run(["--format", "json", "--json-strict", "sessions", "restore", ID], home);
+    assert.equal(ok.code, 0, ok.stderr);
+    assert.equal(ok.stderr, "", "strict: stderr empty");
+    const doc = oneDocument(ok.stdout);
+    assert.deepEqual(
+      (doc.restored as Array<{ id: string }>).map((entry) => entry.id),
+      [ID],
+    );
+    await fs.stat(path.join(home, ".acpx", "sessions", `${ID}.json`)); // it really came back
+  });
+  await withTempHome("acpx-archive-format-", async (home) => {
+    await archivedRecordHome(home);
+    const quiet = await run(["--format", "quiet", "sessions", "restore", ID], home);
+    assert.equal(quiet.code, 0, quiet.stderr);
+    assert.equal(quiet.stdout, `${ID}\n`);
+  });
+  await withTempHome("acpx-archive-format-", async (home) => {
+    await archivedRecordHome(home);
+    const text = await run(["sessions", "restore", ID], home);
+    assert.match(
+      text.stdout,
+      new RegExp(`^restored ${ID} \\(`, "u"),
+      "control: the text form is unchanged",
+    );
+  });
+  await withTempHome("acpx-archive-format-empty-", async (home) => {
+    await fs.mkdir(path.join(home, ".acpx", "sessions"), { recursive: true }); // no archive dir at all
+    for (const strict of [false, true]) {
+      const result = await run(
+        ["--format", "json", ...(strict ? ["--json-strict"] : []), "sessions", "restore", ID],
+        home,
+      );
+      assert.equal(result.code, 2, result.stderr);
+      const doc = oneDocument(result.stdout);
+      assert.equal(doc.refused, true);
+      assert.equal((doc.error as { code?: unknown }).code, "no-archive");
+      if (strict) {
+        assert.equal(result.stderr, "", "strict: a refusal leaks nothing to stderr");
+      }
+    }
+  });
+});
+
+test("under `--format quiet` a HELD first-run `--apply` prints NO ids — a real apply prints the ids it moved, so the two can never be mistaken; a dry run prints what WOULD move (TE-eadf-3)", async () => {
+  await withTempHome("acpx-archive-format-", async (home) => {
+    await firstRunHome(home, true);
+    const held = await run(["--format", "quiet", "sessions", "archive", "--apply"], home);
+    assert.equal(held.code, 0, held.stderr);
+    assert.equal(held.stdout, "", "held: nothing was moved, so no id is printed");
+    assert.match(
+      held.stderr,
+      /--apply was honoured, but D2 first-run gating held it/u,
+      "the held state is on stderr",
+    );
+    await assert.rejects(fs.stat(path.join(home, ".acpx", "sessions-archive")), "nothing moved");
+    const dry = await run(["--format", "quiet", "sessions", "archive", "--dry-run"], home);
+    assert.equal(dry.stdout, `${ID}\n`, "a dry run lists what would move (held or not)");
+    const real = await run(
+      ["--format", "quiet", "sessions", "archive", "--apply", "--allow-first-run"],
+      home,
+    );
+    assert.equal(real.stdout, `${ID}\n`, "a real apply prints the id it moved");
+    assert.notEqual(held.stdout, real.stdout, "the two are distinguishable");
+  });
+});
+
+test("the quiet run's stderr warning does not point at a plan 'above' that was never printed, and JSON still names the `plan` field (TE-eadf-4)", async () => {
+  await withTempHome("acpx-archive-format-", async (home) => {
+    await firstRunHome(home);
+    for (const intent of ["--dry-run", "--apply"]) {
+      const quiet = await run(["--format", "quiet", "sessions", "archive", intent], home);
+      assert.doesNotMatch(quiet.stderr, /plan above/u, intent);
+      assert.match(quiet.stderr, /see it with --dry-run, or --format json/u, intent);
+    }
+    const json = await run(["--format", "json", "sessions", "archive", "--dry-run"], home);
+    assert.doesNotMatch(json.stdout, /plan above/u);
   });
 });
 

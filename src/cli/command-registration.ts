@@ -376,7 +376,7 @@ export function registerSessionsCommand(
     )
     .option("--json", "Machine-readable output")
     .action(async function (this: Command, ids: string[], flags: { json?: boolean }) {
-      await handleSessionsRestore(ids, flags);
+      await handleSessionsRestore(ids, flags, this, config);
     });
 
   sessionsCommand

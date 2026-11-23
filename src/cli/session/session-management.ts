@@ -691,6 +691,7 @@ async function createSessionRecordWithClient(
   let sessionModels: SessionCreateResult["models"];
   let modelApply: ModelApplyOutcome = { applied: false };
   let deferForkModel: string | undefined;
+  let deferForkEffort = false;
   let effectiveSessionOptions = options.sessionOptions;
   let forkContext:
     | {
@@ -719,6 +720,7 @@ async function createSessionRecordWithClient(
     sessionModels = forked.sessionModels;
     modelApply = forked.modelApply;
     deferForkModel = forked.deferForkModel;
+    deferForkEffort = forked.durableClaudeForkApplied;
     forkContext = forked.forkContext;
   } else {
     effectiveSessionOptions = withDefaultModelForNewSession(
@@ -880,6 +882,13 @@ async function createSessionRecordWithClient(
     modelId: effectiveSessionOptions?.model,
     timeoutMs: options.timeoutMs,
     verbose: options.verbose,
+    // brick 94d01658: the effort counterpart of `deferForkModel`. A live set on a
+    // durable Claude fork's id fails in the creating adapter (measured:
+    // `-32603 … Failed to resume forked session … for config op`), and the old
+    // catch turned that into a recorded `default` — every by-the-way copy ran at
+    // the settings tier instead of its source's effort. Persist now; the
+    // open-time replay applies it on the first turn.
+    deferApply: deferForkEffort,
   });
   // brick://874fee67: validate + persist the requested style. NOTE there is no
   // apply step and that is deliberate (R-6 #1) — the style already reached the
@@ -1116,6 +1125,9 @@ type ForkedSessionState = CreatedSessionState & {
   // Set when the eager creation-time set_model was skipped for a durable Claude
   // fork; the source model to persist onto the record for open-time replay.
   deferForkModel?: string;
+  // The same fact for effort: the fork's id is not adapter-registered yet, so the
+  // creation-time effort set is deferred to the open-time replay (brick 94d01658).
+  durableClaudeForkApplied: boolean;
   forkContext: {
     sourceRecord: SessionRecord;
     forkAtMessageIndex: number;
@@ -1346,7 +1358,11 @@ async function resolveForkModelApplication(
   options: SessionCreateOptions,
   forkedSession: SessionCreateResult | SessionForkResult,
   sessionModels: SessionCreateResult["models"],
-): Promise<{ modelApply: ModelApplyOutcome; deferForkModel: string | undefined }> {
+): Promise<{
+  modelApply: ModelApplyOutcome;
+  deferForkModel: string | undefined;
+  durableClaudeForkApplied: boolean;
+}> {
   // Only forkSession (forkAtMessageIndex > 0) can carry the marker; the
   // createSession branch (index 0) is a fresh empty session.
   const durableClaudeForkApplied =
@@ -1355,7 +1371,11 @@ async function resolveForkModelApplication(
     // `sessionOptions.model` is the canonical model acpx already resolved for the
     // copy (via copySessionOptionsWithOverride); the record setters normalize it,
     // and it is the value the open-time replay + adapter model resolution agree on.
-    return { modelApply: { applied: false }, deferForkModel: options.sessionOptions?.model };
+    return {
+      modelApply: { applied: false },
+      deferForkModel: options.sessionOptions?.model,
+      durableClaudeForkApplied,
+    };
   }
   return {
     modelApply: await applyRequestedModelIfAdvertised({
@@ -1368,6 +1388,7 @@ async function resolveForkModelApplication(
       timeoutMs: options.timeoutMs,
     }),
     deferForkModel: undefined,
+    durableClaudeForkApplied,
   };
 }
 
@@ -1415,12 +1436,8 @@ async function forkSessionRecordWithClient(
           );
     const sessionModels = forkedSession.models;
     const agentSessionId = normalizeRuntimeSessionId(forkedSession.agentSessionId);
-    const { modelApply, deferForkModel } = await resolveForkModelApplication(
-      client,
-      options,
-      forkedSession,
-      sessionModels,
-    );
+    const { modelApply, deferForkModel, durableClaudeForkApplied } =
+      await resolveForkModelApplication(client, options, forkedSession, sessionModels);
     return {
       sessionId: forkedSession.sessionId,
       acpSessionId: forkedSession.sessionId,
@@ -1429,6 +1446,7 @@ async function forkSessionRecordWithClient(
       sessionModels,
       modelApply,
       deferForkModel,
+      durableClaudeForkApplied,
       forkContext: {
         sourceRecord,
         forkAtMessageIndex,
