@@ -530,6 +530,14 @@ function createProgram(requestedJsonStrict: boolean): Command {
  * message "(outputHelp)", which in json mode became the USAGE document's whole message and told the caller
  * nothing. It now names the group and what it needs (brick 4a34f245). Same code, same exit — only the words.
  */
+function helpError(command: Command, error: CommanderError): CommanderError {
+  // commander exits 0 for help the caller ASKED for (`<group> help [leaf]`) and 1 for a bare group with no action.
+  // The first is a success — the same as `--help` — not "<leaf> needs a subcommand" (brick acf6a89c, C1-b).
+  return error.exitCode === 0
+    ? new CommanderError(0, "commander.helpDisplayed", error.message)
+    : bareGroupError(command, error);
+}
+
 function bareGroupError(group: Command, error: CommanderError): CommanderError {
   const names: string[] = [];
   for (let node: Command | null = group; node?.parent; node = node.parent) {
@@ -553,17 +561,24 @@ function bareGroupError(group: Command, error: CommanderError): CommanderError {
  * creation, so a subcommand without its own exit callback called `process.exit(1)` itself, past the error
  * handler the top level already has (N1, brick bfbb74e3). In json mode every subcommand that has no callback of its
  * own now throws to `handleProgramParseError` — the SAME JSON-RPC USAGE document, exit 2, as the same mistake at
- * the top level. A command that set its own callback (people, capacity) keeps it. Text mode is untouched.
+ * the top level. A command that set its own callback (people, capacity) keeps it for everything but help, which
+ * is wrapped too (a bare `people` said "(outputHelp)" — C1-a). Text mode is untouched.
  */
 function routeSubcommandUsageErrors(program: Command): void {
   const visit = (command: Command): void => {
     for (const child of command.commands) {
       // commander's default is `null` (it only tests truthiness), so "has none" is falsy, not `=== undefined`
-      if (!Reflect.get(child, "_exitCallback")) {
-        child.exitOverride((error) => {
-          throw error.code === "commander.help" ? bareGroupError(child, error) : error;
-        });
-      }
+      const original: unknown = Reflect.get(child, "_exitCallback");
+      child.exitOverride((error) => {
+        if (error.code === "commander.help") {
+          throw helpError(child, error);
+        }
+        // a command with its OWN callback (people, capacity) keeps it for everything but the help case
+        if (typeof original === "function") {
+          (original as (error: CommanderError) => void)(error);
+        }
+        throw error;
+      });
       visit(child);
     }
   };

@@ -72,13 +72,37 @@ function withInheritedFormat(command: Command, flags: ModelsFlags): ModelsFlags 
   if (flags.json === true || flags.format !== undefined) {
     return flags;
   }
+  return inheritedJson(command) ? { ...flags, format: "json" } : flags;
+}
+
+/** The config file's `format: json`, set by the `preAction` hook (`registerModelsCommand` holds the config). */
+let configFormatJson = false;
+
+/**
+ * Whether an ANCESTOR (the `models` parent, the program) or the config file asks for json, the nearest explicit
+ * word winning: a `--format text` on the `models` parent beats a program-level json. The config file is the last
+ * resort, as it is for every other verb (`resolveGlobalFlags`; C2-a, brick acf6a89c).
+ */
+function inheritedJson(command: Command): boolean {
   for (let ancestor = command.parent; ancestor; ancestor = ancestor.parent) {
     const opts = ancestor.opts<{ format?: string; json?: boolean }>();
-    if (opts.json === true || opts.format === "json") {
-      return { ...flags, format: "json" };
+    if (opts.json === true) {
+      return true;
+    }
+    if (opts.format !== undefined) {
+      return opts.format === "json";
     }
   }
-  return flags;
+  return configFormatJson;
+}
+
+/** The format `command` is really run with: its OWN word first (`--json`, `--format`), then `inheritedJson`. */
+function runsAsJson(command: Command): boolean {
+  const own = command.opts<{ format?: string; json?: boolean }>();
+  if (own.json === true) {
+    return true;
+  }
+  return own.format === undefined ? inheritedJson(command) : own.format === "json";
 }
 
 /** Only the two formats this verb actually renders; `quiet` would have no meaning here. */
@@ -798,6 +822,12 @@ function handleLastUsedSet(agentType: string, key: string): void {
     );
   }
   getUiPrefsStore().setLastUsedModel(agent, `${parsed.source}:${parsed.id}`);
+  if (jsonOutputRequested) {
+    out(
+      `${JSON.stringify({ action: "last-used-set", agentType: agent, modelKey: `${parsed.source}:${parsed.id}` })}\n`,
+    );
+    return;
+  }
   out(`  last-used for ${agent} is now ${parsed.source}:${parsed.id} on ${boxLabel()}\n`);
 }
 
@@ -815,9 +845,7 @@ async function handleFavWrite(
   // would strand it forever.
   if (action === "rm" && parsed.source) {
     store.removeFavorite(parsed.source, parsed.id);
-    out(
-      `  ☆ unstarred ${parsed.source}:${parsed.id} — ${store.listFavorites().length} favorites on ${boxLabel()}\n`,
-    );
+    reportFavWrite("fav-rm", `${parsed.source}:${parsed.id}`, store.listFavorites().length);
     return;
   }
 
@@ -825,13 +853,27 @@ async function handleFavWrite(
   const model = resolveOne(catalogue, ref);
   if (action === "add") {
     store.addFavorite(model.source, model.id);
-    out(`  ★ starred ${model.key} — ${store.listFavorites().length} favorites on ${boxLabel()}\n`);
+    reportFavWrite("fav-add", model.key, store.listFavorites().length);
   } else {
     store.removeFavorite(model.source, model.id);
-    out(
-      `  ☆ unstarred ${model.key} — ${store.listFavorites().length} favorites on ${boxLabel()}\n`,
-    );
+    reportFavWrite("fav-rm", model.key, store.listFavorites().length);
   }
+}
+
+/**
+ * The success line of `fav add` / `fav rm`: the text line, or — when the verb runs as json (C2-d, brick acf6a89c)
+ * — ONE document, so a strict caller's stdout is JSON on success as it is on failure.
+ */
+function reportFavWrite(action: "fav-add" | "fav-rm", key: string, favorites: number): void {
+  if (jsonOutputRequested) {
+    out(`${JSON.stringify({ action, key, favorited: action === "fav-add", favorites })}\n`);
+    return;
+  }
+  out(
+    action === "fav-add"
+      ? `  ★ starred ${key} — ${favorites} favorites on ${boxLabel()}\n`
+      : `  ☆ unstarred ${key} — ${favorites} favorites on ${boxLabel()}\n`,
+  );
 }
 
 // ── Registration ─────────────────────────────────────────────────────────────
@@ -860,15 +902,18 @@ export function registerModelsCommand(parent: Command, config: ResolvedAcpxConfi
   modelsCommand.hook("preAction", (_command, action) => {
     const opts = action.optsWithGlobals();
     jsonStrictRequested = opts.jsonStrict === true;
-    jsonOutputRequested =
-      opts.json === true ||
-      opts.format === "json" ||
-      withInheritedFormat(action, {}).format === "json";
+    configFormatJson = config.format === "json";
+    jsonOutputRequested = runsAsJson(action);
     // `--json-strict` needs `--format json` on EVERY verb; `models` alone used to print its text table instead of
-    // refusing. The same message, document and exit code as `resolveGlobalFlags` gives the others (a config-file
-    // `format: json` counts, as it does there).
-    if (jsonStrictRequested && !jsonOutputRequested && config.format !== "json") {
+    // refusing. The same messages, document and exit code as `resolveGlobalFlags` gives the others, in its order:
+    // the format first — judged on the format the verb REALLY runs with, so a leaf `--format text` under an
+    // ancestor json is the same conflict (C2-b) and a config-file `format: json` counts (C2-a) — then `--verbose`
+    // (C2-c).
+    if (jsonStrictRequested && !jsonOutputRequested) {
       throw new InvalidArgumentError("--json-strict requires --format json");
+    }
+    if (jsonStrictRequested && opts.verbose === true) {
+      throw new InvalidArgumentError("--json-strict cannot be combined with --verbose");
     }
   });
 
