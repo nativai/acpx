@@ -355,9 +355,11 @@ test("38465e2c: a CHECKPOINT write of a body round-trips the conversation (why t
   });
 });
 
-test("38465e2c: a BOUNDARY write of a body erases the conversation (why nothing may)", async () => {
+test("38465e2c / A-60: a BOUNDARY write of a body no longer erases the conversation — compaction keeps the file's own tail (it used to rewrite the log from the body's empty memory)", async () => {
   await withTempHome("acpx-scan-", async () => {
     await seed([{ acpxRecordId: "a" }]);
+    const before = await messagesOnDisk("a");
+    assert.ok(before > 0, "the seeded record has a conversation");
     const previous = process.env.ACPX_MESSAGES_LOG_COMPACT_BYTES;
     // Compaction runs only past the threshold (32 MB); lower it so this small log is past it.
     process.env.ACPX_MESSAGES_LOG_COMPACT_BYTES = "1";
@@ -370,6 +372,6 @@ test("38465e2c: a BOUNDARY write of a body erases the conversation (why nothing 
         process.env.ACPX_MESSAGES_LOG_COMPACT_BYTES = previous;
       }
     }
-    assert.equal(await messagesOnDisk("a"), 0);
+    assert.equal(await messagesOnDisk("a"), before);
   });
 });

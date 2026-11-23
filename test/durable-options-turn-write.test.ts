@@ -336,10 +336,13 @@ test("the same for an injected prompt's own prompt-start write", async () => {
     const lockPath = `${file}.lock`;
     await fs.writeFile(lockPath, "{}");
     midTurnHandler?.([makeTask("req-inj", INJECTED_PROMPT_TEXT, INJ)]);
-    await waitFor(async () => await logHas(logPath, INJ), "the injection's log append");
+    // Since A-60 (C3.5 (i)) the log append happens INSIDE the record lock, so a write parked on the lock
+    // has appended nothing yet: let the injection's write reach the lock, plant the set, then release.
+    await sleep(300);
     await plantSets(file, "New", "low");
     await fs.rm(lockPath, { force: true });
     await injectedInFlight.promise;
+    await waitFor(async () => await logHas(logPath, INJ), "the injection's log append");
 
     control.resolveMainPrompt({ stopReason: "end_turn" });
     injectedRelease.resolve({ stopReason: "end_turn" });

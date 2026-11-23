@@ -1188,7 +1188,10 @@ test("A-18 negative: when the CUT's own entry moved (the turn's user message is 
   assert.deepEqual(after.acpx.sleeping, planBefore, "the plan is unchanged");
 });
 
-test("A-18 negative (the fixture premise): an owner that IDLE-RELEASES after a hand-written in-progress turn persists its own record over it — which is why the A-18 rows switch release off", async () => {
+test("A-60 (the A-18 fixture premise, inverted): an owner that IDLE-RELEASES after a hand-written in-progress turn leaves that inline tail in place", async () => {
+  // Before A-60 the released owner's persist replaced another writer's inline entries with its own
+  // (none), which is why the A-18 rows switch the release off. C3.5 (i): a write publishes only its own
+  // unfinished inline entries and keeps every other as it finds it on disk.
   const f = makeBox({ requestMib: 4000 });
   Object.assign(f.env, { ACPX_OWNER_IDLE_RELEASE_MS: "10000" });
   const source = await warmTarget(f, 1);
@@ -1206,13 +1209,16 @@ test("A-18 negative (the fixture premise): an owner that IDLE-RELEASES after a h
   assert.equal((readRecord(f, source) as PlanRecord).messages?.length, 2, "the fixture's write");
   // Ordering, not a clock: the owner logs the release line, then persists and exits.
   const deadline = Date.now() + 120_000;
-  let after = (readRecord(f, source) as PlanRecord).messages?.length;
-  while (after !== 0 && Date.now() < deadline) {
+  while (!logged() && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 250));
-    after = (readRecord(f, source) as PlanRecord).messages?.length;
   }
   assert.ok(logged(), "the owner released");
-  assert.equal(after, 0, "the released owner's persist replaced the hand-written inline tail");
+  await new Promise((resolve) => setTimeout(resolve, 3_000)); // its persist and exit
+  assert.equal(
+    (readRecord(f, source) as PlanRecord).messages?.length,
+    2,
+    "the released owner's persist left the hand-written inline tail alone",
+  );
 });
 
 test("A-18 negative: a cut whose last entry is a COMPLETED agent entry (the turn is over) is not moved", async () => {
