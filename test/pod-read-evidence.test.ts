@@ -15,8 +15,10 @@ import {
   toldEvents,
 } from "../src/pod/target-verdict.js";
 import { resolveSessionRecord } from "../src/session/persistence.js";
+import { serializeSessionRecordForDisk } from "../src/session/persistence/serialize.js";
 import { agentPodEnv, agentPodHome, CLI, runCli, type ChildRun } from "./pod-a3-helpers.js";
 import { startRecordedAtrium } from "./pod-kit/recorded-atrium.js";
+import { makeSessionRecord } from "./runtime-test-helpers.js";
 
 // K5 round 4 follow-ups (brick 3543498a; source: the K5R4 TE round 2, brick 46b827ba). Three guarantees of the armed
 // verdict child's READ EVIDENCE (`src/pod/armed-guards.ts`) that no row could fail on:
@@ -200,11 +202,23 @@ function assertDoorRefusal(run: ChildRun): void {
   assert.doesNotMatch(run.stdout + run.stderr, /does not parse|Session not found/u);
 }
 
-async function podStatusOfSeatWithTruncatedSeatFile(blind: boolean): Promise<ChildRun> {
+async function podStatusOfSeatWithTruncatedSeatFile(
+  blind: boolean,
+  seatFile: "file" | "symlink-out" = "file",
+): Promise<ChildRun> {
   const atriumHome = await makeHome(); // atrium's store: the seat is nowhere in it
   const { home } = agentPodHome();
   await fs.mkdir(sessionsOf(home), { recursive: true });
-  await fs.writeFile(path.join(sessionsOf(home), "seats.json"), '{"2222');
+  if (seatFile === "file") {
+    await fs.writeFile(path.join(sessionsOf(home), "seats.json"), '{"2222');
+  } else {
+    // the seat file is ITSELF a symlink, under its canonical name, to a truncated file outside the store
+    await fs.writeFile(path.join(home, "elsewhere-seats.json"), '{"2222');
+    await fs.symlink(
+      path.join(home, "elsewhere-seats.json"),
+      path.join(sessionsOf(home), "seats.json"),
+    );
+  }
   const entry = path.join(
     await fs.mkdtemp(path.join(os.tmpdir(), "acpx-evidence-entry-")),
     "blind.mjs",
@@ -227,6 +241,10 @@ async function podStatusOfSeatWithTruncatedSeatFile(blind: boolean): Promise<Chi
 
 test("F2 seat file (end to end): a pod's `status --seat` with a truncated pod-local seats.json ends in the door's refusal", async () => {
   assertDoorRefusal(await podStatusOfSeatWithTruncatedSeatFile(false));
+});
+
+test("F2 seat file (end to end, FIX ROUND 1): a pod-local seats.json that is ITSELF a symlink out of the store, read by its canonical path, still ends in the door's refusal (the realpath-only comparison relayed the complaint)", async () => {
+  assertDoorRefusal(await podStatusOfSeatWithTruncatedSeatFile(false, "symlink-out"));
 });
 
 test("F2 seat file (end to end, the row can fail): with seats.json reads routed past the evidence in the real child, the pod RELAYS the pod-local file's complaint — and the row's own check throws", async () => {
@@ -518,8 +536,8 @@ const SPELLINGS: Spelling[] = [
     },
   },
   {
-    name: "NOT a store file, though it LOOKS like one after folding: `sessions/link/../<id>.json` where the link points OUT of the store",
-    expectFlagged: false,
+    name: "LOOKS like a store file after folding (`sessions/link/../<id>.json`, the link points OUT of the store) but is not: flagged all the same — an over-flag, the safe direction (the door's refusal), the price of watching the lexical spelling too",
+    expectFlagged: true,
     setup: async (home) => {
       await fs.mkdir(path.join(home, "elsewhere", "deep"), { recursive: true });
       await fs.writeFile(path.join(home, "elsewhere", `${ID}.json`), TRUNCATED_RECORD);
@@ -530,6 +548,52 @@ const SPELLINGS: Spelling[] = [
       return {
         read: () => fs.readFile(`${sessionsOf(home)}/outbound/../${ID}.json`, "utf8"),
       };
+    },
+  },
+  {
+    name: "the RECORD is itself a symlink to a truncated file OUT of the store, read by its canonical path",
+    expectFlagged: true,
+    setup: async (home) => {
+      await fs.writeFile(path.join(home, "target.json"), TRUNCATED_RECORD);
+      await fs.symlink(path.join(home, "target.json"), record(home));
+      return { read: () => fs.readFile(record(home), "utf8") };
+    },
+  },
+  {
+    name: "seats.json is itself a symlink to a truncated file OUT of the store, read by its canonical path",
+    expectFlagged: true,
+    setup: async (home) => {
+      await fs.writeFile(path.join(home, "target.json"), '{"2222');
+      await fs.symlink(path.join(home, "target.json"), path.join(sessionsOf(home), "seats.json"));
+      return { read: () => fs.readFile(path.join(sessionsOf(home), "seats.json"), "utf8") };
+    },
+  },
+  {
+    name: "index.json is itself a symlink to a truncated file OUT of the store (another target name), read by its canonical path",
+    expectFlagged: true,
+    setup: async (home) => {
+      await fs.writeFile(path.join(home, "elsewhere-index.txt"), '{"entries":[');
+      await fs.symlink(
+        path.join(home, "elsewhere-index.txt"),
+        path.join(sessionsOf(home), "index.json"),
+      );
+      return { read: () => fs.readFile(path.join(sessionsOf(home), "index.json"), "utf8") };
+    },
+  },
+  {
+    name: "NO false positive: a whole record read through a symlinked home is not flagged",
+    expectFlagged: false,
+    setup: async (home) => {
+      const whole = makeSessionRecord({
+        acpxRecordId: ID,
+        acpSessionId: "acp-whole",
+        agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+        cwd: home,
+      });
+      await fs.writeFile(record(home), `${JSON.stringify(serializeSessionRecordForDisk(whole))}\n`);
+      const link = `${home}-link`;
+      await fs.symlink(home, link);
+      return { read: () => fs.readFile(record(link), "utf8") };
     },
   },
 ];

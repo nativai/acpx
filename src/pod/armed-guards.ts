@@ -197,22 +197,34 @@ function realPathOf(raw: string): string {
   }
 }
 
-/** Is this path a store file whose content decides a lookup? Evaluated per call: the store is where the env says. */
+/** The kind of store file `resolved` is, if its directory is the (hot or archive) store directory as spelled by `hot`/`archive`. */
+function kindIn(resolved: string, hot: string, archive: string): StoreKind | undefined {
+  const dir = path.dirname(resolved);
+  const base = path.basename(resolved);
+  if (dir === hot) {
+    return hotKindOf(base);
+  }
+  return dir === archive && isSessionRecordFileName(base) ? "record" : undefined;
+}
+
+/**
+ * Is this path a store file whose content decides a lookup? Evaluated per call: the store is where the env says.
+ * ⚠️ EITHER spelling counts: the path as written (folded lexically) OR its real path. The real path alone misses a store
+ * file that is ITSELF a symlink out of the store, read by its canonical name (its real path is elsewhere); the lexical
+ * spelling alone misses every alias of the reader. Over-flagging is the safe direction (the door's refusal); under-flagging
+ * is a wrong not-found. Held by the "store file is a symlink OUT of the store" rows in `test/pod-read-evidence.test.ts`.
+ */
 function storeKindOf(file: unknown): StoreKind | undefined {
   const raw = rawPathOf(file);
   if (raw === undefined) {
     return undefined;
   }
-  const resolved = realPathOf(raw);
-  const dir = path.dirname(resolved);
-  const base = path.basename(resolved);
   const hot = sessionBaseDir();
-  if (dir === realPathOf(hot)) {
-    return hotKindOf(base);
-  }
-  return dir === realPathOf(sessionArchiveDirFor(hot)) && isSessionRecordFileName(base)
-    ? "record"
-    : undefined;
+  const archive = sessionArchiveDirFor(hot);
+  return (
+    kindIn(path.resolve(raw), hot, archive) ??
+    kindIn(realPathOf(raw), realPathOf(hot), realPathOf(archive))
+  );
 }
 
 function hotKindOf(base: string): StoreKind | undefined {
