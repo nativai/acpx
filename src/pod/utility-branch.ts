@@ -276,6 +276,7 @@ async function liveUtilityDeps(): Promise<UtilityDeps> {
       if (override) {
         return override;
       }
+      configModule.suppressProjectConfigWarningForArgv(argv);
       const config = await configModule.loadResolvedConfig(
         flagValue(argv, "--cwd") ?? process.cwd(),
       );

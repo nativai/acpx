@@ -10,10 +10,13 @@ async function handleConfigShow(command: Command, config: ResolvedAcpxConfig): P
       global: config.globalPath,
       project: config.projectPath,
     },
+    // `loaded.project` is whether the project file was READ: a control-role host ignores it, so it is false there
+    // (N2), and `ignored.project` says why — the only signal a `--json-strict` caller gets (F-23 silenced the warning).
     loaded: {
       global: config.hasGlobalConfig,
-      project: config.hasProjectConfig,
+      project: config.hasProjectConfig && config.projectConfigIgnored !== true,
     },
+    ...(config.projectConfigIgnored === true ? { ignored: { project: "control-pod" } } : {}),
   };
 
   if (globalFlags.format === "json") {

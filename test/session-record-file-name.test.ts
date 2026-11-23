@@ -342,6 +342,8 @@ const LIST_SPELLINGS: Readonly<Record<string, string>> = {
     'const EXTS = [".json"];\nexport const f = (n: string) => Array.from(EXTS).some((e) => n.endsWith(e));',
   "F-17 a copy of the list (slice / toSorted)":
     'const EXTS = [".json"];\nexport const f = (n: string) => EXTS.slice().some((e) => n.endsWith(e)) || EXTS.toSorted().some((e) => n.endsWith(e));',
+  "F-25 a `let` WITH an initialiser binds a suffix local too":
+    'import path from "node:path";\nexport const f = (n: string) => {\n  let ext = path.extname(n);\n  return ext === ".json";\n};',
   "F-15 includes on a const list":
     'import path from "node:path";\nconst EXTS = [".json", ".yaml"];\nexport const f = (n: string) => EXTS.includes(path.extname(n));',
   "F-15 has on a const Set":
@@ -385,6 +387,33 @@ test("CONFORMANCE NEGATIVE (F-14/F-15): a suffix test through a constant list is
 test("CONFORMANCE (F-14/F-15): the old line-based scan saw NONE of the constant-list forms — red on yesterday's scan", () => {
   for (const [name, text] of Object.entries(LIST_SPELLINGS)) {
     assert.equal(legacyCatches(text), false, `the old scan already caught: ${name}`);
+  }
+});
+
+/**
+ * NAMED ESCAPES — real suffix tests the scan does NOT see, listed in the header of `sessions-dir-scan.ts`. They are
+ * NOT look-alikes (so not in LIST_CONTROLS, where "stays quiet" would read as "is correct"): this row pins that
+ * each one still escapes, so closing one turns it red and moves it to SPELLINGS (brick bfbb74e3, F20-a).
+ */
+const NAMED_ESCAPES: Readonly<Record<string, string>> = {
+  "a `let` assigned AFTER its declaration":
+    'import path from "node:path";\nexport const f = (n: string) => {\n  let ext: string;\n  ext = path.extname(n);\n  return ext === ".json";\n};',
+};
+
+test("NAMED ESCAPES (F20-a): each documented escape is a real `.json` suffix test the scan does not see — closing one must move it to SPELLINGS", () => {
+  for (const [name, text] of Object.entries(NAMED_ESCAPES)) {
+    assert.deepEqual(
+      scanFresh({ "fresh.ts": text }),
+      [],
+      `now seen — move it to SPELLINGS: ${name}`,
+    );
+    // it IS a suffix test: the same shape with the initialiser on the declaration is seen
+    assert.equal(
+      scanFresh({ "fresh.ts": text.replace("let ext: string;\n  ext = ", "const ext = ") })
+        .length >= 1,
+      true,
+      `the control shape is not a suffix test: ${name}`,
+    );
   }
 });
 

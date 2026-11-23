@@ -53,12 +53,21 @@ export type ResolvedAcpxConfig = {
   globalPath: string;
   projectPath: string;
   hasGlobalConfig: boolean;
+  /** The project config file EXISTS (whether or not it was read — see `projectConfigIgnored`). */
   hasProjectConfig: boolean;
+  /**
+   * The project config file exists but was NOT read: on a control-role host it is workbench-writable, so it is
+   * ignored (`readProjectConfigFile`). Since F-23 `--json-strict` prints no warning, so `config show` must say it
+   * (brick bfbb74e3, N2). Absent ≡ false.
+   */
+  projectConfigIgnored?: boolean;
 };
 
 type ConfigFileLoadResult = {
   config?: ConfigFileShape;
   exists: boolean;
+  /** Present on a file that exists but was deliberately not read. */
+  ignored?: boolean;
 };
 
 const DEFAULT_TIMEOUT_MS = undefined;
@@ -92,6 +101,29 @@ function projectConfigPath(cwd: string): string {
 
 const warnedIgnoredProjectConfigs = new Set<string>();
 
+let projectConfigWarningSuppressed = false;
+
+/**
+ * `--json-strict` promises an EMPTY stderr (and stdout only the document). On a control-role host a project
+ * `.acpxrc.json` is ignored with a one-line warning on stderr — so a strict invocation must not print it.
+ * SUPPRESSED rather than moved into the JSON document: the config is ignored either way (nothing a caller
+ * could act on differently), JSON documents have no shared envelope to carry a warning (a new field on every
+ * command's document is a contract change), and text and plain `--format json` still say it (F-23, brick
+ * 9a49e76f). Called by every entry that loads config before the command runs.
+ */
+export function suppressProjectConfigWarningForArgv(argv: readonly string[]): void {
+  projectConfigWarningSuppressed = false;
+  for (const token of argv) {
+    if (token === "--") {
+      return;
+    }
+    if (token === "--json-strict" || token.startsWith("--json-strict=")) {
+      projectConfigWarningSuppressed = true;
+      return;
+    }
+  }
+}
+
 async function readProjectConfigFile(projectPath: string): Promise<ConfigFileLoadResult> {
   if (!isControlPod()) {
     return readConfigFile(projectPath);
@@ -106,13 +138,13 @@ async function readProjectConfigFile(projectPath: string): Promise<ConfigFileLoa
     }
     throw error;
   }
-  if (!warnedIgnoredProjectConfigs.has(projectPath)) {
+  if (!warnedIgnoredProjectConfigs.has(projectPath) && !projectConfigWarningSuppressed) {
     process.stderr.write(
       `acpx: ignoring project config ${JSON.stringify(projectPath)} on the control pod; use control-only global config or explicit CLI options.\n`,
     );
     warnedIgnoredProjectConfigs.add(projectPath);
   }
-  return { exists: true };
+  return { exists: true, ignored: true };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -404,6 +436,7 @@ export async function loadResolvedConfig(cwd: string): Promise<ResolvedAcpxConfi
     projectPath,
     hasGlobalConfig: globalResult.exists,
     hasProjectConfig: projectResult.exists,
+    ...(projectResult.ignored === true ? { projectConfigIgnored: true } : {}),
   };
 }
 

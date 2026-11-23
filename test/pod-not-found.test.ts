@@ -1086,6 +1086,16 @@ test("judgeChild: the relay rule, case by case — only a confirmed, finished, n
       result({ stderr: "", events: `${confirmed}{"event":"verdict"}\n${exited(2)}`, status: 2 }),
       undefined,
     ],
+    [
+      "a json-mode USAGE error (exit 2, JSON-RPC -32602 acpxCode USAGE on stdout, no verdict event) IS the control pod's answer and is RELAYED — a judge that read exit 2 as 'refused' would be red here",
+      result({
+        status: 2,
+        stdout: `${JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32602, message: "error: unknown option '--format'", data: { acpxCode: "USAGE", origin: "cli", sessionId: "unknown" } } })}\n`,
+        stderr: "",
+        events: `${confirmed}${exited(2)}`,
+      }),
+      undefined,
+    ],
     ["a spawn error / timeout", result({ error: "ETIMEDOUT", status: null }), "child-ETIMEDOUT"],
     ["killed by a signal", result({ status: null, signal: "SIGKILL" }), "child-signal"],
     [
@@ -1806,3 +1816,43 @@ test("F2 (the race can fail): the SAME loop WITHOUT the read evidence relays a w
     `no wrong not-found in ${control.lookups} lookups without the evidence: the race does not bite here, so the row above proves nothing`,
   );
 });
+
+// ---- F1c (bfbb74e3 / N1): a leaf `--format` on a verb that declares none — the USAGE document, measured on the control pod ----
+
+for (const [format, expectation] of [
+  ["json", "exit 2 and the JSON-RPC -32602 USAGE document on stdout"],
+  ["text", "exit 1 (text mode is unchanged)"],
+] as const) {
+  test(`F1c (${format}): a leaf \`--format\` on \`claude status\` (a verb that declares none) — the control pod gives ${expectation}; the pod's answer is the child's, byte-equal (the usage error is met before the lookup)`, async () => {
+    const argv =
+      format === "json"
+        ? ["--format", "json", "claude", "status", "--session-id", GHOST, "--format", "json"]
+        : ["claude", "status", "--session-id", GHOST, "--format", "text"];
+    const rigged = await bothAnswer(argv, "text");
+    if (format === "json") {
+      assert.equal(rigged.control.status, 2, rigged.control.stderr + rigged.control.stdout);
+      const doc = JSON.parse(rigged.control.stdout.trim().split("\n").at(-1) ?? "{}") as {
+        error?: { code?: number; data?: { acpxCode?: string } };
+      };
+      assert.equal(doc.error?.code, -32602);
+      assert.equal(doc.error?.data?.acpxCode, "USAGE", "the control's USAGE document");
+      const podDoc = JSON.parse(rigged.pod.stdout.trim().split("\n").at(-1) ?? "{}") as typeof doc;
+      assert.equal(
+        podDoc.error?.data?.acpxCode,
+        "USAGE",
+        "the pod's answer carries the same USAGE document",
+      );
+    } else {
+      assert.equal(rigged.control.status, 1, rigged.control.stderr);
+    }
+    assert.equal(rigged.pod.status, rigged.control.status, rigged.pod.stderr);
+    assert.equal(
+      normalise(rigged.pod.stdout, rigged.homes),
+      normalise(rigged.control.stdout, rigged.homes),
+    );
+    assert.equal(
+      normalise(rigged.pod.stderr, rigged.homes),
+      normalise(rigged.control.stderr, rigged.homes),
+    );
+  });
+}
