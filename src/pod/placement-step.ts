@@ -131,15 +131,19 @@ export function decidePlacement(params: {
   }
   const classification = classifyArgv(params.argv, { builtInAgents: params.builtInAgents });
   const output = classification.output;
-  if (params.verdict.mode === "refuse") {
-    const core =
-      params.verdict.reason === "pod_identity_missing"
-        ? decideWithoutIdentity(classification)
-        : ({ kind: "refuse-seam-sandbox" } as const);
-    return { ...core, output };
+  // ⚠️ ORDER (D1, TE2 round 4): a missing place file under `ag-…` is named BEFORE a missing identity.
+  // With both missing the operator must be pointed at the place mount (the contract table's
+  // `pod_place_missing`), not at the identity. Both refuse, exit 2, nothing written — only the
+  // reason differs. The seam-sandbox refusal stays first: it is a test guard, not a diagnosis. Pinned
+  // by `test/pod-placement-facts.test.ts` "D1: …" (each order of the two missing pieces).
+  if (params.verdict.mode === "refuse" && params.verdict.reason === "test_seam_outside_sandbox") {
+    return { kind: "refuse-seam-sandbox", output };
   }
   if (params.podFile.kind === "place-missing") {
     return { ...decideWithoutPlace(classification), output };
+  }
+  if (params.verdict.mode === "refuse") {
+    return { ...decideWithoutIdentity(classification), output };
   }
   if (classification.kind === "unclassified") {
     return { kind: "refuse-unclassified", path: classification.path, output };

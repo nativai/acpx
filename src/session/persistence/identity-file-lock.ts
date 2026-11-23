@@ -567,10 +567,11 @@ function breakLine(
   body: Record<string, unknown> | undefined,
   proof: BreakProof,
   own: PodIdentity,
+  brokenAtMs: number,
 ) {
   return {
     v: 1,
-    ts: new Date(deps.nowMs()).toISOString(),
+    ts: new Date(brokenAtMs).toISOString(),
     lock: lockPath,
     holder: holderRecord(body),
     breaker: { pod: own, pid: process.pid },
@@ -587,6 +588,7 @@ async function writeBreakLine(
   lockPath: string,
   body: Record<string, unknown> | undefined,
   proof: BreakProof,
+  brokenAtMs: number,
 ): Promise<void> {
   const own = deps.ownPod();
   if (!own) {
@@ -595,10 +597,14 @@ async function writeBreakLine(
   const file = lockBreakLedgerPath(own.uid);
   try {
     await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-    await fs.appendFile(file, `${JSON.stringify(breakLine(lockPath, body, proof, own))}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
-    });
+    await fs.appendFile(
+      file,
+      `${JSON.stringify(breakLine(lockPath, body, proof, own, brokenAtMs))}\n`,
+      {
+        encoding: "utf8",
+        mode: 0o600,
+      },
+    );
   } catch (error) {
     process.stderr.write(
       `[acpx] WARNING: lock break ledger ${file} not written: ${(error as Error).message}\n`,
@@ -616,29 +622,35 @@ function sameHolder(
   return token ? bodyToken(parseBody(raw)) === token : raw === judgedRaw;
 }
 
+/** `brokenAtMs` is the clock at the unlink, taken inside the mutex (L2). */
+type RemoveOutcome = { outcome: "broken"; brokenAtMs: number } | { outcome: "gone" | "changed" };
+
 /** Inside the mutex: read again (open-and-read, never `stat`), unlink only the judged holder. */
-async function removeJudgedHolder(
-  lockPath: string,
-  judged: ReadHolder,
-): Promise<"broken" | "gone" | "changed"> {
+async function removeJudgedHolder(lockPath: string, judged: ReadHolder): Promise<RemoveOutcome> {
   await deps.insideBreakMutex();
   // The same read as the judgement (open and read — never `stat`): an unreadable lock reads as the
   // unidentified holder "" there and here, so today's age rule still clears it (T15 "unreadable").
   const current = await readHolder(lockPath);
   if (!current) {
-    return "gone";
+    return { outcome: "gone" };
   }
   const again = current.raw;
   if (!sameHolder(again, judged.raw, judged.body)) {
-    return "changed";
+    return { outcome: "changed" };
   }
   await deps.beforeUnlink();
   try {
     await fs.unlink(lockPath);
   } catch (error) {
-    return isGoneError(error) ? "gone" : "changed";
+    return { outcome: isGoneError(error) ? "gone" : "changed" };
   }
-  return "broken";
+  // ⚠️ L2: THE LEDGER'S `ts` IS THE BREAK'S, NOT THE WRITE'S. The line is appended after the mutex is
+  // released (below), possibly seconds later on a slow mount; a `ts` taken there lets a later break's
+  // line carry an EARLIER time than an earlier break's. Here, inside the mutex, breaks of one pod are
+  // serialized, so this clock reading orders them. DO NOT move it into `breakLine` / `writeBreakLine`.
+  // The file's LINE order is the append order and is not promised; `ts` is the order key. Pinned by
+  // `test/pod-lock-mutex-coupling.test.ts` "L2: …".
+  return { outcome: "broken", brokenAtMs: deps.nowMs() };
 }
 
 /**
@@ -655,12 +667,12 @@ async function executeBreak(
   judged: ReadHolder,
   waitMs: number,
 ): Promise<boolean> {
-  const outcome = await withBreakMutex(waitMs, () => removeJudgedHolder(lockPath, judged));
-  if (outcome === "broken") {
-    await writeBreakLine(lockPath, judged.body, plan.proof);
+  const removed = await withBreakMutex(waitMs, () => removeJudgedHolder(lockPath, judged));
+  if (removed?.outcome === "broken") {
+    await writeBreakLine(lockPath, judged.body, plan.proof, removed.brokenAtMs);
     reportBreak(policy, lockPath, plan, judged.raw);
   }
-  return outcome === "broken" || outcome === "gone";
+  return removed?.outcome === "broken" || removed?.outcome === "gone";
 }
 
 function reportBreak(

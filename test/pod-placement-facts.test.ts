@@ -390,6 +390,67 @@ test("A-28 CASE 2: the same with an EMPTY (or unreadable) place file → pod_pla
   }
 });
 
+test("D1 (TE2 round 4): `ag-…` with the place file missing AND the identity missing names the PLACE — each order of the two missing pieces", () => {
+  const lines = (decision: ReturnType<typeof decisionFor>["decision"]) =>
+    refusalFor(decision)?.lines[0];
+  // both missing: no identity variables, no service-account namespace — the place mount is what to fix
+  for (const content of [undefined, "", { directory: true }] as const) {
+    const host = witnessHost("ag-abc", content);
+    fs.rmSync(path.join(host.box.sa, "namespace"));
+    const both = decisionFor(host, {});
+    assert.equal(
+      mode(both.verdict),
+      "refuse:pod_identity_missing",
+      "the verdict itself is unchanged",
+    );
+    assert.deepEqual(both.podFile, { kind: "place-missing" });
+    assert.equal(both.decision.kind, "refuse-pod-place", JSON.stringify(content));
+    assert.equal(lines(both.decision), "acpx: REFUSED reason=pod_place_missing");
+    assert.equal(refusalFor(both.decision)?.exitCode, 2);
+  }
+  // place missing alone (identity complete): the place, as CASE 1
+  assert.equal(
+    lines(decisionFor(witnessHost("ag-abc", undefined), IDENTITY_OWN).decision),
+    "acpx: REFUSED reason=pod_place_missing",
+  );
+  // identity missing alone (the place file names the pod): the identity, as CASE 3 — NOT the place
+  const identityOnly = decisionFor(witnessHost("ag-abc", `${NAME}\n`), {});
+  assert.equal(mode(identityOnly.verdict), "refuse:pod_identity_missing");
+  assert.equal(identityOnly.decision.kind, "refuse-pod-identity");
+  assert.equal(lines(identityOnly.decision), "acpx: REFUSED reason=pod_identity_missing");
+  // a hostname that is not `ag-…` with a MISSING file is the control pod: no place refusal either way
+  assert.notEqual(
+    decisionFor(witnessHost("dev-server-abc", undefined), { ACPX_OWNER_PLACEMENT: "pod" }).decision
+      .kind,
+    "refuse-pod-place",
+  );
+});
+
+test("D1: both missing, a command that is class `local` or a help request still runs (the diagnosable set is the place refusal's, as for the identity one)", () => {
+  const host = witnessHost("ag-abc", undefined);
+  fs.rmSync(path.join(host.box.sa, "namespace"));
+  assert.equal(decisionFor(host, {}, ["agent-folders"]).decision.kind, "local");
+  assert.equal(decisionFor(host, {}, ["sessions", "list", "--help"]).decision.kind, "local");
+  assert.equal(decisionFor(host, {}, ["sessions", "list"]).decision.kind, "refuse-pod-place");
+});
+
+test("D1: the seam-sandbox refusal still comes first (a test guard, not a diagnosis)", () => {
+  const host = witnessHost("ag-abc", undefined);
+  const outside = tmp(); // a state home outside the seam's home
+  const env = host.box.env({ ACPX_STATE_HOME: outside });
+  const verdict = podModeVerdict(
+    hostFacts(env, undefined, { count: 0 }, { hostname: host.hostname }),
+  );
+  assert.equal(mode(verdict), "refuse:test_seam_outside_sandbox");
+  const decision = decidePlacement({
+    argv: argvNotLocal,
+    verdict,
+    podFile: readPodFileWithWitness(env, host.hostname),
+    builtInAgents: ["claude"],
+  });
+  assert.equal(decision.kind, "refuse-seam-sandbox");
+});
+
 test("A-28 CASE 3: hostname `ag-…` and a place file that NAMES the pod → as before (its own session's pod, by the key)", () => {
   const { podFile, verdict, decision } = decisionFor(
     witnessHost("ag-x", `${NAME}\n`),
