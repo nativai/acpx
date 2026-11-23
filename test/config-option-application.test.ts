@@ -399,6 +399,90 @@ test("persistAndApplyRequestedEffort: never writes effort when the agent has no 
   assert.equal(client.calls.length, 0);
 });
 
+// brick 94d01658 — only the agent refusing the LEVEL may fall back. The shapes below are what
+// claude-agent-acp 842fb79 returns, measured on devbox 2026-11-23: the durable-fork failure and a
+// level rejection share code -32603 and differ only in text.
+const FORK_RESUME_FAILURE = {
+  code: -32603,
+  message:
+    "Internal error: Failed to resume forked session s1 for config op: Claude Code returned an error result: No message found with message.uuid of: 64fb00ed-3af5-4e75-94a4-6304d38d77b1",
+};
+const LEVEL_REJECTION = {
+  code: -32603,
+  message: "Internal error",
+  data: { details: "Invalid value for config option effort: max" },
+};
+
+function rejectingWith(payload: unknown): ReturnType<typeof mockClient> {
+  const client = mockClient();
+  client.setSessionConfigOption = (sessionId, configId, value) => {
+    client.calls.push({ sessionId, configId, value });
+    return Promise.reject(payload);
+  };
+  return client;
+}
+
+function recordWithEffort(effort: string): SessionRecord {
+  return {
+    acpx: { desired_config_options: { effort }, session_options: { effort } },
+  } as unknown as SessionRecord;
+}
+
+test("persistAndApplyRequestedEffort: a non-rejection error surfaces and leaves the record's effort unchanged", async () => {
+  // On the unfixed build every one of these RESOLVED and rewrote the record to the advertised
+  // "default" — the call must reject AND the record must still read "high".
+  const failures: Array<[string, unknown]> = [
+    ["fork resume failure", FORK_RESUME_FAILURE],
+    ["session not found", { code: -32002, message: "Resource not found: s1" }],
+    ["transport/timeout", new Error("Timed out after 5000ms")],
+  ];
+  for (const [label, failure] of failures) {
+    const record = recordWithEffort("high");
+    const client = rejectingWith(failure);
+    await assert.rejects(
+      persistAndApplyRequestedEffort({
+        client,
+        sessionId: "s1",
+        record,
+        reasoningEffort: "max",
+        advertised: [effortOption("default", OPUS_EFFORT_LEVELS)],
+      }),
+      label,
+    );
+    assert.equal(getDesiredConfigOptions(record.acpx).effort, "high", label);
+    assert.equal(record.acpx?.session_options?.effort, "high", label);
+    assert.deepEqual(client.calls, [{ sessionId: "s1", configId: "effort", value: "max" }], label);
+  }
+});
+
+test("persistAndApplyRequestedEffort: the adapter's own level rejection still falls back to the advertised value", async () => {
+  const record = recordWithDesired();
+  await persistAndApplyRequestedEffort({
+    client: rejectingWith(LEVEL_REJECTION),
+    sessionId: "s1",
+    record,
+    reasoningEffort: "max",
+    advertised: [effortOption("high", OPUS_EFFORT_LEVELS)],
+  });
+  assert.equal(getDesiredConfigOptions(record.acpx).effort, "high");
+});
+
+test("persistAndApplyRequestedEffort: deferApply persists the intent and sends nothing", async () => {
+  const client = mockClient();
+  const record = recordWithDesired();
+  await persistAndApplyRequestedEffort({
+    client,
+    sessionId: "durable-unregistered",
+    record,
+    reasoningEffort: "max",
+    advertised: [effortOption("default", OPUS_EFFORT_LEVELS)],
+    deferApply: true,
+  });
+  assert.equal(getDesiredConfigOptions(record.acpx).effort, "max");
+  assert.equal(record.acpx?.session_options?.effort, "max");
+  assert.equal(client.calls.length, 0);
+});
+
 test("persistAndApplyRequestedEffort: no-op when no effort requested", async () => {
   const client = mockClient();
   const record = recordWithDesired();

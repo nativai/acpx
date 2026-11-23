@@ -1,4 +1,5 @@
 import type { SessionConfigOption, SessionModeState } from "@agentclientprotocol/sdk";
+import { extractAcpError, extractAcpErrorDetails } from "../acp/error-shapes.js";
 import {
   acpxRoutesDepthMechanism,
   depthMechanismForAgentCommand,
@@ -203,11 +204,46 @@ async function setConfigOptionWithEffortFallback(
     );
     return { value, response, wire: "sent" };
   } catch (error) {
-    if (params.configId !== "effort") {
+    // ⚠️ ONLY THE AGENT REFUSING THIS LEVEL MAY FALL BACK (brick 94d01658).
+    // This catch used to take EVERY error for `effort`, so a failure that says
+    // nothing about the level — the session not resolvable yet, a transport
+    // drop, a timeout — was recorded as "the agent chose default" and written
+    // over the user's intent. That is how every by-the-way copy of a Claude
+    // session came to record `default` and run at the settings tier: the eager
+    // set on the unregistered durable fork id failed with
+    // `-32603 … Failed to resume forked session … for config op`, and landed here.
+    // Do not widen this back to "any error": a non-rejection must surface.
+    // Tests: `test/config-option-application.test.ts` → "a non-rejection error …".
+    if (params.configId !== "effort" || !isAgentEffortLevelRejection(error)) {
       throw error;
     }
     return rejectedEffortFallback(option, params.modelId, value, params.verbose);
   }
+}
+
+/**
+ * The texts an agent answers with when it refuses an `effort` LEVEL (or has no
+ * `effort` option at all), as opposed to failing for an unrelated reason.
+ *
+ * Measured on claude-agent-acp 842fb79, the only adapter that advertises a
+ * selectable `effort` config option: its `setSessionConfigOption` throws a plain
+ * `Error("Invalid value for config option effort: <v>")` or
+ * `Error("Unknown config option: effort")`, which the ACP SDK serializes as
+ * `{code:-32603, message:"Internal error", data:{details:"<that text>"}}`. The
+ * fork-resume failure uses the SAME code (-32603), so the code cannot tell them
+ * apart — the text is the only discriminator the adapter provides.
+ */
+const EFFORT_LEVEL_REJECTION =
+  /^(?:Internal error: )?(?:Invalid value for config option effort\b|Unknown config option: effort\b)/;
+
+function isAgentEffortLevelRejection(error: unknown): boolean {
+  const acp = extractAcpError(error);
+  const candidates = [
+    acp?.message,
+    extractAcpErrorDetails(error),
+    error instanceof Error ? error.message : undefined,
+  ];
+  return candidates.some((text) => typeof text === "string" && EFFORT_LEVEL_REJECTION.test(text));
 }
 
 function rejectedEffortFallback(
@@ -361,6 +397,14 @@ export async function persistAndApplyRequestedEffort(params: {
   modelId?: string;
   timeoutMs?: number;
   verbose?: boolean;
+  /**
+   * Persist the intent but do NOT send it now (brick 94d01658). Set for a
+   * durable Claude fork, whose session id the creating adapter has not
+   * registered: a live set on it fails, exactly as `set_model` does (see
+   * `resolveForkModelApplication`). The open-time `replayDesiredConfigOptions`
+   * sends the persisted effort on the first proper resume instead.
+   */
+  deferApply?: boolean;
 }): Promise<void> {
   if (!params.reasoningEffort) {
     return;
@@ -421,16 +465,28 @@ export async function persistAndApplyRequestedEffort(params: {
     });
     return;
   }
+  const before = effortStateOf(params.record);
   setDesiredConfigOption(params.record, "effort", params.reasoningEffort);
-  const wire = await applyRequestedConfigOptionsIfAdvertised({
-    client: params.client,
-    sessionId: params.sessionId,
-    record: params.record,
-    advertised: params.advertised,
-    modelId: params.modelId,
-    timeoutMs: params.timeoutMs,
-    verbose: params.verbose,
-  });
+  if (params.deferApply) {
+    return;
+  }
+  let wire: EffortWireOutcome | undefined;
+  try {
+    wire = await applyRequestedConfigOptionsIfAdvertised({
+      client: params.client,
+      sessionId: params.sessionId,
+      record: params.record,
+      advertised: params.advertised,
+      modelId: params.modelId,
+      timeoutMs: params.timeoutMs,
+      verbose: params.verbose,
+    });
+  } catch (error) {
+    // A failure that is not the agent refusing the level persists NOTHING: the
+    // record keeps the effort it had before this call.
+    restoreEffortState(params.record, before);
+    throw error;
+  }
   // ⚠️ THE SUCCESS ARM MUST RECORD TOO — it did not, and that is the second half
   // of the same defect the unavailable arm above fixes.
   //
@@ -460,6 +516,32 @@ export async function persistAndApplyRequestedEffort(params: {
   // `recordDepthOutcome` is a no-op for the Claude family, so their records are
   // untouched by this.
   recordDepthOutcome(params.record, depthOutcomeFromWire(params.reasoningEffort, wire));
+}
+
+type EffortState = { desired: string | undefined; sessionOption: string | undefined };
+
+function effortStateOf(record: SessionRecord): EffortState {
+  return {
+    desired: getDesiredConfigOptions(record.acpx).effort,
+    sessionOption: record.acpx?.session_options?.effort,
+  };
+}
+
+function restoreEffortState(record: SessionRecord, state: EffortState): void {
+  // Restores `desired_config_options.effort`, and syncs `session_options.effort`
+  // to it — then puts `session_options.effort` back too, should the two have differed.
+  setDesiredConfigOption(record, "effort", state.desired);
+  const acpx = record.acpx;
+  if (!acpx || acpx.session_options?.effort === state.sessionOption) {
+    return;
+  }
+  const sessionOptions = { ...acpx.session_options };
+  if (state.sessionOption === undefined) {
+    delete sessionOptions.effort;
+  } else {
+    sessionOptions.effort = state.sessionOption;
+  }
+  acpx.session_options = sessionOptions;
 }
 
 /**
