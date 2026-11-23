@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
+import { writeTerminalCloseAfterOwnerStop } from "../src/cli/session/terminal-close.js";
 import { appendAtMeasuredEnd, messagesLogPath } from "../src/session/messages-log.js";
 import {
   resolveSessionRecord,
@@ -370,5 +371,117 @@ test("60.6: a compaction by a stale writer keeps the entries another writer appe
         process.env.ACPX_MESSAGES_LOG_COMPACT_BYTES = previous;
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// 60.10 / 60.5 — a close of another session writes after the owner has stopped, from a fresh read
+// ---------------------------------------------------------------------------------------------
+
+async function captureStderr(run: () => Promise<void>): Promise<string> {
+  const original = process.stderr.write.bind(process.stderr);
+  let captured = "";
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    captured += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    await run();
+  } finally {
+    process.stderr.write = original;
+  }
+  return captured;
+}
+
+/** An owner mid-turn: the user entry logged, a partial checkpointed inline. The close read it at this point. */
+async function ownerMidTurn(homeDir: string, id: string) {
+  const owner = newRecord(homeDir, id, [user("u1", "go")]);
+  await writeSessionRecordAtBoundary(owner);
+  const partial = agent("partial");
+  owner.messages.push(partial);
+  await writeSessionRecord(owner);
+  const closeSnapshot = await resolveSessionRecord(id);
+  return { owner, partial, closeSnapshot };
+}
+
+for (const reason of ["survived", "successor", "identity-unverified"]) {
+  test(`60.10: a close whose owner is not proven stopped (${reason}) writes the scalars only`, async () => {
+    await withTempHome("acpx-a60-keep-", async (homeDir) => {
+      const id = `keep-${reason}`;
+      const { owner, partial, closeSnapshot } = await ownerMidTurn(homeDir, id);
+      // The owner is still alive: it ends its turn after the close's read, and its reply goes to the log.
+      setAgentText(partial, "the final reply");
+      await writeSessionRecordAtBoundary(owner);
+      // … and streams the next turn's first words inline.
+      owner.messages.push(agent("next turn, first words"));
+      await writeSessionRecord(owner);
+      const before = await rawRecord(homeDir, id);
+      const logBefore = await fs.readFile(logPathOf(homeDir, id), "utf8");
+
+      const stderr = await captureStderr(async () => {
+        const closed = await writeTerminalCloseAfterOwnerStop(closeSnapshot, {
+          stopped: false,
+          reason,
+        });
+        assert.equal(closed.state.status, "read");
+      });
+
+      const after = (await rawRecord(homeDir, id)) as RawRecord & {
+        closed: boolean;
+        closed_at: string;
+      };
+      assert.equal(after.closed, true, "the scalars landed");
+      assert.ok(after.closed_at);
+      assert.deepEqual(after.messages_log, before.messages_log, "the watermark is the owner's");
+      assert.deepEqual(after.messages, before.messages, "the inline entries are the owner's");
+      assert.equal(
+        await fs.readFile(logPathOf(homeDir, id), "utf8"),
+        logBefore,
+        "the log is untouched",
+      );
+      assert.match(
+        stderr,
+        new RegExp(`not proven stopped \\(${reason}\\)`),
+        "stderr names the reason",
+      );
+    });
+  });
+}
+
+test("60.10 (control) / 60.1 (record level): an owner that stopped — the close logs nothing the owner already logged", async () => {
+  await withTempHome("acpx-a60-stopped-", async (homeDir) => {
+    const id = "stopped-after-reply";
+    const { owner, partial, closeSnapshot } = await ownerMidTurn(homeDir, id);
+    setAgentText(partial, "the final reply");
+    await writeSessionRecordAtBoundary(owner); // the owner's turn end, after the close's early read
+
+    await writeTerminalCloseAfterOwnerStop(closeSnapshot, { stopped: true, reason: "stopped" });
+
+    assert.deepEqual(
+      await logTexts(homeDir, id),
+      ["go", "the final reply"],
+      "the final reply is there once; the stale partial the close read at its start is not logged",
+    );
+    assert.deepEqual(await inlineTexts(homeDir, id), []);
+    await assertPointerMatchesLog(homeDir, id);
+  });
+});
+
+test("60.5 (record level): the text the owner streamed between the close's start and its stop is in the record after the close", async () => {
+  await withTempHome("acpx-a60-cancel-", async (homeDir) => {
+    const id = "close-cancel";
+    const { owner, partial, closeSnapshot } = await ownerMidTurn(homeDir, id);
+    // The turn does not settle within the drain; the owner streams more, checkpoints, and is stopped.
+    setAgentText(partial, "partial, and what it streamed after the close started");
+    await writeSessionRecord(owner);
+
+    await writeTerminalCloseAfterOwnerStop(closeSnapshot, { stopped: true, reason: "stopped" });
+
+    assert.deepEqual(await logTexts(homeDir, id), [
+      "go",
+      "partial, and what it streamed after the close started",
+    ]);
+    assert.deepEqual(await inlineTexts(homeDir, id), []);
+    await assertPointerMatchesLog(homeDir, id);
   });
 });
