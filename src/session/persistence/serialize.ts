@@ -1,5 +1,5 @@
 import { assertPersistedKeyPolicy } from "../../persisted-key-policy.js";
-import type { SessionRecord, SubagentRef } from "../../types.js";
+import type { SessionMessage, SessionRecord, SubagentRef } from "../../types.js";
 import { SESSION_RECORD_SCHEMA } from "../../types.js";
 import { getLoggedMessageCount } from "../messages-log-bookkeeping.js";
 import { normalizeRuntimeSessionId } from "../runtime-session-id.js";
@@ -17,6 +17,12 @@ function serializeSubagentRef(ref: SubagentRef): Record<string, unknown> {
 
 export type SerializeSessionRecordForDiskOptions = {
   messages?: "inline" | "split-tail";
+  /**
+   * The inline entries to publish, decided by the writer under the record's lock (C3.5 (i)): its own
+   * unfinished entries plus every other writer's inline entry as it stands on disk. Replaces the
+   * `messages` choice above; the writer's own in-memory window is then never what lands.
+   */
+  inlineMessages?: readonly SessionMessage[] | undefined;
 };
 
 /**
@@ -45,6 +51,19 @@ function acpxForDisk(acpx: SessionRecord["acpx"]): SessionRecord["acpx"] | Recor
   return unreadable === undefined ? acpx : { ...acpx, sleeping: unreadable.raw };
 }
 
+/** The inline entries and the log pointer a record is written with (split form, or all inline). */
+function persistedMessages(
+  record: SessionRecord,
+  options: SerializeSessionRecordForDiskOptions,
+): { messages: readonly SessionMessage[]; messagesLog: SessionRecord["messagesLog"] } {
+  const useSplitTail = options.messages === "split-tail" && record.messagesLog !== undefined;
+  const messages =
+    options.inlineMessages ??
+    (useSplitTail ? record.messages.slice(getLoggedMessageCount(record)) : record.messages);
+  const split = useSplitTail || (options.inlineMessages !== undefined && record.messagesLog);
+  return { messages, messagesLog: split ? record.messagesLog : undefined };
+}
+
 export function serializeSessionRecordForDisk(
   record: SessionRecord,
   options: SerializeSessionRecordForDiskOptions = {},
@@ -53,10 +72,7 @@ export function serializeSessionRecordForDisk(
     ...record,
     schema: SESSION_RECORD_SCHEMA,
   };
-  const useSplitTail = options.messages === "split-tail" && canonical.messagesLog !== undefined;
-  const messages = useSplitTail
-    ? canonical.messages.slice(getLoggedMessageCount(record))
-    : canonical.messages;
+  const { messages, messagesLog } = persistedMessages(canonical, options);
 
   const persisted: Record<string, unknown> = {
     schema: canonical.schema,
@@ -89,7 +105,7 @@ export function serializeSessionRecordForDisk(
     agent_capabilities: canonical.agentCapabilities,
     title: canonical.title,
     messages,
-    ...(useSplitTail ? { messages_log: canonical.messagesLog } : {}),
+    ...(messagesLog === undefined ? {} : { messages_log: messagesLog }),
     updated_at: canonical.updated_at,
     cumulative_token_usage: canonical.cumulative_token_usage,
     request_token_usage: canonical.request_token_usage,

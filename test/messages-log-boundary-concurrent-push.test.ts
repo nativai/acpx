@@ -41,7 +41,7 @@ test("a message pushed during the boundary append is persisted by the next bound
     let injected = 0;
     fsPromises.open = (async (...args: Parameters<typeof originalOpen>) => {
       const [file, flags] = args;
-      if (injected === 0 && flags === "a" && String(file).includes("child-record")) {
+      if (injected === 0 && typeof flags === "number" && String(file).includes("child-record")) {
         // The tailer delivers a batch while this append is in flight.
         injected += 1;
         record.messages.push(message(3));

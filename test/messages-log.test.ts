@@ -259,7 +259,7 @@ test("serializeSessionRecordForDisk drops messages_log for write-inline records"
   assert.deepEqual(persisted.messages, messages);
 });
 
-test("appendFinalizedMessagesToLog truncates from the watermark before appending", async () => {
+test("appendFinalizedMessagesToLog cuts an incomplete tail back to its last newline, then appends", async () => {
   await withTempHome("acpx-messages-log-", async (homeDir) => {
     const sessionDir = path.join(homeDir, ".acpx", "sessions");
     const first = userMessage(1);
@@ -479,10 +479,11 @@ test("an empty record's converged split form round-trips through export and impo
   });
 });
 
-test("checkpoints never append unlogged split tails and the next boundary appends once", async () => {
+test("checkpoints never append unlogged split tails and the next boundary appends only the writer's own entry, once", async () => {
   await withTempHome("acpx-messages-log-", async (homeDir) => {
     const sessionDir = path.join(homeDir, ".acpx", "sessions");
     const logMessages = [userMessage(1), agentMessage(2)];
+    // Another writer's unfinished entry, published inline (an owner's streamed partial).
     const inlineMessages = [userMessage(3)];
     const log = await writeMessagesLog(sessionDir, "append-once", logMessages);
     await writeSplitRecord(
@@ -505,19 +506,21 @@ test("checkpoints never append unlogged split tails and the next boundary append
     assert.equal(await fs.readFile(log.path, "utf8"), serializeMessages(logMessages));
     assert.deepEqual((await readRawRecord(homeDir, "append-once")).messages, inlineMessages);
 
+    // C3.5 (i): the boundary appends what this writer ADDED — never the inline entry it only loaded.
+    const own = agentMessage(4);
+    resolved.messages.push(own);
+    await writeSessionRecordAtBoundary(resolved);
     await writeSessionRecordAtBoundary(resolved);
 
-    assert.equal(
-      await fs.readFile(log.path, "utf8"),
-      serializeMessages([...logMessages, ...inlineMessages]),
-    );
+    const logged = [...logMessages, own];
+    assert.equal(await fs.readFile(log.path, "utf8"), serializeMessages(logged));
     const raw = await readRawRecord(homeDir, "append-once");
-    assert.deepEqual(raw.messages, []);
+    assert.deepEqual(raw.messages, inlineMessages);
     assert.deepEqual(raw.messages_log, {
       v: 1,
       count: 3,
       base_index: 0,
-      bytes: Buffer.byteLength(serializeMessages([...logMessages, ...inlineMessages])),
+      bytes: Buffer.byteLength(serializeMessages(logged)),
     });
   });
 });
@@ -713,23 +716,20 @@ test("hydrate handles empty log and log-only records", async () => {
   });
 });
 
-test("compactMessagesLog rewrites the current window and advances base_index", async () => {
+test("compactMessagesLog keeps the last 200 lines of the FILE and advances base_index", async () => {
   await withTempHome("acpx-messages-log-", async (homeDir) => {
     const sessionDir = path.join(homeDir, ".acpx", "sessions");
-    const originalLogMessages = [
-      userMessage(1),
-      agentMessage(2),
-      userMessage(3),
-      agentMessage(4),
-      userMessage(5),
-    ];
-    const kept = [userMessage(3), agentMessage(4), userMessage(5)];
+    const originalLogMessages = Array.from({ length: 205 }, (_unused, index) =>
+      userMessage(index + 1),
+    );
+    const kept = originalLogMessages.slice(5);
     const { path: logPath, completeBytes } = await writeMessagesLog(
       sessionDir,
       "compact",
       originalLogMessages,
     );
-    const record = sessionRecord("compact", kept, {
+    // The writer remembers only a short window: the kept tail is NOT taken from it (C3.5 (i)).
+    const record = sessionRecord("compact", [userMessage(205)], {
       messagesLog: {
         v: 1,
         count: originalLogMessages.length,
@@ -743,7 +743,7 @@ test("compactMessagesLog rewrites the current window and advances base_index", a
     assert.deepEqual(record.messagesLog, {
       v: 1,
       count: kept.length,
-      base_index: 102,
+      base_index: 105,
       bytes: Buffer.byteLength(serializeMessages(kept)),
     });
     assert.equal(await fs.readFile(logPath, "utf8"), serializeMessages(kept));
