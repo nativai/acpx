@@ -105,7 +105,22 @@ function diag(text: string): void {
   process.stderr.write(text);
 }
 
+/**
+ * Whether the verb being run asked for JSON (its own `--format json` / `--json`, or one inherited from an ancestor
+ * — `withInheritedFormat`). Set by the `preAction` hook of `registerModelsCommand`.
+ */
+let jsonOutputRequested = false;
+
+/**
+ * A usage failure of a `models` verb (an unknown or ambiguous ref, a bad endpoint read, …). In json mode it is
+ * THROWN as a commander usage error, so it reaches the top level's one handler: the JSON-RPC USAGE document on
+ * stdout, exit 2, and — under `--json-strict` — an empty stderr (brick 4a34f245). It used to write the TEXT error to
+ * stderr and leave stdout empty even under json. Text mode is unchanged: the message on stderr, exit 2.
+ */
 function failUsage(message: string): never {
+  if (jsonOutputRequested) {
+    throw new InvalidArgumentError(message.replace(/\n$/u, ""));
+  }
   diag(message.endsWith("\n") ? message : `${message}\n`);
   process.exit(2);
 }
@@ -843,7 +858,18 @@ export function registerModelsCommand(parent: Command, config: ResolvedAcpxConfi
     );
   addListFlags(modelsCommand);
   modelsCommand.hook("preAction", (_command, action) => {
-    jsonStrictRequested = action.optsWithGlobals().jsonStrict === true;
+    const opts = action.optsWithGlobals();
+    jsonStrictRequested = opts.jsonStrict === true;
+    jsonOutputRequested =
+      opts.json === true ||
+      opts.format === "json" ||
+      withInheritedFormat(action, {}).format === "json";
+    // `--json-strict` needs `--format json` on EVERY verb; `models` alone used to print its text table instead of
+    // refusing. The same message, document and exit code as `resolveGlobalFlags` gives the others (a config-file
+    // `format: json` counts, as it does there).
+    if (jsonStrictRequested && !jsonOutputRequested && config.format !== "json") {
+      throw new InvalidArgumentError("--json-strict requires --format json");
+    }
   });
 
   addListFlags(modelsCommand.command("list"))
