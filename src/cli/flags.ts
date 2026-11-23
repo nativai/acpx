@@ -910,7 +910,11 @@ export function addPromptInputOption(command: Command): Command {
  */
 export function resolveRequestedFormat(command: Command, config: ResolvedAcpxConfig): OutputFormat {
   for (let node: Command | null = command; node; node = node.parent) {
-    const own = asRecord(node.opts() as unknown) ?? {};
+    // (a caller that hands this a bare object with only `optsWithGlobals` — `test/cli-flags.test.ts` does — has no tree)
+    const own =
+      asRecord(
+        (typeof node.opts === "function" ? node.opts() : node.optsWithGlobals()) as unknown,
+      ) ?? {};
     if (own.json === true) {
       return "json";
     }

@@ -173,7 +173,7 @@ test("O1 negatives: with NO verb-level word the program's (or config's) format s
   }
 });
 
-test("O1 + config: the verb's own word beats the config file's `format` both ways, on a verb that always let the program win", async () => {
+test("O1 + config (negative, green on base too): the verb's own word still beats the config file's `format` both ways, and the config still applies when nothing else speaks", async () => {
   const asText = host("json");
   const text = await runCli(["profiles", "list", "--format", "text"], asText.env, {
     cwd: asText.cwd,
