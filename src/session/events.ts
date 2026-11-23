@@ -1,4 +1,4 @@
-import fs from "node:fs/promises";
+import fs, { type FileHandle } from "node:fs/promises";
 import { isAcpJsonRpcMessage } from "../acp/jsonrpc.js";
 import { incrementPerfCounter, measurePerf } from "../perf-metrics.js";
 import { getOwnProcessIdentity } from "../process-identity.js";
@@ -204,8 +204,63 @@ export async function appendInParts(
       from = to;
       if (from < data.length) {
         await handle.datasync();
+        await holdMidLineForTest(filePath);
       }
     }
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * ⚠️ TEST SEAM, honoured ONLY under a non-empty `NODE_TEST_CONTEXT` (`node --test` sets it; `""` does not
+ * count): when `ACPX_TEST_STREAM_HOLD_MID_LINE` names a file, the writer that has just synced a part of
+ * a larger flush writes that file (its content is the stream path, so a test sees which file is held)
+ * and then never returns. A test SIGKILLs the process there — a REAL writer dead mid-line, the A8 TE's
+ * F1 shape (brick eef0805f) — instead of racing the parts. In production the variable is ignored.
+ * Held by `test/stream-partial-line.test.ts` ("the hold seam is honoured only under NODE_TEST_CONTEXT").
+ */
+export function streamHoldMarkerForTest(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if ((env.NODE_TEST_CONTEXT ?? "") === "") {
+    return undefined;
+  }
+  const marker = env.ACPX_TEST_STREAM_HOLD_MID_LINE;
+  return marker === undefined || marker === "" ? undefined : marker;
+}
+
+async function holdMidLineForTest(filePath: string): Promise<void> {
+  const marker = streamHoldMarkerForTest();
+  if (marker === undefined) {
+    return;
+  }
+  await fs.writeFile(marker, filePath, "utf8");
+  await new Promise<never>(() => {
+    setInterval(() => {}, 1_000_000);
+  });
+}
+
+/**
+ * True when the file exists and its last byte is not a newline: a writer died mid-line (SIGKILL, OOM,
+ * a pod gone) and left a PARTIAL line. A missing or empty file, and one ending in a newline, are not.
+ */
+export async function endsMidLine(filePath: string): Promise<boolean> {
+  let handle: FileHandle;
+  try {
+    handle = await fs.open(filePath, "r");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+  try {
+    const { size } = await handle.stat();
+    if (size === 0) {
+      return false;
+    }
+    const last = Buffer.alloc(1);
+    const { bytesRead } = await handle.read(last, 0, 1, size - 1);
+    return bytesRead === 1 && last[0] !== 0x0a;
   } finally {
     await handle.close();
   }
@@ -299,6 +354,13 @@ export class SessionEventWriter {
   private activePath: string;
   private activeSizeBytes: number;
   private segmentCount: number;
+  /**
+   * The file whose tail this writer has already checked. A writer that finds the file it is about to
+   * append to ending mid-line closes that line with ONE newline before its first frame (see
+   * `appendActive`); after that, and after a rotation hands it a fresh empty file, every byte it writes
+   * ends in a newline and there is nothing left to check.
+   */
+  private tailCheckedPath: string | undefined;
   private closed = false;
 
   private constructor(
@@ -387,7 +449,7 @@ export class SessionEventWriter {
         group = [];
         // C3.2 A-4: the holder checks its lock immediately before it publishes.
         await assertLockHeld(this.lock.filePath, this.lock.content);
-        await appendInParts(this.activePath, Buffer.concat(written.map((entry) => entry.line)));
+        await this.appendActive(Buffer.concat(written.map((entry) => entry.line)));
         for (const entry of written) {
           this.noteWritten(entry.message);
         }
@@ -412,6 +474,29 @@ export class SessionEventWriter {
     if (options.checkpoint === true) {
       await writeSessionRecord(this.record);
     }
+  }
+
+  /**
+   * ⚠️ A DEAD WRITER'S PARTIAL LINE MUST NOT SWALLOW THIS WRITER'S FIRST FRAME (brick eef0805f; the A8 TE's
+   * F1). A writer killed mid-line leaves a tail with no newline; the next append would land on that line
+   * and a reader that splits on newline would read both as one damaged line, losing a good frame. So before
+   * its FIRST append to a file, under the stream lock it holds, the writer looks at the last byte and, if
+   * it is not a newline, puts ONE newline in front of its own bytes: the partial line stays a single damaged
+   * line and every good frame stays readable. The newline rides in the SAME write as the frames (C10: one
+   * write per flush), and it is added only after a look at the tail — a tail that already ends in a newline
+   * gets none (no empty line), an empty or missing file is untouched, and it never cuts a COMPLETE line
+   * (C3.5: a complete line is only ever followed, never changed). Rows in `test/stream-partial-line.test.ts`.
+   */
+  private async appendActive(lines: Buffer): Promise<void> {
+    let data = lines;
+    if (this.tailCheckedPath !== this.activePath) {
+      if (await endsMidLine(this.activePath)) {
+        data = Buffer.concat([Buffer.from("\n"), lines]);
+        this.activeSizeBytes += 1;
+      }
+    }
+    await appendInParts(this.activePath, data);
+    this.tailCheckedPath = this.activePath;
   }
 
   /** The record's bookkeeping for one frame that is now on disk. */
