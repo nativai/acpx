@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
+import { maybeWrapSessionControlError } from "../src/acp/session-control-errors.js";
 import {
   advertisesConfigOption,
   applyExecReasoningEffort,
@@ -396,6 +397,159 @@ test("persistAndApplyRequestedEffort: never writes effort when the agent has no 
   });
   assert.equal(getDesiredConfigOptions(record.acpx).effort, undefined);
   assert.equal(record.acpx?.desired_config_options, undefined);
+  assert.equal(client.calls.length, 0);
+});
+
+// brick 94d01658 — only the agent refusing the LEVEL may fall back. The shapes below are what
+// claude-agent-acp 842fb79 returns, measured on devbox 2026-11-23: the durable-fork failure and a
+// level rejection share code -32603 and differ only in text.
+const FORK_RESUME_FAILURE = {
+  code: -32603,
+  message:
+    "Internal error: Failed to resume forked session s1 for config op: Claude Code returned an error result: No message found with message.uuid of: 64fb00ed-3af5-4e75-94a4-6304d38d77b1",
+};
+const LEVEL_REJECTION = {
+  code: -32603,
+  message: "Internal error",
+  data: { details: "Invalid value for config option effort: max" },
+};
+
+function rejectingWith(payload: unknown): ReturnType<typeof mockClient> {
+  const client = mockClient();
+  client.setSessionConfigOption = (sessionId, configId, value) => {
+    client.calls.push({ sessionId, configId, value });
+    return Promise.reject(payload);
+  };
+  return client;
+}
+
+function recordWithEffort(effort: string): SessionRecord {
+  return {
+    acpx: { desired_config_options: { effort }, session_options: { effort } },
+  } as unknown as SessionRecord;
+}
+
+test("persistAndApplyRequestedEffort: a non-rejection error surfaces and leaves the record's effort unchanged", async () => {
+  // On the unfixed build every one of these RESOLVED and rewrote the record to the advertised
+  // "default" — the call must reject AND the record must still read "high".
+  const failures: Array<[string, unknown]> = [
+    ["fork resume failure", FORK_RESUME_FAILURE],
+    ["session not found", { code: -32002, message: "Resource not found: s1" }],
+    // claude-agent-acp 842fb79, probed: a config op on an id it does not hold.
+    [
+      "adapter Session not found (-32603)",
+      { code: -32603, message: "Internal error", data: { details: "Session not found" } },
+    ],
+    // A -32602 that names a missing session is not a refusal of the value.
+    [
+      "invalid params naming an unknown session",
+      maybeWrapSessionControlError(
+        "session/set_config_option",
+        { code: -32602, message: "Unknown sessionId: s1" },
+        'for "effort"="max"',
+      ),
+    ],
+    ["transport/timeout", new Error("Timed out after 5000ms")],
+  ];
+  for (const [label, failure] of failures) {
+    const record = recordWithEffort("high");
+    const client = rejectingWith(failure);
+    await assert.rejects(
+      persistAndApplyRequestedEffort({
+        client,
+        sessionId: "s1",
+        record,
+        reasoningEffort: "max",
+        advertised: [effortOption("default", OPUS_EFFORT_LEVELS)],
+      }),
+      label,
+    );
+    assert.equal(getDesiredConfigOptions(record.acpx).effort, "high", label);
+    assert.equal(record.acpx?.session_options?.effort, "high", label);
+    assert.deepEqual(client.calls, [{ sessionId: "s1", configId: "effort", value: "max" }], label);
+  }
+});
+
+test("persistAndApplyRequestedEffort: the adapter's own level rejection still falls back to the advertised value", async () => {
+  const record = recordWithDesired();
+  await persistAndApplyRequestedEffort({
+    client: rejectingWith(LEVEL_REJECTION),
+    sessionId: "s1",
+    record,
+    reasoningEffort: "max",
+    advertised: [effortOption("high", OPUS_EFFORT_LEVELS)],
+  });
+  assert.equal(getDesiredConfigOptions(record.acpx).effort, "high");
+});
+
+test("persistAndApplyRequestedEffort: every refusal shape the real adapter returns falls back", async () => {
+  // Captured from claude-agent-acp 842fb79 at zero turns (brick 94d01658 IMPL §9), each as it reaches
+  // this catch — i.e. after acpx's own `maybeWrapSessionControlError`.
+  const wrap = (payload: unknown) =>
+    maybeWrapSessionControlError("session/set_config_option", payload, 'for "effort"="max"');
+  const refusals: Array<[string, unknown]> = [
+    [
+      "level outside the ladder (-32603 details)",
+      wrap({
+        code: -32603,
+        message: "Internal error",
+        data: { details: "Invalid value for config option effort: ultra" },
+      }),
+    ],
+    [
+      "schema rejection (-32602 Invalid params)",
+      wrap({
+        code: -32602,
+        message: "Invalid params",
+        data: { value: { _errors: ["Invalid input: expected string, received number"] } },
+      }),
+    ],
+    ["older adapter: no effort option", new Error("Unknown config option: effort")],
+  ];
+  for (const [label, refusal] of refusals) {
+    const record = recordWithDesired();
+    await persistAndApplyRequestedEffort({
+      client: rejectingWith(refusal),
+      sessionId: "s1",
+      record,
+      reasoningEffort: "max",
+      advertised: [effortOption("high", OPUS_EFFORT_LEVELS)],
+    });
+    assert.equal(getDesiredConfigOptions(record.acpx).effort, "high", label);
+  }
+});
+
+test("persistAndApplyRequestedEffort: deferApply persists the intent and sends nothing", async () => {
+  const client = mockClient();
+  const record = recordWithDesired();
+  await persistAndApplyRequestedEffort({
+    client,
+    sessionId: "durable-unregistered",
+    record,
+    reasoningEffort: "max",
+    advertised: [effortOption("default", OPUS_EFFORT_LEVELS)],
+    deferApply: true,
+  });
+  assert.equal(getDesiredConfigOptions(record.acpx).effort, "max");
+  assert.equal(record.acpx?.session_options?.effort, "max");
+  assert.equal(client.calls.length, 0);
+});
+
+test("persistAndApplyRequestedEffort: deferApply records the level the copy's model will serve", async () => {
+  const client = mockClient();
+  const record = recordWithDesired();
+  await persistAndApplyRequestedEffort({
+    client,
+    sessionId: "durable-unregistered",
+    record,
+    reasoningEffort: "max",
+    // the fork-time advertisement is the broad one; the copy runs sonnet
+    advertised: [effortOption("default", OPUS_EFFORT_LEVELS)],
+    modelId: "sonnet",
+    deferApply: true,
+  });
+  assert.equal(getDesiredConfigOptions(record.acpx).effort, "high");
+  assert.equal(record.acpx?.session_options?.effort, "high");
   assert.equal(client.calls.length, 0);
 });
 
