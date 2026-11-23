@@ -414,8 +414,18 @@ for (const reason of ["survived", "successor", "identity-unverified"]) {
       await writeSessionRecordAtBoundary(owner);
       // … and streams the next turn's first words inline.
       owner.messages.push(agent("next turn, first words"));
+      // … and, after the close's early read, changes what a live owner changes: the title, the token
+      // usage and acpx state no merge protects (TE L1: the keep arm used to write its early copy of these).
+      owner.title = "the owner's later title";
+      owner.cumulative_token_usage = { input_tokens: 4321, output_tokens: 1234 };
+      owner.acpx = {
+        ...owner.acpx,
+        available_commands: ["/later-command"],
+        context_window_size: 1_000_000,
+      };
       await writeSessionRecord(owner);
-      const before = await rawRecord(homeDir, id);
+      const before = (await rawRecord(homeDir, id)) as RawRecord & Record<string, unknown>;
+      assert.equal(before.title, "the owner's later title", "the owner's later fields are on disk");
       const logBefore = await fs.readFile(logPathOf(homeDir, id), "utf8");
 
       const stderr = await captureStderr(async () => {
@@ -429,9 +439,29 @@ for (const reason of ["survived", "successor", "identity-unverified"]) {
       const after = (await rawRecord(homeDir, id)) as RawRecord & {
         closed: boolean;
         closed_at: string;
+        title: string;
+        cumulative_token_usage: unknown;
+        acpx: unknown;
       };
       assert.equal(after.closed, true, "the scalars landed");
       assert.ok(after.closed_at);
+      // Every field except the scalars is byte-for-byte what the live owner left (TE L1).
+      const {
+        closed: _c,
+        closed_at: _a,
+        pid: _p,
+        pid_identity: _i,
+        ...afterRest
+      } = after as Record<string, unknown>;
+      const { closed: _c2, closed_at: _a2, pid: _p2, pid_identity: _i2, ...beforeRest } = before;
+      assert.deepEqual(afterRest, beforeRest, "the close changed nothing but its scalars");
+      assert.equal(after.title, "the owner's later title", "the title is the owner's");
+      assert.deepEqual(after.cumulative_token_usage, { input_tokens: 4321, output_tokens: 1234 });
+      assert.deepEqual(
+        after.acpx as { available_commands?: string[]; context_window_size?: number },
+        { ...(before.acpx as object) },
+        "the acpx state is the owner's",
+      );
       assert.deepEqual(after.messages_log, before.messages_log, "the watermark is the owner's");
       assert.deepEqual(after.messages, before.messages, "the inline entries are the owner's");
       assert.equal(

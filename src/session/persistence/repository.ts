@@ -1425,6 +1425,56 @@ async function writeSessionRecordInternal(
   });
 }
 
+/**
+ * C3.5 (ii), A-60 (TE L1) — THE CLOSE OF A SESSION WHOSE OWNER IS NOT PROVEN STOPPED WRITES THE SCALARS
+ * ONLY: `closed`, `closed_at` and the adapter pid cleared (with its identity, which travels with it).
+ * The record is read FRESH under the record's lock and every other field goes back as it stands on disk:
+ * the live owner's later title, token usage, event log, acpx state, messages pointer and inline entries
+ * are not the close's to write. The early copy the close read at its start is never serialized here —
+ * writing it back (even with the merged fields kept) reverted whatever the owner wrote after that read.
+ * Returns the written record, hydrated, for the caller's result.
+ *
+ * ⚠️ DO NOT ROUTE THIS THROUGH `writeSessionRecordInternal` WITH AN EARLY COPY. It serializes every field
+ * of the copy it is given; only the merged ones survive. Row 60.10 (test/writer-rules-a60.test.ts) goes
+ * red on a title, a usage counter or an acpx field the owner changed after the close's read.
+ */
+export async function writeCloseScalarsOnFreshRecord(
+  acpxRecordId: string,
+  closedAt: string,
+): Promise<SessionRecord> {
+  const sessionDir = sessionBaseDir();
+  const file = sessionFilePath(acpxRecordId);
+  let written: SessionRecord | undefined;
+  await retryOnLostRecordLock(file, () =>
+    withRecordFileLock(file, async (lock) => {
+      const raw = JSON.parse(await fs.readFile(file, "utf8")) as DiskRecord;
+      raw.closed = true;
+      raw.closed_at = closedAt;
+      delete raw.pid;
+      delete raw.pid_identity;
+      const parsed = parseSessionRecord(raw);
+      if (!parsed) {
+        throw new Error(`session record ${acpxRecordId} is not readable; nothing was closed`);
+      }
+      const ledger = openSpawnLedgerForRecord(parsed.metadata, sessionDir);
+      try {
+        await persistRecordFile(file, raw, ledger, lock);
+      } finally {
+        ledger?.close();
+      }
+      written = parsed;
+    }),
+  );
+  if (!written) {
+    throw new Error(`session record ${acpxRecordId}: the close wrote nothing`);
+  }
+  const hydrated = await hydrateSessionRecordMessages(written);
+  await updateIndexForWrittenRecord(sessionDir, hydrated, path.basename(file), {
+    preserveLifecycle: false,
+  });
+  return hydrated;
+}
+
 async function persistRecordFile(
   file: string,
   raw: DiskRecord,
@@ -1470,10 +1520,9 @@ async function retryOnLostRecordLock(file: string, write: () => Promise<void>): 
  *   keeps every other writer's inline entry as it finds it on disk.
  * - `adopt`: the writer is the ONLY one left — a close after the owner was proven stopped — so the
  *   inline entries its fresh read loaded are the dead owner's last output, and it logs them too.
- * - `keep`: the writer may not touch the log or the inline entries — a close whose owner was not
- *   proven stopped. The record's scalars are written; the pointer and the inline entries stay as on disk.
+ * (A close whose owner was NOT proven stopped writes none of this: `writeCloseScalarsOnFreshRecord`.)
  */
-export type MessageWriteMode = "own" | "adopt" | "keep";
+export type MessageWriteMode = "own" | "adopt";
 
 // One boundary append per log file at a time in this process (brick://5b608eaa). Two
 // overlapping boundary writes of one record — two injections drained in one tick — would
@@ -1541,9 +1590,6 @@ async function publishMessagesUnderLock(
 ): Promise<readonly SessionMessage[] | undefined> {
   if (fresh) {
     record.messagesLog = fresh.messagesLog;
-  }
-  if (options.mode === "keep" && fresh) {
-    return fresh.inlineMessages;
   }
   return await inMessagesLogBoundaryChain(logPath, async () => {
     // Inline entries on a record with NO split log are the whole conversation of a pre-split record,
