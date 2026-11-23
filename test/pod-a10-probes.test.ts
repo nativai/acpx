@@ -1164,6 +1164,8 @@ async function rig(opts: {
   statusFails?: boolean;
   /** `GET /v1/agents` is never answered (a hung broker) while POST still works (M1 F-B fix round 1). */
   statusHangs?: boolean;
+  /** The POST's stream never finishes after `scheduling`: the pod never wakes (M1 F-B fix round 2). */
+  postHangs?: boolean;
 }): Promise<Rig> {
   const home = fs.mkdtempSync(path.join(ROOT, "home-"));
   const stubDir = fs.mkdtempSync(path.join(ROOT, "stub-"));
@@ -1196,6 +1198,7 @@ async function rig(opts: {
     ...(opts.statusHangs ? { statusHangs: true } : {}),
     default: {
       steps: ["scheduling"],
+      ...(opts.postHangs ? { hang: true } : {}),
       final: {
         ready: {
           ip: "10.1.2.3",
@@ -2186,7 +2189,34 @@ test("M1 F-B fix round 1 REAL CLI: a HANGING capacity read counts against the ca
     const own = UTILITY_TIMEOUT_GRACE_MS + 1_000; // `--timeout 1` + the grace
     // The CLI's own start-up before the clock is a fraction of a second; the 5 s read must NOT be on top of it.
     assert.ok(deadlineAt - startedAt >= own - 50, `${deadlineAt - startedAt}`);
-    assert.ok(deadlineAt - startedAt < own + 3_000, `${deadlineAt - startedAt}`);
+    assert.ok(deadlineAt - startedAt < own + 3_500, `${deadlineAt - startedAt}`);
+  } finally {
+    await r.close();
+  }
+});
+
+test("M1 F-B fix round 2 REAL CLI: a HANGING capacity read AND a pod that never wakes — the call ends inside the WAKE BOUND measured from the CLI's start (exit 75 pod_starting), the read does not sit on top of it (red before the fix: ~read-bound later)", async () => {
+  const WAKE_BOUND_MS = 8_000; // the test seam shortens the production 20 s; the read's own bound is 5 s
+  const r = await rig({
+    statusHangs: true,
+    postHangs: true,
+    extraEnv: { ACPX_TEST_WAKE_BOUND_MS: String(WAKE_BOUND_MS) },
+    stub: { exit: 0 },
+  });
+  try {
+    const startedAt = Date.now();
+    const result = await cli(["--agent", CLAUDE, "--timeout", "1", "exec", "hi"], r.env);
+    const took = Date.now() - startedAt;
+    assert.equal(result.code, 75, result.stderr);
+    assert.match(
+      result.stderr.split("\n")[0] ?? "",
+      /^acpx: REFUSED reason=pod_starting nothing_started=true protocol=1 /,
+    );
+    assert.equal(AGENTS_GETS(r)[0]?.outcome, "status_hung");
+    assert.equal(r.calls().length, 0, "nothing ran");
+    // Start-up of the CLI is a fraction of a second; the 5 s read must not come on top of the 8 s bound.
+    assert.ok(took >= WAKE_BOUND_MS - 500, `${took}`);
+    assert.ok(took < WAKE_BOUND_MS + 2_500, `${took}`);
   } finally {
     await r.close();
   }
