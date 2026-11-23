@@ -14,7 +14,6 @@ import {
   type CallHomeOutcome,
 } from "./call-home.js";
 import type { Classification, OutputMode } from "./command-classes.js";
-import { answerLikeLocal, type TargetFailure } from "./not-found-answer.js";
 import {
   buildPassThroughCall,
   PassThroughUsageError,
@@ -25,6 +24,7 @@ import {
   type BranchContext,
   type PlacementDecision,
 } from "./placement-step.js";
+import { judgeChild, spawnVerdictChild, verdictOf, type ChildRunner } from "./verdict-child.js";
 
 /**
  * A3 — the pass-through client and the message route, no direct path (CONTRACTS-r4 C6.1, C6.2, C7.2;
@@ -97,32 +97,32 @@ function asBody(value: unknown): AnswerBody {
 }
 
 /**
- * K5: a target atrium cannot resolve (`400 class-not-passable` + `target-unresolved`) is the control pod's
- * "Session not found", not a policy refusal — for the verbs and selector forms `not-found-answer.ts` maps.
+ * K5 (brick 46b827ba): a target atrium says is no session — or two — is answered by the control pod's own code:
+ * the same argv run in a read-only child with the verdict armed, relayed ONLY when the child confirms it is read-only
+ * and ends in an answer (`verdict-child.ts`). Returns the exit code, or undefined to keep the door's refusal.
  */
-async function localAnswerFor(
+function verdictAnswerFor(
   status: number,
   body: AnswerBody,
   deps: {
-    output: OutputMode;
+    io: PassThroughIo;
     context: BranchContext;
-    classification: Extract<Classification, { kind: "classified" }>;
+    classification: Classification;
+    env: NodeJS.ProcessEnv;
+    runChild: ChildRunner;
   },
-): Promise<number | undefined> {
-  if (status !== 400 || body.error !== "class-not-passable") {
+): number | undefined {
+  const verdict = verdictOf(status, body, deps.classification);
+  if (verdict === undefined) {
     return undefined;
   }
-  // A-52: `target-unresolved` means ONLY that no session matches; `target-ambiguous` carries the resolver's own
-  // sentence. `target-lookup-failed` (and any reason this build does not know) keeps the door's refusal.
-  const failure: TargetFailure | undefined =
-    body.reason === "target-unresolved"
-      ? { kind: "not-found" }
-      : body.reason === "target-ambiguous" && typeof body.message === "string"
-        ? { kind: "ambiguous", message: body.message }
-        : undefined;
-  return failure === undefined
-    ? undefined
-    : await answerLikeLocal(deps.classification, deps.context.argv, deps.context, failure);
+  const judged = judgeChild(deps.runChild({ argv: deps.context.argv, verdict, env: deps.env }));
+  if (!judged.relay) {
+    return undefined;
+  }
+  deps.io.stdout(judged.stdout);
+  deps.io.stderr(judged.stderr);
+  return judged.exit;
 }
 
 /** Print what atrium answered, or the failure it amounts to; returns the exit code. */
@@ -133,7 +133,9 @@ async function finishAnswered(
     output: OutputMode;
     io: PassThroughIo;
     context: BranchContext;
-    classification: Extract<Classification, { kind: "classified" }>;
+    classification: Classification;
+    env: NodeJS.ProcessEnv;
+    runChild: ChildRunner;
   },
 ): Promise<number> {
   const body = asBody(outcome.body);
@@ -142,9 +144,9 @@ async function finishAnswered(
     deps.io.stderr(typeof body.stderr === "string" ? body.stderr : "");
     return body.exit;
   }
-  const local = await localAnswerFor(outcome.status, body, deps);
-  if (local !== undefined) {
-    return local;
+  const answered = verdictAnswerFor(outcome.status, body, deps);
+  if (answered !== undefined) {
+    return answered;
   }
   // A 4xx is a refusal by the door (a 400 class-not-passable, a 403 caller gate): FINAL, never
   // retried. Any other answer (a 500, a body that is not `{exit}`): the command may have run.
@@ -168,6 +170,8 @@ export type PassThroughRun = {
   readStdin?: () => Buffer;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  /** Test seam: the verdict child (default: this CLI under the Node permission model). */
+  runChild?: ChildRunner;
 };
 
 const defaultIo: PassThroughIo = {
@@ -272,21 +276,13 @@ export async function runPassThrough(run: PassThroughRun): Promise<number> {
   }
   const outcome = await sendCall(run, env, call, decision.output);
   if (outcome.kind === "answered") {
-    // `buildCallOrRefuse` fails closed on anything unclassified, so this is the classified branch.
-    const classification = decision.classification;
-    if (classification.kind !== "classified") {
-      return refuseLines(
-        decision,
-        context,
-        ROUTED_TWICE_REFUSAL.lines,
-        ROUTED_TWICE_REFUSAL.exitCode,
-      );
-    }
     return await finishAnswered(outcome, call, {
       output: decision.output,
       io: run.io ?? defaultIo,
       context,
-      classification,
+      classification: decision.classification,
+      env,
+      runChild: run.runChild ?? spawnVerdictChild,
     });
   }
   const failure =

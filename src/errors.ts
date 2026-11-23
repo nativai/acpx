@@ -1,3 +1,4 @@
+import { noteRegistryRefusal } from "./pod/target-verdict.js";
 import type {
   AutomationCapacityReservedDetail,
   CapacityRefusalDetail,
@@ -370,6 +371,7 @@ export class AgentStartupTimeoutError extends AcpxOperationalError {
 // A subscription id was requested that is not in the registry. Usage error.
 export class SubscriptionUnknownError extends AcpxOperationalError {
   constructor(id: string, knownIds?: readonly string[]) {
+    noteRegistryRefusal();
     const known =
       knownIds && knownIds.length > 0
         ? ` Known subscription ids: ${knownIds.join(", ")}.`
@@ -802,6 +804,7 @@ export class SubscriptionTurnInFlightError extends AcpxOperationalError {
 // SubscriptionUnknownError for the unified credential-move path.
 export class ProfileUnknownError extends AcpxOperationalError {
   constructor(id: string, knownIds?: readonly string[]) {
+    noteRegistryRefusal();
     const known =
       knownIds && knownIds.length > 0
         ? ` Known profile ids: ${knownIds.join(", ")}.`
