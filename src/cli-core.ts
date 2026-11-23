@@ -525,6 +525,30 @@ function createProgram(requestedJsonStrict: boolean): Command {
   return program;
 }
 
+/**
+ * A usage error on a SUBCOMMAND (`agents list --bogus`, `agents list extra`) used to exit 1 with NOTHING on
+ * stdout under `--json-strict` (commander's own text goes to the suppressed writer) and no JSON document in plain
+ * json either: the subcommands are registered BEFORE `program.exitOverride`, and commander copies that setting at
+ * creation, so a subcommand without its own exit callback called `process.exit(1)` itself, past the error
+ * handler the top level already has (N1, brick bfbb74e3). In json mode every subcommand that has no callback of its
+ * own now throws to `handleProgramParseError` — the SAME JSON-RPC USAGE document, exit 2, as the same mistake at
+ * the top level. A command that set its own callback (people, capacity) keeps it. Text mode is untouched.
+ */
+function routeSubcommandUsageErrors(program: Command): void {
+  const visit = (command: Command): void => {
+    for (const child of command.commands) {
+      // commander's default is `null` (it only tests truthiness), so "has none" is falsy, not `=== undefined`
+      if (!Reflect.get(child, "_exitCallback")) {
+        child.exitOverride((error) => {
+          throw error;
+        });
+      }
+      visit(child);
+    }
+  };
+  visit(program);
+}
+
 async function handleProgramParseError(
   error: unknown,
   requestedOutputPolicy: OutputPolicy,
@@ -605,6 +629,9 @@ export async function main(argv: string[] = process.argv): Promise<void> {
   program.exitOverride((error) => {
     throw error;
   });
+  if (requestedOutputPolicy.format === "json") {
+    routeSubcommandUsageErrors(program);
+  }
 
   try {
     await runWithOutputPolicy(requestedOutputPolicy, async () => {

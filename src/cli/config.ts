@@ -53,12 +53,21 @@ export type ResolvedAcpxConfig = {
   globalPath: string;
   projectPath: string;
   hasGlobalConfig: boolean;
+  /** The project config file EXISTS (whether or not it was read — see `projectConfigIgnored`). */
   hasProjectConfig: boolean;
+  /**
+   * The project config file exists but was NOT read: on a control-role host it is workbench-writable, so it is
+   * ignored (`readProjectConfigFile`). Since F-23 `--json-strict` prints no warning, so `config show` must say it
+   * (brick bfbb74e3, N2). Absent ≡ false.
+   */
+  projectConfigIgnored?: boolean;
 };
 
 type ConfigFileLoadResult = {
   config?: ConfigFileShape;
   exists: boolean;
+  /** Present on a file that exists but was deliberately not read. */
+  ignored?: boolean;
 };
 
 const DEFAULT_TIMEOUT_MS = undefined;
@@ -135,7 +144,7 @@ async function readProjectConfigFile(projectPath: string): Promise<ConfigFileLoa
     );
     warnedIgnoredProjectConfigs.add(projectPath);
   }
-  return { exists: true };
+  return { exists: true, ignored: true };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -427,6 +436,7 @@ export async function loadResolvedConfig(cwd: string): Promise<ResolvedAcpxConfi
     projectPath,
     hasGlobalConfig: globalResult.exists,
     hasProjectConfig: projectResult.exists,
+    ...(projectResult.ignored === true ? { projectConfigIgnored: true } : {}),
   };
 }
 
