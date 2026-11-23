@@ -512,7 +512,13 @@ function exportedValues(text: string): string[] {
  * a `createRequire` held in a variable or destructured / renamed out of a DYNAMIC `node:module` load (`const { createRequire:
  * mk } = await import("node:module")`), `createRequire.call(…)`; a loader member not called directly (`loader.import.call(…)`,
  * `Reflect.apply(loader.import, …)`, a computed key); `module.register(…)` (loader hooks); `child_process.fork(modulePath)`.
+ * Also unseen, for `Worker` itself (R2-I2): a `Worker` destructured out of a dynamic `import("node:worker_threads")` /
+ * `require("node:worker_threads")`, held in a variable (`const W = wt.Worker; new W(…)`), re-exported under another name by a
+ * local module, reached as `wt["Worker"]`, or built with `Reflect.construct(Worker, […])`.
  * None of those is in `src/` today (`grep -rnE` over src/, lows-r3 TE).
+ *
+ * The KEY is the FULL call text as written (whitespace collapsed), never a prefix: an edit anywhere in a registered call —
+ * a preload in `execArgv`, a raised `resourceLimits` — is a new key and so red (brick 7115375b).
  */
 function unfollowableSites(files: Iterable<[string, string]>): Map<string, number> {
   const found = new Map<string, number>();
@@ -565,7 +571,7 @@ function unfollowableSites(files: Iterable<[string, string]>): Map<string, numbe
       }
     }
     const note = (kind: string, node: ts.Node): void => {
-      const written = node.getText(sf).replace(/\s+/gu, " ").slice(0, 160);
+      const written = node.getText(sf).replace(/\s+/gu, " ");
       const key = `${rel} | ${kind} | ${written}`;
       found.set(key, (found.get(key) ?? 0) + 1);
     };
@@ -651,7 +657,7 @@ const KNOWN_NON_LEDGER_UNFOLLOWABLE: Readonly<Record<string, number>> = {
   "flows/cli.ts | non-literal import() | import(flowUrl)": 1,
   // the capacity governor's /proc readers: a worker run from a template-literal source (`READER_SOURCE`) that requires only node:fs / node:os /
   // node:worker_threads and reads /proc/<pid>/stat — not a ledger use
-  "capacity/governor/scan.ts | new Worker | new Worker(READER_SOURCE, { eval: true, workerData: { ctl, port: port2, index, count: options.readers, procRoot, nice: options.nice }, transferList: [port2], re": 1,
+  "capacity/governor/scan.ts | new Worker | new Worker(READER_SOURCE, { eval: true, workerData: { ctl, port: port2, index, count: options.readers, procRoot, nice: options.nice }, transferList: [port2], resourceLimits: { maxOldGenerationSizeMb: 16, maxYoungGenerationSizeMb: 4 }, })": 1,
   // `node:sqlite`, loaded once by `loadSqlite`
   "pod/sqlite-loader.ts | createRequire | createRequire(import.meta.url)": 1,
 };
@@ -1019,4 +1025,41 @@ test("K4-2 / FN-3: the unfollowable SITES in src/ today are exactly the register
     Object.keys(KNOWN_NON_LEDGER_UNFOLLOWABLE).some((key) => key.startsWith("cli/brand-new.ts")),
     false,
   );
+});
+
+test("K4-2 / R2-F2: the registry keys the FULL call text — an edit to the registered Worker call PAST the old 160-char mark (a ledger preload in `execArgv`, a raised `resourceLimits`) is red, as is one before it", () => {
+  const rel = "capacity/governor/scan.ts";
+  const source = [...srcFiles(SRC)].find(([file]) => file === rel)?.[1] ?? "";
+  const registered = Object.fromEntries(
+    Object.entries(KNOWN_NON_LEDGER_UNFOLLOWABLE).filter(([key]) => key.startsWith(`${rel} | `)),
+  );
+  const keysOf = (text: string): Record<string, number> =>
+    Object.fromEntries(
+      [...unfollowableSites([[rel, text]]).entries()].toSorted(([a], [b]) => a.localeCompare(b)),
+    );
+  // control: the real file IS the registry (so a red below is the edit's, nothing else's)
+  assert.deepEqual(keysOf(source), registered);
+  const [key] = Object.keys(registered);
+  assert.ok(
+    (key ?? "").split(" | ").slice(2).join(" | ").length > 160,
+    "the registered call is longer than the old 160-char cut: the edits below land PAST it",
+  );
+  const edits: Array<[string, string, string]> = [
+    // the TE's two measured edits: both stayed GREEN under slice(0, 160)
+    [
+      "resourceLimits: { maxOldGenerationSizeMb: 16, maxYoungGenerationSizeMb: 4 },",
+      'resourceLimits: { maxOldGenerationSizeMb: 16, maxYoungGenerationSizeMb: 4 }, execArgv: ["--import", "../capacity/ledger.js"],',
+      "a ledger preload appended after resourceLimits",
+    ],
+    ["maxOldGenerationSizeMb: 16", "maxOldGenerationSizeMb: 4096", "resourceLimits 16 -> 4096"],
+    // and one BEFORE the old mark
+    ["eval: true,", "eval: true, name: 'x',", "an option edit near the start"],
+  ];
+  for (const [from, to, what] of edits) {
+    const edited = source.replace(from, to);
+    assert.notEqual(edited, source, `the edit applied: ${what}`);
+    assert.notDeepEqual(keysOf(edited), registered, `${what}: is NOT green`);
+  }
+  // control: a whitespace-only re-wrap keys the same (the key collapses whitespace)
+  assert.deepEqual(keysOf(source.replace("eval: true,\n", "eval: true,\n\n  ")), registered);
 });
