@@ -13,6 +13,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
+import { fileURLToPath } from "node:url";
 import workerThreads from "node:worker_threads";
 import { sessionArchiveDirFor } from "../session/archive/paths.js";
 import { parseSessionRecord } from "../session/persistence/parse.js";
@@ -167,28 +168,51 @@ function watchDenials(undo: Restore[]): void {
 
 type StoreKind = "record" | "index" | "seats";
 
-function pathOf(file: unknown): string | undefined {
+/** The path as the caller spelled it — NOT folded: `path.resolve` folds `a/../b` lexically, which an alias in `a` makes untrue. */
+function rawPathOf(file: unknown): string | undefined {
   if (file instanceof URL) {
-    return path.resolve(file.pathname);
+    return file.protocol === "file:" ? fileURLToPath(file) : undefined;
   }
-  return typeof file === "string" || Buffer.isBuffer(file)
-    ? path.resolve(file.toString())
-    : undefined;
+  return typeof file === "string" || Buffer.isBuffer(file) ? file.toString() : undefined;
+}
+
+/**
+ * The path with every symlink resolved, so that ONE store file has ONE spelling (`..` after a link, a symlinked home, a
+ * link to the file itself, a trailing slash). A file that is not there (a read that failed) is named by its directory's
+ * real path; a directory that is not there is named as written. ⚠️ Never compare a store file by its `path.resolve`d
+ * spelling: a reader reaching the store through an alias would not be watched (brick 3543498a; held by the
+ * "store file spelling" rows in `test/pod-not-found.test.ts`).
+ */
+function realPathOf(raw: string): string {
+  try {
+    return fs.realpathSync.native(raw);
+  } catch {
+    // fall through: the file itself is absent or unreadable
+  }
+  const resolved = path.resolve(raw);
+  try {
+    return path.join(fs.realpathSync.native(path.dirname(resolved)), path.basename(resolved));
+  } catch {
+    return resolved;
+  }
 }
 
 /** Is this path a store file whose content decides a lookup? Evaluated per call: the store is where the env says. */
 function storeKindOf(file: unknown): StoreKind | undefined {
-  const resolved = pathOf(file);
-  if (resolved === undefined) {
+  const raw = rawPathOf(file);
+  if (raw === undefined) {
     return undefined;
   }
+  const resolved = realPathOf(raw);
   const dir = path.dirname(resolved);
   const base = path.basename(resolved);
   const hot = sessionBaseDir();
-  if (dir === hot) {
+  if (dir === realPathOf(hot)) {
     return hotKindOf(base);
   }
-  return dir === sessionArchiveDirFor(hot) && isSessionRecordFileName(base) ? "record" : undefined;
+  return dir === realPathOf(sessionArchiveDirFor(hot)) && isSessionRecordFileName(base)
+    ? "record"
+    : undefined;
 }
 
 function hotKindOf(base: string): StoreKind | undefined {
