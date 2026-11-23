@@ -412,6 +412,23 @@ async function sleepWithCancel(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+// brick fc9eea92 — a HELD prompt: the turn blocks until the test creates `releaseFile`, so "the prompt
+// is in flight" is a state the test holds open for as long as it needs, independent of box load (a
+// `sleep <ms>` prompt finishes on a clock, and under load the row that reads it in flight loses the
+// race). Cancel-aware like `sleep`. The cap keeps a test that died before releasing from stranding an
+// owner on a held turn forever.
+const HOLD_UNTIL_FILE_CAP_MS = 120_000;
+
+async function holdUntilFile(releaseFile: string, signal: AbortSignal): Promise<void> {
+  const deadline = Date.now() + HOLD_UNTIL_FILE_CAP_MS;
+  while (!existsSync(releaseFile)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`hold-until-file: ${releaseFile} never appeared`);
+    }
+    await sleepWithCancel(25, signal);
+  }
+}
+
 function parseOptionValue(args: string[], index: number, flag: string): string {
   const value = args[index];
   if (typeof value !== "string" || value.trim().length === 0) {
@@ -2143,6 +2160,16 @@ class MockAgent implements Agent {
 
       await sleepWithCancel(Math.round(ms), signal);
       return `slept ${Math.round(ms)}ms`;
+    }
+
+    if (text.startsWith("hold-until-file ")) {
+      const releaseFile = text.slice("hold-until-file ".length).trim();
+      if (!releaseFile) {
+        throw new Error("Usage: hold-until-file <release file path>");
+      }
+
+      await holdUntilFile(releaseFile, signal);
+      return "released by file";
     }
 
     if (text.startsWith("stream-sleep ")) {

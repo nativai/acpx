@@ -4795,9 +4795,47 @@ test("integration: sessions owner-status --descendants-of scans transitive desce
   });
 });
 
+// brick fc9eea92 — the in-flight row is HELD, not timed. Its first form sent `sleep 1500` and gave history
+// a 5 s `waitFor`: the turn's User row is written only after the cold owner's connect (brick 6f461fe4,
+// test/turn-cut-before-prompt.test.ts — by design), so under box load the row appeared after the
+// 1.5 s prompt had finished, or after the bound. A longer bound alone would let the prompt finish before
+// the read and the row would stop proving "in flight". The prompt is now held by the mock agent until
+// the test creates a release file, so the order is: the prompt is accepted -> history shows it ->
+// the test releases it -> the prompt completes. The wait below is an ordering wait: its bound is a
+// hang detector, never a timing assertion, because a held prompt cannot finish before its release.
+const HELD_PROMPT_HISTORY_WAIT_MS = 60_000;
+
+async function waitForHistoryToShowPrompt(params: {
+  cwd: string;
+  homeDir: string;
+  marker: string;
+  promptIsRunning: () => boolean;
+  timeoutMs: number;
+}): Promise<string> {
+  const deadline = Date.now() + params.timeoutMs;
+  while (Date.now() < deadline) {
+    if (!params.promptIsRunning()) {
+      // The prompt left before history showed it: not "in flight" any more, and no later read can
+      // change that. Fail at once with the cause (`waitFor` would swallow this and retry to its bound).
+      throw new Error("the prompt process exited before sessions history showed it in flight");
+    }
+    const result = await runCli(
+      [...baseAgentArgs(params.cwd), "--format", "quiet", "sessions", "history"],
+      params.homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    if (result.stdout.includes(params.marker)) {
+      return result.stdout;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error("Timed out waiting for condition");
+}
+
 test("integration: sessions history shows in-flight prompt after prompt starts", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const releaseFile = path.join(cwd, "release-held-prompt");
 
     try {
       const created = await runCli(
@@ -4811,7 +4849,13 @@ test("integration: sessions history shows in-flight prompt after prompt starts",
         [
           CLI_PATH,
           ...addressByRememberedId(
-            [...baseAgentArgs(cwd), "--format", "quiet", "prompt", "sleep 1500"],
+            [
+              ...baseAgentArgs(cwd),
+              "--format",
+              "quiet",
+              "prompt",
+              `hold-until-file ${releaseFile}`,
+            ],
             homeDir,
             cwd,
           ),
@@ -4826,27 +4870,73 @@ test("integration: sessions history shows in-flight prompt after prompt starts",
       );
 
       try {
-        const history = await waitFor(async () => {
-          const result = await runCli(
-            [...baseAgentArgs(cwd), "--format", "quiet", "sessions", "history"],
-            homeDir,
-          );
-          assert.equal(result.code, 0, result.stderr);
-          return result.stdout.includes("sleep 1500") ? result.stdout : null;
-        }, 5_000);
+        const history = await waitForHistoryToShowPrompt({
+          cwd,
+          homeDir,
+          marker: releaseFile,
+          promptIsRunning: () => promptChild.exitCode == null && promptChild.signalCode == null,
+          timeoutMs: HELD_PROMPT_HISTORY_WAIT_MS,
+        });
 
-        assert.match(history, /sleep 1500/);
+        assert.match(history, /hold-until-file /);
         assert.doesNotMatch(history, /No history/);
+        // In flight: the agent is still holding the turn, so history has the prompt and no answer.
+        assert.equal(promptChild.exitCode, null, "the held prompt must still be running");
+        assert.doesNotMatch(history, /released by file/);
 
+        await fs.writeFile(releaseFile, "");
         const promptResult = await awaitChildClose(promptChild);
         assert.equal(promptResult.code, 0, promptResult.stderr);
-        assert.match(promptResult.stdout, /slept 1500ms/);
+        assert.match(promptResult.stdout, /released by file/);
       } finally {
+        // Release first, so a failing row never leaves the owner on a held turn.
+        await fs.writeFile(releaseFile, "").catch(() => {});
         if (promptChild.exitCode == null && promptChild.signalCode == null) {
           promptChild.kill("SIGKILL");
           await awaitChildClose(promptChild).catch(() => {});
         }
       }
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// Negative controls for the row above: its wait can FAIL. The same helper, over a session in which the
+// in-flight entry is genuinely absent, must reject — the first with no prompt ever sent (a read issued
+// before the prompt), the second with a prompt process that is already gone.
+test("integration: in-flight history wait rejects when no prompt was ever sent", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+
+    try {
+      const created = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "sessions", "new"],
+        homeDir,
+      );
+      assert.equal(created.code, 0, created.stderr);
+
+      await assert.rejects(
+        waitForHistoryToShowPrompt({
+          cwd,
+          homeDir,
+          marker: path.join(cwd, "release-held-prompt"),
+          promptIsRunning: () => true,
+          timeoutMs: 1_500,
+        }),
+        /Timed out waiting for condition/,
+      );
+
+      await assert.rejects(
+        waitForHistoryToShowPrompt({
+          cwd,
+          homeDir,
+          marker: path.join(cwd, "release-held-prompt"),
+          promptIsRunning: () => false,
+          timeoutMs: 1_500,
+        }),
+        /exited before sessions history showed it in flight/,
+      );
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
