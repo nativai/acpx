@@ -107,7 +107,11 @@ test("F-14: a level the agent REJECTED is never recorded as served exactly", asy
   // level the agent just refused — so the record claimed the agent served
   // exactly the thing it said no to.
   const rec = record();
-  const client = agent({ rejectWith: new Error("Invalid params"), ladder: ["low"] });
+  // A JSON-RPC `-32602 Invalid params` — the agent refusing the value. It must carry
+  // the code: since brick 94d01658 only a recognised REFUSAL takes the fallback, and a
+  // bare Error that says nothing about the level surfaces instead.
+  const rejection = Object.assign(new Error("Invalid params"), { code: -32602 });
+  const client = agent({ rejectWith: rejection, ladder: ["low"] });
   // A single-value ladder with no `default` entry is what makes the fallback
   // resolve back to the request; that is the case being pinned.
   await applyEffort(rec, client, "low", [effortOption("high", ["low"])]);
