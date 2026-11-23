@@ -230,6 +230,22 @@ test("94d01658: an explicit --reasoning-effort low on a cut copy records low and
   }
 });
 
+test("94d01658: a cut copy with --model sonnet of an effort-max source records high — what sonnet serves", async () => {
+  const f = makeRig();
+  try {
+    const source = await makeMaxSource(f);
+    const copyId = await copy(f, source, ["--model", "sonnet"], ["--at-log-index", "2"]);
+
+    // sonnet's ladder tops out at `high`: the record must say what the turn will run at,
+    // not the inherited `max` it can never serve.
+    assert.deepEqual(effortOf(f, copyId), { desired: "high", sessionOption: "high" });
+    assert.equal(await firstTurnWireEffort(f, copyId), "high");
+    assert.deepEqual(effortOf(f, copyId), { desired: "high", sessionOption: "high" });
+  } finally {
+    removeTempHomeSync(f.root);
+  }
+});
+
 test("94d01658: a full copy (no cut) of an effort-max Claude source records max and serves max", async () => {
   const f = makeRig();
   try {

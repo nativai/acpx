@@ -535,6 +535,24 @@ test("persistAndApplyRequestedEffort: deferApply persists the intent and sends n
   assert.equal(client.calls.length, 0);
 });
 
+test("persistAndApplyRequestedEffort: deferApply records the level the copy's model will serve", async () => {
+  const client = mockClient();
+  const record = recordWithDesired();
+  await persistAndApplyRequestedEffort({
+    client,
+    sessionId: "durable-unregistered",
+    record,
+    reasoningEffort: "max",
+    // the fork-time advertisement is the broad one; the copy runs sonnet
+    advertised: [effortOption("default", OPUS_EFFORT_LEVELS)],
+    modelId: "sonnet",
+    deferApply: true,
+  });
+  assert.equal(getDesiredConfigOptions(record.acpx).effort, "high");
+  assert.equal(record.acpx?.session_options?.effort, "high");
+  assert.equal(client.calls.length, 0);
+});
+
 test("persistAndApplyRequestedEffort: no-op when no effort requested", async () => {
   const client = mockClient();
   const record = recordWithDesired();

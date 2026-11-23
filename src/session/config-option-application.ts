@@ -487,11 +487,12 @@ export async function persistAndApplyRequestedEffort(params: {
     });
     return;
   }
-  const before = effortStateOf(params.record);
-  setDesiredConfigOption(params.record, "effort", params.reasoningEffort);
   if (params.deferApply) {
+    persistDeferredEffort(params.record, params.reasoningEffort, params.advertised, params.modelId);
     return;
   }
+  const before = effortStateOf(params.record);
+  setDesiredConfigOption(params.record, "effort", params.reasoningEffort);
   let wire: EffortWireOutcome | undefined;
   try {
     wire = await applyRequestedConfigOptionsIfAdvertised({
@@ -538,6 +539,28 @@ export async function persistAndApplyRequestedEffort(params: {
   // `recordDepthOutcome` is a no-op for the Claude family, so their records are
   // untouched by this.
   recordDepthOutcome(params.record, depthOutcomeFromWire(params.reasoningEffort, wire));
+}
+
+/**
+ * The deferred arm of `persistAndApplyRequestedEffort`: persist what WILL be served,
+ * not the raw request — the same normalisation the eager path applies before it
+ * sends (the copy's model ladder over the advertisement). A `max` inherited onto a
+ * `--model sonnet` copy is recorded `high`, sonnet's top level, which is what the
+ * first turn runs at (TE finding on brick 94d01658). A level the model does not
+ * normalise is kept as requested, exactly as the eager path leaves it.
+ */
+function persistDeferredEffort(
+  record: SessionRecord,
+  requested: string,
+  advertised: SessionConfigOption[] | undefined,
+  modelId: string | undefined,
+): void {
+  const option = advertised?.find((entry) => entry.id === "effort");
+  const served =
+    option === undefined
+      ? undefined
+      : supportedConfigOptionValue("effort", requested, option, modelId);
+  setDesiredConfigOption(record, "effort", served ?? requested);
 }
 
 type EffortState = { desired: string | undefined; sessionOption: string | undefined };
