@@ -4864,7 +4864,7 @@ async function waitForHoldToEngage(params: {
 
 async function runHeldPromptInFlightScenario(
   homeDir: string,
-  options: { preCreateReleaseFile: boolean },
+  options: { preCreateReleaseFile: boolean; createReleaseAfterPrecondition?: boolean },
 ): Promise<void> {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
   const releaseFile = path.join(cwd, "release-held-prompt");
@@ -4891,6 +4891,11 @@ async function runHeldPromptInFlightScenario(
       homeDir,
     );
     assert.equal(created.code, 0, created.stderr);
+    if (options.createReleaseAfterPrecondition) {
+      // Passes the precondition above (the file did not exist then) and still means the hold can never
+      // engage; only the `.holding` sentinel wait below can catch it (brick 1e674c0a, from fc9eea92 R2-O1).
+      await fs.writeFile(releaseFile, "");
+    }
 
     const promptChild = spawn(
       process.execPath,
@@ -4913,15 +4918,19 @@ async function runHeldPromptInFlightScenario(
     const promptIsRunning = () => promptChild.exitCode == null && promptChild.signalCode == null;
 
     try {
+      // The hold engages FIRST, then history is read: a release file that exists once the prompt is
+      // sent ends the prompt at once, and this wait then fails with the sentinel's own error on every
+      // run. In the other order the history wait races the prompt's exit and could fail first, with its
+      // own message, which would not prove the sentinel.
+      await waitForHoldToEngage({
+        holdingFile,
+        promptIsRunning,
+        timeoutMs: HELD_PROMPT_HISTORY_WAIT_MS,
+      });
       const history = await waitForHistoryToShowPrompt({
         cwd,
         homeDir,
         marker: releaseFile,
-        promptIsRunning,
-        timeoutMs: HELD_PROMPT_HISTORY_WAIT_MS,
-      });
-      await waitForHoldToEngage({
-        holdingFile,
         promptIsRunning,
         timeoutMs: HELD_PROMPT_HISTORY_WAIT_MS,
       });
@@ -4962,6 +4971,22 @@ test("integration: in-flight row fails when the release file already exists", as
     await assert.rejects(
       runHeldPromptInFlightScenario(homeDir, { preCreateReleaseFile: true }),
       /the release file must not exist before the prompt is sent/,
+    );
+  });
+});
+
+// Negative control for the `.holding` sentinel (brick 1e674c0a, from fc9eea92 TE R2-O1): the release file
+// is created AFTER the precondition, so the precondition passes and only the sentinel can catch it. The
+// row above rejects at the precondition and so never reaches the sentinel. The message is pinned: the
+// scenario's other waits fail with different messages.
+test("integration: in-flight row fails when the release file appears after the precondition (the hold never engages)", async () => {
+  await withTempHome(async (homeDir) => {
+    await assert.rejects(
+      runHeldPromptInFlightScenario(homeDir, {
+        preCreateReleaseFile: false,
+        createReleaseAfterPrecondition: true,
+      }),
+      /the prompt process exited before the mock agent engaged the hold/,
     );
   });
 });

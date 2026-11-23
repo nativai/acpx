@@ -343,7 +343,14 @@ test("the quiet run's stderr warning does not point at a plan 'above' that was n
     for (const intent of ["--dry-run", "--apply"]) {
       const quiet = await run(["--format", "quiet", "sessions", "archive", intent], home);
       assert.doesNotMatch(quiet.stderr, /plan above/u, intent);
-      assert.match(quiet.stderr, /see it with --dry-run, or --format json/u, intent);
+      if (intent === "--dry-run") {
+        // the user just RAN the dry run: "see it with --dry-run" would be circular; --format text shows the plan
+        // (brick 3bc340d5, TE-d202-2)
+        assert.match(quiet.stderr, /see it with --format text, or --format json/u, intent);
+        assert.doesNotMatch(quiet.stderr, /see it with --dry-run/u, intent);
+      } else {
+        assert.match(quiet.stderr, /see it with --dry-run, or --format json/u, intent);
+      }
     }
     const json = await run(["--format", "json", "sessions", "archive", "--dry-run"], home);
     assert.doesNotMatch(json.stdout, /plan above/u);

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 import ts from "typescript";
 import {
   admitCreate,
@@ -790,7 +791,9 @@ const KNOWN_NON_LEDGER_UNFOLLOWABLE: Readonly<Record<string, number>> = {
 /**
  * What an `eval: true` Worker RUNS (bricks 61de55d6, TE-7115-3 / TE-61de-1 / TE-61de-2). The call is keyed above; the code it
  * runs is a string constant elsewhere in the file. For each `new Worker(SRC, { eval: true, … })` whose first argument is an
- * identifier bound — by its ONE `const` declaration in the file, never reassigned — to a string / template constant, this
+ * identifier bound — by its ONE `const` declaration in the file, never reassigned, and by NO other binding of the name anywhere
+ * in the file (a parameter, a destructured binding, an import, a function / class / enum / namespace name, a catch variable:
+ * TE-61de-7) — to a string / template constant, this
  * RESOLVES the source (every `${…}` span is evaluated statically: a numeric or string literal, or an identifier bound to a
  * `const` of those, recursively), PARSES it as code, and walks the syntax tree:
  *  - `require("x")` → `require:x`; `import("x")` → `import:x`; `import … from "x"` / `import "x"` → `import:x`;
@@ -798,6 +801,7 @@ const KNOWN_NON_LEDGER_UNFOLLOWABLE: Readonly<Record<string, number>> = {
  *    `.call`, `Reflect.apply`, `(0, require)`, `require?.(…)`) → `<non-literal require>`; a non-literal `import()`; a computed
  *    member `x[expr]` whose key is not a literal; and any identifier, property or string named in `WORKER_DENIED_NAMES`
  *    (`eval`, `Function`, `getBuiltinModule`, `createRequire`, `binding`, `_load`, `process`, `module`, `globalThis`, `Worker`, …);
+ *    and `this`, wherever it stands (`<this>`; TE-61de-6: in an eval worker it is the global object, which holds `require`);
  *  - a span that cannot be resolved, a source that does not parse, a `new Worker` whose first argument is not such a constant
  *    (a path, a URL, a call, a constant declared twice, a `let`, one assigned elsewhere), or one without `eval: true`, is
  *    `<unresolved …>` — red until read and registered. A span can be allowed by name in `KNOWN_WORKER_SOURCE_SPANS`.
@@ -805,7 +809,8 @@ const KNOWN_NON_LEDGER_UNFOLLOWABLE: Readonly<Record<string, number>> = {
  * Keyed `<file> | <IDENT>`, value the sorted list.
  *
  * NAMED LIMIT (pinned by its own row): what the call hands the worker through `workerData` is not examined here — the call's key
- * pins it (an edit of `workerData` is an edit of the call, so red there).
+ * pins the expressions it passes, not their values (an edit of `workerData` is an edit of the call, so red there; a change of
+ * what a variable it names holds is not).
  */
 const WORKER_DENIED_NAMES: ReadonlySet<string> = new Set([
   "eval",
@@ -859,9 +864,13 @@ function workerSourceModules(
         }
       }
     }
-    // every declaration of a name, and every name that is assigned, anywhere in the file
+    // every declaration of a name, EVERY binding of it, and every name that is assigned, anywhere in the file
     const declarations = new Map<string, ts.VariableDeclaration[]>();
+    const bindings = new Map<string, number>();
     const assigned = new Set<string>();
+    const bind = (name: string): void => {
+      bindings.set(name, (bindings.get(name) ?? 0) + 1);
+    };
     const gather = (node: ts.Node): void => {
       if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
         declarations.set(node.name.text, [...(declarations.get(node.name.text) ?? []), node]);
@@ -871,12 +880,34 @@ function workerSourceModules(
           assigned.add(node.left.text);
         }
       }
+      // TE-61de-7: a name is bound by more than a `const` — a parameter, a destructured binding, an import, a function / class /
+      // enum / namespace name, a catch variable. Every one of them is counted, wherever it sits (a count by SCOPE would need the
+      // type checker; a same-named binding in an unrelated scope is a false red, which is the safe direction).
+      if (
+        (ts.isVariableDeclaration(node) || ts.isParameter(node) || ts.isBindingElement(node)) &&
+        ts.isIdentifier(node.name)
+      ) {
+        bind(node.name.text);
+      } else if (
+        (ts.isImportClause(node) ||
+          ts.isNamespaceImport(node) ||
+          ts.isImportSpecifier(node) ||
+          ts.isImportEqualsDeclaration(node) ||
+          ts.isFunctionLike(node) ||
+          ts.isClassLike(node) ||
+          ts.isEnumDeclaration(node) ||
+          ts.isModuleDeclaration(node)) &&
+        node.name !== undefined &&
+        ts.isIdentifier(node.name)
+      ) {
+        bind(node.name.text);
+      }
       ts.forEachChild(node, gather);
     };
     gather(sf);
     const constantOf = (name: string): ts.Expression | undefined => {
       const all = declarations.get(name) ?? [];
-      const only = all.length === 1 ? all[0] : undefined;
+      const only = all.length === 1 && bindings.get(name) === 1 ? all[0] : undefined;
       const list = only?.parent;
       return only !== undefined &&
         !assigned.has(name) &&
@@ -958,6 +989,12 @@ function workerSourceModules(
           if (!(ts.isStringLiteralLike(key) || ts.isNumericLiteral(key))) {
             loads.add("<computed member>");
           }
+        }
+        if (node.kind === ts.SyntaxKind.ThisKeyword) {
+          // TE-61de-6: in an eval worker `this` IS the global object and `require` is one of its properties, so `this["require"](…)`,
+          // `Object.getOwnPropertyDescriptor(this, "require").value(…)` and `(function () { return this; })()["require"](…)` load a
+          // module with no `require` call the walk can see. `this` is denied wherever it stands (a keyword, so no name list holds it).
+          loads.add("<this>");
         }
         const named = ts.isIdentifier(node) || ts.isStringLiteralLike(node) ? node.text : undefined;
         if (named !== undefined && WORKER_DENIED_NAMES.has(named)) {
@@ -1754,6 +1791,193 @@ test("K4-2 / TE-61de-2: the NAMED limit — what the call hands the worker throu
     registeredKeys,
     "the call's own key is red",
   );
+});
+
+/** The three global-object routes to `require` the TE measured in a real eval Worker (TE-61de-6, P7 / P7b / P7c): `[what, code that loads node:os]`. */
+const THIS_ROUTES: ReadonlyArray<readonly [string, string]> = [
+  ['P7 this["require"]', 'this["require"]("node:os")'],
+  [
+    'P7b Object.getOwnPropertyDescriptor(this, "require").value',
+    'Object.getOwnPropertyDescriptor(this, "require").value("node:os")',
+  ],
+  [
+    'P7c (function () { return this; })()["require"]',
+    '(function () { return this; })()["require"]("node:os")',
+  ],
+];
+
+test('K4-2 / TE-61de-6: `this` in an eval worker IS the global object — `this["require"]`, `getOwnPropertyDescriptor(this, "require").value` and `(function () { return this; })()["require"]` really load a module (run in a real Worker), and the scan reds each as `<this>`, with the call key unchanged', async () => {
+  const source = scanSource();
+  const registered = registeredLoads();
+  assert.deepEqual(workerLoads(source), registered, "control: the real file IS the registry");
+  assert.ok(
+    !workerLoads(source)["capacity/governor/scan.ts | READER_SOURCE"]?.includes("<this>"),
+    "control: the real READER_SOURCE uses no `this`",
+  );
+  // the premise, measured: each form returns the module system from inside an `eval: true` Worker
+  for (const [what, load] of THIS_ROUTES) {
+    const worker = new Worker(
+      `const { parentPort } = require("node:worker_threads"); parentPort.postMessage(typeof (${load}).cpus);`,
+      { eval: true },
+    );
+    const answer = await new Promise<unknown>((resolve, reject) => {
+      worker.once("message", resolve);
+      worker.once("error", reject);
+    });
+    await worker.terminate();
+    assert.equal(
+      answer,
+      "function",
+      `${what}: runs for real — \`require\` is reachable through \`this\``,
+    );
+  }
+  const callKeys = (text: string): string[] =>
+    [...unfollowableSites([[SCAN_REL, text]]).keys()].toSorted();
+  for (const [what, load] of THIS_ROUTES) {
+    const edited = source.replace(
+      ANCHOR,
+      `${ANCHOR}\nconst l = ${load.replace("node:os", "../capacity/ledger.js")};`,
+    );
+    assert.notEqual(edited, source, `the edit applied: ${what}`);
+    assert.ok(
+      workerLoads(edited)["capacity/governor/scan.ts | READER_SOURCE"]?.includes("<this>"),
+      `${what}: is RED, with the reason <this>`,
+    );
+    assert.notDeepEqual(workerLoads(edited), registered, `${what}: is NOT green`);
+    assert.deepEqual(callKeys(edited), callKeys(source), `${what}: the call key is unchanged`);
+  }
+  // `this` is denied wherever it stands — top level, in a function, in an arrow, in a class method
+  for (const [where, code] of [
+    ["top level", "const g = this;"],
+    ["a function", "const f = function () { return this; };"],
+    ["an arrow", "const f = () => this;"],
+    ["a class method", "class K { m() { return this; } }"],
+  ] as const) {
+    const edited = source.replace(ANCHOR, `${ANCHOR}\n${code}`);
+    assert.ok(
+      workerLoads(edited)["capacity/governor/scan.ts | READER_SOURCE"]?.includes("<this>"),
+      `\`this\` in ${where} is red`,
+    );
+  }
+  // controls: the WORD `this` in a comment, a string, or as a property name is not the keyword
+  for (const [what, code] of [
+    ["a comment", "// this is the reader"],
+    ["a string", 'const note = "this";'],
+    ["a property name", "const o = { this: 1 }; o.this;"],
+  ] as const) {
+    const edited = source.replace(ANCHOR, `${ANCHOR}\n${code}`);
+    assert.notEqual(edited, source, `the control edit applied: ${what}`);
+    assert.deepEqual(workerLoads(edited), registered, `${what}: stays green`);
+  }
+});
+
+const WORKER_HEAD = 'import { Worker } from "node:worker_threads";\n';
+const loadsOfBody = (body: string): Record<string, string[]> =>
+  Object.fromEntries(workerSourceModules([["x.ts", WORKER_HEAD + body]]).entries());
+const LEDGER_CODE = "'require(\"../capacity/ledger.js\")'";
+
+test("K4-2 / TE-61de-7: a name is resolved only when it has ONE binding in the file — a parameter, a destructured const, an import, a function, class, enum or catch variable of the same name turns the scan red (P6c, P6d, P6e)", () => {
+  // control: the plain shape resolves, and the Worker argument is read
+  assert.deepEqual(
+    loadsOfBody(
+      'const READER_SOURCE = `require("node:fs");`;\nnew Worker(READER_SOURCE, { eval: true });',
+    ),
+    { "x.ts | READER_SOURCE": ["require:node:fs"] },
+    "control",
+  );
+  assert.deepEqual(
+    loadsOfBody(
+      'const SEQ = 1;\nconst S = `require("node:fs"); post(${SEQ});`;\nnew Worker(S, { eval: true });',
+    ),
+    { "x.ts | S": ["require:node:fs"] },
+    "control: a span const with its one binding resolves",
+  );
+  // the Worker argument: the module const, and ANOTHER binding of the same name at the call
+  const argument: Array<[string, string]> = [
+    [
+      "P6c parameter at the call",
+      `const READER_SOURCE = \`require("node:fs");\`;\n((READER_SOURCE: string) => new Worker(READER_SOURCE, { eval: true }))(${LEDGER_CODE});`,
+    ],
+    [
+      "P6d destructured const in the call's scope",
+      `const READER_SOURCE = \`require("node:fs");\`;\nfunction start() { const { READER_SOURCE } = { READER_SOURCE: ${LEDGER_CODE} }; return new Worker(READER_SOURCE, { eval: true }); }`,
+    ],
+    [
+      "P6d2 array-destructured const",
+      `const READER_SOURCE = \`require("node:fs");\`;\nfunction start() { const [READER_SOURCE] = [${LEDGER_CODE}]; return new Worker(READER_SOURCE, { eval: true }); }`,
+    ],
+    [
+      "P6d3 destructured parameter",
+      `const READER_SOURCE = \`require("node:fs");\`;\nfunction start({ READER_SOURCE }: { READER_SOURCE: string }) { return new Worker(READER_SOURCE, { eval: true }); }`,
+    ],
+    [
+      "P6f import of the same name",
+      `import { READER_SOURCE } from "./elsewhere.js";\nfunction local() { const READER_SOURCE = \`require("node:fs");\`; return new Worker(READER_SOURCE, { eval: true }); }`,
+    ],
+  ];
+  for (const [what, body] of argument) {
+    assert.deepEqual(
+      loadsOfBody(body),
+      { "x.ts | <unresolved: READER_SOURCE>": ["<unresolved>"] },
+      `${what}: is RED (the Worker argument is no longer resolved to the module const)`,
+    );
+  }
+  // a span name: its const, and ANOTHER binding of the same name — each kind of binding
+  const kinds: Array<[string, string]> = [
+    [
+      "P6e import (the only const is a local elsewhere)",
+      'import { SEQ } from "./elsewhere.js";\nfunction local() { const SEQ = 0; return SEQ; }',
+    ],
+    [
+      "P6e2 default import",
+      'import SEQ from "./elsewhere.js";\nconst unused = () => { const SEQ = 0; return SEQ; };',
+    ],
+    [
+      "P6e3 namespace import",
+      'import * as SEQ from "./elsewhere.js";\nconst unused = () => { const SEQ = 0; return SEQ; };',
+    ],
+    [
+      "P6e4 import-equals",
+      'import SEQ = require("./elsewhere.js");\nconst unused = () => { const SEQ = 0; return SEQ; };',
+    ],
+    ["a parameter", "const SEQ = 0;\nconst unused = (SEQ: number) => SEQ;"],
+    [
+      "a destructured binding",
+      "const SEQ = 0;\nconst unused = () => { const { SEQ } = { SEQ: 5 }; return SEQ; };",
+    ],
+    [
+      "a function name",
+      "const SEQ = 0;\nfunction unused() { function SEQ() { return 5; } return SEQ; }",
+    ],
+    ["a class name", "const SEQ = 0;\nfunction unused() { class SEQ {} return SEQ; }"],
+    ["an enum name", "const SEQ = 0;\nfunction unused() { enum SEQ { a } return SEQ; }"],
+    [
+      "a catch variable",
+      "const SEQ = 0;\nfunction unused() { try { return 1; } catch (SEQ) { return SEQ; } }",
+    ],
+    [
+      "a second const in another scope",
+      "const SEQ = 0;\nfunction unused() { const SEQ = 5; return SEQ; }",
+    ],
+  ];
+  for (const [what, shadow] of kinds) {
+    const body = `${shadow}\nconst S = \`require("node:fs"); post(\${SEQ});\`;\nnew Worker(S, { eval: true });`;
+    assert.deepEqual(
+      loadsOfBody(body),
+      { "x.ts | S": ["<unresolved span: SEQ>", "require:node:fs"] },
+      `${what}: the span is RED (the name has two bindings)`,
+    );
+  }
+  // controls: a binding of ANOTHER name, or one the scan has no way to confuse, changes nothing
+  assert.deepEqual(
+    loadsOfBody(
+      'const SEQ = 1;\nconst other = (n: number) => { const { m } = { m: n }; return m; };\nconst S = `require("node:fs"); post(${SEQ});`;\nnew Worker(S, { eval: true });',
+    ),
+    { "x.ts | S": ["require:node:fs"] },
+    "control: bindings of other names do not matter",
+  );
+  // the real file: every name it resolves has one binding (the registry control above holds), and the real spans are all read
+  assert.deepEqual(workerLoads(scanSource()), registeredLoads());
 });
 
 test("K4-2 / TE-61de-3: ASI — a line break before a block comment survives, and a lone CR, U+2028 and U+2029 are line terminators (the TE's T1, T1b, T2, T2b probes)", () => {

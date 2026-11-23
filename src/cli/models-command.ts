@@ -40,6 +40,7 @@ import type { CatalogueModel, ModelCatalogue } from "../models/types.js";
 import { getUiPrefsStore } from "../models/ui-prefs-store.js";
 import { PodNoSqliteError } from "../pod/sqlite-loader.js";
 import type { ResolvedAcpxConfig } from "./config.js";
+import { resolveRequestedFormat } from "./flags.js";
 
 type ModelsFlags = {
   search?: string;
@@ -61,48 +62,21 @@ function wantsJson(flags: ModelsFlags): boolean {
 }
 
 /**
- * The flags with the format an ANCESTOR command carries filled in (N3, brick bfbb74e3). `--format json` may sit
- * before the verb (`acpx --format json models list`, the CLI-wide flag) or on the `models` parent
- * (`acpx models --format json list`); commander hands a subcommand's action only its own options, so those used
- * to be ignored and the text table was printed. HONOURED rather than refused: a bare `--format json` is the
- * documented way to ask any acpx verb for JSON, and `models list --format json` already works. Only an explicit
- * `json` is taken from an ancestor; the subcommand's own flag wins, and `quiet`/`text` change nothing here.
+ * The flags with the format the verb REALLY runs with filled in (N3, brick bfbb74e3; O1, brick 3bc340d5): the same
+ * leaf-wins precedence as every other verb (`resolveRequestedFormat`) — a `--format json` may sit before the verb
+ * (the CLI-wide flag) or on the `models` parent, and the verb's own word beats both.
  */
-function withInheritedFormat(command: Command, flags: ModelsFlags): ModelsFlags {
-  if (flags.json === true || flags.format !== undefined) {
-    return flags;
-  }
-  return inheritedJson(command) ? { ...flags, format: "json" } : flags;
+function withInheritedFormat(
+  command: Command,
+  flags: ModelsFlags,
+  config: ResolvedAcpxConfig,
+): ModelsFlags {
+  return runsAsJson(command, config) ? { ...flags, format: "json" } : flags;
 }
 
-/** The config file's `format: json`, set by the `preAction` hook (`registerModelsCommand` holds the config). */
-let configFormatJson = false;
-
-/**
- * Whether an ANCESTOR (the `models` parent, the program) or the config file asks for json, the nearest explicit
- * word winning: a `--format text` on the `models` parent beats a program-level json. The config file is the last
- * resort, as it is for every other verb (`resolveGlobalFlags`; C2-a, brick acf6a89c).
- */
-function inheritedJson(command: Command): boolean {
-  for (let ancestor = command.parent; ancestor; ancestor = ancestor.parent) {
-    const opts = ancestor.opts<{ format?: string; json?: boolean }>();
-    if (opts.json === true) {
-      return true;
-    }
-    if (opts.format !== undefined) {
-      return opts.format === "json";
-    }
-  }
-  return configFormatJson;
-}
-
-/** The format `command` is really run with: its OWN word first (`--json`, `--format`), then `inheritedJson`. */
-function runsAsJson(command: Command): boolean {
-  const own = command.opts<{ format?: string; json?: boolean }>();
-  if (own.json === true) {
-    return true;
-  }
-  return own.format === undefined ? inheritedJson(command) : own.format === "json";
+/** Whether `command` is really run as json: `resolveRequestedFormat`, the one precedence every verb shares. */
+function runsAsJson(command: Command, config: ResolvedAcpxConfig): boolean {
+  return resolveRequestedFormat(command, config) === "json";
 }
 
 /** Only the two formats this verb actually renders; `quiet` would have no meaning here. */
@@ -902,8 +876,7 @@ export function registerModelsCommand(parent: Command, config: ResolvedAcpxConfi
   modelsCommand.hook("preAction", (_command, action) => {
     const opts = action.optsWithGlobals();
     jsonStrictRequested = opts.jsonStrict === true;
-    configFormatJson = config.format === "json";
-    jsonOutputRequested = runsAsJson(action);
+    jsonOutputRequested = runsAsJson(action, config);
     // `--json-strict` needs `--format json` on EVERY verb; `models` alone used to print its text table instead of
     // refusing. The same messages, document and exit code as `resolveGlobalFlags` gives the others, in its order:
     // the format first — judged on the format the verb REALLY runs with, so a leaf `--format text` under an
@@ -922,7 +895,7 @@ export function registerModelsCommand(parent: Command, config: ResolvedAcpxConfi
       "List models, banded: favorites first, then each harness, then OpenRouter by vendor",
     )
     .action(async function (this: Command, flags: ModelsFlags) {
-      await handleList(withInheritedFormat(this, flags), config);
+      await handleList(withInheritedFormat(this, flags, config), config);
     });
 
   addListFlags(modelsCommand.command("show"))
@@ -931,7 +904,7 @@ export function registerModelsCommand(parent: Command, config: ResolvedAcpxConfi
     )
     .argument("<ref>", "<source>:<id> or a bare <id>")
     .action(async function (this: Command, ref: string, flags: ModelsFlags) {
-      await handleShow(ref, withInheritedFormat(this, flags), config);
+      await handleShow(ref, withInheritedFormat(this, flags, config), config);
     });
 
   // ⚠️ A SUBCOMMAND OF `models`, WHICH IS ALREADY IN `TOP_LEVEL_VERBS` — so the
@@ -950,7 +923,7 @@ export function registerModelsCommand(parent: Command, config: ResolvedAcpxConfi
     .option("--format <fmt>", "Output format: text, json", parseModelsFormat)
     .option("--refresh", "Force a fetch instead of serving the 5-minute cache")
     .action(async function (this: Command, slug: string, flags: ModelsFlags) {
-      await handleEndpoints(slug, withInheritedFormat(this, flags));
+      await handleEndpoints(slug, withInheritedFormat(this, flags, config));
     });
 
   const favCommand = modelsCommand
@@ -959,7 +932,7 @@ export function registerModelsCommand(parent: Command, config: ResolvedAcpxConfi
     .option("--json", "Shorthand for --format json")
     .option("--format <fmt>", "Output format: text, json", parseModelsFormat)
     .action(async function (this: Command, flags: ModelsFlags) {
-      await handleFavList(withInheritedFormat(this, flags));
+      await handleFavList(withInheritedFormat(this, flags, config));
     });
 
   favCommand
@@ -988,7 +961,7 @@ export function registerModelsCommand(parent: Command, config: ResolvedAcpxConfi
     .option("--json", "Shorthand for --format json")
     .option("--format <fmt>", "Output format: text, json", parseModelsFormat)
     .action(function (this: Command, flags: ModelsFlags) {
-      handleLastUsedList(withInheritedFormat(this, flags));
+      handleLastUsedList(withInheritedFormat(this, flags, config));
     });
 
   lastUsedCommand
@@ -1012,6 +985,6 @@ export function registerModelsCommand(parent: Command, config: ResolvedAcpxConfi
   // hand-rolled check here duplicating it; the test pins the behaviour, not this
   // comment.
   modelsCommand.action(async function (this: Command, flags: ModelsFlags) {
-    await handleList(withInheritedFormat(this, flags), config);
+    await handleList(withInheritedFormat(this, flags, config), config);
   });
 }

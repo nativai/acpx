@@ -1088,8 +1088,52 @@ function putTurnInProgress(f: Fixture, sourceId: string, userId: string, partial
  * empty inline tail, over the fixture's write — the wake sees a 2-entry source, cut 3 is out of range
  * and the row reds with a wrong-looking `1 !== 0`. The negative row "an owner that idle-released
  * rewrote the source" below fails if this ever stops being true of the fixture's premise.
+ *
+ * `=0` switches off ONLY the idle-memory release. The owner's DEPLOY-STALENESS recycle stays armed:
+ * with no deploy record (`ACPX_DEPLOY_VERSION_FILE` unset, no `/data/runtime/info.json`, as in a
+ * workbench) the owner fingerprints its own entry point (`readEntryPointHash`,
+ * `queue-owner-runtime.ts`), `process.argv[1]` = this worktree's `dist-test/src/cli.js` (the rig's
+ * `CLI_PATH`, `test/umq-rig.ts`; the owner re-spawns `realpath(argv[1])`), and recycles when it
+ * changes — with the same write-back and the same red. So never re-emit `dist-test/` with a changed
+ * `src/cli.ts` (`pnpm run build:test`, or `pnpm test`, which runs it) in this worktree while an A-18
+ * row is running: a rewrite that changes that file's bytes recycles the owner. `dist/` is not read by
+ * these owners.
+ *
+ * ⚠️ THE FIXTURE'S "NO RELEASE" PREMISE: before A-60 (C3.5 (i)) an owner's drain write-back replaced an
+ * outside writer's inline entries, and a premise row pinned that. A-60 made the owner PRESERVE outside
+ * inline entries, so that row was deleted (brick f67e0ff1). The rows below still switch the release off:
+ * the sources are written by hand and the release's timing is not what they test.
  */
 const NO_OWNER_RELEASE = { ACPX_OWNER_IDLE_RELEASE_MS: "0" } as const;
+
+/** What the source's owner logged about releasing: any reason, or only `reason` when given. */
+function ownerLoggedRelease(f: Fixture, sourceId: string, reason?: string): boolean {
+  try {
+    const log = fs.readFileSync(recordPath(f, sourceId).replace(/\.json$/u, ".owner.log"), "utf8");
+    return log
+      .split("\n")
+      .some(
+        (line) =>
+          line.includes("queue owner releasing session ") &&
+          (reason === undefined || line.includes(`(reason=${reason})`)),
+      );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The source as the wake reads it, for an assertion message. The `precondition:` assertion in the
+ * positive row only catches a release that lands in the instant between the fixture's write and its
+ * own read; a release that lands LATER (between that read and the wake subprocess reading the source,
+ * seconds under load) still reds at the wake as a wrong-looking `1 !== 0`. This text is what makes that
+ * recurrence name itself: an inline tail of 0 plus a release line means the owner wrote its own record
+ * over the fixture's (brick 1e674c0a, from the A-18 verification F2). Read at failure time.
+ */
+function describeSourceAtWake(f: Fixture, sourceId: string): string {
+  const tail = (readRecord(f, sourceId) as PlanRecord).messages?.length;
+  return `source inline tail=${tail}, owner.log release line=${ownerLoggedRelease(f, sourceId) ? "yes" : "no"}`;
+}
 
 test("A-18 (Pi, Codex): a by-the-way cut at the end of a RUNNING turn is moved to before the in-progress agent entry; it survives the entry growing and wakes", async () => {
   const f = makeBox({ requestMib: 4000 });
@@ -1132,17 +1176,20 @@ test("A-18 (Pi, Codex): a by-the-way cut at the end of a RUNNING turn is moved t
 
   putTurnInProgress(f, source, userId, "1\n2\n3\n4\n5\n6 — the reply kept growing after create");
   // The premise, asserted where it can fail loudly instead of surfacing as a wake error: the grown
-  // entry is still on the source's disk record when the wake reads it.
+  // entry is still on the source's disk record when the wake reads it. ⚠️ This read comes right after
+  // the fixture's own write, so it catches only a release landing in that instant. A release between
+  // here and the wake's own read is not caught here; it reds at the wake, whose message carries
+  // `describeSourceAtWake` so the recurrence names itself.
   assert.equal(
     (readRecord(f, source) as PlanRecord).messages?.length,
     2,
-    "precondition: the source record still holds the in-progress turn the fixture wrote",
+    `precondition: the source record still holds the in-progress turn the fixture wrote (${describeSourceAtWake(f, source)})`,
   );
   const wake = await runCli([...base(f), "prompt", "--session-id", RECORD_ID, "x"], f.env, f.root);
   assert.equal(
     wake.code,
     0,
-    `the grown entry is not part of the cut: ${wake.stderr}\nSTDOUT ${wake.stdout}`,
+    `the grown entry is not part of the cut: ${wake.stderr}\nSTDOUT ${wake.stdout}\n${describeSourceAtWake(f, source)}`,
   );
   assert.notEqual((readRecord(f, RECORD_ID) as PlanRecord).acp_session_id, "");
 });
@@ -1182,43 +1229,14 @@ test("A-18 negative: when the CUT's own entry moved (the turn's user message is 
   putTurnInProgress(f, source, "a18a18a1-0000-4000-8000-0000000000ff", "1\n2\n3\n4");
   const wake = await runCli([...base(f), "prompt", "--session-id", RECORD_ID, "x"], f.env, f.root);
   assert.notEqual(wake.code, 0, "the cut entry changed: the wake must refuse");
-  assert.match(wake.stdout + wake.stderr, /FORK_CUT_MOVED/u);
+  assert.match(
+    wake.stdout + wake.stderr,
+    /FORK_CUT_MOVED/u,
+    `${wake.stdout}${wake.stderr}\n${describeSourceAtWake(f, source)}`,
+  );
   const after = readRecord(f, RECORD_ID) as PlanRecord;
   assert.equal(after.acp_session_id, "", "still never run");
   assert.deepEqual(after.acpx.sleeping, planBefore, "the plan is unchanged");
-});
-
-test("A-60 (the A-18 fixture premise, inverted): an owner that IDLE-RELEASES after a hand-written in-progress turn leaves that inline tail in place", async () => {
-  // Before A-60 the released owner's persist replaced another writer's inline entries with its own
-  // (none), which is why the A-18 rows switch the release off. C3.5 (i): a write publishes only its own
-  // unfinished inline entries and keeps every other as it finds it on disk.
-  const f = makeBox({ requestMib: 4000 });
-  Object.assign(f.env, { ACPX_OWNER_IDLE_RELEASE_MS: "10000" });
-  const source = await warmTarget(f, 1);
-  const ownerLog = recordPath(f, source).replace(/\.json$/u, ".owner.log");
-  const releaseLine = /queue owner releasing session .*reason=idle-memory/u;
-  const logged = (): boolean => {
-    try {
-      return releaseLine.test(fs.readFileSync(ownerLog, "utf8"));
-    } catch {
-      return false;
-    }
-  };
-  putTurnInProgress(f, source, "a18a18a1-0000-4000-8000-000000000003", "1\n2\n3");
-  assert.equal(logged(), false, "precondition: the write landed while the owner was still alive");
-  assert.equal((readRecord(f, source) as PlanRecord).messages?.length, 2, "the fixture's write");
-  // Ordering, not a clock: the owner logs the release line, then persists and exits.
-  const deadline = Date.now() + 120_000;
-  while (!logged() && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  assert.ok(logged(), "the owner released");
-  await new Promise((resolve) => setTimeout(resolve, 3_000)); // its persist and exit
-  assert.equal(
-    (readRecord(f, source) as PlanRecord).messages?.length,
-    2,
-    "the released owner's persist left the hand-written inline tail alone",
-  );
 });
 
 test("A-18 negative: a cut whose last entry is a COMPLETED agent entry (the turn is over) is not moved", async () => {

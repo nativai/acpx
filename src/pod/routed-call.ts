@@ -120,6 +120,14 @@ export type RoutedCallOptions = {
   payload?: string | Uint8Array;
   /** The caller's own deadline — `one-shot` only. */
   deadlineMs?: number;
+  /**
+   * `one-shot` only: when the caller's clock started — epoch ms on the same clock as `now` (`Date.now()` unless a
+   * test injects one) — for a caller that did work BEFORE this call which must count against it: the utility
+   * branch's capacity read (M1 F-B). Default: now. The deadline is `startedAtMs + deadlineMs`, and the broker's
+   * wake bound is what is left of it after that work (`wakeBoundFor`), so the work before the call pushes
+   * neither past its own bound.
+   */
+  startedAtMs?: number;
   /** Caller identity — set ONLY when an agent caused the call through the pass-through (C2). */
   callerIdentity?: CallerIdentity;
   /** The caller's environment: read for `ACPX_LOCKED_BY`, `PATH`, `HOME`; nothing else is forwarded. */
@@ -611,6 +619,20 @@ function piUnresolved(callId: string): RoutedCallError {
   });
 }
 
+/**
+ * The wake bound of THIS call: the bound (`WAKE_BOUND_MS`, a seam's or the caller's) less the time the caller
+ * already spent since `startedAtMs` — the utility branch's capacity read (M1 F-B fix round 2) — never below
+ * zero. At zero the broker is not waited for, and the answer is the typed refusal a run-out bound gives today.
+ * Without `startedAtMs` nothing is subtracted.
+ */
+function wakeBoundFor(options: RoutedCallOptions): number {
+  const bound = options.broker?.wakeBoundMs ?? testWakeBoundMs(options.env) ?? WAKE_BOUND_MS;
+  if (options.startedAtMs === undefined) {
+    return bound;
+  }
+  return Math.max(0, bound - ((options.now ?? Date.now)() - options.startedAtMs));
+}
+
 async function askBroker(options: RoutedCallOptions, callId: string): Promise<EnsuredPod> {
   const releases = releasesOrFail(options, callId);
   const sources = readAgentBrokerOriginSources();
@@ -621,7 +643,7 @@ async function askBroker(options: RoutedCallOptions, callId: string): Promise<En
   const brokerOptions = {
     origin,
     fetchImpl: options.broker?.fetchImpl,
-    wakeBoundMs: options.broker?.wakeBoundMs ?? testWakeBoundMs(options.env) ?? WAKE_BOUND_MS,
+    wakeBoundMs: wakeBoundFor(options),
   };
   let agentsRead: BrokerAgentsResult | undefined;
   const answer = await ensureAgentPod(options.key, brokerRequestOf(options, releases), {
@@ -796,6 +818,11 @@ async function dispatch(
   });
 }
 
+/** The deadline's start: the caller's own clock start when it gave one (`startedAtMs`), else now. */
+function callStartOf(options: RoutedCallOptions, now: () => number): number {
+  return options.startedAtMs ?? now();
+}
+
 /**
  * Runs one routed call. Resolves with the command's exit code once its output has been relayed, or
  * `no_pod` for an `owner-if-pod` call with no pod; THROWS the refusal (`CapacityRefusedError`,
@@ -804,7 +831,7 @@ async function dispatch(
 export async function runRoutedCall(options: RoutedCallOptions): Promise<RoutedCallResult> {
   const callId = options.callId ?? randomUUID();
   const now = options.now ?? Date.now;
-  const callStartMs = now();
+  const callStartMs = callStartOf(options, now);
   const payloadDir = options.payloadDir ?? ROUTED_PAYLOAD_DIR;
 
   if (!isUnderSharedRoot(options.cwd)) {

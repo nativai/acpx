@@ -1501,6 +1501,9 @@ test("F2 (seat's HOLDER mid-write): `status --seat` and `--session-url ?seat=` w
   assert.equal(normalise(none.pod.stderr, none.homes), normalise(none.control.stderr, none.homes));
 });
 
+// THIS ROW CANNOT FAIL ON ITS OWN: `seatFromStore` refuses an unhealthy seat file, so the door's refusal holds even if the
+// read evidence stopped watching `seats.json`. Its falsifiable twins (a red tree built in the test, in process and end to end
+// through the real armed child) are the `F2 seat file` rows in `test/pod-read-evidence.test.ts` (brick 3543498a).
 test("F2 (a seat file that cannot be read): a truncated seats.json is never read as 'no such seat' — the door's refusal", async () => {
   const rigged = await bothAnswer(
     ["claude", "status", "--seat", SEAT_OF_HOLDER],

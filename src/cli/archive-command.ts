@@ -501,9 +501,7 @@ async function runArchiveVerb(
     // Resolved from the STATED intent, never from a default — see resolveRunIntent.
     dryRun: intent === "dry-run",
     allowFirstRun: flags.allowFirstRun === true || process.env.ACPX_ARCHIVE_ALLOW_FIRST_RUN === "1",
-    // a JSON document, and a quiet run, have no plan "above"
-    ...(flags.json ? { planRef: "the `plan` field" } : {}),
-    ...(flags.quietOutput ? { planRef: "the plan (see it with --dry-run, or --format json)" } : {}),
+    ...planReference(flags, intent),
   });
 
   if (flags.json) {
@@ -514,6 +512,29 @@ async function runArchiveVerb(
     writeArchiveRunText(context, result);
   }
   return archiveExitCode(result);
+}
+
+/**
+ * What a first-run warning calls the plan when it is not printed "above": a JSON document has its `plan` field; a quiet run
+ * has no plan at all. A quiet DRY run already IS the dry run, so "see it with --dry-run" would be circular there; it is
+ * `--format text` that shows the plan (brick 3bc340d5, TE-d202-2).
+ */
+function planReference(
+  flags: SessionsArchiveFlags,
+  intent: "dry-run" | "apply",
+): { planRef?: string } {
+  if (flags.json) {
+    return { planRef: "the `plan` field" };
+  }
+  if (!flags.quietOutput) {
+    return {};
+  }
+  return {
+    planRef:
+      intent === "dry-run"
+        ? "the plan (see it with --format text, or --format json)"
+        : "the plan (see it with --dry-run, or --format json)",
+  };
 }
 
 function archiveExitCode(result: ArchiveRunResult): number {

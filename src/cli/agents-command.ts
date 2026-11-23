@@ -132,13 +132,14 @@ function renderDetail(capability: HarnessCapabilities): string {
   );
 }
 
-/** `--json` is a shorthand for the repo's own `--format json`; both are accepted. */
-function wantsJson(command: Command, format: string): boolean {
-  // optsWithGlobals, not opts: commander binds a flag to the ANCESTOR that
-  // declares it, so `agents show <id> --json` lands `json` on `agents`, and a
-  // plain `.opts()` on the subcommand reads an empty object and silently
-  // prints text. Measured against commander directly, 2026-09-04.
-  return format === "json" || command.optsWithGlobals().json === true;
+/**
+ * `--json` is a shorthand for the repo's own `--format json`; both are accepted. `format` is what
+ * `resolveGlobalFlags` resolved with the leaf-wins precedence (`resolveRequestedFormat`), which already counts
+ * a `--json` on the verb or on its `agents` group (commander binds a flag to the ANCESTOR that declares it, so
+ * `agents show <id> --json` lands `json` on `agents` — measured against commander directly, 2026-09-04).
+ */
+function wantsJson(format: string): boolean {
+  return format === "json";
 }
 
 function handleAgentsList(command: Command, config: ResolvedAcpxConfig): void {
@@ -146,7 +147,7 @@ function handleAgentsList(command: Command, config: ResolvedAcpxConfig): void {
   const capabilities = listHarnessCapabilities();
   const sessionRoot = resolveSessionRoot();
 
-  if (wantsJson(command, format)) {
+  if (wantsJson(format)) {
     const payload: AgentsListPayload = { agents: capabilities, sessionRoot };
     process.stdout.write(`${JSON.stringify(payload)}\n`);
     return;
@@ -183,7 +184,7 @@ function handleAgentShow(command: Command, id: string, config: ResolvedAcpxConfi
   }
   const capability = resolveHarnessCapabilities(requested);
 
-  if (wantsJson(command, format)) {
+  if (wantsJson(format)) {
     process.stdout.write(`${JSON.stringify(capability)}\n`);
     return;
   }

@@ -16,7 +16,7 @@
  * (`src/cli-core.ts`). Without the second, `acpx people resolve laatz` is absorbed as an AGENT NAME and, in a
  * session-bearing cwd, the rest of the line becomes a prompt delivery.
  */
-import type { Command } from "commander";
+import { CommanderError, type Command } from "commander";
 import { SessionNotFoundError, SessionResolutionError } from "../errors.js";
 import {
   PeopleFileError,
@@ -251,7 +251,15 @@ async function handlePrincipal(printer: Printer, sessionFlag: string | undefined
 // Subcommands are created before `program.exitOverride()` runs in `main`, and commander copies that setting
 // at creation, so each level rethrows itself: a usage error then reaches `handleProgramParseError` and exits
 // 2 (§4.1), where commander's own default would exit 1.
+//
+// ⚠️ EXCEPT help the caller ASKED for (`people help [leaf]`): commander raises it as `commander.help` with exit code
+// 0, and rethrown as it is, `handleProgramParseError` printed its "(outputHelp)" message and exited 2 in text mode
+// (brick 3bc340d5, F2). It is the same success the other groups give, so it is re-raised as `helpDisplayed`
+// (exit 0, nothing more printed). A BARE `people` (exit code 1) keeps §4.1's usage-error exit 2.
 function rethrow(error: Error): never {
+  if (error instanceof CommanderError && error.code === "commander.help" && error.exitCode === 0) {
+    throw new CommanderError(0, "commander.helpDisplayed", error.message);
+  }
   throw error;
 }
 
