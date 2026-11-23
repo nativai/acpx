@@ -57,7 +57,23 @@ export const ARCHIVE_EXIT_OK = 0;
 export const ARCHIVE_EXIT_PROBLEMS = 1;
 export const ARCHIVE_EXIT_REFUSED = 2;
 
+/**
+ * `--json-strict` promises machine-clean stderr: when it is on, every line this file would write to stderr is dropped, and a
+ * refusal or an unexpected error is a DOCUMENT on stdout (`{refused, error}` / `{error}`) — never a bare stderr line (brick
+ * eadfe315, TE-1e13-3). Set once per process by `handleSessionsArchive`.
+ */
+let strictOutput = false;
+/** Errors whose OWN document is already on stdout (the sweeps' refusal envelopes): the entrypoint adds no second one. */
+const documented = new WeakSet<object>();
+function errWrite(text: string): void {
+  if (!strictOutput) {
+    process.stderr.write(text);
+  }
+}
+
 export type SessionsArchiveFlags = {
+  /** Set by `handleSessionsArchive` from the global `--format quiet`: one id per line for the run verb. */
+  quietOutput?: boolean;
   dryRun?: boolean;
   apply?: boolean;
   closedBefore?: string;
@@ -178,7 +194,7 @@ function warnIfDetached(context: ArchiveContext): void {
   // while acpx and acpx-ui resolve DIFFERENT hot dirs makes the two share ONE
   // archive while having two hot dirs. That is a genuine footgun and it is silent
   // — this line is the only thing that makes it visible.
-  process.stderr.write(
+  errWrite(
     `[acpx] warning: archive dir ${context.archiveDir} is not a sibling of the hot dir ${context.hotDir} (ACPX_SESSIONS_ARCHIVE_DIR is set). acpx and acpx-ui may disagree about which archive they are using.\n`,
   );
 }
@@ -232,21 +248,62 @@ async function readExcludeIdsFile(file: string | undefined): Promise<Set<string>
   return ids;
 }
 
-export async function handleSessionsArchive(
-  flags: SessionsArchiveFlags,
+/**
+ * The global output flags, honoured like the other verbs: `--format json` is this verb's `--json`; `--format quiet` prints one
+ * id per line for the run verb (the ids moved, or that would move); `--json-strict` needs `--format json`.
+ */
+function resolveArchiveOutput(
   command: Command,
+  config: { format?: string } | undefined,
+): { json: boolean; quiet: boolean; strict: boolean; format: string } {
+  // (a caller that hands this exported handler a bare object — `test/session-archive-index.test.ts` does — has no globals)
+  const opts: { format?: unknown; jsonStrict?: unknown; json?: unknown } =
+    typeof command.optsWithGlobals === "function" ? command.optsWithGlobals() : {};
+  const format = typeof opts.format === "string" ? opts.format : (config?.format ?? "text");
+  const json = opts.json === true || format === "json";
+  return { json, quiet: format === "quiet" && !json, strict: opts.jsonStrict === true, format };
+}
+
+export async function handleSessionsArchive(
+  rawFlags: SessionsArchiveFlags,
+  command: Command,
+  config?: { format?: string },
 ): Promise<void> {
+  const output = resolveArchiveOutput(command, config);
+  if (output.strict && output.format !== "json") {
+    process.stderr.write("[acpx] refused: --json-strict requires --format json\n");
+    process.exitCode = ARCHIVE_EXIT_REFUSED;
+    return;
+  }
+  strictOutput = output.strict;
+  const flags: SessionsArchiveFlags = {
+    ...rawFlags,
+    json: rawFlags.json === true || output.json,
+    quietOutput: output.quiet,
+  };
   try {
     process.exitCode = await dispatchArchive(flags, command);
   } catch (error) {
-    if (error instanceof ArchiveRefusal) {
-      process.stderr.write(`[acpx] refused: ${error.message}\n`);
-      process.exitCode = ARCHIVE_EXIT_REFUSED;
-      return;
-    }
-    writeUnexpectedErrorJson(flags.json === true, error);
-    throw error;
+    reportArchiveError(error, flags.json === true);
   }
+}
+
+/** A refusal is exit 2 (a `{refused, error}` document under JSON); anything else is a `{error}` document, then rethrown. */
+function reportArchiveError(error: unknown, json: boolean): void {
+  if (error instanceof ArchiveRefusal) {
+    if (json && !documented.has(error)) {
+      writeJson({ refused: true, error: { code: error.code, message: error.message } });
+    }
+    errWrite(`[acpx] refused: ${error.message}\n`);
+    process.exitCode = ARCHIVE_EXIT_REFUSED;
+    return;
+  }
+  writeUnexpectedErrorJson(json, error);
+  if (json && error instanceof Error) {
+    // the document above IS this error's output: the entrypoint must not print a second one
+    (error as Error & { outputAlreadyEmitted?: boolean }).outputAlreadyEmitted = true;
+  }
+  throw error;
 }
 
 /**
@@ -444,10 +501,14 @@ async function runArchiveVerb(
     // Resolved from the STATED intent, never from a default — see resolveRunIntent.
     dryRun: intent === "dry-run",
     allowFirstRun: flags.allowFirstRun === true || process.env.ACPX_ARCHIVE_ALLOW_FIRST_RUN === "1",
+    // a JSON document has no "above"
+    ...(flags.json ? { planRef: "the `plan` field" } : {}),
   });
 
   if (flags.json) {
-    writeJson(archiveRunJson(context, result));
+    writeJson(archiveRunJson(context, result, intent));
+  } else if (flags.quietOutput) {
+    writeArchiveRunQuiet(result);
   } else {
     writeArchiveRunText(context, result);
   }
@@ -477,8 +538,14 @@ function blockerSummary(plan: ArchivePlan): Record<string, number> {
   return byBlocker;
 }
 
-function archiveRunJson(context: ArchiveContext, result: ArchiveRunResult): unknown {
+function archiveRunJson(
+  context: ArchiveContext,
+  result: ArchiveRunResult,
+  intent: "dry-run" | "apply",
+): unknown {
   return {
+    // what the caller STATED (the gate refuses silence): a held first-run apply still says `apply`, with applied:false
+    intent,
     hotDir: context.hotDir,
     archiveDir: context.archiveDir,
     at: context.at,
@@ -520,6 +587,19 @@ function archiveRunJson(context: ArchiveContext, result: ArchiveRunResult): unkn
     seatArchive: result.seatArchive,
     warnings: result.warnings,
   };
+}
+
+/** `--format quiet`: the ids this run moved (apply) or would move (dry run), one per line; warnings on stderr. */
+function writeArchiveRunQuiet(result: ArchiveRunResult): void {
+  const ids = result.applied
+    ? result.moved.map((entry) => entry.id)
+    : result.plan.selected.map((entry) => entry.candidate.id);
+  if (ids.length > 0) {
+    process.stdout.write(`${ids.join("\n")}\n`);
+  }
+  for (const warning of result.warnings) {
+    errWrite(`[acpx] ⚠ ${warning}\n`);
+  }
 }
 
 function writeArchiveRunText(context: ArchiveContext, result: ArchiveRunResult): void {
@@ -668,7 +748,7 @@ function writeArchivedListText(
     );
   }
   for (const warning of warnings) {
-    process.stderr.write(`[acpx] ⚠ ${warning}\n`);
+    errWrite(`[acpx] ⚠ ${warning}\n`);
   }
 }
 
@@ -695,7 +775,7 @@ async function runListOrphansVerb(
     process.stdout.write(`${orphan.id}\n`);
   }
   // On stderr so stdout stays a clean id list for a pipe.
-  process.stderr.write(
+  errWrite(
     `[acpx] ${orphans.length} of ${totalIds} orphan id(s); ${files} files / ${formatBytes(bytes)} total\n`,
   );
   return ARCHIVE_EXIT_OK;
@@ -777,7 +857,7 @@ async function runThawVerb(flags: SessionsArchiveFlags): Promise<number> {
     if (flags.json) {
       writeJson(thawErrorJson(id, to, error));
     }
-    process.stderr.write(`[acpx] thaw refused: ${error.message}\n`);
+    errWrite(`[acpx] thaw refused: ${error.message}\n`);
     return ARCHIVE_EXIT_REFUSED;
   }
 }
@@ -803,7 +883,7 @@ async function runCatVerb(flags: SessionsArchiveFlags): Promise<number> {
     if (!isThawFailure(error)) {
       throw error;
     }
-    process.stderr.write(`[acpx] ${error.message}\n`);
+    errWrite(`[acpx] ${error.message}\n`);
     return ARCHIVE_EXIT_REFUSED;
   }
 }
@@ -878,6 +958,7 @@ async function runCompressVerb(
   } catch (error) {
     if (error instanceof ArchiveRefusal && flags.json) {
       writeJson(refusalEnvelope("compress", context, error));
+      documented.add(error);
     }
     throw error;
   }
@@ -908,6 +989,7 @@ async function runDecompressVerb(
   } catch (error) {
     if (error instanceof ArchiveRefusal && flags.json) {
       writeJson(refusalEnvelope("decompress", context, error));
+      documented.add(error);
     }
     throw error;
   }
@@ -920,10 +1002,10 @@ function writeSweepResult(
   flags: SessionsArchiveFlags,
 ): void {
   if (result.error) {
-    process.stderr.write(`[acpx] ${result.action} ${result.outcome}: ${result.error.message}\n`);
+    errWrite(`[acpx] ${result.action} ${result.outcome}: ${result.error.message}\n`);
   }
   for (const warning of result.warnings) {
-    process.stderr.write(`[acpx] ⚠ ${warning}\n`);
+    errWrite(`[acpx] ⚠ ${warning}\n`);
   }
   if (flags.json) {
     writeJson(result);
@@ -983,7 +1065,7 @@ async function runRepairVerb(
       );
     }
     for (const warning of result.warnings) {
-      process.stderr.write(`[acpx] ⚠ ${warning}\n`);
+      errWrite(`[acpx] ⚠ ${warning}\n`);
     }
   }
   return result.lost.length > 0 ? ARCHIVE_EXIT_PROBLEMS : ARCHIVE_EXIT_OK;
@@ -1005,7 +1087,7 @@ async function runReindexVerb(
       `reindexed ${entries} entries across ${months.length} shard(s): ${months.join(", ")}\n`,
     );
     for (const warning of warnings) {
-      process.stderr.write(`[acpx] ⚠ ${warning}\n`);
+      errWrite(`[acpx] ⚠ ${warning}\n`);
     }
   }
   return ARCHIVE_EXIT_OK;
@@ -1037,7 +1119,7 @@ export async function handleSessionsRestore(
     if (flags.json) {
       writeJson({ refused: true, error: { code: refusal.code, message: refusal.message } });
     }
-    process.stderr.write(`[acpx] refused: ${refusal.message}\n`);
+    errWrite(`[acpx] refused: ${refusal.message}\n`);
     process.exitCode = ARCHIVE_EXIT_REFUSED;
   }
 }
@@ -1073,7 +1155,7 @@ function writeRestoreText(result: Awaited<ReturnType<typeof runRestore>>): void 
   }
   for (const warning of result.warnings) {
     // The byway-anchor warning lives here and is the one a user must not miss.
-    process.stderr.write(`[acpx] ⚠ ${warning}\n`);
+    errWrite(`[acpx] ⚠ ${warning}\n`);
   }
 }
 

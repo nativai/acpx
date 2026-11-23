@@ -364,7 +364,7 @@ export function registerSessionsCommand(
       ].join("\n"),
     )
     .action(async function (this: Command, flags: SessionsArchiveFlags) {
-      await handleSessionsArchive(flags, this);
+      await handleSessionsArchive(flags, this, config);
     });
 
   sessionsCommand

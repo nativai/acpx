@@ -146,6 +146,11 @@ export type ArchiveRunOptions = {
    * ⚠️ A PRODUCT BEHAVIOUR, NOT AN OPERATIONAL COURTESY — see `isFirstRun`.
    */
   allowFirstRun: boolean;
+  /**
+   * How the warnings name the plan: text output says "the plan above"; a JSON document has no "above" (brick eadfe315,
+   * TE-1e13-2), so the caller passes "the `plan` field".
+   */
+  planRef?: string;
 };
 
 /**
@@ -223,12 +228,30 @@ async function loadManifestRetentionView(context: ArchiveContext): Promise<Manif
 // here, but the output has to say SO, and name the second opt-in — otherwise closing one confident-wrong-impression opens
 // another. And an operator who stated `--dry-run` never stated `--apply`: the dry run must not claim a flag nobody gave
 // (brick 1e13eb2f) — it says what a real apply would meet on this box's first run.
-export function firstRunApplyWarning(archiveDir: string): string {
-  return `--apply was honoured, but D2 first-run gating held it: no archive directory exists yet at ${archiveDir}, so this is this box's FIRST run and nothing was moved. The plan above is what WOULD move. Re-run with --apply --allow-first-run (or set ACPX_ARCHIVE_ALLOW_FIRST_RUN=1) to apply it.`;
+export function firstRunApplyWarning(archiveDir: string, planRef = "the plan above"): string {
+  return `--apply was honoured, but D2 first-run gating held it: no archive directory exists yet at ${archiveDir}, so this is this box's FIRST run and nothing was moved. ${planRef[0]?.toUpperCase()}${planRef.slice(1)} is what WOULD move. Re-run with --apply --allow-first-run (or set ACPX_ARCHIVE_ALLOW_FIRST_RUN=1) to apply it.`;
 }
 
-export function firstRunDryRunWarning(archiveDir: string): string {
-  return `First run: no archive directory exists yet at ${archiveDir}, so a real --apply would be held by D2 first-run gating and move nothing. Nothing was moved by this dry run either. The plan above is what WOULD move once the first run is allowed: --apply --allow-first-run (or set ACPX_ARCHIVE_ALLOW_FIRST_RUN=1).`;
+export function firstRunDryRunWarning(archiveDir: string, planRef = "the plan above"): string {
+  return `First run: no archive directory exists yet at ${archiveDir}, so a real --apply would be held by D2 first-run gating and move nothing. Nothing was moved by this dry run either. ${planRef[0]?.toUpperCase()}${planRef.slice(1)} is what WOULD move once the first run is allowed: --apply --allow-first-run (or set ACPX_ARCHIVE_ALLOW_FIRST_RUN=1).`;
+}
+
+/** D2: a first run without the opt-in is HELD — the result says so, with the warning for the intent that was stated. */
+async function holdFirstRun(
+  options: ArchiveRunOptions,
+  result: ArchiveRunResult,
+): Promise<boolean> {
+  const { archiveDir } = options.context;
+  if (!(await isFirstRun(archiveDir)) || options.allowFirstRun) {
+    return false;
+  }
+  result.firstRunGated = true;
+  result.warnings.push(
+    options.dryRun
+      ? firstRunDryRunWarning(archiveDir, options.planRef)
+      : firstRunApplyWarning(archiveDir, options.planRef),
+  );
+  return true;
 }
 
 export async function applyArchiveRun(options: ArchiveRunOptions): Promise<ArchiveRunResult> {
@@ -244,17 +267,10 @@ export async function applyArchiveRun(options: ArchiveRunOptions): Promise<Archi
     warnings: [],
   };
 
-  const firstRun = await isFirstRun(context.archiveDir);
-  if (firstRun && !options.allowFirstRun) {
-    result.firstRunGated = true;
-    result.warnings.push(
-      options.dryRun
-        ? firstRunDryRunWarning(context.archiveDir)
-        : firstRunApplyWarning(context.archiveDir),
-    );
-    return result;
-  }
-  if (options.dryRun) {
+  const gated = await holdFirstRun(options, result);
+  // A held first run is a dry run — and a dry run LISTS EVERYTHING the allowed apply would do: the lone spawn-state
+  // removals and the seat folds too, not only the moves (brick eadfe315, TE-1e13-1).
+  if (gated || options.dryRun) {
     for (const file of plan.loneSpawnStates) {
       result.warnings.push(`lone spawn-state ${file} (no record) would be removed on apply`);
     }
