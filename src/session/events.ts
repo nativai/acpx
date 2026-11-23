@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import { isAcpJsonRpcMessage } from "../acp/jsonrpc.js";
 import { incrementPerfCounter, measurePerf } from "../perf-metrics.js";
-import { lockHostPlace } from "../pod/identity.js";
+import { getOwnProcessIdentity } from "../process-identity.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
 import { DELIVERY_EVENT_METHOD } from "./delivery-events.js";
 import {
@@ -20,9 +20,7 @@ import {
 import {
   acquireIdentityFileLock,
   assertLockHeld,
-  judgeLockHolder,
   releaseIdentityFileLock,
-  removeLockIfUnchanged,
   type IdentityLockPolicy,
 } from "./persistence/identity-file-lock.js";
 
@@ -218,48 +216,6 @@ export type LockHandle = {
   content: string;
 };
 
-type EventLockPayload = {
-  body: Record<string, unknown> | undefined;
-  created_at?: string;
-};
-
-function parseEventLockPayload(raw: string): EventLockPayload {
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return { body: undefined };
-    }
-    const record = parsed as Record<string, unknown>;
-    return {
-      body: record,
-      created_at: typeof record.created_at === "string" ? record.created_at : undefined,
-    };
-  } catch {
-    return { body: undefined };
-  }
-}
-
-/**
- * May this stream lock be taken over by the local, age-based rule? (brick ae547131 §6.4; G1 of block A8)
- * - a body WITHOUT `pod` (a process that cannot name its pod — never in an agent pod, A-25) keeps
- *   today's rules: a holder the shared identity rules prove GONE at once, and ANY holder older than
- *   EVENT_LOCK_STALE_MS by its `created_at` — a deliberate non-change (R11);
- * - a body WITH `pod` is NEVER broken by age, in any pod (C3.2 A-4): the same pod's holder only when
- *   its process is gone; another pod's holder is `unjudgeable` here, and is broken only by the
- *   primitive's proof of its pod's death, by the control pod (`acquireEventsLock`).
- * `created_at` must stay in the body: without it a pre-0a reader computes an infinite age and steals
- * at once.
- */
-export function isStreamLockStealable(raw: string, nowMs: number = Date.now()): boolean {
-  const parsed = parseEventLockPayload(raw);
-  if (parsed.body && Object.hasOwn(parsed.body, "pod")) {
-    return judgeLockHolder(parsed.body) === "breakable";
-  }
-  const createdAtMs = parsed.created_at ? Date.parse(parsed.created_at) : Number.NaN;
-  const lockAgeMs = Number.isFinite(createdAtMs) ? nowMs - createdAtMs : Number.POSITIVE_INFINITY;
-  return lockAgeMs > EVENT_LOCK_STALE_MS || judgeLockHolder(parsed.body) === "breakable";
-}
-
 export const STREAM_LOCK_TIMEOUT_CODE = "stream-lock-timeout";
 class StreamLockTimeoutError extends Error {
   readonly code = STREAM_LOCK_TIMEOUT_CODE;
@@ -284,24 +240,23 @@ const STREAM_LOCK_POLICY: IdentityLockPolicy = {
 };
 
 /**
- * Today's age rule for a holder WITHOUT `pod`, applied after the primitive's budget ran out: the
- * primitive never breaks a LIVE local holder, the stream lock always did after 15 s (R11). Not in an
- * agent pod (nothing there breaks a body without `pod`, A-25), and never for a body that carries `pod`.
+ * ⚠️ THE STREAM LOCK IS THE PRIMITIVE'S POLICY AND HAS NO RULE OF ITS OWN (A-60, C3.5 (iii)).
+ * It used to add R11: a body without `pod` was broken once its `created_at` was 15 s old, even when
+ * the primitive judged its holder LIVE. That took a live owner's turn lock (the probe's F4-normal): a
+ * flow's turn ran beside the owner and was then erased. Now a holder judged `live` is never broken,
+ * by a waiter or by any sweep, at any age; a waiter that cannot break waits the budget and fails with
+ * `stream-lock-timeout`, having written nothing. `EVENT_LOCK_STALE_MS` is only the stale age of an
+ * `unjudgeable` holder (another pid namespace, a pre-0a body). Rows 60.4, 60.11 and 60.13 go red if
+ * an age rule comes back.
  */
-async function breakAgedLocalStreamLock(lockPath: string): Promise<boolean> {
-  if (lockHostPlace() === "agent-pod") {
-    return false;
-  }
-  try {
-    const payload = await fs.readFile(lockPath, "utf8");
-    if (!isStreamLockStealable(payload)) {
-      return false;
-    }
-    await removeLockIfUnchanged(lockPath, payload);
-    incrementPerfCounter("session.events.stale_lock_recovered");
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT";
+export const STREAM_LOCK_IDENTITY_MISSING_CODE = "stream-lock-identity-missing";
+class StreamLockIdentityMissingError extends Error {
+  readonly code = STREAM_LOCK_IDENTITY_MISSING_CODE;
+  constructor() {
+    super(
+      "this process cannot read its own birth identity, so it takes no session stream lock: " +
+        "its holder could not be judged live by a waiter or a sweep",
+    );
   }
 }
 
@@ -310,23 +265,16 @@ export async function acquireEventsLock(
   sessionId: string,
   budgetMs: number = STREAM_LOCK_BUDGET_MS,
 ): Promise<LockHandle> {
+  // C3.5 (iii): a body without the holder's birth identity can only be judged by age. No lock without it.
+  if (getOwnProcessIdentity() === undefined) {
+    throw new StreamLockIdentityMissingError();
+  }
   await ensureSessionDir();
   const lockPath = eventsLockPath(sessionId);
-  for (;;) {
-    try {
-      return {
-        filePath: lockPath,
-        content: await acquireIdentityFileLock(lockPath, { ...STREAM_LOCK_POLICY, budgetMs }),
-      };
-    } catch (error) {
-      if (
-        !(error instanceof StreamLockTimeoutError) ||
-        !(await breakAgedLocalStreamLock(lockPath))
-      ) {
-        throw error;
-      }
-    }
-  }
+  return {
+    filePath: lockPath,
+    content: await acquireIdentityFileLock(lockPath, { ...STREAM_LOCK_POLICY, budgetMs }),
+  };
 }
 
 async function releaseEventsLock(lock: LockHandle): Promise<void> {

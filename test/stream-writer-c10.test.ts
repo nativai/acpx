@@ -11,7 +11,6 @@ import {
   STREAM_WRITE_PART_BYTES,
   acquireEventsLock,
   appendInParts,
-  isStreamLockStealable,
 } from "../src/session/events.js";
 import { writeSessionRecord } from "../src/session/persistence.js";
 import { setPodLockDepsForTests } from "../src/session/persistence/identity-file-lock.js";
@@ -267,11 +266,6 @@ test("G1 NEVER: a stream lock held in another pod is not broken by age — even 
       fs.mkdirSync(path.dirname(lockPath), { recursive: true });
       const raw = foreignBody(Date.now() - 3_600_000);
       fs.writeFileSync(lockPath, raw);
-      assert.equal(
-        isStreamLockStealable(raw),
-        false,
-        "the sync judge: a `pod` body is never age-stolen",
-      );
       await assert.rejects(acquireEventsLock("g1-age", 800), { code: "stream-lock-timeout" });
       assert.equal(fs.readFileSync(lockPath, "utf8"), raw, "the lock is byte-identical");
     } finally {
@@ -309,17 +303,6 @@ test("G1 NEVER: an agent pod breaks no foreign stream lock, even one whose pod i
       restorePod();
     }
   });
-});
-
-test("G1: a body WITHOUT `pod` keeps today's rule — an old body of a live local holder is stealable (R11, a non-change)", () => {
-  const old = new Date(Date.now() - 16_000).toISOString();
-  assert.equal(isStreamLockStealable(JSON.stringify({ pid: process.pid, created_at: old })), true);
-  assert.equal(
-    isStreamLockStealable(
-      JSON.stringify({ pid: process.pid, created_at: new Date().toISOString() }),
-    ),
-    false,
-  );
 });
 
 test("G1: the control pod's sweep removes a stream lock whose pod is gone — and leaves one whose pod exists", async () => {

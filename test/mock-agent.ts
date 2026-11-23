@@ -2206,6 +2206,19 @@ class MockAgent implements Agent {
       return "released by file";
     }
 
+    if (text.startsWith("stream-hold ")) {
+      // A-60 rows (brick f67e0ff1): stream a partial (the live checkpoint publishes it inline), hold the
+      // turn until <file> exists, then end it with a DIFFERENT final chunk. The probe's `stream-hold`.
+      const [releaseFile, ...liveWords] = text.slice("stream-hold ".length).trim().split(/\s+/);
+      if (!releaseFile || liveWords.length === 0) {
+        throw new Error("Usage: stream-hold <release file path> <text>");
+      }
+      const liveText = liveWords.join(" ");
+      await this.sendAssistantMessage(sessionId, liveText);
+      await holdUntilFile(releaseFile, signal);
+      return ` FINAL-AFTER-HOLD ${liveText}`;
+    }
+
     if (text.startsWith("stream-sleep ")) {
       const rest = text.slice("stream-sleep ".length).trim();
       const firstSpace = rest.search(/\s/);
