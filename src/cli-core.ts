@@ -526,6 +526,27 @@ function createProgram(requestedJsonStrict: boolean): Command {
 }
 
 /**
+ * A bare command group with no action (`seats`, `box`, `flow`) makes commander show its help and exit with the
+ * message "(outputHelp)", which in json mode became the USAGE document's whole message and told the caller
+ * nothing. It now names the group and what it needs (brick 4a34f245). Same code, same exit — only the words.
+ */
+function bareGroupError(group: Command, error: CommanderError): CommanderError {
+  const names: string[] = [];
+  for (let node: Command | null = group; node?.parent; node = node.parent) {
+    names.unshift(node.name());
+  }
+  const subcommands = group.commands
+    .map((command) => command.name())
+    .filter((name) => name !== "help");
+  const needs = subcommands.length > 0 ? ` (one of: ${subcommands.join(", ")})` : "";
+  return new CommanderError(
+    error.exitCode,
+    error.code,
+    `error: 'acpx ${names.join(" ")}' needs a subcommand${needs}`,
+  );
+}
+
+/**
  * A usage error on a SUBCOMMAND (`agents list --bogus`, `agents list extra`) used to exit 1 with NOTHING on
  * stdout under `--json-strict` (commander's own text goes to the suppressed writer) and no JSON document in plain
  * json either: the subcommands are registered BEFORE `program.exitOverride`, and commander copies that setting at
@@ -540,7 +561,7 @@ function routeSubcommandUsageErrors(program: Command): void {
       // commander's default is `null` (it only tests truthiness), so "has none" is falsy, not `=== undefined`
       if (!Reflect.get(child, "_exitCallback")) {
         child.exitOverride((error) => {
-          throw error;
+          throw error.code === "commander.help" ? bareGroupError(child, error) : error;
         });
       }
       visit(child);
