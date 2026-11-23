@@ -1091,10 +1091,13 @@ function putTurnInProgress(f: Fixture, sourceId: string, userId: string, partial
  *
  * `=0` switches off ONLY the idle-memory release. The owner's DEPLOY-STALENESS recycle stays armed:
  * with no deploy record (`ACPX_DEPLOY_VERSION_FILE` unset, no `/data/runtime/info.json`, as in a
- * workbench) the owner fingerprints its own entry point, `process.argv[1]` = this worktree's
- * `dist/cli.js` (`readEntryPointHash`, `queue-owner-runtime.ts`), and recycles when it changes —
- * with the same write-back and the same red. So never run `pnpm run build` (or anything that rewrites
- * `dist/`, not only `dist-test/`) in this worktree while an A-18 row is running.
+ * workbench) the owner fingerprints its own entry point (`readEntryPointHash`,
+ * `queue-owner-runtime.ts`), `process.argv[1]` = this worktree's `dist-test/src/cli.js` (the rig's
+ * `CLI_PATH`, `test/umq-rig.ts`; the owner re-spawns `realpath(argv[1])`), and recycles when it
+ * changes — with the same write-back and the same red. So never re-emit `dist-test/` with a changed
+ * `src/cli.ts` (`pnpm run build:test`, or `pnpm test`, which runs it) in this worktree while an A-18
+ * row is running: a rewrite that changes that file's bytes recycles the owner. `dist/` is not read by
+ * these owners.
  *
  * ⚠️ THE FIXTURE'S "NO RELEASE" PREMISE IS A LATENT HAZARD, NOT A FEATURE. The premise row below pins,
  * as expected behaviour, that an owner's drain write-back replaces an outside writer's messages. If
