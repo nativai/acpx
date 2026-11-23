@@ -13,6 +13,7 @@ import {
   assertBoxWideWriteAllowed,
   isBoxWideFileInAgentPod,
 } from "../../pod/foreign-write-guard.js";
+import { rebuildNoteAllowed } from "../../pod/target-verdict.js";
 import type { SessionRecord } from "../../types.js";
 import { modelSetMethodKnownUnsupported } from "../mode-preference.js";
 import { isIndexLockTimeoutError, withSessionIndexLock } from "./index-lock.js";
@@ -1033,7 +1034,7 @@ export async function rebuildSessionIndex(
 ): Promise<SessionIndex> {
   // Full-store re-parse — the prod observable for the "zero full-store
   // rebuilds on new-file creation" target (VERIFICATION-ANNEX S4 greps for it).
-  if (!rebuildLogSuppressed) {
+  if (!rebuildLogSuppressed && rebuildNoteAllowed()) {
     process.stderr.write(`[acpx] full session-index rebuild (reason: ${reason})\n`);
   }
   // C10 / A8: in an agent pod the index is the control pod's file — a read there builds the answer

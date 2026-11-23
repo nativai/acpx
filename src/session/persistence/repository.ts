@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { mapWithConcurrency } from "../../async-control.js";
 import {
+  AcpxOperationalError,
   SessionArchivedError,
   SessionNotFoundError,
   SessionResolutionError,
@@ -10,6 +11,12 @@ import {
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { isBoxWideFileInAgentPod } from "../../pod/foreign-write-guard.js";
 import { SPAWN_STATE_SUFFIX } from "../../pod/spawn-state.js";
+import {
+  armedTargetVerdict,
+  tellParent,
+  toldEvents,
+  type TargetVerdict,
+} from "../../pod/target-verdict.js";
 import {
   openSpawnLedgerForRecord,
   type DiskRecord,
@@ -161,7 +168,16 @@ async function resolveArchivedSessionRecord(sessionId: string): Promise<SessionR
 }
 
 async function ensureSessionDir(): Promise<void> {
-  await fs.mkdir(sessionBaseDir(), { recursive: true });
+  // A stat first, because `mkdir -p` on a directory that EXISTS is still a write to a permission-checked runtime —
+  // and the pod's read-only verdict child (`pod/target-verdict.ts`) must be able to resolve. A missing directory is
+  // created exactly as before; a path that is not a directory still fails in `mkdir`.
+  const exists = await fs.stat(sessionBaseDir()).then(
+    (stat) => stat.isDirectory(),
+    () => false,
+  );
+  if (!exists) {
+    await fs.mkdir(sessionBaseDir(), { recursive: true });
+  }
 }
 
 /**
@@ -1543,7 +1559,82 @@ async function loadUniqueRecordFromIndexEntries(
   }
 }
 
+/**
+ * K5 (brick 46b827ba): in a pod's verdict child (`pod/target-verdict.ts`) atrium has said this value names no session
+ * (or names two). The lookup is run FOR REAL, read-only, and must agree: it fails with the resolver's OWN error, which is
+ * the control pod's answer by construction, and the command never goes further. If the pod's own view DISAGREES —
+ * the record is there, two records became one, the read failed otherwise — the parent is told (`differs`) and keeps the
+ * door's refusal: never a "not found" the pod's own disk contradicts. Inert in every ordinary process (nothing armed).
+ */
+/**
+ * K5 round 4 (brick 46b827ba) — the armed verdict child's lookup. Atrium said this value names no session (or two). Every
+ * not-found the child could print goes through here, whatever id it is (the verdict's own, a seat's holder, a set-parent
+ * parent, `people`'s session …): the lookup runs FOR REAL, read-only, and the evidence is taken AT ITS READS — an unreadable
+ * record, index or seat file tells `differs` from `pod/armed-guards.ts`, the instant the read returns, never in a later
+ * scan (TE F2: a scan made after the lookup cannot prove what the lookup saw; the record can be whole by then).
+ *
+ * A lookup that found the record, or whose answer differs from atrium's, or that read anything unreadable, throws THIS —
+ * never a not-found about a session the pod's own disk contradicts (TE F3): the parent keeps the door's refusal.
+ */
+function podViewDiffers(): never {
+  tellParent("differs");
+  throw new AcpxOperationalError(
+    "acpx: this pod's own read of the session store differs from atrium's answer (a record that exists, or one that cannot be read right now); nothing was answered.",
+    { outputCode: "RUNTIME", origin: "cli" },
+  );
+}
+
+type ArmedLookup = { record: SessionRecord | undefined; own: unknown };
+
+async function lookUpArmed(sessionId: string): Promise<ArmedLookup> {
+  try {
+    return { record: await resolveSessionRecordFromDisk(sessionId), own: undefined };
+  } catch (own) {
+    return { record: undefined, own };
+  }
+}
+
+const isRefusedLookup = (own: unknown): boolean =>
+  own instanceof SessionNotFoundError || own instanceof SessionResolutionError;
+
+/** Does the pod's own answer for the id atrium judged AGREE with atrium's (not-found, or the same ambiguity sentence)? */
+function agreesWithVerdict(verdict: TargetVerdict, own: unknown): boolean {
+  return verdict.kind === "ambiguous"
+    ? own instanceof SessionResolutionError && own.message === verdict.message
+    : own instanceof SessionNotFoundError;
+}
+
+async function resolveSessionRecordArmed(
+  verdict: TargetVerdict,
+  sessionId: string,
+): Promise<SessionRecord> {
+  const { record, own } = await lookUpArmed(sessionId);
+  const tainted = toldEvents().has("differs");
+  if (verdict.values.includes(sessionId)) {
+    if (record !== undefined || !agreesWithVerdict(verdict, own) || tainted) {
+      return podViewDiffers();
+    }
+    tellParent("verdict");
+    throw own;
+  }
+  // not the id atrium judged (a seat's holder, a parent): the pod's own answer, unless it cannot be trusted
+  if (isRefusedLookup(own) && tainted) {
+    return podViewDiffers();
+  }
+  if (own !== undefined) {
+    throw own;
+  }
+  return record as SessionRecord;
+}
+
 export async function resolveSessionRecord(sessionId: string): Promise<SessionRecord> {
+  const verdict = armedTargetVerdict();
+  return verdict === undefined
+    ? await resolveSessionRecordFromDisk(sessionId)
+    : await resolveSessionRecordArmed(verdict, sessionId);
+}
+
+async function resolveSessionRecordFromDisk(sessionId: string): Promise<SessionRecord> {
   await ensureSessionDir();
 
   const directPath = sessionFilePath(sessionId);

@@ -136,6 +136,15 @@ type MockAgentOptions = {
    */
   withdrawParkedOnCancel?: boolean;
   claudeAgentAcp: boolean;
+  /**
+   * brick 94d01658 — `--config-op-requires-registered-session`: a `session/set_config_option` on a
+   * session id this adapter never created, forked, loaded or resumed fails the way claude-agent-acp
+   * 842fb79 answers one on a durable fork id it has not registered (measured on devbox, 2026-11-23):
+   * `-32603 Internal error: Failed to resume forked session <id> for config op: …`. Without it the
+   * mock silently creates state for any id, so the eager effort set on a durable fork succeeds here
+   * while it fails in production. Opt-in, so every other row is unchanged.
+   */
+  configOpRequiresRegisteredSession?: boolean;
   expectedForkMeta?: unknown;
   /**
    * brick ebfe4c3c — the `model` select's options, read from a JSON file
@@ -564,6 +573,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let withdrawParkedOnCancel = false;
   let pushConfigOnSetModel = false;
   let claudeAgentAcp = false;
+  let configOpRequiresRegisteredSession = false;
   let expectedForkMeta: unknown;
   let modelAdvertisement: MockAgentOptions["modelAdvertisement"];
 
@@ -759,6 +769,11 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--config-op-requires-registered-session") {
+      configOpRequiresRegisteredSession = true;
+      continue;
+    }
+
     if (token === "--park-concurrent-prompts") {
       parkConcurrentPrompts = true;
       continue;
@@ -878,6 +893,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     parkConcurrentPrompts,
     withdrawParkedOnCancel,
     claudeAgentAcp,
+    configOpRequiresRegisteredSession,
     expectedForkMeta,
     ...(modelAdvertisement !== undefined ? { modelAdvertisement } : {}),
   };
@@ -1767,6 +1783,7 @@ class MockAgent implements Agent {
   async setSessionConfigOption(
     params: SetSessionConfigOptionRequest,
   ): Promise<SetSessionConfigOptionResponse> {
+    const registered = this.sessions.has(params.sessionId);
     const session = this.ensureSession(params.sessionId);
     if (this.options.logConfigOptionOps) {
       this.recordOperation({
@@ -1774,7 +1791,15 @@ class MockAgent implements Agent {
         sessionId: params.sessionId,
         configId: params.configId,
         value: params.value,
+        ...(this.options.configOpRequiresRegisteredSession ? { registered } : {}),
       });
+    }
+    if (this.options.configOpRequiresRegisteredSession && !registered) {
+      this.sessions.delete(params.sessionId);
+      throw RequestError.internalError(
+        undefined,
+        `Failed to resume forked session ${params.sessionId} for config op: Claude Code returned an error result: No message found with message.uuid of: mock-cut-uuid`,
+      );
     }
     if (this.options.setSessionConfigInvalidParams) {
       const error = new Error("Invalid params") as Error & {

@@ -581,6 +581,14 @@ test("CLI: agent pod — a record command about an unresolvable session answers 
   // `target-unresolved` exactly as the real one does for an id it cannot resolve (the old row scripted a world
   // the real atrium never produces, and so hid X1 TE round 2 P1: exit 2 and a policy-refusal sentence).
   const home = podHome({ podFile: agentPodName("rec-own") });
+  // a real pod's home holds the box's store AND its index (the verdict child reads them; it may not create them)
+  fs.mkdirSync(path.join(home, ".acpx", "sessions"), { recursive: true });
+  run(["sessions", "reindex"], {
+    PATH: process.env.PATH,
+    HOME: home,
+    ACPX_STATE_HOME: home,
+    NODE_TEST_CONTEXT: "child",
+  });
   const argv = ["sessions", "set-os", "rec-nobody", "default"];
   const { result, requests } = await runCallingHome(argv, home, {});
   // The control pod's answer, MEASURED: the same verb outside any pod, in a home whose index already exists.
