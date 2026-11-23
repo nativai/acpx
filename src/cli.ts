@@ -64,23 +64,17 @@ async function armedVerdictRun(): Promise<boolean> {
   if (!process.env.ACPX_POD_TARGET_VERDICT) {
     return false; // every ordinary invocation: nothing to load
   }
-  const {
-    VERDICT_ENV,
-    armTargetVerdict,
-    isReadOnlyProcess,
-    openSideChannel,
-    parseVerdict,
-    tellExit,
-    tellParent,
-  } = await import("./pod/target-verdict.js");
+  const { VERDICT_ENV, armTargetVerdict, openSideChannel, parseVerdict, tellExit, tellParent } =
+    await import("./pod/target-verdict.js");
+  const guards = await import("./pod/armed-guards.js");
   const verdict = parseVerdict(process.env[VERDICT_ENV]);
-  if (verdict === undefined || !isReadOnlyProcess()) {
+  if (verdict === undefined || !guards.isReadOnlyProcess()) {
     return false;
   }
   delete process.env[VERDICT_ENV];
   armTargetVerdict(verdict);
   openSideChannel();
-  (await import("./pod/armed-guards.js")).installArmedGuards();
+  guards.installArmedGuards();
   // The child's own word on how it ended: a normal end says so with its code; an uncaught exception says `crashed`.
   process.on("exit", (code) => tellExit(code));
   process.on("uncaughtExceptionMonitor", () => tellParent("crashed"));

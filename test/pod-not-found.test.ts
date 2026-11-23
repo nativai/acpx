@@ -826,7 +826,7 @@ import cp from "node:child_process";
 import net from "node:net";
 const m = await import(${JSON.stringify(VERDICT_MODULE)});
 const g = await import(${JSON.stringify(GUARDS_MODULE)});
-if (!process.env.FIXTURE_NO_CONFIRM && m.isReadOnlyProcess()) {
+if (!process.env.FIXTURE_NO_CONFIRM && g.isReadOnlyProcess()) {
   m.armTargetVerdict({ values: ["x"], kind: "not-found" });
   m.openSideChannel();
   g.installArmedGuards();

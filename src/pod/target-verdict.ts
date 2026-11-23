@@ -1,7 +1,4 @@
 import { writeSync } from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { acpxStateRoot, sessionBaseDir } from "../session/persistence/session-base-dir.js";
 
 /**
  * K5, parity BY CONSTRUCTION (A9 round 4, brick 46b827ba; FINDINGS.md there).
@@ -71,46 +68,6 @@ function verdictFrom(parsed: Partial<TargetVerdict>): TargetVerdict | undefined 
 export function parseVerdict(raw: string | undefined): TargetVerdict | undefined {
   const parsed = raw ? parseJson(raw) : undefined;
   return parsed ? verdictFrom(parsed) : undefined;
-}
-
-type Permission = { has(scope: string, reference?: string): boolean };
-
-/** `permission.has`, with a runtime that does not know the scope counted as "no". */
-function granted(permission: Permission, scope: string, reference?: string): boolean {
-  try {
-    return permission.has(scope, reference);
-  } catch {
-    return false;
-  }
-}
-
-/** The places a write grant is looked for by PATH: the root, the store, the home, the working directory, tmp. */
-function writeProbePaths(): string[] {
-  const cwd = process.cwd();
-  return [path.parse(cwd).root, sessionBaseDir(), acpxStateRoot(), os.homedir(), cwd, os.tmpdir()];
-}
-
-/**
- * Has the RUNTIME made this process read-only? The permission model is on and grants — at ANY scope this can test —
- * no file write (not on the root, the store, the state home, the home, the working directory or tmp: a path-scoped
- * grant answers `has("fs.write")` false and `has("fs.write", <path>)` true, so the path-less question is not
- * enough: K5 round 4 TE F1), no child process, no worker, no addon, no wasi; the command line carries no `--allow-*`
- * but the read grant; and `NODE_OPTIONS` carries none. Anything else is "not read-only" and the verdict is not honoured.
- */
-export function isReadOnlyProcess(): boolean {
-  const permission = (process as unknown as { permission?: Permission }).permission;
-  if (permission === undefined) {
-    return false;
-  }
-  const scopes = ["fs.write", "child", "worker", "addon", "wasi"];
-  return (
-    !scopes.some((scope) => granted(permission, scope)) &&
-    !writeProbePaths().some((probe) => granted(permission, "fs.write", probe)) &&
-    !process.execArgv.some(
-      (arg) => arg.startsWith("--allow-") && !arg.startsWith("--allow-fs-read"),
-    ) &&
-    !(process.env.NODE_OPTIONS ?? "").includes("--allow-")
-  );
 }
 
 let armed: TargetVerdict | undefined;
