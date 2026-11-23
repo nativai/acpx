@@ -1135,26 +1135,109 @@ test("fail closed (c): atrium says AMBIGUOUS but the pod's own read finds one re
   assert.doesNotMatch(rigged.pod.stderr + rigged.pod.stdout, /ambiguous: ab12|Session not found/u);
 });
 
-test("fail closed (c): a record MID-WRITE (a truncated file) reads as no record to the pod's resolver exactly as it would to the control pod's — the answer is the same not-found, not an error", async () => {
-  const rigged = await bothAnswer(
+/** A record file in the pod's home that cannot be parsed, in the shapes a write in flight leaves. */
+const UNREADABLE: Array<[string, string]> = [
+  ["truncated", '{"acpxRecordId":"eeeeeeee-0000-4000'],
+  ["empty", ""],
+  ["partial JSON", '{"acpxRecordId": '],
+  ["not a record", "[]"],
+];
+
+test("fail closed (c), the selector is an ID and `<id>.json` exists but does not parse (truncated, empty, partial, not a record): the door's refusal — a record that EXISTS is being written, so a not-found is wrong in that instant", async () => {
+  for (const [shape, text] of UNREADABLE) {
+    const rigged = await bothAnswer(
+      ["claude", "status", "--session-id", GHOST],
+      "text",
+      {},
+      undefined,
+      {
+        pod: (home) => fs.writeFile(path.join(home, ".acpx", "sessions", `${GHOST}.json`), text),
+      },
+    );
+    assertDoorRefusal(rigged.pod, `${shape}: the id's own file`);
+    assert.deepEqual(rigged.written, [], `${shape}: nothing written`);
+  }
+});
+
+test("fail closed (c), the selector is a NAME (a suffix) and ANY record in the scanned set does not parse: the door's refusal, since it cannot be ruled out as the target", async () => {
+  for (const [shape, text] of UNREADABLE) {
+    const rigged = await bothAnswer(
+      ["claude", "status", "--session-id", "zz99"],
+      "text",
+      {},
+      undefined,
+      {
+        pod: (home) =>
+          fs.writeFile(
+            path.join(home, ".acpx", "sessions", "99999999-0000-4000-8000-0000000000aa.json"),
+            text,
+          ),
+      },
+    );
+    assertDoorRefusal(rigged.pod, `${shape}: an unrelated file, a suffix selector`);
+  }
+});
+
+test("fail closed (c), an UNPARSABLE INDEX beside good records follows the same rule", async () => {
+  for (const [shape, text] of UNREADABLE.slice(0, 3)) {
+    const rigged = await bothAnswer(
+      ["claude", "status", "--session-id", GHOST],
+      "text",
+      {},
+      undefined,
+      {
+        pod: (home) => fs.writeFile(path.join(home, ".acpx", "sessions", "index.json"), text),
+      },
+    );
+    assertDoorRefusal(rigged.pod, `${shape}: index.json`);
+  }
+});
+
+test("fail closed (c) TWINS: the same lines with every record well-formed relay the control pod's not-found — id, suffix and a rewritten-but-valid index", async () => {
+  for (const argv of [
+    ["claude", "status", "--session-id", GHOST],
+    ["claude", "status", "--session-id", "zz99"],
+  ]) {
+    const rigged = await bothAnswer(argv, "text", {}, undefined, {
+      // an unrelated WELL-FORMED record the pod can see and the control pod cannot: it changes nothing about the answer
+      pod: (home) => writeRecordIn(home, "99999999-0000-4000-8000-0000000000aa"),
+    });
+    assert.equal(rigged.pod.status, 4, rigged.pod.stderr);
+    assert.match(rigged.pod.stderr, /Session not found: /u);
+    assert.equal(rigged.control.status, 4);
+    assert.doesNotMatch(rigged.pod.stderr, /pass_through_refused/u);
+  }
+  const index = await bothAnswer(
     ["claude", "status", "--session-id", GHOST],
     "text",
     {},
     undefined,
     {
       pod: async (home) => {
-        await fs.writeFile(
-          path.join(home, ".acpx", "sessions", `${GHOST}.json`),
-          '{"acpxRecordId":"eeeeeeee-0000-4000',
-        );
+        const file = path.join(home, ".acpx", "sessions", "index.json");
+        await fs.writeFile(file, JSON.stringify(JSON.parse(await fs.readFile(file, "utf8"))));
       },
     },
   );
-  assert.equal(rigged.pod.status, rigged.control.status, rigged.pod.stderr);
-  assert.equal(
-    normalise(rigged.pod.stderr, rigged.homes),
-    normalise(rigged.control.stderr, rigged.homes),
+  assert.equal(index.pod.status, 4, index.pod.stderr);
+});
+
+test("fail closed (c): an ambiguity is not undone by an unrelated unreadable record (two parsed records still match) — only a not-found is withheld", async () => {
+  const rigged = await bothAnswer(
+    ["claude", "cancel", "--session-id", "ab12"],
+    "text",
+    {},
+    undefined,
+    {
+      pod: (home) =>
+        fs.writeFile(
+          path.join(home, ".acpx", "sessions", "99999999-0000-4000-8000-0000000000aa.json"),
+          "{",
+        ),
+    },
   );
+  assert.equal(rigged.pod.status, 1, rigged.pod.stderr);
+  assert.match(rigged.pod.stderr, /Session id is ambiguous: ab12/u);
 });
 
 // ---- the seam: the verdict variable opens no way round the door ---------------------------------------------------------

@@ -76,7 +76,7 @@ import { copySeatHolderFields, copySeatLinkageFields } from "./seat-fields.js";
 import { findHolderlessSeats, reapHolderlessSeats } from "./seat-holderless.js";
 import { serializeSessionRecordForDisk } from "./serialize.js";
 import { sessionBaseDir } from "./session-base-dir.js";
-import { isSessionRecordFileName } from "./session-dir-files.js";
+import { isSessionRecordFileName, SESSION_INDEX_FILE } from "./session-dir-files.js";
 import { dropStaleSleepingForPersist } from "./sleeping-merge.js";
 import {
   canonicalMarkBase,
@@ -1560,6 +1560,38 @@ async function loadUniqueRecordFromIndexEntries(
  * the record is there, two records became one, the read failed otherwise — the parent is told (`differs`) and keeps the
  * door's refusal: never a "not found" the pod's own disk contradicts. Inert in every ordinary process (nothing armed).
  */
+/**
+ * Is ANY record file of the hot sessions directory — or the index — unreadable (truncated, empty, partial JSON, not a record)?
+ * A read, never a write. Such a file may BE the session that was asked for, mid-write, so "not found" is wrong in that
+ * instant on either pod: the verdict child never confirms a not-found over one (K5 round 4, (c)). A suffix or an ACP id
+ * could match any record, so the whole scanned set counts, not only `<id>.json`.
+ */
+async function hasUnreadableRecordFile(): Promise<boolean> {
+  const dir = sessionBaseDir();
+  const readable = async (file: string, asIndex: boolean): Promise<boolean> => {
+    try {
+      const parsed: unknown = JSON.parse(await fs.readFile(path.join(dir, file), "utf8"));
+      return asIndex
+        ? typeof parsed === "object" && parsed !== null
+        : parseSessionRecord(parsed) !== null;
+    } catch {
+      return false;
+    }
+  };
+  const names = await fs.readdir(dir).catch(() => [] as string[]);
+  const indexBad =
+    names.includes(SESSION_INDEX_FILE) && !(await readable(SESSION_INDEX_FILE, true));
+  if (indexBad) {
+    return true;
+  }
+  const verdicts = await mapWithConcurrency(
+    names.filter((name) => isSessionRecordFileName(name)),
+    SESSION_SCAN_CONCURRENCY,
+    (name) => readable(name, false),
+  );
+  return verdicts.includes(false);
+}
+
 async function resolveArmedVerdict(verdict: TargetVerdict, sessionId: string): Promise<never> {
   let own: unknown;
   try {
@@ -1570,7 +1602,7 @@ async function resolveArmedVerdict(verdict: TargetVerdict, sessionId: string): P
   const agrees =
     verdict.kind === "ambiguous"
       ? own instanceof SessionResolutionError && own.message === verdict.message
-      : own instanceof SessionNotFoundError;
+      : own instanceof SessionNotFoundError && !(await hasUnreadableRecordFile());
   tellParent(agrees ? "verdict" : "differs");
   throw own ?? new SessionNotFoundError(sessionId);
 }
