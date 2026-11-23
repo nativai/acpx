@@ -73,6 +73,28 @@ function childCommand(env: NodeJS.ProcessEnv): { flags: string[]; entry: string 
   return { flags, entry };
 }
 
+/**
+ * The child's environment: the pod's, with the verdict and `ACPX_ROUTED`, and WITHOUT `NODE_OPTIONS` — a pod image or an
+ * agent that sets `NODE_OPTIONS=--allow-fs-write=<the store>` must not hand the child a write grant (TE F1). The flags are
+ * constructed here, exactly (`DEFAULT_CHILD_FLAGS`). Test seam (under `node --test` only): `ACPX_POD_VERDICT_CHILD_NODE_OPTIONS`
+ * puts a value back, to prove the CHILD refuses one that got through (its own checks, `isReadOnlyProcess`).
+ */
+function childEnv(spec: ChildSpec): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...spec.env,
+    [ROUTED_MARKER_ENV]: "1",
+    [VERDICT_ENV]: JSON.stringify(spec.verdict),
+  };
+  delete env.NODE_OPTIONS;
+  const seam = spec.env.NODE_TEST_CONTEXT
+    ? spec.env.ACPX_POD_VERDICT_CHILD_NODE_OPTIONS
+    : undefined;
+  if (seam !== undefined) {
+    env.NODE_OPTIONS = seam;
+  }
+  return env;
+}
+
 /** The real child: this very CLI, under `--permission` (no file write, no child process, no worker), reads allowed. */
 export const spawnVerdictChild: ChildRunner = (spec) => {
   const { flags, entry } = childCommand(spec.env);
@@ -80,7 +102,7 @@ export const spawnVerdictChild: ChildRunner = (spec) => {
     return { status: null, signal: null, stdout: "", stderr: "", events: "", error: "no-entry" };
   }
   const result = spawnSync(process.execPath, [...flags, entry, ...spec.argv], {
-    env: { ...spec.env, [ROUTED_MARKER_ENV]: "1", [VERDICT_ENV]: JSON.stringify(spec.verdict) },
+    env: childEnv(spec),
     stdio: ["ignore", "pipe", "pipe", "pipe"],
     timeout: timeoutMs(spec.env),
     killSignal: "SIGKILL",
@@ -134,13 +156,20 @@ function unfinished(result: ChildResult, events: Events): string | undefined {
   return events.seen.has("readonly") ? undefined : "not-confirmed-read-only";
 }
 
+/** Events the child tells that make its answer untrustworthy, each with the reason the parent gives for the refusal. */
+const MISBEHAVIOURS: ReadonlyArray<readonly [string, string]> = [
+  ["network", "network"],
+  ["denied", "denied"],
+  ["differs", "pod-view-differs"],
+  ["registry", "pod-registry-refusal"],
+];
+
 /** Why it is not an answer when it finished and confirmed itself: it did what it must not, or it succeeded. */
 function misbehaved(result: ChildResult, events: Events): string | undefined {
-  if (events.seen.has("network")) {
-    return "network";
-  }
-  if (events.seen.has("differs")) {
-    return "pod-view-differs";
+  for (const [event, why] of MISBEHAVIOURS) {
+    if (events.seen.has(event)) {
+      return why;
+    }
   }
   return result.status === 0 ? "child-succeeded" : undefined;
 }
@@ -150,14 +179,18 @@ function misbehaved(result: ChildResult, events: Events): string | undefined {
  * the code it left with (a process killed or exited by something other than acpx's own exit path).
  */
 function unconvincing(result: ChildResult, events: Events): string | undefined {
-  if (
-    events.seen.has("crashed") ||
-    `${result.stdout}${result.stderr}`.includes("ERR_ACCESS_DENIED")
-  ) {
-    return events.seen.has("crashed") ? "crashed" : "denied";
+  const output = `${result.stdout}${result.stderr}`;
+  if (events.seen.has("crashed")) {
+    return "crashed";
+  }
+  if (DENIAL_TEXT.some((text) => output.includes(text))) {
+    return "denied";
   }
   return events.exitCode === result.status ? undefined : "no-normal-end";
 }
+
+/** What a denied write looks like in the output, when a handler prints the message and not the code (TE F5). */
+const DENIAL_TEXT = ["ERR_ACCESS_DENIED", "Access to this API has been restricted"];
 
 /** Is this the control pod's answer, and may it be relayed? (See the header for the cases that may not.) */
 export function judgeChild(result: ChildResult): Judgement {

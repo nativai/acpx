@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { mapWithConcurrency } from "../../async-control.js";
 import {
+  AcpxOperationalError,
   SessionArchivedError,
   SessionNotFoundError,
   SessionResolutionError,
@@ -10,7 +11,12 @@ import {
 import { incrementPerfCounter, measurePerf } from "../../perf-metrics.js";
 import { isBoxWideFileInAgentPod } from "../../pod/foreign-write-guard.js";
 import { SPAWN_STATE_SUFFIX } from "../../pod/spawn-state.js";
-import { armedTargetVerdict, tellParent, type TargetVerdict } from "../../pod/target-verdict.js";
+import {
+  armedTargetVerdict,
+  tellParent,
+  toldEvents,
+  type TargetVerdict,
+} from "../../pod/target-verdict.js";
 import {
   openSpawnLedgerForRecord,
   type DiskRecord,
@@ -76,7 +82,7 @@ import { copySeatHolderFields, copySeatLinkageFields } from "./seat-fields.js";
 import { findHolderlessSeats, reapHolderlessSeats } from "./seat-holderless.js";
 import { serializeSessionRecordForDisk } from "./serialize.js";
 import { sessionBaseDir } from "./session-base-dir.js";
-import { isSessionRecordFileName, SESSION_INDEX_FILE } from "./session-dir-files.js";
+import { isSessionRecordFileName } from "./session-dir-files.js";
 import { dropStaleSleepingForPersist } from "./sleeping-merge.js";
 import {
   canonicalMarkBase,
@@ -1561,58 +1567,71 @@ async function loadUniqueRecordFromIndexEntries(
  * door's refusal: never a "not found" the pod's own disk contradicts. Inert in every ordinary process (nothing armed).
  */
 /**
- * Is ANY record file of the hot sessions directory — or the index — unreadable (truncated, empty, partial JSON, not a record)?
- * A read, never a write. Such a file may BE the session that was asked for, mid-write, so "not found" is wrong in that
- * instant on either pod: the verdict child never confirms a not-found over one (K5 round 4, (c)). A suffix or an ACP id
- * could match any record, so the whole scanned set counts, not only `<id>.json`.
+ * K5 round 4 (brick 46b827ba) — the armed verdict child's lookup. Atrium said this value names no session (or two). Every
+ * not-found the child could print goes through here, whatever id it is (the verdict's own, a seat's holder, a set-parent
+ * parent, `people`'s session …): the lookup runs FOR REAL, read-only, and the evidence is taken AT ITS READS — an unreadable
+ * record, index or seat file tells `differs` from `pod/armed-guards.ts`, the instant the read returns, never in a later
+ * scan (TE F2: a scan made after the lookup cannot prove what the lookup saw; the record can be whole by then).
+ *
+ * A lookup that found the record, or whose answer differs from atrium's, or that read anything unreadable, throws THIS —
+ * never a not-found about a session the pod's own disk contradicts (TE F3): the parent keeps the door's refusal.
  */
-async function hasUnreadableRecordFile(): Promise<boolean> {
-  const dir = sessionBaseDir();
-  const readable = async (file: string, asIndex: boolean): Promise<boolean> => {
-    try {
-      const parsed: unknown = JSON.parse(await fs.readFile(path.join(dir, file), "utf8"));
-      return asIndex
-        ? typeof parsed === "object" && parsed !== null
-        : parseSessionRecord(parsed) !== null;
-    } catch {
-      return false;
-    }
-  };
-  const names = await fs.readdir(dir).catch(() => [] as string[]);
-  const indexBad =
-    names.includes(SESSION_INDEX_FILE) && !(await readable(SESSION_INDEX_FILE, true));
-  if (indexBad) {
-    return true;
-  }
-  const verdicts = await mapWithConcurrency(
-    names.filter((name) => isSessionRecordFileName(name)),
-    SESSION_SCAN_CONCURRENCY,
-    (name) => readable(name, false),
+function podViewDiffers(): never {
+  tellParent("differs");
+  throw new AcpxOperationalError(
+    "acpx: this pod's own read of the session store differs from atrium's answer (a record that exists, or one that cannot be read right now); nothing was answered.",
+    { outputCode: "RUNTIME", origin: "cli" },
   );
-  return verdicts.includes(false);
 }
 
-async function resolveArmedVerdict(verdict: TargetVerdict, sessionId: string): Promise<never> {
-  let own: unknown;
+type ArmedLookup = { record: SessionRecord | undefined; own: unknown };
+
+async function lookUpArmed(sessionId: string): Promise<ArmedLookup> {
   try {
-    await resolveSessionRecordFromDisk(sessionId);
-  } catch (error) {
-    own = error;
+    return { record: await resolveSessionRecordFromDisk(sessionId), own: undefined };
+  } catch (own) {
+    return { record: undefined, own };
   }
-  const agrees =
-    verdict.kind === "ambiguous"
-      ? own instanceof SessionResolutionError && own.message === verdict.message
-      : own instanceof SessionNotFoundError && !(await hasUnreadableRecordFile());
-  tellParent(agrees ? "verdict" : "differs");
-  throw own ?? new SessionNotFoundError(sessionId);
+}
+
+const isRefusedLookup = (own: unknown): boolean =>
+  own instanceof SessionNotFoundError || own instanceof SessionResolutionError;
+
+/** Does the pod's own answer for the id atrium judged AGREE with atrium's (not-found, or the same ambiguity sentence)? */
+function agreesWithVerdict(verdict: TargetVerdict, own: unknown): boolean {
+  return verdict.kind === "ambiguous"
+    ? own instanceof SessionResolutionError && own.message === verdict.message
+    : own instanceof SessionNotFoundError;
+}
+
+async function resolveSessionRecordArmed(
+  verdict: TargetVerdict,
+  sessionId: string,
+): Promise<SessionRecord> {
+  const { record, own } = await lookUpArmed(sessionId);
+  const tainted = toldEvents().has("differs");
+  if (verdict.values.includes(sessionId)) {
+    if (record !== undefined || !agreesWithVerdict(verdict, own) || tainted) {
+      return podViewDiffers();
+    }
+    tellParent("verdict");
+    throw own;
+  }
+  // not the id atrium judged (a seat's holder, a parent): the pod's own answer, unless it cannot be trusted
+  if (isRefusedLookup(own) && tainted) {
+    return podViewDiffers();
+  }
+  if (own !== undefined) {
+    throw own;
+  }
+  return record as SessionRecord;
 }
 
 export async function resolveSessionRecord(sessionId: string): Promise<SessionRecord> {
   const verdict = armedTargetVerdict();
-  if (verdict?.values.includes(sessionId)) {
-    return await resolveArmedVerdict(verdict, sessionId);
-  }
-  return await resolveSessionRecordFromDisk(sessionId);
+  return verdict === undefined
+    ? await resolveSessionRecordFromDisk(sessionId)
+    : await resolveSessionRecordArmed(verdict, sessionId);
 }
 
 async function resolveSessionRecordFromDisk(sessionId: string): Promise<SessionRecord> {

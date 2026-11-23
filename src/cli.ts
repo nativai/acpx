@@ -67,8 +67,8 @@ async function armedVerdictRun(): Promise<boolean> {
   const {
     VERDICT_ENV,
     armTargetVerdict,
-    installNetworkBarrier,
     isReadOnlyProcess,
+    openSideChannel,
     parseVerdict,
     tellExit,
     tellParent,
@@ -79,7 +79,8 @@ async function armedVerdictRun(): Promise<boolean> {
   }
   delete process.env[VERDICT_ENV];
   armTargetVerdict(verdict);
-  installNetworkBarrier();
+  openSideChannel();
+  (await import("./pod/armed-guards.js")).installArmedGuards();
   // The child's own word on how it ended: a normal end says so with its code; an uncaught exception says `crashed`.
   process.on("exit", (code) => tellExit(code));
   process.on("uncaughtExceptionMonitor", () => tellParent("crashed"));

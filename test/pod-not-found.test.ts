@@ -6,6 +6,12 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { installReadEvidenceOnly } from "../src/pod/armed-guards.js";
+import {
+  armTargetVerdict,
+  disarmTargetVerdictForTests,
+  toldEvents,
+} from "../src/pod/target-verdict.js";
 import { judgeChild, type ChildResult } from "../src/pod/verdict-child.js";
 import { resolveSessionRecord } from "../src/session/persistence.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence/serialize.js";
@@ -471,7 +477,7 @@ test("A-52 resolveTargetRecordId keeps its type (an id or null) for the routed p
 
 // ---- the corpus: every line, control pod vs agent pod, byte for byte ------------------------------------------------
 
-type Expect = "parity" | "os-relative" | "lookup-failed";
+type Expect = "parity" | "os-relative" | "lookup-failed" | "registry";
 type Line = { argv: string[]; expect?: Expect };
 const U = URL_OF;
 const CORPUS: Line[] = [
@@ -536,8 +542,11 @@ const CORPUS: Line[] = [
   { argv: ["sessions", "set-metadata", "principal_id", "x", "--session-id", GHOST] },
   { argv: ["sessions", "set-metadata", "atrium_os_x", "x", "--session-id", GHOST] },
   { argv: ["sessions", "set-metadata", "brick", "notuuid", "--session-id", GHOST] },
-  { argv: ["claude", "set", "subscription", "nosuchsub", "--session-id", GHOST] },
-  { argv: ["claude", "set", "profile", "nosuch", "--session-id", GHOST] },
+  {
+    argv: ["claude", "set", "subscription", "nosuchsub", "--session-id", GHOST],
+    expect: "registry",
+  },
+  { argv: ["claude", "set", "profile", "nosuch", "--session-id", GHOST], expect: "registry" },
   { argv: ["claude", "set", "auto-failover", "maybe", "--session-id", GHOST] },
   { argv: ["claude", "set", "auto-subscription", "bad", "--session-id", GHOST] },
   { argv: ["claude", "set", "fable-degrade", "bad", "--session-id", GHOST] },
@@ -678,6 +687,18 @@ for (const format of ["text", "json", "quiet"] as const) {
             `${name}: control ${control.status} pod ${pod.status} calls ${rigged.calls}`,
           );
         }
+      } else if (line.expect === "registry") {
+        // EXPECTED difference (TE F8): the refusal comes from the POD's view of registry.json, not the box's; the pod does not
+        // relay it — the door's refusal. The control pod's own answer is a usage refusal about the registry (exit 2).
+        const ok =
+          control.status === 2 &&
+          pod.status === 2 &&
+          /not found in registry/u.test(control.stderr + control.stdout) &&
+          /pass_through_refused/u.test(pod.stderr + pod.stdout) &&
+          !/not found in registry/u.test(pod.stderr + pod.stdout);
+        if (!ok) {
+          mismatches.push(`${name}: control ${control.status} pod ${pod.status}`);
+        }
       } else if (line.expect === "lookup-failed") {
         // EXPECTED difference (A-52): atrium answers `target-lookup-failed` for a URL naming both ?seat= and ?session=, which
         // keeps the door's refusal BY DESIGN (a failed lookup is never shown as a not-found); the control pod's usage error is exit 2.
@@ -791,12 +812,27 @@ const VERDICT_MODULE = pathToFileURL(
   fileURLToPath(new URL("../src/pod/target-verdict.js", import.meta.url)),
 ).href;
 
-/** A fixture child: confirms read-only like the real one (unless told not to), then misbehaves in one way. */
+const GUARDS_MODULE = pathToFileURL(
+  fileURLToPath(new URL("../src/pod/armed-guards.js", import.meta.url)),
+).href;
+
+/**
+ * A fixture child: arms and confirms read-only EXACTLY as the real one does (`cli.ts`'s `armedVerdictRun`: arm, open the
+ * side channel, install the guards, tell `readonly`, report its end) unless told not to, then behaves in one way.
+ */
 function fixtureSource(body: string): string {
   return `import fs from "node:fs";
 import cp from "node:child_process";
+import net from "node:net";
 const m = await import(${JSON.stringify(VERDICT_MODULE)});
-if (!process.env.FIXTURE_NO_CONFIRM && m.isReadOnlyProcess()) { m.installNetworkBarrier(); m.tellParent("readonly"); }
+const g = await import(${JSON.stringify(GUARDS_MODULE)});
+if (!process.env.FIXTURE_NO_CONFIRM && m.isReadOnlyProcess()) {
+  m.armTargetVerdict({ values: ["x"], kind: "not-found" });
+  m.openSideChannel();
+  g.installArmedGuards();
+  process.on("exit", (code) => m.tellExit(code));
+  m.tellParent("readonly");
+}
 const sessionNotFound = "Session not found: x\\n";
 ${body}
 `;
@@ -804,21 +840,51 @@ ${body}
 
 const FIXTURES: Record<string, { source: string; env?: NodeJS.ProcessEnv; why: string }> = {
   writes: {
-    why: "a child that WRITES a file",
+    why: "a child that WRITES a file (the error printed)",
     source: fixtureSource(
       `try { fs.writeFileSync(process.env.FIXTURE_FILE, "x"); } catch (e) { process.stderr.write(e.code + ": " + e.message + "\\n"); }\nprocess.stderr.write(sessionNotFound); process.exit(4);`,
     ),
   },
+  "writes, swallowed": {
+    why: "a child that tries to WRITE and swallows the denial: only the guard's event says so",
+    source: fixtureSource(
+      `try { fs.writeFileSync(process.env.FIXTURE_FILE, "x"); } catch {}\nprocess.stderr.write(sessionNotFound); process.exit(4);`,
+    ),
+  },
+  "writes through a promise, swallowed": {
+    why: "a child that tries a promises-API mkdir and swallows the denial",
+    source: fixtureSource(
+      `await fs.promises.mkdir(process.env.FIXTURE_FILE + "-dir").catch(() => {});\nprocess.stderr.write(sessionNotFound); process.exit(4);`,
+    ),
+  },
+  "writes through a stream, swallowed": {
+    why: "a child that opens a write STREAM and swallows its error",
+    source: fixtureSource(
+      `const w = fs.createWriteStream(process.env.FIXTURE_FILE); w.on("error", () => {}); await new Promise((r) => setTimeout(r, 200));\nprocess.stderr.write(sessionNotFound); process.exit(4);`,
+    ),
+  },
   spawns: {
-    why: "a child that SPAWNS a process",
+    why: "a child that SPAWNS a process (the error printed)",
     source: fixtureSource(
       `try { cp.spawnSync("true"); } catch (e) { process.stderr.write(e.code + ": " + e.message + "\\n"); }\nprocess.stderr.write(sessionNotFound); process.exit(4);`,
     ),
   },
+  "spawns, swallowed": {
+    why: "a child that tries to SPAWN and swallows the denial",
+    source: fixtureSource(
+      `try { cp.spawnSync("true"); } catch {}\nprocess.stderr.write(sessionNotFound); process.exit(4);`,
+    ),
+  },
   connects: {
-    why: "a child that CONNECTS (to the recorded atrium itself)",
+    why: "a child that CONNECTS (to the recorded atrium itself), swallowed",
     source: fixtureSource(
       `try { await fetch(process.env.FIXTURE_URL + "/api/acpx/call", { method: "POST", body: "{}" }); } catch {}\nprocess.stderr.write(sessionNotFound); process.exit(4);`,
+    ),
+  },
+  listens: {
+    why: "a child that LISTENS on a port, swallowed (TE F4)",
+    source: fixtureSource(
+      `try { net.createServer().listen(0, "127.0.0.1"); } catch {}\nprocess.stderr.write(sessionNotFound); process.exit(4);`,
     ),
   },
   hangs: {
@@ -830,9 +896,9 @@ const FIXTURES: Record<string, { source: string; env?: NodeJS.ProcessEnv; why: s
     why: "a child that is KILLED (a crash)",
     source: fixtureSource(`process.kill(process.pid, "SIGKILL");`),
   },
-  "exits non-zero, silent": {
-    why: "a child that exits non-zero and says nothing",
-    source: fixtureSource(`process.exit(5);`),
+  "exits non-zero, silent, without reporting its end": {
+    why: "a child that exits non-zero, says nothing, and never reports its own normal end",
+    source: fixtureSource(`process.removeAllListeners("exit"); process.exit(5);`),
   },
   "exits zero": {
     why: "a child that SUCCEEDS (an armed run about a missing session cannot)",
@@ -879,6 +945,14 @@ async function runWithFixture(
   }
 }
 
+test("fail closed (b) CONTROL: a well-behaved fixture child IS relayed — so the fixtures above are valid, and their refusals are the guards' doing", async () => {
+  const good = await runWithFixture(
+    fixtureSource(`process.stderr.write(sessionNotFound); process.exit(4);`),
+  );
+  assert.equal(good.run.status, 4, good.run.stderr);
+  assert.match(good.run.stderr, /Session not found: x/u);
+});
+
 test("fail closed (b): a child that writes, spawns, connects, hangs, is killed, exits non-zero silently, exits zero, or never confirms read-only ends in the door's refusal — never a not-found", async () => {
   for (const [name, fixture] of Object.entries(FIXTURES)) {
     const { run, requests, wroteIt } = await runWithFixture(fixture.source, fixture.env);
@@ -894,9 +968,12 @@ test("fail closed (b), the network: the barrier in the armed child refuses a con
   await fs.writeFile(
     script,
     `const m = await import(${JSON.stringify(VERDICT_MODULE)});
-m.installNetworkBarrier();
+const g = await import(${JSON.stringify(GUARDS_MODULE)});
+m.armTargetVerdict({ values: ["x"], kind: "not-found" });
+m.openSideChannel();
+g.installArmedGuards();
 const outcomes = [];
-for (const attempt of [() => fetch("http://127.0.0.1:9/"), async () => (await import("node:net")).connect(9, "127.0.0.1")]) {
+for (const attempt of [() => fetch("http://127.0.0.1:9/"), async () => (await import("node:net")).connect(9, "127.0.0.1"), async () => (await import("node:net")).createServer().listen(0, "127.0.0.1")]) {
   try { await attempt(); outcomes.push("connected"); } catch (e) { outcomes.push(e.code ?? e.cause?.code ?? "refused"); }
 }
 process.stdout.write(JSON.stringify(outcomes));
@@ -913,7 +990,7 @@ process.stdout.write(JSON.stringify(outcomes));
     child.on("close", () => resolve({ out, side }));
   });
   const outcomes = JSON.parse(events.out) as string[];
-  assert.equal(outcomes.length, 2);
+  assert.equal(outcomes.length, 3);
   assert.ok(!outcomes.includes("connected"), `a connection was made: ${events.out}`);
   assert.match(events.side, /"event":"network"/u, "the parent was told");
   const verdict = judgeChild({
@@ -927,17 +1004,24 @@ process.stdout.write(JSON.stringify(outcomes));
 });
 
 /** The pod run with the REAL CLI as the verdict child (no fixture entry), under test-seam flags. */
-async function runWithRealChild(flags: string): Promise<{ run: ChildRun; requests: number }> {
+async function runWithRealChild(
+  flags: string | ((home: string) => string),
+  extraEnv: (home: string) => NodeJS.ProcessEnv = () => ({}),
+): Promise<{ run: ChildRun; requests: number; home: string }> {
   const { home } = agentPodHome();
   await fs.mkdir(path.join(home, ".acpx", "sessions"), { recursive: true }); // a real pod's home has its store
   const atrium = await startRecordedAtrium({});
   try {
     const run = await runCli(
       ["claude", "status", "--session-id", GHOST],
-      agentPodEnv(home, atrium.url, { ...FAST, ACPX_POD_VERDICT_CHILD_FLAGS: flags }),
+      agentPodEnv(home, atrium.url, {
+        ...FAST,
+        ACPX_POD_VERDICT_CHILD_FLAGS: typeof flags === "function" ? flags(home) : flags,
+        ...extraEnv(home),
+      }),
       { cwd: home },
     );
-    return { run, requests: atrium.requests.length };
+    return { run, requests: atrium.requests.length, home };
   } finally {
     await atrium.close();
   }
@@ -1222,7 +1306,7 @@ test("fail closed (c) TWINS: the same lines with every record well-formed relay 
   assert.equal(index.pod.status, 4, index.pod.stderr);
 });
 
-test("fail closed (c): an ambiguity is not undone by an unrelated unreadable record (two parsed records still match) — only a not-found is withheld", async () => {
+test("fail closed (c): with an unreadable record the lookup READ, even an ambiguity is not relayed — any taint at the reads withholds the answer; the well-formed twin relays it", async () => {
   const rigged = await bothAnswer(
     ["claude", "cancel", "--session-id", "ab12"],
     "text",
@@ -1236,8 +1320,12 @@ test("fail closed (c): an ambiguity is not undone by an unrelated unreadable rec
         ),
     },
   );
-  assert.equal(rigged.pod.status, 1, rigged.pod.stderr);
-  assert.match(rigged.pod.stderr, /Session id is ambiguous: ab12/u);
+  assert.equal(rigged.pod.status, 2, rigged.pod.stderr);
+  assert.match(rigged.pod.stderr.split("\n")[0] ?? "", /detail=target-ambiguous$/u);
+  assert.doesNotMatch(rigged.pod.stderr + rigged.pod.stdout, /ambiguous: ab12|Session not found/u);
+  const twin = await bothAnswer(["claude", "cancel", "--session-id", "ab12"], "text");
+  assert.equal(twin.pod.status, 1, twin.pod.stderr);
+  assert.match(twin.pod.stderr, /Session id is ambiguous: ab12/u);
 });
 
 // ---- the seam: the verdict variable opens no way round the door ---------------------------------------------------------
@@ -1347,4 +1435,374 @@ test("ensureSessionDir: an EXISTING sessions dir is left untouched (contents and
       ["EEXIST", "ENOTDIR"].includes(String(e.code)),
     );
   });
+});
+
+// ======== K5 round 4, fix round 1 (the TE's FAIL: F2) and F1, F3, F4, F5, F6, F8 =======================================
+
+const HOLDER = "88888888-0000-4000-8000-0000000000e8";
+const SEAT_OF_HOLDER = "22222222-2222-4222-8222-2222222222bb";
+
+async function seatStoreWith(home: string, holder: string | null): Promise<void> {
+  await seedStore(home, [{ id: HOLDER, acp: "acp-holder" }]);
+  await fs.writeFile(
+    path.join(home, ".acpx", "sessions", "seats.json"),
+    JSON.stringify({
+      [SEAT_OF_HOLDER]: {
+        seat_id: SEAT_OF_HOLDER,
+        created_at: "2026-11-01T00:00:00.000Z",
+        active_holder_id: holder,
+        next_ordinal: 2,
+        closed_at: null,
+      },
+    }),
+  );
+}
+
+const truncate = (home: string, id: string): Promise<void> =>
+  fs.writeFile(path.join(home, ".acpx", "sessions", `${id}.json`), '{"acpxRecordId":"8888');
+
+test("F2 (seat's HOLDER mid-write): `status --seat` and `--session-url ?seat=` whose holder's record is truncated end in the door's refusal — never `Session not found: <holder>`", async () => {
+  for (const argv of [
+    ["claude", "status", "--seat", SEAT_OF_HOLDER],
+    ["claude", "status", "--session-url", `https://atrium.example/?seat=${SEAT_OF_HOLDER}`],
+  ]) {
+    const rigged = await bothAnswer(argv, "text", {}, undefined, {
+      pod: async (home) => {
+        await seatStoreWith(home, HOLDER);
+        await truncate(home, HOLDER);
+      },
+    });
+    assertDoorRefusal(rigged.pod, `${argv.join(" ")}: the holder's record is mid-write`);
+  }
+  // TWIN: the holder's record whole — the child finds it, so atrium's not-found is contradicted: still the door's refusal
+  const whole = await bothAnswer(
+    ["claude", "status", "--seat", SEAT_OF_HOLDER],
+    "text",
+    {},
+    undefined,
+    {
+      pod: (home) => seatStoreWith(home, HOLDER),
+    },
+  );
+  assertDoorRefusal(whole.pod, "the holder is whole: the pod's own read contradicts atrium");
+  // TWIN: the seat is nowhere in the pod's store — the seat's own not-found (exit 4), byte-equal to the control's
+  const none = await bothAnswer(["claude", "status", "--seat", SEAT_OF_HOLDER], "text");
+  assert.equal(none.pod.status, none.control.status, none.pod.stderr);
+  assert.equal(normalise(none.pod.stderr, none.homes), normalise(none.control.stderr, none.homes));
+});
+
+test("F2 (a seat file that cannot be read): a truncated seats.json is never read as 'no such seat' — the door's refusal", async () => {
+  const rigged = await bothAnswer(
+    ["claude", "status", "--seat", SEAT_OF_HOLDER],
+    "text",
+    {},
+    undefined,
+    {
+      pod: (home) => fs.writeFile(path.join(home, ".acpx", "sessions", "seats.json"), '{"2222'),
+    },
+  );
+  assertDoorRefusal(rigged.pod, "seats.json mid-write");
+});
+
+test("F2 (set-parent's PARENT mid-write): `--parent-id <target>` whose record is truncated ends in the door's refusal — never `PARENT_NOT_FOUND`", async () => {
+  const rigged = await bothAnswer(
+    ["sessions", "set-parent", "--session-id", GHOST, "--parent-id", PARENT],
+    "text",
+    {},
+    undefined,
+    { pod: (home) => truncate(home, PARENT) },
+  );
+  assertDoorRefusal(rigged.pod, "the parent is mid-write");
+  // TWIN: the parent whole — the true answer about the GHOST session, byte-equal to the control
+  const whole = await bothAnswer(
+    ["sessions", "set-parent", "--session-id", GHOST, "--parent-id", PARENT],
+    "text",
+  );
+  assert.equal(whole.pod.status, whole.control.status, whole.pod.stderr);
+  assert.equal(
+    normalise(whole.pod.stderr, whole.homes),
+    normalise(whole.control.stderr, whole.homes),
+  );
+});
+
+test("F3: an armed process whose own read FOUND the record (or could not read it) never prints `Session not found` — a neutral 'differs' sentence, the parent told", async () => {
+  const home = await copyOfTemplate();
+  const plain = {
+    PATH: process.env.PATH,
+    HOME: home,
+    ACPX_STATE_HOME: home,
+    NODE_TEST_CONTEXT: "child",
+  };
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+  const armed = (id: string): Promise<{ status: number | null; out: string; side: string }> =>
+    new Promise((resolve) => {
+      const child = spawn(
+        process.execPath,
+        ["--permission", "--allow-fs-read=*", cli, "claude", "status", "--session-id", id],
+        {
+          env: {
+            ...plain,
+            ACPX_POD_TARGET_VERDICT: JSON.stringify({ values: [id], kind: "not-found" }),
+          },
+          stdio: ["ignore", "pipe", "pipe", "pipe"],
+        },
+      );
+      let out = "";
+      let side = "";
+      child.stdout?.on("data", (c: Buffer) => (out += c.toString()));
+      child.stderr?.on("data", (c: Buffer) => (out += c.toString()));
+      (child.stdio[3] as NodeJS.ReadableStream).on("data", (c: Buffer) => (side += c.toString()));
+      child.on("close", (status) => resolve({ status, out, side }));
+    });
+  const found = await armed(POD_OWN); // the record EXISTS in this home
+  assert.doesNotMatch(found.out, /Session not found/u, found.out);
+  assert.match(found.side, /"event":"differs"/u);
+  assert.match(found.out, /this pod's own read of the session store differs/u);
+  await fs.writeFile(path.join(home, ".acpx", "sessions", `${SAME_TAIL}.json`), "{");
+  const unreadable = await armed(SAME_TAIL);
+  assert.doesNotMatch(unreadable.out, /Session not found/u, unreadable.out);
+  assert.match(unreadable.side, /"event":"differs"/u);
+  // CONTROL: an id that is really absent, in a store that reads cleanly elsewhere, IS a not-found (the verdict agrees)
+  const home2 = await copyOfTemplate();
+  const clean = await new Promise<{ out: string; side: string }>((resolve) => {
+    const child = spawn(
+      process.execPath,
+      ["--permission", "--allow-fs-read=*", cli, "claude", "status", "--session-id", GHOST],
+      {
+        env: {
+          PATH: process.env.PATH,
+          HOME: home2,
+          ACPX_STATE_HOME: home2,
+          NODE_TEST_CONTEXT: "child",
+          ACPX_POD_TARGET_VERDICT: JSON.stringify({ values: [GHOST], kind: "not-found" }),
+        },
+        stdio: ["ignore", "pipe", "pipe", "pipe"],
+      },
+    );
+    let out = "";
+    let side = "";
+    child.stderr?.on("data", (c: Buffer) => (out += c.toString()));
+    (child.stdio[3] as NodeJS.ReadableStream).on("data", (c: Buffer) => (side += c.toString()));
+    child.on("close", () => resolve({ out, side }));
+  });
+  assert.match(clean.out, /Session not found: /u);
+  assert.doesNotMatch(clean.side, /"event":"differs"/u);
+});
+
+test('F5: a denial the handler PRINTS by message or SWALLOWS never reaches the answer — `people set-owner <p> --session ""` in the pod shape, and set-parent in a pod home with no `.acpx/sessions`, end in the door\'s refusal', async () => {
+  const { brammertz } = await konsiqPair();
+  // the pod's own ACPX_SESSION_URL names its own session (as in every agent pod): the empty --session falls back to it, and the owner WRITE is denied
+  const owner = await bothAnswer(["people", "set-owner", brammertz.id, "--session", ""], "text");
+  assert.notEqual(owner.pod.status, 0);
+  assert.doesNotMatch(
+    owner.pod.stdout + owner.pod.stderr,
+    /Access to this API has been restricted/u,
+  );
+  assertDoorRefusal(owner.pod, 'people set-owner --session "" in the pod shape');
+  for (const argv of [
+    ["sessions", "set-parent", "--children-of", GHOST, "--parent-id", PARENT],
+    ["sessions", "set-parent", "--session-id", GHOST, "--parent-id", PARENT],
+  ]) {
+    const none = await bothAnswer(argv, "text", {}, undefined, {
+      pod: (home) => fs.rm(path.join(home, ".acpx"), { recursive: true, force: true }),
+    });
+    assert.doesNotMatch(
+      none.pod.stdout + none.pod.stderr,
+      /Access to this API has been restricted/u,
+    );
+    assertDoorRefusal(none.pod, `${argv.join(" ")} with no .acpx at all`);
+  }
+});
+
+test("F8: a registry refusal (`set subscription|profile <unknown>`) is the POD's view of registry.json — the door's refusal, never relayed as the answer; with the SAME registry on both sides the line proceeds to the session lookup and is byte-equal", async () => {
+  for (const argv of [
+    ["claude", "set", "subscription", "alias-a", "--session-id", GHOST],
+    ["claude", "set", "profile", "alias-a", "--session-id", GHOST],
+  ]) {
+    const registryOnControlOnly = await bothAnswer(argv, "text", {}, undefined, {
+      control: async (home) => {
+        await fs.mkdir(path.join(home, ".acpx", "subscriptions"), { recursive: true });
+        await fs.writeFile(
+          path.join(home, ".acpx", "subscriptions", "registry.json"),
+          JSON.stringify({
+            version: 3,
+            subscriptions: [{ id: "alias-a", label: "A", configDir: "/tmp/alias-a" }],
+            profiles: [{ id: "alias-a", subscriptionId: "alias-a" }],
+          }),
+        );
+      },
+    });
+    assert.equal(registryOnControlOnly.pod.status, 2, registryOnControlOnly.pod.stderr);
+    assert.match(registryOnControlOnly.pod.stderr.split("\n")[0] ?? "", /pass_through_refused/u);
+    assert.doesNotMatch(
+      registryOnControlOnly.pod.stderr + registryOnControlOnly.pod.stdout,
+      /not found in registry/u,
+    );
+  }
+});
+
+test("F6: with the pod home's index MISSING the armed child prints the rebuild note ONCE, as the control pod does (it rebuilds in memory on every load and may not persist)", async () => {
+  const noIndex = (home: string): Promise<void> =>
+    fs.rm(path.join(home, ".acpx", "sessions", "index.json"), { force: true });
+  for (const argv of [
+    ["sessions", "set-parent", "--children-of", GHOST, "--parent-id", PARENT],
+    ["claude", "status", "--session-id", GHOST],
+  ]) {
+    const rigged = await bothAnswer(argv, "text", {}, undefined, {
+      control: noIndex,
+      pod: noIndex,
+    });
+    const notes = (text: string): number =>
+      text.split("\n").filter((l) => l.startsWith("[acpx] full session-index rebuild")).length;
+    assert.equal(notes(rigged.control.stderr), 1, "the measure: the control pod says it once");
+    assert.equal(notes(rigged.pod.stderr), 1, `${argv.join(" ")}: ${rigged.pod.stderr}`);
+    assert.equal(rigged.pod.status, rigged.control.status);
+  }
+});
+
+// ---- F1: the child cannot be handed a write grant --------------------------------------------------------------------
+
+test("F1: a path-scoped write grant, wasi or addons given to the child by FLAGS keep the door's refusal; the child's own check (not just the path-less `has('fs.write')`) is what refuses", async () => {
+  const grants: Array<[string, (home: string) => string]> = [
+    [
+      "a write grant on the store",
+      (home) =>
+        `--permission --allow-fs-read=* --allow-fs-write=${path.join(home, ".acpx", "sessions")}`,
+    ],
+    [
+      "a write grant on the state home",
+      (home) => `--permission --allow-fs-read=* --allow-fs-write=${path.join(home, ".acpx")}`,
+    ],
+    [
+      "a write grant on the home",
+      (home) => `--permission --allow-fs-read=* --allow-fs-write=${home}`,
+    ],
+    [
+      "a write grant on the working directory's parent",
+      (home) => `--permission --allow-fs-read=* --allow-fs-write=${path.dirname(home)}`,
+    ],
+    ["wasi", () => "--permission --allow-fs-read=* --allow-wasi"],
+    ["addons", () => "--permission --allow-fs-read=* --allow-addons"],
+  ];
+  for (const [name, flags] of grants) {
+    const { run } = await runWithRealChild(flags);
+    assertDoorRefusal(run, name);
+  }
+});
+
+test("F1: the same grants reaching the child through NODE_OPTIONS (the parent's own removal defeated by a test seam) are refused by the CHILD's own checks; and in the ordinary path NODE_OPTIONS is REMOVED from the child", async () => {
+  const viaOptions: Array<[string, (home: string) => string]> = [
+    [
+      "a write grant on the store",
+      (home) => `--allow-fs-write=${path.join(home, ".acpx", "sessions")}`,
+    ],
+    ["wasi", () => "--allow-wasi"],
+    ["addons", () => "--allow-addons"],
+    ["write everywhere", () => "--allow-fs-write=*"],
+  ];
+  for (const [name, options] of viaOptions) {
+    const { run } = await runWithRealChild("--permission --allow-fs-read=*", (home) => ({
+      ACPX_POD_VERDICT_CHILD_NODE_OPTIONS: options(home),
+    }));
+    assertDoorRefusal(run, `${name} through NODE_OPTIONS`);
+  }
+  // the ordinary path: the pod's NODE_OPTIONS never reaches the child. (A pod environment that itself carried an
+  // `--allow-*` option could not even start acpx — Node refuses it without `--permission` — so the carried value here
+  // is a harmless one, and a well-behaved fixture child reports what it was given.)
+  const seen = await runWithFixture(
+    fixtureSource(
+      `process.stderr.write("NODE_OPTIONS=" + (process.env.NODE_OPTIONS ?? "<removed>") + "\\n" + sessionNotFound); process.exit(4);`,
+    ),
+    { NODE_OPTIONS: "--max-old-space-size=300" },
+  );
+  assert.equal(seen.run.status, 4, seen.run.stderr);
+  assert.match(
+    seen.run.stderr,
+    /NODE_OPTIONS=<removed>/u,
+    "the child's environment has no NODE_OPTIONS",
+  );
+});
+
+// ---- F2: the REAL race — a non-atomic writer against armed lookups, in process ------------------------------------
+
+const RACE_TARGET = "77777777-0000-4000-8000-0000000000c7";
+const RACE_ACP = "acp-race-target";
+const RACE_SELECTORS: Array<[string, string]> = [
+  ["id", RACE_TARGET],
+  ["suffix", "0000000000c7"],
+  ["ACP id", RACE_ACP],
+];
+const RACE_LOOKUPS = 500;
+
+const WRITER_SOURCE = `import fs from "node:fs";
+const [file, text] = process.argv.slice(2);
+process.on("SIGTERM", () => process.exit(0));
+for (;;) { fs.writeFileSync(file, text); }
+`;
+
+/** One selector, `RACE_LOOKUPS` armed lookups against a record rewritten NON-ATOMICALLY, never settling; the number relayed as not-found. */
+async function raceRelays(
+  selector: string,
+  evidence: boolean,
+  cap = RACE_LOOKUPS,
+): Promise<{ wrong: number; lookups: number; writerStarted: boolean }> {
+  const home = await copyOfTemplate();
+  await seedStore(home, [{ id: RACE_TARGET, acp: RACE_ACP }]);
+  const index = await runCli(
+    ["sessions", "reindex"],
+    { PATH: process.env.PATH, HOME: home, ACPX_STATE_HOME: home, NODE_TEST_CONTEXT: "child" },
+    { cwd: home },
+  );
+  assert.equal(index.status, 0, index.stderr);
+  const file = path.join(home, ".acpx", "sessions", `${RACE_TARGET}.json`);
+  const whole = await fs.readFile(file, "utf8");
+  const script = path.join(home, "writer.mjs");
+  await fs.writeFile(script, WRITER_SOURCE);
+  const writer = spawn(process.execPath, [script, file, whole], { stdio: "ignore" });
+  const restore = evidence ? installReadEvidenceOnly() : () => undefined;
+  let wrong = 0;
+  let lookups = 0;
+  try {
+    await withStateHome(home, async () => {
+      for (; lookups < cap; lookups += 1) {
+        disarmTargetVerdictForTests();
+        armTargetVerdict({ values: [selector], kind: "not-found" });
+        await resolveSessionRecord(selector).catch(() => undefined);
+        const told = toldEvents();
+        if (told.has("verdict") && !told.has("differs")) {
+          wrong += 1; // a not-found the child would have CONFIRMED, for a record that exists throughout
+        }
+        if (!evidence && wrong > 0) {
+          lookups += 1;
+          break;
+        }
+      }
+    });
+  } finally {
+    restore();
+    disarmTargetVerdictForTests();
+    writer.kill("SIGKILL");
+  }
+  return { wrong, lookups, writerStarted: writer.pid !== undefined };
+}
+
+test(`F2 (the real race): ${RACE_LOOKUPS} armed lookups per selector kind against a non-atomic writer loop — ZERO wrong not-founds with the read evidence`, async () => {
+  for (const [kind, selector] of RACE_SELECTORS) {
+    const armedRun = await raceRelays(selector, true);
+    assert.equal(armedRun.writerStarted, true);
+    assert.equal(armedRun.lookups, RACE_LOOKUPS, kind);
+    assert.equal(
+      armedRun.wrong,
+      0,
+      `${kind}: ${armedRun.wrong} of ${armedRun.lookups} relayed a not-found for a record that exists`,
+    );
+  }
+});
+
+test("F2 (the race can fail): the SAME loop WITHOUT the read evidence relays a wrong not-found — the suffix selector, TE-measured at 21–29 %, within a few thousand lookups", async () => {
+  const control = await raceRelays("0000000000c7", false, 4000);
+  assert.ok(
+    control.wrong > 0,
+    `no wrong not-found in ${control.lookups} lookups without the evidence: the race does not bite here, so the row above proves nothing`,
+  );
 });

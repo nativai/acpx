@@ -1,5 +1,7 @@
 import { writeSync } from "node:fs";
-import { Socket } from "node:net";
+import os from "node:os";
+import path from "node:path";
+import { acpxStateRoot, sessionBaseDir } from "../session/persistence/session-base-dir.js";
 
 /**
  * K5, parity BY CONSTRUCTION (A9 round 4, brick 46b827ba; FINDINGS.md there).
@@ -71,22 +73,49 @@ export function parseVerdict(raw: string | undefined): TargetVerdict | undefined
   return parsed ? verdictFrom(parsed) : undefined;
 }
 
-type Permission = { has(scope: string): boolean };
+type Permission = { has(scope: string, reference?: string): boolean };
+
+/** `permission.has`, with a runtime that does not know the scope counted as "no". */
+function granted(permission: Permission, scope: string, reference?: string): boolean {
+  try {
+    return permission.has(scope, reference);
+  } catch {
+    return false;
+  }
+}
+
+/** The places a write grant is looked for by PATH: the root, the store, the home, the working directory, tmp. */
+function writeProbePaths(): string[] {
+  const cwd = process.cwd();
+  return [path.parse(cwd).root, sessionBaseDir(), acpxStateRoot(), os.homedir(), cwd, os.tmpdir()];
+}
 
 /**
- * Has the RUNTIME made this process read-only: the permission model is on and grants no file write, no child
- * process, no worker, no addon. Anything else — the model absent (an older Node, a normal process) or any of
- * those granted — is "not read-only" and the verdict is not honoured.
+ * Has the RUNTIME made this process read-only? The permission model is on and grants — at ANY scope this can test —
+ * no file write (not on the root, the store, the state home, the home, the working directory or tmp: a path-scoped
+ * grant answers `has("fs.write")` false and `has("fs.write", <path>)` true, so the path-less question is not
+ * enough: K5 round 4 TE F1), no child process, no worker, no addon, no wasi; the command line carries no `--allow-*`
+ * but the read grant; and `NODE_OPTIONS` carries none. Anything else is "not read-only" and the verdict is not honoured.
  */
 export function isReadOnlyProcess(): boolean {
   const permission = (process as unknown as { permission?: Permission }).permission;
+  if (permission === undefined) {
+    return false;
+  }
+  const scopes = ["fs.write", "child", "worker", "addon", "wasi"];
   return (
-    permission !== undefined &&
-    !["fs.write", "child", "worker", "addon"].some((scope) => permission.has(scope))
+    !scopes.some((scope) => granted(permission, scope)) &&
+    !writeProbePaths().some((probe) => granted(permission, "fs.write", probe)) &&
+    !process.execArgv.some(
+      (arg) => arg.startsWith("--allow-") && !arg.startsWith("--allow-fs-read"),
+    ) &&
+    !(process.env.NODE_OPTIONS ?? "").includes("--allow-")
   );
 }
 
 let armed: TargetVerdict | undefined;
+let channelOpen = false;
+const told = new Set<VerdictEvent>();
 
 export function armTargetVerdict(verdict: TargetVerdict): void {
   armed = verdict;
@@ -96,10 +125,41 @@ export function armedTargetVerdict(): TargetVerdict | undefined {
   return armed;
 }
 
-/** One event on the side channel; a process with no such pipe (a normal one) simply has nothing to tell. */
-export type VerdictEvent = "readonly" | "verdict" | "network" | "differs" | "crashed";
+/** Test seam: forget the armed verdict and every event told (an in-process row arms, looks up, and disarms). */
+export function disarmTargetVerdictForTests(): void {
+  armed = undefined;
+  channelOpen = false;
+  told.clear();
+}
+
+/** The events this process has told so far. */
+export function toldEvents(): ReadonlySet<VerdictEvent> {
+  return told;
+}
+
+/** The child opens its side channel (fd 3) once it has armed; a process that never does writes to no descriptor. */
+export function openSideChannel(): void {
+  channelOpen = true;
+}
+
+/** One event on the side channel. */
+export type VerdictEvent =
+  | "readonly"
+  | "verdict"
+  | "network"
+  | "differs"
+  | "crashed"
+  | "denied"
+  | "registry";
 
 export function tellParent(event: VerdictEvent): void {
+  if (armed === undefined) {
+    return; // only an armed verdict child has anything to tell
+  }
+  told.add(event);
+  if (!channelOpen) {
+    return;
+  }
   try {
     writeSync(VERDICT_FD, `${JSON.stringify({ event })}\n`);
   } catch {
@@ -109,6 +169,9 @@ export function tellParent(event: VerdictEvent): void {
 
 /** The child's own word that it reached its normal end, with the code it ends with (`process.on("exit")`). */
 export function tellExit(code: number): void {
+  if (!channelOpen) {
+    return;
+  }
   try {
     writeSync(VERDICT_FD, `${JSON.stringify({ event: "exit", code })}\n`);
   } catch {
@@ -117,19 +180,23 @@ export function tellExit(code: number): void {
 }
 
 /**
- * The Node permission model does not restrict the NETWORK (v22). The verdict child never needs it, so — as one more
- * line of defence, at the single place every `net`, `tls`, `http` and `fetch` connection passes — a connection
- * attempt is told to the parent and refused. (UDP and DNS are not covered; measured clean in the corpus — see
- * FINDINGS.md.)
+ * The armed child prints acpx's one-time `[acpx] full session-index rebuild …` note AT MOST ONCE: it rebuilds in memory
+ * on every index load (it may not persist the index), where the control pod rebuilds once and persists (K5 round 4 TE F6).
  */
-export function installNetworkBarrier(): void {
-  Socket.prototype.connect = function refused(): never {
-    tellParent("network");
-    throw Object.assign(
-      new Error("ERR_ACCESS_DENIED: a pod's verdict child may not use the network"),
-      {
-        code: "ERR_ACCESS_DENIED",
-      },
-    );
-  } as typeof Socket.prototype.connect;
+let rebuildNotePrinted = false;
+export function rebuildNoteAllowed(): boolean {
+  if (armed === undefined) {
+    return true;
+  }
+  const allowed = !rebuildNotePrinted;
+  rebuildNotePrinted = true;
+  return allowed;
+}
+
+/**
+ * A registry-dependent refusal (`set subscription|profile <unknown>`) raised in the armed child is the POD's view of
+ * `registry.json`, not the box's: it is told, and the parent keeps the door's refusal (TE F8).
+ */
+export function noteRegistryRefusal(): void {
+  tellParent("registry");
 }

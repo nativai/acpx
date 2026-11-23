@@ -479,7 +479,6 @@ const LISTING_INVENTORY: Readonly<Record<string, Listing>> = {
   "session/persistence/index.ts::listSessionRecordFiles": { records: true },
   "session/archive/retention.ts::scanSessionDir": { records: true }, // every name, to CLAIM them to ids; the record read is behind the predicate (readRecordCandidates)
   "cli/transcripts-dedup.ts::readDirents": { records: true }, // indexRecordFiles filters its entries through the predicate
-  "session/persistence/repository.ts::hasUnreadableRecordFile": { records: true }, // K5 round 4 (c): every name goes through isSessionRecordFileName
   "session/persistence/repository.ts::unlinkHardDeletedFiles": NOT(
     "per-id stream-file lookup by id prefix",
   ),
