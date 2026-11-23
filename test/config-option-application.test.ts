@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
+import { maybeWrapSessionControlError } from "../src/acp/session-control-errors.js";
 import {
   advertisesConfigOption,
   applyExecReasoningEffort,
@@ -434,6 +435,20 @@ test("persistAndApplyRequestedEffort: a non-rejection error surfaces and leaves 
   const failures: Array<[string, unknown]> = [
     ["fork resume failure", FORK_RESUME_FAILURE],
     ["session not found", { code: -32002, message: "Resource not found: s1" }],
+    // claude-agent-acp 842fb79, probed: a config op on an id it does not hold.
+    [
+      "adapter Session not found (-32603)",
+      { code: -32603, message: "Internal error", data: { details: "Session not found" } },
+    ],
+    // A -32602 that names a missing session is not a refusal of the value.
+    [
+      "invalid params naming an unknown session",
+      maybeWrapSessionControlError(
+        "session/set_config_option",
+        { code: -32602, message: "Unknown sessionId: s1" },
+        'for "effort"="max"',
+      ),
+    ],
     ["transport/timeout", new Error("Timed out after 5000ms")],
   ];
   for (const [label, failure] of failures) {
@@ -465,6 +480,43 @@ test("persistAndApplyRequestedEffort: the adapter's own level rejection still fa
     advertised: [effortOption("high", OPUS_EFFORT_LEVELS)],
   });
   assert.equal(getDesiredConfigOptions(record.acpx).effort, "high");
+});
+
+test("persistAndApplyRequestedEffort: every refusal shape the real adapter returns falls back", async () => {
+  // Captured from claude-agent-acp 842fb79 at zero turns (brick 94d01658 IMPL §9), each as it reaches
+  // this catch — i.e. after acpx's own `maybeWrapSessionControlError`.
+  const wrap = (payload: unknown) =>
+    maybeWrapSessionControlError("session/set_config_option", payload, 'for "effort"="max"');
+  const refusals: Array<[string, unknown]> = [
+    [
+      "level outside the ladder (-32603 details)",
+      wrap({
+        code: -32603,
+        message: "Internal error",
+        data: { details: "Invalid value for config option effort: ultra" },
+      }),
+    ],
+    [
+      "schema rejection (-32602 Invalid params)",
+      wrap({
+        code: -32602,
+        message: "Invalid params",
+        data: { value: { _errors: ["Invalid input: expected string, received number"] } },
+      }),
+    ],
+    ["older adapter: no effort option", new Error("Unknown config option: effort")],
+  ];
+  for (const [label, refusal] of refusals) {
+    const record = recordWithDesired();
+    await persistAndApplyRequestedEffort({
+      client: rejectingWith(refusal),
+      sessionId: "s1",
+      record,
+      reasoningEffort: "max",
+      advertised: [effortOption("high", OPUS_EFFORT_LEVELS)],
+    });
+    assert.equal(getDesiredConfigOptions(record.acpx).effort, "high", label);
+  }
 });
 
 test("persistAndApplyRequestedEffort: deferApply persists the intent and sends nothing", async () => {

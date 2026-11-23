@@ -1,5 +1,9 @@
 import type { SessionConfigOption, SessionModeState } from "@agentclientprotocol/sdk";
-import { extractAcpError, extractAcpErrorDetails } from "../acp/error-shapes.js";
+import {
+  extractAcpError,
+  extractAcpErrorDetails,
+  isAcpResourceNotFoundError,
+} from "../acp/error-shapes.js";
 import {
   acpxRoutesDepthMechanism,
   depthMechanismForAgentCommand,
@@ -70,8 +74,10 @@ const LEGACY_HAIKU_CLAUDE_EFFORT_LEVELS = new Set(["high"]);
 // (brick 44662379), which accepts every level it advertises, spawn-time and live
 // (probed on raw ACP, brick 226d715c). Treating the alias as 4.5 pinned the
 // current model to `high` for the sake of one retired. An adapter that still
-// serves 4.5 behind the alias and rejects an effort set is absorbed by
-// `rejectedEffortFallback`, so a spawn never aborts either way. Guarded by the
+// serves 4.5 behind the alias and REFUSES the level is absorbed by
+// `rejectedEffortFallback` — but only a refusal is (brick 94d01658): an error
+// `isAgentEffortLevelRejection` does not recognise as one SURFACES and aborts the
+// spawn rather than being recorded as the agent's choice. Guarded by the
 // "haiku alias and 5.x defer" and "legacy haiku stays high-only" cases in
 // test/config-option-application.test.ts.
 const LEGACY_HAIKU_MODEL_ID = /haiku[-.]4|3(?:[-.]5)?-haiku/;
@@ -222,22 +228,38 @@ async function setConfigOptionWithEffortFallback(
 }
 
 /**
- * The texts an agent answers with when it refuses an `effort` LEVEL (or has no
- * `effort` option at all), as opposed to failing for an unrelated reason.
+ * The agent REFUSED the effort request (the level, the value, or effort itself),
+ * as opposed to failing for a reason that says nothing about it.
  *
- * Measured on claude-agent-acp 842fb79, the only adapter that advertises a
- * selectable `effort` config option: its `setSessionConfigOption` throws a plain
- * `Error("Invalid value for config option effort: <v>")` or
- * `Error("Unknown config option: effort")`, which the ACP SDK serializes as
- * `{code:-32603, message:"Internal error", data:{details:"<that text>"}}`. The
- * fork-resume failure uses the SAME code (-32603), so the code cannot tell them
- * apart — the text is the only discriminator the adapter provides.
+ * Every refusal path of claude-agent-acp 842fb79 (the only adapter that
+ * advertises a selectable `effort` config option), enumerated from its
+ * `setSessionConfigOption` and probed live at zero turns on 2026-11-23:
+ *   - a level outside the advertised ladder, a level no advertised model supports
+ *     (the resume-race tolerance branch), or a non-string value reaching the
+ *     handler: `Error("Invalid value for config option effort: <v>")`, which the
+ *     ACP SDK serializes as `{code:-32603, message:"Internal error",
+ *     data:{details:"<that text>"}}` — matched by EFFORT_LEVEL_REJECTION;
+ *   - a request the SDK's schema rejects (e.g. a non-string value):
+ *     `-32602 Invalid params` — matched by the code below;
+ *   - `Unknown config option: effort` (older adapters; 842fb79 no longer throws
+ *     it for effort) — matched by EFFORT_LEVEL_REJECTION.
+ * Not refusals, and they surface: `Session not found` and the fork-resume failure
+ * (`-32603`, the SAME code as a level refusal — hence the text), a transport
+ * drop, a timeout, and an `applyFlagSettings` failure (the SDK has no key or
+ * level allowlist there, so it can only fail for process/transport reasons).
+ * A model that does not support effort is not a refusal either: the adapter
+ * accepts the set and Claude Code ignores it (probed on `haiku`/`sonnet`).
  */
 const EFFORT_LEVEL_REJECTION =
   /^(?:Internal error: )?(?:Invalid value for config option effort\b|Unknown config option: effort\b)/;
 
+const JSON_RPC_INVALID_PARAMS = -32602;
+
 function isAgentEffortLevelRejection(error: unknown): boolean {
   const acp = extractAcpError(error);
+  if (acp?.code === JSON_RPC_INVALID_PARAMS && !isAcpResourceNotFoundError(error)) {
+    return true;
+  }
   const candidates = [
     acp?.message,
     extractAcpErrorDetails(error),
