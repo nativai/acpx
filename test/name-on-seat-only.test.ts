@@ -82,8 +82,10 @@ const ALLOWED_NAME_READS: ReadonlyMap<string, { count: number; why: string }> = 
   [
     "session/persistence/parse.ts",
     {
-      count: 2,
-      why: "a SUBAGENT REF's `name` inside a parent record (the adapter's subagent label), not a session name",
+      count: 3,
+      why:
+        "a SUBAGENT REF's `name` inside a parent record (the adapter's subagent label), not a session name; " +
+        "and `RETIRED_TOP_LEVEL_KEYS` (A-65), which LISTS `name` so that no write carries it back — the opposite of a read",
     },
   ],
   [
