@@ -15,7 +15,8 @@ import { placeOf, podModeVerdictNow, readPodFileWithWitness } from "./placement.
  *   any other host             → THE SESSION'S LEASE DECIDES, in or out of pod mode:
  *                                a lease that names a pod → `session-in-pod`;
  *                                no lease, or one without `pod` → `local`;
- *                                a lease that cannot be read → `pod-unreadable` (fail closed)
+ *                                a lease that cannot be read, or whose `pod` key is present but unreadable
+ *                                → `pod-unreadable` (fail closed)
  *   a host with no pod identity (A-5) that is not switched
  *                              → `local` before anything is read: it was never switched, so no lease
  *                                of its own names a pod — a box that was never switched is unchanged
@@ -54,7 +55,9 @@ export async function localProofScope(
 
 async function leaseScope(recordId: string): Promise<ProofScope> {
   const lease = await readQueueOwnerLeaseFile(recordId);
-  if (lease.kind === "unparsable") {
+  // A lease whose `pod` is present but cannot be read is as unreadable as a lease that cannot be parsed:
+  // reading it as "no pod" would remove what a living pod writes (TE LOW-1).
+  if (lease.kind === "unparsable" || (lease.kind === "ok" && lease.podMalformed === true)) {
     return { local: false, reason: "pod-unreadable" };
   }
   return lease.kind === "ok" && lease.record.pod !== undefined

@@ -7,6 +7,7 @@ import {
   reapLeftBehindTranscripts,
   type TranscriptReapSummary,
 } from "../../config/transcript-reap.js";
+import { localProofScope, type ProofScope } from "../../pod/proof-scope.js";
 import {
   isRecordedPidPossiblyAlive,
   observeProcessIncarnation,
@@ -338,6 +339,8 @@ export type CloseReapDeps = {
   isAdapterAlive: (pid: number, identity: RecordPidIdentity | undefined) => boolean;
   sleep: (ms: number) => Promise<void>;
   hasLeftBehind: (record: SessionRecord) => Promise<boolean>;
+  /** Is this host's process table the whole world for the session (`localProofScope`, A-67)? */
+  proofScope: (recordId: string) => Promise<ProofScope>;
   reap: typeof reapLeftBehindTranscripts;
   writeLog: (sessionId: string, line: string) => Promise<void>;
 };
@@ -350,6 +353,7 @@ const defaultCloseReapDeps: CloseReapDeps = {
   isAdapterAlive: isRecordedPidPossiblyAlive,
   sleep: async (ms) => await new Promise((resolve) => setTimeout(resolve, ms)),
   hasLeftBehind: async (record) => await hasLeftBehindTranscript(record),
+  proofScope: localProofScope,
   reap: reapLeftBehindTranscripts,
   writeLog: async (sessionId, line) =>
     await fs.promises.appendFile(queueOwnerLogPath(sessionId), line),
@@ -381,6 +385,17 @@ async function runCloseReap(input: CloseReapInput, deps: CloseReapDeps): Promise
   const record = await deps.resolveRecord(input.sessionId);
   if (ownerExitReapGateReason(record)) {
     return undefined;
+  }
+  // ⚠️ The close runs in whatever process runs `acpx sessions close` — the control pod included — and the
+  // proofs below (owner gone by identity, group empty, adapter pid) are all read from THIS host's table.
+  // For a session that may live in a pod they answer for the wrong host, so the step stops here (A-67).
+  // The reap would refuse by itself (`reapLeftBehindTranscripts` asks the same function); this keeps the
+  // proof sequence from running at all, and names the reason.
+  if (!(await deps.proofScope(record.acpxRecordId)).local) {
+    if (await deps.hasLeftBehind(record)) {
+      await emitCloseLine(input, deps, `session=${record.acpSessionId} skipped=not-local-proof`);
+    }
+    return { ran: false, reason: "not-local-proof" };
   }
   if (deps.now() - input.closeStartedAt >= CLOSE_REAP_SLOW_CLOSE_MS) {
     // No probe either: a close that is already slow must not get slower.

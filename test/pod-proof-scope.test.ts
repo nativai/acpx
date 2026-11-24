@@ -4,7 +4,12 @@ import { tryAcquireQueueOwnerLease } from "../src/cli/queue/lease-store.js";
 import { sessionKey } from "../src/pod/placement.js";
 import { localProofScope } from "../src/pod/proof-scope.js";
 import { agentPodNameFor, makeWorld, withEnv, worldEnv } from "./pod-owner-helpers.js";
-import { RECORD_ID, writeLeaseGarbage, writePodLease } from "./pod-proof-helpers.js";
+import {
+  RECORD_ID,
+  writeLeaseGarbage,
+  writeLeaseWithBadPod,
+  writePodLease,
+} from "./pod-proof-helpers.js";
 
 // Block A11 (brick e867b917), items 2 + 4 (C91: "transcript removal for a session runs only in that
 // session's pod or when it has none"). `localProofScope` says whether THIS process's `/proc` is the whole
@@ -82,4 +87,36 @@ test("A11 scope, inside an agent pod: local only for that session's own pod", as
       reason: "other-pod",
     });
   });
+});
+
+test("A11 scope fails closed on a lease whose `pod` key is present but unreadable (TE LOW-1) — in and out of pod mode", async () => {
+  const shapes: Array<[string, unknown]> = [
+    ["no uid", { name: "ag-x", node: "n1" }],
+    ["not an object", "ag-x"],
+    ["null", null],
+    ["empty object", {}],
+  ];
+  for (const [label, podValue] of shapes) {
+    const world = makeWorld(`ps-badpod-${label.replace(/\W/g, "")}`);
+    await writeLeaseWithBadPod(world, RECORD_ID, podValue);
+    for (const podMode of [false, true]) {
+      await withEnv(worldEnv(world, { podMode }), async () => {
+        assert.deepEqual(
+          await localProofScope(RECORD_ID),
+          { local: false, reason: "pod-unreadable" },
+          `${label} podMode=${podMode}`,
+        );
+      });
+    }
+  }
+});
+
+test("A11 scope: a lease with NO pod key at all is still local (the control for the malformed-pod rows)", async () => {
+  const world = makeWorld("ps-nopodkey");
+  await writeLeaseWithBadPod(world, RECORD_ID, undefined);
+  for (const podMode of [false, true]) {
+    await withEnv(worldEnv(world, { podMode }), async () => {
+      assert.deepEqual(await localProofScope(RECORD_ID), { local: true }, `podMode=${podMode}`);
+    });
+  }
 });

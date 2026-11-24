@@ -26,8 +26,26 @@ export function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:"'`])\/\/.*$/gm, "$1");
 }
 
-const PROCESS_TABLE_READER =
-  /["'`]\/proc(?:["'`/]|\b)|\bprocRoot\b|\.kill\([^()]*,\s*0\s*\)|\b(?:isRecordedPidPossiblyAlive|sessionOwnedByLiveProcess|scanLiveProcesses|isPidAlive|isProcessAlive)\b/;
+// ⚠️ THE SPELLINGS THE SCAN KNOWS ARE ITS WHOLE WORLD (TE LOW-4): a reader that reaches the process table
+// through a helper this list does not name is invisible to it. Name a new helper here when one is added.
+const PROCESS_TABLE_HELPERS = [
+  "isRecordedPidPossiblyAlive",
+  "sessionOwnedByLiveProcess",
+  "scanLiveProcesses",
+  "isPidAlive",
+  "isProcessAlive",
+  "isProcessDefinitelyDead",
+  "observeProcessIncarnation",
+  "readProcessBirthIdentity",
+  "scanLivePids",
+  "pidObservedLive",
+  "listLiveGroupMembers",
+].join("|");
+const PROCESS_TABLE_READER = new RegExp(
+  // `/proc` as a path literal, `procRoot`, `kill(<anything>, 0)` (the pid expression may hold parentheses,
+  // `kill(Number(x), 0)`), or one of the helpers above.
+  `["'\`]/proc(?:["'\`/]|\\b)|\\bprocRoot\\b|\\.kill\\([^;]*?,\\s*0\\s*\\)|\\b(?:${PROCESS_TABLE_HELPERS})\\b`,
+);
 const CALLS_THE_SCOPE = /\b(?:localProofScope|proofScope|localProof)\b/;
 
 export type ProcReaders = { scoped: string[]; unscoped: string[] };
@@ -46,24 +64,32 @@ export function findProcessTableReaders(root: string): ProcReaders {
   return { scoped, unscoped };
 }
 
-const PID_IN_NAME = /\$\{\s*(?:String\()?process\.pid\b/;
+// A pid mixed into a name: in a template (`${process.pid}`), by concatenation (`"." + process.pid`,
+// `process.pid + "."`) or through `String(…)` / `.toString()`.
+const PID_IN_NAME =
+  /\$\{\s*(?:String\()?process\.pid\b|[+]\s*(?:String\()?process\.pid\b|\bprocess\.pid(?:\.toString\(\))?\s*[+]|String\(\s*process\.pid\s*\)/;
 const TEMP_WORD = /tmp|temp/i;
 const RANDOM_PART = /randomUUID|randomBytes|uniqueTempPath/;
 
 /**
- * Temp names built from `process.pid` whose statement (the physical line) carries no random part. The
- * helper `uniqueTempPath` is the one place such a name is built correctly; any other line that mixes the
- * pid into a temp-looking name without a random call is flagged — per OCCURRENCE, not per file.
+ * Temp names built from `process.pid` whose STATEMENT (the text up to the next `;`, so a name split over
+ * several lines is one subject) carries no random part. The helper `uniqueTempPath` is the one place such
+ * a name is built correctly; any other statement that mixes the pid into a temp-looking name without a
+ * random call is flagged — per OCCURRENCE, not per file. Reported as `file:line` of the pid.
  */
 export function findPidOnlyTempNames(root: string): string[] {
   const hits: string[] = [];
   for (const file of listSourceFiles(root)) {
-    const lines = stripComments(fs.readFileSync(file, "utf8")).split("\n");
-    lines.forEach((line, index) => {
-      if (PID_IN_NAME.test(line) && TEMP_WORD.test(line) && !RANDOM_PART.test(line)) {
-        hits.push(`${path.relative(root, file)}:${index + 1}`);
+    const code = stripComments(fs.readFileSync(file, "utf8"));
+    let line = 1;
+    for (const statement of code.split(";")) {
+      const pid = PID_IN_NAME.exec(statement);
+      if (pid && TEMP_WORD.test(statement) && !RANDOM_PART.test(statement)) {
+        const pidLine = line + statement.slice(0, pid.index).split("\n").length - 1;
+        hits.push(`${path.relative(root, file)}:${pidLine}`);
       }
-    });
+      line += statement.split("\n").length - 1;
+    }
   }
   return hits;
 }

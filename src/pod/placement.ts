@@ -492,3 +492,41 @@ export function assertBridgeMayStartHere(what: "adapter" | "owner"): void {
     throw new BridgeOnControlPodError(what);
   }
 }
+
+// ---- the release layout (C9; block A11) ----------------------------------------------------------
+//
+// ⚠️ THESE LIVE HERE, IN `placement.ts`, ON PURPOSE (TE F-1). `release-staleness.ts` — reached from the
+// owner runtime, i.e. from `cli.js`'s static graph — and `routed-call.ts`, which `cli.js` imports lazily,
+// both need them. A module shared by a lazy chunk and the static graph becomes a chunk of its own that
+// `cli.js` then reaches statically: a first leaf module took `dist/cli.js` from 10 to 11
+// chunks, importing them from `routed-call` / `routed-branches` made it 12, and the shipped-bundle row of
+// `test/pod-command-classes.test.ts` allows 10. `placement` is already a shared chunk both sides import.
+
+/**
+ * THE release-name grammar (C9, A-46): the entrypoint's rule (`runtime-links.sh`) plus a 128-character bound —
+ * it starts with a letter or digit (so never `.`, `..` or a hidden name), has no path separator and no `+`,
+ * and is never `previous`. A release name ends up in a path, so every place that reads or sends one asks THIS.
+ * Every bootstrap name (`<sha>-<stamp>[-in-place]`) passes. An empty or odd value is NOT a release.
+ */
+export const RELEASE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+export function isReleaseName(value: string | undefined): value is string {
+  return value !== undefined && RELEASE_NAME.test(value) && value !== "previous";
+}
+
+/** `.releases/<tool>/<name>` (relative or absolute) → `<name>`; undefined for any other shape. */
+export function releaseNameOf(target: string, tool: string): string | undefined {
+  const parts = target.split("/").filter((part) => part.length > 0);
+  const name = parts.at(-1);
+  const shaped = parts.at(-3) === ".releases" && parts.at(-2) === tool;
+  return shaped && isReleaseName(name) ? name : undefined;
+}
+
+/**
+ * TEST SEAM, honoured ONLY under `node --test` (`NODE_TEST_CONTEXT`, the precedent of
+ * `ACPX_OS_COMPAT_LINK` / `ACPX_POD_TEST_HOME`): the release layout of a sandbox. ⚠️ DO NOT read it
+ * unconditionally — on a box it would redirect what a pod is pinned to. Held by
+ * test/pod-routed-branches.test.ts.
+ */
+export function testRuntimeDir(env: NodeJS.ProcessEnv): string | undefined {
+  return env.NODE_TEST_CONTEXT ? env.ACPX_TEST_RUNTIME_DIR?.trim() || undefined : undefined;
+}

@@ -2,8 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { lockHostPlace } from "./identity.js";
 import { acpxReleaseOf } from "./owner-pod.js";
-import { testRuntimeDir } from "./routed-branches.js";
-import { releaseNameOf } from "./routed-call.js";
+import { releaseNameOf, testRuntimeDir } from "./placement.js";
 
 /**
  * C9 "Staleness" (block A11): in an agent pod acpx's deploy-staleness token is "`releases.acpx` is not
@@ -33,18 +32,25 @@ export function currentAcpxRelease(env: NodeJS.ProcessEnv): string | undefined {
   }
 }
 
+export type PodReleaseDetail = { pinned: string; current: string };
+
 /**
  * The staleness probe of an owner that runs in an agent pod: the pinned release is captured once, the
  * link is read at every call. Either side unknown → `false`: an owner is recycled only on a positive
- * difference, never for a lack of evidence.
+ * difference, never for a lack of evidence. `detail()` names the two releases when (and only when) they
+ * differ, for the owner's release log line — one line shows what test-plan row NG-K14.3 reads.
  */
-export function createPodReleaseStalenessProbe(env: NodeJS.ProcessEnv): () => boolean {
+export function createPodReleaseStalenessProbe(env: NodeJS.ProcessEnv): {
+  stale: () => boolean;
+  detail: () => PodReleaseDetail | undefined;
+} {
   const pinned = acpxReleaseOf(env);
-  return () => {
+  const detail = (): PodReleaseDetail | undefined => {
     if (pinned === undefined) {
-      return false;
+      return undefined;
     }
     const current = currentAcpxRelease(env);
-    return current !== undefined && current !== pinned;
+    return current !== undefined && current !== pinned ? { pinned, current } : undefined;
   };
+  return { stale: () => detail() !== undefined, detail };
 }

@@ -23,3 +23,19 @@ export async function writePodLease(world: PodWorld, recordId: string): Promise<
   });
   fs.rmSync(path.join(world.home, ".nv-agent"));
 }
+
+/**
+ * A lease an agent pod wrote, then edited so its `pod` key is PRESENT BUT UNREADABLE (`podValue`): the
+ * shape a writer bug or a release skew could leave (TE LOW-1). `undefined` removes the key.
+ */
+export async function writeLeaseWithBadPod(
+  world: PodWorld,
+  recordId: string,
+  podValue: unknown,
+): Promise<void> {
+  await writePodLease(world, recordId);
+  const file = queueLockFilePath(recordId, world.home);
+  const body = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+  body.pod = podValue;
+  fs.writeFileSync(file, JSON.stringify(body));
+}

@@ -22,6 +22,7 @@ import {
   WAKE_BOUND_MS,
 } from "./broker-client.js";
 import { CALLER_IDENTITY_VARS, type CallerIdentity } from "./caller-identity.js";
+import { isReleaseName, releaseNameOf } from "./placement.js";
 import {
   admissionBusyRefusal,
   agentCapRefusal,
@@ -29,6 +30,9 @@ import {
   RoutedCallError,
   type AgentCapWhy,
 } from "./pod-refusal.js";
+
+// The grammar and the link reader live in `placement.ts` (block A11, F-1: see the note there); re-exported here.
+export { isReleaseName, RELEASE_NAME, releaseNameOf } from "./placement.js";
 
 /**
  * C2 — the routed call, caller side: one acpx invocation executed inside an agent pod on behalf of
@@ -603,17 +607,6 @@ function refuseReadyPodWithoutPi(
   }
 }
 
-/**
- * THE release-name grammar (C9, A-46): the entrypoint's rule (`runtime-links.sh`) plus a 128-character bound —
- * it starts with a letter or digit (so never `.`, `..` or a hidden name), has no path separator and no `+`,
- * and is never `previous`. A release name ends up in a path, so every place that reads or sends one asks THIS.
- * Every bootstrap name (`<sha>-<stamp>[-in-place]`) passes. An empty or odd value is NOT a release.
- */
-export const RELEASE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-export function isReleaseName(value: string | undefined): value is string {
-  return value !== undefined && RELEASE_NAME.test(value) && value !== "previous";
-}
-
 /** The one named line for a Pi call that cannot have `pi` (A-42/A-43): no new public reason. */
 function piUnresolved(callId: string): RoutedCallError {
   return new RoutedCallError({
@@ -1002,14 +995,6 @@ export const RELEASE_TOOLS_OPTIONAL = ["pi-extensions", "pi", "claude-pty-acp"] 
 export type ResolveReleasesResult =
   | { ok: true; releases: Record<string, string> }
   | { ok: false; tool: string };
-
-/** `.releases/<tool>/<name>` (relative or absolute) → `<name>`; undefined for any other shape. */
-export function releaseNameOf(target: string, tool: string): string | undefined {
-  const parts = target.split("/").filter((part) => part.length > 0);
-  const name = parts.at(-1);
-  const shaped = parts.at(-3) === ".releases" && parts.at(-2) === tool;
-  return shaped && isReleaseName(name) ? name : undefined;
-}
 
 /** The link's target; `null` when NOTHING is there (ENOENT); `undefined` when something is there that cannot be read as a link. */
 function readLinkOrUndefined(file: string): string | null | undefined {

@@ -33,7 +33,16 @@ test("the discovering check is RED on a planted pid-only temp name, clean on one
     path.join(root, "good.ts"),
     "const tmp = `${f}.${process.pid}.${randomUUID()}.tmp`;\n// const old = `${f}.${process.pid}.tmp`;\nconst log = `pid ${process.pid}`;\n",
   );
-  assert.deepEqual(findPidOnlyTempNames(root), ["bad.ts:1", "bad.ts:2"]);
+  fs.writeFileSync(
+    path.join(root, "concat.ts"),
+    'const a = target + ".tmp-" + process.pid;\nconst b =\n  `${target}` +\n  ".tmp-" +\n  String(process.pid);\nconst fine = target + ".tmp-" + process.pid + randomBytes(4);\n',
+  );
+  assert.deepEqual(findPidOnlyTempNames(root), [
+    "bad.ts:1",
+    "bad.ts:2",
+    "concat.ts:1",
+    "concat.ts:4",
+  ]);
 });
 
 test("the routed payload (C2): published under its final name, mode 0600, no temp left, also on a failed rename", () => {

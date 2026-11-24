@@ -21,8 +21,6 @@ const CAPACITY =
 const PRIMITIVE =
   "primitive: answers for the reader's own pid namespace; its callers are scoped or listed";
 const C3 = "lock-holder or lease judgement: C3.2 / C3.3 rules, not the A-67 bullet";
-const OWN_TREE =
-  "runs inside the session's own owner, so in the session's own pod; judges its own group or tasks";
 
 export const REVIEWED: Record<string, string> = {
   "acp/auth-env.ts": `PID 1's environ for pod facts: ${OWN_PROCESS}`,
@@ -46,8 +44,13 @@ export const REVIEWED: Record<string, string> = {
     "capacity admission's owner-tree check: a lease scan and this host's own tree (R12)",
   "cli/queue/ipc.ts": C3,
   "cli/queue/lease-store.ts": C3,
-  "cli/session/owner-exit-transcript-reap.ts": OWN_TREE,
-  "cli/session/owner-task-reap.ts": OWN_TREE,
+  "cli/session/owner-task-reap.ts":
+    "createOwnerTaskReaper runs inside the owner (its own pid, its own pod); the close-side export clearBackgroundTaskChipAfterReap reads no table",
+  "acp/harness-config-dir.ts":
+    "releases a per-session config dir under THIS host's tmpdir when no holder pid is live; the dir and the holder pids are on the same host by construction (root = tmpdir())",
+  "process-signal.ts":
+    "signals a recorded pid only on a full birth-identity match in the reader's own pid namespace; another pod's pid reads unknown and is never signalled",
+  "session/persistence/identity-file-lock.ts": C3,
   "cli/session/queue-owner-runtime.ts": `/proc/self/stat: ${OWN_PROCESS}`,
   "cli/session/session-control.ts": `walks this process's own parent chain: ${OWN_PROCESS}`,
   "pod/placement.ts": `PID 1's environ for pod facts (A-26): ${OWN_PROCESS}`,
@@ -81,6 +84,7 @@ test("every reader of this host's process table is scoped or reviewed — and th
   assert.deepEqual(
     scoped,
     [
+      "cli/session/owner-exit-transcript-reap.ts",
       "cli/transcripts-dedup.ts",
       "config/transcript-dedup.ts",
       "session/abandoned-record-sweep.ts",
@@ -102,6 +106,11 @@ test("the scan is RED on a planted /proc walk and a planted kill(pid, 0), clean 
     "export const alive = (pid: number) => process.kill(pid, 0);\n",
   );
   fs.writeFileSync(path.join(root, "census.ts"), "const scan = scanLiveProcesses();\n");
+  fs.writeFileSync(path.join(root, "nested.ts"), "process.kill(Number(entry.pid), 0);\n");
+  fs.writeFileSync(
+    path.join(root, "helper.ts"),
+    "const state = observeProcessIncarnation(pid, id);\n",
+  );
   fs.writeFileSync(
     path.join(root, "scoped.ts"),
     'const scope = await localProofScope(id);\nfs.readdirSync("/proc");\n',
@@ -111,6 +120,6 @@ test("the scan is RED on a planted /proc walk and a planted kill(pid, 0), clean 
     "// walks /proc and calls kill(pid, 0)\nexport const x = 1;\n",
   );
   const { scoped, unscoped } = findProcessTableReaders(root);
-  assert.deepEqual(unscoped, ["census.ts", "probe.ts", "walk.ts"]);
+  assert.deepEqual(unscoped, ["census.ts", "helper.ts", "nested.ts", "probe.ts", "walk.ts"]);
   assert.deepEqual(scoped, ["scoped.ts"]);
 });

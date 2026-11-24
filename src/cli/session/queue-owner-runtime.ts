@@ -11,7 +11,11 @@ import { QueueConnectionError, SessionClosedError } from "../../errors.js";
 import { checkpointPerfMetricsCapture } from "../../perf-metrics-capture.js";
 import { incrementPerfCounter, setPerfGauge } from "../../perf-metrics.js";
 import { assertOwnerEntryInOwnPod } from "../../pod/owner-pod.js";
-import { createPodReleaseStalenessProbe, inAgentPod } from "../../pod/release-staleness.js";
+import {
+  createPodReleaseStalenessProbe,
+  inAgentPod,
+  type PodReleaseDetail,
+} from "../../pod/release-staleness.js";
 import { promptToDisplayText } from "../../prompt-content.js";
 import { bindRecordToDefaultAccount } from "../../runtime/engine/default-account-binding.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
@@ -192,12 +196,17 @@ function readDeployedBuildToken(): string | undefined {
  * path-1 token exactly as it was. The arm is chosen by `inAgentPod`, not by the placement switch, so no
  * host that is not an agent pod can reach the release arm.
  */
+export type DeployStalenessProbe = (() => Promise<boolean>) & {
+  /** The pod arm only: the pinned and the current release, while they differ. */
+  releaseDetail?: () => PodReleaseDetail | undefined;
+};
+
 export function createDeployStalenessProbe(
   env: NodeJS.ProcessEnv = process.env,
-): () => Promise<boolean> {
+): DeployStalenessProbe {
   if (inAgentPod(env)) {
     const podProbe = createPodReleaseStalenessProbe(env);
-    return async () => podProbe();
+    return Object.assign(async () => podProbe.stale(), { releaseDetail: podProbe.detail });
   }
   // Deploy-staleness signal (Path 1, W13-24-10). Capture the owner's build token
   // at spawn; re-read it at each idle check. A difference means a deploy happened
@@ -1111,11 +1120,15 @@ export function formatOwnerReleaseLine(input: {
   at: number;
   idleMs: number;
   liveBackgroundTasks: number;
+  /** An owner in an agent pod released for a stale release (C9): `release=<pinned> current=<link>`. */
+  releases?: PodReleaseDetail;
 }): string {
   return (
     `[acpx] queue owner releasing session ${input.sessionId} (reason=${input.reason}); ` +
     `next prompt cold-respawns with context; at=${new Date(input.at).toISOString()} ` +
-    `idle=${formatIdleAge(input.idleMs)} live_background_tasks=${input.liveBackgroundTasks}\n`
+    `idle=${formatIdleAge(input.idleMs)} live_background_tasks=${input.liveBackgroundTasks}` +
+    (input.releases ? ` release=${input.releases.pinned} current=${input.releases.current}` : "") +
+    "\n"
   );
 }
 
@@ -1836,6 +1849,10 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
               at: releasedAt,
               idleMs: releasedAt - Math.max(lastTaskCompletedAt, lastIdleDrainActivityAt),
               liveBackgroundTasks: backgroundTasks.liveCount(),
+              ...(decision.reason === "deploy-staleness" &&
+              deployedBuildDiffersFromOwner.releaseDetail
+                ? { releases: deployedBuildDiffersFromOwner.releaseDetail() }
+                : {}),
             }),
           );
           incrementPerfCounter(

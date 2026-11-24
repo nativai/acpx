@@ -9,6 +9,7 @@ import {
   type BranchHandler,
   type PlacementDecision,
 } from "./placement-step.js";
+import { testRuntimeDir } from "./placement.js";
 import { isRoutedCall, refuseRoutedTwice } from "./routed-twice.js";
 
 // ⚠️ NO static import — not even a type-only one — of `routed-call.ts` / `broker-client.ts` here:
@@ -400,14 +401,12 @@ export async function failLikeAcpx(error: unknown, output: OutputMode): Promise<
 }
 
 /**
- * TEST SEAMS, honoured ONLY under `node --test` (`NODE_TEST_CONTEXT`, the precedent of
- * `ACPX_OS_COMPAT_LINK` / `ACPX_POD_TEST_HOME`): the release layout and the payload directory of a
- * sandbox. ⚠️ DO NOT read either unconditionally — on a box they would redirect what a pod is pinned
- * to and where a prompt's text is written. Held by test/pod-routed-branches.test.ts.
+ * TEST SEAMS, honoured ONLY under `node --test` (`NODE_TEST_CONTEXT`): the release layout (`testRuntimeDir`,
+ * in `placement.ts`, re-exported here) and the payload directory of a sandbox. ⚠️ DO NOT read
+ * either unconditionally — on a box they would redirect what a pod is pinned to and where a prompt's text
+ * is written. Held by test/pod-routed-branches.test.ts.
  */
-export function testRuntimeDir(env: NodeJS.ProcessEnv): string | undefined {
-  return env.NODE_TEST_CONTEXT ? env.ACPX_TEST_RUNTIME_DIR?.trim() || undefined : undefined;
-}
+export { testRuntimeDir } from "./placement.js";
 
 export function testPayloadDir(env: NodeJS.ProcessEnv): string | undefined {
   const home = env.NODE_TEST_CONTEXT ? env.ACPX_POD_TEST_HOME?.trim() : undefined;

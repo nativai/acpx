@@ -397,7 +397,12 @@ export async function readQueueOwnerProcessIdentity(
 export type LeaseFile =
   | { kind: "missing" }
   | { kind: "unparsable" }
-  | { kind: "ok"; record: QueueOwnerRecord };
+  /**
+   * `podMalformed`: the file carries a `pod` key that `parsePodRef` could not read (no uid, not an
+   * object…). `record.pod` is then absent, and a caller that reads "no pod" from it would fail OPEN
+   * (block A11, TE LOW-1) — `localProofScope` fails closed on it.
+   */
+  | { kind: "ok"; record: QueueOwnerRecord; podMalformed?: true };
 
 async function readLeaseFile(lockPath: string): Promise<LeaseFile> {
   let payload: string;
@@ -409,8 +414,15 @@ async function readLeaseFile(lockPath: string): Promise<LeaseFile> {
       : { kind: "unparsable" };
   }
   try {
-    const record = parseQueueOwnerRecord(JSON.parse(payload));
-    return record ? { kind: "ok", record } : { kind: "unparsable" };
+    const raw: unknown = JSON.parse(payload);
+    const record = parseQueueOwnerRecord(raw);
+    if (!record) {
+      return { kind: "unparsable" };
+    }
+    const podKey = (raw as Record<string, unknown>).pod;
+    return podKey !== undefined && record.pod === undefined
+      ? { kind: "ok", record, podMalformed: true }
+      : { kind: "ok", record };
   } catch {
     return { kind: "unparsable" };
   }

@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   createDeployStalenessProbe,
   decideIdleOwnerRelease,
+  formatOwnerReleaseLine,
   type DecideIdleOwnerReleaseInput,
 } from "../src/cli/session/queue-owner-runtime.js";
 import { makeWorld, withEnv, worldEnv, type PodWorld } from "./pod-owner-helpers.js";
@@ -213,4 +214,45 @@ test("A11 pod OFF: no deploy record and no entry point at all stays 'never recyc
   } finally {
     process.argv[1] = saved;
   }
+});
+
+// ---- the owner's release log line names the two releases (TE LOW-5; test-plan row NG-K14.3) ----
+
+test("A11 pod: the probe names the pinned and the current release while they differ, and the release line carries them", async () => {
+  const world = makeWorld("rs-line");
+  const runtime = makeRuntime(world, ["A", "B"], "A");
+  await withEnv(podEnv(world, runtime, "A"), async () => {
+    const probe = createDeployStalenessProbe();
+    assert.equal(probe.releaseDetail?.(), undefined, "not stale: nothing to name");
+    relink(runtime, "B");
+    const detail = probe.releaseDetail?.();
+    assert.deepEqual(detail, { pinned: "A", current: "B" });
+    const line = formatOwnerReleaseLine({
+      sessionId: "s1",
+      reason: "deploy-staleness",
+      at: BASE_NOW,
+      idleMs: 60_000,
+      liveBackgroundTasks: 0,
+      releases: detail,
+    });
+    assert.match(line, /\(reason=deploy-staleness\);/);
+    assert.match(line, / live_background_tasks=0 release=A current=B\n$/);
+  });
+});
+
+test("A11 pod OFF: no releaseDetail on a control host, and a release line without `releases` is byte-identical to today's", async () => {
+  const world = makeWorld("rs-line-off");
+  const runtime = makeRuntime(world, ["A"], "A");
+  await withEnv(controlEnv(world, runtime), async () => {
+    assert.equal(createDeployStalenessProbe().releaseDetail, undefined);
+  });
+  const line = formatOwnerReleaseLine({
+    sessionId: "s1",
+    reason: "deploy-staleness",
+    at: BASE_NOW,
+    idleMs: 60_000,
+    liveBackgroundTasks: 2,
+  });
+  assert.doesNotMatch(line, /release=|current=/);
+  assert.match(line, / live_background_tasks=2\n$/);
 });

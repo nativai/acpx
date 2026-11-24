@@ -4,6 +4,10 @@ import path from "node:path";
 import test from "node:test";
 import { tryAcquireQueueOwnerLease } from "../src/cli/queue/lease-store.js";
 import { queueLockFilePath } from "../src/cli/queue/paths.js";
+import {
+  reapTranscriptsAfterClose,
+  type CloseReapInput,
+} from "../src/cli/session/owner-exit-transcript-reap.js";
 import { runTranscriptsDedup } from "../src/cli/transcripts-dedup.js";
 import { transcriptCwdHash, transcriptJsonlPath } from "../src/config/subscription-transcript.js";
 import type { SubscriptionRegistry } from "../src/config/subscriptions.js";
@@ -28,6 +32,7 @@ import {
   ELEVEN_MIN,
   RECORD_ID,
   writeLeaseGarbage,
+  writeLeaseWithBadPod,
   writePodLease,
 } from "./pod-proof-helpers.js";
 import {
@@ -314,4 +319,100 @@ test("A11 archive liveness: a session whose lease names a pod is live (not-local
       },
     );
   });
+});
+
+test("A11 removal NEGATIVE (TE LOW-1): a lease whose `pod` is present but malformed → the copy is kept, switch on or off", async () => {
+  for (const podMode of [true, false]) {
+    const world = makeWorld(`rm-badpod-${podMode}`);
+    await writeLeaseWithBadPod(world, RECORD_ID, { name: "ag-x" });
+    await withTranscripts(world, async (fx) => {
+      const before = await sha256File(fx.leftBehind);
+      await withEnv(worldEnv(world, { podMode }), async () => {
+        const summary = await reap(world, fx);
+        assert.equal(summary.files.length, 0, `podMode=${podMode}`);
+        assert.equal(summary.keptReasons["not-local-proof"], 1);
+      });
+      assert.equal(await sha256File(fx.leftBehind), before);
+    });
+  }
+});
+
+// ---- the close's last step runs in the CLOSER (TE LOW-4): its proof sequence is scoped too ----
+
+function closeInput(recordId: string): CloseReapInput {
+  return {
+    sessionId: recordId,
+    closeStartedAt: Date.now(),
+    observation: { pid: 424242, identity: { kind: "timestamp" } as never, groupLeader: true },
+    ownerStop: { stopped: true, reason: "stopped" },
+    adapter: { pid: undefined, pidIdentity: undefined },
+    recordClosedState: { status: "read", closed: { present: true, value: true } },
+  };
+}
+
+test("A11 close step NEGATIVE: a session whose lease names a pod gets no proof sequence and no reap, switch on or off", async () => {
+  for (const podMode of [true, false]) {
+    const world = makeWorld(`cl-${podMode}`);
+    await writePodLease(world, RECORD_ID);
+    const calls: string[] = [];
+    const lines: string[] = [];
+    await withEnv(worldEnv(world, { podMode }), async () => {
+      const outcome = await reapTranscriptsAfterClose(closeInput(RECORD_ID), {
+        resolveRecord: async () => recordOf(RECORD_ID, sessionIdFor("proof-scope")),
+        hasLeftBehind: async () => true,
+        writeLog: async (_id, line) => {
+          lines.push(line);
+        },
+        isOwnerGone: () => {
+          calls.push("isOwnerGone");
+          return true;
+        },
+        listMembers: () => {
+          calls.push("listMembers");
+          return [];
+        },
+        isAdapterAlive: () => {
+          calls.push("isAdapterAlive");
+          return false;
+        },
+        reap: async () => {
+          calls.push("reap");
+          throw new Error("must not run");
+        },
+      });
+      assert.deepEqual(outcome, { ran: false, reason: "not-local-proof" }, `podMode=${podMode}`);
+    });
+    assert.deepEqual(calls, [], "no proof read from this host's table, no reap");
+    assert.match(lines.join(""), /skipped=not-local-proof/);
+  }
+});
+
+test("A11 close step control: no lease → the proof sequence runs as today", async () => {
+  const world = makeWorld("cl-ctl");
+  const calls: string[] = [];
+  await withEnv(worldEnv(world, { podMode: true }), async () => {
+    const outcome = await reapTranscriptsAfterClose(closeInput(RECORD_ID), {
+      resolveRecord: async () => recordOf(RECORD_ID, sessionIdFor("proof-scope")),
+      hasLeftBehind: async () => false,
+      writeLog: async () => {},
+      isOwnerGone: () => {
+        calls.push("isOwnerGone");
+        return true;
+      },
+      listMembers: () => [],
+      isAdapterAlive: () => false,
+      reap: async () => {
+        calls.push("reap");
+        return {
+          session: "s",
+          active: "a",
+          files: [],
+          keptReasons: {},
+          skipped: [],
+        };
+      },
+    });
+    assert.equal(outcome?.ran, true, JSON.stringify(outcome));
+  });
+  assert.deepEqual(calls, ["isOwnerGone", "reap"]);
 });
