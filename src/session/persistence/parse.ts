@@ -8,7 +8,7 @@ import type {
   SessionConversation,
   SubagentRef,
 } from "../../types.js";
-import { SESSION_RECORD_SCHEMA } from "../../types.js";
+import { SESSION_RECORD_SCHEMA, UNKNOWN_TOP_LEVEL_FIELDS } from "../../types.js";
 import { defaultSessionEventLog } from "../event-log.js";
 import { normalizeSessionOwnerOptions } from "../owner-options.js";
 import { normalizeRuntimeSessionId } from "../runtime-session-id.js";
@@ -1440,6 +1440,107 @@ function parseMessagesLogState(raw: unknown): SessionMessagesLogState | undefine
   };
 }
 
+/**
+ * A-65 / C3.5 (iv) — THE TOP-LEVEL KEYS THIS RELEASE READS. Any other top-level key of a record on disk is
+ * one a newer release added, and it travels with the record (`UNKNOWN_TOP_LEVEL_FIELDS`) so a write by this
+ * release puts it back, value unchanged. Nested objects (`acpx`, `template`, ...) are NOT covered: a field a
+ * newer release adds inside one carries no such promise (rule 2), and its absence reads as the old behaviour.
+ *
+ * ⚠️ THIS LIST IS THE ONE PLACE THAT DECIDES "UNKNOWN". A key the release reads or writes but that is missing
+ * here is carried as well; `serializeSessionRecordForDisk` writes its own value over a carried one, so that
+ * costs nothing. A key listed here that nothing reads is dropped on a rewrite like any other. Two committed
+ * checks keep it exact (`test/unknown-top-level-fields.test.ts`): every key the serializer emits is listed,
+ * and every key `parseSessionRecord` touches is listed (found by a recording proxy, not by reading the code).
+ */
+export const KNOWN_TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
+  "schema",
+  "acpx_record_id",
+  "acp_session_id",
+  "agent_session_id",
+  "agent_name",
+  "agent_command",
+  "cwd",
+  "created_at",
+  "last_used_at",
+  "last_seq",
+  "last_request_id",
+  "event_log",
+  "closed",
+  "closed_at",
+  "reopened_at",
+  "favorite",
+  "favorited_at",
+  "pid",
+  "pid_identity",
+  "agent_started_at",
+  "last_prompt_at",
+  "last_agent_exit_code",
+  "last_agent_exit_signal",
+  "last_agent_exit_at",
+  "last_agent_disconnect_reason",
+  "last_agent_unexpected_during_prompt",
+  "protocol_version",
+  "agent_capabilities",
+  "title",
+  "messages",
+  "messages_log",
+  "updated_at",
+  "cumulative_token_usage",
+  "request_token_usage",
+  "acpx",
+  "kind",
+  "parent_session_id",
+  "parent_session_url",
+  "parent_set_at",
+  "spawned_by_session_id",
+  "forked_from_session_id",
+  "forked_at_message_index",
+  "forked_at_message_index_requested",
+  "subagents",
+  "metadata",
+  "template",
+  "seat_id",
+  "holder_ordinal",
+  "holder_active",
+  "parent_seat_id",
+  "imported_from",
+]);
+
+/**
+ * Top-level keys this release KNOWS and has retired: never read, never written, never carried. A retired key
+ * is a decision, not a newer release's field — an old record that still holds one loses it on a rewrite, and
+ * a migration that strips it (`seats backfill`'s name leg) is not undone by the next write. `name` moved to
+ * the seat store (brick 15f4ad42, D-NAME-HARD-MIGRATION; `test/name-on-seat-only.test.ts`).
+ */
+export const RETIRED_TOP_LEVEL_KEYS: ReadonlySet<string> = new Set(["name"]);
+
+/**
+ * The top-level keys of a raw record that this release does not know, with their values untouched; `undefined`
+ * when there are none. Own enumerable keys only; stored with `defineProperty`, so a key named `__proto__`
+ * (which `JSON.parse` creates as an own property) is an ordinary entry, never a prototype assignment.
+ */
+export function unknownTopLevelFieldsOf(raw: unknown): Record<string, unknown> | undefined {
+  const record = asRecord(raw);
+  if (!record) {
+    return undefined;
+  }
+  let unknown: Record<string, unknown> | undefined;
+  // Values are read only for the unknown keys, so a recording proxy sees the known keys read by the parser alone.
+  for (const key of Object.keys(record)) {
+    if (KNOWN_TOP_LEVEL_KEYS.has(key) || RETIRED_TOP_LEVEL_KEYS.has(key)) {
+      continue;
+    }
+    unknown ??= {};
+    Object.defineProperty(unknown, key, {
+      value: record[key],
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  return unknown;
+}
+
 // eslint-disable-next-line complexity -- fork integration function; intentionally over budget, refactor would risk verified merge semantics
 export function parseSessionRecord(raw: unknown): SessionRecord | null {
   const record = asRecord(raw);
@@ -1583,6 +1684,8 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
     return null;
   }
 
+  const unknownFields = unknownTopLevelFieldsOf(record);
+
   const parsedRecord = rememberSessionModelBaseline(
     rememberSessionMetadataBaseline({
       schema: SESSION_RECORD_SCHEMA,
@@ -1634,6 +1737,7 @@ export function parseSessionRecord(raw: unknown): SessionRecord | null {
       importedFrom: recordMetadata.importedFrom,
       template: parseTemplateState(record.template),
       ...seatFields,
+      ...(unknownFields === undefined ? {} : { [UNKNOWN_TOP_LEVEL_FIELDS]: unknownFields }),
     }),
   );
   return rememberSessionDurableOptionsBaseline(parsedRecord);

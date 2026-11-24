@@ -7,6 +7,7 @@ import { acpAdapterKind } from "../acp/agent-command.js";
 import { effectiveCreateCwd } from "../config/session-root.js";
 import { AcpxOperationalError } from "../errors.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
+import { UNKNOWN_TOP_LEVEL_FIELDS } from "../types.js";
 import { defaultSessionEventLog, sessionEventActivePath } from "./event-log.js";
 import { setLoggedMessageCount } from "./messages-log-bookkeeping.js";
 import { messagesLogPath } from "./messages-log.js";
@@ -328,7 +329,7 @@ function buildImportedRecord(
     segment_count: parsed.history.length > 0 ? 1 : sourceRecord.eventLog.segment_count,
   };
 
-  return {
+  const imported: SessionRecord = {
     ...sourceRecord,
     acpxRecordId: options.newRecordId,
     agentName: sourceRecord.agentName ?? normalizeAgentIdentity(parsed.session.agent_name),
@@ -350,6 +351,10 @@ function buildImportedRecord(
       exportedAt: parsed.exported_at,
     },
   };
+  // A-65: an import is a NEW session. The top-level keys this release does not know belong to the exported
+  // session and are not carried into it, as a fork's are not (the sub-HoD's call on the contract's silence).
+  delete imported[UNKNOWN_TOP_LEVEL_FIELDS];
+  return imported;
 }
 
 async function restoreImportedMessagesLog(
