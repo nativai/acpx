@@ -11,7 +11,11 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import { writeTerminalCloseAfterOwnerStop } from "../src/cli/session/terminal-close.js";
+import {
+  writeTerminalCloseAfterOwnerStop,
+  type ClosedAdapter,
+} from "../src/cli/session/terminal-close.js";
+import { captureRecordPidIdentity } from "../src/process-identity.js";
 import { appendAtMeasuredEnd, messagesLogPath } from "../src/session/messages-log.js";
 import {
   resolveSessionRecord,
@@ -393,9 +397,25 @@ async function captureStderr(run: () => Promise<void>): Promise<string> {
   return captured;
 }
 
-/** An owner mid-turn: the user entry logged, a partial checkpointed inline. The close read it at this point. */
-async function ownerMidTurn(homeDir: string, id: string) {
+/** The close's adapter when the row has none to speak of: the stopped arm does not read it. */
+const NO_ADAPTER: ClosedAdapter = {
+  pid: undefined,
+  pidIdentity: undefined,
+  kill: { signalled: false, reason: "no-pid" },
+};
+
+/**
+ * An owner mid-turn: the user entry logged, a partial checkpointed inline. The close read it at this point.
+ * `withAdapter` gives the record an adapter pid and its identity (this process's own, so it is a real one)
+ * before the close's read — row 60.10 pins what the close does with them (TE L-a of brick abee5465).
+ */
+async function ownerMidTurn(homeDir: string, id: string, withAdapter = false) {
   const owner = newRecord(homeDir, id, [user("u1", "go")]);
+  if (withAdapter) {
+    owner.pid = process.pid;
+    owner.pidIdentity = captureRecordPidIdentity(process.pid);
+    assert.ok(owner.pidIdentity, "an identity can be read for this process");
+  }
   await writeSessionRecordAtBoundary(owner);
   const partial = agent("partial");
   owner.messages.push(partial);
@@ -408,7 +428,7 @@ for (const reason of ["survived", "successor", "identity-unverified"]) {
   test(`60.10: a close whose owner is not proven stopped (${reason}) writes the scalars only`, async () => {
     await withTempHome("acpx-a60-keep-", async (homeDir) => {
       const id = `keep-${reason}`;
-      const { owner, partial, closeSnapshot } = await ownerMidTurn(homeDir, id);
+      const { owner, partial, closeSnapshot } = await ownerMidTurn(homeDir, id, true);
       // The owner is still alive: it ends its turn after the close's read, and its reply goes to the log.
       setAgentText(partial, "the final reply");
       await writeSessionRecordAtBoundary(owner);
@@ -429,10 +449,16 @@ for (const reason of ["survived", "successor", "identity-unverified"]) {
       const logBefore = await fs.readFile(logPathOf(homeDir, id), "utf8");
 
       const stderr = await captureStderr(async () => {
-        const closed = await writeTerminalCloseAfterOwnerStop(closeSnapshot, {
-          stopped: false,
-          reason,
-        });
+        const closed = await writeTerminalCloseAfterOwnerStop(
+          closeSnapshot,
+          { stopped: false, reason },
+          // The close's own adapter, the one of its first read, and its kill ended it (A-64): proved gone.
+          {
+            pid: closeSnapshot.pid,
+            pidIdentity: closeSnapshot.pidIdentity,
+            kill: { signalled: true },
+          },
+        );
         assert.equal(closed.state.status, "read");
       });
 
@@ -442,9 +468,17 @@ for (const reason of ["survived", "successor", "identity-unverified"]) {
         title: string;
         cumulative_token_usage: unknown;
         acpx: unknown;
+        pid?: number;
+        pid_identity?: unknown;
       };
       assert.equal(after.closed, true, "the scalars landed");
       assert.ok(after.closed_at);
+      // TE L-a: the subject HAS an adapter pid and identity, and the close removed both — the pid outcome
+      // is pinned, not merely excluded from the comparison below.
+      assert.equal(before.pid, process.pid, "the subject carried its adapter pid");
+      assert.ok(before.pid_identity, "…and its identity");
+      assert.equal(after.pid, undefined, "the adapter the close proved gone has no pid left");
+      assert.equal(after.pid_identity, undefined, "…nor its identity");
       // Every field except the scalars is byte-for-byte what the live owner left (TE L1).
       const {
         closed: _c,
@@ -485,7 +519,11 @@ test("60.10 (control) / 60.1 (record level): an owner that stopped — the close
     setAgentText(partial, "the final reply");
     await writeSessionRecordAtBoundary(owner); // the owner's turn end, after the close's early read
 
-    await writeTerminalCloseAfterOwnerStop(closeSnapshot, { stopped: true, reason: "stopped" });
+    await writeTerminalCloseAfterOwnerStop(
+      closeSnapshot,
+      { stopped: true, reason: "stopped" },
+      NO_ADAPTER,
+    );
 
     assert.deepEqual(
       await logTexts(homeDir, id),
@@ -505,7 +543,11 @@ test("60.5 (record level): the text the owner streamed between the close's start
     setAgentText(partial, "partial, and what it streamed after the close started");
     await writeSessionRecord(owner);
 
-    await writeTerminalCloseAfterOwnerStop(closeSnapshot, { stopped: true, reason: "stopped" });
+    await writeTerminalCloseAfterOwnerStop(
+      closeSnapshot,
+      { stopped: true, reason: "stopped" },
+      NO_ADAPTER,
+    );
 
     assert.deepEqual(await logTexts(homeDir, id), [
       "go",

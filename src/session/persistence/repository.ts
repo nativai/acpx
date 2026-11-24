@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { mapWithConcurrency } from "../../async-control.js";
 import {
   AcpxOperationalError,
@@ -1426,21 +1427,41 @@ async function writeSessionRecordInternal(
 }
 
 /**
- * C3.5 (ii), A-60 (TE L1) — THE CLOSE OF A SESSION WHOSE OWNER IS NOT PROVEN STOPPED WRITES THE SCALARS
- * ONLY: `closed`, `closed_at` and the adapter pid cleared (with its identity, which travels with it).
- * The record is read FRESH under the record's lock and every other field goes back as it stands on disk:
- * the live owner's later title, token usage, event log, acpx state, messages pointer and inline entries
- * are not the close's to write. The early copy the close read at its start is never serialized here —
- * writing it back (even with the merged fields kept) reverted whatever the owner wrote after that read.
+ * The adapter a close dealt with and PROVED GONE (A-64): the pid and identity of the close's first read,
+ * handed over only when its kill ended it (`signalled`) or found it gone (`gone`, `foreign`).
+ */
+export type CloseProvedGoneAdapter = {
+  pid: number;
+  pidIdentity: SessionRecord["pidIdentity"];
+};
+
+/**
+ * C3.5 (ii), A-60 (TE L1), A-64 — THE CLOSE OF A SESSION WHOSE OWNER IS NOT PROVEN STOPPED WRITES THE
+ * SCALARS ONLY: `closed`, `closed_at` and, for an adapter the close proved gone, its pid cleared (with its
+ * identity, which travels with it). The record is read FRESH under the record's lock and every other field
+ * goes back as it stands on disk: the live owner's later title, token usage, event log, acpx state,
+ * messages pointer and inline entries are not the close's to write. The early copy the close read at its
+ * start is never serialized here — writing it back (even with the merged fields kept) reverted whatever
+ * the owner wrote after that read.
+ *
+ * COMPARE-AND-CLEAR (A-64): the pid and `pid_identity` are cleared only when `provedGone` is given AND the
+ * record read here still names that adapter, the same pid with the same identity. A successor's adapter
+ * (the close never signals it) or any pid the close could not prove gone keeps both. The caller passes
+ * `provedGone` only for a kill outcome of `signalled`, `gone` or `foreign` — never `no-identity`,
+ * `unverified` or `no-pid`.
  * Returns the written record, hydrated, for the caller's result.
  *
  * ⚠️ DO NOT ROUTE THIS THROUGH `writeSessionRecordInternal` WITH AN EARLY COPY. It serializes every field
  * of the copy it is given; only the merged ones survive. Row 60.10 (test/writer-rules-a60.test.ts) goes
  * red on a title, a usage counter or an acpx field the owner changed after the close's read.
+ * ⚠️ DO NOT "TIDY" THE COMPARE AWAY INTO `delete raw.pid`. That is the defect A-64 closed: the record's
+ * pid on disk is the successor's adapter, and clearing it blinds the archive's `pid-alive` signal,
+ * reconnect, export and transcript dedup while that adapter runs. Rows 64.1 and 64.2 go red on it.
  */
 export async function writeCloseScalarsOnFreshRecord(
   acpxRecordId: string,
   closedAt: string,
+  provedGone?: CloseProvedGoneAdapter,
 ): Promise<SessionRecord> {
   const sessionDir = sessionBaseDir();
   const file = sessionFilePath(acpxRecordId);
@@ -1448,10 +1469,20 @@ export async function writeCloseScalarsOnFreshRecord(
   await retryOnLostRecordLock(file, () =>
     withRecordFileLock(file, async (lock) => {
       const raw = JSON.parse(await fs.readFile(file, "utf8")) as DiskRecord;
+      const current = parseSessionRecord(raw);
+      if (!current) {
+        throw new Error(`session record ${acpxRecordId} is not readable; nothing was closed`);
+      }
       raw.closed = true;
       raw.closed_at = closedAt;
-      delete raw.pid;
-      delete raw.pid_identity;
+      if (
+        provedGone !== undefined &&
+        current.pid === provedGone.pid &&
+        isDeepStrictEqual(current.pidIdentity, provedGone.pidIdentity)
+      ) {
+        delete raw.pid;
+        delete raw.pid_identity;
+      }
       const parsed = parseSessionRecord(raw);
       if (!parsed) {
         throw new Error(`session record ${acpxRecordId} is not readable; nothing was closed`);

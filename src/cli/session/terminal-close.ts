@@ -9,6 +9,7 @@ import {
 } from "../../session/persistence.js";
 import type { MessageWriteMode, RawRecordFieldState } from "../../session/persistence.js";
 import type { SessionRecord } from "../../types.js";
+import type { SessionCloseAdapterKill } from "./session-control.js";
 
 // The two steps of a terminal close that every close arm shares: the CLI's non-self close and
 // self-close (`session-control.ts`), and the queue owner's own close at the end of a turn
@@ -54,7 +55,27 @@ export async function writeTerminalCloseRecord(
 }
 
 /**
- * C3.5 (ii), A-60 — THE TERMINAL WRITE OF A CLOSE OF ANOTHER SESSION, after the stop. `closeSession`
+ * The adapter the close dealt with, as the close's FIRST read named it and as its kill came out (A-64).
+ * `pid`/`pidIdentity` are the early copy's; `kill` is `killRecordedAdapter`'s outcome for exactly that
+ * adapter. Both are threaded in, never re-derived from the record this write reads.
+ */
+export type ClosedAdapter = {
+  pid: SessionRecord["pid"];
+  pidIdentity: SessionRecord["pidIdentity"];
+  kill: SessionCloseAdapterKill;
+};
+
+/**
+ * A-64: the kill proved the adapter gone when it ended it (`signalled`: TERM, then KILL after the grace,
+ * on a verified identity) or found it gone (`gone`, `foreign`: the pid no longer names that process).
+ * `no-pid`, `no-identity` and `unverified` prove nothing; `self-close` never reaches this arm.
+ */
+export function adapterProvedGone(kill: SessionCloseAdapterKill): boolean {
+  return kill.signalled || kill.reason === "gone" || kill.reason === "foreign";
+}
+
+/**
+ * C3.5 (ii), A-60, A-64 — THE TERMINAL WRITE OF A CLOSE OF ANOTHER SESSION, after the stop. `closeSession`
  * reads the record at its start, to know which owner generation to drain and stop; it then waits for
  * the turn, `close_session` and the stop, and the owner writes its turn's output meanwhile. Writing
  * that early read back is what replaced a mid-turn session's final reply with the partial the close
@@ -62,19 +83,24 @@ export async function writeTerminalCloseRecord(
  *
  * - Owner STOPPED (`stopped: true` — `stopped`, `already-gone`, `released`, `no-owner`): the close is the
  *   only writer left. It reads the record AGAIN, so the owner's last output is in it, and its write may
- *   log the dead owner's last inline partial, at the log's true end (`adopt`).
+ *   log the dead owner's last inline partial, at the log's true end (`adopt`). It clears the adapter pid.
  * - Owner NOT proven stopped (`successor`, `survived`, `identity-unverified`, …): a live writer may
- *   still append. The close writes the scalars only — `closed`, `closed_at`, the adapter pid cleared —
- *   onto a record read fresh under the lock (`writeCloseScalarsOnFreshRecord`): every other field, the
- *   watermark and the inline entries stay as the owner left them, and stderr says why.
+ *   still append. The close writes the scalars only — `closed`, `closed_at` and, for an adapter the close
+ *   proved gone, its pid cleared — onto a record read fresh under the lock
+ *   (`writeCloseScalarsOnFreshRecord`): every other field, the watermark and the inline entries stay as
+ *   the owner left them, and stderr says why. The pid is compare-and-cleared there: only when the fresh
+ *   record still names `adapter` (the close's first read) and its kill proved it gone. A successor's
+ *   adapter, which the close never signals, keeps its pid and identity.
  *
  * ⚠️ DO NOT "SIMPLIFY" THIS BACK TO `writeTerminalCloseRecord(record)` WITH THE EARLY COPY. That copy is
  * the stale one. Rows 60.1, 60.5 and 60.10 (test/writer-rules-a60*.test.ts) go red if you do.
+ * ⚠️ NOR TO AN UNCONDITIONAL PID CLEAR in the not-stopped arm: rows 64.1 and 64.2 go red.
  * A self-close and a deferred close are the owner's own writes and keep `writeTerminalCloseRecord`.
  */
 export async function writeTerminalCloseAfterOwnerStop(
   record: SessionRecord,
   ownerStop: { stopped: boolean; reason?: string },
+  adapter: ClosedAdapter,
 ): Promise<{ record: SessionRecord; state: SessionCloseRecordState }> {
   if (!ownerStop.stopped) {
     process.stderr.write(
@@ -82,7 +108,11 @@ export async function writeTerminalCloseAfterOwnerStop(
         `wrote the record's scalars only — its messages log and inline entries are left to the owner\n`,
     );
     // The scalars only, onto a record read fresh under the lock: the early copy is never written (TE L1).
-    const closed = await writeCloseScalarsOnFreshRecord(record.acpxRecordId, isoNow());
+    const provedGone =
+      adapter.pid !== undefined && adapterProvedGone(adapter.kill)
+        ? { pid: adapter.pid, pidIdentity: adapter.pidIdentity }
+        : undefined;
+    const closed = await writeCloseScalarsOnFreshRecord(record.acpxRecordId, isoNow(), provedGone);
     return { record: closed, state: await readBackRecordClosedState(record.acpxRecordId) };
   }
   const afterStop = await resolveSessionRecord(record.acpxRecordId);
