@@ -1,7 +1,6 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { isAcpJsonRpcMessage } from "../acp/jsonrpc.js";
 import { AcpxOperationalError } from "../errors.js";
 import { isRecordedPidPossiblyAlive } from "../process-identity.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
@@ -12,6 +11,7 @@ import {
   sessionEventLockPath,
   sessionEventSegmentPath,
 } from "./event-log.js";
+import { parseStreamPayload } from "./events.js";
 import { getLoggedMessageCount } from "./messages-log-bookkeeping.js";
 import { messagesLogFileName, messagesLogPath } from "./messages-log.js";
 import { isArchivedRecord, resolveSessionRecord, sessionBaseDir } from "./persistence.js";
@@ -106,7 +106,7 @@ async function readHistoryFile(filePath: string): Promise<AcpJsonRpcMessage[]> {
     }
     throw error;
   });
-  return parseHistoryPayload(payload);
+  return parseStreamPayload(payload, filePath);
 }
 
 /**
@@ -119,22 +119,7 @@ async function readArchivedHistoryFile(hotPath: string): Promise<AcpJsonRpcMessa
     sessionArchiveDirFor(sessionBaseDir()),
     path.basename(hotPath),
   );
-  return parseHistoryPayload(read ? read.bytes.toString("utf8") : "");
-}
-
-function parseHistoryPayload(payload: string): AcpJsonRpcMessage[] {
-  const history: AcpJsonRpcMessage[] = [];
-  for (const line of payload.split("\n").filter((entry) => entry.trim().length > 0)) {
-    try {
-      const parsed: unknown = JSON.parse(line);
-      if (isAcpJsonRpcMessage(parsed)) {
-        history.push(parsed);
-      }
-    } catch {
-      // Match event listing resilience: tolerate truncated NDJSON writes.
-    }
-  }
-  return history;
+  return parseStreamPayload(read ? read.bytes.toString("utf8") : "", hotPath);
 }
 
 /**

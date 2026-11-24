@@ -1,5 +1,4 @@
-import { appendFileSync } from "node:fs";
-import { appendFile, stat } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import net from "node:net";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { normalizeOutputError } from "../../acp/error-normalization.js";
@@ -14,7 +13,7 @@ import {
   type DeliveryStopReason,
 } from "../../session/delivery-events.js";
 import type { DepthProjection } from "../../session/depth-projection.js";
-import { sessionEventActivePath } from "../../session/event-log.js";
+import { appendStreamText, appendStreamTextSync } from "../../session/events.js";
 import type {
   AcpClientOptions,
   NonInteractivePermissionPolicy,
@@ -236,7 +235,7 @@ function writeQueueMessage(socket: net.Socket, message: QueueOwnerMessage): void
 }
 
 // C4 (G3): append a delivery lifecycle event straight to the session stream, the
-// same fire-and-forget direct-appendFile pattern as the `acpx/received` marker.
+// same fire-and-forget direct append (`appendStreamText`, a line-boundary append that takes no lock) as the `acpx/received` marker.
 // Used for the `queued` visibility event and the owner-exit `QUEUE_OWNER_SHUTDOWN`
 // terminal — points where no SessionEventWriter is held (the owner may be dying).
 // A task with no messageId has no delivery lifecycle to update, so it is skipped.
@@ -250,7 +249,7 @@ export function appendDeliveryStreamEvent(
   if (!line) {
     return;
   }
-  void appendFile(sessionEventActivePath(sessionId), line, "utf8").catch(() => {
+  void appendStreamText(sessionId, line).catch(() => {
     // Best effort — the owner may be tearing down; never throw from a marker.
   });
 }
@@ -281,7 +280,7 @@ export function appendDeliveryStreamEventSync(
     return;
   }
   try {
-    appendFileSync(sessionEventActivePath(sessionId), line, "utf8");
+    appendStreamTextSync(sessionId, line);
   } catch {
     // Best effort — the owner is tearing down; never throw from a marker.
   }
@@ -322,7 +321,7 @@ export function appendRefusedStreamEventSync(
     },
   })}\n`;
   try {
-    appendFileSync(sessionEventActivePath(sessionId), line, "utf8");
+    appendStreamTextSync(sessionId, line);
   } catch {
     // Best effort — never throw from a marker.
   }
@@ -1462,7 +1461,7 @@ export class SessionQueueOwner {
           })}\n`,
       )
       .join("");
-    void appendFile(sessionEventActivePath(this.sessionId), markers, "utf8").catch(() => {});
+    void appendStreamText(this.sessionId, markers).catch(() => {});
 
     if (!request.waitForCompletion) {
       socket.end();
