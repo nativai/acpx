@@ -78,6 +78,7 @@ import {
   type SessionsTemplateFlags,
   type StatusFlags,
 } from "./flags.js";
+import { resolveGlobalFlags } from "./flags.js";
 import { registerGovernorCommand } from "./governor-command.js";
 import { registerModelsCommand } from "./models-command.js";
 import { registerPeopleCommand } from "./people-command.js";
@@ -259,6 +260,27 @@ export function registerSessionsCommand(
     )
     .action(async function (this: Command, flags: { dryRun?: boolean; backupDir?: string }) {
       await handleSessionsRepairAccountSeam(flags, this, config);
+    });
+
+  // A-71 (brick 70921280): the one-time removal of the legacy queue leases acpx cannot parse, before a
+  // box's control pod first runs A-69's code with the pod's identity. DRY RUN BY DEFAULT (the census);
+  // `--apply` removes. Its code is loaded by a dynamic import, so the bundle's static graph gains nothing.
+  sessionsCommand
+    .command("unparsable-leases")
+    .description(
+      "Census of queue leases whose body cannot be read, is not JSON, or is JSON that is not an " +
+        "object (A-71). Removes and writes NOTHING unless --apply: then each is removed only if " +
+        "older than the control pod's start by more than 10 min and unchanged across two reads " +
+        "15 s apart, under the lease guard, with a durable record",
+    )
+    .option("--apply", "Remove the leases that meet every condition (default: census only)")
+    .option(
+      "--records-file <path>",
+      "With --apply: where the removal records go (default <root>/.acpx/maintenance/unparsable-lease-removal-<UTC>-<pid>.ndjson)",
+    )
+    .action(async function (this: Command, flags: { apply?: boolean; recordsFile?: string }) {
+      const { handleUnparsableLeases } = await import("./lease-removal-command.js");
+      await handleUnparsableLeases(flags, resolveGlobalFlags(this, config).format);
     });
 
   // ⚠️ THIS VERB REQUIRES AN EXPLICIT INTENT AND REFUSES SILENCE (exit 2). It is the

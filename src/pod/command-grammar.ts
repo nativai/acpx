@@ -107,6 +107,7 @@ export const COMMAND_GRAMMAR: Readonly<Record<string, GrammarNode>> = {
       "--wave",
     ],
   },
+  "sessions unparsable-leases": { valueFlags: ["--records-file"] },
   "sessions restore": { valueFlags: [] },
   "sessions template": { valueFlags: ["--auto-prompt", "--owner", "--slug"] },
   "sessions new": {

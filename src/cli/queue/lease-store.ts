@@ -444,6 +444,14 @@ async function readLeaseFile(lockPath: string): Promise<LeaseFile> {
       ? { kind: "missing" }
       : UNPARSABLE_BYTES;
   }
+  return classifyLeasePayload(payload);
+}
+
+/**
+ * The pure half of `readLeaseFile`: what a lease BODY is, whoever read it (A-69, A-72). Exported so the
+ * A-71 removal verb classifies the very bytes it fingerprints with the store's own rule, not a second one.
+ */
+export function classifyLeasePayload(payload: string): LeaseFile {
   let json: unknown;
   let record: QueueOwnerRecord | null;
   try {

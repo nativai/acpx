@@ -183,6 +183,14 @@ export const COMMAND_TABLE: Readonly<Record<string, CommandEntry>> = {
       "(retention sweep, --compress, --decompress --all, --status/--verify/--repair/--reindex, " +
       "--thaw, --cat) is maintenance — control_pod_only in an agent pod",
   },
+  "sessions unparsable-leases": {
+    class: "control-store",
+    reason: "maintenance on the box's shared lease store (A-71's one-time removal)",
+    controlPodOnly: true,
+    judgment:
+      "it removes lease files of every session on the box and reads the CONTROL pod's start: " +
+      "control_pod_only in an agent pod; on a workbench or any other host it removes nothing",
+  },
   "sessions restore": { class: "control-store", reason: "the archive" },
   "sessions template": {
     class: "control-store",

@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { withIdentityFileLock } from "../../session/persistence/identity-file-lock.js";
-import { queueLockFilePath } from "./paths.js";
+import { queueBaseDir, queueKeyForSession, queueLockFilePath } from "./paths.js";
 
 /**
  * The per-lease mutation guard (brick ae547131 §7.1). Every lease mutation — acquire, refresh,
@@ -39,6 +39,11 @@ export function queueLeaseGuardPath(sessionId: string): string {
   return `${queueLockFilePath(sessionId)}.guard`;
 }
 
+/** The guard of the lease whose file stem is `key` — `queueLeaseGuardPath(id)` for the id whose key it is. */
+export function queueLeaseGuardPathForKey(key: string): string {
+  return path.join(queueBaseDir(), `${key}.lock.guard`);
+}
+
 // In-process serialization per guard path, so two mutations of one owner never contend on the file.
 const localTails = new Map<string, Promise<void>>();
 
@@ -46,7 +51,20 @@ export async function withQueueLeaseMutation<T>(
   sessionId: string,
   mutate: () => Promise<T>,
 ): Promise<T> {
-  const guardPath = queueLeaseGuardPath(sessionId);
+  return await withQueueLeaseMutationAtKey(queueKeyForSession(sessionId), mutate);
+}
+
+/**
+ * The same guard, named by the lease's KEY (its file stem under `queues/`). A lease that no session
+ * record names has no session id to hash (A-71's removal verb), yet it is the same `<key>.lock.guard` that
+ * acquire takes for a session whose id hashes to it. `withQueueLeaseMutation` is this with the key
+ * derived, so the two cannot drift.
+ */
+export async function withQueueLeaseMutationAtKey<T>(
+  key: string,
+  mutate: () => Promise<T>,
+): Promise<T> {
+  const guardPath = queueLeaseGuardPathForKey(key);
   await fs.mkdir(path.dirname(guardPath), { recursive: true, mode: 0o700 });
   const previous = localTails.get(guardPath) ?? Promise.resolve();
   let releaseLocal!: () => void;
