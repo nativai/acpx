@@ -335,11 +335,7 @@ test("69.6 a REAL set of each of the six record-edit keys, identity + switch OFF
           );
         }
       } catch (error) {
-        failures.push(
-          `${label}: ${String((error as Error).message)
-            .split("\n")[0]
-            .slice(0, 160)}`,
-        );
+        failures.push(`${label}: ${(error as Error).message.split("\n")[0].slice(0, 160)}`);
       }
     }
     assert.deepEqual(failures, [], "every held body refuses on every key");
