@@ -68,6 +68,13 @@ export type BranchDeps = {
     key: string,
     uid: string,
   ) => Promise<{ kind: "deleted" | "refused" | "unavailable" }>;
+  /**
+   * ba830305 (A-32, C3.1): the control pod's judgement of the session's PREDECESSOR lease, made before the call is
+   * routed into a pod. A replacement pod's owner can never prove its predecessor dead (an agent pod never asks
+   * the API server, C3.3 A-4), so a lease that names a pod proven `gone` on a stale heartbeat is reaped HERE, the one
+   * place that may prove it. Never throws, never signals; absent ⇒ nothing is judged.
+   */
+  reapPredecessorLease?: (sessionId: string) => Promise<void>;
   releases: () => ResolveReleasesResult;
   /** The target session's URL for the broker's Job annotation (C4 `sessionUrl`); may read the box's base URL. */
   sessionUrl?: (sessionId: string) => string | undefined;
@@ -314,8 +321,7 @@ async function dispatchRouted(
   if (plan === "prompt_required") {
     return await usageError(PROMPT_REQUIRED_MESSAGE, ready.classification.output, deps);
   }
-  const { agentPodKey } = await import("./routed-call.js");
-  const key = agentPodKey(ready.record.acpxRecordId);
+  const key = await podKeyAfterPredecessorJudgement(ready.record.acpxRecordId, deps);
   try {
     const result = await deps.run(runOptions(ready, plan, deps, routedClass, key));
     return result.kind === "no_pod" ? "proceed" : result.exitCode;
@@ -325,6 +331,19 @@ async function dispatchRouted(
     }
     return await deps.fail(error, ready.classification.output);
   }
+}
+
+/**
+ * The session's pod key, after the control pod has judged the session's predecessor lease (ba830305, A-32 + C3.1,
+ * row 32.5): "the control pod's next judgement" is THIS one, made before the call goes into a pod.
+ */
+async function podKeyAfterPredecessorJudgement(
+  sessionId: string,
+  deps: BranchDeps,
+): Promise<string> {
+  const { agentPodKey } = await import("./routed-call.js");
+  await deps.reapPredecessorLease?.(sessionId);
+  return agentPodKey(sessionId);
 }
 
 const DELETES_UNREACHABLE_POD = new Set(["sessions close", "sessions recover"]);
@@ -413,6 +432,26 @@ export function testPayloadDir(env: NodeJS.ProcessEnv): string | undefined {
   return home ? `${home}/.acpx/routed` : undefined;
 }
 
+/**
+ * The live `reapPredecessorLease` (ba830305). Only a lease that NAMES A POD is judged here, and only by the
+ * existing reaper `readQueueOwnerStatus`: on the control pod a stale heartbeat plus the death proof `gone` removes
+ * exactly the judged generation (and records the pod's end on the session); a fresh heartbeat, an `exists` or
+ * `unknown` proof, an A-68 lease whose `pod` key names no pod and an A-69 lease acpx cannot parse are all left
+ * alone by that judge. A failure here never fails the call — the pod can still do what it can.
+ */
+async function reapPredecessorLease(sessionId: string): Promise<void> {
+  try {
+    const leases = await import("../cli/queue/lease-store.js");
+    const owner = await leases.readQueueOwnerRecord(sessionId);
+    if (owner?.pod === undefined) {
+      return;
+    }
+    await leases.readQueueOwnerStatus(sessionId);
+  } catch {
+    // best effort: a lease that cannot be judged now is judged by the next call
+  }
+}
+
 async function liveDeps(): Promise<BranchDeps> {
   const authEnv = await import("../acp/auth-env.js");
   const [
@@ -470,6 +509,7 @@ async function liveDeps(): Promise<BranchDeps> {
         ? await broker.deleteAgent(key, { uid, origin })
         : { kind: "unavailable" as const };
     },
+    reapPredecessorLease: reapPredecessorLease,
     releases: () => routed.resolveReleases(testRuntimeDir(process.env)),
     payloadDir: testPayloadDir(process.env),
     sessionUrl: (id) => {
