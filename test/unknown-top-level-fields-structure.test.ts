@@ -178,3 +178,15 @@ test("65.5 (control): the parsed copy DOES carry the key a newer release later r
     assert.ok(Object.hasOwn(copy[UNKNOWN_TOP_LEVEL_FIELDS] ?? {}, "te_unknown_future_field"));
   });
 });
+
+test("a RETIRED key (`name`, moved to the seat store) is neither carried by parse nor written back", () => {
+  const onDisk = { ...fullOnDiskRecord(), name: "an older acpx wrote this", te_new_key: 1 };
+  const parsed = parseSessionRecord(onDisk);
+  assert.deepEqual(parsed?.[UNKNOWN_TOP_LEVEL_FIELDS], { te_new_key: 1 }, "name is not carried");
+  assert.ok(parsed);
+  const persisted = serializeSessionRecordForDisk(parsed);
+  assert.equal(Object.hasOwn(persisted, "name"), false, "a rewrite drops it, as before A-65");
+  // Even a carrier somebody filled by hand cannot write a retired key.
+  parsed[UNKNOWN_TOP_LEVEL_FIELDS] = { name: "x", te_new_key: 1 };
+  assert.equal(Object.hasOwn(serializeSessionRecordForDisk(parsed), "name"), false);
+});

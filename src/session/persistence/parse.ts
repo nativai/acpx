@@ -1507,6 +1507,14 @@ export const KNOWN_TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Top-level keys this release KNOWS and has retired: never read, never written, never carried. A retired key
+ * is a decision, not a newer release's field — an old record that still holds one loses it on a rewrite, and
+ * a migration that strips it (`seats backfill`'s name leg) is not undone by the next write. `name` moved to
+ * the seat store (brick 15f4ad42, D-NAME-HARD-MIGRATION; `test/name-on-seat-only.test.ts`).
+ */
+export const RETIRED_TOP_LEVEL_KEYS: ReadonlySet<string> = new Set(["name"]);
+
+/**
  * The top-level keys of a raw record that this release does not know, with their values untouched; `undefined`
  * when there are none. Own enumerable keys only; stored with `defineProperty`, so a key named `__proto__`
  * (which `JSON.parse` creates as an own property) is an ordinary entry, never a prototype assignment.
@@ -1519,7 +1527,7 @@ export function unknownTopLevelFieldsOf(raw: unknown): Record<string, unknown> |
   let unknown: Record<string, unknown> | undefined;
   // Values are read only for the unknown keys, so a recording proxy sees the known keys read by the parser alone.
   for (const key of Object.keys(record)) {
-    if (KNOWN_TOP_LEVEL_KEYS.has(key)) {
+    if (KNOWN_TOP_LEVEL_KEYS.has(key) || RETIRED_TOP_LEVEL_KEYS.has(key)) {
       continue;
     }
     unknown ??= {};

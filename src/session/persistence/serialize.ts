@@ -3,7 +3,7 @@ import type { SessionMessage, SessionRecord, SubagentRef } from "../../types.js"
 import { SESSION_RECORD_SCHEMA, UNKNOWN_TOP_LEVEL_FIELDS } from "../../types.js";
 import { getLoggedMessageCount } from "../messages-log-bookkeeping.js";
 import { normalizeRuntimeSessionId } from "../runtime-session-id.js";
-import { KNOWN_TOP_LEVEL_KEYS } from "./parse.js";
+import { KNOWN_TOP_LEVEL_KEYS, RETIRED_TOP_LEVEL_KEYS } from "./parse.js";
 import { seatFieldsToPersistedRecord } from "./seat-fields.js";
 
 function serializeSubagentRef(ref: SubagentRef): Record<string, unknown> {
@@ -162,7 +162,11 @@ function withUnknownTopLevelFields(
     return persisted;
   }
   for (const [key, value] of Object.entries(carried)) {
-    if (KNOWN_TOP_LEVEL_KEYS.has(key) || Object.hasOwn(persisted, key)) {
+    if (
+      KNOWN_TOP_LEVEL_KEYS.has(key) ||
+      RETIRED_TOP_LEVEL_KEYS.has(key) ||
+      Object.hasOwn(persisted, key)
+    ) {
       continue;
     }
     Object.defineProperty(persisted, key, {
