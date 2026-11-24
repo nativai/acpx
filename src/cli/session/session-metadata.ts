@@ -1,10 +1,19 @@
 import { InvalidArgumentError } from "commander";
+import { metadataKeyRuleViolation } from "../../persisted-key-policy.js";
 import {
   ATRIUM_OS_METADATA_PREFIX,
   PRINCIPAL_METADATA_PREFIX,
 } from "../../session/persistence/principal.js";
 import type { SessionRecord } from "../../types.js";
 import { isBrickUuid } from "./brick-link.js";
+
+/** Refuses a `metadata` key that breaks the rule, as a usage error (exit 2) naming the key and the rule. */
+export function assertMetadataKeyRule(key: string): void {
+  const violation = metadataKeyRuleViolation(key);
+  if (violation !== undefined) {
+    throw new InvalidArgumentError(violation);
+  }
+}
 
 /**
  * Validate a value for the self-apply `sessions set-metadata <key> <value>`
@@ -13,6 +22,9 @@ import { isBrickUuid } from "./brick-link.js";
  * semantics, `brick`, must additionally be a full uuid.
  */
 export function validateSessionMetadataValue(key: string, value: string): string {
+  // A-65 correction (C3.5 (iv)): a key acpx would write itself is spelled `^[a-z][a-z0-9_]*$`, refused here
+  // before any write — the write path no longer judges a `metadata` key it merely carries.
+  assertMetadataKeyRule(key);
   // brick b0968426 (PERSON-CONTRACT C8.3, G1): the recorded principal is written ONCE, at creation, and no verb
   // rewrites it — this is the only verb that writes a free-form key, so it is refused here, before any write.
   if (key.startsWith(PRINCIPAL_METADATA_PREFIX)) {

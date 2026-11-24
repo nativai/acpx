@@ -114,6 +114,25 @@ function collectKeyViolation(
   }
 }
 
+/**
+ * The rule for a `metadata` key acpx ENTERS onto a record (A-65 correction, C3.5 (iv) "`metadata` keys"):
+ * `^[a-z][a-z0-9_]*$`, the same spelling every older release's key policy accepts. It is checked where a
+ * key enters — `sessions set-metadata`, `--metadata`, acpx's own fixed keys — and never on the way to disk,
+ * because `serializeSessionRecordForDisk` does not judge `metadata` (a key carried unchanged, such as a
+ * hand edit's, is never a reason to refuse a write, and is never renamed).
+ *
+ * ⚠️ DO NOT "TIGHTEN" THE WRITE BACK INTO A WALK OVER `metadata`. It looks like the safer twin of this check
+ * and it is the bug: one carried non-snake_case key made every writer refuse the record (the A-65 TE's F-1:
+ * a turn, every `set-*` verb, both close arms and export exited 1). The two halves land in ONE change, and
+ * `test/metadata-key-rule.test.ts` carries the negative case for each.
+ */
+export function metadataKeyRuleViolation(key: string): string | undefined {
+  if (SNAKE_CASE_KEY.test(key)) {
+    return undefined;
+  }
+  return `metadata key ${JSON.stringify(key)} is not allowed: a metadata key is lower-case ASCII letters, digits and underscores, starting with a letter (^[a-z][a-z0-9_]*$)`;
+}
+
 export function findPersistedKeyPolicyViolations(value: unknown): string[] {
   const violations: string[] = [];
   collectViolations(value, [], violations);
