@@ -20,6 +20,7 @@ import {
 import { rescueStrandedPiTranscriptForResume } from "../../acp/harness-config-dir.js";
 import { RequestedModelUnsupportedError } from "../../acp/model-support.js";
 import { InterruptedError, TimeoutError, withTimeout } from "../../async-control.js";
+import { forkContextEndWarning } from "../../cli/session/fork-at-log-index.js";
 import { findProfile, loadProfileRegistry, transcriptAnchorDir } from "../../config/profiles.js";
 import {
   ensureTranscriptAtConfigDir,
@@ -912,6 +913,20 @@ async function forkForSleepingPlan(
       cut: fork.cut,
       timeoutMs: params.timeoutMs,
     });
+    // brick 4bf088a7 Q5: a cut whose agent context ends short of the record's cut (a Pi cut after a
+    // mid-turn steer) is SAID, as the live copy says it. The create could not know it (nothing is
+    // pinned for Pi), and the wake has no retry, so the record carries it from here.
+    const end =
+      "contextEndLogIndex" in cutFork.forked ? cutFork.forked.contextEndLogIndex : undefined;
+    if (end !== undefined) {
+      params.record.metadata = {
+        ...params.record.metadata,
+        fork_context_end_log_index: String(end),
+      };
+      process.stderr.write(
+        forkContextEndWarning(end, fork.cut.log_index ?? fork.cut.message_index),
+      );
+    }
     return { ...cutFork, inherited: undefined };
   }
   return await forkTemplateForSleepingSession({

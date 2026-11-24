@@ -42,6 +42,15 @@ const FORK_WINDOW_MESSAGES = 200;
 export const FORK_CUT_MOVED = "FORK_CUT_MOVED";
 
 /**
+ * The one stderr line for a copy whose agent context ends before its record cut (brick 0dc53ac9) —
+ * printed by `sessions copy` and by the pod-mode wake (brick 4bf088a7 Q5), which both persist the
+ * same `metadata.fork_context_end_log_index`.
+ */
+export function forkContextEndWarning(end: number | string, cutLogIndex: number): string {
+  return `[acpx] warning: the copy's agent context ends at log index ${end}, before the record cut at ${cutLogIndex} (metadata fork_context_end_log_index=${end})\n`;
+}
+
+/**
  * `--expect-entry` named an entry that is not at `n-1` any more. The message IS
  * the compact JSON line the conception specifies on stderr, so a caller can match
  * `"code":"FORK_CUT_MOVED"` in either stream; `detailCode` carries the same code

@@ -1859,12 +1859,15 @@ function assertCopyableSource(source: SessionRecord): void {
  * re-derives the rule.
  */
 /** brick 0dc53ac9: one stderr line when the copy's agent context ends before its record cut. */
-function warnIfContextEndsEarly(created: SessionRecord, forkAtLogIndex: number | undefined): void {
+async function warnIfContextEndsEarly(
+  created: SessionRecord,
+  forkAtLogIndex: number | undefined,
+): Promise<void> {
   const end = created.metadata?.fork_context_end_log_index;
   if (forkAtLogIndex !== undefined && typeof end === "string") {
-    process.stderr.write(
-      `[acpx] warning: the copy's agent context ends at log index ${end}, before the record cut at ${forkAtLogIndex} (metadata fork_context_end_log_index=${end})\n`,
-    );
+    // Lazy, as every other use of this module in the CLI (it is not part of the cli.js static graph).
+    const { forkContextEndWarning } = await import("./session/fork-at-log-index.js");
+    process.stderr.write(forkContextEndWarning(end, forkAtLogIndex));
   }
 }
 
@@ -5106,7 +5109,9 @@ async function runSessionCopy(
     }),
   );
   await maybeStampBrickLink(created);
-  warnIfContextEndsEarly(created, forkAtLogIndex);
+  // A Pi `--at-index` on a full-window source is resolved as `--at-log-index` (brick 4bf088a7), so its
+  // context shortfall is reported the same way.
+  await warnIfContextEndsEarly(created, forkAtLogIndex ?? flags.atIndex);
   const sourceType = agentTypeLabel(source.agentCommand, config);
   printCreatedSessionBanner(created, sourceType, globalFlags.format, globalFlags.jsonStrict);
   // The result line is the CALLER's: `sessions new --from-template` prints it only after the

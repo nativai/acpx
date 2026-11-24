@@ -1239,25 +1239,39 @@ export const HARNESS_FACTS: Record<HarnessId, HarnessCapabilityFacts> = {
     },
     credential: { tier: "box-provider", providers: ["openrouter"] }, // box key via pi's per-session auth.json command reference, never env (1dc24c1c)
     // B5: the fork implements `session/fork` on pi's JSONL session tree (the SDK
-    // already dispatched it; upstream simply had no handler), and honours
-    // `_meta.acpx.forkAtMessageIndex` by truncating the copied JSONL after the
-    // nth message record. Proven two-way on real turns: the source recalls both
-    // planted facts, the fork truncated at index 2 recalls the first and answers
-    // UNKNOWN for the second — from a SEPARATE adapter process that resolved it
-    // by `session/load`, so it is the file that carries the history.
-    // ⚠️ THE INDEX MAPPING IS VERIFIED ON BOTH SIDES, because "exact" is a claim
-    // about two counts agreeing. acpx's side: `ensureAgentMessage`
-    // (src/session/conversation-model.ts:358-369) REUSES the last entry when it is
-    // already an Agent entry, so a whole turn — text, tool uses, tool results —
-    // accumulates into ONE Agent entry until a User entry intervenes.
+    // already dispatched it; upstream simply had no handler). brick 4bf088a7 REPLACED
+    // the mechanism behind this cell, and the cell's wording with it:
     //
-    // `exact` is claimed on a MEASURED basis, not on the fork returning success:
-    // the fork counts the index in CLIENT messages (a `user` record, or an
-    // `assistant` record that closes a turn), because pi's JSONL writes THREE
-    // records for one tool-using turn — assistant(toolCall), toolResult,
-    // assistant — where the client counts one. Counting records instead would
-    // land three records early on a session with one tool call and still report
-    // success.
+    // BEFORE (the claim this cell carried from af431c6): "acpx sends
+    // `_meta.acpx.forkAtMessageIndex = n` and pi-acp truncates after the nth
+    // client-visible record". That was FALSE on steered sessions — pi files a
+    // mid-turn steer's user record after the running step's tool records, an
+    // auto-retry adds an error record, a failed delivery never reaches pi, a batch is
+    // one pi record — so the two counts disagree and the fork silently held content
+    // the copy does not inherit: 654 of 1,385 measured cuts, 18 of 117 real records.
+    //
+    // NOW: acpx PROVES the cut against pi's own JSONL (`src/acp/pi-fork-anchor.ts`,
+    // DESIGN §2) and sends the pi ENTRY ID, `_meta.acpx.forkAfterEntryId`; pi-acp keeps
+    // the file up to and including that entry. `exact` therefore has Claude's meaning
+    // (see the `claude` block's `fork` cell): the fork ends exactly at the cut, OR is
+    // refused with a named code (`FORK_CUT_UNRESOLVED`, `FORK_ENTRY_UNSUPPORTED` for an
+    // adapter that cannot take an entry id), OR ends SHORT with
+    // `fork_context_end_log_index` reported — and is never LATER than the cut. Measured
+    // on the prototype over every cut of all 117 real records: 1,337 exact, 42 short,
+    // 6 refused, 0 later.
+    //
+    // ⚠️ THE CITATION BELOW IS STILL `PI_FORK_BUILD` (af431c6) ON PURPOSE. This file's
+    // rule forbids citing a commit nobody measured; the entry-id path is proven on
+    // fixtures and on the real records, but its adapter build has had no real
+    // round-trip yet. Move `fork.atIndex` to a `PI_FORK_ENTRY_BUILD` (commit + entry
+    // sha256) ONLY after the test-engineer's round trip on that deployed build
+    // (brick 4bf088a7, TEST-PLAN §4), and update
+    // `test/harness-measurement-citations.test.ts` in the same change. Carrier test:
+    // `test/pi-fork-anchor-wire.test.ts` → "the capability cell".
+    //
+    // ⚠️ DO NOT "FIX" THE CELL TO `ignored`/`unsupported` WHILE THE BUILD IS IN
+    // FLIGHT: `assertForkAtIndexHonoured` would then refuse every Pi cut and stop
+    // by-the-ways for the duration, and neither value describes this defect.
     fork: { supported: true, atIndex: "exact" },
     // ⚠️ FLIPPED 2026-09-09 (brick 7daa105e) — was `false` per I2 R3 (measured
     // 2026-09-03 against a pi-acp that queued concurrent prompts). The nativai
@@ -1384,9 +1398,10 @@ export class ForkAtIndexUnsupportedError extends Error {
  * - `'unsupported'` — **no harness today.** ⚠️ Pi occupied this branch while
  *   acpx launched UPSTREAM pi-acp, which advertises no fork capability at all
  *   (the string `fork` occurs zero times in 0.0.26 and 0.0.33, I2 R4). The
- *   nativai fork implements `session/fork` on pi's JSONL session tree and
- *   honours `_meta.acpx.forkAtMessageIndex`, so pi is `'exact'` now (brick
- *   ef5999ca). **The branch is kept because the descriptor value still exists and
+ *   nativai fork implements `session/fork` on pi's JSONL session tree, so pi is
+ *   `'exact'` now (brick ef5999ca) — and since brick 4bf088a7 it is cut by a PROVED
+ *   entry id (`_meta.acpx.forkAfterEntryId`, `src/acp/pi-fork-anchor.ts`), no longer
+ *   by `forkAtMessageIndex`, whose count disagreed with acpx's on steered sessions. **The branch is kept because the descriptor value still exists and
  *   a harness can re-enter it** — including pi itself on a box that has not yet
  *   installed the fork, which is why the message names the adapter rather than
  *   the harness.

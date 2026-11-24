@@ -205,6 +205,12 @@ import {
 } from "./openrouter-routing.js";
 import type { ShimHandle } from "./openrouter-shim.js";
 import {
+  ForkEntryUnsupportedError,
+  PiForkEntryRefusedError,
+  piForkEntryRefusalCode,
+  proveLogIndexPiCut,
+} from "./pi-fork-anchor.js";
+import {
   formatSessionControlAcpSummary,
   maybeWrapSessionControlError,
 } from "./session-control-errors.js";
@@ -298,6 +304,8 @@ type ForkRequestContext = {
   claudeResumeSessionAt?: string;
   /** `--at-log-index`: where the agent's context provably ends, when short of the cut. */
   contextEndLogIndex?: number;
+  /** A Pi cut: the entry the proof chose; the fork's echo must equal it (brick 4bf088a7). */
+  piForkAfterEntryId?: string;
 };
 
 /** The durable byway-fork provenance uuid a messages_log entry carries, if any. */
@@ -315,7 +323,8 @@ function forkEntryClaudeUuid(entry: SessionMessage | undefined): string | undefi
 }
 
 /**
- * Resolve the fork `_meta` for the non-Claude-ACP path (A5). When the entry being
+ * Resolve the fork `_meta` for the non-Claude-ACP path (A5) — CODEX ONLY since brick 4bf088a7: a Pi
+ * cut is proved to an entry id (`buildPiForkRequestContext`) and NEVER reaches this index path. When the entry being
  * forked at (`messages[atIndex-1]`) carries durable provenance, send it via the
  * EXISTING direct-uuid path (`claudeCode.options.resumeSessionAt`) — immune to
  * mid-turn steers and any messages_log/transcript divergence. Otherwise fall
@@ -675,6 +684,8 @@ export type SessionForkResult = SessionLoadResult & {
    * the cut. The record persists it as `metadata.fork_context_end_log_index`.
    */
   contextEndLogIndex?: number;
+  /** brick 4bf088a7: pi-acp's `_meta.piAcp.forkedAfterEntryId` echo — the entry the fork actually kept up to. */
+  forkedAfterEntryId?: string;
 };
 
 type ReconnectedSessionResponse = LoadSessionResponse | ResumeSessionResponse;
@@ -701,12 +712,15 @@ function toCreateSessionResult(response: NewSessionResponse): SessionCreateResul
 }
 
 function toForkSessionResult(response: ForkSessionResponse): SessionForkResult {
+  const echoed = (response._meta as { piAcp?: { forkedAfterEntryId?: unknown } } | undefined | null)
+    ?.piAcp?.forkedAfterEntryId;
   return {
     sessionId: response.sessionId,
     agentSessionId: extractRuntimeSessionId(response._meta),
     configOptions: response.configOptions ?? undefined,
     models: response.models ?? undefined,
     modes: response.modes ?? undefined,
+    ...(typeof echoed === "string" ? { forkedAfterEntryId: echoed } : {}),
   };
 }
 
@@ -1409,6 +1423,20 @@ export class AcpClient {
 
   supportsForkSession(): boolean {
     return Boolean(this.initResult?.agentCapabilities?.sessionCapabilities?.fork);
+  }
+
+  /**
+   * brick 4bf088a7 (DESIGN §4): whether this pi-acp can fork at an entry id. The adapter VERSION cannot
+   * say (fork and upstream both report 0.0.33), so the capability is the integer contract version it
+   * advertises at `sessionCapabilities.fork._meta.piAcp.forkAfterEntryId`.
+   */
+  supportsPiForkAfterEntry(): boolean {
+    const fork = this.initResult?.agentCapabilities?.sessionCapabilities?.fork as
+      | { _meta?: { piAcp?: { forkAfterEntryId?: unknown } } | null }
+      | null
+      | undefined;
+    const version = fork?._meta?.piAcp?.forkAfterEntryId;
+    return typeof version === "number" && version >= 1;
   }
 
   supportsCloseSession(): boolean {
@@ -2757,7 +2785,16 @@ export class AcpClient {
               mcpServers: this.options.mcpServers ?? [],
               ...(requestMeta ? { _meta: requestMeta } : {}),
             }),
-          );
+          ).catch((error: unknown) => {
+            const code = forkContext.piForkAfterEntryId ? piForkEntryRefusalCode(error) : undefined;
+            if (code !== undefined) {
+              throw new PiForkEntryRefusedError(
+                code,
+                error instanceof Error ? error.message : String(error),
+              );
+            }
+            throw error;
+          });
 
           await this.waitForSessionUpdateDrain(
             options.replayIdleMs ?? REPLAY_IDLE_MS,
@@ -2771,6 +2808,16 @@ export class AcpClient {
           throw new Error("session/fork returned no response");
         }
         const result = toForkSessionResult(response);
+        // ⚠️ AN ADAPTER THAT ADVERTISES BUT IGNORES THE ID would silently full-copy: the echo is the
+        // proof it cut where it was told. No cleanup: the orphan pi file is the adapter's to explain.
+        if (
+          forkContext.piForkAfterEntryId !== undefined &&
+          result.forkedAfterEntryId !== forkContext.piForkAfterEntryId
+        ) {
+          throw new ForkEntryUnsupportedError(
+            `the adapter did not echo the entry it was asked to fork after (asked ${forkContext.piForkAfterEntryId}, echoed ${result.forkedAfterEntryId ?? "nothing"})`,
+          );
+        }
         if (forkContext.contextEndLogIndex !== undefined) {
           result.contextEndLogIndex = forkContext.contextEndLogIndex;
         }
@@ -3060,13 +3107,77 @@ export class AcpClient {
       };
     }
 
-    // Non-Claude-ACP path: prefer durable provenance, fall
+    if (isPiAcpCommand(command, args)) {
+      return await this.buildPiForkRequestContext(
+        sourceAcpSessionId,
+        cwd,
+        atIndex,
+        sourceMessages,
+        logIndexHistory,
+      );
+    }
+
+    // Non-Claude-ACP path (codex): prefer durable provenance, fall
     // back to the legacy messages_log index for pre-provenance sessions (A5).
     return {
       claudeFork: false,
       sourceCwd: cwd,
       meta: resolveIndexForkMeta(sourceMessages, atIndex, logIndexHistory !== undefined),
     };
+  }
+
+  /**
+   * brick 4bf088a7: a Pi cut is PROVED to a pi entry id and sent as `forkAfterEntryId`, never as an
+   * index. ⚠️ `resolveIndexForkMeta` IS UNREACHABLE FOR PI ON PURPOSE: pi-acp counts the index in its
+   * own "client-visible" records, which a mid-turn steer, an auto-retry or a failed delivery skews, so
+   * the fork silently held later content (654 of 1,385 real cuts). An adapter that cannot take an
+   * entry id is REFUSED (`FORK_ENTRY_UNSUPPORTED`), not used by position.
+   * Test: `test/pi-fork-anchor-wire.test.ts`.
+   */
+  private async buildPiForkRequestContext(
+    sourceAcpSessionId: string,
+    sourceCwd: string,
+    atIndex: number,
+    sourceMessages: readonly SessionMessage[] | undefined,
+    logIndexHistory: LogIndexHistory | undefined,
+  ): Promise<ForkRequestContext> {
+    if (!logIndexHistory) {
+      // The CLI resolves every Pi cut to an absolute position first (`resolveForkSourceContext`).
+      throw new Error(
+        `Cannot copy a pi session at a bare message index ${atIndex}: use --at-log-index, which carries the history the cut is proved against`,
+      );
+    }
+    this.assertPiForkAfterEntrySupported();
+    const cut = await proveLogIndexPiCut({
+      cwd: sourceCwd,
+      acpSessionId: sourceAcpSessionId,
+      env: this.agentSpawnEnv ?? process.env,
+      cut: {
+        atLogIndex: atIndex,
+        window: sourceMessages ?? [],
+        before: logIndexHistory.before,
+        after: logIndexHistory.after,
+      },
+    });
+    return {
+      claudeFork: false,
+      sourceCwd,
+      meta: { acpx: { forkAfterEntryId: cut.entryId } },
+      piForkAfterEntryId: cut.entryId,
+      contextEndLogIndex: cut.contextEndLogIndex,
+    };
+  }
+
+  /** DESIGN §4 pre-flight: an adapter that does not advertise fork-after-entry is refused BEFORE `session/fork`. */
+  private assertPiForkAfterEntrySupported(): void {
+    if (this.supportsPiForkAfterEntry()) {
+      return;
+    }
+    const info = this.initResult?.agentInfo;
+    throw new ForkEntryUnsupportedError(
+      `this pi-acp cannot fork at an entry (it does not advertise fork-after-entry); a whole copy still works; deploy the nativai pi-acp with brick 4bf088a7. ` +
+        `adapter: ${info?.name ?? "unknown"}@${info?.version ?? "unknown"}, command: ${this.options.agentCommand}`,
+    );
   }
 
   private applySessionUpdateSuppression(enabled: boolean): SessionUpdateSuppressionState {

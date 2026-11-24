@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
+import { InvalidArgumentError } from "commander";
 import { acpAdapterKind } from "../../acp/agent-command.js";
 import { isOsCompatLinkInPlace } from "../../acp/atrium-os.js";
 import { ForkCutUnresolvedError } from "../../acp/claude-fork-anchor.js";
@@ -15,6 +16,11 @@ import {
 import { formatErrorMessage } from "../../acp/error-normalization.js";
 import { isAcpResourceNotFoundError } from "../../acp/error-shapes.js";
 import { assertForkAtIndexHonoured } from "../../acp/harness-capabilities.js";
+import {
+  ForkEntryUnsupportedError,
+  PiForkEntryRefusedError,
+  proveLogIndexPiCut,
+} from "../../acp/pi-fork-anchor.js";
 import { readTransientAdvertisement } from "../../acp/transient-advertisement.js";
 import { withInterrupt, withTimeout } from "../../async-control.js";
 import { effectiveCreateCwd } from "../../config/session-root.js";
@@ -1279,6 +1285,21 @@ async function loadForkSourceRecord(options: SessionCreateOptions): Promise<Sess
   return sourceRecord;
 }
 
+/** Legacy `--at-index k` on Pi: the same cut as `--at-log-index k` when the window is the full history, else refused. */
+async function piAtIndexContext(
+  sourceRecord: SessionRecord,
+  options: SessionCreateOptions,
+  requested: number,
+): Promise<ForkSourceContext> {
+  const full = await readFullSourceHistory(sourceRecord);
+  if (full.baseIndex !== 0 || full.messages.length !== sourceRecord.messages.length) {
+    throw new InvalidArgumentError(
+      `--at-index counts in the source's last ${sourceRecord.messages.length} entries, but pi counts from the start of its file and this source has ${full.baseIndex + full.messages.length} entries: use --at-log-index`,
+    );
+  }
+  return await resolveLogIndexForkSourceContext(sourceRecord, options, requested);
+}
+
 async function resolveForkSourceContext(options: SessionCreateOptions): Promise<ForkSourceContext> {
   const sourceRecord = await loadForkSourceRecord(options);
 
@@ -1311,6 +1332,14 @@ async function resolveForkSourceContext(options: SessionCreateOptions): Promise<
   const requested = options.forkAtMessageIndex;
   if (requested < 0 || requested > sourceRecord.messages.length) {
     throw new Error(`--at-index out of range (0-${sourceRecord.messages.length})`);
+  }
+
+  // brick 4bf088a7 (DESIGN §2.5): pi-acp counts an index from the START of pi's file, never from a
+  // 200-entry window, so a window-relative `--at-index k` is silently wrong for Pi once the source
+  // outgrows its window. When the window IS the full history the two coincide and the cut is
+  // resolved exactly as `--at-log-index k`; otherwise it is refused.
+  if (acpAdapterKind(options.agentCommand) === "pi") {
+    return await piAtIndexContext(sourceRecord, options, requested);
   }
 
   // ⚠️ THE RECORD CARRIES THE EFFECTIVE INDEX, NOT THE REQUESTED ONE, and this
@@ -1393,11 +1422,14 @@ async function resolveForkModelApplication(
 }
 
 // A coded copy refusal keeps its own shape (detailCode + stderr JSON line), so a caller can route
-// it without parsing a wrapped message: FORK_CUT_UNRESOLVED, and the session-root refusals
+// it without parsing a wrapped message: FORK_CUT_UNRESOLVED, the Pi entry refusals (FORK_ENTRY_UNSUPPORTED and
+// pi-acp's own FORK_ENTRY_* codes, brick 4bf088a7), and the session-root refusals
 // SOURCE_TRANSCRIPT_MISSING / SESSION_CWD_MISSING (brick 45917618 §5.5, §5.6).
 function keepsOwnCopyRefusalShape(error: unknown): boolean {
   return (
     error instanceof ForkCutUnresolvedError ||
+    error instanceof ForkEntryUnsupportedError ||
+    error instanceof PiForkEntryRefusedError ||
     error instanceof SourceTranscriptMissingError ||
     error instanceof SessionCwdMissingError
   );
@@ -1759,6 +1791,7 @@ async function createCutRecordOnly(inputOptions: SessionCreateOptions): Promise<
     inputOptions,
     await resolveForkSourceContext(inputOptions),
   );
+  await refuseUnprovablePiCut(inputOptions, source, context);
   const pinned =
     context.forkAtMessageIndex === 0 ? undefined : await pinForkCut(inputOptions, context);
   const record = await createSleepingSession(
@@ -1794,6 +1827,36 @@ async function createCutRecordOnly(inputOptions: SessionCreateOptions): Promise<
     },
   );
   return record;
+}
+
+/**
+ * brick 4bf088a7 Q4 — a Pi cut the proof cannot place is refused HERE, before the record exists, as an
+ * unprovable Claude cut is (`claudeCutAnchor` inside `pinForkCut`). REFUSAL ONLY: nothing the proof
+ * found is stored — the wake re-proves against the file as it is then, and pins stay phase 2 (DESIGN
+ * §7). Without this a Pi cut would be refused at the wake, where there is no retry.
+ */
+async function refuseUnprovablePiCut(
+  options: SessionCreateOptions,
+  source: SessionRecord,
+  context: ForkSourceContext,
+): Promise<void> {
+  const { logWindow } = context;
+  if (acpAdapterKind(options.agentCommand) !== "pi" || context.forkAtMessageIndex === 0) {
+    return; // a cut at 0 is a fresh session: nothing to prove
+  }
+  if (!logWindow) {
+    throw new Error("a pi cut is proved against the source's full history (--at-log-index)");
+  }
+  await proveLogIndexPiCut({
+    cwd: source.cwd,
+    acpSessionId: source.acpSessionId,
+    cut: {
+      atLogIndex: logWindow.logIndex,
+      window: logWindow.messages,
+      before: logWindow.history.before,
+      after: logWindow.history.after,
+    },
+  });
 }
 
 /**
