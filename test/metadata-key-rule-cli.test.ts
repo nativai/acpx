@@ -484,4 +484,8 @@ test(
         "=v",
       ]);
       assert.notEqual(created.code, 0, `${created.stdout}${created.stderr}`);
-      assert.equal(sha256
+      assert.equal(sha256(recordFile(homeDir, id)), before, "the record is byte-unchanged");
+      assert.deepEqual(recordFiles(homeDir), filesBefore, "no session was created");
+    });
+  },
+);
