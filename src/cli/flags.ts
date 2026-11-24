@@ -909,21 +909,42 @@ export function addPromptInputOption(command: Command): Command {
  * ⚠️ Read the format ONLY through here: a second reader of `opts.format` is a second precedence.
  */
 export function resolveRequestedFormat(command: Command, config: ResolvedAcpxConfig): OutputFormat {
+  const layers: FormatWords[] = [];
   for (let node: Command | null = command; node; node = node.parent) {
     // (a caller that hands this a bare object with only `optsWithGlobals` — `test/cli-flags.test.ts` does — has no tree)
     const own =
       asRecord(
         (typeof node.opts === "function" ? node.opts() : node.optsWithGlobals()) as unknown,
       ) ?? {};
-    if (own.json === true) {
+    layers.push({ json: own.json === true, format: stringOption(own.format) });
+  }
+  return pickRequestedFormat(layers, config.format);
+}
+
+/** What one command says about the output format: its own `--json` and/or `--format <word>`. */
+export type FormatWords = { json?: boolean; format?: string };
+
+/**
+ * The precedence itself — the ONLY place that orders the words (brick 3bc340d5 O1, shared with the error path by
+ * brick ec04ee32): `layers` run nearest command first (verb, group, program); the first layer that states a format
+ * wins, and within ONE layer `--json` is `--format json` and beats a `--format` beside it; nothing stated → the
+ * config's `format`, then text. `resolveRequestedFormat` feeds it the parsed command tree; the argv scan behind the
+ * error document (`detectRequestedOutputFormat`, cli-core) feeds it the words it can read BEFORE commander has
+ * parsed — so a `<verb> --json` that errors answers in the same format the same call would have run in.
+ */
+export function pickRequestedFormat(
+  layers: Iterable<FormatWords>,
+  configFormat: string | undefined,
+): OutputFormat {
+  for (const layer of layers) {
+    if (layer.json === true) {
       return "json";
     }
-    const word = stringOption(own.format);
-    if (word !== undefined) {
-      return parseOutputFormat(word);
+    if (layer.format !== undefined) {
+      return parseOutputFormat(layer.format);
     }
   }
-  return parseOutputFormat(config.format ?? "text");
+  return parseOutputFormat(configFormat ?? "text");
 }
 
 export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig): GlobalFlags {

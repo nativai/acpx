@@ -16,9 +16,11 @@ import { registerAgentCommand, registerDefaultCommands } from "./cli/command-reg
 import { loadResolvedConfig, suppressProjectConfigWarningForArgv } from "./cli/config.js";
 import {
   addGlobalFlags,
+  type FormatWords,
   parseAllowedTools,
   parseMaxTurns,
   parseTtlSeconds,
+  pickRequestedFormat,
   resolveOutputPolicy,
 } from "./cli/flags.js";
 import { createOutputFormatter, getTextErrorRemediationHints } from "./cli/output/output.js";
@@ -295,27 +297,79 @@ function detectInitialCwd(argv: string[]): string {
   return process.cwd();
 }
 
-function detectRequestedOutputFormat(argv: string[], fallback: OutputFormat): OutputFormat {
-  let detectedFormat = fallback;
+/**
+ * The format the ERROR document (and the usage-error routing) will use — read from argv alone, because it must be
+ * known before commander has parsed anything. It walks argv down the registered command tree (program, group, verb:
+ * each token that names a subcommand moves one layer down) collecting each layer's own words, then asks
+ * `pickRequestedFormat` — the same precedence the verbs run with (brick ec04ee32): the nearest layer that speaks
+ * wins, `--json` beats a `--format` beside it. `--json` counts wherever it stands, so a `<verb> --json` that errors
+ * is a JSON document exactly as `--format json` is, and a `--json` on a verb that has none (an unknown option) is
+ * one too. `--json-strict` still means json outright. Exported for the parity test.
+ */
+export function detectRequestedOutputFormat(
+  program: Command,
+  argv: string[],
+  fallback: OutputFormat,
+): OutputFormat {
+  let node = program;
+  let words: FormatWords = {};
+  const layers: FormatWords[] = [words]; // program first, the nearest command last
 
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
-
     if (token === "--") {
       break;
     }
-
     if (isJsonStrictToken(token)) {
       return "json";
     }
-
-    const format = readFormatFlagValue(token, argv[index + 1]);
-    if (format) {
-      detectedFormat = format;
+    if (token.startsWith("-") && token !== "-") {
+      index += readFlagWords(node, words, token, argv[index + 1]);
+      continue;
+    }
+    const child = node.commands.find(
+      (command) => command.name() === token || command.aliases().includes(token),
+    );
+    if (child) {
+      node = child;
+      words = {};
+      layers.push(words);
     }
   }
 
-  return detectedFormat;
+  return pickRequestedFormat(layers.toReversed(), fallback);
+}
+
+/** Record a flag's `--json` / `--format` word into its layer; the number of following tokens it swallowed. */
+function readFlagWords(
+  node: Command,
+  words: FormatWords,
+  token: string,
+  next: string | undefined,
+): number {
+  if (token === "--json") {
+    words.json = true;
+    return 0;
+  }
+  const format = readFormatFlagValue(token, next);
+  if (format) {
+    words.format = format;
+  }
+  return takesNextTokenAsValue(node, token, next) ? 1 : 0; // that value is not a command token
+}
+
+/** Does `token` (a flag) swallow `next` as its value? From the node's own option, else the program's known value flags. */
+function takesNextTokenAsValue(node: Command, token: string, next: string | undefined): boolean {
+  if (token.includes("=")) {
+    return false;
+  }
+  const option = node.options.find(
+    (candidate) => candidate.long === token || candidate.short === token,
+  );
+  if (option) {
+    return option.required || (option.optional && next !== undefined && !next.startsWith("-"));
+  }
+  return token === "--agent" || AGENT_SCAN_VALUE_FLAGS.has(token);
 }
 
 function readFormatFlagValue(
@@ -637,12 +691,6 @@ export async function main(argv: string[] = process.argv): Promise<void> {
   // --json-strict promises machine-clean stderr: silence the session-index
   // full-rebuild notice (same suppression class as session banners).
   setSessionIndexRebuildLogSuppressed(requestedJsonStrict);
-  const requestedOutputFormat = detectRequestedOutputFormat(rawArgs, config.format);
-  const requestedOutputPolicy = {
-    ...resolveOutputPolicy(requestedOutputFormat, requestedJsonStrict),
-    suppressReads: rawArgs.some((token) => token === "--suppress-reads"),
-  };
-
   const program = createProgram(requestedJsonStrict);
 
   addGlobalFlags(program);
@@ -661,6 +709,13 @@ export async function main(argv: string[] = process.argv): Promise<void> {
       await handlePrompt(undefined, promptParts, {}, command, config);
     },
   });
+
+  // read off the REGISTERED tree: which token is a group or a verb is the tree's to say (brick ec04ee32)
+  const requestedOutputFormat = detectRequestedOutputFormat(program, rawArgs, config.format);
+  const requestedOutputPolicy = {
+    ...resolveOutputPolicy(requestedOutputFormat, requestedJsonStrict),
+    suppressReads: rawArgs.some((token) => token === "--suppress-reads"),
+  };
 
   program.exitOverride((error) => {
     throw error;
