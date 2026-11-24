@@ -340,7 +340,7 @@ function functionBody(text: string, header: RegExp): string | undefined {
   return undefined;
 }
 
-const VERDICT_CALL = /\bstreamWriteVerdict(Sync)?\s*\(/;
+const VERDICT_CALL = /\b(streamWriteVerdict(Sync)?|divertedBeforeWrite)\s*\(/;
 const GUARD_MODULE = "pod/stream-write-guard.ts";
 /** Files that name the owner log and append, each reviewed: why none of them is a foreign write. */
 const OWNER_LOG_APPEND_REVIEWED: Record<string, string> = {
@@ -367,6 +367,11 @@ export function guardViolations(files: Map<string, string>): string[] {
         `session/events.ts: the entry ${name} writes without asking streamWriteVerdict`,
       );
     }
+  }
+  // The async entry asks through `divertedBeforeWrite`; that helper must itself ask the proof.
+  const asker = functionBody(events, /function\s+divertedBeforeWrite\s*\(/);
+  if (asker === undefined || !/\bstreamWriteVerdict\s*\(/.test(asker)) {
+    violations.push("session/events.ts: divertedBeforeWrite does not ask streamWriteVerdict");
   }
   for (const [file, raw] of files) {
     const text = code(raw);

@@ -13,6 +13,7 @@ import { incrementPerfCounter, measurePerf } from "../perf-metrics.js";
 import {
   divertStreamMessages,
   divertStreamText,
+  isControlRoleHost,
   REPROVE_AFTER_MS,
   streamWriteVerdict,
   streamWriteVerdictSync,
@@ -740,7 +741,11 @@ export class SessionEventWriter {
   /** Absent in sidecar mode (A-80): that writer takes no stream lock and writes no stream byte. */
   private readonly lock: LockHandle | undefined;
   /** A-80: set when C3.3 did not prove the session's pod gone — every frame goes to `<id>.markers.ndjson`. */
-  private readonly sidecarWhy: ForeignWriteWhy | undefined;
+  private sidecarWhy: ForeignWriteWhy | undefined;
+  /** A-80: this writer runs on a control-role host, so each write needs a proof (an agent pod's writer never does). */
+  private readonly proofNeeded: boolean;
+  /** When the last proof was taken: it serves for REPROVE_AFTER_MS (S3's bound). */
+  private provenAt: number;
   private readonly maxSegmentBytes: number;
   private readonly maxSegments: number;
   private activePath: string;
@@ -757,11 +762,14 @@ export class SessionEventWriter {
       activePath: string;
       activeSizeBytes: number;
       segmentCount: number;
+      provenAt: number;
     },
   ) {
     this.record = record;
     this.lock = lock;
     this.sidecarWhy = sidecarWhy;
+    this.proofNeeded = isControlRoleHost();
+    this.provenAt = state.provenAt;
     this.maxSegmentBytes = options.maxSegmentBytes;
     this.maxSegments = options.maxSegments;
     this.activePath = state.activePath;
@@ -776,8 +784,9 @@ export class SessionEventWriter {
     // A-80: BEFORE the stream lock (a pod's owner holds it; waiting 20 s for it and then writing is the bug).
     // Not proven gone ⇒ a sidecar-mode writer: no lock, no closed tail, no flush into the stream.
     const verdict = await streamWriteVerdict(record.acpxRecordId);
+    const provenAt = Date.now();
     if (verdict.write === "sidecar") {
-      return SessionEventWriter.sidecarMode(record, verdict.why, options);
+      return SessionEventWriter.sidecarMode(record, verdict.why, options, provenAt);
     }
     const lock = await acquireEventsLock(record.acpxRecordId);
     // ⚠️ AT ACQUISITION, under the lock just taken (the previous holder is released or proven dead, so no
@@ -811,6 +820,7 @@ export class SessionEventWriter {
         activePath,
         activeSizeBytes,
         segmentCount,
+        provenAt,
       },
     );
   }
@@ -819,6 +829,7 @@ export class SessionEventWriter {
     record: SessionRecord,
     why: ForeignWriteWhy,
     options: SessionEventWriterOptions,
+    provenAt: number,
   ): SessionEventWriter {
     return new SessionEventWriter(
       record,
@@ -836,6 +847,7 @@ export class SessionEventWriter {
         activePath: activeEventPath(record.acpxRecordId),
         activeSizeBytes: 0,
         segmentCount: record.eventLog.segment_count,
+        provenAt,
       },
     );
   }
@@ -867,6 +879,9 @@ export class SessionEventWriter {
         }
       }
 
+      // A-80, PER WRITE (C10; architect #19 on S4): a writer that stays open proves the pod gone again before each
+      // write (a proof serves REPROVE_AFTER_MS), BEFORE any rotation too. Once it diverts it stays diverted.
+      await this.proveBeforeWrite();
       // A-80: a sidecar-mode writer (the pod was not proven gone) diverts the whole batch, once validated. Nothing
       // reached the stream, so no record bookkeeping (`lastSeq`, `eventLog`) moves either.
       if (this.sidecarWhy !== undefined) {
@@ -909,6 +924,21 @@ export class SessionEventWriter {
 
     if (options.checkpoint === true) {
       await writeSessionRecord(this.record);
+    }
+  }
+
+  private async proveBeforeWrite(): Promise<void> {
+    if (
+      !this.proofNeeded ||
+      this.sidecarWhy !== undefined ||
+      Date.now() - this.provenAt < REPROVE_AFTER_MS
+    ) {
+      return;
+    }
+    const verdict = await streamWriteVerdict(this.record.acpxRecordId);
+    this.provenAt = Date.now();
+    if (verdict.write === "sidecar") {
+      this.sidecarWhy = verdict.why;
     }
   }
 

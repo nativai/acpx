@@ -1,10 +1,9 @@
-import { createHash } from "node:crypto";
-import { appendFileSync, closeSync, fstatSync, mkdirSync, openSync, readSync } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { readQueueOwnerLeaseFile, type LeaseFile } from "../cli/queue/lease-store.js";
 import { incrementPerfCounter } from "../perf-metrics.js";
-import { safeSessionId, sessionBaseDir, sessionEventActivePath } from "../session/event-log.js";
+import { safeSessionId, sessionBaseDir, streamPositionNow } from "../session/event-log.js";
 import { proveDeath } from "./death-proof.js";
 import { lockHostPlace, type PodRef } from "./identity.js";
 import { localProofScope, localProofScopeSync, type ProofScope } from "./proof-scope.js";
@@ -42,8 +41,6 @@ export type StreamWriteVerdict = { write: "here" } | { write: "sidecar"; why: Fo
 export type ForeignWriteFile = "stream" | "owner-log";
 
 export const FOREIGN_WRITE_COUNTER = "session.pod_foreign_write";
-/** The active stream's content print covers its first bytes up to this many (acpx-ui `PRINT_BYTES`). */
-const PRINT_BYTES = 4096;
 /** A waiting appender proves again when its last proof is older than this (C3.3 is asked at most this often). */
 export const REPROVE_AFTER_MS = 1_000;
 
@@ -72,12 +69,17 @@ function verdictOfScope(scope: ProofScope): StreamWriteVerdict | undefined {
   return scope.reason === "session-in-pod" ? undefined : divert("pod-unreadable");
 }
 
+/** Does a write here need the proof at all? Only a control-role host's does (an agent pod writes its own files). */
+export function isControlRoleHost(env: NodeJS.ProcessEnv = process.env): boolean {
+  return lockHostPlace(env) === "control";
+}
+
 /** Where may THIS process write the session's stream and owner log now? Asked immediately before the write. */
 export async function streamWriteVerdict(
   sessionId: string,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<StreamWriteVerdict> {
-  if (lockHostPlace(env) !== "control") {
+  if (!isControlRoleHost(env)) {
     return HERE;
   }
   const decided = verdictOfScope(await localProofScope(sessionId, env));
@@ -100,7 +102,7 @@ export function streamWriteVerdictSync(
   sessionId: string,
   env: NodeJS.ProcessEnv = process.env,
 ): StreamWriteVerdict {
-  if (lockHostPlace(env) !== "control") {
+  if (!isControlRoleHost(env)) {
     return HERE;
   }
   return verdictOfScope(localProofScopeSync(sessionId, env)) ?? divert("no-sync-proof");
@@ -110,41 +112,6 @@ export function streamWriteVerdictSync(
 
 export function markersPath(sessionId: string): string {
   return path.join(sessionBaseDir(), `${safeSessionId(sessionId)}.markers.ndjson`);
-}
-
-/** `<len>:<first 24 hex of sha256>` of the first up-to-4096 bytes of an open file (acpx-ui `printOfFd`). */
-function printOfFd(fd: number, size: number): string {
-  const wanted = Math.min(PRINT_BYTES, size);
-  const buffer = Buffer.alloc(wanted);
-  let read = 0;
-  while (read < wanted) {
-    const got = readSync(fd, buffer, read, wanted - read, read);
-    if (got <= 0) {
-      break;
-    }
-    read += got;
-  }
-  return `${read}:${createHash("sha256").update(buffer.subarray(0, read)).digest("hex").slice(0, 24)}`;
-}
-
-type Position = { offset: number; ino?: number; fp?: string };
-
-/** The position triple of the ACTIVE stream now, measured on ONE fd (acpx-ui `streamPositionNow`). */
-function streamPositionNow(sessionId: string): Position {
-  let fd: number;
-  try {
-    fd = openSync(sessionEventActivePath(sessionId), "r");
-  } catch {
-    return { offset: 0 };
-  }
-  try {
-    const st = fstatSync(fd);
-    return st.size === 0
-      ? { offset: 0 }
-      : { offset: st.size, ino: st.ino, fp: printOfFd(fd, st.size) };
-  } finally {
-    closeSync(fd);
-  }
 }
 
 type Marker = Record<string, unknown>;

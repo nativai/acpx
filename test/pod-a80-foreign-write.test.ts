@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test, { mock } from "node:test";
+import { queueLockFilePath } from "../src/cli/queue/paths.js";
 import { reapTranscriptsAfterClose } from "../src/cli/session/owner-exit-transcript-reap.js";
 import { appendClearedBackgroundTasksLine } from "../src/cli/session/owner-task-reap.js";
 import { getPerfMetricsSnapshot, resetPerfMetrics } from "../src/perf-metrics.js";
@@ -26,6 +27,7 @@ import {
 } from "../src/session/events.js";
 import { writeSessionRecord } from "../src/session/persistence.js";
 import { judgeLockHolder } from "../src/session/persistence/identity-file-lock.js";
+import { withRecordFileLock } from "../src/session/persistence/record-file-lock.js";
 import { startFakeApiServer, type ApiScript } from "./pod-kit/fake-apiserver.js";
 import { KIT_NAMESPACE } from "./pod-kit/two-pods.js";
 import {
@@ -625,5 +627,150 @@ test("80.3 the stream appender's dead-writer test: at a partial line under a no-
     }
   } finally {
     fs.rmSync(world.root, { recursive: true, force: true });
+  }
+});
+
+// ---- 80.3 on the RECORD lock too (architect #19: every lock on the one primitive judged such a body gone) ----------
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+test("80.3 the RECORD lock: a no-pod body from another boot is not taken inside the stale age on the control pod, broken past it by age, and never in an agent pod", async () => {
+  const world = makeWorld("a80r");
+  try {
+    for (const place of ["control", "agent-pod"] as const) {
+      await withEnv(
+        worldEnv(world, { place, podMode: place === "agent-pod", extra: { HOME: world.home } }),
+        async () => {
+          const recordFile = path.join(world.home, `rec-${place}.json`);
+          const lockFile = `${recordFile}.lock`;
+          const body = JSON.stringify(otherBootBody());
+          fs.writeFileSync(lockFile, body);
+          let entered = false;
+          const stderr = captureStderr();
+          try {
+            const taking = withRecordFileLock(recordFile, async () => {
+              entered = true;
+              return "in";
+            });
+            await sleep(1_200);
+            assert.equal(
+              entered,
+              false,
+              `${place}: not taken inside the stale age (red today: taken in ms)`,
+            );
+            assert.equal(
+              fs.readFileSync(lockFile, "utf8"),
+              body,
+              `${place}: the holder's lock is untouched`,
+            );
+            const old = new Date(Date.now() - 10 * 60_000);
+            fs.utimesSync(lockFile, old, old);
+            if (place === "control") {
+              assert.equal(
+                await taking,
+                "in",
+                "past the stale age the control pod breaks it, by age",
+              );
+              assert.ok(
+                stderr.lines().some((line) => line.includes("broke stale session record lock")),
+              );
+            } else {
+              await sleep(1_200);
+              assert.equal(entered, false, "an agent pod never breaks it, whatever its age");
+              fs.rmSync(lockFile); // the holder releases: only now may the waiter in
+              assert.equal(await taking, "in");
+            }
+          } finally {
+            stderr.restore();
+          }
+        },
+      );
+    }
+  } finally {
+    fs.rmSync(world.root, { recursive: true, force: true });
+  }
+});
+
+// ---- 80.4: the check is per write -----------------------------------------------------------------------------
+
+test("80.4 a writer that stays open proves again before each write: a live pod's lease appears, the next writes (a proof serves 1 s) go to the sidecar and the writer never returns to the stream", async () => {
+  const ctl = makeWorld("a80w4");
+  const podABase = makeWorld("a80w4a");
+  const podBBase = makeWorld("a80w4b");
+  const podA: PodWorld = { ...podABase, home: ctl.home };
+  const podB: PodWorld = { ...podBBase, home: ctl.home };
+  const api = await startFakeApiServer({
+    // A is absent on a Ready node: C3.3 `gone`. B exists: C3.3 `exists`.
+    pods: [
+      { name: podB.pod.name, namespace: KIT_NAMESPACE, uid: podB.pod.uid, node: podB.pod.node },
+    ],
+    nodes: [
+      { name: podA.pod.node, ready: "True" },
+      { name: podB.pod.node, ready: "True" },
+    ],
+  });
+  const env = worldEnv(ctl, {
+    podMode: true,
+    extra: { ACPX_POD_API_URL: api.url, HOME: ctl.home },
+  });
+  try {
+    await withEnv(env, async () => {
+      const leaseFile = (sid: string): string => queueLockFilePath(sid, ctl.home);
+      const run = async (sid: string, replaceLease: boolean): Promise<string[]> => {
+        const states: string[] = [];
+        await writeSessionRecord(record(sid, ctl.home));
+        await writePodLease(podA, sid);
+        const writer = await SessionEventWriter.open(record(sid, ctl.home));
+        await writer.appendMessage(frame(1));
+        const afterFirst = fs.readFileSync(sessionEventActivePath(sid), "utf8");
+        assert.ok(
+          afterFirst.includes('"n":1'),
+          "the first batch lands in the stream (the pod is gone)",
+        );
+        if (replaceLease) {
+          fs.rmSync(leaseFile(sid));
+          await writePodLease(podB, sid); // a live pod's lease replaces it
+        }
+        const stderr = captureStderr();
+        try {
+          await sleep(1_100);
+          await writer.appendMessage(frame(2));
+          await writer.appendMessage(frame(3));
+          if (replaceLease) {
+            // The writer does not return to the stream for the rest of its life, even if the lease goes away again.
+            fs.rmSync(leaseFile(sid));
+            await sleep(1_100);
+            await writer.appendMessage(frame(4));
+          }
+        } finally {
+          stderr.restore();
+        }
+        await writer.close();
+        states.push(
+          fs.readFileSync(sessionEventActivePath(sid), "utf8") === afterFirst
+            ? "stream-unchanged"
+            : "stream-grew",
+          String(sidecarLines(sid).length),
+          String(foreignWriteLines(stderr.lines()).length),
+        );
+        return states;
+      };
+      resetPerfMetrics();
+      assert.deepEqual(
+        await run("a80-w4-live", true),
+        ["stream-unchanged", "3", "3"],
+        "after the live pod's lease: three writes diverted, one pod_foreign_write line each, the stream untouched",
+      );
+      assert.equal(getPerfMetricsSnapshot().counters[COUNTER], 3);
+      // The pair: with no new lease the same writer keeps writing to the stream, a second later too.
+      assert.deepEqual(await run("a80-w4-same", false), ["stream-grew", "0", "0"]);
+    });
+  } finally {
+    await api.close();
+    for (const root of [ctl.root, podABase.root, podBBase.root]) {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   }
 });
