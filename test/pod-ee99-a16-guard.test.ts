@@ -187,7 +187,8 @@ test("ee99 79.4 · the switch off, the lease names an existing pod: a shell's pr
     untouched("cancel");
 
     // Atrium's two spawn shapes keep the promise.
-    const marked = await run(env, cwd, [
+    const runner = { ...env, ACPX_ADMISSION_CLASS: "delivery" }; // as atrium's runner sets it (A-79 / F-R3)
+    const marked = await run(runner, cwd, [
       "--format",
       "json",
       "prompt",
@@ -208,7 +209,7 @@ test("ee99 79.4 · the switch off, the lease names an existing pod: a shell's pr
     assert.equal(markedData.queued, true);
     assert.equal(markedData.message, OLD_SENTENCE);
     const batch = await run(
-      env,
+      runner,
       cwd,
       ["--format", "json", "prompt", "--no-wait", "--session-id", id, "--batch-file", "-"],
       BATCH,
@@ -223,6 +224,35 @@ test("ee99 79.4 · the switch off, the lease names an existing pod: a shell's pr
     assert.equal(batchData.queued, true);
     assert.equal(batchData.message, OLD_SENTENCE);
     untouched("atrium spawns");
+
+    // Row 79.6 at this guard: the same marks passed by hand, without the runner's class, hold nothing.
+    for (const [label, args, stdin] of [
+      [
+        "--message-id",
+        [
+          "prompt",
+          "--no-wait",
+          "--session-id",
+          id,
+          "--message-id",
+          "d00dfeed-0000-4000-8000-0000000000bb",
+          "hello",
+        ],
+        "",
+      ],
+      ["--batch-file", ["prompt", "--no-wait", "--session-id", id, "--batch-file", "-"], BATCH],
+    ] as const) {
+      const byHand = await run(env, cwd, ["--format", "json", ...args], stdin);
+      assert.equal(byHand.status, 75, `${label}: ${byHand.stderr}`);
+      const handData = (
+        JSON.parse(byHand.stdout.trim().split("\n").at(-1) ?? "{}") as {
+          error: { data: Record<string, unknown> };
+        }
+      ).error.data;
+      assert.equal(handData.queued, false, label);
+      assert.match(String(handData.message), /the message was NOT queued and NOT sent/u, label);
+    }
+    untouched("hand-passed marks");
 
     // The pair: the pod proven gone — the same shell prompt starts a local owner (A-16 allows it).
     clearPods(api);
