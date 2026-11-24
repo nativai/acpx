@@ -332,11 +332,11 @@ test("ee99 G2 · the JSON form: exit 75, queued=false, the message says NOT queu
       assert.equal(lines(out.result.stderr)[0], BASE[reason].token, reason);
       const error = (
         JSON.parse(lines(out.result.stdout).at(-1) ?? "{}") as {
-          error?: { data?: { capacityRefusal?: Record<string, unknown>; tokenLine?: string } };
+          error?: { data?: Record<string, unknown> };
         }
       ).error;
-      const detail = error?.data?.capacityRefusal;
-      assert.ok(detail, `${reason}: error.data.capacityRefusal in ${out.result.stdout}`);
+      const detail = error?.data;
+      assert.ok(detail, `${reason}: error.data in ${out.result.stdout}`);
       assert.equal(detail.queued, false, reason);
       assert.equal(detail.tokenLine, BASE[reason].token, reason);
       assert.match(String(detail.message), /was NOT queued and NOT sent/u, reason);
