@@ -35,6 +35,7 @@ import {
   readAgentsFigures,
   type PodRoom,
 } from "../pod/pod-capacity.js";
+import { withHoldPromise } from "../pod/pod-refusal.js";
 import { EXIT_CODES, type OutputFormat } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import { parseOutputFormat, resolveGlobalFlags } from "./flags.js";
@@ -738,6 +739,20 @@ function writeAdmitWakeText(sessionId: string, decision: WakeDecision): void {
  * A closed record is NOT short-circuited: atrium asks before a `--reopen`, so a refusal reopens
  * nothing; it answers a closed target without `reopen` with its own 409 before ever calling.
  */
+/**
+ * A-79: `capacity admit-wake` is atrium's pre-admission verb — atrium holds what it is refused, so a pod-plane
+ * refusal keeps the hold sentence and carries `queued: true`. The token line and exit code do not change.
+ */
+function withHeldRefusal(decision: WakeDecision): WakeDecision {
+  if (decision.decision !== "refused") {
+    return decision;
+  }
+  const held = withHoldPromise(decision.error);
+  return held === decision.error
+    ? decision
+    : { ...decision, error: held, refusal: { ...decision.refusal, message: held.message } };
+}
+
 async function handleAdmitWake(
   flags: AdmitWakeFlags,
   command: Command,
@@ -746,7 +761,7 @@ async function handleAdmitWake(
   const { format } = resolveGlobalFlags(command, config);
   const { resolveSessionRecord } = await import("../session/persistence.js");
   const record = await resolveSessionRecord(flags.sessionId);
-  const decision: WakeDecision = (await ownerMayBeRunning(record.acpxRecordId))
+  const decided: WakeDecision = (await ownerMayBeRunning(record.acpxRecordId))
     ? { decision: "not-needed" }
     : await admitWake(
         wakeRequestFor(record, {
@@ -755,6 +770,7 @@ async function handleAdmitWake(
           sender: flags.sender,
         }),
       );
+  const decision = withHeldRefusal(decided);
   if (!emitJsonResult(format, admitWakeJson(record.acpxRecordId, decision))) {
     writeAdmitWakeText(record.acpxRecordId, decision);
   } else if (decision.decision === "refused") {

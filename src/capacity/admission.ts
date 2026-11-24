@@ -81,6 +81,18 @@ const ADMISSION_CLASSES: readonly AdmissionClass[] = [
   "spawn",
 ];
 
+/**
+ * Does this environment carry an admission class the runner set (a KNOWN one)? The routed branch and A-16's guard
+ * run before (or after) `takeAdmissionClassFromEnv` deletes the variable, so they ask both: the value taken at
+ * start, or the variable still in `env`.
+ */
+export function admissionClassDeclared(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (
+    explicitClass?.value !== undefined ||
+    (ADMISSION_CLASSES as readonly string[]).includes(env.ACPX_ADMISSION_CLASS?.trim() ?? "")
+  );
+}
+
 type ExplicitClass = { readonly raw: string; readonly value: AdmissionClass | undefined };
 let explicitClass: ExplicitClass | undefined;
 

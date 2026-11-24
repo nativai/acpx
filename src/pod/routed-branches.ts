@@ -323,8 +323,18 @@ async function dispatchRouted(
     if (await deletedUnreachablePod(error, ready, routedClass, key, deps)) {
       return "proceed";
     }
-    return await deps.fail(error, ready.classification.output);
+    return await deps.fail(await refusalForCaller(error, ready), ready.classification.output);
   }
+}
+
+/**
+ * A-79: the sentence of a refusal that promises a hold is chosen here and at A-16's guard, by ONE helper
+ * (`refusalForCaller`, pod-refusal.ts): the promise stands only for atrium's delivery spawns (`--message-id`,
+ * `--batch-file`); every other caller is told nothing was queued. Token line and exit code unchanged.
+ */
+async function refusalForCaller(error: unknown, ready: Ready): Promise<unknown> {
+  const { refusalForCaller: choose } = await import("./pod-refusal.js");
+  return choose(error, ready.argv);
 }
 
 const DELETES_UNREACHABLE_POD = new Set(["sessions close", "sessions recover"]);

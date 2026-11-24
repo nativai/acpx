@@ -275,6 +275,12 @@ export type CapacityRefusalDetail = {
    * after the token line, joined by `\n` — as the one product text every surface relays.
    */
   message?: string;
+  /**
+   * `pod_starting` / `agent_cap` / `admission_busy` of a session's pod only (brick ee9980e3): does the
+   * sentence promise a hold? `true` = atrium's delivery runner (`--message-id`) is the caller and holds the item;
+   * `false` = the CLI had no holder and said so (NOT queued). Absent = the refusal promises nothing.
+   */
+  queued?: boolean;
   /** A WAKE refusal only: the released session that was not started. */
   wake?: { sessionId: string; seatId: string | null };
   /** `pod_starting` / `agent_cap` only (C7.2): the fields of the token line beyond the common ones. */

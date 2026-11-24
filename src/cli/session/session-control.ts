@@ -6,6 +6,7 @@ import {
   ProfileTurnInFlightError,
   SubscriptionTurnInFlightError,
 } from "../../errors.js";
+import { isRecordOnlyCreate } from "../../pod/create-plan.js";
 import {
   classifyRecordedIdentity,
   getOwnProcessScope,
@@ -116,6 +117,17 @@ import {
 } from "./terminal-close.js";
 import { gateSetConnect } from "./wake-gate.js";
 
+/**
+ * A-79 / C1.2 (a setting on a session without a pod): on a pod-mode control pod, a `set` that reaches its no-owner
+ * fallback has no pod to apply to (routed-if-pod answered "no pod"), and a direct connect would start the harness
+ * ON THE CONTROL POD — which nothing may do in pod mode. So every key's fallback answers from the record, as for a
+ * sleeping record: the request is written, nothing connects, and the next wake's pod applies it. It never reaches
+ * `gateSetConnect`, so no wake-gate decision and no "queued" sentence either. With the switch off, nothing changes.
+ */
+function answersFromRecordInPodMode(): boolean {
+  return isRecordOnlyCreate();
+}
+
 export async function cancelSessionPrompt(
   options: SessionCancelOptions,
 ): Promise<SessionCancelResult> {
@@ -151,8 +163,9 @@ export async function setSessionMode(
   }
 
   const modeRecord = await resolveSessionRecord(options.sessionId);
-  if (modeRecord.acpx?.sleeping) {
+  if (modeRecord.acpx?.sleeping || answersFromRecordInPodMode()) {
     // UMQ K7: a sleeping record has no adapter — write the pin, connect nothing; the first wake replays it.
+    // A-79 / C1.2: the same for a session whose pod is gone, on a pod-mode control pod (see `answersFromRecordInPodMode`).
     setDesiredModeId(modeRecord, options.modeId);
     await writeSessionRecord(modeRecord);
     return { record: modeRecord, resumed: false, validatedAgainst: "record" };
@@ -308,7 +321,7 @@ export async function setSessionModel(
     setDesiredModelSource(record, "explicit");
     await writeSessionRecord(record);
     result = { record, resumed: false, validatedAgainst: "adapter" };
-  } else if (recordOnlyModelVerdict(record).kind === "record") {
+  } else if (answersFromRecordInPodMode() || recordOnlyModelVerdict(record).kind === "record") {
     result = await setSessionModelOnRecord(options);
   } else {
     const direct = await gateSetConnect(
@@ -425,7 +438,10 @@ async function setSessionConfigOptionWithoutOwner(
   options: SessionSetConfigOptionOptions,
 ): Promise<SessionSetConfigOptionResult> {
   const record = await resolveSessionRecord(options.sessionId);
-  if (recordOnlyConfigOptionVerdict(record, options.configId, options.value).kind === "record") {
+  if (
+    answersFromRecordInPodMode() ||
+    recordOnlyConfigOptionVerdict(record, options.configId, options.value).kind === "record"
+  ) {
     return await setSessionConfigOptionOnRecord(options, record);
   }
   const direct = await gateSetConnect(
@@ -487,7 +503,7 @@ export async function setSessionDepth(
   }
 
   const depthRecord = await resolveSessionRecord(options.sessionId);
-  if (depthRecord.acpx?.sleeping) {
+  if (depthRecord.acpx?.sleeping || answersFromRecordInPodMode()) {
     // UMQ K7: nothing to project against until the first wake — carry the pin, connect nothing.
     setDesiredConfigOption(depthRecord, "effort", options.requested);
     await writeSessionRecord(depthRecord);
