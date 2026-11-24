@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import test, { mock } from "node:test";
+import test, { afterEach, mock } from "node:test";
 import {
   appendDeliveryStreamEvent,
   appendDeliveryStreamEventSync,
@@ -18,9 +18,11 @@ import {
   envWithout,
   frame,
   frameNumbers,
+  holdInProcess,
   killAndWait,
   leaveDeadWriterMidLine,
   methodsOf,
+  releaseAllHeld,
   releaseAndWait,
   releaseUntil,
   runChild,
@@ -36,6 +38,10 @@ import {
 // line-boundary rule. These rows drive the PRODUCTION entry points and REAL processes (a writer held
 // between parts by the existing `ACPX_TEST_STREAM_HOLD_MID_LINE` seam), so they also run on 57004dd5 +
 // the seam commit, where the dead-writer, live-writer and queue rows are red.
+
+afterEach(async () => {
+  await releaseAllHeld();
+});
 
 const TASK = { messageId: "msg-1", requestId: "req-1" };
 const FAILED = { code: 1, message: "boom", detailCode: "BOOM" };
@@ -377,6 +383,7 @@ test("(a) A line queued behind THIS process's own multi-part write goes out afte
       const writer = await SessionEventWriter.open(await resolveSessionRecord(id));
       const active = sessionEventActivePath(id);
       const flush = writer.appendMessages([frame(1), frame(2, 2.5 * 1024 * 1024)]);
+      holdInProcess(marker, flush, () => writer.close({ checkpoint: false }));
       await waitFor("the writer between parts", () => fs.existsSync(marker));
       const before = fs.statSync(active).size;
       appendDeliveryStreamEventSync(id, TASK, "done", undefined, { stopReason: "end_turn" });
@@ -434,6 +441,7 @@ test("(a) A line queued behind a multi-part write that THROWS is written with th
     try {
       const writer = await SessionEventWriter.open(await resolveSessionRecord(id));
       const flush = writer.appendMessages([frame(1, 2.5 * 1024 * 1024)]);
+      holdInProcess(marker, flush, () => writer.close({ checkpoint: false }));
       const rejected = assert.rejects(flush, /injected part failure/);
       await waitFor("the writer between parts", () => fs.existsSync(marker));
       appendDeliveryStreamEventSync(id, TASK, "done", undefined, { stopReason: "end_turn" });
@@ -552,6 +560,64 @@ test("Two appenders in a row after a dead writer put ONE closing newline between
     assert.deepEqual(
       { damaged: shape.damaged, empty: shape.empty, lines: shape.lines },
       { damaged: 1, empty: 0, lines: 4 },
+    );
+  });
+});
+
+test("L-B: an appender of THIS process while the owner's own SINGLE-part flush is in flight adds no empty line and tears nothing", async () => {
+  await withTempHome("acpx-appender-single-part-", async (homeDir) => {
+    const id = "own-single-part";
+    await seedRecord(homeDir, id);
+    const active = sessionEventActivePath(id);
+    const writer = await SessionEventWriter.open(await resolveSessionRecord(id), {
+      maxSegmentBytes: 1024 * 1024 * 1024,
+    });
+    holdInProcess(path.join(homeDir, "unused-marker"), Promise.resolve(), () =>
+      writer.close({ checkpoint: false }),
+    );
+    await writer.appendMessages([frame(1)]);
+    let hits = 0;
+    for (let trial = 0; trial < 30; trial += 1) {
+      const base = fs.statSync(active).size;
+      const big = frame(100 + trial, 900 * 1024);
+      const expectedEnd = base + Buffer.byteLength(JSON.stringify(big)) + 1;
+      const flush = writer.appendMessages([big]);
+      for (let spins = 0; spins < 200_000; spins += 1) {
+        const size = fs.statSync(active).size;
+        if (size > base && size < expectedEnd) {
+          // The write is in flight on the libuv pool: the file is mid-line RIGHT NOW.
+          appendDeliveryStreamEventSync(
+            id,
+            { messageId: `m${trial}`, requestId: `r${trial}` },
+            "queued",
+          );
+          hits += 1;
+          break;
+        }
+        if (size >= expectedEnd) {
+          break;
+        }
+        if (spins % 50 === 0) {
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+      }
+      await flush;
+    }
+    await writer.close({ checkpoint: false });
+    assert.ok(hits >= 3, `the instrument saw the own write in flight ${hits} times (not vacuous)`);
+    const shape = shapeOf(await fsp.readFile(active, "utf8"));
+    assert.deepEqual(
+      { damaged: shape.damaged, empty: shape.empty },
+      { damaged: 0, empty: 0 },
+      `${hits} appends landed beside the own write`,
+    );
+    const events = await listSessionEvents(id);
+    assert.equal(frameNumbers(events).length, 31, "every frame is whole");
+    assert.equal(
+      events.filter((event) => (event as { method?: string }).method === DELIVERY_EVENT_METHOD)
+        .length,
+      hits,
+      "every appended line is read",
     );
   });
 });

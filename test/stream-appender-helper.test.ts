@@ -52,30 +52,132 @@ const STREAM_PATH_USERS: Record<string, "helper" | "no-append"> = {
 };
 const STREAM_PATH_TOKEN =
   /\b(sessionEventActivePath|activeEventPath|sessionEventSegmentPath|segmentEventPath)\b|eventLog\??\.active_path|\.active_path\b/;
-const APPEND_CALL =
-  /\b(appendFile|appendFileSync|createWriteStream|appendInParts)\s*\(|\bopen(Sync)?\s*\([^)]*["'`]a\+?["'`]/;
+/** Text that builds a stream file name by hand (a path that does not come from the tokens above). */
+const HAND_BUILT_STREAM = /stream\.ndjson|\.stream\.\$\{|\.stream\.\d/;
+/** The only functions of the helper module that may append, each reviewed (the helper and its two tail writers). */
+const HELPER_APPEND_FUNCTIONS = new Set([
+  "appendInParts",
+  "closeDeadTail",
+  "appendClosingTailSync",
+  "appendStepSync",
+]);
+/** The only exported appenders of events.ts: a new one is a new way to append a caller-given path. */
+const HELPER_EXPORTED_APPENDERS = ["appendInParts", "appendStreamText", "appendStreamTextSync"];
+
+/** The text between the parenthesis that opens at `openIndex` and its match (strings and nesting respected). */
+function balancedArgs(text: string, openIndex: number): string {
+  let depth = 0;
+  let quote: string | undefined;
+  for (let i = openIndex; i < text.length; i += 1) {
+    const ch = text[i] ?? "";
+    if (quote !== undefined) {
+      if (ch === "\\") {
+        i += 1;
+      } else if (ch === quote) {
+        quote = undefined;
+      }
+    } else if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+    } else if (ch === "(") {
+      depth += 1;
+    } else if (ch === ")") {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(openIndex + 1, i);
+      }
+    }
+  }
+  return text.slice(openIndex + 1);
+}
+
+/** Every append shape in `text`, with where it starts: a call by name, an open in append mode, a write with an append flag, O_APPEND. */
+function appendShapes(text: string): { shape: string; at: number }[] {
+  const found: { shape: string; at: number }[] = [];
+  for (const match of text.matchAll(
+    /\b(appendFile|appendFileSync|createWriteStream|appendInParts)\s*\(/g,
+  )) {
+    found.push({ shape: match[1] ?? "append", at: match.index });
+  }
+  for (const match of text.matchAll(/\b(open|openSync|writeFile|writeFileSync)\s*\(/g)) {
+    const args = balancedArgs(text, match.index + match[0].length - 1);
+    if (/["'`]a[+sx]?["'`]|\bO_APPEND\b/.test(args)) {
+      found.push({ shape: `${match[1]} in append mode`, at: match.index });
+    }
+  }
+  for (const match of text.matchAll(/\bO_APPEND\b/g)) {
+    found.push({ shape: "O_APPEND", at: match.index });
+  }
+  return found;
+}
+
+function enclosingFunction(text: string, at: number): string {
+  const before = text.slice(0, at);
+  const all = [...before.matchAll(/\bfunction\s+(\w+)/g)];
+  return all.at(-1)?.[1] ?? "(top level or a method)";
+}
 
 export function streamAppendViolations(files: Map<string, string>): string[] {
   const violations: string[] = [];
   for (const [file, raw] of files) {
     const text = code(raw);
-    if (!STREAM_PATH_TOKEN.test(text)) {
+    const shapes = appendShapes(text);
+    const role = STREAM_PATH_USERS[file];
+    if (STREAM_PATH_TOKEN.test(text)) {
+      if (role === undefined) {
+        violations.push(`${file}: builds or uses the stream path but is not a registered user`);
+      } else if (role === "no-append" && shapes.length > 0) {
+        violations.push(`${file}: a stream-path user that may not append, appends`);
+      }
+    }
+    if (file === "session/events.ts") {
+      for (const { shape, at } of shapes) {
+        if (shape === "appendInParts") {
+          continue; // the helper's own flush, called from its own writer
+        }
+        const owner = enclosingFunction(text, at);
+        if (!HELPER_APPEND_FUNCTIONS.has(owner)) {
+          violations.push(
+            `${file}: a raw ${shape} inside ${owner}, outside the helper's own functions`,
+          );
+        }
+      }
+      const exported = [...text.matchAll(/export\s+(?:async\s+)?function\s+(append\w*)/g)].map(
+        (m) => m[1],
+      );
+      if (
+        JSON.stringify(exported.toSorted()) !== JSON.stringify(HELPER_EXPORTED_APPENDERS.toSorted())
+      ) {
+        violations.push(
+          `${file}: the exported appenders are ${exported.join(", ")}, not the reviewed set`,
+        );
+      }
       continue;
     }
-    const role = STREAM_PATH_USERS[file];
-    if (role === undefined) {
-      violations.push(`${file}: builds or uses the stream path but is not a registered user`);
-    } else if (role === "no-append" && APPEND_CALL.test(text)) {
-      violations.push(`${file}: a stream-path user that may not append, appends`);
+    if (shapes.some(({ shape }) => shape === "O_APPEND") && !O_APPEND_REVIEWED.has(file)) {
+      violations.push(`${file}: O_APPEND outside the helper module`);
     }
-  }
-  for (const [file, raw] of files) {
-    if (file !== "session/events.ts" && /\bappendInParts\s*\(/.test(code(raw))) {
+    if (shapes.some(({ shape }) => shape === "appendInParts")) {
       violations.push(`${file}: calls appendInParts outside the helper module`);
+    }
+    if (
+      HAND_BUILT_STREAM.test(text) &&
+      role === undefined &&
+      shapes.length > 0 &&
+      !HAND_BUILT_REVIEWED.has(file)
+    ) {
+      violations.push(
+        `${file}: names a stream file by hand and appends (${shapes.map((x) => x.shape).join(", ")})`,
+      );
     }
   }
   return violations;
 }
+
+/** Modules that use O_APPEND, reviewed: each appends to its OWN ledger file, none to a session stream. */
+const O_APPEND_REVIEWED = new Set<string>(["capacity/governor/notify.ts", "cli/message-ledger.ts"]);
+
+/** Modules that name stream files by hand and also append, reviewed: their appends are not to a stream. */
+const HAND_BUILT_REVIEWED = new Set<string>([]);
 
 function realSources(): Map<string, string> {
   return new Map(
@@ -93,46 +195,103 @@ test("63.4 SCAN: no source file but the helper module appends to a session's str
     .filter(([, text]) => STREAM_PATH_TOKEN.test(code(text)))
     .map(([file]) => file);
   assert.ok(users.includes("session/events.ts"), "positive control: the helper module is found");
+  const helperAppends = appendShapes(code(files.get("session/events.ts") ?? ""));
+  assert.ok(helperAppends.length >= 4, "positive control: the scan sees the helper's own appends");
   assert.deepEqual(streamAppendViolations(files), []);
 });
 
-test("63.4 SCAN negatives: a planted append past the helper is red, in every shape", () => {
+test("63.4 SCAN negatives: a planted append past the helper is red, in every shape (plants go into a COPY of the source map)", () => {
   const base = realSources();
+  const events = base.get("session/events.ts") ?? "";
   const plant = (name: string, text: string): string[] =>
     streamAppendViolations(new Map([...base, [name, text]]));
-  assert.deepEqual(
+  const plantInto = (name: string, extra: string): string[] =>
+    streamAppendViolations(new Map([...base, [name, `${base.get(name) ?? ""}\n${extra}`]]));
+  const red = (violations: string[], why: string): void => {
+    assert.equal(violations.length, 1, `${why}: ${violations.join(" | ")}`);
+  };
+  red(
     plant(
       "cli/new-appender.ts",
       `import { sessionEventActivePath } from "../session/event-log.js";\nawait appendFile(sessionEventActivePath(id), line, "utf8");`,
-    ).length,
-    1,
+    ),
     "a NEW module that appends to the stream path",
   );
-  assert.equal(
+  red(
     plant(
       "cli/aliased.ts",
       `const p = sessionEventActivePath(id);\nawait fs.appendFile(\n  p,\n  line,\n);`,
-    ).length,
-    1,
+    ),
     "an alias, a multi-line call",
   );
-  assert.equal(
-    plant("cli/by-eventlog.ts", `fs.appendFileSync(record.eventLog.active_path, line);`).length,
-    1,
+  red(
+    plant("cli/by-eventlog.ts", `fs.appendFileSync(record.eventLog.active_path, line);`),
     "through the record's own active_path",
   );
-  assert.equal(
-    plant("cli/direct-parts.ts", `await appendInParts(somePath, data);`).length,
-    1,
-    "appendInParts outside the helper module",
+  red(
+    plant("cli/direct-parts.ts", `await appendInParts(somePath, data);`),
+    "appendInParts outside",
   );
-  assert.equal(
-    plant(
-      "session/export.ts",
-      `${base.get("session/export.ts")}\nfs.appendFileSync(sessionEventActivePath(i), l);`,
-    ).length,
-    1,
+  red(
+    plantInto("session/export.ts", `fs.appendFileSync(sessionEventActivePath(i), l);`),
     "a registered READER that starts appending",
+  );
+  // The shapes the 3f33cc2d TE found the first scan missed (L-D):
+  red(
+    plantInto(
+      "session/import.ts",
+      `await fs.writeFile(sessionEventActivePath(i), l, { flag: "a" });`,
+    ),
+    "F: writeFile with the append flag, in a registered module",
+  );
+  red(
+    plant(
+      "cli/open-nested.ts",
+      `const fh = await fs.open(sessionEventActivePath(sessionId), "a");`,
+    ),
+    "G: open(path(x), 'a'), nested parentheses",
+  );
+  red(
+    plant(
+      "cli/open-multiline.ts",
+      `const fh = openSync(\n  join(dir, "x"),\n  "a+",\n);\nconst p = sessionEventActivePath(i);`,
+    ),
+    "G: a multi-line open in append mode next to the path",
+  );
+  red(
+    plant("cli/o-append.ts", `fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_APPEND);`),
+    "H: O_APPEND",
+  );
+  red(
+    plant(
+      "cli/hand-built.ts",
+      "const p = path.join(dir, `${id}.stream.ndjson`);\nawait fs.appendFile(p, line);",
+    ),
+    "I: a hand-built <id>.stream.ndjson path",
+  );
+  assert.ok(
+    streamAppendViolations(
+      new Map([
+        ...base,
+        [
+          "session/events.ts",
+          `${events}\nexport async function appendToAnyPath(file: string, line: string) { await fs.appendFile(file, line); }`,
+        ],
+      ]),
+    ).some((violation) => violation.includes("exported appenders")),
+    "J: a new exported appender of a caller-given path inside events.ts is red",
+  );
+  red(
+    streamAppendViolations(
+      new Map([
+        ...base,
+        [
+          "session/events.ts",
+          `${events}\nfunction quietly(id: string, line: string) { return fs.appendFile(activeEventPath(id), line); }`,
+        ],
+      ]),
+    ),
+    "K: a raw append inside events.ts, outside the helper's own functions",
   );
   assert.deepEqual(
     plant(
@@ -141,6 +300,14 @@ test("63.4 SCAN negatives: a planted append past the helper is red, in every sha
     ),
     [],
     "a comment is not a use",
+  );
+  assert.deepEqual(
+    plant(
+      "cli/helper-call.ts",
+      `import { appendStreamText } from "../session/events.js";\nawait appendStreamText(id, line);`,
+    ),
+    [],
+    "negative: a module that calls the helper is not an appender",
   );
 });
 

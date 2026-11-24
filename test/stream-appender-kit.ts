@@ -111,6 +111,11 @@ await writer.appendMessages([frame(2, 2.5 * 1024 * 1024)]);
 await writer.close({ checkpoint: false });
 `;
 
+const heldWriters = new Set<HeldWriter>();
+const spawnedChildren = new Set<ChildProcess>();
+const inProcessHolds: { marker: string; flush: Promise<unknown>; close?: () => Promise<void> }[] =
+  [];
+
 export type HeldWriter = { child: ChildProcess; marker: string; exited: Promise<number | null> };
 
 /**
@@ -151,6 +156,7 @@ export async function startWriterHeldMidLine(homeDir: string, id: string): Promi
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
+  heldWriters.add({ child, marker, exited });
   return { child, marker, exited };
 }
 
@@ -256,12 +262,50 @@ export async function runChild(
     stdio: ["ignore", "pipe", "inherit"],
     env,
   });
+  spawnedChildren.add(child);
   let stdout = "";
   child.stdout?.on("data", (chunk: Buffer) => {
     stdout += chunk.toString("utf8");
   });
   const code = await new Promise<number | null>((resolve) => child.once("exit", resolve));
   return { stdout, code };
+}
+
+/** Registers a writer of THIS process that sits in the hold seam, so `releaseAllHeld` can let it go. */
+export function holdInProcess(
+  marker: string,
+  flush: Promise<unknown>,
+  close?: () => Promise<void>,
+): void {
+  inProcessHolds.push({ marker, flush, ...(close ? { close } : {}) });
+}
+
+/**
+ * L-A: run after EVERY row (`afterEach`). A row that fails an assertion while a writer is held (a real
+ * process in the seam, or one of this process holding the stream lock) must not leave it there: a held
+ * writer makes every later row wait out the lock, so a regression would HANG the gate instead of reddening it.
+ */
+export async function releaseAllHeld(): Promise<void> {
+  for (const held of heldWriters) {
+    if (held.child.exitCode === null && held.child.signalCode === null) {
+      held.child.kill("SIGKILL");
+    }
+    await held.exited;
+  }
+  heldWriters.clear();
+  for (const child of spawnedChildren) {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+    }
+  }
+  spawnedChildren.clear();
+  for (const hold of inProcessHolds.splice(0)) {
+    await Promise.race([
+      releaseUntil(hold.marker, hold.flush).catch(() => {}),
+      new Promise((resolve) => setTimeout(resolve, 10_000)),
+    ]);
+    await hold.close?.().catch(() => {});
+  }
 }
 
 export function envWithout(...names: string[]): NodeJS.ProcessEnv {

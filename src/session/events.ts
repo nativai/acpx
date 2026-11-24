@@ -55,8 +55,8 @@ const STREAM_APPEND_POLL_MS = 25;
 
 /** Raw bodies of the stream locks THIS process holds: a partial tail under one of them is not another writer's. */
 const heldStreamLocks = new Set<string>();
-/** Active files this process is writing in parts right now, with the lines other appenders of this process queued. */
-const multiPartInFlight = new Map<string, string[]>();
+/** Active files this process is writing right now (one write or several), with the lines other appenders of this process queued. */
+const ownFlushInFlight = new Map<string, string[]>();
 
 // Adapter heartbeats, delivery notifications, and ACPX status chrome are
 // persisted to the stream (so the live per-session transcript + debug see them),
@@ -212,8 +212,8 @@ async function rotateSegments(sessionId: string, maxSegments: number): Promise<v
  * STREAM_WRITE_PART_BYTES, otherwise in parts of at most that size with a data sync after each part but
  * the last — so a large flush shows on another machine as a growing partial line, never as a hole.
  *
- * ⚠️ For exactly the span of a multi-part flush this process is "mid-line" on `filePath`: it is listed in
- * `multiPartInFlight`, and every line another appender of THIS process hands to `appendStreamText[Sync]`
+ * ⚠️ For exactly the span of a flush (one write or several) this process is "mid-line" on `filePath`: it is
+ * listed in `ownFlushInFlight`, and every line another appender of THIS process hands to `appendStreamText[Sync]`
  * meanwhile is queued there, never written between the parts (brick 3f33cc2d). The queue goes out right
  * after the last part, on the same handle; after a failed part, or at process exit, with the closing
  * newline of the line that will never be finished.
@@ -223,12 +223,21 @@ export async function appendInParts(
   data: Buffer,
   partBytes: number = STREAM_WRITE_PART_BYTES,
 ): Promise<void> {
-  const handle = await fs.open(filePath, "a");
-  let queued: string[] | undefined;
-  if (data.length > partBytes) {
-    queued = [];
-    multiPartInFlight.set(filePath, queued);
-    registerExitDrain();
+  // ⚠️ EVERY own write of the file is registered, not only a multi-part one (L-B of the 3f33cc2d TE): a
+  // single `write()` runs on the libuv pool and a regular file's size grows page by page while it runs, so
+  // an appender of this process that reads the tail then would see a mid-line tail that is OUR live line.
+  const queued: string[] = [];
+  ownFlushInFlight.set(filePath, queued);
+  registerExitDrain();
+  let handle: FileHandle;
+  try {
+    handle = await fs.open(filePath, "a");
+  } catch (error) {
+    ownFlushInFlight.delete(filePath);
+    if (queued.length > 0) {
+      appendClosingTailSync(filePath, queued.join(""));
+    }
+    throw error;
   }
   let completed = false;
   try {
@@ -262,21 +271,19 @@ async function writeRange(
 async function finishParts(
   handle: FileHandle,
   filePath: string,
-  queued: string[] | undefined,
+  queued: string[],
   completed: boolean,
 ): Promise<void> {
-  if (queued) {
-    multiPartInFlight.delete(filePath);
-  }
+  ownFlushInFlight.delete(filePath);
   try {
-    if (completed && queued && queued.length > 0) {
+    if (completed && queued.length > 0) {
       const rest = Buffer.from(queued.join(""), "utf8");
       await writeRange(handle, rest, 0, rest.length);
     }
   } finally {
     await handle.close();
   }
-  if (!completed && queued && queued.length > 0) {
+  if (!completed && queued.length > 0) {
     appendClosingTailSync(filePath, queued.join(""));
   }
 }
@@ -346,9 +353,9 @@ export async function endsMidLine(filePath: string): Promise<boolean> {
  * on ourselves, 20 s) and the sync callers are exit paths. So, in the active file:
  *   1. the tail ends in a newline, or the file is empty or missing → ONE write of the text;
  *   2. the tail is mid-line and its writer is DEAD (no lock file, a holder `judgeLockHolder` calls
- *      breakable, or a lock THIS process holds with no multi-part write of its own in flight) → ONE write of
+ *      breakable, or a lock THIS process holds with no flush of its own in flight) → ONE write of
  *      "\n" + the text: the partial line stays one damaged line, the closing newline rides in the same write;
- *   3. this process's own multi-part flush is in flight → the text is QUEUED behind it (`appendInParts`);
+ *   3. this process's own flush is in flight (single- or multi-part) → the text is QUEUED behind it (`appendInParts`);
  *   4. another process holds the lock and is live or unjudgeable → it may be between parts: WAIT for the tail
  *      to end in a newline; if it does not grow for the stall time (sync: the hard cap) the holder is frozen,
  *      not writing, and rule 2 applies.
@@ -398,7 +405,7 @@ function tailWriterIsDead(sessionId: string): boolean {
 
 function appendStepSync(sessionId: string, text: string, force: boolean): AppendStep {
   const active = activeEventPath(sessionId);
-  const queue = multiPartInFlight.get(active);
+  const queue = ownFlushInFlight.get(active);
   if (queue) {
     queue.push(text);
     return "queued";
@@ -484,7 +491,7 @@ function registerExitDrain(): void {
   }
   exitDrainRegistered = true;
   process.once("exit", () => {
-    for (const [filePath, queued] of multiPartInFlight) {
+    for (const [filePath, queued] of ownFlushInFlight) {
       if (queued.length > 0) {
         try {
           appendClosingTailSync(filePath, queued.join(""));
