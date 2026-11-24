@@ -1,4 +1,4 @@
-import { readQueueOwnerLeaseFile } from "../cli/queue/lease-store.js";
+import { readQueueOwnerLeaseFile, type UnparsableShape } from "../cli/queue/lease-store.js";
 import { lockHostPlace, lockPodIdentity } from "./identity.js";
 import { placeOf, podModeVerdictNow, readPodFileWithWitness } from "./placement.js";
 
@@ -55,12 +55,31 @@ export async function localProofScope(
 
 async function leaseScope(recordId: string): Promise<ProofScope> {
   const lease = await readQueueOwnerLeaseFile(recordId);
+  if (lease.kind === "unparsable") {
+    return unparsableScope(lease.shape);
+  }
   // A lease whose `pod` is present but cannot be read is as unreadable as a lease that cannot be parsed:
   // reading it as "no pod" would remove what a living pod writes (TE LOW-1).
-  if (lease.kind === "unparsable" || (lease.kind === "ok" && lease.record.podUnreadable === true)) {
+  if (lease.kind === "ok" && lease.record.podUnreadable === true) {
     return { local: false, reason: "pod-unreadable" };
   }
   return lease.kind === "ok" && lease.record.pod !== undefined
     ? { local: false, reason: "session-in-pod" }
     : { local: true };
+}
+
+/**
+ * A-69 / A-67 (C1.1 "On any other host"): a lease acpx cannot parse is read by the SHAPE the lease store gives it
+ * (`UnparsableShape`, the one `removeUnparsableLease` reads — never re-parsed here). A JSON object with NO `pod`
+ * key is a control-pod writer's lease (only an agent pod writes `pod`): local. One whose readable `pod` names a
+ * pod is that pod's: not local until C3.3 proves it gone and the lease is removed. A `pod` that names no pod, and
+ * every body that is not a JSON object (kind (1)), stay `pod-unreadable`.
+ */
+function unparsableScope(shape: UnparsableShape): ProofScope {
+  if (shape.kind === "schema" && shape.pod.kind === "absent") {
+    return { local: true };
+  }
+  return shape.kind === "schema" && shape.pod.kind === "pod"
+    ? { local: false, reason: "session-in-pod" }
+    : { local: false, reason: "pod-unreadable" };
 }

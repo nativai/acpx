@@ -11,7 +11,7 @@ import {
   type LeaseFile,
 } from "../src/cli/queue/lease-store.js";
 import { queueLockFilePath } from "../src/cli/queue/paths.js";
-import { heldLeasePod, refuseWhileUnparsableLeaseHeld } from "../src/cli/session/pod-wake-guard.js";
+import { heldLeasePod } from "../src/cli/session/pod-wake-guard.js";
 import { localProofScope } from "../src/pod/proof-scope.js";
 import {
   clearNodes,
@@ -154,6 +154,7 @@ function plant(world: PodWorld, raw: string, ageMs: number): string {
   return file;
 }
 
+type ProofScopeReading = Awaited<ReturnType<typeof localProofScope>>;
 const OLD_MS = 60_000; // well past the 15 s rule
 const YOUNG_MS = 2_000;
 
@@ -383,16 +384,22 @@ test('72.1 acpx half: JSON that is not an object (null, [], 7, "x", true) reads 
   });
 });
 
-test("72.1 / 69.1 a held body is not local (`pod-unreadable`) on a host with the identity — every kind (1) body and kind (2) body", async () => {
+test("69.4 a lease acpx cannot parse is local or not by the store's SHAPE: no `pod` key → local; a readable `pod` → not local `session-in-pod`; a `pod` naming no pod and every kind (1) body → `pod-unreadable`", async () => {
+  const expected: Record<BodyKind, ProofScopeReading> = {
+    bytes: { local: false, reason: "pod-unreadable" },
+    "schema-no-pod": { local: false, reason: "pod-unreadable" },
+    "schema-readable": { local: false, reason: "session-in-pod" },
+    "schema-no-key": { local: true },
+  };
   for (const body of BODIES) {
     const world = makeWorld("a69-scope");
     plant(world, body.raw(world), OLD_MS);
     await withEnv(hostEnv(world, "control, switch off"), async () => {
-      assert.deepEqual(
-        await localProofScope(ID),
-        { local: false, reason: "pod-unreadable" },
-        body.label,
-      );
+      assert.deepEqual(await localProofScope(ID), expected[body.kind], body.label);
+    });
+    // The host without the identity reads every lease as local (nothing there is a pod's), as before.
+    await withEnv(hostEnv(world, "no identity"), async () => {
+      assert.deepEqual(await localProofScope(ID), { local: true }, `${body.label}, no identity`);
     });
   }
 });
@@ -685,39 +692,4 @@ test("A-16 round 2 passing pairs through the real CLI: a host WITHOUT the identi
     await api.close();
     fs.rmSync(cwd, { recursive: true, force: true });
   }
-});
-
-test("A-16 round 2 unit: `refuseWhileUnparsableLeaseHeld` judges only an UNPARSABLE lease — a parseable one is left to its own door, a missing one passes", async () => {
-  const world = makeWorld("a69-r2-unit");
-  const asked: string[] = [];
-  const deps = {
-    applies: () => true,
-    prove: async () => {
-      asked.push("prove");
-      return { answer: "exists" as const };
-    },
-  };
-  await withEnv(hostEnv(world, "control, switch off"), async () => {
-    await refuseWhileUnparsableLeaseHeld(ID, deps); // no lease at all
-    plant(world, parseableLease(world), OLD_MS);
-    await refuseWhileUnparsableLeaseHeld(ID, deps); // parseable: not this guard's
-    assert.deepEqual(asked, []);
-    plant(world, "", OLD_MS);
-    await assert.rejects(refuseWhileUnparsableLeaseHeld(ID, deps), (e: Error) =>
-      TURNOVER_TOKEN.test(e.message),
-    );
-    plant(world, schemaRefused(world, { present: true, value: OTHER_POD }), OLD_MS);
-    await assert.rejects(refuseWhileUnparsableLeaseHeld(ID, deps), (e: Error) =>
-      TURNOVER_TOKEN.test(e.message),
-    );
-    assert.deepEqual(
-      asked,
-      ["prove"],
-      "a readable pod is proven once; a body that names none is not",
-    );
-  });
-  await withEnv(hostEnv(world, "no identity"), async () => {
-    plant(world, "", OLD_MS);
-    await refuseWhileUnparsableLeaseHeld(ID, deps); // without the identity: as before
-  });
 });

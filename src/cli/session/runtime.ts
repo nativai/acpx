@@ -221,7 +221,7 @@ import { type QueueOwnerActiveSessionController } from "../queue/owner-turn-cont
 import { isSessionCloseDrainActive } from "../queue/session-close-intent.js";
 import { buildBatchPrompt } from "./batch-envelope.js";
 import type { RunOnceOptions, SessionSendOptions } from "./contracts.js";
-import { refuseWhileUnparsableLeaseHeld } from "./pod-wake-guard.js";
+import { refuseWakeWhilePodNotGone } from "./pod-wake-guard.js";
 import { createSubagentBoundaryWriteEnqueuer } from "./subagent-boundary-write.js";
 
 function claudeSubagentDir(cwd: string, acpSessionId: string): string {
@@ -5444,7 +5444,7 @@ export async function runOnce(runOptions: RunOnceOptions): Promise<RunPromptResu
 
 export async function sendSessionDirect(options: SessionSendOptions): Promise<SessionSendResult> {
   // A-69 (3): the flows' direct send starts an adapter without an owner and without `sendSession`.
-  await refuseWhileUnparsableLeaseHeld(options.sessionId);
+  await refuseWakeWhilePodNotGone(options.sessionId);
   const record = await resolveSessionRecord(options.sessionId);
   const ownerOptions = resolveSessionOwnerOptions(record, options, {
     permissionModeExplicit: options.permissionModeExplicit,
