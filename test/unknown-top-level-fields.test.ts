@@ -15,6 +15,7 @@ import test from "node:test";
 import {
   writeTerminalCloseAfterOwnerStop,
   writeTerminalCloseRecord,
+  type ClosedAdapter,
 } from "../src/cli/session/terminal-close.js";
 import { createFileSessionStore } from "../src/runtime/public/file-session-store.js";
 import { exportSession } from "../src/session/export.js";
@@ -44,6 +45,13 @@ import {
   writeRaw,
   type Raw,
 } from "./unknown-top-level-fields-fixtures.js";
+
+/** The close's adapter when the row has none to speak of (A-64's third argument; the pid stays as it is). */
+const NO_ADAPTER: ClosedAdapter = {
+  pid: undefined,
+  pidIdentity: undefined,
+  kill: { signalled: false, reason: "no-pid" },
+};
 
 type Writer = {
   name: string;
@@ -100,14 +108,22 @@ const WRITERS: Writer[] = [
   {
     name: "writeTerminalCloseAfterOwnerStop, owner stopped",
     write: async (record) => {
-      await writeTerminalCloseAfterOwnerStop(record, { stopped: true, reason: "stopped" });
+      await writeTerminalCloseAfterOwnerStop(
+        record,
+        { stopped: true, reason: "stopped" },
+        NO_ADAPTER,
+      );
     },
     landed: (raw) => raw.closed === true,
   },
   {
     name: "writeTerminalCloseAfterOwnerStop, owner NOT proven stopped (the scalars-only arm)",
     write: async (record) => {
-      await writeTerminalCloseAfterOwnerStop(record, { stopped: false, reason: "survived" });
+      await writeTerminalCloseAfterOwnerStop(
+        record,
+        { stopped: false, reason: "survived" },
+        NO_ADAPTER,
+      );
     },
     landed: (raw) => raw.closed === true,
   },
