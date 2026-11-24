@@ -1,3 +1,12 @@
+import {
+  closeSync,
+  fstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+  statSync,
+  writeSync,
+} from "node:fs";
 import fs, { type FileHandle } from "node:fs/promises";
 import { isAcpJsonRpcMessage } from "../acp/jsonrpc.js";
 import { incrementPerfCounter, measurePerf } from "../perf-metrics.js";
@@ -20,6 +29,7 @@ import {
 import {
   acquireIdentityFileLock,
   assertLockHeld,
+  judgeLockHolder,
   releaseIdentityFileLock,
   type IdentityLockPolicy,
 } from "./persistence/identity-file-lock.js";
@@ -33,6 +43,20 @@ export const STREAM_LOCK_BUDGET_MS = 20_000;
  * line, never a hole (the spike: a 4 MiB append arrived as four requests, out of order).
  */
 export const STREAM_WRITE_PART_BYTES = 1024 * 1024;
+/**
+ * The appender's wait on a LIVE foreign writer that has left a partial line (brick 3f33cc2d): async, the
+ * tail may stay unchanged this long before the writer is judged frozen; sync, the whole wait is capped
+ * at this (the sync callers are exit paths: `PROCESS_EXIT_GRACE_MS` is 1.5 s). `ACPX_TEST_STREAM_APPEND_STALL_MS`
+ * replaces both under `NODE_TEST_CONTEXT` only (`streamAppendTimingForTest`).
+ */
+export const STREAM_APPEND_STALL_MS = 5_000;
+export const STREAM_APPEND_SYNC_MAX_WAIT_MS = 1_000;
+const STREAM_APPEND_POLL_MS = 25;
+
+/** Raw bodies of the stream locks THIS process holds: a partial tail under one of them is not another writer's. */
+const heldStreamLocks = new Set<string>();
+/** Active files this process is writing in parts right now, with the lines other appenders of this process queued. */
+const multiPartInFlight = new Map<string, string[]>();
 
 // Adapter heartbeats, delivery notifications, and ACPX status chrome are
 // persisted to the stream (so the live per-session transcript + debug see them),
@@ -186,7 +210,13 @@ async function rotateSegments(sessionId: string, maxSegments: number): Promise<v
 /**
  * C10's writer rule, one open-append-close: the buffer goes out in ONE write when it fits
  * STREAM_WRITE_PART_BYTES, otherwise in parts of at most that size with a data sync after each part but
- * the last — so a large flush shows on another machine as a growing partial line, never a hole.
+ * the last — so a large flush shows on another machine as a growing partial line, never as a hole.
+ *
+ * ⚠️ For exactly the span of a multi-part flush this process is "mid-line" on `filePath`: it is listed in
+ * `multiPartInFlight`, and every line another appender of THIS process hands to `appendStreamText[Sync]`
+ * meanwhile is queued there, never written between the parts (brick 3f33cc2d). The queue goes out right
+ * after the last part, on the same handle; after a failed part, or at process exit, with the closing
+ * newline of the line that will never be finished.
  */
 export async function appendInParts(
   filePath: string,
@@ -194,6 +224,13 @@ export async function appendInParts(
   partBytes: number = STREAM_WRITE_PART_BYTES,
 ): Promise<void> {
   const handle = await fs.open(filePath, "a");
+  const multiPart = data.length > partBytes;
+  const queued: string[] = [];
+  if (multiPart) {
+    multiPartInFlight.set(filePath, queued);
+    registerExitDrain();
+  }
+  let completed = false;
   try {
     for (let from = 0; from < data.length; ) {
       const to = Math.min(data.length, from + partBytes);
@@ -207,8 +244,24 @@ export async function appendInParts(
         await holdMidLineForTest(filePath);
       }
     }
+    completed = true;
   } finally {
-    await handle.close();
+    if (multiPart) {
+      multiPartInFlight.delete(filePath);
+    }
+    try {
+      if (completed && queued.length > 0) {
+        const rest = Buffer.from(queued.join(""), "utf8");
+        for (let at = 0; at < rest.length; ) {
+          at += (await handle.write(rest, at, rest.length - at, null)).bytesWritten;
+        }
+      }
+    } finally {
+      await handle.close();
+    }
+    if (!completed && queued.length > 0) {
+      appendClosingTailSync(filePath, queued.join(""));
+    }
   }
 }
 
@@ -265,6 +318,172 @@ export async function endsMidLine(filePath: string): Promise<boolean> {
     return bytesRead === 1 && last[0] !== 0x0a;
   } finally {
     await handle.close();
+  }
+}
+
+/**
+ * ⚠️ ONE RULE FOR EVERY APPENDER TO THE STREAM: A LINE IS APPENDED ONLY AT A LINE BOUNDARY (brick 3f33cc2d,
+ * the eef0805f TE's F1). The lockless appenders (`acpx/received`, delivery terminals, `acpx/refused`, the
+ * background-task chip clear) used to `appendFile` blind: after a dead writer they fused onto its partial
+ * line and were lost; and they could land BETWEEN the parts of a live writer's multi-part flush, tearing
+ * that frame. They cannot take the stream lock: the owner's own writer holds it for its whole life (a wait
+ * on ourselves, 20 s) and the sync callers are exit paths. So, in the active file:
+ *   1. the tail ends in a newline, or the file is empty or missing → ONE write of the text;
+ *   2. the tail is mid-line and its writer is DEAD (no lock file, a holder `judgeLockHolder` calls
+ *      breakable, or a lock THIS process holds with no multi-part write of its own in flight) → ONE write of
+ *      "\n" + the text: the partial line stays one damaged line, the closing newline rides in the same write;
+ *   3. this process's own multi-part flush is in flight → the text is QUEUED behind it (`appendInParts`);
+ *   4. another process holds the lock and is live or unjudgeable → it may be between parts: WAIT for the tail
+ *      to end in a newline; if it does not grow for the stall time (sync: the hard cap) the holder is frozen,
+ *      not writing, and rule 2 applies.
+ * `SessionEventWriter.open` closes a dead predecessor's tail at acquisition, so "live holder + partial tail"
+ * can only mean rule 3 or 4. Rows in `test/stream-appenders.test.ts`.
+ */
+type AppendStep = "written" | "queued" | "wait";
+
+function streamAppendTimingForTest(env: NodeJS.ProcessEnv = process.env): number | undefined {
+  if ((env.NODE_TEST_CONTEXT ?? "") === "") {
+    return undefined;
+  }
+  const raw = env.ACPX_TEST_STREAM_APPEND_STALL_MS;
+  const value = raw === undefined ? NaN : Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function writeAllSync(fd: number, data: Buffer): void {
+  for (let at = 0; at < data.length; ) {
+    at += writeSync(fd, data, at, data.length - at);
+  }
+}
+
+/** Does the stream's last writer still live? `dead`: nobody can be finishing the partial tail. */
+function tailWriterIsDead(sessionId: string): boolean {
+  let raw: string;
+  try {
+    raw = readFileSync(eventsLockPath(sessionId), "utf8");
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
+  }
+  if (heldStreamLocks.has(raw)) {
+    return true;
+  }
+  let body: Record<string, unknown> | undefined;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    body =
+      parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : undefined;
+  } catch {
+    body = undefined;
+  }
+  return judgeLockHolder(body) === "breakable";
+}
+
+function appendStepSync(sessionId: string, text: string, force: boolean): AppendStep {
+  const active = activeEventPath(sessionId);
+  const queue = multiPartInFlight.get(active);
+  if (queue) {
+    queue.push(text);
+    return "queued";
+  }
+  const fd = openSync(active, "a+");
+  try {
+    const { size } = fstatSync(fd);
+    let midLine = false;
+    if (size > 0) {
+      const last = Buffer.alloc(1);
+      midLine = readSync(fd, last, 0, 1, size - 1) === 1 && last[0] !== 0x0a;
+    }
+    if (midLine && !force && !tailWriterIsDead(sessionId)) {
+      return "wait";
+    }
+    writeAllSync(fd, Buffer.from(midLine ? `\n${text}` : text, "utf8"));
+    return "written";
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function sizeOrZero(filePath: string): number {
+  try {
+    return statSync(filePath).size;
+  } catch {
+    return 0;
+  }
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** The synchronous appender (exit paths and CLI terminals). Waits at most `STREAM_APPEND_SYNC_MAX_WAIT_MS`. */
+export function appendStreamTextSync(sessionId: string, text: string): void {
+  const cap = streamAppendTimingForTest() ?? STREAM_APPEND_SYNC_MAX_WAIT_MS;
+  const startedAt = Date.now();
+  while (appendStepSync(sessionId, text, Date.now() - startedAt >= cap) === "wait") {
+    sleepSync(STREAM_APPEND_POLL_MS);
+  }
+}
+
+/** The asynchronous appender: the same rule, waiting without blocking the loop. */
+export async function appendStreamText(sessionId: string, text: string): Promise<void> {
+  const stallMs = streamAppendTimingForTest() ?? STREAM_APPEND_STALL_MS;
+  const active = activeEventPath(sessionId);
+  const startedAt = Date.now();
+  let lastSize = -1;
+  let lastGrowthAt = startedAt;
+  for (;;) {
+    const now = Date.now();
+    const size = sizeOrZero(active);
+    if (size !== lastSize) {
+      lastSize = size;
+      lastGrowthAt = now;
+    }
+    const frozen = now - lastGrowthAt >= stallMs || now - startedAt >= STREAM_LOCK_BUDGET_MS;
+    if (appendStepSync(sessionId, text, frozen) !== "wait") {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, STREAM_APPEND_POLL_MS));
+  }
+}
+
+/** A line that follows a writer which will never finish its own: close the tail if it is mid-line, then append. */
+function appendClosingTailSync(filePath: string, text: string): void {
+  const fd = openSync(filePath, "a+");
+  try {
+    const { size } = fstatSync(fd);
+    const last = Buffer.alloc(1);
+    const midLine = size > 0 && readSync(fd, last, 0, 1, size - 1) === 1 && last[0] !== 0x0a;
+    writeAllSync(fd, Buffer.from(midLine ? `\n${text}` : text, "utf8"));
+  } finally {
+    closeSync(fd);
+  }
+}
+
+let exitDrainRegistered = false;
+function registerExitDrain(): void {
+  if (exitDrainRegistered) {
+    return;
+  }
+  exitDrainRegistered = true;
+  process.once("exit", () => {
+    for (const [filePath, queued] of multiPartInFlight) {
+      if (queued.length > 0) {
+        try {
+          appendClosingTailSync(filePath, queued.join(""));
+        } catch {
+          // Best effort: the process is leaving.
+        }
+      }
+    }
+  });
+}
+
+/** Closes a dead writer's partial line with ONE newline (a clean, empty or missing tail is left alone). */
+async function closeDeadTail(filePath: string): Promise<void> {
+  if (await endsMidLine(filePath)) {
+    await fs.appendFile(filePath, "\n", "utf8");
   }
 }
 
@@ -328,14 +547,14 @@ export async function acquireEventsLock(
   }
   await ensureSessionDir();
   const lockPath = eventsLockPath(sessionId);
-  return {
-    filePath: lockPath,
-    content: await acquireIdentityFileLock(lockPath, { ...STREAM_LOCK_POLICY, budgetMs }),
-  };
+  const content = await acquireIdentityFileLock(lockPath, { ...STREAM_LOCK_POLICY, budgetMs });
+  heldStreamLocks.add(content);
+  return { filePath: lockPath, content };
 }
 
 async function releaseEventsLock(lock: LockHandle): Promise<void> {
   // Compare-and-delete: a writer whose lock was taken over must not delete its successor's.
+  heldStreamLocks.delete(lock.content);
   await releaseIdentityFileLock(lock.filePath, lock.content);
 }
 
@@ -356,13 +575,6 @@ export class SessionEventWriter {
   private activePath: string;
   private activeSizeBytes: number;
   private segmentCount: number;
-  /**
-   * The file whose tail this writer has already checked. A writer that finds the file it is about to
-   * append to ending mid-line closes that line with ONE newline before its first frame (see
-   * `appendActive`); after that, and after a rotation hands it a fresh empty file, every byte it writes
-   * ends in a newline and there is nothing left to check.
-   */
-  private tailCheckedPath: string | undefined;
   private closed = false;
 
   private constructor(
@@ -389,6 +601,16 @@ export class SessionEventWriter {
     options: SessionEventWriterOptions = {},
   ): Promise<SessionEventWriter> {
     const lock = await acquireEventsLock(record.acpxRecordId);
+    // ⚠️ AT ACQUISITION, under the lock just taken (the previous holder is released or proven dead, so no
+    // live multi-part write exists): a dead predecessor's partial line is closed with ONE newline NOW, not
+    // at the first append. From here on, a partial tail under a live holder can only be that holder's own
+    // in-flight part, which is what lets the lockless appenders (`appendStreamText`) tell the two apart.
+    try {
+      await closeDeadTail(activeEventPath(record.acpxRecordId));
+    } catch (error) {
+      await releaseEventsLock(lock);
+      throw error;
+    }
     const maxSegmentBytes =
       options.maxSegmentBytes ??
       record.eventLog.max_segment_bytes ??
@@ -479,26 +701,11 @@ export class SessionEventWriter {
   }
 
   /**
-   * ⚠️ A DEAD WRITER'S PARTIAL LINE MUST NOT SWALLOW THIS WRITER'S FIRST FRAME (brick eef0805f; the A8 TE's
-   * F1). A writer killed mid-line leaves a tail with no newline; the next append would land on that line
-   * and a reader that splits on newline would read both as one damaged line, losing a good frame. So before
-   * its FIRST append to a file, under the stream lock it holds, the writer looks at the last byte and, if
-   * it is not a newline, puts ONE newline in front of its own bytes: the partial line stays a single damaged
-   * line and every good frame stays readable. The newline rides in the SAME write as the frames (C10: one
-   * write per flush), and it is added only after a look at the tail — a tail that already ends in a newline
-   * gets none (no empty line), an empty or missing file is untouched, and it never cuts a COMPLETE line
-   * (C3.5: a complete line is only ever followed, never changed). Rows in `test/stream-partial-line.test.ts`.
+   * One write per flush (C10). A dead writer's partial tail was already closed at `open` (see there), so
+   * every byte this writer writes starts at a line boundary and ends in a newline.
    */
   private async appendActive(lines: Buffer): Promise<void> {
-    let data = lines;
-    if (this.tailCheckedPath !== this.activePath) {
-      if (await endsMidLine(this.activePath)) {
-        data = Buffer.concat([Buffer.from("\n"), lines]);
-        this.activeSizeBytes += 1;
-      }
-    }
-    await appendInParts(this.activePath, data);
-    this.tailCheckedPath = this.activePath;
+    await appendInParts(this.activePath, lines);
   }
 
   /** The record's bookkeeping for one frame that is now on disk. */
@@ -552,6 +759,49 @@ export class SessionEventWriter {
   }
 }
 
+/** Damaged lines already reported by this process, `<file>:<byte offset>`: a re-read of the same file stays quiet. */
+const reportedDamagedLines = new Set<string>();
+
+/**
+ * Parses one stream file's text the way every acpx reader does, and COUNTS AND LOGS what it skips (C10, A-63):
+ * an unparsable line is a writer's partial line, or a frame a frozen writer's appender ended. It is skipped,
+ * never silently: a stderr line names the file, how many lines and the byte offset of each new one, and the
+ * `session.events.damaged_line` perf counter counts them. A line is reported once per process.
+ */
+export function parseStreamPayload(payload: string, filePath: string): AcpJsonRpcMessage[] {
+  const events: AcpJsonRpcMessage[] = [];
+  const fresh: number[] = [];
+  let damaged = 0;
+  let offset = 0;
+  for (const line of payload.split("\n")) {
+    const lineOffset = offset;
+    offset += Buffer.byteLength(line, "utf8") + 1;
+    if (line.trim().length === 0) {
+      continue;
+    }
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (isAcpJsonRpcMessage(parsed)) {
+        events.push(parsed);
+      }
+    } catch {
+      damaged += 1;
+      incrementPerfCounter("session.events.damaged_line");
+      if (!reportedDamagedLines.has(`${filePath}:${lineOffset}`)) {
+        reportedDamagedLines.add(`${filePath}:${lineOffset}`);
+        fresh.push(lineOffset);
+      }
+    }
+  }
+  if (fresh.length > 0) {
+    process.stderr.write(
+      `[acpx] stream file ${filePath}: skipped ${damaged} damaged line(s) ` +
+        `(unparsable, a writer's partial line); new at byte offset ${fresh.join(", ")}\n`,
+    );
+  }
+  return events;
+}
+
 export async function listSessionEvents(sessionId: string): Promise<AcpJsonRpcMessage[]> {
   const maxSegments = await resolveSessionMaxSegments(sessionId);
   const files: string[] = [];
@@ -570,18 +820,7 @@ export async function listSessionEvents(sessionId: string): Promise<AcpJsonRpcMe
 
   const events: AcpJsonRpcMessage[] = [];
   for (const filePath of files) {
-    const payload = await fs.readFile(filePath, "utf8");
-    const lines = payload.split("\n").filter((line) => line.trim().length > 0);
-    for (const line of lines) {
-      try {
-        const parsed: unknown = JSON.parse(line);
-        if (isAcpJsonRpcMessage(parsed)) {
-          events.push(parsed);
-        }
-      } catch {
-        // Skip malformed lines to keep event listing resilient.
-      }
-    }
+    events.push(...parseStreamPayload(await fs.readFile(filePath, "utf8"), filePath));
   }
 
   return events;

@@ -1,4 +1,3 @@
-import { appendFile } from "node:fs/promises";
 import {
   followUntilQuietSync,
   formatSurvivors,
@@ -11,7 +10,7 @@ import {
   type ReapSnapshot,
   type Signaller,
 } from "../../process-tree-reap.js";
-import { sessionEventActivePath } from "../../session/event-log.js";
+import { appendStreamText } from "../../session/events.js";
 import { resolveSessionRecord } from "../../session/persistence.js";
 
 /**
@@ -174,7 +173,7 @@ export async function appendClearedBackgroundTasksLine(
     method: "_claude/backgroundTasks",
     params: { sessionId: acpSessionId, at: new Date().toISOString(), tasks: [] },
   })}\n`;
-  await appendFile(sessionEventActivePath(sessionId), line, "utf8").catch(() => {});
+  await appendStreamText(sessionId, line).catch(() => {});
 }
 
 /**
