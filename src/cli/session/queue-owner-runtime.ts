@@ -11,6 +11,7 @@ import { QueueConnectionError, SessionClosedError } from "../../errors.js";
 import { checkpointPerfMetricsCapture } from "../../perf-metrics-capture.js";
 import { incrementPerfCounter, setPerfGauge } from "../../perf-metrics.js";
 import { assertOwnerEntryInOwnPod } from "../../pod/owner-pod.js";
+import { createPodReleaseStalenessProbe, inAgentPod } from "../../pod/release-staleness.js";
 import { promptToDisplayText } from "../../prompt-content.js";
 import { bindRecordToDefaultAccount } from "../../runtime/engine/default-account-binding.js";
 import { applyLifecycleSnapshotToRecord } from "../../runtime/engine/lifecycle.js";
@@ -180,6 +181,41 @@ function readDeployedBuildToken(): string | undefined {
   }
   const hash = readEntryPointHash();
   return hash !== undefined ? `entry:${hash}` : undefined;
+}
+
+/**
+ * The owner's deploy-staleness probe, captured at the owner's start and asked at each idle check.
+ *
+ * IN AN AGENT POD (C9, block A11) the token is by release — `releases.acpx` is not the release the box's
+ * `acpx` link points to (`src/pod/release-staleness.ts`) — and the info.json / entry-hash token below is
+ * never consulted. EVERYWHERE ELSE (the control pod, a workbench, a rig, pod mode off) the body is the
+ * path-1 token exactly as it was. The arm is chosen by `inAgentPod`, not by the placement switch, so no
+ * host that is not an agent pod can reach the release arm.
+ */
+export function createDeployStalenessProbe(
+  env: NodeJS.ProcessEnv = process.env,
+): () => Promise<boolean> {
+  if (inAgentPod(env)) {
+    const podProbe = createPodReleaseStalenessProbe(env);
+    return async () => podProbe();
+  }
+  // Deploy-staleness signal (Path 1, W13-24-10). Capture the owner's build token
+  // at spawn; re-read it at each idle check. A difference means a deploy happened
+  // while this owner was alive (it is running OUTDATED code) — the ONLY condition
+  // under which a quiet, current-code owner may be recycled. Never a liveness check.
+  const ownerBuildToken = readDeployedBuildToken();
+  return async () => {
+    // Safe default (North Star): no resolvable signal at spawn OR now → never
+    // recycle, stay warm. We only recycle on a positive build difference.
+    if (ownerBuildToken === undefined) {
+      return false;
+    }
+    const current = readDeployedBuildToken();
+    if (current === undefined) {
+      return false;
+    }
+    return current !== ownerBuildToken;
+  };
 }
 
 async function submitToRunningOwner(
@@ -1316,19 +1352,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   // at spawn; re-read it at each idle check. A difference means a deploy happened
   // while this owner was alive (it is running OUTDATED code) — the ONLY condition
   // under which a quiet, current-code owner may be recycled. Never a liveness check.
-  const ownerBuildToken = readDeployedBuildToken();
-  const deployedBuildDiffersFromOwner = async (): Promise<boolean> => {
-    // Safe default (North Star): no resolvable signal at spawn OR now → never
-    // recycle, stay warm. We only recycle on a positive build difference.
-    if (ownerBuildToken === undefined) {
-      return false;
-    }
-    const current = readDeployedBuildToken();
-    if (current === undefined) {
-      return false;
-    }
-    return current !== ownerBuildToken;
-  };
+  const deployedBuildDiffersFromOwner = createDeployStalenessProbe();
 
   const applyPendingCancel = async (): Promise<boolean> => {
     return await turnController.applyPendingCancel();

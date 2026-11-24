@@ -95,7 +95,7 @@ function placementOf(env: NodeJS.ProcessEnv): "pool" | "home" | undefined {
 }
 
 /** `NV_RUNTIME_RELEASES` is the C9 object `{"<tool>":"<release>"}`; the lease names acpx's. */
-function acpxReleaseOf(env: NodeJS.ProcessEnv): string | undefined {
+export function acpxReleaseOf(env: NodeJS.ProcessEnv): string | undefined {
   const raw = podFactValue("NV_RUNTIME_RELEASES", hostFacts(env));
   try {
     const release = (JSON.parse(raw ?? "null") as { acpx?: unknown } | null)?.acpx;

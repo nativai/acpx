@@ -999,7 +999,7 @@ export type ResolveReleasesResult =
   | { ok: false; tool: string };
 
 /** `.releases/<tool>/<name>` (relative or absolute) → `<name>`; undefined for any other shape. */
-function releaseNameOf(target: string, tool: string): string | undefined {
+export function releaseNameOf(target: string, tool: string): string | undefined {
   const parts = target.split("/").filter((part) => part.length > 0);
   const name = parts.at(-1);
   const shaped = parts.at(-3) === ".releases" && parts.at(-2) === tool;
