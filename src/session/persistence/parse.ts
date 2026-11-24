@@ -1351,9 +1351,11 @@ function parseMetadata(raw: unknown): Record<string, string> | undefined | null 
   }
   const parsed: Record<string, string> = {};
   for (const [key, value] of Object.entries(record)) {
-    if (typeof key !== "string" || key.length === 0) {
-      return null;
-    }
+    // ⚠️ DO NOT REJECT AN EMPTY (OR ANY OTHER RULE-BREAKING) KEY HERE. A carried `metadata` key is kept
+    // unchanged, never refused and never renamed (A-65 correction, C3.5 (iv) rule 3), and a `null` from this
+    // function rejects the WHOLE record: every verb then reads the session as missing (`Session not found`,
+    // rc 4 — the A-65 correction TE's F-1, a hand-edited `""` key). Only a non-string VALUE is malformed.
+    // `test/metadata-key-rule-cli.test.ts` row 65.4 (empty key) carries the case.
     if (typeof value !== "string") {
       return null;
     }

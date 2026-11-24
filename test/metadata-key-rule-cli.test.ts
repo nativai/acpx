@@ -301,6 +301,78 @@ test(
   },
 );
 
+/** The empty key alone, planted as a hand edit would: not under the lock helper's `CARRIED` pair. */
+async function plantEmptyKeyUnderLock(homeDir: string, id: string): Promise<void> {
+  const file = recordFile(homeDir, id);
+  await withRecordFileLock(file, async () => {
+    const raw = JSON.parse(fs.readFileSync(file, "utf8")) as Raw;
+    raw.metadata = { ...raw.metadata, "": "empty-key-value" };
+    const temporary = `${file}.plant.tmp`;
+    fs.writeFileSync(temporary, `${JSON.stringify(raw)}\n`);
+    fs.renameSync(temporary, file);
+  });
+  assert.equal(readRaw(homeDir, id).metadata?.[""], "empty-key-value", "positive control");
+}
+
+test(
+  "65.4 empty key: a record with an empty-string metadata key stays reachable — a turn, a set-*, a close, the index and `show` all work and the key is byte-equal",
+  { timeout: ROW_TIMEOUT_MS },
+  async () => {
+    await withTempHome("acpx-a65m-empty-", async (homeDir) => {
+      const id = await newSession(homeDir);
+      assert.equal((await prompt(homeDir, id, "echo hello").done).code, 0);
+      await plantEmptyKeyUnderLock(homeDir, id);
+      const keep = (label: string): void =>
+        assert.equal(readRaw(homeDir, id).metadata?.[""], "empty-key-value", `${label}: the key`);
+
+      const shown = await run(homeDir, [
+        "--format",
+        "json",
+        "sessions",
+        "show",
+        "--session-id",
+        id,
+      ]);
+      assert.equal(shown.code, 0, `show: ${shown.stdout}${shown.stderr}`);
+      assert.equal((await prompt(homeDir, id, "echo again").done).code, 0);
+      keep("turn");
+      const set = await run(homeDir, [
+        "sessions",
+        "set-metadata",
+        "te_own_key",
+        "own-value",
+        "--session-id",
+        id,
+      ]);
+      assert.equal(set.code, 0, `set-metadata: ${set.stdout}${set.stderr}`);
+      assert.equal(readRaw(homeDir, id).metadata?.te_own_key, "own-value", "its own change");
+      keep("set-metadata");
+      const reindexed = await run(homeDir, ["sessions", "reindex"]);
+      assert.equal(reindexed.code, 0, `reindex: ${reindexed.stdout}${reindexed.stderr}`);
+      const listed = await run(homeDir, ["--format", "json", "sessions", "list"]);
+      assert.equal(listed.code, 0, `list: ${listed.stdout}${listed.stderr}`);
+      assert.ok(listed.stdout.includes(id), "control: the session is listed");
+      const closed = await run(homeDir, ["sessions", "close", "--session-id", id]);
+      assert.equal(closed.code, 0, `close: ${closed.stdout}${closed.stderr}`);
+      assert.equal(readRaw(homeDir, id).closed, true, "control: the close landed");
+      keep("close");
+      const archive = path.join(homeDir, "out.acpx.json");
+      const exported = await run(homeDir, [
+        "sessions",
+        "export",
+        "--session-id",
+        id,
+        "--output",
+        archive,
+      ]);
+      assert.equal(exported.code, 0, `export: ${exported.stdout}${exported.stderr}`);
+      const state = (JSON.parse(fs.readFileSync(archive, "utf8")) as { session: { state: Raw } })
+        .session.state;
+      assert.equal(state.metadata?.[""], "empty-key-value", "export bundle: the key");
+    });
+  },
+);
+
 // ---------------------------------------------------------------------------------------------
 // 65.5 — acpx refuses a key of its own that breaks the rule, before any write
 // ---------------------------------------------------------------------------------------------
@@ -392,3 +464,24 @@ test(
     });
   },
 );
+
+test(
+  '65.5 empty key: `set-metadata "" x` and `--metadata =v` are refused at input, nothing written or created',
+  { timeout: ROW_TIMEOUT_MS },
+  async () => {
+    await withTempHome("acpx-a65m-empty-input-", async (homeDir) => {
+      const id = await newSession(homeDir);
+      const filesBefore = recordFiles(homeDir);
+      const before = sha256(recordFile(homeDir, id));
+      const set = await run(homeDir, ["sessions", "set-metadata", "", "x", "--session-id", id]);
+      assert.notEqual(set.code, 0, `${set.stdout}${set.stderr}`);
+      const created = await run(homeDir, [
+        "--format",
+        "json",
+        "sessions",
+        "new",
+        "--metadata",
+        "=v",
+      ]);
+      assert.notEqual(created.code, 0, `${created.stdout}${created.stderr}`);
+      assert.equal(sha256

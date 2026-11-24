@@ -34,6 +34,9 @@ const CARRIED: Readonly<Record<string, string>> = {
   te_meta_ünï: "unicode-value",
   "te-meta": "dash-value",
   "Te Meta 1": "spaces-value",
+  // The empty key: `parseMetadata` used to reject the WHOLE record for it, so the session read as missing
+  // (the A-65 correction TE's F-1). Carried like any other rule-breaking key.
+  "": "empty-key-value",
   te_meta_snake: "snake-value",
 };
 
