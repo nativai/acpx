@@ -86,8 +86,8 @@ test("readPersistedLifecycle reports the disk record's unknown keys (the source 
     await seeded(homeDir, "lifecycle");
     const lifecycle = await readPersistedLifecycle("lifecycle");
     assert.deepEqual(
-      Object.keys(lifecycle?.unknownTopLevelFields ?? {}).sort(),
-      Object.keys(PLANTED).sort(),
+      Object.keys(lifecycle?.unknownTopLevelFields ?? {}).toSorted(),
+      Object.keys(PLANTED).toSorted(),
     );
   });
 });
