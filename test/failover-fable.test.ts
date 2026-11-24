@@ -177,6 +177,9 @@ function sessionRecord(subscription: string, model: string): SessionRecord {
     acpxRecordId: "rec-fable",
     cwd: "/work/fable",
     agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+    // A record always carries its messages (parse.ts rejects one without the array); the record
+    // write path reads them (A-60 appendOwnEntries, brick 54b21963).
+    messages: [] as SessionRecord["messages"],
     acpx: { session_options: { subscription, model } },
   } as SessionRecord;
 }
