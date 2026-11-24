@@ -593,6 +593,8 @@ const VERBATIM_FLAGS: Readonly<Record<string, string>> = {
   "sessions archive --exclude-ids":
     "sessions archive: the scheduler's file on the control pod (control-pod only)",
   "sessions archive --manifest-out": "sessions archive: control-pod only",
+  "sessions unparsable-leases --records-file":
+    "sessions unparsable-leases: control-pod only (A-71), an operator's path there",
   "sessions archive --cat": "sessions archive: control-pod only",
   "agent-folders migrate --pool":
     "agent-folders migrate: an operator's pool directory on the control pod",

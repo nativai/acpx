@@ -558,6 +558,7 @@ const VERBATIM_PATH_FLAGS: Readonly<Record<string, string>> = {
   "--backup-dir": "sessions repair-account-seam: an operator's directory on the control pod",
   "--exclude-ids": "sessions archive: the scheduler's file on the control pod (control-pod only)",
   "--manifest-out": "sessions archive: control-pod only",
+  "--records-file": "sessions unparsable-leases: control-pod only (A-71), an operator's path there",
   "--to": "sessions archive: control-pod only",
   "--cat": "sessions archive: control-pod only",
   "--input-file": "flow run: local, never passed",
