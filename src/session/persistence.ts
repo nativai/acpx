@@ -42,6 +42,7 @@ export {
   rollbackTemplateSlug,
   sessionBaseDir,
   sessionRecordFileName,
+  writeCloseScalarsOnFreshRecord,
   writeSessionRecord,
   writeSessionRecordAtBoundary,
   writeSessionRecordAtBoundaryNow,
