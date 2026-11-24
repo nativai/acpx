@@ -306,6 +306,8 @@ test("69.6 a REAL set of each of the six record-edit keys, identity + switch OFF
   try {
     setProof(api, "exists");
     const rig = makeRig("a69k-held", true, api.url);
+    // One body failing must not hide the next: each body's first failing key is collected, then all are asserted.
+    const failures: string[] = [];
     for (const [label, raw] of HELD_BODIES) {
       const id = await createSession(rig, `a69k-held-${label.replace(/\W/g, "")}`);
       plantTranscript(rig, id);
@@ -313,25 +315,34 @@ test("69.6 a REAL set of each of the six record-edit keys, identity + switch OFF
       const leaseBytes = fs.readFileSync(lease, "utf8");
       const recordBytes = fs.readFileSync(recordFileOf(rig, id), "utf8");
       const opsBytes = readOps(rig);
-      for (const { key, argv } of KEYS) {
-        const result = await runCli(rig, argv(id));
-        const where = `${label} / set ${key}: rc ${result.status} ${result.stderr.slice(0, 300)}`;
-        assert.equal(result.status, 75, where);
-        assert.match(result.stderr.split("\n")[0] ?? "", TURNOVER_TOKEN, where);
-        assert.equal(fs.readFileSync(lease, "utf8"), leaseBytes, `lease: ${where}`);
-        assert.equal(
-          fs.readFileSync(recordFileOf(rig, id), "utf8"),
-          recordBytes,
-          `record: ${where}`,
-        );
-        assert.equal(readOps(rig), opsBytes, `an adapter operation ran: ${where}`);
-        assert.equal(
-          fs.existsSync(transcriptIn(rig, id, "subB")),
-          false,
-          `a transcript was copied: ${where}`,
+      try {
+        for (const { key, argv } of KEYS) {
+          const result = await runCli(rig, argv(id));
+          const where = `${label} / set ${key}: rc ${result.status} ${result.stderr.slice(0, 300)}`;
+          assert.equal(result.status, 75, where);
+          assert.match(result.stderr.split("\n")[0] ?? "", TURNOVER_TOKEN, where);
+          assert.equal(fs.readFileSync(lease, "utf8"), leaseBytes, `lease: ${where}`);
+          assert.equal(
+            fs.readFileSync(recordFileOf(rig, id), "utf8"),
+            recordBytes,
+            `record: ${where}`,
+          );
+          assert.equal(readOps(rig), opsBytes, `an adapter operation ran: ${where}`);
+          assert.equal(
+            fs.existsSync(transcriptIn(rig, id, "subB")),
+            false,
+            `a transcript was copied: ${where}`,
+          );
+        }
+      } catch (error) {
+        failures.push(
+          `${label}: ${String((error as Error).message)
+            .split("\n")[0]
+            .slice(0, 160)}`,
         );
       }
     }
+    assert.deepEqual(failures, [], "every held body refuses on every key");
   } finally {
     await api.close();
   }
