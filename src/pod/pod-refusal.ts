@@ -28,6 +28,21 @@ export type AgentCapWhy = (typeof AGENT_CAP_WHYS)[number];
 
 const AGENT_CAP_RETRY_AFTER_S = 60;
 
+/**
+ * The three sentence tails that PROMISE a hold (brick ee9980e3). A promise is true for exactly one caller: atrium's own
+ * delivery spawn (`--message-id`), which holds the item on the token line and exit 75. Every other caller of a
+ * routed call — a shell on the control pod, an ssh-remote script, a person — has no holder, so
+ * {@link withoutQueuePromise} swaps the tail for {@link notQueuedTail} before the refusal is printed.
+ */
+const POD_STARTING_QUEUED_TAIL = "the message stays queued and is delivered when the pod is ready.";
+const AGENT_CAP_QUEUED_TAIL = "the message stays queued until room frees.";
+const ADMISSION_BUSY_QUEUED_TAIL = "the message stays queued and is delivered when they answer.";
+const QUEUED_TAILS = [
+  POD_STARTING_QUEUED_TAIL,
+  AGENT_CAP_QUEUED_TAIL,
+  ADMISSION_BUSY_QUEUED_TAIL,
+] as const;
+
 /** C7.2: 3 for scheduling, starting, turnover; 15 for pulling (a pull took 43 s); 60 for scaling-up. */
 export function podStartingRetryAfterS(phase: PodStartingPhase): number {
   if (phase === "pulling") {
@@ -59,8 +74,8 @@ export function podStartingRefusal(input: {
   const sentence =
     input.wake === undefined
       ? `acpx: the box's utility pod ${PHASE_SENTENCE[input.phase]}. Nothing was run; this is not available right now.`
-      : `acpx: the session's agent pod ${PHASE_SENTENCE[input.phase]}. Nothing was run; the message ` +
-        `stays queued and is delivered when the pod is ready.`;
+      : `acpx: the session's agent pod ${PHASE_SENTENCE[input.phase]}. Nothing was run; ` +
+        POD_STARTING_QUEUED_TAIL;
   return new CapacityRefusedError({
     tokenLine,
     sentence,
@@ -71,12 +86,38 @@ export function podStartingRefusal(input: {
       retryAfterS,
       queuedAhead: 0,
       message: sentence,
+      ...(input.wake === undefined ? {} : { queued: true }),
       ...(input.wake === undefined
         ? {}
         : { wake: { sessionId: input.sessionId ?? input.wake, seatId: input.seatId ?? null } }),
       pod: { phase: input.phase },
     },
   });
+}
+
+/** The sentence of an `agent_cap` refusal, and whether it promises a hold (a wake, never a create's waiting line). */
+function agentCapSentence(input: { live: number; cap: number; why: AgentCapWhy; wake?: string }): {
+  sentence: string;
+  promisesHold: boolean;
+} {
+  const state = `${input.live} of ${input.cap} in use; ${input.why}`;
+  // `waiting-line` is a CREATE's refusal only (C7.2): no message waits and nothing was created.
+  if (input.why === "waiting-line") {
+    return {
+      sentence: `acpx: the box's line of sessions waiting for a pod is full (${state}). Nothing was created; try again in a minute.`,
+      promisesHold: false,
+    };
+  }
+  if (input.wake === undefined) {
+    return {
+      sentence: `acpx: the box's utility pod cannot be started now (${state}). Nothing was started; this is not available right now.`,
+      promisesHold: false,
+    };
+  }
+  return {
+    sentence: `acpx: no agent pod can be started on this box now (${state}). Nothing was started; ${AGENT_CAP_QUEUED_TAIL}`,
+    promisesHold: true,
+  };
 }
 
 export function agentCapRefusal(input: {
@@ -93,14 +134,7 @@ export function agentCapRefusal(input: {
     `retry_after_s=${AGENT_CAP_RETRY_AFTER_S} live=${input.live} cap=${input.cap} ` +
     `box=${input.box} why=${input.why}` +
     (input.wake === undefined ? "" : ` wake=${input.wake}`);
-  const state = `${input.live} of ${input.cap} in use; ${input.why}`;
-  // `waiting-line` is a CREATE's refusal only (C7.2): no message waits and nothing was created.
-  const sentence =
-    input.why === "waiting-line"
-      ? `acpx: the box's line of sessions waiting for a pod is full (${state}). Nothing was created; try again in a minute.`
-      : input.wake === undefined
-        ? `acpx: the box's utility pod cannot be started now (${state}). Nothing was started; this is not available right now.`
-        : `acpx: no agent pod can be started on this box now (${state}). Nothing was started; the message stays queued until room frees.`;
+  const { sentence, promisesHold } = agentCapSentence(input);
   return new CapacityRefusedError({
     tokenLine,
     sentence,
@@ -111,6 +145,7 @@ export function agentCapRefusal(input: {
       retryAfterS: AGENT_CAP_RETRY_AFTER_S,
       queuedAhead: 0,
       message: sentence,
+      ...(promisesHold ? { queued: true } : {}),
       ...(input.wake === undefined
         ? {}
         : { wake: { sessionId: input.sessionId ?? input.wake, seatId: input.seatId ?? null } }),
@@ -134,11 +169,49 @@ export function admissionBusyRefusal(
     ? "acpx: the broker or the Kubernetes API server did not answer, so the box's utility pod could not be checked or started. " +
       "Nothing was started; this is not available right now."
     : "acpx: the broker or the Kubernetes API server did not answer, so the session's agent pod could not be checked or started. " +
-      "Nothing was started; the message stays queued and is delivered when they answer.";
+      `Nothing was started; ${ADMISSION_BUSY_QUEUED_TAIL}`;
   return new CapacityRefusedError({
     tokenLine: base.stderrLine,
     sentence,
-    detail: { ...base.capacityRefusal, tokenLine: base.stderrLine, message: sentence },
+    detail: {
+      ...base.capacityRefusal,
+      tokenLine: base.stderrLine,
+      message: sentence,
+      ...(options.utility ? {} : { queued: true }),
+    },
+  });
+}
+
+/**
+ * brick ee9980e3 (C7.2 sentence rule): a refusal whose sentence promises a hold ("the message stays queued …",
+ * `detail.queued === true`) is true only when atrium's delivery runner is the caller — it holds the item on
+ * the token line and exit 75, under the message id it passed (`--message-id`). For ANY other caller nothing
+ * holds the message, so the promise is replaced by the plain fact: NOT queued, NOT sent, how to retry.
+ *
+ * The TOKEN LINE, the exit code, the reason and every other field are untouched, byte for byte — atrium and
+ * scripts parse them. Only the sentence and `detail.message` change, and `detail.queued` becomes `false`.
+ * A refusal that promises nothing (a utility pod, the waiting line, a non-capacity error) is returned as it is.
+ */
+export function withoutQueuePromise(error: unknown, call: { prompt: boolean }): unknown {
+  if (!(error instanceof CapacityRefusedError) || error.capacityRefusal.queued !== true) {
+    return error;
+  }
+  const detail = error.capacityRefusal;
+  const sentence = error.message.slice(error.stderrLine.length + 1);
+  const tail = QUEUED_TAILS.find((candidate) => sentence.endsWith(candidate));
+  if (tail === undefined) {
+    return error;
+  }
+  const what = call.prompt ? "message" : "call";
+  const retry = detail.retryAfterS;
+  const rewritten =
+    sentence.slice(0, sentence.length - tail.length) +
+    `the ${what} was NOT queued and NOT sent. Run the same command again in about ${retry} s; ` +
+    `a message that must wait for room goes through atrium (send-message.sh), which holds it.`;
+  return new CapacityRefusedError({
+    tokenLine: error.stderrLine,
+    sentence: rewritten,
+    detail: { ...detail, message: rewritten, queued: false },
   });
 }
 
