@@ -13,10 +13,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import test from "node:test";
 import type { SessionCloseAdapterKill } from "../src/cli/session/session-control.js";
-import {
-  adapterProvedGone,
-  writeTerminalCloseAfterOwnerStop,
-} from "../src/cli/session/terminal-close.js";
+import { writeTerminalCloseAfterOwnerStop } from "../src/cli/session/terminal-close.js";
 import { captureRecordPidIdentity, type RecordPidIdentity } from "../src/process-identity.js";
 import { resolveSessionRecord, writeSessionRecord } from "../src/session/persistence.js";
 import type { SessionRecord } from "../src/types.js";
@@ -115,7 +112,6 @@ for (const { arm, kill, clears } of KILLS) {
         assert.deepEqual(after.pid_identity, identity, "…and its identity, byte for byte");
         assert.equal(closed.record.pid, ADAPTER_PID, "the returned record agrees");
       }
-      assert.equal(adapterProvedGone(kill), clears, "the proof predicate names the same arms");
     });
   });
 }
@@ -236,26 +232,5 @@ test("64.2 (control): an owner proven STOPPED still clears the adapter pid and i
     assert.equal(after.closed, true);
     assert.equal(after.pid, undefined, "the terminal write of a stopped owner clears the pid");
     assert.equal(after.pid_identity, undefined, "…and the identity");
-  });
-});
-
-test("64.2 (predicate): only signalled, gone and foreign prove an adapter gone", () => {
-  const verdicts = {
-    signalled: adapterProvedGone({ signalled: true }),
-    gone: adapterProvedGone({ signalled: false, reason: "gone" }),
-    foreign: adapterProvedGone({ signalled: false, reason: "foreign" }),
-    noIdentity: adapterProvedGone({ signalled: false, reason: "no-identity" }),
-    unverified: adapterProvedGone({ signalled: false, reason: "unverified" }),
-    noPid: adapterProvedGone({ signalled: false, reason: "no-pid" }),
-    selfClose: adapterProvedGone({ signalled: false, reason: "self-close" }),
-  };
-  assert.deepEqual(verdicts, {
-    signalled: true,
-    gone: true,
-    foreign: true,
-    noIdentity: false,
-    unverified: false,
-    noPid: false,
-    selfClose: false,
   });
 });

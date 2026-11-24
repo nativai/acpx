@@ -70,7 +70,7 @@ export type ClosedAdapter = {
  * on a verified identity) or found it gone (`gone`, `foreign`: the pid no longer names that process).
  * `no-pid`, `no-identity` and `unverified` prove nothing; `self-close` never reaches this arm.
  */
-export function adapterProvedGone(kill: SessionCloseAdapterKill): boolean {
+function adapterProvedGone(kill: SessionCloseAdapterKill): boolean {
   return kill.signalled || kill.reason === "gone" || kill.reason === "foreign";
 }
 
