@@ -1,8 +1,9 @@
 import { assertPersistedKeyPolicy } from "../../persisted-key-policy.js";
 import type { SessionMessage, SessionRecord, SubagentRef } from "../../types.js";
-import { SESSION_RECORD_SCHEMA } from "../../types.js";
+import { SESSION_RECORD_SCHEMA, UNKNOWN_TOP_LEVEL_FIELDS } from "../../types.js";
 import { getLoggedMessageCount } from "../messages-log-bookkeeping.js";
 import { normalizeRuntimeSessionId } from "../runtime-session-id.js";
+import { KNOWN_TOP_LEVEL_KEYS } from "./parse.js";
 import { seatFieldsToPersistedRecord } from "./seat-fields.js";
 
 function serializeSubagentRef(ref: SubagentRef): Record<string, unknown> {
@@ -23,6 +24,12 @@ export type SerializeSessionRecordForDiskOptions = {
    * `messages` choice above; the writer's own in-memory window is then never what lands.
    */
   inlineMessages?: readonly SessionMessage[] | undefined;
+  /**
+   * The unknown top-level keys to write (A-65, C3.5 (iv)), decided by the writer under the record's lock:
+   * the keys of the record as it stands on disk, over any the in-memory copy carried. Replaces the carrier
+   * on the record (`UNKNOWN_TOP_LEVEL_FIELDS`), which stays the source for a writer that reads no disk.
+   */
+  unknownTopLevelFields?: Readonly<Record<string, unknown>> | undefined;
 };
 
 /**
@@ -132,6 +139,38 @@ export function serializeSessionRecordForDisk(
       : undefined,
   };
 
+  // The key policy checks the keys THIS release writes, and only those: a carried key is a newer release's
+  // and is never a reason to refuse the write (A-65), whatever its spelling.
   assertPersistedKeyPolicy(persisted);
+  return withUnknownTopLevelFields(
+    persisted,
+    options.unknownTopLevelFields ?? canonical[UNKNOWN_TOP_LEVEL_FIELDS],
+  );
+}
+
+/**
+ * Appends the carried keys after the known ones. A carried key this release writes itself is skipped — the
+ * known value wins, including a known field that is deliberately `undefined` (cleared) — so a stale carrier
+ * can never bring a cleared field back. The check is against `persisted`'s own keys (an `undefined` value
+ * is still a key there, until `JSON.stringify`), not against a second list.
+ */
+function withUnknownTopLevelFields(
+  persisted: Record<string, unknown>,
+  carried: Readonly<Record<string, unknown>> | undefined,
+): Record<string, unknown> {
+  if (carried === undefined) {
+    return persisted;
+  }
+  for (const [key, value] of Object.entries(carried)) {
+    if (KNOWN_TOP_LEVEL_KEYS.has(key) || Object.hasOwn(persisted, key)) {
+      continue;
+    }
+    Object.defineProperty(persisted, key, {
+      value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
   return persisted;
 }

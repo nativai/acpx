@@ -29,10 +29,10 @@ import type { SessionAcpxState, SessionRecord } from "../src/types.js";
 // matters does NOT live in these filters — it lives in RECORD_FIELD_PLAN's own
 // `satisfies { [K in keyof Required<SessionRecord>]: FieldPlan }`, which fails to
 // compile when a field is added unclassified.
-const PERSISTED_TRUE_KEYS = (Object.keys(RECORD_FIELD_PLAN) as (keyof SessionRecord)[]).filter(
+const PERSISTED_TRUE_KEYS = (Object.keys(RECORD_FIELD_PLAN) as Exclude<keyof SessionRecord, symbol>[]).filter(
   (key) => RECORD_FIELD_PLAN[key].persisted,
 );
-const PERSISTED_FALSE_KEYS = (Object.keys(RECORD_FIELD_PLAN) as (keyof SessionRecord)[]).filter(
+const PERSISTED_FALSE_KEYS = (Object.keys(RECORD_FIELD_PLAN) as Exclude<keyof SessionRecord, symbol>[]).filter(
   (key) => !RECORD_FIELD_PLAN[key].persisted,
 );
 
@@ -47,7 +47,7 @@ const PERSISTED_FALSE_KEYS = (Object.keys(RECORD_FIELD_PLAN) as (keyof SessionRe
  * top-level fields survive; `acpx.*` internal content fidelity is
  * `persisted-acpx-contract.ts`'s job, not duplicated here.
  */
-const CONTENT_CHECK_EXEMPT = new Set<keyof SessionRecord>(["acpx"]);
+const CONTENT_CHECK_EXEMPT = new Set<Exclude<keyof SessionRecord, symbol>>(["acpx"]);
 
 /**
  * A FULLY POPULATED SessionRecord — every `persisted: true` field carries a

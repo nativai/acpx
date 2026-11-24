@@ -50,6 +50,7 @@
  */
 
 import type { SessionRecord } from "../../types.js";
+import { UNKNOWN_TOP_LEVEL_FIELDS } from "../../types.js";
 
 export type FieldPlan =
   | { readonly persisted: true }
@@ -115,4 +116,12 @@ export const RECORD_FIELD_PLAN = {
   holderOrdinal: { persisted: true },
   holderActive: { persisted: true },
   parentSeatId: { persisted: true },
+  // A-65: a SYMBOL key, so `Object.keys(RECORD_FIELD_PLAN)` (what the round-trip guard walks) never lists it.
+  // Its own guarantee is `test/unknown-top-level-fields.test.ts`: the keys it holds are written back unchanged.
+  [UNKNOWN_TOP_LEVEL_FIELDS]: {
+    persisted: false,
+    reason:
+      "carrier of the unknown top-level keys of the record on disk (A-65): not a field of this release — " +
+      "serialize writes the keys it holds, not the symbol",
+  },
 } as const satisfies { [K in keyof Required<SessionRecord>]: FieldPlan };

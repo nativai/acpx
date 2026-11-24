@@ -472,6 +472,11 @@ export type AcpClientOptions = {
 };
 
 export const SESSION_RECORD_SCHEMA = "acpx.session.v1" as const;
+
+/** The `SessionRecord` key under which the unknown top-level fields of a record travel (A-65). */
+export const UNKNOWN_TOP_LEVEL_FIELDS: unique symbol = Symbol.for(
+  "acpx.session-record.unknown-top-level-fields",
+);
 export type SessionMessageImage = {
   source: string;
   size?: {
@@ -1505,6 +1510,19 @@ export type SessionRecord = {
    * rather than in the holder half whose writer is the activation flip.
    */
   parentSeatId?: string;
+  /**
+   * A-65 / C3.5 (iv): THE TOP-LEVEL KEYS OF THE RECORD ON DISK THAT THIS RELEASE DOES NOT KNOW, as
+   * `parseSessionRecord` read them, so a writer through `serializeSessionRecordForDisk` puts them back
+   * unchanged and a field a newer release added survives this release's write.
+   *
+   * ⚠️ A SYMBOL KEY, NOT A NAMED FIELD, ON PURPOSE. A symbol-keyed own property is skipped by
+   * `JSON.stringify` (so `sessions show --format json` and every API body stay free of keys that were
+   * never this release's fields), is not read by any index projection (they copy field by field), and is
+   * still carried by an object spread, which most rebuilds of a record in this codebase use. Absent when
+   * the record had no unknown key. Never set it by hand: the only writers are `parseSessionRecord` and the
+   * locked write in `repository.ts`, which also takes the keys from the disk record under the lock.
+   */
+  [UNKNOWN_TOP_LEVEL_FIELDS]?: Readonly<Record<string, unknown>>;
 };
 
 /**

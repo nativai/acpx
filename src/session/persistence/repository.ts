@@ -29,6 +29,7 @@ import type {
   SessionMessage,
   SessionRecord,
 } from "../../types.js";
+import { UNKNOWN_TOP_LEVEL_FIELDS } from "../../types.js";
 import {
   isArchivedFileCorrupt,
   readArchivedFileVerified,
@@ -337,6 +338,8 @@ function matchesAgentIdentity(
 }
 
 export type PersistedSessionLifecycle = {
+  /** The record's unknown top-level keys as they stand on disk (A-65, C3.5 (iv)); see `unknownFieldsForWrite`. */
+  unknownTopLevelFields?: Readonly<Record<string, unknown>>;
   closed: boolean | undefined;
   closedAt: string | undefined;
   /** The monotonicity guard's warrant for a closed:true->false transition —
@@ -402,6 +405,7 @@ export async function readPersistedLifecycle(
       return undefined;
     }
     return {
+      unknownTopLevelFields: parsed[UNKNOWN_TOP_LEVEL_FIELDS],
       closed: parsed.closed,
       closedAt: parsed.closedAt,
       reopenedAt: parsed.reopenedAt,
@@ -1235,6 +1239,24 @@ async function updateIndexForWrittenRecord(
   });
 }
 
+/**
+ * A-65 / C3.5 (iv) — THE UNKNOWN TOP-LEVEL KEYS A LOCKED WRITE PUTS BACK: those of the record as it stands on
+ * disk NOW, read under the record's lock like every merge above — DISK WINS, and the caller's carrier is used
+ * only when there is no readable record on disk (a new file). Two cases need the disk and not the copy: a
+ * writer that rebuilt its record without the parsed original, and a copy the owner loaded at the start of a
+ * long turn, before a newer release added the field.
+ *
+ * ⚠️ DO NOT NARROW THIS TO THE COPY'S CARRIER ALONE: that is the stale-copy loss (row 65.4 of
+ * `test/unknown-top-level-fields.test.ts`). ⚠️ AND DO NOT UNION THE TWO: a key a newer release deliberately
+ * removed from disk would come back from an older writer's stale carrier (row 65.5).
+ */
+function unknownFieldsForWrite(
+  record: SessionRecord,
+  fresh: PersistedSessionLifecycle | undefined,
+): Readonly<Record<string, unknown>> | undefined {
+  return fresh === undefined ? record[UNKNOWN_TOP_LEVEL_FIELDS] : fresh.unknownTopLevelFields;
+}
+
 async function writeSessionRecordInternal(
   record: SessionRecord,
   options: {
@@ -1396,6 +1418,7 @@ async function writeSessionRecordInternal(
           const persistedRecord = serializeSessionRecordForDisk(record, {
             messages: "split-tail",
             inlineMessages,
+            unknownTopLevelFields: unknownFieldsForWrite(record, freshPersisted),
           });
 
           // The temp name must be unique PER CALL, not per millisecond: two writes
