@@ -5,7 +5,7 @@
 //   <out>/state/.acpx/sessions[-archive]/<id>.{json,messages.ndjson[.zst],…}   (the record's files)
 //   <out>/pi-agent/sessions/<slug>/<file>.jsonl                                (the pi file the product locates)
 // then makes every file 0444 and writes MANIFEST.sha256. The real-record suite runs against it with
-//   ACPX_STATE_HOME=<out>/state  ACPX_PI_BOX_AGENT_DIR=<out>/pi-agent  ACPX_PI_CUT_REAL_FIXTURES=<out>
+//   ACPX_STATE_HOME=<out>/state  ACPX_PI_BOX_AGENT_DIR=<out>/pi-agent  ACPX_REAL_PICUT_SNAPSHOT=<out>
 //
 // Usage: node scripts/freeze-pi-cut-records.mjs <dist-test root> <ids file> <out dir>
 import { createHash } from "node:crypto";

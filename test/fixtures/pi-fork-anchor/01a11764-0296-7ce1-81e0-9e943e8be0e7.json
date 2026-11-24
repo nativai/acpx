@@ -1,0 +1,1182 @@
+{
+  "id": "01a11764-0296-7ce1-81e0-9e943e8be0e7",
+  "baseIndex": 0,
+  "keepEnds": 8,
+  "entries": [
+    {
+      "User": {
+        "id": "7b41c8ea-fabf-4835-96c9-bcfbec4e825b",
+        "content": [{ "Text": "]0[ ?Jo § <1snOXc" }]
+      }
+    },
+    {
+      "User": {
+        "id": "8deff6a1-043f-4b97-8b59-d50b8b0febce",
+        "content": [{ "Text": "K<J<5<Ee§u:B~R[{=" }]
+      }
+    },
+    {
+      "Agent": {
+        "content": [
+          { "Text": "F pBczf4§9e;o9nC^" },
+          { "Thinking": { "text": "^&R Sn e§t z9cpiL" } },
+          {
+            "ToolUse": {
+              "id": "call_f618fd86e7de4b63bdceee48",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          {
+            "ToolUse": {
+              "id": "call_0cdcc94b32364ef7b630040a",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          {
+            "ToolUse": {
+              "id": "call_8a378fed79ab45ee8866c787",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          {
+            "ToolUse": {
+              "id": "call_b63efca7abae437f9ccf8584",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          {
+            "ToolUse": {
+              "id": "call_0f5321c575ac4d6a8b0dba3e",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          { "Thinking": { "text": "+D) mY> §A!9Oo*O;" } },
+          {
+            "ToolUse": {
+              "id": "call_d679ec0386714bd1bb96def8",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          {
+            "ToolUse": {
+              "id": "call_ce51730199dc4fcc993a0baa",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          { "Thinking": { "text": "+Lk9L&P^§n^3)L>:]" } },
+          { "Text": "+Lk9L&P^§n^3)L>:]" },
+          {
+            "ToolUse": {
+              "id": "call_73e5a1d1fc8e4030aba65802",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          { "Thinking": { "text": "$wxGKlWA§n^3)L>:]" } },
+          { "Text": "$wxGKlWA§;wp%}o3|" },
+          {
+            "ToolUse": {
+              "id": "call_58f25a1c358a43b492157539",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          { "Thinking": { "text": "Y:!%3lQV§PY7*k^eo" } },
+          { "Text": "Y:!%3lQV§;wp%}o3R" },
+          {
+            "ToolUse": {
+              "id": "call_ab9f6368b1e34be1b269bfb1",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          { "Thinking": { "text": "Yn} =g#A§0dssFaWO" } },
+          { "Text": "y7P yaZ*§q <Z6[#]" }
+        ],
+        "tool_results": {
+          "call_f618fd86e7de4b63bdceee48": {
+            "tool_use_id": "call_f618fd86e7de4b63bdceee48",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "call_0cdcc94b32364ef7b630040a": {
+            "tool_use_id": "call_0cdcc94b32364ef7b630040a",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "call_8a378fed79ab45ee8866c787": {
+            "tool_use_id": "call_8a378fed79ab45ee8866c787",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "call_b63efca7abae437f9ccf8584": {
+            "tool_use_id": "call_b63efca7abae437f9ccf8584",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "call_0f5321c575ac4d6a8b0dba3e": {
+            "tool_use_id": "call_0f5321c575ac4d6a8b0dba3e",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "call_d679ec0386714bd1bb96def8": {
+            "tool_use_id": "call_d679ec0386714bd1bb96def8",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "call_ce51730199dc4fcc993a0baa": {
+            "tool_use_id": "call_ce51730199dc4fcc993a0baa",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "call_73e5a1d1fc8e4030aba65802": {
+            "tool_use_id": "call_73e5a1d1fc8e4030aba65802",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "call_58f25a1c358a43b492157539": {
+            "tool_use_id": "call_58f25a1c358a43b492157539",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "call_ab9f6368b1e34be1b269bfb1": {
+            "tool_use_id": "call_ab9f6368b1e34be1b269bfb1",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          }
+        }
+      }
+    },
+    {
+      "User": {
+        "id": "749fc840-994e-4520-a0c4-fc240a7df300",
+        "content": [{ "Text": "KXNbhRB;§mK mY>}!" }]
+      }
+    },
+    {
+      "Agent": {
+        "content": [
+          { "Thinking": { "text": "mIVb ? =§zNm{s}Ie" } },
+          { "Text": ">Euig @ §Sn^3)L>*" }
+        ],
+        "tool_results": {}
+      }
+    },
+    {
+      "User": {
+        "id": "31608787-a827-4a5c-8208-72d6292697d4",
+        "content": [{ "Text": "KXNbhRB;§bo- JR8(" }]
+      }
+    },
+    {
+      "Agent": {
+        "content": [
+          { "Thinking": { "text": "K-7>/6 <§:!%3lQVG" } },
+          {
+            "ToolUse": {
+              "id": "chatcmpl-tool-ac0d080cf27456ec",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          {
+            "ToolUse": {
+              "id": "chatcmpl-tool-a2a944951e2b731b",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          {
+            "ToolUse": {
+              "id": "chatcmpl-tool-87bd643d3e09a22c",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          {
+            "ToolUse": {
+              "id": "chatcmpl-tool-a05d9860386fed32",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          { "Thinking": { "text": "Yn} z9cp§lWA}zu;F" } },
+          {
+            "ToolUse": {
+              "id": "chatcmpl-tool-abab5c83f8dff840",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          { "Thinking": { "text": "Yn} z9cp§< mY>Ikz" } },
+          {
+            "ToolUse": {
+              "id": "chatcmpl-tool-8d8aaebf057c729c",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          { "Thinking": { "text": "^&R Sn B§zRib&IWU" } },
+          {
+            "ToolUse": {
+              "id": "chatcmpl-tool-850f759ca919487f",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          { "Thinking": { "text": "Yn} yaZ*§-, bN}xo" } },
+          {
+            "ToolUse": {
+              "id": "chatcmpl-tool-b8fe8a634c9b2f9c",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          { "Thinking": { "text": "Yn} 0dss§pkZFr;)y" } },
+          { "Text": "Yn} 0dss§wLm!r[D|" },
+          {
+            "ToolUse": {
+              "id": "chatcmpl-tool-a6327a790ff8d5ea",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          { "Thinking": { "text": "Yn} mywB§v, z9D1X" } },
+          {
+            "ToolUse": {
+              "id": "chatcmpl-tool-8e2119eedd1b0481",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          { "Thinking": { "text": "+ ya=d m§3 %p#rGu" } },
+          { "Text": "+ ?ZWwU8§wLm!r[D|" },
+          {
+            "ToolUse": {
+              "id": "chatcmpl-tool-9745df434fde2347",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          { "Thinking": { "text": "+ S_66 ?§ni>e8I)+" } },
+          {
+            "ToolUse": {
+              "id": "call_e7e214b560d24424a54b209b",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          { "Thinking": { "text": "+DZO bN}§BLiwA}sJ" } },
+          {
+            "ToolUse": {
+              "id": "call_aa6476dfd66d4d53b1f62622",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          {
+            "ToolUse": {
+              "id": "call_2b8d2a87709f4dacb4064997",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          { "Text": "yLAO487x§Sn^3)L>*" }
+        ],
+        "tool_results": {
+          "chatcmpl-tool-ac0d080cf27456ec": {
+            "tool_use_id": "chatcmpl-tool-ac0d080cf27456ec",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "chatcmpl-tool-a2a944951e2b731b": {
+            "tool_use_id": "chatcmpl-tool-a2a944951e2b731b",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "chatcmpl-tool-87bd643d3e09a22c": {
+            "tool_use_id": "chatcmpl-tool-87bd643d3e09a22c",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "chatcmpl-tool-a05d9860386fed32": {
+            "tool_use_id": "chatcmpl-tool-a05d9860386fed32",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "chatcmpl-tool-abab5c83f8dff840": {
+            "tool_use_id": "chatcmpl-tool-abab5c83f8dff840",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "chatcmpl-tool-8d8aaebf057c729c": {
+            "tool_use_id": "chatcmpl-tool-8d8aaebf057c729c",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "chatcmpl-tool-850f759ca919487f": {
+            "tool_use_id": "chatcmpl-tool-850f759ca919487f",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "chatcmpl-tool-b8fe8a634c9b2f9c": {
+            "tool_use_id": "chatcmpl-tool-b8fe8a634c9b2f9c",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "chatcmpl-tool-a6327a790ff8d5ea": {
+            "tool_use_id": "chatcmpl-tool-a6327a790ff8d5ea",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "chatcmpl-tool-8e2119eedd1b0481": {
+            "tool_use_id": "chatcmpl-tool-8e2119eedd1b0481",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "chatcmpl-tool-9745df434fde2347": {
+            "tool_use_id": "chatcmpl-tool-9745df434fde2347",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "call_e7e214b560d24424a54b209b": {
+            "tool_use_id": "call_e7e214b560d24424a54b209b",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "call_aa6476dfd66d4d53b1f62622": {
+            "tool_use_id": "call_aa6476dfd66d4d53b1f62622",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "call_2b8d2a87709f4dacb4064997": {
+            "tool_use_id": "call_2b8d2a87709f4dacb4064997",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          }
+        }
+      }
+    }
+  ],
+  "pi": [
+    { "type": "session", "version": 3, "id": "fixture", "cwd": "/workspace" },
+    { "type": "model_change", "id": "3160b842", "parentId": null },
+    { "type": "thinking_level_change", "id": "3a8c4c14", "parentId": "3160b842" },
+    {
+      "type": "message",
+      "id": "75a8b1f5",
+      "parentId": "3a8c4c14",
+      "message": { "role": "user", "content": [{ "type": "text", "text": "]0[ ?Jo § <1snOXc" }] }
+    },
+    {
+      "type": "message",
+      "id": "4b7cf3a7",
+      "parentId": "75a8b1f5",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "thinking", "thinking": "^&R Sn e§t z9cpiL" },
+          {
+            "type": "toolCall",
+            "id": "call_f618fd86e7de4b63bdceee48",
+            "name": "tool",
+            "arguments": {}
+          },
+          {
+            "type": "toolCall",
+            "id": "call_0cdcc94b32364ef7b630040a",
+            "name": "tool",
+            "arguments": {}
+          },
+          {
+            "type": "toolCall",
+            "id": "call_8a378fed79ab45ee8866c787",
+            "name": "tool",
+            "arguments": {}
+          },
+          {
+            "type": "toolCall",
+            "id": "call_b63efca7abae437f9ccf8584",
+            "name": "tool",
+            "arguments": {}
+          },
+          {
+            "type": "toolCall",
+            "id": "call_0f5321c575ac4d6a8b0dba3e",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "bf1814a4",
+      "parentId": "4b7cf3a7",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "call_f618fd86e7de4b63bdceee48",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "15cb9f15",
+      "parentId": "bf1814a4",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "call_0cdcc94b32364ef7b630040a",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "33c7ab5b",
+      "parentId": "15cb9f15",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "call_8a378fed79ab45ee8866c787",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "488a0f03",
+      "parentId": "33c7ab5b",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "call_b63efca7abae437f9ccf8584",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "d20a1761",
+      "parentId": "488a0f03",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "call_0f5321c575ac4d6a8b0dba3e",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "0e5cc460",
+      "parentId": "d20a1761",
+      "message": { "role": "user", "content": [{ "type": "text", "text": "K<J<5<Ee§u:B~R[{=" }] }
+    },
+    {
+      "type": "message",
+      "id": "2b4ab032",
+      "parentId": "0e5cc460",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "thinking", "thinking": "+D) mY> §A!9Oo*O;" },
+          {
+            "type": "toolCall",
+            "id": "call_d679ec0386714bd1bb96def8",
+            "name": "tool",
+            "arguments": {}
+          },
+          {
+            "type": "toolCall",
+            "id": "call_ce51730199dc4fcc993a0baa",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "f3933734",
+      "parentId": "2b4ab032",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "call_d679ec0386714bd1bb96def8",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "b0d3df31",
+      "parentId": "f3933734",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "call_ce51730199dc4fcc993a0baa",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "7ea4020d",
+      "parentId": "b0d3df31",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "thinking", "thinking": "+Lk9L&P^§n^3)L>:]" },
+          { "type": "text", "text": "+Lk9L&P^§n^3)L>:]" },
+          {
+            "type": "toolCall",
+            "id": "call_73e5a1d1fc8e4030aba65802",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "08f67fad",
+      "parentId": "7ea4020d",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "call_73e5a1d1fc8e4030aba65802",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "add54e59",
+      "parentId": "08f67fad",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "thinking", "thinking": "$wxGKlWA§n^3)L>:]" },
+          { "type": "text", "text": "$wxGKlWA§;wp%}o3|" },
+          {
+            "type": "toolCall",
+            "id": "call_58f25a1c358a43b492157539",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "41f19875",
+      "parentId": "add54e59",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "call_58f25a1c358a43b492157539",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "a8258fbc",
+      "parentId": "41f19875",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "thinking", "thinking": "Y:!%3lQV§PY7*k^eo" },
+          { "type": "text", "text": "Y:!%3lQV§;wp%}o3R" },
+          {
+            "type": "toolCall",
+            "id": "call_ab9f6368b1e34be1b269bfb1",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "dd9798ff",
+      "parentId": "a8258fbc",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "call_ab9f6368b1e34be1b269bfb1",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "58f176a6",
+      "parentId": "dd9798ff",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "thinking", "thinking": "Yn} =g#A§0dssFaWO" },
+          { "type": "text", "text": "y7P yaZ*§q <Z6[#]" }
+        ],
+        "stopReason": "stop"
+      }
+    },
+    {
+      "type": "message",
+      "id": "74094eee",
+      "parentId": "58f176a6",
+      "message": { "role": "user", "content": [{ "type": "text", "text": "KXNbhRB;§mK mY>}!" }] }
+    },
+    {
+      "type": "message",
+      "id": "521fc873",
+      "parentId": "74094eee",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "thinking", "thinking": "mIVb ? =§zNm{s}Ie" },
+          { "type": "text", "text": ">Euig @ §Sn^3)L>*" }
+        ],
+        "stopReason": "stop"
+      }
+    },
+    {
+      "type": "message",
+      "id": "b8790b1b",
+      "parentId": "521fc873",
+      "message": { "role": "user", "content": [{ "type": "text", "text": "KXNbhRB;§bo- JR8(" }] }
+    },
+    {
+      "type": "message",
+      "id": "0133d344",
+      "parentId": "b8790b1b",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "thinking", "thinking": "K-7>/6 <§:!%3lQVG" },
+          {
+            "type": "toolCall",
+            "id": "chatcmpl-tool-ac0d080cf27456ec",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "3baf4f74",
+      "parentId": "0133d344",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "chatcmpl-tool-ac0d080cf27456ec",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "e79b67f1",
+      "parentId": "3baf4f74",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "text", "text": " " },
+          {
+            "type": "toolCall",
+            "id": "chatcmpl-tool-a2a944951e2b731b",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "2ba21086",
+      "parentId": "e79b67f1",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "chatcmpl-tool-a2a944951e2b731b",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "123791df",
+      "parentId": "2ba21086",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "text", "text": " " },
+          {
+            "type": "toolCall",
+            "id": "chatcmpl-tool-87bd643d3e09a22c",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "f0d2c98b",
+      "parentId": "123791df",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "chatcmpl-tool-87bd643d3e09a22c",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "9bcc13e3",
+      "parentId": "f0d2c98b",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "text", "text": " " },
+          {
+            "type": "toolCall",
+            "id": "chatcmpl-tool-a05d9860386fed32",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "40a2ad4f",
+      "parentId": "9bcc13e3",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "chatcmpl-tool-a05d9860386fed32",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "00c8433f",
+      "parentId": "40a2ad4f",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "text", "text": " " },
+          { "type": "thinking", "thinking": "Yn} z9cp§lWA}zu;F" },
+          {
+            "type": "toolCall",
+            "id": "chatcmpl-tool-abab5c83f8dff840",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "17c92172",
+      "parentId": "00c8433f",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "chatcmpl-tool-abab5c83f8dff840",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "befcd603",
+      "parentId": "17c92172",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "text", "text": " " },
+          { "type": "thinking", "thinking": "Yn} z9cp§< mY>Ikz" },
+          {
+            "type": "toolCall",
+            "id": "chatcmpl-tool-8d8aaebf057c729c",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "1c818447",
+      "parentId": "befcd603",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "chatcmpl-tool-8d8aaebf057c729c",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "b45b16e9",
+      "parentId": "1c818447",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "text", "text": " " },
+          { "type": "thinking", "thinking": "^&R Sn B§zRib&IWU" },
+          {
+            "type": "toolCall",
+            "id": "chatcmpl-tool-850f759ca919487f",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "0290cd9e",
+      "parentId": "b45b16e9",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "chatcmpl-tool-850f759ca919487f",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "a03ecb10",
+      "parentId": "0290cd9e",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "text", "text": " " },
+          { "type": "thinking", "thinking": "Yn} yaZ*§-, bN}xo" },
+          {
+            "type": "toolCall",
+            "id": "chatcmpl-tool-b8fe8a634c9b2f9c",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "2024936d",
+      "parentId": "a03ecb10",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "chatcmpl-tool-b8fe8a634c9b2f9c",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "eeb928b9",
+      "parentId": "2024936d",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "thinking", "thinking": "Yn} 0dss§pkZFr;)y" },
+          { "type": "text", "text": "Yn} 0dss§wLm!r[D|" },
+          {
+            "type": "toolCall",
+            "id": "chatcmpl-tool-a6327a790ff8d5ea",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "09ec5352",
+      "parentId": "eeb928b9",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "chatcmpl-tool-a6327a790ff8d5ea",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "d4afec44",
+      "parentId": "09ec5352",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "thinking", "thinking": "Yn} mywB§v, z9D1X" },
+          {
+            "type": "toolCall",
+            "id": "chatcmpl-tool-8e2119eedd1b0481",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "f7576a84",
+      "parentId": "d4afec44",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "chatcmpl-tool-8e2119eedd1b0481",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "f90e96f4",
+      "parentId": "f7576a84",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "text", "text": " + ?ZWwU§wLm!r[D|" },
+          { "type": "thinking", "thinking": "+ ya=d m§3 %p#rGu" },
+          {
+            "type": "toolCall",
+            "id": "chatcmpl-tool-9745df434fde2347",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "a208e61c",
+      "parentId": "f90e96f4",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "chatcmpl-tool-9745df434fde2347",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "03abb0ec",
+      "parentId": "a208e61c",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "thinking", "thinking": "+ S_66 ?§ni>e8I)+" },
+          {
+            "type": "toolCall",
+            "id": "call_e7e214b560d24424a54b209b",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "16d4e9b9",
+      "parentId": "03abb0ec",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "call_e7e214b560d24424a54b209b",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "5fb9f4e1",
+      "parentId": "16d4e9b9",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "thinking", "thinking": "+DZO bN}§BLiwA}sJ" },
+          {
+            "type": "toolCall",
+            "id": "call_aa6476dfd66d4d53b1f62622",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "b8f9fd4d",
+      "parentId": "5fb9f4e1",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "call_aa6476dfd66d4d53b1f62622",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "0e6d43ce",
+      "parentId": "b8f9fd4d",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "call_2b8d2a87709f4dacb4064997",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "a22ee28c",
+      "parentId": "0e6d43ce",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "call_2b8d2a87709f4dacb4064997",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "f7a28cb6",
+      "parentId": "a22ee28c",
+      "message": {
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "yLAO487x§Sn^3)L>*" }],
+        "stopReason": "stop"
+      }
+    },
+    ""
+  ],
+  "answers": [
+    { "n": 2, "entryId": "75a8b1f5", "line": 4, "contextEndLogIndex": 1, "indexCutLine": 11 },
+    { "n": 3, "entryId": "58f176a6", "line": 21, "indexCutLine": 21 },
+    { "n": 4, "entryId": "74094eee", "line": 22, "indexCutLine": 22 },
+    { "n": 5, "entryId": "521fc873", "line": 23, "indexCutLine": 23 },
+    { "n": 6, "entryId": "b8790b1b", "line": 24, "indexCutLine": 24 },
+    { "n": 7, "entryId": "f7a28cb6", "line": 53, "indexCutLine": 53 }
+  ]
+}

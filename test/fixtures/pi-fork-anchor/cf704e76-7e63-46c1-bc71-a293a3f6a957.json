@@ -1,0 +1,491 @@
+{
+  "id": "cf704e76-7e63-46c1-bc71-a293a3f6a957",
+  "baseIndex": 0,
+  "keepEnds": 8,
+  "entries": [
+    {
+      "User": {
+        "id": "7d0307ca-c127-4196-af5f-6f8ad0361678",
+        "content": [{ "Text": "K<J<5<Ee§>H ~,@O5" }]
+      }
+    },
+    {
+      "Agent": {
+        "content": [
+          { "Thinking": { "text": "(eh mY> §0@x-iR#/" } },
+          {
+            "ToolUse": {
+              "id": "c98e87d4-631f-4fb1-9cfc-e4f4c25089c0",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          {
+            "ToolUse": {
+              "id": "0976a208-a4c3-4d6b-ade9-25a8ed5b762a",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          {
+            "ToolUse": {
+              "id": "8857bbb7-63c5-4b3c-8d77-679cb884a71f",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          {
+            "ToolUse": {
+              "id": "c6ba76de-950b-4781-bccc-51fd3404c4b9",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          {
+            "ToolUse": {
+              "id": "5f27683f-5d0f-492a-9032-f5926a4c1aa3",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          {
+            "ToolUse": {
+              "id": "8a1f4a1c-d18d-4867-8235-e666d69d8f0c",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          {
+            "ToolUse": {
+              "id": "e1abe266-770f-4ef0-b2d0-7a65cacd8abc",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          {
+            "ToolUse": {
+              "id": "28682403-2ebb-4fa5-bca2-8677ece7e99b",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          {
+            "ToolUse": {
+              "id": "9f4e2bf9-cf85-49e4-9fb1-d63bc8a9bd34",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          {
+            "ToolUse": {
+              "id": "68f0a064-b385-4fea-b951-fa24341d3378",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          },
+          { "Thinking": { "text": "y7P eAWE§7IoPY7*k" } },
+          { "Text": "(#]& eAW§: bNha3D" }
+        ],
+        "tool_results": {
+          "c98e87d4-631f-4fb1-9cfc-e4f4c25089c0": {
+            "tool_use_id": "c98e87d4-631f-4fb1-9cfc-e4f4c25089c0",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "0976a208-a4c3-4d6b-ade9-25a8ed5b762a": {
+            "tool_use_id": "0976a208-a4c3-4d6b-ade9-25a8ed5b762a",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "8857bbb7-63c5-4b3c-8d77-679cb884a71f": {
+            "tool_use_id": "8857bbb7-63c5-4b3c-8d77-679cb884a71f",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "c6ba76de-950b-4781-bccc-51fd3404c4b9": {
+            "tool_use_id": "c6ba76de-950b-4781-bccc-51fd3404c4b9",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "5f27683f-5d0f-492a-9032-f5926a4c1aa3": {
+            "tool_use_id": "5f27683f-5d0f-492a-9032-f5926a4c1aa3",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "8a1f4a1c-d18d-4867-8235-e666d69d8f0c": {
+            "tool_use_id": "8a1f4a1c-d18d-4867-8235-e666d69d8f0c",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "e1abe266-770f-4ef0-b2d0-7a65cacd8abc": {
+            "tool_use_id": "e1abe266-770f-4ef0-b2d0-7a65cacd8abc",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "28682403-2ebb-4fa5-bca2-8677ece7e99b": {
+            "tool_use_id": "28682403-2ebb-4fa5-bca2-8677ece7e99b",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "9f4e2bf9-cf85-49e4-9fb1-d63bc8a9bd34": {
+            "tool_use_id": "9f4e2bf9-cf85-49e4-9fb1-d63bc8a9bd34",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          },
+          "68f0a064-b385-4fea-b951-fa24341d3378": {
+            "tool_use_id": "68f0a064-b385-4fea-b951-fa24341d3378",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          }
+        }
+      }
+    },
+    {
+      "User": {
+        "id": "2a8c635f-3093-4ba5-8d8f-823d42c9f5db",
+        "content": [{ "Text": "K<J<5<Ee§bNh@/B=7" }]
+      }
+    },
+    {
+      "Agent": {
+        "content": [
+          {
+            "Thinking": {
+              "text": "Yn} L@@~ <p ?}!rkB Sn mK ==zbxVt ? ~AjhIb DN ~,tas ?} =*s- DN ? >?Vhi;)P!0 &j_Py8 ?z]iB2^ mK mysG*A8A BoeC9<0!U  Yn} ~,tas ?JoH l?  (eh mY> ~|t&~ BLiwA}s! ADWKEi zT~ By| -akr]yu9BM?){{cIl3aXc!Ig5|TIw? 63  yLAO48 <Z HWK ev02 ?}sF Df! myq+ oTS[ |H7 AD17/{rP~:b}DLyDXN> !5  Yn} ?]PtO< SeY1 <Zo#L7@C     K   Yn} |b;T+ =gV~~~V 01 mY> ~|t&~ BLiwA}sJ     K   Yn} BLiwA}sw ?]PtO< mY> |,8]= 0m9 ~USW=     K   Yn} ~3bv, ?]! mY> Za~R15 &T$g;VU ~YQZK L@@ mK ?z&8 mY> Bysx%BFB DN mY> ==zu-^N ~Y25 zG=0 bsZUM zI$V ~Yu<+ ?ZWwU8Y yn#eI r$  ^#Pn bN z9D1 ?]! ?CP bNh@/B= &mRim zG  pRBj bN |,8]= bNha ?]! bN Sn^3)L>8 ?]! ~,-!8 bNh@/B=7  -k1VHMi bTky mK &=@mhuW mY> ~|t&~ BLiwA}sJ  Yn} =g#iC|c^ mHC] &=@mhuWC, AEAmOJbHMT=D+E= <Zo#L7@7s@JOaoDLk pop~4xf4dYcYgRi4 ~Yjm? Jbo- Sn ? ev_F DN ~3bv,EB  Yn} BUG[Wi5 mHC] <p ? =gq}Ch ~-[ ~|z7;G Iy-, &=@mhuW mY> BLiwA}s ?]! mY>H zG=npkw0Q mY> ?zNm{s}I ?zRib&JC 0@PdZ Df mY> BUG[Wi5 BLwz67! ov3i@* <p mY> AR|XM>gAxTePl6 mysG*A8A4 ~~( Iy-, =g#U@|U& ?}{6# ~U|_ L@@ mY> A99lj% mK@a mK &=@mhuW mY> BLiwA}sJE<Q L@@~ ~~}/w Sn mK ==zbxVt ? ~I^=a,]W mabq ?} =*s- DN ? ~8BE>o40] =gq}C my&E$ l?  ODg6[V- mY> BLiwA}s! ADWKEi zT~ By| -akr]yu9BM?){{cIl3aXc!Ig5|TIw 63  yLAO48 <Z HWK ev02 oTS[ L@1_d AD17/{rP~:b}DLyDXN^     K   Yn} |b;T+ =gV~~~V 01 mY> BLiwA}sJ     K   Yn} BLiwA}sw ?]PtO< mY> |,8]= 0m9 ~USW=     K   Yn} ~3bv, ?]! mY> Za~R15 &T$g;VU ~YQZK L@@ mK ?z&8 mY> Bysx%BFB DN mY> ==zu-^N ~Y25 zG=0 bsZUM zI$V ~Yu<+ ?ZWwU8Y yn#eI !5  Kp bNh eAWE ?]& z9D1t D6 ?CP ?]&kS+=M &mRim! bTky mK L@@ mY> A99lj% mK@a mK &=@mhuW mY> BLiwA}sJ pr,N_ ADWKEi zTz ~U|_ ma&: ? eA@H mf6l6p ~|z7;G ?]W>:NEgy; mYs6 mY> D{n5D[ ~U|_ 0P mY> [pyy ?%zxU zT ~AW]^<^f 1mCP7h>= ~+B1q1 ?Z ?] yo ?]! mY> &=@mhuT4t &Tas=tlx/C% <p &rrkALB/, ?]! ^c]O?1:y zG= ?h)Oz <Z+:M^9OAF$:z SeY1 ?}v:lG mY> BLiwA}s &=@mhuT4t ~U|_ ?z6M-7 mY> D{n5D[: &~u/ <? mY> ADWKEi% BLiwA}s S_SA3 <1 ~AVf ev0^ ? eA@H ~~VqKa ~U|_ &=@mhuW mY> BLiwA}s ?]! &=G%fY, mY> bTRd6R{3T =*s-tM  ODg6[VZn[ =4:Uu l? (eh mY> A99lj% BLiwA}sJ 63 &}*{5 mY> D{n5D[> !5 ZZBF{c~pi mY> z9e^% ?zRib&JC ev02cwj9 L@@~ ~~}/w Sn mK ==zbxVt ? ~I^=a,]W ~A|zAwO* DN ?CL)WiD2 l?  (eh ? ~|t&~ BLiwA}s! ADWKEi zT~ By| -akr]yu9BM?){{cIl3aXc!Ig5|TIw? 63  l4h_ zG= zT ~AW]^<^ o<ql[2wOSzE yaZ*!7J 01 mY> BLiwA}s &=@mhuT4tSx !5  y4zq! mY> BLiwA}s z9e;o9nCz( bTky mK ?zRib&I ~USW ? ~+B|nH ev02 DN myq+ BLwz%*CW{($     ?( Yn} [pyy |b;T+ =gV~~~V 01 mY> BLiwA}sJ     0y Yn} BLiwA}sw ?]PtO<nV mY> |,8]= 0m9 ~USW ov3i@* <p >zKij5 zT~ By| -akr]yu9BM?){{cIl3aXc!Ig5|TI</5     BX Yn} ~3bv,p ~YQZK L@@ mK ?z&8 mY> Bysx%BFB DN mY> ==zu-^N ~Y25 zG=E     ^k Yn} Za~R15 &T$g;VU ~YQZK L@@ mK ?z&8 mY> Bysx%BFB DN mY> ==zu-^N ~Y25 zG=EI ya=d ?ZWwU8Y eAWE1m mY> BLwz67! zG= AR|XM>gAxTePl6, <Zo#L75[5 ATd<Z#8{Y3lc:7#^Zb$>2?2;Iw-=o ?]! ~AT2!2c D[l{q BLwNr<3=&^Kq; z9D1tFA ~|z7;G BoeC9 <?1 Hqar mY> bTRd6R{3T ~3bv, ?]! &T$g;V zG= Bysx%BFB ?C$0MP zI$V mY> eAWE1m BLwz67!^ ~I^=a,]WD;{f mY> AR|XM>gAxTePl6 ~A7czF  -k1VHMi SeY1 &=@mhuW mY> ~|t&~ BLiwA}sJE<Q L@@~ ~~}/w Sn mK &=@mhuW ? ~I^=a,]W ~|t&~ BLiwA}s ?]! mY>H ?]PtO< <Z Dfp ev02 ~USW ? BLiW3W2gR^) DN <Z;#eRApQ-* ^cAN2s5 zI$V mY> &=@mhuT4t ?]!SW eAWE1m BLwz67!Z  Yn} BLiwA}s <px ADWKEi zT~ By| -akr]yu9BM?){{cIl3aXc!Ig5|TIw  y4zq! ?CP}]>$ mY> BLiwA}soU bTky mK =gq?DR20 l? Yn} |b;T+ =gV~~~V 01 AV0e -akr]yu9BM?){{cIl3aXc!Ig5|TIw? 63 Yn} BLiwA}sw ~YQZK L@@ mK ?]PtO< mY> |,8]= 0m9E !5 Yn} ~3bv, ?]! Za~R15 &T$g;VU ~YQZK L@@ mK ?z&8 mY> Bysx%BFB DN mY> ==zu-^N ~Y25 zG= oTV#jh zI$V ~Yu<+ ?ZWwU8Y yn#e@j  -k1VHMi bTky mK &=@mhuW mY> BLiwA}sJE<Q L@@~ ~~}/w Sn mK ?CP ? ~I^=a,]W ~|t&~ BLiwA}s ?]! mY>H =gq?DR2 ? Dfpc)Cz* ?]PtO< 0@PdZ Df mY> D{n5D[: bsZWA8 mY> |b;T+ =gV~~~V[ mY> BLiwA}s L@@A zG= mY> |,8]= 0m9g mY> ~3bv,+ ?]! mY> Za~R15 &T$g;V zG= Bysx%BFB ?z&8o9$@  Yn} BLiwA}s <px ADWKEi zT~ By| -akr]yu9BM?){{cIl3aXc!Ig5|TIw8 bTky mK &=@mhuW mY5F BLiwA}s z9cpiLm?2 L@@~ ~~}/w Sn mK &=@mhuW ? ~I^=a,]W ~|t&~ BLiwA}s ?]! mY>H ?zRib&I ~USW ? ~+B|nH ev02 BLwz%*CW{( mY> D{n5D[: mY> BLiwA}sw ?]PtO<nVc mY> ~3bv,+ ?]! mY> Za~R15 &T$g;V zG= Bysx%BFB ?z&8o9$@..."
+            }
+          },
+          {
+            "ToolUse": {
+              "id": "chatcmpl-tool-a8745526a354f270",
+              "name": "tool",
+              "raw_input": "",
+              "input": {},
+              "is_input_complete": true
+            }
+          }
+        ],
+        "tool_results": {
+          "chatcmpl-tool-a8745526a354f270": {
+            "tool_use_id": "chatcmpl-tool-a8745526a354f270",
+            "tool_name": "tool",
+            "is_error": false,
+            "content": { "Text": "" }
+          }
+        }
+      }
+    }
+  ],
+  "pi": [
+    { "type": "session", "version": 3, "id": "fixture", "cwd": "/workspace" },
+    { "type": "model_change", "id": "3877adf2", "parentId": null },
+    { "type": "thinking_level_change", "id": "fde4c9ca", "parentId": "3877adf2" },
+    {
+      "type": "message",
+      "id": "c3cf9168",
+      "parentId": "fde4c9ca",
+      "message": { "role": "user", "content": [{ "type": "text", "text": "K<J<5<Ee§>H ~,@O5" }] }
+    },
+    {
+      "type": "message",
+      "id": "fbc452e1",
+      "parentId": "c3cf9168",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "thinking", "thinking": "(eh mY> §0@x-iR#/" },
+          {
+            "type": "toolCall",
+            "id": "c98e87d4-631f-4fb1-9cfc-e4f4c25089c0",
+            "name": "tool",
+            "arguments": {}
+          },
+          {
+            "type": "toolCall",
+            "id": "0976a208-a4c3-4d6b-ade9-25a8ed5b762a",
+            "name": "tool",
+            "arguments": {}
+          },
+          {
+            "type": "toolCall",
+            "id": "8857bbb7-63c5-4b3c-8d77-679cb884a71f",
+            "name": "tool",
+            "arguments": {}
+          },
+          {
+            "type": "toolCall",
+            "id": "c6ba76de-950b-4781-bccc-51fd3404c4b9",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "06fa4c43",
+      "parentId": "fbc452e1",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "c98e87d4-631f-4fb1-9cfc-e4f4c25089c0",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "d57f8197",
+      "parentId": "06fa4c43",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "0976a208-a4c3-4d6b-ade9-25a8ed5b762a",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "60532cf0",
+      "parentId": "d57f8197",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "8857bbb7-63c5-4b3c-8d77-679cb884a71f",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "1f677087",
+      "parentId": "60532cf0",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "c6ba76de-950b-4781-bccc-51fd3404c4b9",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "7030f737",
+      "parentId": "1f677087",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "5f27683f-5d0f-492a-9032-f5926a4c1aa3",
+            "name": "tool",
+            "arguments": {}
+          },
+          {
+            "type": "toolCall",
+            "id": "8a1f4a1c-d18d-4867-8235-e666d69d8f0c",
+            "name": "tool",
+            "arguments": {}
+          },
+          {
+            "type": "toolCall",
+            "id": "e1abe266-770f-4ef0-b2d0-7a65cacd8abc",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "85bdb4ef",
+      "parentId": "7030f737",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "5f27683f-5d0f-492a-9032-f5926a4c1aa3",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "21742874",
+      "parentId": "85bdb4ef",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "8a1f4a1c-d18d-4867-8235-e666d69d8f0c",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "85757e1c",
+      "parentId": "21742874",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "e1abe266-770f-4ef0-b2d0-7a65cacd8abc",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "0a52a673",
+      "parentId": "85757e1c",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "28682403-2ebb-4fa5-bca2-8677ece7e99b",
+            "name": "tool",
+            "arguments": {}
+          },
+          {
+            "type": "toolCall",
+            "id": "9f4e2bf9-cf85-49e4-9fb1-d63bc8a9bd34",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "f30b2939",
+      "parentId": "0a52a673",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "28682403-2ebb-4fa5-bca2-8677ece7e99b",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "ff137109",
+      "parentId": "f30b2939",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "9f4e2bf9-cf85-49e4-9fb1-d63bc8a9bd34",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "cc9e6579",
+      "parentId": "ff137109",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "68f0a064-b385-4fea-b951-fa24341d3378",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    {
+      "type": "message",
+      "id": "94cc29ea",
+      "parentId": "cc9e6579",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "68f0a064-b385-4fea-b951-fa24341d3378",
+        "toolName": "tool",
+        "content": [{ "type": "text", "text": "" }],
+        "isError": false
+      }
+    },
+    {
+      "type": "message",
+      "id": "1372ee8a",
+      "parentId": "94cc29ea",
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "thinking", "thinking": "y7P eAWE§7IoPY7*k" },
+          { "type": "text", "text": "(#]& eAW§: bNha3D" }
+        ],
+        "stopReason": "stop"
+      }
+    },
+    {
+      "type": "message",
+      "id": "87c18188",
+      "parentId": "1372ee8a",
+      "message": { "role": "user", "content": [{ "type": "text", "text": "K<J<5<Ee§bNh@/B=7" }] }
+    },
+    {
+      "type": "message",
+      "id": "d2283b3f",
+      "parentId": "87c18188",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": "Yn} L@@~ <p ?}!rkB Sn mK ==zbxVt ? ~AjhIb DN ~,tas ?} =*s- DN ? >?Vhi;)P!0 &j_Py8 ?z]iB2^ mK mysG*A8A BoeC9<0!U  Yn} ~,tas ?JoH l?  (eh mY> ~|t&~ BLiwA}s! ADWKEi zT~ By| -akr]yu9BM?){{cIl3aXc!Ig5|TIw? 63  yLAO48 <Z HWK ev02 ?} SO Df! myq+ oTS[ |H7 AD17/{rP~:b}DLyDXN> !5  Yn} ?]PtO< SeY1 <Zo#L7@C     K   Yn} |b;T+ =gV~~~V 01 mY> ~|t&~ BLiwA}sJ     K   Yn} BLiwA}s + ?]PtO< mY> |,8]= 0m9 ~USW=     K   Yn} ~3bv, ?]! mY> Za~R15 &T$g;V + ~YQZK L@@ mK ?z&8 mY> Bysx%BFB DN mY> ==zu-^ + ~Y25 zG=0 bsZUM zI$V ~Yu< + ?ZWwU8Y yn#eI r$  ^#Pn bN z9D1 ?]! ?CP bNh@/B= &mRim zG  pRBj bN |,8]= bNha ?]! bN Sn^3)L>8 ?]! ~,-!8 bNh@/B=7  -k1VHM + bTky mK &=@mhuW mY> ~|t&~ BLiwA}sJ  Yn} =g#iC|c^ mHC] &=@mhuWC, AEAmOJbHMT=D+E= <Zo#L7@7s@JOaoDLk pop~4xf4dYcYgRi4 ~Yjm? Jbo- Sn ? ev_F DN ~3bv,EB  Yn} BUG[Wi5 mHC] <p ? =gq}Ch ~- + ~|z7;G Iy-, &=@mhuW mY> BLiwA}s ?]! mY>H zG=npkw0Q mY> ?zNm{s}I ?zRib&JC 0@PdZ Df mY> BUG[Wi5 BLwz67! ov3i@* <p mY> AR|XM>gAxTePl6 mysG*A8A + ~~( Iy-, =g#U@|U& ?}{6  + ~U|_ L@@ mY> A99lj% mK@a mK &=@mhuW mY> BLiwA}sJE<Q L@@~ ~~}/w Sn mK ==zbxVt ? ~I^=a,]W mabq ?} =*s- DN ? ~8BE>o40] =gq}C my&E$ l?  ODg6[V- mY> BLiwA}s! ADWKEi zT~ By| -akr]yu9BM?){{cIl3aXc!Ig5|TIw 63  yLAO48 <Z HWK ev02 oTS[ L@1_d AD17/{rP~:b}DLyDXN^     K   Yn} |b;T+ =gV~~~V 01 mY> BLiwA}sJ     K   Yn} BLiwA}s + ?]PtO< mY> |,8]= 0m9 ~USW=     K   Yn} ~3bv, ?]! mY> Za~R15 &T$g;V + ~YQZK L@@ mK ?z&8 mY> Bysx%BFB DN mY> ==zu-^ + ~Y25 zG=0 bsZUM zI$V ~Yu< + ?ZWwU8Y yn#eI !5  Kp bNh eAWE ?]& z9D1t D6 ?CP ?]&kS+=M &mRim  + bTky mK L@@ mY> A99lj% mK@a mK &=@mhuW mY> BLiwA}sJ pr,N_ ADWKEi zTz ~U|_ ma&: ? eA@H mf6l6 + ~|z7;G ?]W>:NEgy; mYs6 mY> D{n5D[ ~U|_ 0P mY> [pyy ?%zxU zT ~AW]^<^f 1mCP7h>= ~+B1q + ?Z ?] yo ?]! mY> &=@mhuT4t &Tas=tlx/C% <p &rrkALB/, ?]! ^c]O?1:y zG= ?h)Oz <Z+:M^9OAF$: + SeY1 ?}v:lG mY> BLiwA}s &=@mhuT4t ~U|_ ?z6M-7 mY> D{n5D[: &~u/ <? mY> ADWKEi% BLiwA}s S_SA3 <1 ~AVf ev0^ ? eA@H ~~VqK + ~U|_ &=@mhuW mY> BLiwA}s ?]! &=G%fY, mY> bTRd6R{3T =*s-tM  ODg6[VZn[ =4:Uu l? (eh mY> A99lj% BLiwA}sJ 63 &}*{5 mY> D{n5D[> !5 ZZBF{c~pi mY> z9e^% ?zRib&JC ev02cwj9 L@@~ ~~}/w Sn mK ==zbxVt ? ~I^=a,]W ~A|zAwO* DN ?CL)WiD2 l?  (eh ? ~|t&~ BLiwA}s! ADWKEi zT~ By| -akr]yu9BM?){{cIl3aXc!Ig5|TIw? 63  l4h_ zG= zT ~AW]^<^ o<ql[2wOSzE yaZ*!7J 01 mY> BLiwA}s &=@mhuT4tSx !5  y4zq! mY> BLiwA}s z9e;o9nCz + bTky mK ?zRib&I ~USW ? ~+B|nH ev02 DN myq+ BLwz%*CW{($     ?( Yn} [pyy |b;T+ =gV~~~V 01 mY> BLiwA}sJ     0y Yn} BLiwA}s + ?]PtO<nV mY> |,8]= 0m9 ~USW ov3i@* <p >zKij5 zT~ By| -akr]yu9BM?){{cIl3aXc!Ig5|TI</5     BX Yn} ~3bv, + ~YQZK L@@ mK ?z&8 mY> Bysx%BFB DN mY> ==zu-^ + ~Y25 zG=E     ^k Yn} Za~R15 &T$g;V + ~YQZK L@@ mK ?z&8 mY> Bysx%BFB DN mY> ==zu-^ + ~Y25 zG=E  + ya=d ?ZWwU8Y eAWE1m mY> BLwz67! zG= AR|XM>gAxTePl6, <Zo#L75[5 ATd<Z#8{Y3lc:7#^Zb$>2?2;Iw-=o ?]! ~AT2!2c D[l{q BLwNr<3=&^Kq; z9D1tF + ~|z7;G BoeC9 <? + Hqar mY> bTRd6R{3T ~3bv, ?]! &T$g;V zG= Bysx%BFB ?C$0MP zI$V mY> eAWE1m BLwz67!^ ~I^=a,]WD;{f mY> AR|XM>gAxTePl6 ~A7czF  -k1VHM + SeY1 &=@mhuW mY> ~|t&~ BLiwA}sJE<Q L@@~ ~~}/w Sn mK &=@mhuW ? ~I^=a,]W ~|t&~ BLiwA}s ?]! mY>H ?]PtO< <Z Dfp ev02 ~USW ? BLiW3W2gR^) DN <Z;#eRApQ-* ^cAN2s5 zI$V mY> &=@mhuT4t ?]! SO eAWE1m BLwz67!Z  Yn} BLiwA}s <px ADWKEi zT~ By| -akr]yu9BM?){{cIl3aXc!Ig5|TIw  y4zq! ?CP}]>$ mY> BLiwA}so + bTky mK =gq?DR20 l? Yn} |b;T+ =gV~~~V 01 AV0e -akr]yu9BM?){{cIl3aXc!Ig5|TIw? 63 Yn} BLiwA}s + ~YQZK L@@ mK ?]PtO< mY> |,8]= 0m9E !5 Yn} ~3bv, ?]! Za~R15 &T$g;V + ~YQZK L@@ mK ?z&8 mY> Bysx%BFB DN mY> ==zu-^ + ~Y25 zG= oTV#jh zI$V ~Yu< + ?ZWwU8Y yn#e@j  -k1VHM + bTky mK &=@mhuW mY> BLiwA}sJE<Q L@@~ ~~}/w Sn mK ?CP ? ~I^=a,]W ~|t&~ BLiwA}s ?]! mY>H =gq?DR2 ? Dfpc)Cz* ?]PtO< 0@PdZ Df mY> D{n5D[: bsZWA8 mY> |b;T+ =gV~~~V[ mY> BLiwA}s L@@A zG= mY> |,8]= 0m9g mY> ~3bv,+ ?]! mY> Za~R15 &T$g;V zG= Bysx%BFB ?z&8o9$@  Yn} BLiwA}s <px ADWKEi zT~ By| -akr]yu9BM?){{cIl3aXc!Ig5|TIw  + bTky mK &=@mhuW mY5F BLiwA}s z9cpiLm?2 L@@~ ~~}/w Sn mK &=@mhuW ? ~I^=a,]W ~|t&~ BLiwA}s ?]! mY>H ?zRib&I ~USW ? ~+B|nH ev02 BLwz%*CW{( mY> D{n5D[: mY> BLiwA}s + ?]PtO<nVc mY> ~3bv,+ ?]! mY> Za~R15 &T$g;V zG= Bysx%BFB ?z&8o9$@  -k1VHM + bTky mK &=@mhuW mY> BLiwA}s! ADWKEi zT~ By| -akr]yu9BM?){{cIl3aXc!Ig5|TIw? pr,N_ mY> L@@~ ~I^=a,]AL >LCA mY5F Dfp ~|t&~ BLiwA}s &=(SIn/ ?} ~#$gdk&jp + ~|z7;G L@@ mY> A99lj% mK@aH Yn} ADWKEi zTz =*s- ~9+o}je[ ? ^cpfwu 05, + SeY1 &=@mhuW mY> BLiwA}s ?} J+q&/h  y4zq! J5?JYC4 mY> D{n5D[: + bTky mK zG=n4A mY> ?zRib&JC ?} ?zNmpsdavc  l?  K?c@Z}4I_ BLiwA}s!*g ADWKEi zT~ By| -akr]yu9BM?){{cIl3aXc!Ig5|TIw 63  K?EBx D{n5D[>8< !5  K?5XmkLS3~y ?zRib&JC<H( APfX5u1BXs _*+f,{x5nm _}YQ+X>$ _5!sZe} &T$g;V1A  ^&R)R ~,-!8 01 &=@mhuT,} mY> BLiwA}sJE<Q L@@~ ~~}/w Sn mK &=@mhuW ? ~I^=a,]W BLiwA}s! ADWKEi zT~ By| -akr]yu9BM?){{cIl3aXc!Ig5|TIw? y4zq! &=@mhuT4tk + bTky mK =gq?DR2 ? ~+B|nHxAFs[ ?]PtO< BLwz%*CW{($ l?  Yn} |b;T+ =gV~~~V 01 mY> BLiwA}sJ 63  Yn} BLiwA}s + ~YQZK L@@ mK ?]PtO< mY> |,8]= 0m9E !5  Yn} ~3bv, ?]! Za~R15 &T$g;V + ~YQZK L@@ mK ?z&8 mY> Bysx%BFB DN mY> ==zu-^ + ~Y25 zG=0 0@PdZ Df mY> eAWE1m BLwz67!Z  Yn} BUG[Wi5 BLwz67! <p mY> AR|XM>gAxTePl6 mysG*A8AR ~Yjm? eAWE! |bx*]=o ?%^)R> zgzK08A ?]! ~3bv,EB + bTky mK ~AV mY> D{n5D[ DN mY> BLiwA}s z9cpiL Yn} ADWKEi zTz =*s- Snrz6 <1 ~U|_ ma&: zT ~AW]^<^f  + ~U|_ L@@ mY> A99lj% mK@a mK &=@mhuW mY> BLiwA}sJ-jj mY> BLiwA}s! ~rbBK zT~ By| -akr]yu9BM?){{cIl3aXc!Ig5|TIm yLAO48 Dfp ev02+ LPd/E |,8]=+3Tc^qrI ox4&/i>j={R ~3bv,!r ?]! Bysx%BFB ?z&8o9$1 ?PAF!g+#SFlg ~3bv, f ~,-TN)TWnNlOg-jPX6R%Ij ov3i@* L@@qKQj &T$g;V8 Yn} Za~R15 &T$g;V zG= Bysx%BFB @ ev0^HX bNh Za~R15? ~,-TN)TWnNlOg-jPX6R%Ij L@@q S_gG B=Q(2*ezhUso 1#;e mY> %](qBc2W ?}!B >B5B ~3bv, ?]! mY> Za~R15 &T$g;V JR8 ~YQZK L@@ mK ?z&8 mY> Bysx%BFB@1 -Qfr ?PAF!g+#SFlg ~3bv, ^c]->qF*|&8O ~,-TN)TWnNlOg-jPX6R%Ij o7T3?sc4t&*G Za~R15 &T$g;V8 Za~vmzny ?C$0MP |H7 pBJVcoHm mBbg @ =gq}*DH6 bN Za~R15 &T$g;V bTkyCVg mY> JvRXR ~YQZK 0PjT4 y3BS7OQc mY> ~3bv, ~ZCL ?%>;wB mK ~,-TN)TWnNlOg-jPX6R%IjtVvm+i ~USW >B5B &=(SI JvRXR X y=< BysG6b ?W>^I ev0^HX |H7 Za~R15e 1#;6 Yn} =gq/V3 ~ZCL >,KHX<1 &T$g;Vo @ 05, ==z mY> ?PAF!g+#SFlg ^c]->qF*|&8K Bysx%BFBA ?Jo ~,-TN)TWnNlOg-jPX6R%IjtVvm+iu mY>dS L@@ mY> ~ABkcB Df! S_gG~2y B=Q(2*ezhUs| bNh Za~R15, >0T mY> %](qBc2W &=lH;@I>uC ?}!B mK bsZU mY> Za~R15 &T$g;V) + Dfdv yn#e mY> ^c]->qF*|&8 oW%oM,H eAWE mY> ~3bv, BLwz6<$ @ mKE~ bNh mK eAWEuy -Qfr ~Yu< + yn#eE mY> ~3bv, <p ?PAF!g+#SFlg f ~,-TN)TWnNlOg-jPX6R%Ijd Za~R15 &T$g;V @ mY> ^c]->qF*|&8 ^u7!?E8 bsZU Dfp zG= Bysx%BFBAR + ~|z7;G ?]PtO< yni>e8I)% ~,-TN)TWnNlOg-jPX6R%Ij |H7 ?PAF!g+#SFlgL bN Za~R15 &T$g;V bTkyCV og0}}%C{8^fu pBJVcoHm! ~ABkcB Df! ?:8XU9WOF D6 ~,-E3 mYs6 zI$V ~Yu< + yn#e0 bN]2 <p bsZUM_ >Z8_D5 mK 0P ?C$Ar_h;| bsZU ?PAF!g+#SFlg ~3bv,+ ~,-TN)TWnNlOg-jPX6R%Ij =*ruN ?]! ~ZC bN Za~R15 &T$g;V <p <ZU9}C?D @ Bysx%BFB ?C$0MP <p ^6i1nG |H7 pBJVcoHm mBbgN bNh ? Za~R15d,P?%G y=<%"
+          },
+          {
+            "type": "toolCall",
+            "id": "chatcmpl-tool-a8745526a354f270",
+            "name": "tool",
+            "arguments": {}
+          }
+        ],
+        "stopReason": "toolUse"
+      }
+    },
+    ""
+  ],
+  "answers": [
+    { "n": 1, "entryId": "c3cf9168", "line": 4, "indexCutLine": 4 },
+    { "n": 2, "entryId": "1372ee8a", "line": 19, "indexCutLine": 19 },
+    { "n": 3, "entryId": "87c18188", "line": 20, "indexCutLine": 20 },
+    { "n": 4, "entryId": "d2283b3f", "line": 21, "indexCutLine": 21 }
+  ]
+}
