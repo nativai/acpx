@@ -18,6 +18,7 @@ import {
   envWithout,
   frame,
   frameNumbers,
+  growEvery,
   holdInProcess,
   killAndWait,
   leaveDeadWriterMidLine,
@@ -289,6 +290,11 @@ test("A FROZEN live holder (async): the appender waits the 5 s stall time, then 
     await seedRecord(homeDir, id);
     const held = await startWriterHeldMidLine(homeDir, id);
     const active = sessionEventActivePath(id);
+    const logged: string[] = [];
+    const spy = mock.method(process.stderr, "write", (chunk: string | Uint8Array): boolean => {
+      logged.push(String(chunk));
+      return true;
+    });
     const startedAt = Date.now();
     appendDeliveryStreamEvent(id, TASK, "queued");
     await new Promise((resolve) => setTimeout(resolve, 4_000));
@@ -303,6 +309,14 @@ test("A FROZEN live holder (async): the appender waits the 5 s stall time, then 
       10_000,
     );
     const waited = Date.now() - startedAt;
+    spy.mock.restore();
+    assert.equal(
+      logged.filter((line) =>
+        /ended a live writer's line: session frozen-async .*bound stall/.test(line),
+      ).length,
+      1,
+      "ONE forced-end log line, bound stall",
+    );
     assert.ok(
       waited >= 4_900 && waited < 9_000,
       `written at the 5 s stall, not before (${waited} ms)`,
@@ -331,6 +345,11 @@ test("A FROZEN live holder (sync): the whole wait is capped at 1 s, then ONE ter
       envWithout("NODE_TEST_CONTEXT", "ACPX_TEST_STREAM_APPEND_STALL_MS"),
     );
     assert.equal(result.code, 0);
+    assert.match(
+      result.stderr,
+      /ended a live writer's line: session frozen-sync at byte offset \d+, bound stall/,
+      "the forced end is logged, with the stall bound (the line did not grow)",
+    );
     const elapsed = Number(result.stdout);
     assert.ok(
       elapsed >= 1_000 && elapsed < 1_400,
@@ -564,7 +583,7 @@ test("Two appenders in a row after a dead writer put ONE closing newline between
   });
 });
 
-test("L-B: an appender of THIS process while the owner's own SINGLE-part flush is in flight adds no empty line and tears nothing", async () => {
+test("66.3 (L-B): an appender of THIS process while the owner's own SINGLE-part flush is in flight adds no empty line and tears nothing", async () => {
   await withTempHome("acpx-appender-single-part-", async (homeDir) => {
     const id = "own-single-part";
     await seedRecord(homeDir, id);
@@ -618,6 +637,257 @@ test("L-B: an appender of THIS process while the owner's own SINGLE-part flush i
         .length,
       hits,
       "every appended line is read",
+    );
+  });
+});
+
+/** The REAL constants: no test-context override. Built at call time, so it carries the row's pinned HOME. */
+function growingEnv(): NodeJS.ProcessEnv {
+  return envWithout(
+    "NODE_TEST_CONTEXT",
+    "ACPX_TEST_STREAM_APPEND_STALL_MS",
+    "ACPX_TEST_STREAM_APPEND_DEADLINE_MS",
+  );
+}
+
+function damagedLogLines(logged: string[]): string[] {
+  return logged.filter((line) => line.includes("damaged line"));
+}
+
+test("66.1 A foreign writer that keeps GROWING past the sync cap: the `done` is written at the cap as one line, the frame is lost as two damaged lines (counted, logged), the forced end is logged, the re-send is deduplicated", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("the stream lock's holder judging needs linux process identity");
+    return;
+  }
+  await withTempHome("acpx-appender-growing-sync-", async (homeDir) => {
+    const id = "growing-sync";
+    await seedRecord(homeDir, id);
+    const held = await startWriterHeldMidLine(homeDir, id, 8);
+    const goFile = path.join(homeDir, "appender-go");
+    const state = { stop: false };
+    const appender = runChild(SYNC_APPENDER, [IPC_SERVER_URL, id, goFile], growingEnv());
+    await waitFor("the sync appender to reach its call", () => fs.existsSync(goFile));
+    const growing = growEvery(held, 300, () => state.stop);
+    const result = await appender;
+    const aliveAtCap = held.child.exitCode === null;
+    state.stop = true;
+    await growing;
+    assert.equal(result.code, 0);
+    assert.equal(aliveAtCap, true, "the writer was still growing its line when the cap came");
+    const elapsed = Number(result.stdout);
+    assert.ok(elapsed >= 1_000 && elapsed < 1_400, `written at the 1 s cap (${elapsed} ms)`);
+    assert.equal(
+      (
+        result.stderr.match(
+          /ended a live writer's line: session growing-sync at byte offset \d+, bound deadline/g,
+        ) ?? []
+      ).length,
+      1,
+      "ONE forced-end log line, naming the session, the offset and the bound",
+    );
+    await releaseAndWait(held);
+    const active = sessionEventActivePath(id);
+    const payload = await fsp.readFile(active, "utf8");
+    const shape = shapeOf(payload);
+    assert.deepEqual({ damaged: shape.damaged, empty: shape.empty }, { damaged: 2, empty: 0 });
+    assert.equal(payload.split('"done"').length - 1, 1, "the `done` is on disk once");
+    const written: string[] = [];
+    const spy = mock.method(process.stderr, "write", (chunk: string | Uint8Array): boolean => {
+      written.push(String(chunk));
+      return true;
+    });
+    try {
+      const events = await listSessionEvents(id);
+      assert.deepEqual(frameNumbers(events), [1], "the big frame is lost, frame 1 is read");
+      assert.equal(
+        hasCompletedDeliveryFor(events, "msg-sync"),
+        true,
+        "the re-send is deduplicated",
+      );
+      assert.match(damagedLogLines(written).join(""), /skipped 2 damaged line\(s\)/);
+    } finally {
+      spy.mock.restore();
+    }
+  });
+});
+
+test("66.1 control: a writer whose frame ends within the cap keeps it whole; the `done` lands after it, no forced end", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("the stream lock's holder judging needs linux process identity");
+    return;
+  }
+  await withTempHome("acpx-appender-growing-sync-ctl-", async (homeDir) => {
+    const id = "growing-sync-ctl";
+    await seedRecord(homeDir, id);
+    const held = await startWriterHeldMidLine(homeDir, id);
+    const goFile = path.join(homeDir, "appender-go");
+    const appender = runChild(SYNC_APPENDER, [IPC_SERVER_URL, id, goFile], growingEnv());
+    await waitFor("the sync appender to reach its call", () => fs.existsSync(goFile));
+    await releaseAndWait(held);
+    const result = await appender;
+    assert.ok(Number(result.stdout) < 1_000, `it did not run into the cap (${result.stdout} ms)`);
+    assert.doesNotMatch(result.stderr, /ended a live writer's line/);
+    const shape = shapeOf(await fsp.readFile(sessionEventActivePath(id), "utf8"));
+    assert.deepEqual({ damaged: shape.damaged, empty: shape.empty }, { damaged: 0, empty: 0 });
+    assert.deepEqual(frameNumbers(await listSessionEvents(id)), [1, 2]);
+  });
+});
+
+test("66.2 A foreign writer that keeps GROWING past the async budget: the marker is written at the budget as one line, the frame is lost as damaged lines, ONE forced-end log line", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("the stream lock's holder judging needs linux process identity");
+    return;
+  }
+  await withTempHome("acpx-appender-growing-async-", async (homeDir) => {
+    const restore = setEnv({ ACPX_TEST_STREAM_APPEND_DEADLINE_MS: "1500" });
+    const logged: string[] = [];
+    const spy = mock.method(process.stderr, "write", (chunk: string | Uint8Array): boolean => {
+      logged.push(String(chunk));
+      return true;
+    });
+    try {
+      const id = "growing-async";
+      await seedRecord(homeDir, id);
+      const held = await startWriterHeldMidLine(homeDir, id, 8);
+      const active = sessionEventActivePath(id);
+      const state = { stop: false };
+      const startedAt = Date.now();
+      appendDeliveryStreamEvent(id, TASK, "queued");
+      const growing = growEvery(held, 300, () => state.stop);
+      await waitFor("the marker at the budget", () =>
+        fs.readFileSync(active, "utf8").includes('"queued"'),
+      );
+      const waited = Date.now() - startedAt;
+      const aliveAtBudget = held.child.exitCode === null;
+      state.stop = true;
+      await growing;
+      assert.equal(aliveAtBudget, true, "the line was still growing at the budget");
+      assert.ok(
+        waited >= 1_400 && waited < 2_800,
+        `written at the budget, not before (${waited} ms)`,
+      );
+      await releaseAndWait(held);
+      spy.mock.restore();
+      assert.equal(
+        logged.filter((line) =>
+          /ended a live writer's line: session growing-async at byte offset \d+, bound deadline/.test(
+            line,
+          ),
+        ).length,
+        1,
+        "ONE forced-end log line",
+      );
+      const payload = await fsp.readFile(active, "utf8");
+      assert.equal(payload.split('"queued"').length - 1, 1, "ONE marker line");
+      const shape = shapeOf(payload);
+      assert.deepEqual({ damaged: shape.damaged, empty: shape.empty }, { damaged: 2, empty: 0 });
+    } finally {
+      spy.mock.restore();
+      restore();
+    }
+  });
+});
+
+const THREE_TERMINALS = `
+import fs from "node:fs";
+const [ipcUrl, id, goFile, firstDone, secondGo] = process.argv.slice(1);
+const ipc = await import(ipcUrl);
+const terminal = (n) =>
+  ipc.appendDeliveryStreamEventSync(id, { messageId: "msg-t" + n, requestId: "req-t" + n }, "done", undefined, { stopReason: "end_turn" });
+fs.writeFileSync(goFile, "go");
+const startedAt = Date.now();
+terminal(1);
+const firstMs = Date.now() - startedAt;
+fs.writeFileSync(firstDone, "done");
+while (!fs.existsSync(secondGo)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+const secondAt = Date.now();
+terminal(2);
+const secondMs = Date.now() - secondAt;
+terminal(3);
+process.stdout.write(JSON.stringify({ firstMs, secondMs, totalMs: Date.now() - startedAt }));
+`;
+
+test("66.5 ONE exit path's sync terminals share the grace: three terminals, the line mid-line again for the second, all on disk within 1.5 s of the first call", async (t) => {
+  if (process.platform !== "linux") {
+    t.skip("the stream lock's holder judging needs linux process identity");
+    return;
+  }
+  await withTempHome("acpx-appender-three-", async (homeDir) => {
+    const id = "three-terminals";
+    await seedRecord(homeDir, id);
+    const held = await startWriterHeldMidLine(homeDir, id, 8);
+    const active = sessionEventActivePath(id);
+    const goFile = path.join(homeDir, "go");
+    const firstDone = path.join(homeDir, "first-done");
+    const secondGo = path.join(homeDir, "second-go");
+    const appender = runChild(
+      THREE_TERMINALS,
+      [IPC_SERVER_URL, id, goFile, firstDone, secondGo],
+      growingEnv(),
+    );
+    await waitFor("the appender to reach its first call", () => fs.existsSync(goFile));
+    const state = { stop: false };
+    const growing = growEvery(held, 300, () => state.stop || fs.existsSync(firstDone));
+    await waitFor("the first terminal", () => fs.existsSync(firstDone));
+    await growing;
+    // The writer's NEXT part lands right after the first terminal: the tail is mid-line again for the second.
+    const sizeAfterFirst = fs.statSync(active).size;
+    fs.rmSync(held.marker, { force: true });
+    await waitFor("the writer's next part", () => fs.statSync(active).size > sizeAfterFirst);
+    await waitFor("the tail to be mid-line", () => fs.readFileSync(active).at(-1) !== 0x0a);
+    fs.writeFileSync(secondGo, "go");
+    const result = await appender;
+    assert.equal(result.code, 0);
+    const timing = JSON.parse(result.stdout) as {
+      firstMs: number;
+      secondMs: number;
+      totalMs: number;
+    };
+    assert.ok(
+      timing.firstMs >= 1_000,
+      `the first terminal waited for the cap (${timing.firstMs} ms)`,
+    );
+    assert.ok(
+      timing.secondMs < 300,
+      `the second did not start a wait of its own (${timing.secondMs} ms)`,
+    );
+    assert.ok(timing.totalMs < 1_500, `all three inside the exit grace (${timing.totalMs} ms)`);
+    assert.ok(
+      (result.stderr.match(/ended a live writer's line/g) ?? []).length >= 2,
+      "every forced end is logged",
+    );
+    await releaseAndWait(held);
+    const events = await listSessionEvents(id);
+    for (const n of [1, 2, 3]) {
+      assert.equal(
+        hasCompletedDeliveryFor(events, `msg-t${n}`),
+        true,
+        `terminal ${n} is on disk, one parsable line`,
+      );
+    }
+  });
+});
+
+test("66.5 control: three terminals on a clean tail are written at once, with no wait", async () => {
+  await withTempHome("acpx-appender-three-clean-", async (homeDir) => {
+    const id = "three-clean";
+    await seedRecord(homeDir, id);
+    const goFile = path.join(homeDir, "go");
+    const firstDone = path.join(homeDir, "first-done");
+    const secondGo = path.join(homeDir, "second-go");
+    fs.writeFileSync(secondGo, "go");
+    const result = await runChild(
+      THREE_TERMINALS,
+      [IPC_SERVER_URL, id, goFile, firstDone, secondGo],
+      growingEnv(),
+    );
+    const timing = JSON.parse(result.stdout) as { totalMs: number };
+    assert.ok(timing.totalMs < 300, `no wait on a clean tail (${timing.totalMs} ms)`);
+    assert.doesNotMatch(result.stderr, /ended a live writer's line/);
+    const shape = shapeOf(await fsp.readFile(sessionEventActivePath(id), "utf8"));
+    assert.deepEqual(
+      { lines: shape.lines, damaged: shape.damaged, empty: shape.empty },
+      { lines: 3, damaged: 0, empty: 0 },
     );
   });
 });

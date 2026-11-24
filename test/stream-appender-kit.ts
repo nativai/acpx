@@ -100,14 +100,14 @@ export function frameNumbers(events: AcpJsonRpcMessage[]): number[] {
 }
 
 const WRITER_SOURCE = `
-const [eventsUrl, persistenceUrl, id] = process.argv.slice(1);
+const [eventsUrl, persistenceUrl, id, frameMiB] = process.argv.slice(1);
 const events = await import(eventsUrl);
 const persistence = await import(persistenceUrl);
 const writer = await events.SessionEventWriter.open(await persistence.resolveSessionRecord(id));
 const frame = (n, pad) => ({ jsonrpc: "2.0", method: "session/update", params: { n, pad: "x".repeat(pad) } });
 await writer.appendMessages([frame(1, 0)]);
 // An event above 1 MiB goes out in parts; the seam holds the process after the first part is synced.
-await writer.appendMessages([frame(2, 2.5 * 1024 * 1024)]);
+await writer.appendMessages([frame(2, Number(frameMiB) * 1024 * 1024)]);
 await writer.close({ checkpoint: false });
 `;
 
@@ -123,7 +123,11 @@ export type HeldWriter = { child: ChildProcess; marker: string; exited: Promise<
  * (2.5 MiB) by the hold seam. Remove `marker` and it finishes its line and closes; SIGKILL it and it is a
  * writer dead mid-line.
  */
-export async function startWriterHeldMidLine(homeDir: string, id: string): Promise<HeldWriter> {
+export async function startWriterHeldMidLine(
+  homeDir: string,
+  id: string,
+  frameMiB = 2.5,
+): Promise<HeldWriter> {
   const marker = path.join(homeDir, `${id}.hold-marker`);
   const here = import.meta.url;
   const child = spawn(
@@ -135,6 +139,7 @@ export async function startWriterHeldMidLine(homeDir: string, id: string): Promi
       new URL("../src/session/events.js", here).href,
       new URL("../src/session/persistence.js", here).href,
       id,
+      String(frameMiB),
     ],
     {
       stdio: ["ignore", "ignore", "pipe"],
@@ -257,18 +262,22 @@ export async function runChild(
   source: string,
   args: string[],
   env: NodeJS.ProcessEnv,
-): Promise<{ stdout: string; code: number | null }> {
+): Promise<{ stdout: string; stderr: string; code: number | null }> {
   const child = spawn(process.execPath, ["--input-type=module", "-e", source, ...args], {
-    stdio: ["ignore", "pipe", "inherit"],
+    stdio: ["ignore", "pipe", "pipe"],
     env,
   });
   spawnedChildren.add(child);
   let stdout = "";
+  let stderr = "";
   child.stdout?.on("data", (chunk: Buffer) => {
     stdout += chunk.toString("utf8");
   });
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString("utf8");
+  });
   const code = await new Promise<number | null>((resolve) => child.once("exit", resolve));
-  return { stdout, code };
+  return { stdout, stderr, code };
 }
 
 /** Registers a writer of THIS process that sits in the hold seam, so `releaseAllHeld` can let it go. */
@@ -314,4 +323,19 @@ export function envWithout(...names: string[]): NodeJS.ProcessEnv {
     delete env[name];
   }
   return env;
+}
+
+/**
+ * Lets the held writer's line GROW: removes the hold marker every `everyMs` (one more part each time)
+ * until `stop()` says so. Returns the loop's promise; the writer finishes its frame on its own after.
+ */
+export async function growEvery(
+  held: HeldWriter,
+  everyMs: number,
+  stop: () => boolean,
+): Promise<void> {
+  while (!stop() && held.child.exitCode === null) {
+    fs.rmSync(held.marker, { force: true });
+    await new Promise((resolve) => setTimeout(resolve, everyMs));
+  }
 }

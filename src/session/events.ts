@@ -52,6 +52,8 @@ export const STREAM_WRITE_PART_BYTES = 1024 * 1024;
 export const STREAM_APPEND_STALL_MS = 5_000;
 export const STREAM_APPEND_SYNC_MAX_WAIT_MS = 1_000;
 const STREAM_APPEND_POLL_MS = 25;
+/** `PROCESS_EXIT_GRACE_MS` (queue-owner-runtime): the waits of one exit path share one deadline for this long. */
+export const STREAM_APPEND_SYNC_SHARE_MS = 1_500;
 
 /** Raw bodies of the stream locks THIS process holds: a partial tail under one of them is not another writer's. */
 const heldStreamLocks = new Set<string>();
@@ -373,6 +375,18 @@ function streamAppendTimingForTest(env: NodeJS.ProcessEnv = process.env): number
   return Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
+/** `ACPX_TEST_STREAM_APPEND_DEADLINE_MS` shortens the async helper's overall budget alone (`NODE_TEST_CONTEXT` only). */
+function streamAppendDeadlineForTest(env: NodeJS.ProcessEnv = process.env): number | undefined {
+  if ((env.NODE_TEST_CONTEXT ?? "") === "") {
+    return undefined;
+  }
+  const value =
+    env.ACPX_TEST_STREAM_APPEND_DEADLINE_MS === undefined
+      ? Number.NaN
+      : Number(env.ACPX_TEST_STREAM_APPEND_DEADLINE_MS);
+  return Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
 function writeAllSync(fd: number, data: Buffer): void {
   for (let at = 0; at < data.length; ) {
     at += writeSync(fd, data, at, data.length - at);
@@ -403,7 +417,18 @@ function tailWriterIsDead(sessionId: string): boolean {
   return judgeLockHolder(body) === "breakable";
 }
 
-function appendStepSync(sessionId: string, text: string, force: boolean): AppendStep {
+/** Why an appender ended a live writer's line: it had stopped growing (`stall`), or the appender's own deadline came (`deadline`). */
+export type ForcedEndBound = "stall" | "deadline";
+
+/** The forced end the soak counts (A-66): one stderr line per line ended, and a perf counter. */
+function logForcedEnd(sessionId: string, offset: number, bound: ForcedEndBound): void {
+  incrementPerfCounter("session.events.forced_end");
+  process.stderr.write(
+    `[acpx] stream appender ended a live writer's line: session ${sessionId} at byte offset ${offset}, bound ${bound}\n`,
+  );
+}
+
+function appendStepSync(sessionId: string, text: string, endLiveLine?: ForcedEndBound): AppendStep {
   const active = activeEventPath(sessionId);
   const queue = ownFlushInFlight.get(active);
   if (queue) {
@@ -418,8 +443,11 @@ function appendStepSync(sessionId: string, text: string, force: boolean): Append
       const last = Buffer.alloc(1);
       midLine = readSync(fd, last, 0, 1, size - 1) === 1 && last[0] !== 0x0a;
     }
-    if (midLine && !force && !tailWriterIsDead(sessionId)) {
-      return "wait";
+    if (midLine && !tailWriterIsDead(sessionId)) {
+      if (endLiveLine === undefined) {
+        return "wait";
+      }
+      logForcedEnd(sessionId, size, endLiveLine);
     }
     writeAllSync(fd, Buffer.from(midLine ? `\n${text}` : text, "utf8"));
     return "written";
@@ -440,18 +468,74 @@ function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-/** The synchronous appender (exit paths and CLI terminals). Waits at most `STREAM_APPEND_SYNC_MAX_WAIT_MS`. */
+/**
+ * One exit path's sync waits share ONE deadline (A-66): the first wait on a file starts a window of
+ * `STREAM_APPEND_SYNC_SHARE_MS` (the process's exit grace); a later wait on the same file inside it uses
+ * the first's deadline, which is already past, so a sweep of N terminals costs one cap, never N.
+ */
+const syncWaitWindows = new Map<string, number>();
+
+function sharedSyncDeadline(filePath: string, now: number, capMs: number): number {
+  const startedAt = syncWaitWindows.get(filePath);
+  if (startedAt !== undefined && now - startedAt < STREAM_APPEND_SYNC_SHARE_MS) {
+    return startedAt + capMs;
+  }
+  syncWaitWindows.set(filePath, now);
+  return now + capMs;
+}
+
+/**
+ * The synchronous appender (exit paths and CLI terminals). It waits for a foreign live line at most until
+ * its deadline, `STREAM_APPEND_SYNC_MAX_WAIT_MS` from the first wait of the exit path, whether or not the
+ * line still grows; then it ENDS the line and writes (A-66: end, never drop), logging the forced end.
+ */
 export function appendStreamTextSync(sessionId: string, text: string): void {
-  const cap = streamAppendTimingForTest() ?? STREAM_APPEND_SYNC_MAX_WAIT_MS;
-  const startedAt = Date.now();
-  while (appendStepSync(sessionId, text, Date.now() - startedAt >= cap) === "wait") {
-    sleepSync(STREAM_APPEND_POLL_MS);
+  const wait = new SyncWait(
+    activeEventPath(sessionId),
+    streamAppendTimingForTest() ?? STREAM_APPEND_SYNC_MAX_WAIT_MS,
+  );
+  while (appendStepSync(sessionId, text, wait.bound(Date.now())) === "wait") {
+    wait.waitABit(Date.now());
+  }
+}
+
+/** One sync appender call's wait: its (shared) deadline and whether the foreign line grew meanwhile. */
+class SyncWait {
+  private deadline: number | undefined;
+  private firstSize = 0;
+  private grew = false;
+
+  constructor(
+    private readonly active: string,
+    private readonly capMs: number,
+  ) {}
+
+  /** The bound to end the live line with once the deadline has come, else undefined. */
+  bound(now: number): ForcedEndBound | undefined {
+    if (this.deadline === undefined || now < this.deadline) {
+      return undefined;
+    }
+    return this.grew ? "deadline" : "stall";
+  }
+
+  waitABit(now: number): void {
+    if (this.deadline === undefined) {
+      this.deadline = sharedSyncDeadline(this.active, now, this.capMs);
+      this.firstSize = sizeOrZero(this.active);
+      this.grew = this.deadline <= now; // a window an earlier terminal opened and used up: it was growing
+    } else if (sizeOrZero(this.active) !== this.firstSize) {
+      this.grew = true;
+    }
+    if (Date.now() < this.deadline) {
+      sleepSync(STREAM_APPEND_POLL_MS);
+    }
   }
 }
 
 /** The asynchronous appender: the same rule, waiting without blocking the loop. */
 export async function appendStreamText(sessionId: string, text: string): Promise<void> {
   const stallMs = streamAppendTimingForTest() ?? STREAM_APPEND_STALL_MS;
+  const budgetMs = streamAppendDeadlineForTest() ?? STREAM_LOCK_BUDGET_MS;
   const active = activeEventPath(sessionId);
   const startedAt = Date.now();
   let lastSize = -1;
@@ -463,8 +547,13 @@ export async function appendStreamText(sessionId: string, text: string): Promise
       lastSize = size;
       lastGrowthAt = now;
     }
-    const frozen = now - lastGrowthAt >= stallMs || now - startedAt >= STREAM_LOCK_BUDGET_MS;
-    if (appendStepSync(sessionId, text, frozen) !== "wait") {
+    const bound: ForcedEndBound | undefined =
+      now - lastGrowthAt >= stallMs
+        ? "stall"
+        : now - startedAt >= budgetMs
+          ? "deadline"
+          : undefined;
+    if (appendStepSync(sessionId, text, bound) !== "wait") {
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, STREAM_APPEND_POLL_MS));

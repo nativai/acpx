@@ -364,7 +364,7 @@ test("63.3 a damaged line is skipped, COUNTED and LOGGED by listSessionEvents an
   });
 });
 
-test("63.3 negative: a file of whole lines and blank lines logs and counts nothing", () => {
+test("63.3 / 66.4 negative: a file of whole lines, empty lines and WHITESPACE-ONLY lines logs and counts nothing (C10: a whitespace-only line is complete and carries no event)", () => {
   const written: string[] = [];
   const spy = mock.method(process.stderr, "write", (chunk: string | Uint8Array): boolean => {
     written.push(String(chunk));
@@ -373,7 +373,7 @@ test("63.3 negative: a file of whole lines and blank lines logs and counts nothi
   resetPerfMetrics();
   try {
     const events = parseStreamPayload(
-      `${JSON.stringify(frame(1))}\n\n${JSON.stringify(frame(2))}\n`,
+      `${JSON.stringify(frame(1))}\n\n   \n\t \n${JSON.stringify(frame(2))}\n`,
       "/x/clean",
     );
     assert.equal(events.length, 2);
