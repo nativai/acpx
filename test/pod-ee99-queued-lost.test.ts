@@ -8,7 +8,7 @@ import {
   admissionBusyRefusal,
   agentCapRefusal,
   podStartingRefusal,
-  withoutQueuePromise,
+  refusalForCaller,
 } from "../src/pod/pod-refusal.js";
 import { agentPodKey } from "../src/pod/routed-call.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence/serialize.js";
@@ -16,8 +16,10 @@ import { startFakeApiServer, type PodSeed } from "./pod-kit/fake-apiserver.js";
 import { type BrokerScript, startFakeBroker } from "./pod-kit/fake-broker.js";
 import { makeSessionRecord } from "./runtime-test-helpers.js";
 import {
+  agentStarts,
   type Fixture,
   makeBox,
+  makeTarget,
   recordPath,
   refusedUrl,
   runCli,
@@ -79,12 +81,22 @@ if (script.stderr) process.stderr.write(script.stderr);
 process.exitCode = script.exit ?? 0;
 `;
 
+const BATCH = JSON.stringify({
+  v: 1,
+  messages: [
+    { messageId: "11111111-1111-4111-8111-aaaaaaaaaaaa", prompt: [{ type: "text", text: "one" }] },
+    { messageId: "22222222-2222-4222-8222-bbbbbbbbbbbb", prompt: [{ type: "text", text: "two" }] },
+  ],
+});
+
 type Shape = {
   reason: Reason;
   addressing: "session-id" | "seat";
   /** `shell`: a shell on the control pod. `ssh-remote`: what ssh-remote gives — no seat, locator or identity. */
   env: "shell" | "ssh-remote";
   messageId?: boolean;
+  /** atrium's batch spawn: `--batch-file -` with two members on stdin; never `--message-id`. */
+  batch?: boolean;
   json?: boolean;
   /** Default `--no-wait`. */
   wait?: boolean;
@@ -92,6 +104,10 @@ type Shape = {
   woken?: { exit: number; stderr?: string };
   /** Replaces `prompt` (e.g. `cancel`, a routed-if-pod command). */
   verb?: string[];
+  /** Extra environment (e.g. an agent's identity and admission class). */
+  extraEnv?: NodeJS.ProcessEnv;
+  /** Use the rig's mock agent as the session's harness, so a start on the control pod is observable. */
+  mockAgent?: boolean;
 };
 
 function writeRecord(f: Fixture, command: string): void {
@@ -150,7 +166,7 @@ function brokerScript(reason: Reason): { script: BrokerScript; wakeBoundMs?: num
 
 async function run(shape: Shape) {
   const f = makeBox({ requestMib: 4000 });
-  const command = shape.reason === "home_full" ? CODEX : CLAUDE;
+  const command = shape.mockAgent ? f.agent : shape.reason === "home_full" ? CODEX : CLAUDE;
   writeRecord(f, command);
   const sessionFile = recordPath(f, SESSION);
   const before = sha256(sessionFile);
@@ -236,7 +252,7 @@ async function run(shape: Shape) {
     ...target,
     ...(shape.wait ? [] : ["--no-wait"]),
     ...(shape.messageId ? ["--message-id", MESSAGE_ID] : []),
-    "hello",
+    ...(shape.batch ? ["--batch-file", "-"] : ["hello"]),
   ];
   const args = [
     ...(shape.json ? ["--format", "json"] : []),
@@ -245,7 +261,12 @@ async function run(shape: Shape) {
     "--approve-all",
     ...verb,
   ];
-  const result = await runCli(args, env, "/workspace");
+  const result = await runCli(
+    args,
+    { ...env, ...shape.extraEnv },
+    "/workspace",
+    shape.batch ? BATCH : "",
+  );
   const calls = (): string[][] => {
     const file = path.join(stubDir, "calls.jsonl");
     return fs.existsSync(file)
@@ -260,6 +281,16 @@ async function run(shape: Shape) {
     result,
     calls: calls(),
     atriumRequests: stub.requests.length,
+    agentStarts: agentStarts(f),
+    admissionLog: (() => {
+      const dir = path.join(f.root, "admission", "log");
+      return fs.existsSync(dir)
+        ? fs
+            .readdirSync(dir)
+            .map((name) => fs.readFileSync(path.join(dir, name), "utf8"))
+            .join("")
+        : "";
+    })(),
     recordUnchanged: sha256(sessionFile) === before,
     close: async () => {
       await Promise.all([stub.close(), broker.close(), api.close()]);
@@ -268,6 +299,7 @@ async function run(shape: Shape) {
 }
 
 type Out = Awaited<ReturnType<typeof run>>;
+const PROMPT = ["prompt", "--session-id", SESSION, "--no-wait", "hello"];
 const QUEUE_PROMISE = /stays queued|will be queued|is queued|is delivered when/iu;
 const lines = (text: string): string[] => text.split("\n").filter((line) => line.length > 0);
 
@@ -368,6 +400,38 @@ test("ee99 G1' twin · a --message-id delivery (atrium holds it): sentence and t
   }
 });
 
+test("ee99 G1' batch twin (79.2) · atrium's batch spawn (`--batch-file -`, never --message-id) keeps the hold sentence and queued=true — token identical to G1's; with room it is sent to the pod exactly once", async () => {
+  for (const reason of REASONS) {
+    await withRun({ reason, env: "shell", addressing: "session-id", batch: true }, (out) => {
+      assert.equal(out.result.code, 75, `${reason}: ${out.result.stderr}`);
+      assert.deepEqual(lines(out.result.stderr), [BASE[reason].token, BASE[reason].old], reason);
+      assertNothingHappened(out, `${reason}/batch`);
+    });
+    await withRun(
+      { reason, env: "shell", addressing: "session-id", batch: true, json: true },
+      (out) => {
+        assert.match(out.result.stdout, /"queued":\s*true/u, reason);
+        assert.ok(
+          out.result.stdout.includes(JSON.stringify(BASE[reason].old).slice(1, -1)),
+          reason,
+        );
+      },
+    );
+  }
+  await withRun(
+    { reason: "cap", env: "shell", addressing: "session-id", batch: true, woken: { exit: 0 } },
+    (out) => {
+      assert.equal(out.result.code, 0, out.result.stderr);
+      assert.equal(
+        out.calls.length,
+        1,
+        "the batch goes to the pod once; the owner delivers each member once by its id",
+      );
+      assert.equal((out.calls[0] ?? []).filter((arg) => arg === "--batch-file").length, 1);
+    },
+  );
+});
+
 // ───────────────────────── woken sessions ─────────────────────────
 
 test("ee99 woken · a Ready pod takes the prompt (no refusal, so nothing to say): exactly one transport call, exit 0", async () => {
@@ -426,8 +490,9 @@ test("ee99 woken · a non-prompt routed call refused as pod_starting says `call`
     (out) => {
       assert.equal(out.result.code, 75, out.result.stderr);
       const text = lines(out.result.stderr).slice(1).join("\n");
-      assert.match(text, /the call was NOT queued and NOT sent/u);
-      assert.doesNotMatch(text, /the message was/u);
+      // A-79 row 79.3: a command with no message names none — no message, no queue, no later delivery.
+      assert.match(text, /Nothing was run; repeat the command after about 3 s\./u);
+      assert.doesNotMatch(text, /queue|queued|message|send-message|deliver/iu);
     },
   );
 });
@@ -462,9 +527,9 @@ test("ee99 G3 · a refused delivery leaves no trace (record, atrium, pods): the 
   );
 });
 
-// ───────────────────────── withoutQueuePromise itself ─────────────────────────
+// ───────────────────────── refusalForCaller itself ─────────────────────────
 
-test("withoutQueuePromise: rewrites exactly the three promising refusals; anything else is returned as it is; it is idempotent", () => {
+test("refusalForCaller: rewrites exactly the three promising refusals; anything else is returned as it is; it is idempotent", () => {
   const promising = [
     agentCapRefusal({ live: 3, cap: 3, box: "b", why: "cap", wake: "w1" }),
     podStartingRefusal({ phase: "pulling", wake: "w1" }),
@@ -472,18 +537,14 @@ test("withoutQueuePromise: rewrites exactly the three promising refusals; anythi
   ];
   for (const error of promising) {
     assert.equal(error.capacityRefusal.queued, true);
-    const out = withoutQueuePromise(error, { prompt: true });
+    const out = refusalForCaller(error, PROMPT);
     assert.ok(out instanceof CapacityRefusedError);
     assert.notEqual(out, error);
     assert.equal(out.stderrLine, error.stderrLine, "token line untouched");
     assert.equal(out.capacityRefusal.retryAfterS, error.capacityRefusal.retryAfterS);
     assert.equal(out.capacityRefusal.queued, false);
     assert.doesNotMatch(out.message, QUEUE_PROMISE);
-    assert.equal(
-      withoutQueuePromise(out, { prompt: true }),
-      out,
-      "already NOT queued: returned as it is",
-    );
+    assert.equal(refusalForCaller(out, PROMPT), out, "already NOT queued: returned as it is");
   }
   const silent = [
     agentCapRefusal({ live: 3, cap: 3, box: "b", why: "waiting-line" }), // a create's refusal: no message waits
@@ -493,9 +554,137 @@ test("withoutQueuePromise: rewrites exactly the three promising refusals; anythi
   ];
   for (const error of silent) {
     assert.equal(error.capacityRefusal.queued, undefined);
-    assert.equal(withoutQueuePromise(error, { prompt: true }), error);
+    assert.equal(refusalForCaller(error, PROMPT), error);
   }
   const other = new AcpxOperationalError("boom", { outputCode: "RUNTIME", origin: "cli" });
-  assert.equal(withoutQueuePromise(other, { prompt: true }), other);
-  assert.equal(withoutQueuePromise("text", { prompt: true }), "text");
+  assert.equal(refusalForCaller(other, PROMPT), other);
+  assert.equal(refusalForCaller("text", PROMPT), "text");
+});
+
+test("refusalForCaller: the marks are exactly --message-id and --batch-file on a prompt; a mark on a command with no message is no mark; no message → no message named", () => {
+  const error = podStartingRefusal({ phase: "turnover", wake: "w1" });
+  const kept = (argv: string[]) => refusalForCaller(error, argv) === error;
+  assert.equal(kept(["prompt", "--session-id", "x", "--message-id", "m", "hi"]), true);
+  assert.equal(kept(["prompt", "--session-id", "x", "--message-id=m", "hi"]), true);
+  assert.equal(kept(["prompt", "--session-id", "x", "--no-wait", "--batch-file", "-"]), true);
+  assert.equal(kept(["prompt", "--session-id", "x", "--batch-file=b.json"]), true);
+  // negatives of the same shape: a mark after `--` is text, not a flag; no mark at all
+  assert.equal(kept(["prompt", "--session-id", "x", "--", "--message-id"]), false);
+  assert.equal(kept(["prompt", "--session-id", "x", "--no-wait", "hi"]), false);
+  // a command with no message is never held by a mark
+  assert.equal(kept(["cancel", "--session-id", "x", "--message-id", "m"]), false);
+  const none = refusalForCaller(error, ["cancel", "--session-id", "x"]);
+  assert.ok(none instanceof CapacityRefusedError);
+  assert.doesNotMatch(none.message.split("\n").slice(1).join("\n"), /message|queue|deliver/iu);
+  assert.equal(none.capacityRefusal.queued, false);
+});
+
+test("ee99 79.1 pair · NOT in pod mode the same shell prompt is not gated at all, even on a full box, and starts the agent (not-gated why=no-class)", async () => {
+  const f = makeBox({ requestMib: 2048 }); // a FULL box: no slot for any agent
+  const id = await makeTarget(f);
+  const run = await runCli(
+    [
+      "--agent",
+      f.agent,
+      "--cwd",
+      path.join(f.root, "work"),
+      "--approve-all",
+      "--format",
+      "quiet",
+      "prompt",
+      "--session-id",
+      id,
+      "hello",
+    ],
+    f.env,
+    f.root,
+  );
+  assert.equal(run.code, 0, run.stderr);
+  assert.doesNotMatch(run.stderr, /REFUSED|NOT queued/u);
+  assert.equal(agentStarts(f) >= 1, true, "the agent started: the shell was never gated");
+});
+
+// ───────────────────────── F-R1 (TE f9c17148): a candidate THIRD promise site — REPRO ONLY ─────────────────────────
+
+const F_R1_AGENT = {
+  ACPX_SESSION_RECORD_ID: "caller-agent-session",
+  ACPX_SESSION_URL: "https://atrium.example.test/?session=5e55c0de-0000-4000-8000-0000000000aa",
+  ACPX_ADMISSION_CLASS: "spawn",
+};
+
+test(
+  "ee99 F-R1 (TODO — a contract question for the architect; NOT fixed here) · `set-mode` on a session with no pod, called by an agent with a wake class at a full box, still says 'the message stays queued' (queued:true): routed-if-pod → no_pod → proceed → gateSetConnect → admitWake → agentCapRefusal({wake})",
+  {
+    todo: "F-R1: a third promise site (src/capacity/admission.ts:1188-1236 via src/cli/session/wake-gate.ts:122-160): no message exists and nothing holds it",
+  },
+  async () => {
+    await withRun(
+      {
+        reason: "cap",
+        env: "shell",
+        addressing: "session-id",
+        verb: ["--format", "json", "set-mode", "plan", "--session-id", SESSION],
+        extraEnv: F_R1_AGENT,
+      },
+      (out) => {
+        assert.equal(out.result.code, 75, out.result.stderr);
+        assert.equal(lines(out.result.stderr)[0], BASE.cap.token, "the token line is the same");
+        // The desired outcome (A-79's rule): a command with no message names none, queued is not true.
+        const data = (
+          JSON.parse(lines(out.result.stdout).at(-1) ?? "{}") as {
+            error: { data: Record<string, unknown> };
+          }
+        ).error.data;
+        assert.notEqual(data.queued, true, "queued:true on a command that carries no message");
+        assert.doesNotMatch(String(data.message), /queue|message|deliver/iu);
+      },
+    );
+  },
+);
+
+test("ee99 F-R1 control · the same `set-mode` from a caller with no agent identity (a person) is not refused at the gate — the promise above needs an agent's wake class", async () => {
+  await withRun(
+    {
+      reason: "cap",
+      env: "shell",
+      addressing: "session-id",
+      verb: ["set-mode", "plan", "--session-id", SESSION],
+    },
+    (out) => {
+      assert.doesNotMatch(out.result.stderr, /REFUSED reason=agent_cap/u, out.result.stderr);
+    },
+  );
+});
+
+test("ee99 F-R1 reachability (observed at this commit; becomes row 79.5) · a class-less shell's `set mode` / `set model`, pod mode, pod-less non-sleeping record: it REACHES G4's direct connect (no gate, no wake class), and only the control-pod backstop (placement.ts:482 bridge_on_control_pod) stops the harness — exit 1, nothing started", async () => {
+  for (const verb of [
+    ["set-mode", "plan"],
+    ["set", "model", "x-model"],
+  ]) {
+    await withRun(
+      {
+        reason: "cap",
+        env: "shell",
+        addressing: "session-id",
+        mockAgent: true,
+        verb: [...verb, "--session-id", SESSION],
+      },
+      (out) => {
+        const label = verb.join(" ");
+        assert.equal(
+          out.admissionLog,
+          "",
+          `${label}: the wake gate did not run (no class: not even a log line)`,
+        );
+        assert.equal(out.agentStarts, 0, `${label}: no harness started on the control pod`);
+        assert.equal(out.result.code, 1, `${label}: ${out.result.stderr}`);
+        assert.match(
+          out.result.stderr,
+          /REFUSED reason=bridge_on_control_pod nothing_started=true/u,
+          label,
+        );
+        assert.doesNotMatch(out.result.stderr, /agent_cap|stays queued/u, label);
+      },
+    );
+  }
 });

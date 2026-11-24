@@ -1,5 +1,7 @@
+import { listBuiltInAgents } from "../agent-registry.js";
 import { capacityRefusal } from "../capacity/admission.js";
 import { AcpxOperationalError, CapacityRefusedError } from "../errors.js";
+import { classifyArgv } from "./command-classes.js";
 
 /**
  * C7.2 — the two refusal lines of the pod plane, in the wire format every capacity refusal has:
@@ -32,7 +34,7 @@ const AGENT_CAP_RETRY_AFTER_S = 60;
  * The three sentence tails that PROMISE a hold (brick ee9980e3). A promise is true for exactly one caller: atrium's own
  * delivery spawn (`--message-id`), which holds the item on the token line and exit 75. Every other caller of a
  * routed call — a shell on the control pod, an ssh-remote script, a person — has no holder, so
- * {@link withoutQueuePromise} swaps the tail for {@link notQueuedTail} before the refusal is printed.
+ * {@link refusalForCaller} swaps the tail for {@link notQueuedTail} before the refusal is printed.
  */
 const POD_STARTING_QUEUED_TAIL = "the message stays queued and is delivered when the pod is ready.";
 const AGENT_CAP_QUEUED_TAIL = "the message stays queued until room frees.";
@@ -183,17 +185,35 @@ export function admissionBusyRefusal(
 }
 
 /**
- * brick ee9980e3 (C7.2 sentence rule): a refusal whose sentence promises a hold ("the message stays queued …",
- * `detail.queued === true`) is true only when atrium's delivery runner is the caller — it holds the item on
- * the token line and exit 75, under the message id it passed (`--message-id`). For ANY other caller nothing
- * holds the message, so the promise is replaced by the plain fact: NOT queued, NOT sent, how to retry.
+ * A-79 (C7.2 "Whose hold a refusal may promise"): a refusal that promises a hold ("the message stays queued …",
+ * `detail.queued === true`) is true only for atrium's delivery runner, whose two spawn shapes carry a MARK:
+ * `--message-id` (one message) and `--batch-file` (a batch, never with `--message-id`). It holds the item on the
+ * token line and exit 75 and sends it again. For ANY other caller nothing holds the message.
  *
  * The TOKEN LINE, the exit code, the reason and every other field are untouched, byte for byte — atrium and
- * scripts parse them. Only the sentence and `detail.message` change, and `detail.queued` becomes `false`.
+ * scripts parse them. Only the sentence and `detail.message` change, and `detail.queued` becomes `false`:
+ *  - a `prompt`: nothing was started and the message was NOT queued and NOT sent, with `retry_after_s` and `send-message.sh`;
+ *  - a command that carries no message (cancel, close, a setting, a probe): it names none — nothing was run,
+ *    repeat the command after `retry_after_s`.
  * A refusal that promises nothing (a utility pod, the waiting line, a non-capacity error) is returned as it is.
+ *
+ * ONE helper for the two places that print such a refusal: the routed branch's catch (pod mode) and A-16's
+ * guard `turnover-guard.ts` (the switch off). `argv` is the command's own arguments.
  */
-export function withoutQueuePromise(error: unknown, call: { prompt: boolean }): unknown {
+export function refusalForCaller(
+  error: CapacityRefusedError,
+  argv?: readonly string[],
+): CapacityRefusedError;
+export function refusalForCaller(error: unknown, argv?: readonly string[]): unknown;
+export function refusalForCaller(
+  error: unknown,
+  argv: readonly string[] = process.argv.slice(2),
+): unknown {
   if (!(error instanceof CapacityRefusedError) || error.capacityRefusal.queued !== true) {
+    return error;
+  }
+  const prompt = carriesMessage(argv);
+  if (prompt && carriesHoldMark(argv)) {
     return error;
   }
   const detail = error.capacityRefusal;
@@ -202,17 +222,40 @@ export function withoutQueuePromise(error: unknown, call: { prompt: boolean }): 
   if (tail === undefined) {
     return error;
   }
-  const what = call.prompt ? "message" : "call";
   const retry = detail.retryAfterS;
   const rewritten =
     sentence.slice(0, sentence.length - tail.length) +
-    `the ${what} was NOT queued and NOT sent. Run the same command again in about ${retry} s; ` +
-    `a message that must wait for room goes through atrium (send-message.sh), which holds it.`;
+    (prompt
+      ? `the message was NOT queued and NOT sent. Run the same command again in about ${retry} s; ` +
+        `a message that must wait for room goes through atrium (send-message.sh), which holds it.`
+      : `repeat the command after about ${retry} s.`);
   return new CapacityRefusedError({
     tokenLine: error.stderrLine,
     sentence: rewritten,
     detail: { ...detail, message: rewritten, queued: false },
   });
+}
+
+/** The paths whose command carries a message to a session (`prompt`, and the implicit forms `acpx <agent> <text>`). */
+const MESSAGE_PATHS = new Set(["", "<agent>", "prompt"]);
+
+function carriesMessage(argv: readonly string[]): boolean {
+  const classified = classifyArgv(argv, { builtInAgents: listBuiltInAgents() });
+  return classified.kind === "classified" && MESSAGE_PATHS.has(classified.path);
+}
+
+/** `--message-id[=<id>]` or `--batch-file[=<path>]` before any `--`: atrium's two delivery spawn shapes (A-79). */
+function carriesHoldMark(argv: readonly string[]): boolean {
+  const stop = argv.indexOf("--");
+  return argv
+    .slice(0, stop >= 0 ? stop : argv.length)
+    .some(
+      (arg) =>
+        arg === "--message-id" ||
+        arg.startsWith("--message-id=") ||
+        arg === "--batch-file" ||
+        arg.startsWith("--batch-file="),
+    );
 }
 
 /**

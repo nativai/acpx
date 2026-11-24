@@ -327,25 +327,14 @@ async function dispatchRouted(
   }
 }
 
-/** `--message-id <id>` / `--message-id=<id>` on the routed argv: atrium's delivery spawn (K9) — its item is the holder. */
-function carriesMessageId(argv: readonly string[]): boolean {
-  const stop = argv.indexOf("--");
-  return argv
-    .slice(0, stop >= 0 ? stop : argv.length)
-    .some((arg) => arg === "--message-id" || arg.startsWith("--message-id="));
-}
-
 /**
- * brick ee9980e3: a refusal that promises "the message stays queued" is true only for a delivery that
- * atrium holds under its message id. Every other caller of a routed call has no holder, so the promise
- * is replaced by "NOT queued" before it is printed (token line, exit code and reason unchanged).
+ * A-79: the sentence of a refusal that promises a hold is chosen here and at A-16's guard, by ONE helper
+ * (`refusalForCaller`, pod-refusal.ts): the promise stands only for atrium's delivery spawns (`--message-id`,
+ * `--batch-file`); every other caller is told nothing was queued. Token line and exit code unchanged.
  */
 async function refusalForCaller(error: unknown, ready: Ready): Promise<unknown> {
-  if (carriesMessageId(ready.argv)) {
-    return error;
-  }
-  const { withoutQueuePromise } = await import("./pod-refusal.js");
-  return withoutQueuePromise(error, { prompt: PROMPT_PATHS.has(ready.classification.path) });
+  const { refusalForCaller: choose } = await import("./pod-refusal.js");
+  return choose(error, ready.argv);
 }
 
 const DELETES_UNREACHABLE_POD = new Set(["sessions close", "sessions recover"]);
