@@ -27,16 +27,24 @@ export const livePodTurnoverDeps: PodTurnoverDeps = {
   applies: () => podModeVerdictNow().mode === "off" && lockHostPlace() === "control",
 };
 
+/**
+ * What a session's lease says about its pod, for this guard. `"unreadable"` is a `pod` KEY that names no
+ * pod (A-68, `QueueOwnerRecord.podUnreadable`): C3.3 cannot fetch it and answers `unknown`, so it is a
+ * pod that is NOT proven gone and is refused exactly like a readable pod that exists.
+ */
+export type LeasePod = PodRef | "unreadable";
+
 /** Throws the C7.2 `pod_starting … phase=turnover` refusal unless `pod` is proven gone. */
 export async function refuseWhilePodNotGone(
   sessionId: string,
-  pod: PodRef,
+  pod: LeasePod,
   deps: PodTurnoverDeps = livePodTurnoverDeps,
 ): Promise<void> {
   if (!deps.applies()) {
     return;
   }
-  if ((await deps.prove(pod)).answer !== "gone") {
+  const answer = pod === "unreadable" ? "unknown" : (await deps.prove(pod)).answer;
+  if (answer !== "gone") {
     throw podStartingRefusal({ phase: "turnover", wake: sessionId, sessionId });
   }
 }

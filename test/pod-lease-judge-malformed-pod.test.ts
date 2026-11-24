@@ -17,13 +17,14 @@ import {
 import { queueLockFilePath } from "../src/cli/queue/paths.js";
 import { podFieldOf } from "../src/pod/identity.js";
 import { localProofScope } from "../src/pod/proof-scope.js";
+import { refuseWhilePodNotGone } from "../src/pod/turnover-guard.js";
 import {
   judgeLockHolder,
   lockBreakLedgerPath,
   sweepOwnPodLocks,
 } from "../src/session/persistence/identity-file-lock.js";
 import { sessionBaseDir } from "../src/session/persistence/session-base-dir.js";
-import { clearPods, putNode, requestLines, startKitApi } from "./pod-kit-api-helpers.js";
+import { clearPods, putNode, putPod, requestLines, startKitApi } from "./pod-kit-api-helpers.js";
 import { makeWorld, withEnv, worldEnv, type PodWorld } from "./pod-owner-helpers.js";
 
 // A-68 (brick c365682f; C3.2 "A `pod` key that names no pod", C3.1, C3.3, C1.1; test-plan row 68.1).
@@ -322,64 +323,164 @@ async function createSession(env: NodeJS.ProcessEnv, cwd: string, name: string):
   return id;
 }
 
-test("68.1 a REAL `acpx sessions close`: the lease whose `pod` names no pod survives it, byte for byte, and the session stays not-local — every shape, switch off and on; the lease without a `pod` key is reaped by the same close", async () => {
+const TURNOVER_TOKEN =
+  /^acpx: REFUSED reason=pod_starting nothing_started=true protocol=1 retry_after_s=3 phase=turnover wake=/;
+
+/** One real-CLI world: a sandbox state home, a cwd under /workspace, the kit API answering "no pod". */
+type CliWorld = { world: PodWorld; env: NodeJS.ProcessEnv; cwd: string; podMode: boolean };
+
+function cliWorld(label: string, podMode: boolean, apiUrl: string): CliWorld {
+  const world = makeWorld(`a68-cli-${label}-${podMode}`);
+  // In pod mode a close asks the API server whether the session has an agent pod (the kit API: none), and
+  // routes one whose cwd is outside the shared roots (`cwd_not_shared`). Either would end it BEFORE it
+  // reaches the lease and leave it "untouched" for the wrong reason: the cwd is under /workspace, the API
+  // answers, and `assertRan` fails the test if a run was refused or routed when it should have run.
+  const cwd = fs.mkdtempSync(
+    path.join(process.env.ACPX_SESSION_SHARED_TMP || process.cwd(), "a68-cwd-"),
+  );
+  return { world, env: cliEnv(world, podMode, apiUrl), cwd, podMode };
+}
+
+function recordFileOf(w: CliWorld, id: string): string {
+  return path.join(w.world.home, ".acpx", "sessions", `${encodeURIComponent(id)}.json`);
+}
+
+const CLOSE = (id: string) => ["--verbose", "sessions", "close", "--session-id", id];
+const PROMPT = (id: string) => ["--format", "quiet", "prompt", "--session-id", id, "echo a68"];
+
+/** The run was neither refused nor routed, and ended `rc` — never "untouched" because it never ran. */
+function assertRan(result: Run, rc: number, where: string): void {
+  assert.doesNotMatch(
+    result.stderr,
+    /ROUTED outcome=|REFUSED |admission_busy|cwd_not_shared/,
+    where,
+  );
+  assert.equal(result.status, rc, `${where}: rc ${result.status} ${result.stderr.slice(0, 300)}`);
+}
+
+async function readsUnreadable(w: CliWorld, id: string, where: string): Promise<void> {
+  await withEnv(controlEnv(w.world, w.podMode), async () => {
+    assert.deepEqual(
+      await localProofScope(id),
+      { local: false, reason: "pod-unreadable" },
+      `${where}: not local`,
+    );
+  });
+}
+
+test("68.1 a REAL `acpx sessions close`, pod mode ON (C2 decides there): the lease whose `pod` names no pod survives it byte for byte, the session stays not-local; a lease without a `pod` key is reaped by the same close", async () => {
   const api = await startKitApi("dev-kit");
+  const w = cliWorld("on", true, api.url);
   try {
-    await realCloseRows(api);
+    for (const [label, value] of SHAPES) {
+      const id = await createSession(w.env, w.cwd, `a68-on-${label.replace(/\W/g, "")}`);
+      const lease = plantLease(
+        w.world,
+        id,
+        leaseBody(w.world, id, STALE, { present: true, value }),
+      );
+      const close = await runCli(w.env, w.cwd, CLOSE(id));
+      assertRan(close, 0, `${label}, pod mode ON`);
+      assert.equal(fs.readFileSync(queueLockFilePath(id, w.world.home), "utf8"), lease, label);
+      await readsUnreadable(w, id, label);
+    }
+    const id = await createSession(w.env, w.cwd, "a68-on-nokey");
+    plantLease(w.world, id, leaseBody(w.world, id, STALE, { present: false }));
+    assertRan(await runCli(w.env, w.cwd, CLOSE(id)), 0, "no key, pod mode ON");
+    assert.equal(fs.existsSync(queueLockFilePath(id, w.world.home)), false, "reaped by the close");
   } finally {
     await api.close();
+    fs.rmSync(w.cwd, { recursive: true, force: true });
   }
 });
 
-async function realCloseRows(api: Awaited<ReturnType<typeof startKitApi>>): Promise<void> {
-  for (const podMode of SWITCHES) {
-    const world = makeWorld(`a68-cli-${podMode}`);
-    const env = cliEnv(world, podMode, api.url);
-    // In pod mode a close asks the API server whether the session has an agent pod (the kit API: none), and
-    // routes one whose cwd is outside the shared roots (`cwd_not_shared`). Either would end it BEFORE it
-    // reaches the lease and leave the lease "untouched" for the wrong reason: the cwd is under /workspace,
-    // the API answers, and `ranHere` fails the test if the close was refused or routed instead of run.
-    const cwd = fs.mkdtempSync(
-      path.join(process.env.ACPX_SESSION_SHARED_TMP || process.cwd(), "a68-cwd-"),
-    );
-    const ranHere = (close: Run) =>
-      assert.doesNotMatch(
-        close.stderr,
-        /ROUTED outcome=/,
-        `the close was routed, not run: ${close.stderr}`,
-      );
-    for (const [label, value] of SHAPES) {
-      const id = await createSession(env, cwd, `a68-${label.replace(/\W/g, "")}`);
-      const lease = plantLease(world, id, leaseBody(world, id, STALE, { present: true, value }));
-      const close = await runCli(env, cwd, ["--verbose", "sessions", "close", "--session-id", id]);
-      const where = `${label}, podMode=${podMode}: rc=${close.status} ${close.stderr.slice(0, 300)}`;
-      ranHere(close);
-      assert.equal(
-        fs.readFileSync(queueLockFilePath(id, world.home), "utf8"),
-        lease,
-        `the close left the lease alone (${where})`,
-      );
-      await withEnv(controlEnv(world, podMode), async () => {
-        assert.deepEqual(
-          await localProofScope(id),
-          { local: false, reason: "pod-unreadable" },
-          `${where}: not local after the close`,
+test("68.4 / A-16 a REAL close and prompt, pod mode OFF on the control pod: a lease whose `pod` names no pod answers `pod_starting … phase=turnover` (75) exactly as a readable pod that exists does — record and lease byte-identical, nothing written", async () => {
+  const api = await startKitApi("dev-kit");
+  const w = cliWorld("off", false, api.url);
+  try {
+    const exists = "55555555-5555-4555-8555-555555555555";
+    const cases: Array<[string, unknown]> = [
+      ...SHAPES,
+      ["uid renamed (a newer writer's shape)", { name: "ag-a68", uuid: exists, node: "n1" }],
+    ];
+    for (const [label, value] of cases) {
+      for (const verb of [CLOSE, PROMPT]) {
+        const id = await createSession(w.env, w.cwd, `a68-off-${label.replace(/\W/g, "")}`);
+        const lease = plantLease(
+          w.world,
+          id,
+          leaseBody(w.world, id, STALE, { present: true, value }),
         );
-      });
+        const record = fs.readFileSync(recordFileOf(w, id), "utf8");
+        const result = await runCli(w.env, w.cwd, verb(id));
+        const where = `${label} ${verb === CLOSE ? "close" : "prompt"}: ${result.stderr.slice(0, 300)}`;
+        assert.equal(result.status, 75, where);
+        assert.match(result.stderr.split("\n")[0] ?? "", TURNOVER_TOKEN, where);
+        assert.equal(
+          fs.readFileSync(queueLockFilePath(id, w.world.home), "utf8"),
+          lease,
+          `lease: ${where}`,
+        );
+        assert.equal(fs.readFileSync(recordFileOf(w, id), "utf8"), record, `record: ${where}`);
+        await readsUnreadable(w, id, where);
+      }
     }
-    // The passing pair, through the same close: no `pod` key, dead pid → the pid rule reaps it.
-    const id = await createSession(env, cwd, "a68-nokey");
-    plantLease(world, id, leaseBody(world, id, STALE, { present: false }));
-    const close = await runCli(env, cwd, ["--verbose", "sessions", "close", "--session-id", id]);
-    ranHere(close);
-    assert.equal(
-      fs.existsSync(queueLockFilePath(id, world.home)),
-      false,
-      `podMode=${podMode}: a lease without a pod key is reaped by the close (rc=${close.status} ${close.stderr.slice(0, 300)})`,
-    );
-    fs.rmSync(cwd, { recursive: true, force: true });
+    // The control: a READABLE pod that exists gets the same answer, so "the same as a readable pod" is measured.
+    putPod(api, "ag-a68-readable", { uid: exists, phase: "Running" });
+    const id = await createSession(w.env, w.cwd, "a68-off-readable");
+    const readable = { name: "ag-a68-readable", uid: exists, node: "n1" };
+    plantLease(w.world, id, leaseBody(w.world, id, STALE, { present: true, value: readable }));
+    const refused = await runCli(w.env, w.cwd, CLOSE(id));
+    assert.equal(refused.status, 75, refused.stderr.slice(0, 300));
+    assert.match(refused.stderr.split("\n")[0] ?? "", TURNOVER_TOKEN);
+  } finally {
+    await api.close();
+    fs.rmSync(w.cwd, { recursive: true, force: true });
   }
-}
+});
+
+test("68.4 / A-16 passing pair, pod mode OFF: a lease with NO `pod` key and a dead pid is reaped by a real close, and a real prompt wakes a local owner — as before", async () => {
+  const api = await startKitApi("dev-kit");
+  const w = cliWorld("off-pair", false, api.url);
+  try {
+    const closed = await createSession(w.env, w.cwd, "a68-pair-close");
+    plantLease(w.world, closed, leaseBody(w.world, closed, STALE, { present: false }));
+    assertRan(await runCli(w.env, w.cwd, CLOSE(closed)), 0, "no key, close");
+    assert.equal(
+      fs.existsSync(queueLockFilePath(closed, w.world.home)),
+      false,
+      "reaped by the close",
+    );
+
+    const woken = await createSession(w.env, w.cwd, "a68-pair-prompt");
+    plantLease(w.world, woken, leaseBody(w.world, woken, STALE, { present: false }));
+    assertRan(await runCli(w.env, w.cwd, PROMPT(woken)), 0, "no key, prompt");
+    await withEnv(controlEnv(w.world, false), async () => {
+      await terminateQueueOwnerForSession(woken); // the owner the prompt started
+    });
+  } finally {
+    await api.close();
+    fs.rmSync(w.cwd, { recursive: true, force: true });
+  }
+});
+
+// ---- the guard itself ----
+
+test("68.4 / A-16 the turnover guard: an `unreadable` lease pod is refused without asking the API server wherever the guard applies, and passes where it does not", async () => {
+  const asked: string[] = [];
+  const deps = (applies: boolean) => ({
+    applies: () => applies,
+    prove: async () => {
+      asked.push("prove");
+      return { answer: "gone" as const, proof: "pod-gone" as const };
+    },
+  });
+  await assert.rejects(refuseWhilePodNotGone("rec-a68", "unreadable", deps(true)), (error: Error) =>
+    TURNOVER_TOKEN.test(error.message),
+  );
+  await refuseWhilePodNotGone("rec-a68", "unreadable", deps(false)); // pod mode ON / an agent pod: not this guard
+  assert.deepEqual(asked, [], "no proof is asked for a pod that cannot be named");
+});
 
 // ---- one predicate for both judges ----
 

@@ -1,6 +1,6 @@
-import type { PodRef } from "../../pod/identity.js";
 import {
   livePodTurnoverDeps,
+  type LeasePod,
   refuseWhilePodNotGone,
   type PodTurnoverDeps,
 } from "../../pod/turnover-guard.js";
@@ -12,13 +12,19 @@ import { readQueueOwnerRecord } from "../queue/lease-store.js";
  * (today's, every box that never switched) proceeds untouched; one naming a pod must be proven gone.
  */
 export type PodWakeGuardDeps = PodTurnoverDeps & {
-  /** The pod the session's lease names, or undefined for no lease / a lease without `pod`. */
-  leasePod: (sessionId: string) => Promise<PodRef | undefined>;
+  /**
+   * The pod the session's lease names, `"unreadable"` for a `pod` key that names no pod (A-68), or
+   * undefined for no lease / a lease without a `pod` key.
+   */
+  leasePod: (sessionId: string) => Promise<LeasePod | undefined>;
 };
 
 const liveDeps: PodWakeGuardDeps = {
   ...livePodTurnoverDeps,
-  leasePod: async (sessionId) => (await readQueueOwnerRecord(sessionId))?.pod,
+  leasePod: async (sessionId) => {
+    const record = await readQueueOwnerRecord(sessionId);
+    return record?.podUnreadable ? "unreadable" : record?.pod;
+  },
 };
 
 /** Throws the C7.2 `pod_starting … phase=turnover` refusal; resolves when a local owner may start. */

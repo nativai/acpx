@@ -52,18 +52,25 @@ async function connectToSocket(
   });
 }
 
+/**
+ * A-16 backstop (F4): the one door to an owner's socket. A lease that names a pod — or has a `pod` key
+ * that names none (A-68, "unknown") — is not connected to from the control pod in local mode unless the
+ * pod is proven gone — whatever verb asked.
+ */
+async function refuseWhileLeasePodNotGone(owner: QueueOwnerRecord): Promise<void> {
+  if (owner.pod || owner.podUnreadable) {
+    const { refuseWhilePodNotGone } = await import("../../pod/turnover-guard.js");
+    await refuseWhilePodNotGone(owner.sessionId, owner.pod ?? "unreadable");
+  }
+}
+
 export async function connectToQueueOwner(
   owner: QueueOwnerRecord,
   maxAttempts = QUEUE_CONNECT_ATTEMPTS,
 ): Promise<net.Socket | undefined> {
   let lastError: unknown;
 
-  if (owner.pod) {
-    // A-16 backstop (F4): the one door to an owner's socket. A lease that names a pod is not connected
-    // to from the control pod in local mode unless the pod is proven gone — whatever verb asked.
-    const { refuseWhilePodNotGone } = await import("../../pod/turnover-guard.js");
-    await refuseWhilePodNotGone(owner.sessionId, owner.pod);
-  }
+  await refuseWhileLeasePodNotGone(owner);
 
   const attempts = Math.max(1, Math.trunc(maxAttempts));
   for (let attempt = 0; attempt < attempts; attempt += 1) {
