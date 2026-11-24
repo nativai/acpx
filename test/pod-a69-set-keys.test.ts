@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import { queueLockFilePath } from "../src/cli/queue/paths.js";
 import * as sessionControl from "../src/cli/session/session-control.js";
 import { transcriptJsonlPath } from "../src/config/subscription-transcript.js";
@@ -286,6 +287,9 @@ const TURNOVER_TOKEN =
 const HELD_BODIES: Array<[string, (w: PodWorld) => string]> = [
   ["parseable control (readable pod that exists)", parseableLease],
   ["empty", () => ""],
+  // A-72 (1): JSON that is not an object is kind (1) — held, never "no `pod` key" (the plan's row names it).
+  ["JSON null (not an object)", () => "null\n"],
+  ["JSON [] (not an object)", () => "[]\n"],
   ["truncated mid-pod", (w) => schemaRefused(w, { present: true, value: OTHER_POD }).slice(0, -90)],
   [
     "schema-refused, pod names no pod",
@@ -445,4 +449,139 @@ test("69.6 every exported `setSession*` setter of session-control answers the tu
   } finally {
     await api.close();
   }
+});
+
+// ---- LOW-T1: the dispatcher's keys reach ONLY handlers whose write is a discovered `setSession*` setter ----
+// The discovering row above sees only `setSession*` exports of session-control. A seventh `set` key whose handler
+// writes the record itself, or whose handler lives in another module, would bypass it. So this scan walks the
+// dispatcher of `set <key>` (`handleSetConfigOption` and every `handle*` / `tryHandle*` it reaches in
+// command-handlers.ts): each reached function may call only `handle*` / `tryHandle*` functions declared in that
+// file, and each LEAF handler must call a `setSession*` setter that session-control exports (which the discovery
+// row above requires to refuse first) and must not write a record itself. It reads the dispatcher, so a key added
+// to `tryHandleRecordEditConfigKey` or `tryHandleSpecialConfigKey` is found without being registered here.
+
+const SRC_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "src");
+const RECORD_WRITERS = new Set([
+  "writeSessionRecord",
+  "updateSessionRecord",
+  "writeSessionRecordFile",
+]);
+
+function callNames(node: ts.Node): string[] {
+  const names: string[] = [];
+  const visit = (n: ts.Node): void => {
+    if (ts.isCallExpression(n) && ts.isIdentifier(n.expression)) {
+      names.push(n.expression.text);
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(node);
+  return names;
+}
+
+/** What is wrong with the `set <key>` dispatch in `source`, given the guarded setters' names. Empty = sound. */
+function unguardedSetPaths(source: string, setters: ReadonlySet<string>, entry: string): string[] {
+  const file = ts.createSourceFile("handlers.ts", source, ts.ScriptTarget.Latest, true);
+  const declared = new Map<string, ts.FunctionDeclaration>();
+  for (const statement of file.statements) {
+    if (ts.isFunctionDeclaration(statement) && statement.name) {
+      declared.set(statement.name.text, statement);
+    }
+  }
+  const problems: string[] = [];
+  const isHandler = (name: string): boolean => /^(handle|tryHandle)[A-Z]/.test(name);
+  const seen = new Set<string>();
+  const visitFunction = (name: string): void => {
+    if (seen.has(name)) {
+      return;
+    }
+    seen.add(name);
+    const fn = declared.get(name);
+    if (!fn) {
+      problems.push(`${name}: a handler the dispatcher reaches is not declared in this file`);
+      return;
+    }
+    const calls = callNames(fn);
+    const handlers = calls.filter(isHandler);
+    for (const handler of handlers) {
+      visitFunction(handler);
+    }
+    if (handlers.length > 0) {
+      return; // a dispatcher: its leaves are checked
+    }
+    for (const writer of calls.filter((call) => RECORD_WRITERS.has(call))) {
+      problems.push(`${name}: writes the record itself (${writer})`);
+    }
+    const reached = calls.filter((call) => call.startsWith("setSession"));
+    if (reached.length === 0) {
+      problems.push(`${name}: reaches no setSession* setter`);
+    }
+    for (const setter of reached) {
+      if (!setters.has(setter)) {
+        problems.push(`${name}: calls ${setter}, which session-control does not export`);
+      }
+    }
+  };
+  visitFunction(entry);
+  return problems;
+}
+
+const setterNames = (): Set<string> =>
+  new Set(Object.keys(sessionControl).filter((name) => name.startsWith("setSession")));
+
+test("69.6 the dispatcher of `set <key>` reaches only handlers whose write is a guarded setter (the real command-handlers.ts)", () => {
+  const source = fs.readFileSync(path.join(SRC_ROOT, "cli", "command-handlers.ts"), "utf8");
+  assert.deepEqual(unguardedSetPaths(source, setterNames(), "handleSetConfigOption"), []);
+  // The scan's own control: the handlers of the six keys and `set model` exist for it to have reached.
+  for (const handler of [
+    "handleSetSubscription",
+    "handleSetProfile",
+    "handleSetOutputStyle",
+    "handleSetAutoFailover",
+    "handleSetAutoSubscription",
+    "handleSetFableDegrade",
+    "handleSetModel",
+  ]) {
+    assert.ok(source.includes(`function ${handler}(`), `${handler} exists`);
+  }
+});
+
+test("69.6 the dispatcher scan flags a seventh key that bypasses `setSession*` (committed negative cases)", () => {
+  const setters = new Set(["setSessionModel", "setSessionConfigOption"]);
+  const base = `
+    async function handleSetConfigOption() { if (await tryHandleSpecialConfigKey()) { return; } await setSessionConfigOption({}); }
+    async function tryHandleSpecialConfigKey() { await handleSetModel(); EXTRA return true; }
+    async function handleSetModel() { await setSessionModel({}); }
+  `;
+  const check = (extra: string, more = ""): string[] =>
+    unguardedSetPaths(base.replace("EXTRA", extra) + more, setters, "handleSetConfigOption");
+  // the sound shapes pass
+  assert.deepEqual(check(""), []);
+  assert.deepEqual(
+    check(
+      "await handleSetGood();",
+      "async function handleSetGood() { await setSessionModel({}); }",
+    ),
+    [],
+  );
+  // a handler that writes the record itself (the `handleSessionsSetMetadata` shape)
+  assert.deepEqual(
+    check(
+      "await handleSetSeventh();",
+      "async function handleSetSeventh() { const r = await resolveSessionRecord(); await writeSessionRecord(r); }",
+    ),
+    [
+      "handleSetSeventh: writes the record itself (writeSessionRecord)",
+      "handleSetSeventh: reaches no setSession* setter",
+    ],
+  );
+  // a handler declared elsewhere
+  assert.deepEqual(check("await handleSetElsewhere();"), [
+    "handleSetElsewhere: a handler the dispatcher reaches is not declared in this file",
+  ]);
+  // a handler whose setter is not one session-control exports
+  assert.deepEqual(
+    check("await handleSetOdd();", "async function handleSetOdd() { await setSessionOdd({}); }"),
+    ["handleSetOdd: calls setSessionOdd, which session-control does not export"],
+  );
 });
