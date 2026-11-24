@@ -101,3 +101,48 @@ export function composeHandoverPrompt(params: {
     `your predecessor's.\n`
   );
 }
+
+/**
+ * The record `metadata` key a handover writes into its successor's OWN create write (brick 4bc23c1e):
+ * the predecessor's id. A handover has no call id (CONTRACTS-r4 C6.2: it "carries neither flag by
+ * design; its retry safety rests on the seat"), so this is what lets a retry — the caller still being the
+ * seat's active holder — tell its own never-activated successor from any other prepared holder.
+ */
+export const HANDOVER_FROM_KEY = "handover_from";
+
+/** A holder of the caller's seat that was created and never activated (no ordinal, not active, open). */
+export type PreparedHolder = {
+  readonly id: string;
+  readonly createdAt: string;
+  /** Its `metadata.handover_from`, or `undefined` for one no handover of this acpx made. */
+  readonly handoverFrom: string | undefined;
+};
+
+/**
+ * What a handover does with the prepared holders its seat already has: ADOPT the newest one this very
+ * caller's handover left (`handover_from` = the caller) and finish its activation, and NAME every other.
+ * Never adopted: an unmarked one (an older acpx's crash, or a hand-run `sessions new --from`) and one
+ * marked as another predecessor's — each could be someone's deliberate, not-yet-activated holder.
+ */
+export function chooseHandoverSuccessor(
+  callerId: string,
+  prepared: readonly PreparedHolder[],
+): { readonly adopt: PreparedHolder | undefined; readonly others: readonly PreparedHolder[] } {
+  const mine = prepared
+    .filter((holder) => holder.handoverFrom === callerId)
+    .toSorted((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  const adopt = mine[0];
+  return { adopt, others: prepared.filter((holder) => holder !== adopt) };
+}
+
+/** The stderr line naming prepared holders a handover left alone, or nothing. */
+export function preparedHoldersNote(others: readonly PreparedHolder[]): string | undefined {
+  if (others.length === 0) {
+    return undefined;
+  }
+  return (
+    `handover: this seat also holds ${others.length} prepared holder(s) that were never activated and ` +
+    `were not adopted: ${others.map((holder) => holder.id).join(", ")}. Close the ones nobody needs ` +
+    `(acpx sessions close --session-id <id>).`
+  );
+}
