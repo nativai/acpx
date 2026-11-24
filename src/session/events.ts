@@ -224,9 +224,9 @@ export async function appendInParts(
   partBytes: number = STREAM_WRITE_PART_BYTES,
 ): Promise<void> {
   const handle = await fs.open(filePath, "a");
-  const multiPart = data.length > partBytes;
-  const queued: string[] = [];
-  if (multiPart) {
+  let queued: string[] | undefined;
+  if (data.length > partBytes) {
+    queued = [];
     multiPartInFlight.set(filePath, queued);
     registerExitDrain();
   }
@@ -234,10 +234,7 @@ export async function appendInParts(
   try {
     for (let from = 0; from < data.length; ) {
       const to = Math.min(data.length, from + partBytes);
-      let at = from;
-      while (at < to) {
-        at += (await handle.write(data, at, to - at, null)).bytesWritten;
-      }
+      await writeRange(handle, data, from, to);
       from = to;
       if (from < data.length) {
         await handle.datasync();
@@ -246,22 +243,41 @@ export async function appendInParts(
     }
     completed = true;
   } finally {
-    if (multiPart) {
-      multiPartInFlight.delete(filePath);
+    await finishParts(handle, filePath, queued, completed);
+  }
+}
+
+async function writeRange(
+  handle: FileHandle,
+  data: Buffer,
+  from: number,
+  to: number,
+): Promise<void> {
+  for (let at = from; at < to; ) {
+    at += (await handle.write(data, at, to - at, null)).bytesWritten;
+  }
+}
+
+/** The end of a flush: leave the in-flight list (synchronously), then hand the queued lines out. */
+async function finishParts(
+  handle: FileHandle,
+  filePath: string,
+  queued: string[] | undefined,
+  completed: boolean,
+): Promise<void> {
+  if (queued) {
+    multiPartInFlight.delete(filePath);
+  }
+  try {
+    if (completed && queued && queued.length > 0) {
+      const rest = Buffer.from(queued.join(""), "utf8");
+      await writeRange(handle, rest, 0, rest.length);
     }
-    try {
-      if (completed && queued.length > 0) {
-        const rest = Buffer.from(queued.join(""), "utf8");
-        for (let at = 0; at < rest.length; ) {
-          at += (await handle.write(rest, at, rest.length - at, null)).bytesWritten;
-        }
-      }
-    } finally {
-      await handle.close();
-    }
-    if (!completed && queued.length > 0) {
-      appendClosingTailSync(filePath, queued.join(""));
-    }
+  } finally {
+    await handle.close();
+  }
+  if (!completed && queued && queued.length > 0) {
+    appendClosingTailSync(filePath, queued.join(""));
   }
 }
 
@@ -322,8 +338,8 @@ export async function endsMidLine(filePath: string): Promise<boolean> {
 }
 
 /**
- * ⚠️ ONE RULE FOR EVERY APPENDER TO THE STREAM: A LINE IS APPENDED ONLY AT A LINE BOUNDARY (brick 3f33cc2d,
- * the eef0805f TE's F1). The lockless appenders (`acpx/received`, delivery terminals, `acpx/refused`, the
+ * ⚠️ ONE RULE FOR EVERY APPENDER TO THE STREAM: A LINE IS APPENDED ONLY AT A LINE BOUNDARY (CONTRACTS-r4 C10,
+ * the row "Writer — every appender", A-63; brick 3f33cc2d, the eef0805f TE's F1). The lockless appenders (`acpx/received`, delivery terminals, `acpx/refused`, the
  * background-task chip clear) used to `appendFile` blind: after a dead writer they fused onto its partial
  * line and were lost; and they could land BETWEEN the parts of a live writer's multi-part flush, tearing
  * that frame. They cannot take the stream lock: the owner's own writer holds it for its whole life (a wait
@@ -346,7 +362,7 @@ function streamAppendTimingForTest(env: NodeJS.ProcessEnv = process.env): number
     return undefined;
   }
   const raw = env.ACPX_TEST_STREAM_APPEND_STALL_MS;
-  const value = raw === undefined ? NaN : Number(raw);
+  const value = raw === undefined ? Number.NaN : Number(raw);
   return Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 

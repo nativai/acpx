@@ -164,11 +164,11 @@ export async function killAndWait(held: HeldWriter): Promise<void> {
  * last: a 2.5 MiB frame holds twice) until `settled` resolves.
  */
 export async function releaseUntil(marker: string, settled: Promise<unknown>): Promise<void> {
-  let done = false;
+  const state = { done: false };
   const finished = settled.finally(() => {
-    done = true;
+    state.done = true;
   });
-  while (!done) {
+  while (!state.done) {
     fs.rmSync(marker, { force: true });
     await Promise.race([
       finished.catch(() => {}),
