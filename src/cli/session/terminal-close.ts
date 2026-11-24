@@ -67,11 +67,17 @@ export type ClosedAdapter = {
 
 /**
  * A-64: the kill proved the adapter gone when it ended it (`signalled`: TERM, then KILL after the grace,
- * on a verified identity) or found it gone (`gone`, `foreign`: the pid no longer names that process).
- * `no-pid`, `no-identity` and `unverified` prove nothing; `self-close` never reaches this arm.
+ * on a verified identity) or found it gone (`gone`). `foreign`, `no-identity` and `unverified` prove
+ * nothing, and `no-pid` has no pid to clear; `self-close` never reaches this arm.
+ *
+ * ⚠️ DO NOT ADD `foreign` HERE. It reads like "the pid is not that process" and it is not: `foreign` is a
+ * recorded identity in the same boot but another pid or time namespace, which "cannot establish its
+ * absence" (`process-identity.ts`), refused before any signal (`process-signal.ts`), and the pid's
+ * readers count such a process possibly alive. Under route A it can be a live adapter in an agent pod.
+ * Row 64.2 (c) (test/writer-rules-a64.test.ts) goes red if it is added.
  */
 function adapterProvedGone(kill: SessionCloseAdapterKill): boolean {
-  return kill.signalled || kill.reason === "gone" || kill.reason === "foreign";
+  return kill.signalled || kill.reason === "gone";
 }
 
 /**
