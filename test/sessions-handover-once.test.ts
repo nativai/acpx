@@ -6,6 +6,7 @@ import type { AddressInfo } from "node:net";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { checkAdvice } from "../src/pod/pass-through-args.js";
 import { sessionFilePath, withTempHome } from "./runtime-test-helpers.js";
 
 // Brick 4bc23c1e — `acpx sessions handover` is at most once when it dies between writing the
@@ -494,6 +495,91 @@ test(
           assert.ok(isPrepared(await readStored(homeDir, orphan.id)), "the orphan is untouched");
         }
       });
+    });
+  },
+);
+
+// ── TE F2 (brick 4bc23c1e): the loser of two overlapping RETRIES must not advise closing the live successor ──
+// A handover dies (orphan S); two retries overlap and both adopt S. One activates it and delivers the turn;
+// the other is refused while holding S — which is now the seat's active holder. "Close it" would close the
+// live holder, so the advice is read from the seat at refusal time.
+
+const RETRY_STAGGERS_MS = [0, 0, 0, 10, 25, 50];
+
+test(
+  "H8 an orphan and two overlapping retries: the loser never advises closing the successor that is the seat's active holder, and says nothing is to be done",
+  { timeout: ROW_TIMEOUT_MS },
+  async () => {
+    let refusedWithAdvice = 0;
+    for (const [trial, staggerMs] of RETRY_STAGGERS_MS.entries()) {
+      await withTempHome(`acpx-handover-retries-${trial}-`, async (homeDir) => {
+        const cwd = await rig(homeDir);
+        const callerId = await newHolder(homeDir, cwd);
+        const seatId = (await readStored(homeDir, callerId)).seat_id;
+        const brief = await writeBrief(homeDir);
+        const label = `trial ${trial} (stagger ${staggerMs} ms)`;
+
+        await withAcpxUi(async (origin, posted) => {
+          const orphanId = await dieOnce(homeDir, seatId, callerId, origin, brief);
+          const first = handover(homeDir, callerId, origin, brief);
+          await new Promise((resolve) => setTimeout(resolve, staggerMs));
+          const second = handover(homeDir, callerId, origin, brief);
+          const results = await Promise.all([first, second]);
+
+          const winners = results.filter((r) => r.code === 0);
+          const losers = results.filter((r) => r.code !== 0);
+          assert.equal(winners.length, 1, `${label}: exactly one run succeeds`);
+          assert.equal(losers.length, 1, `${label}: the other refuses`);
+          assert.equal(posted.length, 1, `${label}: exactly one turn`);
+          assert.equal((await readStored(homeDir, orphanId)).holder_active, true, label);
+
+          const stderr = losers[0]?.stderr ?? "";
+          assert.ok(
+            !stderr.includes(`sessions close --session-id ${orphanId}`),
+            `${label}: the loser must not advise closing the ACTIVE successor: ${stderr}`,
+          );
+          if (stderr.includes(`already activated ${orphanId}`)) {
+            refusedWithAdvice += 1;
+          }
+        });
+      });
+    }
+    assert.ok(
+      refusedWithAdvice >= 1,
+      "at least one trial reached the refusal's own advice (an overlap, not a late NOT_HOLDER)",
+    );
+  },
+);
+
+test(
+  "H9 every command the pass-through's lost-answer advice prints EXECUTES (rc 0) and shows what it says it shows",
+  { timeout: ROW_TIMEOUT_MS },
+  async () => {
+    await withTempHome("acpx-handover-advice-", async (homeDir) => {
+      const cwd = await rig(homeDir);
+      const callerId = await newHolder(homeDir, cwd);
+      const seatId = String((await readStored(homeDir, callerId)).seat_id);
+      for (const commandPath of ["sessions handover", "seats rename"]) {
+        const advice = checkAdvice(commandPath, {});
+        assert.equal(advice.kind, "check");
+        const how = advice.kind === "check" ? advice.how : "";
+        const commands = [...how.matchAll(/`(acpx [^`]+)`/gu)].map((m) => m[1] ?? "");
+        assert.ok(commands.length >= 1, `${commandPath}: the advice prints a command: ${how}`);
+        for (const printed of commands) {
+          const argv = printed
+            .replace(/^acpx /u, "")
+            .replace("<your seat uuid>", seatId)
+            .replace("<seat uuid>", seatId)
+            .replace("<id>", callerId)
+            .split(" ");
+          const res = await runCli(argv, homeDir);
+          assert.equal(res.code, 0, `${commandPath}: \`${printed}\` must run: ${res.stderr}`);
+          assert.ok(
+            res.stdout.includes(callerId),
+            `${commandPath}: \`${printed}\` shows the holder: ${res.stdout}`,
+          );
+        }
+      }
     });
   },
 );

@@ -6830,15 +6830,44 @@ async function activateHandoverSuccessor(
       (error.code === "CONCURRENT_HANDOVER" || error.code === "CONCURRENT_ACTIVATION")
     ) {
       process.stderr.write(
-        `handover: the successor ${successorId} was left prepared and is not activated; close it ` +
-          `(acpx sessions close --session-id ${successorId}).\n`,
+        `${await leftoverSuccessorAdvice(String(caller.seatId), successorId)}\n`,
       );
       if (error.code === "CONCURRENT_ACTIVATION") {
-        throw new SeatActivationRefusalError("CONCURRENT_HANDOVER", error.message);
+        // The CAS text ends "re-run to activate <successor>" — right for `sessions activate`, wrong here:
+        // a re-run of a handover whose caller lost the seat is refused NOT_HOLDER.
+        throw new SeatActivationRefusalError(
+          "CONCURRENT_HANDOVER",
+          `seat ${caller.seatId} moved while this handover was activating: it no longer names ` +
+            `${caller.acpxRecordId} as its holder. Another handover from the same session won; ` +
+            `nothing was activated by this run.`,
+        );
       }
     }
     throw error;
   }
+}
+
+/**
+ * What to tell the operator about the successor a refused handover run was holding, read from the seat
+ * and the record AT REFUSAL TIME: in an overlap of two retries that both adopted one orphan, the run that
+ * lost is holding the successor the winner just activated, and "close it" would close the live holder.
+ * Close advice only for a successor that is still prepared and is not the seat's active holder.
+ */
+async function leftoverSuccessorAdvice(seatId: string, successorId: string): Promise<string> {
+  const seat = seatFromStore(await readSeatStore(sessionBaseDir()), seatId);
+  if (seat?.activeHolderId === successorId) {
+    return `handover: another run of this handover already activated ${successorId}; there is nothing to do.`;
+  }
+  let record: SessionRecord;
+  try {
+    record = await resolveSessionRecord(successorId);
+  } catch {
+    return `handover: the successor ${successorId} could not be read; this run activated nothing.`;
+  }
+  return isNeverActivatedOpenHolder(record)
+    ? `handover: the successor ${successorId} was left prepared and is not activated; close it ` +
+        `(acpx sessions close --session-id ${successorId}).`
+    : `handover: this run activated nothing; the successor ${successorId} is no longer prepared.`;
 }
 
 /**
