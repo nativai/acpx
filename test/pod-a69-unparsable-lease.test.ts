@@ -207,7 +207,7 @@ test("69.1 the lease store's acquire, three hosts (four states) × every body: r
   }
 });
 
-test("69.1 negative cases: a body well-formed in every other respect is still held — young (not 15 s old), changed under the proof, an API that cannot answer", async () => {
+test("69.1 negative cases: a body well-formed in every other respect is still held — young (not 15 s old), an API that cannot answer", async () => {
   const api = await startKitApi("dev-kit");
   try {
     for (const host of ["control, switch off", "control, switch on"] as const) {
@@ -234,6 +234,30 @@ test("69.1 negative cases: a body well-formed in every other respect is still he
         await acquireOnce(world, host, api);
         assert.ok(fs.existsSync(faulty), `${host}: API ${failure} is unknown, the body is held`);
       }
+      failWith(api, undefined);
+    }
+  } finally {
+    await api.close();
+  }
+});
+
+test("69.1 negative case: a readable-pod body REWRITTEN while the proof is in flight is kept — the removal rests on the bytes that were judged", async () => {
+  const api = await startKitApi("dev-kit");
+  try {
+    for (const host of ["control, switch off", "control, switch on"] as const) {
+      setProof(api, "gone");
+      api.setFaults([{ mode: "slow", delayMs: 1500 }]); // every answer comes 1.5 s late
+      const world = makeWorld("a69-rewrite");
+      const file = plant(world, schemaRefused(world, { present: true, value: OTHER_POD }), OLD_MS);
+      const rewritten = schemaRefused(world, { present: true, value: OTHER_POD }).replace(
+        '"g-3"',
+        '"g-4"',
+      );
+      const acquiring = acquireOnce(world, host, api);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      fs.writeFileSync(file, rewritten); // a writer rewrote it: a fresh mtime, other bytes
+      await acquiring;
+      assert.equal(fs.readFileSync(file, "utf8"), rewritten, `${host}: the rewritten body stands`);
       failWith(api, undefined);
     }
   } finally {
@@ -292,24 +316,23 @@ test("69.1 passing pair: a host WITHOUT the identity removes an empty lease afte
   }
 });
 
-test("69.1 passing pair: the same bodies when parseable go through `judgeLease` as before — a whole lease with a fresh heartbeat is never taken", async () => {
+test("69.1 passing pair: the same lease when parseable goes through `judgeLease` as before — a whole lease with a fresh heartbeat naming another pod is never taken, on every host", async () => {
   const api = await startKitApi("dev-kit");
   try {
     for (const host of HOSTS) {
       const world = makeWorld("a69-whole");
+      const now = new Date().toISOString();
       const whole = `${JSON.stringify({
         sessionId: ID,
         pid: process.pid,
         socketPath: path.join(world.root, "a69.sock"),
-        createdAt: new Date().toISOString(),
-        heartbeatAt: new Date().toISOString(),
+        createdAt: now,
+        heartbeatAt: now,
         ownerGeneration: 3,
         queueDepth: 0,
-        ...(host === "no identity" ? {} : { pod: OTHER_POD }),
+        pod: OTHER_POD,
       })}\n`;
       const file = plant(world, whole, OLD_MS);
-      const fresh = new Date();
-      fs.utimesSync(file, fresh, fresh);
       await acquireOnce(world, host, api);
       assert.equal(fs.readFileSync(file, "utf8"), whole, `${host}: a live holder stands`);
     }
