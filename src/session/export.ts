@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { AcpxOperationalError } from "../errors.js";
+import { localProofScope } from "../pod/proof-scope.js";
 import { isRecordedPidPossiblyAlive } from "../process-identity.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
 import { readArchivedFileVerified } from "./archive/compressed.js";
@@ -89,9 +90,14 @@ async function hasLiveEventLock(recordId: string): Promise<boolean> {
   }
 }
 
-async function isSessionActive(record: SessionRecord): Promise<boolean> {
+export async function isSessionActive(record: SessionRecord): Promise<boolean> {
   if (record.closed) {
     return false;
+  }
+  // A pid compare answers only for THIS host's processes (A-67): a session whose owner may live in a pod
+  // this host cannot see counts as active.
+  if (!(await localProofScope(record.acpxRecordId)).local) {
+    return true;
   }
   return (
     isRecordedPidPossiblyAlive(record.pid, record.pidIdentity) ||

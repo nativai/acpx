@@ -3,6 +3,7 @@ import { constants as fsConstants } from "node:fs";
 import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import type { ProofScope } from "../pod/proof-scope.js";
 import { getAcpxVersion } from "../version.js";
 
 // The ONLY place acpx removes a Claude transcript file (brick 81433524, CONCEPTION
@@ -68,6 +69,12 @@ export type DedupTraceEvent =
 export type DedupHooks = {
   /** Where to scan for writers. Tests point it at a missing dir to prove the fail-closed path. */
   procRoot?: string;
+  /**
+   * Block A11: whether this process's `/proc` is the whole world for the session whose copy is being
+   * removed (`localProofScope`). `local: false` keeps the copy as `not-local-proof` WITHOUT scanning:
+   * a writer in another pod is invisible here, so "no writer" would be a false negative.
+   */
+  localProof?: ProofScope;
   trace?: (event: DedupTraceEvent) => void;
   /** Test seam: runs after the full compare, immediately before the final re-check. */
   beforeRecheck?: () => Promise<void> | void;
@@ -814,6 +821,9 @@ async function writerScanReason(
   file: OpenedFile,
   hooks: DedupHooks | undefined,
 ): Promise<string | undefined> {
+  if (hooks?.localProof && !hooks.localProof.local) {
+    return "not-local-proof";
+  }
   const verdict = await writerHoldsOpen(file, hooks?.procRoot);
   if (verdict === "none") {
     return undefined;

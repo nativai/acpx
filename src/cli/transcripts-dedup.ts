@@ -24,6 +24,7 @@ import {
   type DedupOutcome,
   type ExitTailHeader,
 } from "../config/transcript-dedup.js";
+import { localProofScope, type ProofScope } from "../pod/proof-scope.js";
 import { isRecordedPidPossiblyAlive } from "../process-identity.js";
 import { sessionArchiveDirFor } from "../session/archive/paths.js";
 import { parseSessionRecord } from "../session/persistence.js";
@@ -79,7 +80,13 @@ type ScanResult = {
 };
 
 export type KeepCategory = "active" | "branch" | "exit-block-not-eligible" | "other";
-export type SkipReason = "live-owner" | "live-pid" | "recent" | "ambiguous";
+export type SkipReason =
+  | "live-owner"
+  | "live-pid"
+  | "recent"
+  | "ambiguous"
+  /** Block A11: the session's writer may live in a pod this process's `/proc` cannot see. */
+  | "not-local-proof";
 
 export type DedupAction = {
   action: "delete" | "reduce";
@@ -114,6 +121,8 @@ export type DedupReport = {
 export type DedupDeps = {
   /** Is a queue owner of this acpx record possibly alive? */
   ownerPossiblyAlive: (acpxRecordId: string) => Promise<boolean>;
+  /** Block A11: is this process's table the whole world for that session (`localProofScope`)? */
+  proofScope: (acpxRecordId: string) => Promise<ProofScope>;
 };
 
 export type DedupOptions = {
@@ -188,7 +197,7 @@ async function createContext(
     homes,
     registry: loadSubscriptionRegistry({ homeDir: homes.stateHome }),
     now,
-    deps: { ownerPossiblyAlive: defaultOwnerPossiblyAlive, ...deps },
+    deps: { ownerPossiblyAlive: defaultOwnerPossiblyAlive, proofScope: localProofScope, ...deps },
     recordIndex: await indexRecordFiles(new Set(groups.keys()), homes),
   };
 }
@@ -506,6 +515,11 @@ async function guardReason(
   found: SessionRecords,
   context: DedupContext,
 ): Promise<SkipReason | undefined> {
+  // ⚠️ FIRST: every judgement below that reads this process's table or pids is only as wide as this
+  // pod. A session whose writer may live elsewhere is kept untouched (block A11, C91).
+  if (await anyNotLocal(found.records, context.deps.proofScope)) {
+    return "not-local-proof";
+  }
   for (const record of found.records) {
     if (await context.deps.ownerPossiblyAlive(record.acpxRecordId)) {
       return "live-owner";
@@ -519,6 +533,18 @@ async function guardReason(
   }
   const ambiguous = found.unparsable || activePathsFor(found.records, context).size > 1;
   return ambiguous ? "ambiguous" : undefined;
+}
+
+async function anyNotLocal(
+  records: SessionRecord[],
+  proofScope: DedupDeps["proofScope"],
+): Promise<boolean> {
+  for (const record of records) {
+    if (!(await proofScope(record.acpxRecordId)).local) {
+      return true;
+    }
+  }
+  return false;
 }
 
 async function anyCopyRecent(group: SessionFiles, now: number): Promise<boolean> {
@@ -871,6 +897,7 @@ export function dedupTotals(report: DedupReport): DedupTotals {
     "live-pid": 0,
     recent: 0,
     ambiguous: 0,
+    "not-local-proof": 0,
   };
   for (const entry of report.skippedIds) {
     skipped[entry.reason] += 1;
@@ -904,7 +931,10 @@ export function formatDedupFinalLine(report: DedupReport): string {
     `freed=${t.freedBytes}B (${gib} GiB) | kept: active=${k.active} branch=${k.branch} ` +
     `exit-block-not-eligible=${k["exit-block-not-eligible"]} other=${k.other} | skipped-ids: ` +
     `live-owner=${t.skipped["live-owner"]} live-pid=${t.skipped["live-pid"]} ` +
-    `recent=${t.skipped.recent} ambiguous=${t.skipped.ambiguous} | recheck-failed=${t.recheckFailed}`
+    `recent=${t.skipped.recent} ambiguous=${t.skipped.ambiguous}` +
+    // Only when it happened: a box with pod mode off prints the line it always printed.
+    (t.skipped["not-local-proof"] > 0 ? ` not-local-proof=${t.skipped["not-local-proof"]}` : "") +
+    ` | recheck-failed=${t.recheckFailed}`
   );
 }
 

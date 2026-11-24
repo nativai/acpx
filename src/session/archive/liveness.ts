@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { podModeVerdictNow } from "../../pod/placement.js";
+import { localProofScope } from "../../pod/proof-scope.js";
 import { loadSqlite } from "../../pod/sqlite-loader.js";
 import { isRecordedPidPossiblyAlive, type RecordPidIdentity } from "../../process-identity.js";
 import { hasActiveSidecar } from "./identity.js";
@@ -267,6 +268,11 @@ export async function evaluateLiveness(
   const reported = await reportedLiveness(id, options);
   if (reported) {
     return reported;
+  }
+  // ⚠️ A pid compare answers only for THIS host's processes (A-67). A session whose owner may live in a
+  // pod this host cannot see is kept — "live" is the conservative side of an archive.
+  if (!(await localProofScope(id)).local) {
+    return { live: true, signal: "not-local-proof" };
   }
   if (isRecordedPidPossiblyAlive(pid, pidIdentity)) {
     return { live: true, signal: "pid-alive" };

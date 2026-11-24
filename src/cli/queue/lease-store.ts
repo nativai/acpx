@@ -394,7 +394,7 @@ export async function readQueueOwnerProcessIdentity(
   return identity ? serializeProcessBirthIdentity(identity) : undefined;
 }
 
-type LeaseFile =
+export type LeaseFile =
   | { kind: "missing" }
   | { kind: "unparsable" }
   | { kind: "ok"; record: QueueOwnerRecord };
@@ -414,6 +414,15 @@ async function readLeaseFile(lockPath: string): Promise<LeaseFile> {
   } catch {
     return { kind: "unparsable" };
   }
+}
+
+/**
+ * The lease file as `readQueueOwnerRecord` reads it, but keeping "there is none" and "there is one I
+ * cannot read" apart. A caller that judges by what a lease says about a pod (`localProofScope`) must
+ * treat the second as "cannot tell", never as the first.
+ */
+export async function readQueueOwnerLeaseFile(sessionId: string): Promise<LeaseFile> {
+  return await readLeaseFile(queueLockFilePath(sessionId));
 }
 
 export async function readQueueOwnerRecord(

@@ -1,3 +1,4 @@
+import { localProofScope, type ProofScope } from "../pod/proof-scope.js";
 import {
   type LiveProcessScan,
   scanIsMeasured,
@@ -53,7 +54,14 @@ export interface AbandonedRecordSweepResult {
     closeFailed: number;
     /** No usable timestamp, so age could not be established — never guessed. */
     ageUnknown: number;
+    /**
+     * Block A11 / A-67: the session is not local to this host (`localProofScope`), so this host's process
+     * census says nothing about its owner and no verdict is made.
+     */
+    notLocalProof: number;
   };
+  /** The ids counted in `retainedBy.notLocalProof`, so a report can name them. */
+  notLocalProofIds: string[];
   /** The idle age of the OLDEST record left open, in ms. */
   oldestRetainedIdleMs?: number;
   /** True when the sweep REFUSED because `/proc` was not measurable. */
@@ -76,10 +84,14 @@ export async function sweepAbandonedSessionRecords(params: {
   liveScan?: LiveProcessScan;
   /** Injected so this is testable without touching a real session. */
   closeSession: (sessionId: string) => Promise<unknown>;
+  /** Is this host's process table the whole world for the session? Default: `localProofScope`. */
+  proofScope?: (recordId: string) => Promise<ProofScope>;
   minIdleMs?: number;
   now?: number;
 }): Promise<AbandonedRecordSweepResult> {
-  const retainedBy = { liveOwner: 0, tooYoung: 0, closeFailed: 0, ageUnknown: 0 };
+  const retainedBy = { liveOwner: 0, tooYoung: 0, closeFailed: 0, ageUnknown: 0, notLocalProof: 0 };
+  const proofScope = params.proofScope ?? localProofScope;
+  const notLocalProofIds: string[] = [];
   const open = params.records.filter((record) => record.closed !== true);
 
   if (!scanIsMeasured(params.liveScan)) {
@@ -88,10 +100,15 @@ export async function sweepAbandonedSessionRecords(params: {
   const liveScan = params.liveScan;
   const { now, minIdleMs } = resolveSweepDefaults(params);
 
+  // ⚠️ FIRST: the census below is this host's alone. A session whose owner may live in a pod this host
+  // cannot see gets no verdict — "no process owns it" would be a false negative (A-67).
+  const { local, notLocal } = await partitionByProofScope(open, proofScope);
   const closed: string[] = [];
-  let retained = 0;
+  let retained = notLocal.length;
+  retainedBy.notLocalProof = notLocal.length;
+  notLocalProofIds.push(...notLocal);
   let oldestRetainedIdleMs: number | undefined;
-  for (const record of open) {
+  for (const record of local) {
     const verdict = classifyRecord(record, { liveScan, now, minIdleMs });
     if (verdict.retain) {
       retained += 1;
@@ -115,9 +132,26 @@ export async function sweepAbandonedSessionRecords(params: {
     closed,
     retained,
     retainedBy,
+    notLocalProofIds,
     oldestRetainedIdleMs,
     notMeasured: false,
   };
+}
+
+async function partitionByProofScope(
+  records: readonly SessionRecord[],
+  proofScope: (recordId: string) => Promise<ProofScope>,
+): Promise<{ local: SessionRecord[]; notLocal: string[] }> {
+  const local: SessionRecord[] = [];
+  const notLocal: string[] = [];
+  for (const record of records) {
+    if (record.acpxRecordId && !(await proofScope(record.acpxRecordId)).local) {
+      notLocal.push(record.acpxRecordId);
+    } else {
+      local.push(record);
+    }
+  }
+  return { local, notLocal };
 }
 
 /**
@@ -134,6 +168,7 @@ function refusedSweep(
     closed: [],
     retained: candidates,
     retainedBy: { ...retainedBy, liveOwner: candidates },
+    notLocalProofIds: [],
     notMeasured: true,
   };
 }
@@ -200,7 +235,10 @@ export function describeAbandonedRecordSweep(result: AbandonedRecordSweepResult)
   return (
     `[acpx] abandoned session records: scanned=${result.scanned} closed=${result.closed.length} ` +
     `retained=${result.retained} (liveOwner=${by.liveOwner} tooYoung=${by.tooYoung} ` +
-    `ageUnknown=${by.ageUnknown} closeFailed=${by.closeFailed})` +
+    `ageUnknown=${by.ageUnknown} closeFailed=${by.closeFailed}` +
+    // Only when it happened: a box with no pod session prints the line it always printed.
+    (by.notLocalProof > 0 ? ` notLocalProof=${by.notLocalProof}` : "") +
+    ")" +
     (result.notMeasured ? " — REFUSED: /proc not measurable, nothing was closed" : "") +
     " (scanned=0 means NOT RUN, not clean)\n"
   );

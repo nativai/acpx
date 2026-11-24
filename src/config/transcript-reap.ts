@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { localProofScope } from "../pod/proof-scope.js";
 import { namesAgentSession } from "../session/sleeping.js";
 import type { SessionRecord } from "../types.js";
 import {
@@ -48,7 +49,7 @@ export type TranscriptReapSummary = {
   skipped: string[];
 };
 
-type ReapRecord = Pick<SessionRecord, "cwd" | "acpSessionId" | "acpx">;
+type ReapRecord = Pick<SessionRecord, "cwd" | "acpSessionId" | "acpx" | "acpxRecordId">;
 
 export async function reapLeftBehindTranscripts(params: {
   record: ReapRecord;
@@ -87,7 +88,11 @@ export async function reapLeftBehindTranscripts(params: {
     }
     return summary;
   }
-  await reapCandidates(leftBehind, summary, params);
+  // Block A11: removal is judged by THIS process's `/proc` writer scan, which sees only this pod. In the
+  // session's own pod (or for a session with no pod) that is the whole world; anywhere else every
+  // candidate is kept, named `not-local-proof`, and no scan runs.
+  const localProof = await localProofScope(record.acpxRecordId);
+  await reapCandidates(leftBehind, summary, { ...params, hooks: { ...params.hooks, localProof } });
   return summary;
 }
 
