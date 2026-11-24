@@ -534,6 +534,8 @@ export async function setSessionDepth(
 export async function setSessionSubscription(
   options: SessionSetSubscriptionOptions,
 ): Promise<SessionSetSubscriptionResult> {
+  // A-69 (3) row 69.6 / A-16: a held session keeps its pod until proven gone — refuse before any read, copy or write.
+  await refuseWakeWhilePodNotGone(options.sessionId);
   const liveness = await readQueueOwnerLiveness(options.sessionId);
   const ownerAlive = isOwnerPossiblyAlive(liveness);
 
@@ -584,6 +586,8 @@ export async function setSessionSubscription(
 export async function setSessionProfile(
   options: SessionSetProfileOptions,
 ): Promise<SessionSetProfileResult> {
+  // A-69 (3) row 69.6 / A-16: a held session keeps its pod until proven gone — refuse before any read, copy or write.
+  await refuseWakeWhilePodNotGone(options.sessionId);
   const liveness = await readQueueOwnerLiveness(options.sessionId);
   const ownerAlive = isOwnerPossiblyAlive(liveness);
 
@@ -627,6 +631,8 @@ export async function setSessionProfile(
 export async function setSessionAutoFailover(
   options: SessionSetAutoFailoverOptions,
 ): Promise<SessionSetAutoFailoverResult> {
+  // A-69 (3) row 69.6 / A-16: a held session keeps its pod until proven gone — refuse before any read, copy or write.
+  await refuseWakeWhilePodNotGone(options.sessionId);
   const ownerAlive = await refuseTurnInFlightForLiveOwner(
     options.sessionId,
     () => new ConfigOptionTurnInFlightError("auto-failover"),
@@ -686,6 +692,8 @@ export async function setSessionAutoFailover(
 export async function setSessionOutputStyle(
   options: SessionSetOutputStyleOptions,
 ): Promise<SessionSetOutputStyleResult> {
+  // A-69 (3) row 69.6 / A-16: a held session keeps its pod until proven gone — refuse before any read, copy or write.
+  await refuseWakeWhilePodNotGone(options.sessionId);
   const liveness = await readQueueOwnerLiveness(options.sessionId);
   const ownerAlive = isOwnerPossiblyAlive(liveness);
 
@@ -753,6 +761,8 @@ export async function setSessionOutputStyle(
 export async function setSessionAutoSubscription(
   options: SessionSetAutoSubscriptionOptions,
 ): Promise<SessionSetAutoSubscriptionResult> {
+  // A-69 (3) row 69.6 / A-16: a held session keeps its pod until proven gone — refuse before any read, copy or write.
+  await refuseWakeWhilePodNotGone(options.sessionId);
   const ownerAlive = await refuseTurnInFlightForLiveOwner(
     options.sessionId,
     () => new ConfigOptionTurnInFlightError("auto-subscription"),
@@ -783,6 +793,8 @@ export async function setSessionAutoSubscription(
 export async function setSessionFableDegrade(
   options: SessionSetFableDegradeOptions,
 ): Promise<SessionSetFableDegradeResult> {
+  // A-69 (3) row 69.6 / A-16: a held session keeps its pod until proven gone — refuse before any read, copy or write.
+  await refuseWakeWhilePodNotGone(options.sessionId);
   const ownerAlive = await refuseTurnInFlightForLiveOwner(
     options.sessionId,
     () => new ConfigOptionTurnInFlightError("fable-degrade"),
