@@ -114,7 +114,8 @@ export class SeatActivationRefusalError extends Error {
       | "SUCCESSOR_ARCHIVED"
       | "PREDECESSOR_ARCHIVED"
       | "KIND_MISMATCH"
-      | "CONCURRENT_ACTIVATION",
+      | "CONCURRENT_ACTIVATION"
+      | "CONCURRENT_HANDOVER",
     message: string,
   ) {
     super(message);
@@ -236,10 +237,32 @@ async function resolvePredecessorOrRefuse(
   return predecessor;
 }
 
+/**
+ * Brick 4bc23c1e — a handover activates only while the seat STILL names the session that is handing it
+ * over. Its own check of the caller ran at the start; an overlapping run (a pass-through repeat after a
+ * `255`, while the first run is alive) may have moved the seat since, and without this the preflight takes
+ * the seat's CURRENT holder as the predecessor and activates over that run's successor. Absent for the
+ * plain `sessions activate`, which has no caller to protect.
+ */
+function refuseUnlessSeatNamesExpectedHolder(
+  seat: SeatRecord,
+  expectedHolderId: string | undefined,
+): void {
+  if (expectedHolderId !== undefined && seat.activeHolderId !== expectedHolderId) {
+    throw new SeatActivationRefusalError(
+      "CONCURRENT_HANDOVER",
+      `seat ${seat.seatId} no longer names ${expectedHolderId} as its active holder — it names ` +
+        `${seat.activeHolderId ?? "nobody (the seat is vacant)"}. Another handover from the same session ` +
+        `won; nothing was activated by this run.`,
+    );
+  }
+}
+
 /** Phase 0 — every refusal, before any write. */
 async function preflight(
   seatRef: string,
   successorRef: string,
+  expectedHolderId: string | undefined,
 ): Promise<{
   seat: SeatRecord;
   successor: SessionRecord;
@@ -258,6 +281,7 @@ async function preflight(
   predecessorMirrorActive: boolean | undefined;
 }> {
   const seat = await resolveSeatOrRefuse(seatRef);
+  refuseUnlessSeatNamesExpectedHolder(seat, expectedHolderId);
   const successor = await resolveSuccessorOrRefuse(seat, successorRef);
   const predecessor = await resolvePredecessorOrRefuse(seat, successor);
   return {
@@ -497,9 +521,10 @@ export function composeSeatActivationNotice(params: {
 export async function activateSeatHolder(
   seatRef: string,
   successorRef: string,
+  options: { readonly expectedHolderId?: string } = {},
 ): Promise<SeatActivationOutcome> {
   try {
-    return await activateSeatHolderUnworded(seatRef, successorRef);
+    return await activateSeatHolderUnworded(seatRef, successorRef, options.expectedHolderId);
   } catch (error) {
     // The three missing-row sites throw bare (two are inside `withSeatStoreWrite`'s hold,
     // which may not read session records); the origin-aware wording is added HERE, outside
@@ -514,10 +539,12 @@ export async function activateSeatHolder(
 async function activateSeatHolderUnworded(
   seatRef: string,
   successorRef: string,
+  expectedHolderId: string | undefined,
 ): Promise<SeatActivationOutcome> {
   const { seat, successor, predecessor, predecessorMirrorActive } = await preflight(
     seatRef,
     successorRef,
+    expectedHolderId,
   );
 
   if (seat.activeHolderId === successor.acpxRecordId) {

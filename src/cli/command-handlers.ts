@@ -97,6 +97,7 @@ import {
   OUTPUT_STYLE_CONFIG_ID,
 } from "../session/output-style.js";
 import {
+  isArchivedRecord,
   isoNow,
   isTemplateRecord,
   listSessionIndexEntries,
@@ -232,6 +233,7 @@ import {
 import { type BywayCloseRefusal, bywayCloseRefusal } from "./session/byway-close-guard.js";
 import type { SessionListResult } from "./session/contracts.js";
 import { composeForkDivergenceNotice } from "./session/fork-handoff.js";
+import { HANDOVER_FROM_KEY, type PreparedHolder } from "./session/handover.js";
 import {
   applyBrickFlag,
   withInheritedBrick,
@@ -6758,8 +6760,7 @@ export async function handleSessionsHandover(
 ): Promise<void> {
   const { format } = resolveGlobalFlags(command, config);
   const handover = await import("./session/handover.js");
-  const { activateSeatHolder, SeatActivationRefusalError } =
-    await import("./session/seat-activate.js");
+  const { SeatActivationRefusalError } = await import("./session/seat-activate.js");
   try {
     const brief = await handover.readHandoverBrief(flags.brief);
     const warning = handover.handoverBriefSizeWarning(brief);
@@ -6767,13 +6768,15 @@ export async function handleSessionsHandover(
       process.stderr.write(`${warning}\n`);
     }
     const caller = await resolveHandoverCaller(flags.sessionId, handover.HandoverRefusalError);
-    const { created } = await createSessionFromNewFlags(
+    const successorId = await createOrAdoptHandoverSuccessor(
+      caller,
+      handover,
       explicitAgentName,
-      { from: caller.acpxRecordId },
       command,
       config,
     );
-    const result = await activateSeatHolder(String(caller.seatId), created.acpxRecordId);
+    dieAfterHandoverCreateForTest();
+    const result = await activateHandoverSuccessor(caller, successorId);
     await emitSeatDivergenceLine(result.successorId, result.divergence);
     const turn = {
       ...result,
@@ -6803,6 +6806,154 @@ export async function handleSessionsHandover(
     }
     throw error;
   }
+}
+
+/**
+ * Brick 4bc23c1e — the activation of a handover compares against the CALLER, never against whoever the
+ * seat names by now. When another handover from the same session got there first, this run refuses
+ * (`CONCURRENT_HANDOVER`, exit 1), activates nothing, and NAMES the successor it leaves prepared: a later
+ * retry cannot adopt it, because the caller is no longer the seat's holder (`NOT_HOLDER`).
+ */
+async function activateHandoverSuccessor(
+  caller: SessionRecord,
+  successorId: string,
+): Promise<import("./session/seat-activate.js").SeatActivationOutcome> {
+  const { activateSeatHolder, SeatActivationRefusalError } =
+    await import("./session/seat-activate.js");
+  try {
+    return await activateSeatHolder(String(caller.seatId), successorId, {
+      expectedHolderId: caller.acpxRecordId,
+    });
+  } catch (error) {
+    if (
+      error instanceof SeatActivationRefusalError &&
+      (error.code === "CONCURRENT_HANDOVER" || error.code === "CONCURRENT_ACTIVATION")
+    ) {
+      process.stderr.write(
+        `${await leftoverSuccessorAdvice(String(caller.seatId), successorId)}\n`,
+      );
+      if (error.code === "CONCURRENT_ACTIVATION") {
+        // The CAS text ends "re-run to activate <successor>" — right for `sessions activate`, wrong here:
+        // a re-run of a handover whose caller lost the seat is refused NOT_HOLDER.
+        throw new SeatActivationRefusalError(
+          "CONCURRENT_HANDOVER",
+          `seat ${caller.seatId} moved while this handover was activating: it no longer names ` +
+            `${caller.acpxRecordId} as its holder. Another handover from the same session won; ` +
+            `nothing was activated by this run.`,
+        );
+      }
+    }
+    throw error;
+  }
+}
+
+/**
+ * What to tell the operator about the successor a refused handover run was holding, read from the seat
+ * and the record AT REFUSAL TIME: in an overlap of two retries that both adopted one orphan, the run that
+ * lost is holding the successor the winner just activated, and "close it" would close the live holder.
+ * Close advice only for a successor that is still prepared and is not the seat's active holder.
+ */
+async function leftoverSuccessorAdvice(seatId: string, successorId: string): Promise<string> {
+  const seat = seatFromStore(await readSeatStore(sessionBaseDir()), seatId);
+  if (seat?.activeHolderId === successorId) {
+    return `handover: another run of this handover already activated ${successorId}; there is nothing to do.`;
+  }
+  let record: SessionRecord;
+  try {
+    record = await resolveSessionRecord(successorId);
+  } catch {
+    return `handover: the successor ${successorId} could not be read; this run activated nothing.`;
+  }
+  return isNeverActivatedOpenHolder(record)
+    ? `handover: the successor ${successorId} was left prepared and is not activated; close it ` +
+        `(acpx sessions close --session-id ${successorId}).`
+    : `handover: this run activated nothing; the successor ${successorId} is no longer prepared.`;
+}
+
+/**
+ * ⚠️ TEST SEAM, honoured ONLY under a non-empty `NODE_TEST_CONTEXT` (`node --test` sets it; a production
+ * process never has it): kills this process between the handover's create and its activation — the exact
+ * window brick 4bc23c1e is about — so a test can leave the prepared successor behind and retry.
+ */
+function dieAfterHandoverCreateForTest(): void {
+  if (
+    (process.env.NODE_TEST_CONTEXT ?? "") !== "" &&
+    process.env.ACPX_TEST_HANDOVER_DIE_AFTER_CREATE === "1"
+  ) {
+    process.kill(process.pid, "SIGKILL");
+  }
+}
+
+/**
+ * Brick 4bc23c1e — the caller is still the seat's active holder, so an earlier run of this very handover
+ * may have died after writing its successor and before activating it: adopt that one, otherwise create
+ * the successor (marked as this caller's) — and name any other prepared holder the seat has.
+ */
+async function createOrAdoptHandoverSuccessor(
+  caller: SessionRecord,
+  handover: typeof import("./session/handover.js"),
+  explicitAgentName: string | undefined,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<string> {
+  const { adopt, others } = handover.chooseHandoverSuccessor(
+    caller.acpxRecordId,
+    await preparedHoldersOfSeat(String(caller.seatId), caller.acpxRecordId),
+  );
+  const othersNote = handover.preparedHoldersNote(others);
+  if (othersNote) {
+    process.stderr.write(`${othersNote}\n`);
+  }
+  if (adopt) {
+    process.stderr.write(
+      `handover: adopting ${adopt.id}, the successor an earlier run of this handover left prepared\n`,
+    );
+    return adopt.id;
+  }
+  const { created } = await createSessionFromNewFlags(
+    explicitAgentName,
+    { from: caller.acpxRecordId, metadata: { [HANDOVER_FROM_KEY]: caller.acpxRecordId } },
+    command,
+    config,
+  );
+  return created.acpxRecordId;
+}
+
+/**
+ * The seat's holders that were created and never activated — no ordinal, not active, open, not archived
+ * — read from their RECORDS (the index only narrows the scan to the seat's own entries). A scan over the
+ * index, run only by a handover: a rare, operator-or-agent path, like `firstHolderOfSeat`.
+ */
+async function preparedHoldersOfSeat(seatId: string, callerId: string): Promise<PreparedHolder[]> {
+  const prepared: PreparedHolder[] = [];
+  for (const entry of await listSessionIndexEntries()) {
+    if (entry.seatId !== seatId || entry.acpxRecordId === callerId || entry.closed) {
+      continue;
+    }
+    let record: SessionRecord;
+    try {
+      record = await resolveSessionRecord(entry.acpxRecordId);
+    } catch {
+      continue;
+    }
+    if (isNeverActivatedOpenHolder(record)) {
+      prepared.push({
+        id: record.acpxRecordId,
+        createdAt: record.createdAt,
+        handoverFrom: record.metadata?.[HANDOVER_FROM_KEY],
+      });
+    }
+  }
+  return prepared;
+}
+
+function isNeverActivatedOpenHolder(record: SessionRecord): boolean {
+  return (
+    !isArchivedRecord(record) &&
+    record.closed !== true &&
+    record.holderActive !== true &&
+    record.holderOrdinal === undefined
+  );
 }
 
 /** Brick bbe2bc47 A6: the last thing a handover from far below the alarm prints. */

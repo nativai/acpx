@@ -265,7 +265,7 @@ test("F-1b: the unknown line advises a repeat ONLY for a create; every other cla
 
   const handover = await unknownText(["sessions", "handover", "--brief", "/workspace/b.md"]);
   assert.doesNotMatch(handover.stderr, /Repeat exactly/u);
-  assert.match(handover.stderr, /could create a second successor/u);
+  assert.match(handover.stderr, /overlaps a run still going is refused/u);
 });
 
 test("F-1b: checkAdvice names the runtime-status path from the caller's own environment when it has one", () => {
