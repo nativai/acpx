@@ -52,9 +52,11 @@ const PINNED_TASK_COUNT = 20;
 const OWNER_HARNESS = `
 import { spawn } from "node:child_process";
 import { writeSync } from "node:fs";
+import { appendFile } from "node:fs/promises";
 import { installQueueOwnerFatalSignalHandlers } from "%RUNTIME%";
+import { buildDeliveryEvent } from "%DELIVERY%";
+import { sessionEventActivePath } from "%EVENTLOG%";
 import {
-  appendDeliveryStreamEvent,
   SessionQueueOwner,
   tryAcquireQueueOwnerLease,
 } from "%IPC%";
@@ -122,15 +124,18 @@ process.on("exit", () => {
 if (asyncWriterControl) {
   // CONTROL — the pre-fix behaviour, on the identical signal path: hand the
   // write to libuv and exit. Nothing reaches disk. This is what makes the real
-  // gate below meaningful rather than decorative.
+  // gate below meaningful rather than decorative. It is a RAW libuv \`appendFile\`
+  // on purpose: \`appendDeliveryStreamEvent\` (the async appender) now performs its
+  // first write synchronously (brick 3f33cc2d), so it no longer models the trap.
   process.on("SIGTERM", () => {
     for (let index = 0; index < 3; index += 1) {
-      appendDeliveryStreamEvent(
-        sessionId,
-        { messageId: "msg-" + index, requestId: "req-" + index },
-        "failed",
-        { code: 0, message: "control: asynchronous writer", detailCode: "QUEUE_OWNER_SHUTDOWN" },
-      );
+      const event = buildDeliveryEvent({
+        messageId: "msg-" + index,
+        requestId: "req-" + index,
+        phase: "failed",
+        error: { code: 0, message: "control: asynchronous writer", detailCode: "QUEUE_OWNER_SHUTDOWN" },
+      });
+      void appendFile(sessionEventActivePath(sessionId), JSON.stringify(event) + "\\n", "utf8");
     }
     process.exit(143);
   });
@@ -345,7 +350,10 @@ async function withSignalHarnessHome(
       OWNER_HARNESS.replace(
         "%RUNTIME%",
         new URL("../src/cli/session/queue-owner-runtime.js", import.meta.url).href,
-      ).replace("%IPC%", new URL("../src/cli/queue/ipc.js", import.meta.url).href),
+      )
+        .replace("%IPC%", new URL("../src/cli/queue/ipc.js", import.meta.url).href)
+        .replace("%DELIVERY%", new URL("../src/session/delivery-events.js", import.meta.url).href)
+        .replace("%EVENTLOG%", new URL("../src/session/event-log.js", import.meta.url).href),
       "utf8",
     );
     await run({ homeDir, scriptPath });
