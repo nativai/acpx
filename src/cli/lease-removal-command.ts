@@ -6,6 +6,7 @@ import { acpxStateRoot } from "../session/persistence/session-base-dir.js";
 import type { OutputFormat } from "../types.js";
 import { emitJsonResult } from "./output/json-output.js";
 import {
+  RecordsFileError,
   runLeaseRemoval,
   START_MARGIN_MS,
   type ControlPodStart,
@@ -18,7 +19,8 @@ import {
  * commander action, so cli.js gains no static chunk (`test/pod-command-classes.test.ts`, the 10-chunk bound).
  *
  * Exit: 0 for a census, and for an apply that removed or found absent every selected lease; 1 for an apply
- * that kept a selected lease (named in the output); 2 when refused before acting.
+ * that kept a selected lease (named in the output); 2 when refused before acting — `--records-file` without
+ * `--apply`, or an apply whose records file cannot be created (nothing is read or removed then).
  */
 
 const CLOCK_TICKS_PER_SECOND = 100;
@@ -115,16 +117,17 @@ export function defaultRecordsFile(now: Date = new Date()): string {
 }
 
 function describe(record: LeaseRecord): string {
-  const who =
-    record.sessionId === null
-      ? `key=${record.key} (no session record found)`
-      : `${record.sessionId} key=${record.key}`;
+  const who = {
+    "none-found": `key=${record.key} (no session record found)`,
+    "residue-only": `${record.sessionId} key=${record.key} (session files only, no <id>.json record)`,
+    record: `${record.sessionId} key=${record.key}`,
+  }[record.sessionRecord];
   const fp = record.fingerprint;
   return [
     `${record.decision.toUpperCase()}\t${who}`,
     `state=${record.state}${record.location ? `/${record.location}` : ""}`,
     `bytes=${record.bytes}`,
-    `mtime=${record.mtime}`,
+    `mtime=${record.mtime ?? "unknown"}`,
     `parse=${record.parse}`,
     `fp=ino:${fp.ino},mtimeNs:${fp.mtimeNs},size:${fp.size},sha256:${fp.sha256}`,
     `reason=${record.reason}`,
@@ -146,22 +149,54 @@ export function formatLeaseRemoval(result: LeaseRemovalResult): string {
   return lines.join("\n");
 }
 
+/** Refused before acting: a message on stderr, exit 2 (distinct from 1, "an apply kept a lease"). */
+function refuse(reason: string, message: string): void {
+  process.stderr.write(`acpx: REFUSED reason=${reason} ${message}\n`);
+  process.exitCode = 2;
+}
+
+/** The run, or undefined after a refusal (stderr, exit 2). */
+async function runOrRefuse(flags: {
+  apply?: boolean;
+  recordsFile?: string;
+}): Promise<LeaseRemovalResult | undefined> {
+  const apply = flags.apply === true;
+  if (flags.recordsFile !== undefined && !apply) {
+    refuse(
+      "records_file_needs_apply",
+      "--records-file only goes with --apply (a dry run writes nothing)",
+    );
+    return undefined;
+  }
+  try {
+    return await runLeaseRemoval({
+      apply,
+      controlPodStart: () => readControlPodStart(),
+      ...(apply ? { recordsFile: flags.recordsFile ?? defaultRecordsFile() } : {}),
+    });
+  } catch (error) {
+    if (error instanceof RecordsFileError) {
+      refuse(error.code.replaceAll("-", "_"), error.message);
+      return undefined;
+    }
+    throw error;
+  }
+}
+
 export async function handleUnparsableLeases(
   flags: { apply?: boolean; recordsFile?: string },
   format: OutputFormat,
 ): Promise<void> {
-  const apply = flags.apply === true;
-  const result = await runLeaseRemoval({
-    apply,
-    controlPodStart: () => readControlPodStart(),
-    ...(apply ? { recordsFile: flags.recordsFile ?? defaultRecordsFile() } : {}),
-  });
+  const result = await runOrRefuse(flags);
+  if (!result) {
+    return;
+  }
   if (!emitJsonResult(format, { action: "unparsable_leases", ...result })) {
     process.stdout.write(
       format === "quiet" ? `${result.scanned.selected}\n` : `${formatLeaseRemoval(result)}\n`,
     );
   }
-  if (apply && result.summary.kept > 0) {
+  if (result.mode === "apply" && result.summary.kept > 0) {
     process.exitCode = 1;
   }
 }

@@ -46,19 +46,25 @@ export type LeaseFingerprint = {
 
 export type LeaseDecision = "would-remove" | "removed" | "kept" | "already-absent";
 
-export type SessionState = "closed" | "open" | "archived" | "unknown" | "none";
+/** `residue-only`: files named for the session exist, but no `<id>.json` record does. */
+export type SessionState = "closed" | "open" | "archived" | "residue-only" | "unknown" | "none";
 
 export type LeaseRecord = {
   key: string;
   /** The session id the key resolves to, or null when no session record names the lease. */
   sessionId: string | null;
-  /** `none-found` is spoken out in the text form: "no session record found". */
-  sessionRecord: "found" | "none-found";
+  /**
+   * What was actually found for the key: a `<id>.json` record (`record`, in `location`), only other files
+   * named for the session (`residue-only`: `.owner.log`, `.stream.*`, …: nothing to restore), or nothing
+   * (`none-found`, spoken out in the text form as "no session record found").
+   */
+  sessionRecord: "record" | "residue-only" | "none-found";
   location: "hot" | "archive" | null;
   state: SessionState;
   closed: boolean | null;
   bytes: number;
-  mtime: string;
+  /** The lease's mtime, or null when it could not be read (never an epoch default). */
+  mtime: string | null;
   parse: LeaseParse;
   fingerprint: LeaseFingerprint;
   decision: LeaseDecision;
@@ -75,7 +81,7 @@ export type LeaseRemovalOptions = {
   minGapMs?: number;
   /** Tests only. */
   sleep?: (ms: number) => Promise<void>;
-  /** Apply only: where the durable records go. Created exclusively; if it cannot be, nothing is removed. */
+  /** Apply only: where the durable records go. Created exclusively BEFORE anything is read; if it cannot be, `RecordsFileError` and nothing is removed. */
   recordsFile?: string;
   /** Tests only: observation points. */
   hooks?: {
@@ -98,18 +104,35 @@ export type LeaseRemovalResult = {
   recordsFile: string | null;
 };
 
-type NotRegular = { kind: "not-regular"; fingerprint: LeaseFingerprint; bytes: number };
-type ReadBody = {
-  kind: "read";
+type NotRegular = {
+  kind: "not-regular";
   fingerprint: LeaseFingerprint;
   mtimeMs: number;
   bytes: number;
+};
+type ReadBody = {
+  kind: "read";
+  fingerprint: LeaseFingerprint;
+  /** Undefined when the stat failed: the age is then UNKNOWN, and never defaulted. */
+  mtimeMs: number | undefined;
+  bytes: number;
+  /** Set when the lease could not be statted (`stat-error: <errno>`) or read (`read-error: <errno>`). */
+  error?: string;
   /** Present iff the store's classification SELECTS the body. */
   parse?: LeaseParse;
 };
 type ReadLease = { kind: "absent" } | NotRegular | ReadBody;
 /** A body the store's classification selected. */
 type SelectedBody = ReadBody & { parse: LeaseParse };
+
+export class RecordsFileError extends Error {
+  readonly code = "records-file-unavailable";
+  constructor(target: string, cause: unknown) {
+    super(
+      `records file ${target} cannot be created (${errnoOf(cause)}): nothing was read or removed`,
+    );
+  }
+}
 
 const LEASE_FILE = /^([0-9a-f]{24})\.lock$/;
 const ABSENT: ReadLease = { kind: "absent" };
@@ -142,14 +165,16 @@ function parseLabel(payload: string): LeaseParse {
   }
 }
 
+/** A lease that could not be statted (no `stat`: age unknown) or read (`stat` known). Never selected-and-removed. */
 function unreadable(stat: Stat | undefined, code: string): ReadLease {
   const base = stat ?? { ino: 0n, mtimeNs: 0n, size: 0n };
   return {
     kind: "read",
     fingerprint: fingerprintOf(base, `unreadable:${code}`),
-    mtimeMs: Number(base.mtimeNs / 1_000_000n),
+    mtimeMs: stat ? Number(stat.mtimeNs / 1_000_000n) : undefined,
     bytes: Number(base.size),
     parse: "unreadable",
+    error: `${stat ? "read" : "stat"}-error: ${code}`,
   };
 }
 
@@ -162,6 +187,7 @@ async function lstatLease(file: string): Promise<{ stat: Stat } | { early: ReadL
           early: {
             kind: "not-regular",
             fingerprint: fingerprintOf(stat, "not-a-regular-file"),
+            mtimeMs: Number(stat.mtimeNs / 1_000_000n),
             bytes: Number(stat.size),
           },
         };
@@ -206,13 +232,16 @@ async function readLease(file: string): Promise<ReadLease> {
   }
 }
 
-type SessionHit = { id: string; location: "hot" | "archive" };
+type SessionHit = { id: string; location: "hot" | "archive"; hasRecord: boolean };
 type SessionFacts = Pick<
   LeaseRecord,
   "sessionId" | "sessionRecord" | "location" | "state" | "closed"
 >;
 
-/** key → session, from the NAMES in the hot and archive directories (hot first). No record is read here. */
+/**
+ * key → session, from the NAMES in the hot and archive directories. A hit with a `<id>.json` record beats one
+ * with only residue (`.owner.log`, `.stream.*`), and hot beats archive among equals. No record is read here.
+ */
 async function sessionLookup(): Promise<Map<string, SessionHit>> {
   const hotDir = sessionBaseDir();
   const dirs: Array<[string, "hot" | "archive"]> = [
@@ -221,11 +250,12 @@ async function sessionLookup(): Promise<Map<string, SessionHit>> {
   ];
   const lookup = new Map<string, SessionHit>();
   for (const [dir, location] of dirs) {
-    const names = await fs.readdir(dir).catch(() => [] as string[]);
-    for (const id of names.map((name) => name.split(".")[0]).filter(Boolean)) {
-      const key = queueKeyForSession(id);
-      if (!lookup.has(key)) {
-        lookup.set(key, { id, location });
+    for (const name of await fs.readdir(dir).catch(() => [] as string[])) {
+      const id = name.split(".")[0];
+      const hit: SessionHit = { id, location, hasRecord: name === `${id}.json` };
+      const known = lookup.get(queueKeyForSession(id));
+      if (id && (!known || (hit.hasRecord && !known.hasRecord))) {
+        lookup.set(queueKeyForSession(id), hit);
       }
     }
   }
@@ -262,12 +292,16 @@ async function sessionFacts(hit: SessionHit | undefined): Promise<SessionFacts> 
       closed: null,
     };
   }
+  if (!hit.hasRecord) {
+    const residue = { sessionId: hit.id, location: hit.location, closed: null } as const;
+    return { ...residue, sessionRecord: "residue-only", state: "residue-only" };
+  }
   const hotDir = sessionBaseDir();
   const dir = hit.location === "hot" ? hotDir : sessionArchiveDirFor(hotDir);
   const closed = await closedFlag(path.join(dir, `${hit.id}.json`));
   return {
     sessionId: hit.id,
-    sessionRecord: "found",
+    sessionRecord: "record",
     location: hit.location,
     state: stateOf(hit.location, closed),
     closed,
@@ -291,7 +325,7 @@ function draft(
     key,
     ...facts,
     bytes: read.bytes,
-    mtime: new Date(read.mtimeMs).toISOString(),
+    mtime: read.mtimeMs === undefined ? null : new Date(read.mtimeMs).toISOString(),
     parse,
     fingerprint: read.fingerprint,
   };
@@ -316,15 +350,21 @@ async function appendFsynced(handle: FileHandle, value: unknown): Promise<void> 
   await handle.sync();
 }
 
-/** What a lease's mtime says against the control pod's start, or undefined when it may be removed. */
-function ageVerdict(mtimeMs: number, start: ControlPodStart): string | undefined {
+/**
+ * What a lease's age says against the control pod's start, or undefined when it may be removed. A lease that
+ * could not be statted or read has NO age: it is kept and named, never read as "old" (A-71 (2)(a)).
+ */
+function ageVerdict(read: ReadBody, start: ControlPodStart): string | undefined {
   if (start.ms === undefined) {
     return `control-pod-start-unknown: ${start.reason}`;
   }
-  if (mtimeMs >= start.ms) {
+  if (read.error !== undefined || read.mtimeMs === undefined) {
+    return read.error ?? "stat-error: mtime unknown";
+  }
+  if (read.mtimeMs >= start.ms) {
     return "written-after-pod-start";
   }
-  return mtimeMs >= start.ms - START_MARGIN_MS ? "near-start" : undefined;
+  return read.mtimeMs >= start.ms - START_MARGIN_MS ? "near-start" : undefined;
 }
 
 function startFields(start: ControlPodStart): {
@@ -384,7 +424,7 @@ function notRegularRecord(key: string, first: NotRegular, facts: SessionFacts): 
     key,
     ...facts,
     bytes: first.bytes,
-    mtime: new Date(0).toISOString(),
+    mtime: new Date(first.mtimeMs).toISOString(),
     parse: "unreadable",
     fingerprint: first.fingerprint,
     decision: "kept",
@@ -409,6 +449,10 @@ function afterSecondRead(
       record: { ...draft(key, first, first.parse, facts), decision: "kept", reason },
     };
   }
+  if (second.error !== undefined) {
+    const failed = draft(key, second, second.parse, facts);
+    return { record: { ...failed, decision: "kept", reason: second.error } };
+  }
   if (!sameFingerprint(first.fingerprint, second.fingerprint)) {
     const changed = draft(key, second, second.parse, facts);
     return { record: { ...changed, decision: "kept", reason: "changed-between-reads" } };
@@ -431,7 +475,7 @@ async function judgeCandidate(
     return settled;
   }
   const base = draft(key, settled.second, settled.second.parse, facts);
-  const aged = ageVerdict(settled.second.mtimeMs, ctx.start);
+  const aged = ageVerdict(settled.second, ctx.start);
   if (aged !== undefined) {
     return { record: { ...base, decision: "kept", reason: aged } };
   }
@@ -453,18 +497,15 @@ async function waitGap(
   }
 }
 
-export async function runLeaseRemoval(options: LeaseRemovalOptions): Promise<LeaseRemovalResult> {
-  const queuesDir = queueBaseDir();
-  const gapMs = options.minGapMs ?? READ_GAP_MS;
-  const start = options.controlPodStart();
-  const scan = await scanLeases(queuesDir);
-  const readEndedAt = performance.now();
-  const { candidates } = scan;
-  const lookup = candidates.length > 0 ? await sessionLookup() : new Map<string, SessionHit>();
-  await waitGap(candidates, readEndedAt, gapMs, options.sleep ?? realSleep);
-
-  // Read 2 (at least `gapMs` after read 1 ended) and the age rule.
-  const ctx: JudgeContext = { apply: options.apply, start, hooks: options.hooks };
+/** Read 2 (at least the gap after read 1 ended) and the age rule, for every candidate. */
+async function judgeAll(
+  candidates: Candidate[],
+  lookup: Map<string, SessionHit>,
+  ctx: JudgeContext,
+): Promise<{
+  records: LeaseRecord[];
+  pending: Array<{ index: number; candidate: Candidate; read2: SelectedBody }>;
+}> {
   const records: LeaseRecord[] = [];
   const pending: Array<{ index: number; candidate: Candidate; read2: SelectedBody }> = [];
   for (const candidate of candidates) {
@@ -475,10 +516,46 @@ export async function runLeaseRemoval(options: LeaseRemovalOptions): Promise<Lea
     }
     records.push(judged.record);
   }
+  return { records, pending };
+}
 
-  const recordsFile = options.apply
-    ? await removeAll(options, { records, pending, start, scan: { ...scan, gapMs, queuesDir } })
-    : null;
+/**
+ * An apply opens its records file FIRST: no file, no census, no removal (`RecordsFileError`). A dry run
+ * creates nothing.
+ */
+export async function runLeaseRemoval(options: LeaseRemovalOptions): Promise<LeaseRemovalResult> {
+  const handle = options.apply ? await openRecordsFile(options.recordsFile) : undefined;
+  try {
+    return await censusAndRemove(options, handle);
+  } finally {
+    await handle?.close();
+  }
+}
+
+async function censusAndRemove(
+  options: LeaseRemovalOptions,
+  handle: FileHandle | undefined,
+): Promise<LeaseRemovalResult> {
+  const queuesDir = queueBaseDir();
+  const gapMs = options.minGapMs ?? READ_GAP_MS;
+  const start = options.controlPodStart();
+  const scan = await scanLeases(queuesDir);
+  const readEndedAt = performance.now();
+  const { candidates } = scan;
+  const lookup = candidates.length > 0 ? await sessionLookup() : new Map<string, SessionHit>();
+  await waitGap(candidates, readEndedAt, gapMs, options.sleep ?? realSleep);
+
+  const ctx: JudgeContext = { apply: options.apply, start, hooks: options.hooks };
+  const { records, pending } = await judgeAll(candidates, lookup, ctx);
+
+  if (handle) {
+    await removeAll(options, handle, {
+      records,
+      pending,
+      start,
+      scan: { ...scan, gapMs, queuesDir },
+    });
+  }
   return {
     mode: options.apply ? "apply" : "dry-run",
     queuesDir,
@@ -488,55 +565,53 @@ export async function runLeaseRemoval(options: LeaseRemovalOptions): Promise<Lea
     scanned: { leases: scan.leases, selected: candidates.length, notSelected: scan.notSelected },
     records: records.toSorted((a, b) => a.key.localeCompare(b.key)),
     summary: summarize(records),
-    recordsFile,
+    recordsFile: handle ? (options.recordsFile ?? null) : null,
   };
 }
 
-/** Apply: open the records file FIRST (no file, no removal), then remove each pending lease under its guard. */
+/** Apply: write the run line, then remove each pending lease under its guard (the records file is already open). */
 async function removeAll(
   options: LeaseRemovalOptions,
+  handle: FileHandle,
   run: {
     records: LeaseRecord[];
     pending: Array<{ index: number; candidate: Candidate; read2: SelectedBody }>;
     start: ControlPodStart;
     scan: { leases: number; candidates: Candidate[]; gapMs: number; queuesDir: string };
   },
-): Promise<string> {
-  const target = options.recordsFile;
+): Promise<void> {
+  await appendFsynced(handle, {
+    event: "run",
+    at: (options.now?.() ?? new Date()).toISOString(),
+    queuesDir: run.scan.queuesDir,
+    ...startFields(run.start),
+    startMarginMs: START_MARGIN_MS,
+    readGapMs: run.scan.gapMs,
+    leases: run.scan.leases,
+    selected: run.scan.candidates.length,
+    toRemove: run.pending.length,
+  });
+  for (const { index, candidate, read2 } of run.pending) {
+    run.records[index] = await removeUnderGuard(candidate, read2, run.records[index], run.start, {
+      handle,
+      hooks: options.hooks,
+    });
+  }
+  for (const record of run.records.filter((r) => r.decision === "kept")) {
+    await appendFsynced(handle, { event: "kept", record });
+  }
+}
+
+async function openRecordsFile(target: string | undefined): Promise<FileHandle> {
   if (!target) {
     throw new Error("apply needs a records file");
   }
-  const handle = await openRecordsFile(target);
   try {
-    await appendFsynced(handle, {
-      event: "run",
-      at: (options.now?.() ?? new Date()).toISOString(),
-      queuesDir: run.scan.queuesDir,
-      ...startFields(run.start),
-      startMarginMs: START_MARGIN_MS,
-      readGapMs: run.scan.gapMs,
-      leases: run.scan.leases,
-      selected: run.scan.candidates.length,
-      toRemove: run.pending.length,
-    });
-    for (const { index, candidate, read2 } of run.pending) {
-      run.records[index] = await removeUnderGuard(candidate, read2, run.records[index], run.start, {
-        handle,
-        hooks: options.hooks,
-      });
-    }
-    for (const record of run.records.filter((r) => r.decision === "kept")) {
-      await appendFsynced(handle, { event: "kept", record });
-    }
-  } finally {
-    await handle.close();
+    await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+    return await fs.open(target, "wx", 0o600);
+  } catch (error) {
+    throw new RecordsFileError(target, error);
   }
-  return target;
-}
-
-async function openRecordsFile(target: string): Promise<FileHandle> {
-  await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
-  return await fs.open(target, "wx", 0o600);
 }
 
 type RemovalIo = { handle: FileHandle; hooks: LeaseRemovalOptions["hooks"] };
@@ -571,7 +646,7 @@ function unchangedSince(read2: SelectedBody, third: ReadLease, start: ControlPod
   return (
     isSelected(third) &&
     sameFingerprint(read2.fingerprint, third.fingerprint) &&
-    ageVerdict(third.mtimeMs, start) === undefined
+    ageVerdict(third, start) === undefined
   );
 }
 
@@ -590,7 +665,8 @@ async function removeInsideGuard(
   }
   if (!unchangedSince(read2, third, start)) {
     const seen = third.kind === "read" ? { ...base, fingerprint: third.fingerprint } : base;
-    return decided(seen, "kept", "changed-inside-guard");
+    const failed = third.kind === "read" ? third.error : undefined;
+    return decided(seen, "kept", failed ?? "changed-inside-guard");
   }
   const removing = decided(base, "removed", "all-conditions-met");
   await appendFsynced(io.handle, { event: "intent", record: removing });

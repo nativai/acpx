@@ -2,13 +2,15 @@ import "./install-owner-reaper.js";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { mock } from "node:test";
 import { fileURLToPath } from "node:url";
 import { readControlPodStart } from "../src/cli/lease-removal-command.js";
 import {
   READ_GAP_MS,
+  RecordsFileError,
   runLeaseRemoval,
   START_MARGIN_MS,
   type LeaseRemovalOptions,
@@ -675,6 +677,257 @@ test("THE CLI off the control pod: the census names the leases and removes nothi
     assert.match(json.records[0].reason, /^control-pod-start-unknown: not the control pod/);
     assert.equal(fs.existsSync(file), true);
     assert.equal(result.status, 1);
+  } finally {
+    world.restore();
+  }
+});
+
+// ---- Round 2 (the TE's four LOWs) ----
+
+/** Make `fsp[method]` fail with `code` for `file` only, until the returned restore is called. */
+function failFor(method: "lstat" | "open", file: string, code: string): () => void {
+  const original = fsp[method].bind(fsp) as (...args: unknown[]) => Promise<unknown>;
+  const spy = mock.method(fsp, method, async (...args: unknown[]) => {
+    if (args[0] === file) {
+      throw Object.assign(new Error(`${code}: injected`), { code });
+    }
+    return await original(...args);
+  });
+  return () => spy.mock.restore();
+}
+
+test("LOW-1: an lstat error on a lease written NOW is kept `stat-error`, never read as the epoch (real EACCES)", async (t) => {
+  if (process.getuid?.() === 0) {
+    t.skip("root ignores directory permissions");
+    return;
+  }
+  const world = makeWorld();
+  const key = queueKeyForSession("rec-stat-eacces");
+  const file = lease(world, key, "", Date.now());
+  fs.chmodSync(world.queues, 0o600); // listable, but no entry can be statted
+  try {
+    for (const apply of [false, true]) {
+      const result = await runLeaseRemoval(options(world, { apply }));
+      const record = only(result, key);
+      assert.equal(record.decision, "kept", `apply=${apply}`);
+      assert.equal(record.reason, "stat-error: EACCES");
+      assert.equal(record.mtime, null, "an unknown mtime is null, not 1970");
+      assert.equal(result.summary.wouldRemove + result.summary.removed, 0);
+    }
+  } finally {
+    fs.chmodSync(world.queues, 0o700);
+  }
+  assert.equal(fs.existsSync(file), true);
+  world.restore();
+});
+
+test("LOW-1: a stat error on an OLD lease, at read 2 and inside the guard, is kept `stat-error` (injected EIO)", async () => {
+  const world = makeWorld();
+  try {
+    const atRead2 = queueKeyForSession("rec-eio-read2");
+    const inGuard = queueKeyForSession("rec-eio-guard");
+    const f2 = lease(world, atRead2, "", OLD);
+    const fg = lease(world, inGuard, "null", OLD);
+    let restore = () => {};
+    const result = await runLeaseRemoval(
+      options(world, {
+        apply: true,
+        hooks: {
+          betweenReads: (key) => {
+            if (key === atRead2) {
+              restore = failFor("lstat", f2, "EIO");
+            }
+          },
+          insideGuard: (key) => {
+            if (key === inGuard) {
+              restore = failFor("lstat", fg, "EIO");
+            }
+          },
+        },
+      }),
+    );
+    restore();
+    assert.deepEqual(
+      [atRead2, inGuard].map((k) => [only(result, k).decision, only(result, k).reason]),
+      [
+        ["kept", "stat-error: EIO"],
+        ["kept", "stat-error: EIO"],
+      ],
+    );
+    assert.equal(fs.existsSync(f2) && fs.existsSync(fg), true);
+    assert.equal(
+      records(result.recordsFile as string).filter((l) => l.event === "intent").length,
+      0,
+    );
+  } finally {
+    world.restore();
+  }
+});
+
+test("LOW-1: a READ error on a selected lease (open EIO) is kept `read-error`, with its real mtime", async () => {
+  const world = makeWorld();
+  const key = queueKeyForSession("rec-open-eio");
+  const file = lease(world, key, "", OLD);
+  const restore = failFor("open", file, "EIO");
+  try {
+    const result = await runLeaseRemoval(options(world, { apply: true }));
+    assert.equal(only(result, key).decision, "kept");
+    assert.equal(only(result, key).reason, "read-error: EIO");
+    assert.equal(only(result, key).mtime, new Date(OLD).toISOString());
+    assert.equal(fs.existsSync(file), true);
+  } finally {
+    restore();
+    world.restore();
+  }
+});
+
+test("LOW-1 audit: no record carries an epoch — a non-regular entry shows its real mtime", async () => {
+  const world = makeWorld();
+  try {
+    const key = queueKeyForSession("rec-dir-mtime");
+    const dir = path.join(world.queues, `${key}.lock`);
+    fs.mkdirSync(dir);
+    fs.utimesSync(dir, OLD / 1000, OLD / 1000);
+    const result = await runLeaseRemoval(options(world, { apply: false }));
+    assert.equal(only(result, key).mtime, new Date(OLD).toISOString());
+    assert.ok(result.records.every((r) => r.mtime !== "1970-01-01T00:00:00.000Z"));
+  } finally {
+    world.restore();
+  }
+});
+
+test("LOW-2: an apply whose records file cannot be created refuses BEFORE reading anything (RecordsFileError) and removes nothing", async () => {
+  const world = makeWorld();
+  try {
+    const file = lease(world, queueKeyForSession("rec-refused"), "", OLD);
+    const taken = path.join(world.home, "taken.ndjson");
+    fs.writeFileSync(taken, "mine");
+    let reads = 0;
+    await assert.rejects(
+      runLeaseRemoval(
+        options(world, {
+          apply: true,
+          recordsFile: taken,
+          hooks: { betweenReads: () => void (reads += 1) },
+        }),
+      ),
+      (error: unknown) => error instanceof RecordsFileError && error.message.includes("EEXIST"),
+    );
+    assert.equal(reads, 0, "no second read happened: the refusal came first");
+    assert.equal(fs.existsSync(file), true);
+    assert.equal(fs.readFileSync(taken, "utf8"), "mine");
+  } finally {
+    world.restore();
+  }
+});
+
+test("LOW-3: what was found for a session is reported as it is: record / residue-only / none; a record beats residue", async () => {
+  const world = makeWorld();
+  try {
+    sessionRecord(world.archive, "rec-archived-record", true);
+    fs.writeFileSync(path.join(world.archive, "rec-archived-residue.owner.log"), "x");
+    fs.writeFileSync(path.join(world.sessions, "rec-hot-residue.stream.ndjson"), "x");
+    // residue in the hot dir, the record in the archive: the record wins.
+    fs.writeFileSync(path.join(world.sessions, "rec-split.owner.log"), "x");
+    sessionRecord(world.archive, "rec-split", false);
+    for (const id of [
+      "rec-archived-record",
+      "rec-archived-residue",
+      "rec-hot-residue",
+      "rec-split",
+    ]) {
+      lease(world, queueKeyForSession(id), "", OLD);
+    }
+    lease(world, ORPHAN, "", OLD);
+    const result = await runLeaseRemoval(options(world, { apply: false }));
+    const row = (key: string) => {
+      const r = only(result, key);
+      return [r.sessionId, r.sessionRecord, r.location, r.state, r.closed];
+    };
+    assert.deepEqual(row(queueKeyForSession("rec-archived-record")), [
+      "rec-archived-record",
+      "record",
+      "archive",
+      "archived",
+      true,
+    ]);
+    assert.deepEqual(row(queueKeyForSession("rec-archived-residue")), [
+      "rec-archived-residue",
+      "residue-only",
+      "archive",
+      "residue-only",
+      null,
+    ]);
+    assert.deepEqual(row(queueKeyForSession("rec-hot-residue")), [
+      "rec-hot-residue",
+      "residue-only",
+      "hot",
+      "residue-only",
+      null,
+    ]);
+    assert.deepEqual(row(queueKeyForSession("rec-split")), [
+      "rec-split",
+      "record",
+      "archive",
+      "archived",
+      false,
+    ]);
+    assert.deepEqual(row(ORPHAN), [null, "none-found", null, "none", null]);
+  } finally {
+    world.restore();
+  }
+});
+
+function runCli(home: string, args: string[]) {
+  return spawnSync(
+    process.execPath,
+    [CLI, "--format", "json", "sessions", "unparsable-leases", ...args],
+    {
+      env: {
+        ...process.env,
+        ACPX_STATE_HOME: home,
+        NODE_TEST_CONTEXT: "child-v8",
+        ACPX_POD_TEST_HOME: home,
+      },
+      encoding: "utf8",
+      timeout: 90_000,
+    },
+  );
+}
+
+test("LOW-2 (CLI): a records file that cannot be created exits 2 (not 1), at once, nothing removed; kept-a-lease still exits 1", () => {
+  const world = makeWorld();
+  try {
+    const file = lease(world, ORPHAN, "", Date.parse("2020-01-01T00:00:00Z"));
+    const taken = path.join(world.home, "taken.ndjson");
+    fs.writeFileSync(taken, "mine");
+    const began = Date.now();
+    const result = runCli(world.home, ["--apply", "--records-file", taken]);
+    assert.equal(result.status, 2, `${result.stdout}${result.stderr}`);
+    assert.ok(Date.now() - began < 12_000, "refused before the 15 s gap");
+    assert.match(result.stderr, /REFUSED reason=records_file_unavailable .*EEXIST/);
+    assert.equal(result.stdout, "");
+    assert.equal(fs.existsSync(file), true);
+    assert.equal(fs.readFileSync(taken, "utf8"), "mine");
+  } finally {
+    world.restore();
+  }
+});
+
+test("LOW-4 (CLI): `--records-file` without `--apply` is refused with exit 2 before anything runs", () => {
+  const world = makeWorld();
+  try {
+    lease(world, ORPHAN, "", Date.parse("2020-01-01T00:00:00Z"));
+    const target = path.join(world.home, "out.ndjson");
+    const before = listing(world.home);
+    const began = Date.now();
+    const result = runCli(world.home, ["--records-file", target]);
+    assert.equal(result.status, 2, `${result.stdout}${result.stderr}`);
+    assert.match(result.stderr, /REFUSED reason=records_file_needs_apply .*--apply/);
+    assert.equal(result.stdout, "");
+    assert.ok(Date.now() - began < 12_000, "no census, no gap");
+    assert.deepEqual(listing(world.home), before);
+    assert.equal(fs.existsSync(target), false);
   } finally {
     world.restore();
   }
