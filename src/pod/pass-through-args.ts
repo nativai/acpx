@@ -386,7 +386,7 @@ export function checkAdvice(commandPath: string, env: NodeJS.ProcessEnv): Unknow
   if (commandPath === "sessions handover") {
     return {
       kind: "check",
-      how: "see whether the successor exists: `acpx seats show --seat <your seat url>` names the seat's active holder; handover has no record id yet, so a repeat could create a second successor.",
+      how: "see whether the successor exists: `acpx seats show --seat <your seat url>` names the seat's active holder; a repeat after a run that died adopts that run's successor, and one that overlaps a run still going is refused (CONCURRENT_HANDOVER), so look before repeating.",
     };
   }
   return {

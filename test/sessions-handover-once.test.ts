@@ -401,3 +401,99 @@ test(
     });
   },
 );
+
+// ── TE F1 (brick 4bc23c1e): two OVERLAPPING handovers from one caller ──────────────────────────────
+// A pass-through repeat after a `255` can start while the first run is still alive. The activation
+// compares against the CALLER: only the run that finds the seat still naming it activates; the other
+// refuses and names its own prepared successor. Staggers include 0 (the two start together).
+
+const OVERLAP_STAGGERS_MS = [0, 0, 0, 10, 25, 50, 100, 200];
+
+test(
+  "H6 two overlapping handovers from one caller: exactly ONE successor is activated, exactly ONE turn goes out, the other run refuses and leaves nothing active",
+  { timeout: ROW_TIMEOUT_MS },
+  async () => {
+    for (const [trial, staggerMs] of OVERLAP_STAGGERS_MS.entries()) {
+      await withTempHome(`acpx-handover-overlap-${trial}-`, async (homeDir) => {
+        const cwd = await rig(homeDir);
+        const callerId = await newHolder(homeDir, cwd);
+        const seatId = (await readStored(homeDir, callerId)).seat_id;
+        const brief = await writeBrief(homeDir);
+        const label = `trial ${trial} (stagger ${staggerMs} ms)`;
+
+        await withAcpxUi(async (origin, posted) => {
+          const first = handover(homeDir, callerId, origin, brief);
+          await new Promise((resolve) => setTimeout(resolve, staggerMs));
+          const second = handover(homeDir, callerId, origin, brief);
+          const results = await Promise.all([first, second]);
+
+          const winners = results.filter((r) => r.code === 0);
+          const losers = results.filter((r) => r.code !== 0);
+          assert.equal(winners.length, 1, `${label}: exactly one run succeeds`);
+          assert.equal(losers.length, 1, `${label}: the other refuses`);
+          const loserCode = (JSON.parse((losers[0]?.stdout ?? "").trim()) as { code: string }).code;
+          assert.ok(
+            ["CONCURRENT_HANDOVER", "NOT_HOLDER"].includes(loserCode),
+            `${label}: the loser names a reason (${loserCode})`,
+          );
+          const winnerId = JSON.parse((winners[0]?.stdout ?? "").trim()).successorId as string;
+
+          const holders = await holdersOf(homeDir, seatId);
+          const activated = holders.filter((r) => r.holder_ordinal !== undefined);
+          assert.deepEqual(
+            activated.map((r) => r.id).toSorted(),
+            [callerId, winnerId].toSorted(),
+            `${label}: only the caller and the winner were ever activated`,
+          );
+          assert.deepEqual(
+            holders.filter((r) => r.holder_active === true).map((r) => r.id),
+            [winnerId],
+            `${label}: the winner is the one active holder`,
+          );
+          assert.equal((await readStored(homeDir, winnerId)).holder_ordinal, 2, label);
+          assert.equal(posted.length, 1, `${label}: exactly one turn`);
+          assert.equal(posted[0]?.url, `/api/sessions/${winnerId}/message`, label);
+        });
+      });
+    }
+  },
+);
+
+test(
+  "H7 the loser of an overlap names the successor it left prepared, and a later retry does NOT adopt it (the caller is no longer the holder)",
+  { timeout: ROW_TIMEOUT_MS },
+  async () => {
+    await withTempHome("acpx-handover-overlap-orphan-", async (homeDir) => {
+      const cwd = await rig(homeDir);
+      const callerId = await newHolder(homeDir, cwd);
+      const seatId = (await readStored(homeDir, callerId)).seat_id;
+      const brief = await writeBrief(homeDir);
+
+      await withAcpxUi(async (origin, posted) => {
+        const results = await Promise.all([
+          handover(homeDir, callerId, origin, brief),
+          handover(homeDir, callerId, origin, brief),
+        ]);
+        const loser = results.find((r) => r.code !== 0);
+        assert.ok(loser, "one run refused");
+        const before = await sessionIds(homeDir);
+        const turns = posted.length;
+        const prepared = (await holdersOf(homeDir, seatId)).filter(isPrepared);
+        // The loser either created a successor it could not activate (named on its stderr), or lost at
+        // its caller check before creating one.
+        for (const orphan of prepared) {
+          assert.ok(loser.stderr.includes(orphan.id), `named: ${loser.stderr}`);
+        }
+
+        const retry = await handover(homeDir, callerId, origin, brief);
+        assert.notEqual(retry.code, 0);
+        assert.equal((JSON.parse(retry.stdout.trim()) as { code: string }).code, "NOT_HOLDER");
+        assert.deepEqual(await sessionIds(homeDir), before, "nothing created");
+        assert.equal(posted.length, turns, "nothing delivered");
+        for (const orphan of prepared) {
+          assert.ok(isPrepared(await readStored(homeDir, orphan.id)), "the orphan is untouched");
+        }
+      });
+    });
+  },
+);

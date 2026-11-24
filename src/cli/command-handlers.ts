@@ -6760,8 +6760,7 @@ export async function handleSessionsHandover(
 ): Promise<void> {
   const { format } = resolveGlobalFlags(command, config);
   const handover = await import("./session/handover.js");
-  const { activateSeatHolder, SeatActivationRefusalError } =
-    await import("./session/seat-activate.js");
+  const { SeatActivationRefusalError } = await import("./session/seat-activate.js");
   try {
     const brief = await handover.readHandoverBrief(flags.brief);
     const warning = handover.handoverBriefSizeWarning(brief);
@@ -6777,7 +6776,7 @@ export async function handleSessionsHandover(
       config,
     );
     dieAfterHandoverCreateForTest();
-    const result = await activateSeatHolder(String(caller.seatId), successorId);
+    const result = await activateHandoverSuccessor(caller, successorId);
     await emitSeatDivergenceLine(result.successorId, result.divergence);
     const turn = {
       ...result,
@@ -6804,6 +6803,39 @@ export async function handleSessionsHandover(
       }
       process.exitCode = 1;
       return;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Brick 4bc23c1e — the activation of a handover compares against the CALLER, never against whoever the
+ * seat names by now. When another handover from the same session got there first, this run refuses
+ * (`CONCURRENT_HANDOVER`, exit 1), activates nothing, and NAMES the successor it leaves prepared: a later
+ * retry cannot adopt it, because the caller is no longer the seat's holder (`NOT_HOLDER`).
+ */
+async function activateHandoverSuccessor(
+  caller: SessionRecord,
+  successorId: string,
+): Promise<import("./session/seat-activate.js").SeatActivationOutcome> {
+  const { activateSeatHolder, SeatActivationRefusalError } =
+    await import("./session/seat-activate.js");
+  try {
+    return await activateSeatHolder(String(caller.seatId), successorId, {
+      expectedHolderId: caller.acpxRecordId,
+    });
+  } catch (error) {
+    if (
+      error instanceof SeatActivationRefusalError &&
+      (error.code === "CONCURRENT_HANDOVER" || error.code === "CONCURRENT_ACTIVATION")
+    ) {
+      process.stderr.write(
+        `handover: the successor ${successorId} was left prepared and is not activated; close it ` +
+          `(acpx sessions close --session-id ${successorId}).\n`,
+      );
+      if (error.code === "CONCURRENT_ACTIVATION") {
+        throw new SeatActivationRefusalError("CONCURRENT_HANDOVER", error.message);
+      }
     }
     throw error;
   }
