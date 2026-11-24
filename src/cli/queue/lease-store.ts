@@ -5,7 +5,13 @@ import {
   type DeathProofDetail,
   type PodTerminal,
 } from "../../pod/death-proof.js";
-import { lockHostPlace, podFieldOf, type PodRef } from "../../pod/identity.js";
+import {
+  lockHostPlace,
+  lockPodIdentity,
+  podFieldOf,
+  type PodField,
+  type PodRef,
+} from "../../pod/identity.js";
 import {
   isOwnPod,
   leasePodFields,
@@ -403,15 +409,31 @@ export async function readQueueOwnerProcessIdentity(
   return identity ? serializeProcessBirthIdentity(identity) : undefined;
 }
 
+/**
+ * WHY a lease cannot be parsed (A-69). `bytes` is kind (1): the file cannot be read, is not JSON (empty,
+ * truncated), or is JSON that is not an object (A-72 — `null`, an array, a number, a string, a boolean).
+ * `schema` is kind (2): a JSON OBJECT that `parseQueueOwnerRecord` refuses (a newer writer's field type),
+ * judged by its `pod` KEY (`podFieldOf`, A-68). ⚠️ A body that is not an object is NEVER `schema` with no
+ * `pod` key: that would put it under the control pod's 15 s rule. `test/pod-a69-unparsable-lease.test.ts`
+ * holds all five non-object bodies on the `bytes` side.
+ */
+export type UnparsableShape = { kind: "bytes" } | { kind: "schema"; pod: PodField };
+
 export type LeaseFile =
   | { kind: "missing" }
-  | { kind: "unparsable" }
+  | { kind: "unparsable"; shape: UnparsableShape }
   /**
    * A `pod` key that names no pod is `record.podUnreadable` (A-68), never "no pod": a caller that read
    * "no pod" from it would fail OPEN (block A11, TE LOW-1) — `localProofScope` fails closed on it and
    * `judgeLease` takes it for a holder in another pod.
    */
   | { kind: "ok"; record: QueueOwnerRecord };
+
+const UNPARSABLE_BYTES: LeaseFile = { kind: "unparsable", shape: { kind: "bytes" } };
+
+function isPlainJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 async function readLeaseFile(lockPath: string): Promise<LeaseFile> {
   let payload: string;
@@ -420,14 +442,22 @@ async function readLeaseFile(lockPath: string): Promise<LeaseFile> {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "ENOENT"
       ? { kind: "missing" }
-      : { kind: "unparsable" };
+      : UNPARSABLE_BYTES;
   }
+  let json: unknown;
+  let record: QueueOwnerRecord | null;
   try {
-    const record = parseQueueOwnerRecord(JSON.parse(payload));
-    return record ? { kind: "ok", record } : { kind: "unparsable" };
+    json = JSON.parse(payload);
+    record = parseQueueOwnerRecord(json);
   } catch {
-    return { kind: "unparsable" };
+    return UNPARSABLE_BYTES;
   }
+  if (record) {
+    return { kind: "ok", record };
+  }
+  return isPlainJsonObject(json)
+    ? { kind: "unparsable", shape: { kind: "schema", pod: podFieldOf(json) } }
+    : UNPARSABLE_BYTES;
 }
 
 /**
@@ -868,8 +898,12 @@ function podLeaseRow(proof: Extract<DeathProofDetail, { answer: "gone" }>, pod: 
     recoverable: true,
     alive: false as const,
     deathReason: proof.proof,
-    podEnd: { pod, proof: proof.proof, ...(proof.terminal ? { terminal: proof.terminal } : {}) },
+    podEnd: podEndOf(proof, pod),
   };
+}
+
+function podEndOf(proof: Extract<DeathProofDetail, { answer: "gone" }>, pod: PodRef) {
+  return { pod, proof: proof.proof, ...(proof.terminal ? { terminal: proof.terminal } : {}) };
 }
 
 /** The API server is asked ONLY on the control pod (C3.3 A-4); anywhere else there is no proof. */
@@ -1127,18 +1161,107 @@ function leasePayload(lease: QueueOwnerLease, heartbeatAt: string, queueDepth: n
  * content re-checked). A pre-0a owner creates its lease with `writeFile(wx)`, which exists EMPTY for
  * a moment — the old code unlinked it at once and so deleted a starting owner's lease. Port of
  * openclaw/acpx 92cd5f8d.
+ *
+ * `judged` is the part of the body's shape the caller's rule rests on. The final re-read must still show an
+ * unparsable body of that shape: a file replaced between the judgement and the unlink is never removed on
+ * the old judgement. `pod` (A-69 (2), a body whose readable `pod` names another pod) adds C3.3's proof:
+ * removed only when the pod is `gone`, and the file unchanged again after the proof took its time.
  */
-async function removeUnparsableLeaseIfStale(lockPath: string): Promise<void> {
+async function removeUnparsableLeaseIfStale(
+  sessionId: string,
+  lockPath: string,
+  judged: (shape: UnparsableShape) => boolean,
+  pod?: PodRef,
+): Promise<void> {
   const before = await fs.stat(lockPath).catch(() => undefined);
-  if (!before || Date.now() - before.mtimeMs <= UNPARSABLE_LEASE_STALE_MS) {
+  if (!before || !(await isUnchangedFor15s(lockPath, before))) {
     return;
   }
-  if (
-    (await isLeaseFileUnchanged(lockPath, before)) &&
-    (await readLeaseFile(lockPath)).kind === "unparsable"
-  ) {
-    await unlinkIgnoringMissing(lockPath);
+  const end = pod ? await podEndWhenGone(lockPath, before, pod) : undefined;
+  if (pod && !end) {
+    return;
   }
+  if (!(await unlinkWhileStillJudged(lockPath, judged))) {
+    return;
+  }
+  if (end) {
+    const { recordPodEnd } = await import("../../pod/pod-end.js");
+    await recordPodEnd(sessionId, end);
+  }
+}
+
+/** The final re-read: unlinks only a body that is still unparsable AND still the shape that was judged. */
+async function unlinkWhileStillJudged(
+  lockPath: string,
+  judged: (shape: UnparsableShape) => boolean,
+): Promise<boolean> {
+  const found = await readLeaseFile(lockPath);
+  if (found.kind !== "unparsable" || !judged(found.shape)) {
+    return false;
+  }
+  await unlinkIgnoringMissing(lockPath);
+  return true;
+}
+
+/** C3.3 for a body's readable `pod`: its end when `gone` AND the file is still unchanged after the proof. */
+async function podEndWhenGone(
+  lockPath: string,
+  before: { dev: number; ino: number; mtimeMs: number },
+  pod: PodRef,
+) {
+  const proof = await proofFromControlPod(pod);
+  return proof?.answer === "gone" && (await isLeaseFileUnchanged(lockPath, before))
+    ? podEndOf(proof, pod)
+    : undefined;
+}
+
+/** Older than 15 s AND unchanged across two reads. */
+async function isUnchangedFor15s(
+  lockPath: string,
+  before: { dev: number; ino: number; mtimeMs: number },
+): Promise<boolean> {
+  return (
+    Date.now() - before.mtimeMs > UNPARSABLE_LEASE_STALE_MS &&
+    (await isLeaseFileUnchanged(lockPath, before))
+  );
+}
+
+/**
+ * A-69, the ONE call site that removes a lease acpx cannot parse. A host WITHOUT the pod's identity (never
+ * switched) keeps today's rule exactly: any unparsable body, once 15 s old and unchanged. On a host WITH it
+ * (every agent pod, and a control pod from the commit that brings it the identity — not yet switched,
+ * switched, and after a revert) the body is the lease of a writer this release may not know:
+ *   (1) `bytes` (unreadable, not JSON, JSON that is not an object): held, never removed;
+ *   (2) `schema`, judged by its `pod` KEY: unreadable → held (A-68); readable → only the control pod, on
+ *       C3.3 `gone` and 15 s unchanged; no key → a control-pod writer's lease: the 15 s rule on the control
+ *       pod, and in an agent pod (or anywhere else) it waits (C3.2 row 3).
+ */
+async function removeUnparsableLease(sessionId: string, found: UnparsableShape): Promise<void> {
+  const lockPath = queueLockFilePath(sessionId);
+  if (lockPodIdentity() === undefined) {
+    return await removeUnparsableLeaseIfStale(sessionId, lockPath, () => true);
+  }
+  if (found.kind === "bytes" || found.pod.kind === "unreadable" || lockHostPlace() !== "control") {
+    return;
+  }
+  if (found.pod.kind === "absent") {
+    return await removeUnparsableLeaseIfStale(
+      sessionId,
+      lockPath,
+      (shape) => shape.kind === "schema" && shape.pod.kind === "absent",
+    );
+  }
+  const judgedPod = found.pod.pod;
+  await removeUnparsableLeaseIfStale(
+    sessionId,
+    lockPath,
+    (shape) =>
+      shape.kind === "schema" &&
+      shape.pod.kind === "pod" &&
+      shape.pod.pod.name === judgedPod.name &&
+      shape.pod.pod.uid === judgedPod.uid,
+    judgedPod,
+  );
 }
 
 /** dev, ino, mtime and content are all unchanged across two reads. */
@@ -1184,7 +1307,7 @@ async function acquireUnderGuard(
   }
   const existing = await readLeaseFile(lease.lockPath);
   if (existing.kind === "unparsable") {
-    await removeUnparsableLeaseIfStale(lease.lockPath);
+    await removeUnparsableLease(sessionId, existing.shape);
   } else if (existing.kind === "ok") {
     const { liveness } = await judgeLease(sessionId, existing.record);
     if (liveness.recoverable && (await reapJudgedLeaseUnderGuard(sessionId, existing.record))) {
