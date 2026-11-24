@@ -182,6 +182,7 @@ const LEDGER_ENTRIES = new Set([
 const NOT_LEDGER_ENTRIES = new Set([
   "takeAdmissionClassFromEnv",
   "declaredAdmissionClass",
+  "admissionClassDeclared",
   "buildClause",
   "capacityRefusal",
   "cpuRefuses",

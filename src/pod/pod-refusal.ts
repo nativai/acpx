@@ -1,5 +1,7 @@
-import { capacityRefusal } from "../capacity/admission.js";
+import { listBuiltInAgents } from "../agent-registry.js";
+import { admissionClassDeclared, capacityRefusal } from "../capacity/admission.js";
 import { AcpxOperationalError, CapacityRefusedError } from "../errors.js";
+import { classifyArgv } from "./command-classes.js";
 
 /**
  * C7.2 — the two refusal lines of the pod plane, in the wire format every capacity refusal has:
@@ -27,6 +29,32 @@ export const AGENT_CAP_WHYS = [
 export type AgentCapWhy = (typeof AGENT_CAP_WHYS)[number];
 
 const AGENT_CAP_RETRY_AFTER_S = 60;
+
+/**
+ * A-79 (C7.2 "Whose hold a refusal may promise"): what a refusal's sentence may say after its lead. The builders'
+ * DEFAULT promises nothing and names no message (`none`: nothing was run, repeat the command). Two callers add more,
+ * through {@link refusalForCaller} and {@link withHoldPromise}: a `prompt` with no holder is told `prompt` (neither
+ * queued nor sent, `retry_after_s`, `send-message.sh`), and a caller that DOES hold the message (atrium's delivery
+ * spawns, `capacity admit-wake`) gets `hold` — the sentence the refusals had before A-79.
+ */
+type Promise_ = "none" | "prompt" | "hold";
+type PromiseReason = "pod_starting" | "agent_cap" | "admission_busy";
+const PROMISES: readonly Promise_[] = ["none", "prompt", "hold"];
+const HOLD_TAILS: Record<PromiseReason, string> = {
+  pod_starting: "the message stays queued and is delivered when the pod is ready.",
+  agent_cap: "the message stays queued until room frees.",
+  admission_busy: "the message stays queued and is delivered when they answer.",
+};
+
+function tailOf(reason: PromiseReason, promise: Promise_, retryAfterS: number): string {
+  if (promise === "hold") {
+    return HOLD_TAILS[reason];
+  }
+  return promise === "prompt"
+    ? `the message was NOT queued and NOT sent. Run the same command again in about ${retryAfterS} s; ` +
+        `a message that must wait for room goes through atrium (send-message.sh), which holds it.`
+    : `repeat the command after about ${retryAfterS} s.`;
+}
 
 /** C7.2: 3 for scheduling, starting, turnover; 15 for pulling (a pull took 43 s); 60 for scaling-up. */
 export function podStartingRetryAfterS(phase: PodStartingPhase): number {
@@ -59,8 +87,8 @@ export function podStartingRefusal(input: {
   const sentence =
     input.wake === undefined
       ? `acpx: the box's utility pod ${PHASE_SENTENCE[input.phase]}. Nothing was run; this is not available right now.`
-      : `acpx: the session's agent pod ${PHASE_SENTENCE[input.phase]}. Nothing was run; the message ` +
-        `stays queued and is delivered when the pod is ready.`;
+      : `acpx: the session's agent pod ${PHASE_SENTENCE[input.phase]}. Nothing was run; ` +
+        tailOf("pod_starting", "none", retryAfterS);
   return new CapacityRefusedError({
     tokenLine,
     sentence,
@@ -71,12 +99,38 @@ export function podStartingRefusal(input: {
       retryAfterS,
       queuedAhead: 0,
       message: sentence,
+      ...(input.wake === undefined ? {} : { queued: false }),
       ...(input.wake === undefined
         ? {}
         : { wake: { sessionId: input.sessionId ?? input.wake, seatId: input.seatId ?? null } }),
       pod: { phase: input.phase },
     },
   });
+}
+
+/** The sentence of an `agent_cap` refusal, and whether it is a session's (a wake — carries `queued`; never a create's waiting line). */
+function agentCapSentence(input: { live: number; cap: number; why: AgentCapWhy; wake?: string }): {
+  sentence: string;
+  promisesHold: boolean;
+} {
+  const state = `${input.live} of ${input.cap} in use; ${input.why}`;
+  // `waiting-line` is a CREATE's refusal only (C7.2): no message waits and nothing was created.
+  if (input.why === "waiting-line") {
+    return {
+      sentence: `acpx: the box's line of sessions waiting for a pod is full (${state}). Nothing was created; try again in a minute.`,
+      promisesHold: false,
+    };
+  }
+  if (input.wake === undefined) {
+    return {
+      sentence: `acpx: the box's utility pod cannot be started now (${state}). Nothing was started; this is not available right now.`,
+      promisesHold: false,
+    };
+  }
+  return {
+    sentence: `acpx: no agent pod can be started on this box now (${state}). Nothing was started; ${tailOf("agent_cap", "none", AGENT_CAP_RETRY_AFTER_S)}`,
+    promisesHold: true,
+  };
 }
 
 export function agentCapRefusal(input: {
@@ -93,14 +147,7 @@ export function agentCapRefusal(input: {
     `retry_after_s=${AGENT_CAP_RETRY_AFTER_S} live=${input.live} cap=${input.cap} ` +
     `box=${input.box} why=${input.why}` +
     (input.wake === undefined ? "" : ` wake=${input.wake}`);
-  const state = `${input.live} of ${input.cap} in use; ${input.why}`;
-  // `waiting-line` is a CREATE's refusal only (C7.2): no message waits and nothing was created.
-  const sentence =
-    input.why === "waiting-line"
-      ? `acpx: the box's line of sessions waiting for a pod is full (${state}). Nothing was created; try again in a minute.`
-      : input.wake === undefined
-        ? `acpx: the box's utility pod cannot be started now (${state}). Nothing was started; this is not available right now.`
-        : `acpx: no agent pod can be started on this box now (${state}). Nothing was started; the message stays queued until room frees.`;
+  const { sentence, promisesHold } = agentCapSentence(input);
   return new CapacityRefusedError({
     tokenLine,
     sentence,
@@ -111,6 +158,7 @@ export function agentCapRefusal(input: {
       retryAfterS: AGENT_CAP_RETRY_AFTER_S,
       queuedAhead: 0,
       message: sentence,
+      ...(promisesHold ? { queued: false } : {}),
       ...(input.wake === undefined
         ? {}
         : { wake: { sessionId: input.sessionId ?? input.wake, seatId: input.seatId ?? null } }),
@@ -134,12 +182,113 @@ export function admissionBusyRefusal(
     ? "acpx: the broker or the Kubernetes API server did not answer, so the box's utility pod could not be checked or started. " +
       "Nothing was started; this is not available right now."
     : "acpx: the broker or the Kubernetes API server did not answer, so the session's agent pod could not be checked or started. " +
-      "Nothing was started; the message stays queued and is delivered when they answer.";
+      `Nothing was started; ${tailOf("admission_busy", "none", base.capacityRefusal.retryAfterS)}`;
   return new CapacityRefusedError({
     tokenLine: base.stderrLine,
     sentence,
-    detail: { ...base.capacityRefusal, tokenLine: base.stderrLine, message: sentence },
+    detail: {
+      ...base.capacityRefusal,
+      tokenLine: base.stderrLine,
+      message: sentence,
+      ...(options.utility ? {} : { queued: false }),
+    },
   });
+}
+
+/**
+ * Re-says a session's capacity refusal with another promise. The TOKEN LINE, the exit code, the reason and every
+ * other field are untouched, byte for byte — atrium and scripts parse them. Only the sentence, `detail.message` and
+ * `detail.queued` change (`queued` is true exactly for `hold`). A refusal that carries no `queued` (a utility
+ * pod's, the waiting line's, a non-capacity error) is returned as it is.
+ */
+function withPromise(error: CapacityRefusedError, promise: Promise_): CapacityRefusedError {
+  const detail = error.capacityRefusal;
+  const reason = detail.reason as string;
+  if (
+    detail.queued === undefined ||
+    (reason !== "pod_starting" && reason !== "agent_cap" && reason !== "admission_busy")
+  ) {
+    return error;
+  }
+  const sentence = error.message.slice(error.stderrLine.length + 1);
+  const current = PROMISES.find((candidate) =>
+    sentence.endsWith(tailOf(reason, candidate, detail.retryAfterS)),
+  );
+  if (current === undefined) {
+    return error;
+  }
+  const lead = sentence.slice(
+    0,
+    sentence.length - tailOf(reason, current, detail.retryAfterS).length,
+  );
+  const rewritten = lead + tailOf(reason, promise, detail.retryAfterS);
+  return new CapacityRefusedError({
+    tokenLine: error.stderrLine,
+    sentence: rewritten,
+    detail: { ...detail, message: rewritten, queued: promise === "hold" },
+  });
+}
+
+/** `capacity admit-wake` (atrium's pre-admission verb): atrium holds what it is refused, so the hold sentence stands (A-79). */
+export function withHoldPromise(error: CapacityRefusedError): CapacityRefusedError {
+  return withPromise(error, "hold");
+}
+
+/**
+ * A-79: whose hold may a refusal promise? Only a `prompt` that carries one of atrium's two marks —
+ * `--message-id` (one message) or `--batch-file` (a batch) — WITH the admission class the runner sets
+ * (`ACPX_ADMISSION_CLASS`, read once at start): atrium holds that item on the token line and exit 75 and sends it
+ * again. A mark passed by hand, without the class, counts for nothing. Every other `prompt` is told: neither
+ * queued nor sent, retry after `retry_after_s`, `send-message.sh` holds a message for room. A command that carries
+ * no message names none (the builders' default).
+ *
+ * ONE helper for the two places that print such a refusal: the routed branch's catch (pod mode) and A-16's guard
+ * (`turnover-guard.ts`, the switch off). `argv` is the command's own arguments.
+ */
+export function refusalForCaller(
+  error: CapacityRefusedError,
+  argv?: readonly string[],
+  hasClass?: boolean,
+): CapacityRefusedError;
+export function refusalForCaller(
+  error: unknown,
+  argv?: readonly string[],
+  hasClass?: boolean,
+): unknown;
+export function refusalForCaller(
+  error: unknown,
+  argv: readonly string[] = process.argv.slice(2),
+  hasClass: boolean = admissionClassDeclared(),
+): unknown {
+  if (!(error instanceof CapacityRefusedError)) {
+    return error;
+  }
+  if (!carriesMessage(argv)) {
+    return withPromise(error, "none");
+  }
+  return withPromise(error, hasClass && carriesHoldMark(argv) ? "hold" : "prompt");
+}
+
+/** The paths whose command carries a message to a session (`prompt`, and the implicit forms `acpx <agent> <text>`). */
+const MESSAGE_PATHS = new Set(["", "<agent>", "prompt"]);
+
+function carriesMessage(argv: readonly string[]): boolean {
+  const classified = classifyArgv(argv, { builtInAgents: listBuiltInAgents() });
+  return classified.kind === "classified" && MESSAGE_PATHS.has(classified.path);
+}
+
+/** `--message-id[=<id>]` or `--batch-file[=<path>]` before any `--`: atrium's two delivery spawn shapes (A-79). */
+function carriesHoldMark(argv: readonly string[]): boolean {
+  const stop = argv.indexOf("--");
+  return argv
+    .slice(0, stop >= 0 ? stop : argv.length)
+    .some(
+      (arg) =>
+        arg === "--message-id" ||
+        arg.startsWith("--message-id=") ||
+        arg === "--batch-file" ||
+        arg.startsWith("--batch-file="),
+    );
 }
 
 /**

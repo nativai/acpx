@@ -92,6 +92,9 @@ function makeRecord(options: {
     acpxRecordId: "rec-fo",
     cwd: options.cwd ?? "/work/fo",
     agentCommand: "node /opt/claude-agent-acp/dist/index.js",
+    // A record always carries its messages (parse.ts rejects one without the array); the record
+    // write path reads them (A-60 appendOwnEntries, brick 54b21963).
+    messages: [] as SessionRecord["messages"],
     ...(options.acpSessionId ? { acpSessionId: options.acpSessionId } : {}),
     ...(options.profile || options.subscription
       ? {

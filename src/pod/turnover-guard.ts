@@ -1,7 +1,7 @@
 import { proveDeathDetailed, type DeathProofDetail } from "./death-proof.js";
 import { lockHostPlace, type PodRef } from "./identity.js";
 import { podModeVerdictNow } from "./placement.js";
-import { podStartingRefusal } from "./pod-refusal.js";
+import { podStartingRefusal, refusalForCaller } from "./pod-refusal.js";
 
 /**
  * A-16 — the ROLLBACK refusal, in one place (CONTRACTS-r4 C1.1 "When the switch is reverted"). On a
@@ -45,6 +45,7 @@ export async function refuseWhilePodNotGone(
   }
   const answer = pod === "unreadable" ? "unknown" : (await deps.prove(pod)).answer;
   if (answer !== "gone") {
-    throw podStartingRefusal({ phase: "turnover", wake: sessionId, sessionId });
+    // A-79: the sentence promises a hold only to atrium's delivery spawns — the same helper as the routed branch's.
+    throw refusalForCaller(podStartingRefusal({ phase: "turnover", wake: sessionId, sessionId }));
   }
 }

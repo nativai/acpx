@@ -757,16 +757,14 @@ test("round 2 / F-F: a utility pod's refusals say neither session nor message; a
   assert.match(busy.stderrLine, /^acpx: REFUSED reason=admission_busy /);
   const starting = podStartingRefusal({ phase: "starting" });
   assert.equal(starting.capacityRefusal.tokenLine, starting.stderrLine);
-  // negative control: a session's wake keeps the session wording
-  assert.match(
-    agentCapRefusal({ live: 5, cap: 5, box: "devbox", why: "cap", wake: "r1" }).capacityRefusal
-      .message ?? "",
-    /message stays queued/,
-  );
-  assert.match(
-    admissionBusyRefusal().capacityRefusal.message ?? "",
-    /session's agent pod[\s\S]*message stays queued/,
-  );
+  // negative control: a session's wake keeps the session wording — and, since A-79 (brick ee9980e3), its DEFAULT
+  // promises no hold and names no message (the hold sentence is chosen by `refusalForCaller` / `withHoldPromise`).
+  const sessionCap = agentCapRefusal({ live: 5, cap: 5, box: "devbox", why: "cap", wake: "r1" });
+  assert.match(sessionCap.capacityRefusal.message ?? "", /no agent pod can be started/);
+  assert.doesNotMatch(sessionCap.capacityRefusal.message ?? "", /message|queued/i);
+  assert.equal(sessionCap.capacityRefusal.queued, false);
+  assert.match(admissionBusyRefusal().capacityRefusal.message ?? "", /session's agent pod/);
+  assert.doesNotMatch(admissionBusyRefusal().capacityRefusal.message ?? "", /message|queued/i);
   assert.match(
     podStartingRefusal({ phase: "starting", wake: "r1" }).capacityRefusal.message ?? "",
     /session's agent pod/,
