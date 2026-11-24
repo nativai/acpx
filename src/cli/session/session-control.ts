@@ -1027,9 +1027,12 @@ export async function closeSession(
   const adapterAtClose = { pid: record.pid, pidIdentity: record.pidIdentity };
   // The privileged terminal write + its read-back (`terminal-close.ts`). C3.5 (ii): it is written AFTER
   // the stop, from a record read after it — the early copy above only decided which owner to stop.
+  // A-64: the adapter of the first read and the kill's outcome for it go in, so a not-proven-stopped
+  // close clears the pid only of an adapter it proved gone.
   const { record: closedRecord, state: recordClosedState } = await writeTerminalCloseAfterOwnerStop(
     record,
     ownerStop,
+    { ...adapterAtClose, kill: adapterKill },
   );
 
   releaseConfigDirOnTerminalClose(closedRecord);
