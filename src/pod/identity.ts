@@ -136,3 +136,23 @@ export function parsePodRef(value: unknown): PodRef | undefined {
   const namespace = nonEmpty(field.namespace);
   return { name, uid, ...(node ? { node } : {}), ...(namespace ? { namespace } : {}) };
 }
+
+/**
+ * What a lock body or lease says about its holder's pod (C3.2, A-68). The KEY decides, never the parsed
+ * value: a body that has a `pod` key carries `pod`, whatever it holds. `unreadable` is a key whose value
+ * names no pod (`null`, a string, `{}`, no `name` or no `uid`): that holder lives in ANOTHER pod, on every
+ * host, so no reader judges it by pid, birth identity or age, and C3.3 cannot fetch it (`unknown`).
+ * Only `absent` — no `pod` key at all — is a holder of the control pod, judged by C3.2's pid row.
+ * ⚠️ DO NOT read "no pod" from a `parsePodRef` result: a newer writer's `pod` shape that an older reader
+ * cannot parse would then turn into a pid verdict on a living pod's body (the second owner the soak
+ * measures). `test/pod-lease-judge-malformed-pod.test.ts` holds both judges to this one predicate.
+ */
+export type PodField = { kind: "absent" } | { kind: "pod"; pod: PodRef } | { kind: "unreadable" };
+
+export function podFieldOf(body: Record<string, unknown> | undefined): PodField {
+  if (!body || !Object.hasOwn(body, "pod")) {
+    return { kind: "absent" };
+  }
+  const pod = parsePodRef(body.pod);
+  return pod ? { kind: "pod", pod } : { kind: "unreadable" };
+}

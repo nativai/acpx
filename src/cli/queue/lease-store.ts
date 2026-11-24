@@ -5,7 +5,7 @@ import {
   type DeathProofDetail,
   type PodTerminal,
 } from "../../pod/death-proof.js";
-import { lockHostPlace, parsePodRef, type PodRef } from "../../pod/identity.js";
+import { lockHostPlace, podFieldOf, type PodRef } from "../../pod/identity.js";
 import {
   isOwnPod,
   leasePodFields,
@@ -122,6 +122,11 @@ export type QueueOwnerRecord = {
   protocolFeatures?: readonly string[];
   /** C3.1: the agent pod that wrote this lease. Never absent in an agent pod (A-25). */
   pod?: PodRef;
+  /**
+   * A-68: the file has a `pod` KEY whose value names no pod (`pod` is then absent). Such a lease is a
+   * holder in another pod — never judged by pid, birth identity or age (`judgeLease`).
+   */
+  podUnreadable?: true;
   /** C3.1: `pool` | `home`, from the pod's `NV_AGENT_PLACEMENT`. */
   placement?: "pool" | "home";
   /** C3.1: the C2 version the writer's acpx speaks. */
@@ -290,11 +295,15 @@ function parseQueueOwnerRecord(raw: unknown): QueueOwnerRecord | null {
 /** C3.1's four pod fields as read from a lease file; each is kept only when well formed. */
 function podFieldsOf(
   record: Record<string, unknown>,
-): Pick<QueueOwnerRecord, "pod" | "placement" | "routedContract" | "acpxRelease"> {
-  const pod = parsePodRef(record.pod);
+): Pick<
+  QueueOwnerRecord,
+  "pod" | "podUnreadable" | "placement" | "routedContract" | "acpxRelease"
+> {
+  const podField = podFieldOf(record);
   const { placement, routedContract, acpxRelease } = record;
   return {
-    ...(pod ? { pod } : {}),
+    ...(podField.kind === "pod" ? { pod: podField.pod } : {}),
+    ...(podField.kind === "unreadable" ? { podUnreadable: true as const } : {}),
     ...(placement === "pool" || placement === "home" ? { placement } : {}),
     ...(isPositiveInteger(routedContract) ? { routedContract } : {}),
     ...(typeof acpxRelease === "string" ? { acpxRelease } : {}),
@@ -398,11 +407,11 @@ export type LeaseFile =
   | { kind: "missing" }
   | { kind: "unparsable" }
   /**
-   * `podMalformed`: the file carries a `pod` key that `parsePodRef` could not read (no uid, not an
-   * object…). `record.pod` is then absent, and a caller that reads "no pod" from it would fail OPEN
-   * (block A11, TE LOW-1) — `localProofScope` fails closed on it.
+   * A `pod` key that names no pod is `record.podUnreadable` (A-68), never "no pod": a caller that read
+   * "no pod" from it would fail OPEN (block A11, TE LOW-1) — `localProofScope` fails closed on it and
+   * `judgeLease` takes it for a holder in another pod.
    */
-  | { kind: "ok"; record: QueueOwnerRecord; podMalformed?: true };
+  | { kind: "ok"; record: QueueOwnerRecord };
 
 async function readLeaseFile(lockPath: string): Promise<LeaseFile> {
   let payload: string;
@@ -414,15 +423,8 @@ async function readLeaseFile(lockPath: string): Promise<LeaseFile> {
       : { kind: "unparsable" };
   }
   try {
-    const raw: unknown = JSON.parse(payload);
-    const record = parseQueueOwnerRecord(raw);
-    if (!record) {
-      return { kind: "unparsable" };
-    }
-    const podKey = (raw as Record<string, unknown>).pod;
-    return podKey !== undefined && record.pod === undefined
-      ? { kind: "ok", record, podMalformed: true }
-      : { kind: "ok", record };
+    const record = parseQueueOwnerRecord(JSON.parse(payload));
+    return record ? { kind: "ok", record } : { kind: "unparsable" };
   } catch {
     return { kind: "unparsable" };
   }
@@ -815,13 +817,34 @@ async function judgePodLease(
   if (proof?.answer === "gone") {
     return { liveness: { ...base, ...podLeaseRow(proof, pod) } };
   }
+  return heldInAnotherPod(base, fresh || proof?.answer === "exists" ? true : null);
+}
+
+/**
+ * A-68: a lease with a `pod` KEY that names no pod (`QueueOwnerRecord.podUnreadable`) is a holder in
+ * another pod on every host. No pod can be fetched, so C3.3 can only answer `unknown` — no request is
+ * made: alive while the heartbeat is fresh, otherwise "cannot be told", and never `dead_owner`. Nothing
+ * judges it away; it stays until its writer releases it or a reader that can read its `pod` judges it.
+ */
+function judgeUnreadablePodLease(sessionId: string, owner: QueueOwnerRecord): LeaseJudgement {
+  const base = baseLiveness(sessionId, owner, "foreign");
+  return heldInAnotherPod(
+    base,
+    isFresh(base.heartbeatAgeMs, QUEUE_OWNER_STALE_HEARTBEAT_MS) ? true : null,
+  );
+}
+
+function heldInAnotherPod(
+  base: ReturnType<typeof baseLiveness>,
+  alive: true | null,
+): LeaseJudgement {
   return {
     liveness: {
       ...base,
       ...NO_LOCAL_FACTS,
       state: "foreign_owner",
       recoverable: false,
-      alive: fresh || proof?.answer === "exists" ? true : null,
+      alive,
     },
     skipReason: foreignSkipReason(),
   };
@@ -868,9 +891,23 @@ function leaseScopeFor(recorded: RecordedIdentity): QueueOwnerScope | "scope-onl
   return identityScope(recorded.birth) === "local" ? "local" : "foreign";
 }
 
+/** A lease that places its holder in ANOTHER pod, on every host (A-68 included): never the pid rule. */
+async function judgeAsPodLease(
+  sessionId: string,
+  owner: QueueOwnerRecord,
+): Promise<LeaseJudgement | undefined> {
+  if (owner.podUnreadable) {
+    return judgeUnreadablePodLease(sessionId, owner);
+  }
+  return owner.pod && !isOwnPod(owner.pod)
+    ? await judgePodLease(sessionId, owner, owner.pod)
+    : undefined;
+}
+
 async function judgeLease(sessionId: string, owner: QueueOwnerRecord): Promise<LeaseJudgement> {
-  if (owner.pod && !isOwnPod(owner.pod)) {
-    return await judgePodLease(sessionId, owner, owner.pod);
+  const asPodLease = await judgeAsPodLease(sessionId, owner);
+  if (asPodLease) {
+    return asPodLease;
   }
   const recorded = classifyRecordedIdentity(owner.processIdentity);
   const scope = leaseScopeFor(recorded);

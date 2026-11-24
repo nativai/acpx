@@ -57,7 +57,7 @@ async function leaseScope(recordId: string): Promise<ProofScope> {
   const lease = await readQueueOwnerLeaseFile(recordId);
   // A lease whose `pod` is present but cannot be read is as unreadable as a lease that cannot be parsed:
   // reading it as "no pod" would remove what a living pod writes (TE LOW-1).
-  if (lease.kind === "unparsable" || (lease.kind === "ok" && lease.podMalformed === true)) {
+  if (lease.kind === "unparsable" || (lease.kind === "ok" && lease.record.podUnreadable === true)) {
     return { local: false, reason: "pod-unreadable" };
   }
   return lease.kind === "ok" && lease.record.pod !== undefined

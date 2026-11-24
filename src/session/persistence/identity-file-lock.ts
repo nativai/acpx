@@ -13,6 +13,7 @@ import {
   lockHostPlace,
   lockPodIdentity,
   parsePodRef,
+  podFieldOf,
   podModeRequested,
   podTestHome,
   type LockHostPlace,
@@ -232,16 +233,16 @@ type HolderPlace =
   | { kind: "foreign"; pod: PodRef | undefined };
 
 function holderPlace(body: Record<string, unknown> | undefined): HolderPlace {
-  if (!body || !Object.hasOwn(body, "pod")) {
+  const field = podFieldOf(body);
+  if (field.kind === "absent") {
     return { kind: "no-pod" };
   }
-  const pod = parsePodRef(body.pod);
   const own = deps.ownPod();
-  if (pod && own && own.uid === pod.uid) {
-    return { kind: "same-pod", pod };
+  if (field.kind === "pod" && own && own.uid === field.pod.uid) {
+    return { kind: "same-pod", pod: field.pod };
   }
   // A malformed `pod` field is still a pod field: foreign, and never provably gone.
-  return { kind: "foreign", pod };
+  return { kind: "foreign", pod: field.kind === "pod" ? field.pod : undefined };
 }
 
 /**
