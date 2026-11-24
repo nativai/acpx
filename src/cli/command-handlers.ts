@@ -97,6 +97,7 @@ import {
   OUTPUT_STYLE_CONFIG_ID,
 } from "../session/output-style.js";
 import {
+  isArchivedRecord,
   isoNow,
   isTemplateRecord,
   listSessionIndexEntries,
@@ -232,6 +233,7 @@ import {
 import { type BywayCloseRefusal, bywayCloseRefusal } from "./session/byway-close-guard.js";
 import type { SessionListResult } from "./session/contracts.js";
 import { composeForkDivergenceNotice } from "./session/fork-handoff.js";
+import { HANDOVER_FROM_KEY, type PreparedHolder } from "./session/handover.js";
 import {
   applyBrickFlag,
   withInheritedBrick,
@@ -6767,14 +6769,15 @@ export async function handleSessionsHandover(
       process.stderr.write(`${warning}\n`);
     }
     const caller = await resolveHandoverCaller(flags.sessionId, handover.HandoverRefusalError);
-    const { created } = await createSessionFromNewFlags(
+    const successorId = await createOrAdoptHandoverSuccessor(
+      caller,
+      handover,
       explicitAgentName,
-      { from: caller.acpxRecordId },
       command,
       config,
     );
     dieAfterHandoverCreateForTest();
-    const result = await activateSeatHolder(String(caller.seatId), created.acpxRecordId);
+    const result = await activateSeatHolder(String(caller.seatId), successorId);
     await emitSeatDivergenceLine(result.successorId, result.divergence);
     const turn = {
       ...result,
@@ -6818,6 +6821,78 @@ function dieAfterHandoverCreateForTest(): void {
   ) {
     process.kill(process.pid, "SIGKILL");
   }
+}
+
+/**
+ * Brick 4bc23c1e — the caller is still the seat's active holder, so an earlier run of this very handover
+ * may have died after writing its successor and before activating it: adopt that one, otherwise create
+ * the successor (marked as this caller's) — and name any other prepared holder the seat has.
+ */
+async function createOrAdoptHandoverSuccessor(
+  caller: SessionRecord,
+  handover: typeof import("./session/handover.js"),
+  explicitAgentName: string | undefined,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<string> {
+  const { adopt, others } = handover.chooseHandoverSuccessor(
+    caller.acpxRecordId,
+    await preparedHoldersOfSeat(String(caller.seatId), caller.acpxRecordId),
+  );
+  const othersNote = handover.preparedHoldersNote(others);
+  if (othersNote) {
+    process.stderr.write(`${othersNote}\n`);
+  }
+  if (adopt) {
+    process.stderr.write(
+      `handover: adopting ${adopt.id}, the successor an earlier run of this handover left prepared\n`,
+    );
+    return adopt.id;
+  }
+  const { created } = await createSessionFromNewFlags(
+    explicitAgentName,
+    { from: caller.acpxRecordId, metadata: { [HANDOVER_FROM_KEY]: caller.acpxRecordId } },
+    command,
+    config,
+  );
+  return created.acpxRecordId;
+}
+
+/**
+ * The seat's holders that were created and never activated — no ordinal, not active, open, not archived
+ * — read from their RECORDS (the index only narrows the scan to the seat's own entries). A scan over the
+ * index, run only by a handover: a rare, operator-or-agent path, like `firstHolderOfSeat`.
+ */
+async function preparedHoldersOfSeat(seatId: string, callerId: string): Promise<PreparedHolder[]> {
+  const prepared: PreparedHolder[] = [];
+  for (const entry of await listSessionIndexEntries()) {
+    if (entry.seatId !== seatId || entry.acpxRecordId === callerId || entry.closed) {
+      continue;
+    }
+    let record: SessionRecord;
+    try {
+      record = await resolveSessionRecord(entry.acpxRecordId);
+    } catch {
+      continue;
+    }
+    if (isNeverActivatedOpenHolder(record)) {
+      prepared.push({
+        id: record.acpxRecordId,
+        createdAt: record.createdAt,
+        handoverFrom: record.metadata?.[HANDOVER_FROM_KEY],
+      });
+    }
+  }
+  return prepared;
+}
+
+function isNeverActivatedOpenHolder(record: SessionRecord): boolean {
+  return (
+    !isArchivedRecord(record) &&
+    record.closed !== true &&
+    record.holderActive !== true &&
+    record.holderOrdinal === undefined
+  );
 }
 
 /** Brick bbe2bc47 A6: the last thing a handover from far below the alarm prints. */

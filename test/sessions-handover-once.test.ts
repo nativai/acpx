@@ -219,7 +219,7 @@ async function dieOnce(
   assert.notEqual(died.code, 0, "fixture: the run died");
   const fresh = (await holdersOf(homeDir, seatId)).filter((r) => !known.has(r.id));
   assert.equal(fresh.length, 1, "fixture: the death left exactly one new record");
-  return String(fresh[0]?.id);
+  return fresh[0].id;
 }
 
 test(
