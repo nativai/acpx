@@ -6773,6 +6773,7 @@ export async function handleSessionsHandover(
       command,
       config,
     );
+    dieAfterHandoverCreateForTest();
     const result = await activateSeatHolder(String(caller.seatId), created.acpxRecordId);
     await emitSeatDivergenceLine(result.successorId, result.divergence);
     const turn = {
@@ -6802,6 +6803,20 @@ export async function handleSessionsHandover(
       return;
     }
     throw error;
+  }
+}
+
+/**
+ * ⚠️ TEST SEAM, honoured ONLY under a non-empty `NODE_TEST_CONTEXT` (`node --test` sets it; a production
+ * process never has it): kills this process between the handover's create and its activation — the exact
+ * window brick 4bc23c1e is about — so a test can leave the prepared successor behind and retry.
+ */
+function dieAfterHandoverCreateForTest(): void {
+  if (
+    (process.env.NODE_TEST_CONTEXT ?? "") !== "" &&
+    process.env.ACPX_TEST_HANDOVER_DIE_AFTER_CREATE === "1"
+  ) {
+    process.kill(process.pid, "SIGKILL");
   }
 }
 
