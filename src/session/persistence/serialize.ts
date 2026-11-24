@@ -141,7 +141,9 @@ export function serializeSessionRecordForDisk(
 
   // The key policy checks the keys THIS release writes, and only those: a carried key is a newer release's
   // and is never a reason to refuse the write (A-65), whatever its spelling.
-  assertPersistedKeyPolicy(persisted);
+  // `metadata` is carried whole, so its keys are not judged here either (A-65 correction, C3.5 (iv)): they
+  // are checked where they ENTER (`metadataKeyRuleViolation`, at `set-metadata` and `--metadata`).
+  assertPersistedKeyPolicy({ ...persisted, metadata: undefined });
   return withUnknownTopLevelFields(
     persisted,
     options.unknownTopLevelFields ?? canonical[UNKNOWN_TOP_LEVEL_FIELDS],

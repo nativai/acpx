@@ -24,6 +24,7 @@ import {
   type PermissionMode,
 } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
+import { assertMetadataKeyRule } from "./session/session-metadata.js";
 
 export type PermissionFlags = {
   approveAll?: boolean;
@@ -472,6 +473,9 @@ export function parseMetadataEntry(
       `--metadata key must not be empty (got: ${JSON.stringify(value)})`,
     );
   }
+  // A-65 correction (C3.5 (iv)): checked here, where the key enters, so a refusal is a usage error (exit 2)
+  // before any session is created, spawned or written.
+  assertMetadataKeyRule(key);
   const rawValue = value.slice(eqIndex + 1);
   return { ...previous, [key]: rawValue };
 }
