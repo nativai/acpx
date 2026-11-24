@@ -74,6 +74,7 @@ import {
   type BoxProviderEntry,
   type BoxProviderLookupOptions,
 } from "../config/providers.js";
+import { writeFileReplacingSync } from "../temp-name.js";
 import type { CatalogueEntitlement } from "./types.js";
 
 /** The per-key endpoint. Answers to an ordinary key; no management credential. */
@@ -246,9 +247,7 @@ function validateCacheFile(
 /** Atomic tmp + rename — a reader never sees a half-written set. */
 function writeCache(cachePath: string, file: EntitlementCacheFile): void {
   fs.mkdirSync(path.dirname(cachePath), { recursive: true });
-  const tmpPath = `${cachePath}.${process.pid}.tmp`;
-  fs.writeFileSync(tmpPath, `${JSON.stringify(file)}\n`, "utf8");
-  fs.renameSync(tmpPath, cachePath);
+  writeFileReplacingSync(cachePath, `${JSON.stringify(file)}\n`);
 }
 
 function isFresh(file: EntitlementCacheFile, ttlMs: number, now: number): boolean {

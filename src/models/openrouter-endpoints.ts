@@ -52,6 +52,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { writeFileReplacingSync } from "../temp-name.js";
 
 export const OPENROUTER_ENDPOINTS_TTL_MS = 5 * 60 * 1000;
 
@@ -266,9 +267,7 @@ function isFresh(snapshot: OpenRouterEndpointsSnapshot, ttlMs: number, now: numb
 function cacheOrWarn(cachePath: string, snapshot: OpenRouterEndpointsSnapshot): void {
   try {
     fs.mkdirSync(path.dirname(cachePath), { recursive: true });
-    const tmpPath = `${cachePath}.${process.pid}.tmp`;
-    fs.writeFileSync(tmpPath, `${JSON.stringify(snapshot)}\n`, "utf8");
-    fs.renameSync(tmpPath, cachePath);
+    writeFileReplacingSync(cachePath, `${JSON.stringify(snapshot)}\n`);
   } catch (error) {
     // An unwritable cache degrades to "fetch every time", not to a failure.
     process.stderr.write(

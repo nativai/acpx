@@ -6,6 +6,7 @@ import {
   type ProcEntry,
   queueOwnerTokenState,
 } from "../../process-tree-reap.js";
+import { writeFileReplacingSync } from "../../temp-name.js";
 
 /**
  * CONCEPTION 5d7a23b6 §3 — what the governor may kill: POSITIVE ORIGIN. A session (sid) is governed
@@ -515,9 +516,7 @@ export function saveGroupMemory(file: string, memory: ReadonlyMap<number, GroupR
 export function writeFileAtomic(file: string, body: string): void {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    const temp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(temp, body);
-    fs.renameSync(temp, file);
+    writeFileReplacingSync(file, body);
   } catch {
     // The governor runs on; state is attribution, never safety (E20).
   }

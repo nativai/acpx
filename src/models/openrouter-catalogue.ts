@@ -9,6 +9,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { writeFileReplacingSync } from "../temp-name.js";
 
 export const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models";
 
@@ -137,9 +138,7 @@ export function readOpenRouterCacheSync(
 /** Atomic tmp + rename — a reader never sees a half-written catalogue. */
 function writeCache(cachePath: string, snapshot: OpenRouterSnapshot): void {
   fs.mkdirSync(path.dirname(cachePath), { recursive: true });
-  const tmpPath = `${cachePath}.${process.pid}.tmp`;
-  fs.writeFileSync(tmpPath, `${JSON.stringify(snapshot)}\n`, "utf8");
-  fs.renameSync(tmpPath, cachePath);
+  writeFileReplacingSync(cachePath, `${JSON.stringify(snapshot)}\n`);
 }
 
 function isFresh(snapshot: OpenRouterSnapshot, ttlMs: number, now: number): boolean {

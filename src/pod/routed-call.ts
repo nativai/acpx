@@ -299,15 +299,20 @@ export function writeRoutedPayload(
 ): string {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const final = path.join(dir, `${callId}.payload`);
-  const temp = `${final}.tmp-${process.pid}`;
+  const temp = `${final}.tmp-${process.pid}-${randomUUID()}`;
   const fd = fs.openSync(temp, "wx", 0o600);
   try {
-    fs.writeFileSync(fd, content);
-    fs.fchmodSync(fd, 0o600);
-  } finally {
-    fs.closeSync(fd);
+    try {
+      fs.writeFileSync(fd, content);
+      fs.fchmodSync(fd, 0o600);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(temp, final);
+  } catch (error) {
+    fs.rmSync(temp, { force: true });
+    throw error;
   }
-  fs.renameSync(temp, final);
   return final;
 }
 

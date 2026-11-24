@@ -129,17 +129,10 @@
  */
 
 import { spawnSync } from "node:child_process";
-import {
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { writeFileReplacingSync } from "../temp-name.js";
 
 /** Long enough that the spawn is amortised to nothing; short enough that a pi
  *  upgrade is picked up the same day EVEN IF its binary identity somehow does not
@@ -326,9 +319,7 @@ function readCache(cachePath: string): PiModelKnowledge | null {
 function writeJsonAtomic(path: string, value: PiModelKnowledge | KeptOverlay): void {
   try {
     mkdirSync(dirname(path), { recursive: true });
-    const tmpPath = `${path}.${process.pid}.tmp`;
-    writeFileSync(tmpPath, `${JSON.stringify(value)}\n`, "utf8");
-    renameSync(tmpPath, path);
+    writeFileReplacingSync(path, `${JSON.stringify(value)}\n`);
   } catch {
     // Caching is an optimisation. A read-only or full disk must not fail a
     // session create; the next spawn simply pays the ~539 ms again.

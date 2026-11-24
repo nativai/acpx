@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { assertBoxWideWriteAllowed } from "../../pod/foreign-write-guard.js";
+import { uniqueTempPath } from "../../temp-name.js";
 import {
   acquireIdentityFileLock,
   releaseIdentityFileLock,
@@ -1230,9 +1231,14 @@ export async function rewriteArchiveReadme(archiveDir: string, warnings: string[
     if (current === ARCHIVE_README) {
       return;
     }
-    const temp = `${target}.${process.pid}.tmp`;
-    await fs.writeFile(temp, ARCHIVE_README, "utf8");
-    await fs.rename(temp, target);
+    const temp = uniqueTempPath(target);
+    try {
+      await fs.writeFile(temp, ARCHIVE_README, "utf8");
+      await fs.rename(temp, target);
+    } catch (error) {
+      await fs.rm(temp, { force: true });
+      throw error;
+    }
   } catch (error) {
     warnings.push(`README.md not rewritten (${(error as Error).message})`);
   }

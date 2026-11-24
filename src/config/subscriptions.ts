@@ -1,7 +1,8 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path, { dirname } from "node:path";
 import { assertBoxWideWriteAllowed } from "../pod/foreign-write-guard.js";
+import { writeFileReplacingSync } from "../temp-name.js";
 
 // Per-subscription Claude credential registry. Each subscription is a
 // CLAUDE_CONFIG_DIR holding its own .credentials.json (and per-dir runtime
@@ -659,18 +660,8 @@ function mutateLockFieldsInArray(
 function writeRegistryDocument(registryPath: string, document: Record<string, unknown>): void {
   assertBoxWideWriteAllowed("registry", registryPath);
   mkdirSync(dirname(registryPath), { recursive: true });
-  // DELIBERATELY no randomUUID here, unlike the async write-tmp+rename sites
-  // (persistence/repository.ts, persistence/index.ts, runtime/public/file-session-store.ts,
-  // session/messages-log.ts, flows/store.ts). This function is fully SYNCHRONOUS:
-  // there is no await point between writeFileSync and renameSync, so two calls in
-  // this process cannot interleave — the first has already renamed the temp away
-  // before the second starts. Across processes the `${pid}` segment differs. So the
-  // same-millisecond collision that ENOENTs the async sites is unreachable here.
-  // If this is ever made async, it MUST gain the randomUUID segment.
-  const tempPath = `${registryPath}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(tempPath, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
-  chmodSync(tempPath, 0o600);
-  renameSync(tempPath, registryPath);
+  // The temp name carries a random part (A-67): two pods can run the same pid against one shared store.
+  writeFileReplacingSync(registryPath, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
   chmodSync(registryPath, 0o600);
 }
 
