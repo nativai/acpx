@@ -939,3 +939,24 @@ test("the argv shapes atrium really sends classify as expected (acpx-ui origin/m
   );
   assert.equal(classified(cases[0][0]).target?.value, "S");
 });
+
+// A-71 (brick 70921280): `sessions unparsable-leases` removes lease files of every session on the box and dates them
+// by the CONTROL pod's start (`readControlPodStart`: /proc/1/stat in an agent pod would date the AGENT pod's start,
+// and a lease younger than that start could be selected while live). Its entry — `control-store`, controlPodOnly —
+// is what keeps it out of pods (`test/pod-proc-readers.test.ts` REVIEWED names this test). Both forms, census and
+// `--apply`, must classify so; a change of class or of controlPodOnly fails here.
+test("A-71: `sessions unparsable-leases` is control-store and controlPodOnly, in its census and --apply forms", () => {
+  for (const argv of [
+    ["sessions", "unparsable-leases"],
+    ["--format", "json", "sessions", "unparsable-leases"],
+    ["sessions", "unparsable-leases", "--apply"],
+  ]) {
+    const c = classified(argv);
+    assert.equal(c.path, "sessions unparsable-leases", JSON.stringify(argv));
+    assert.equal(c.class, "control-store", JSON.stringify(argv));
+    assert.equal(c.controlPodOnly, true, JSON.stringify(argv));
+  }
+  // The class and the flag come from the table's own entry, not from a neighbour's.
+  assert.equal(COMMAND_TABLE["sessions unparsable-leases"]?.class, "control-store");
+  assert.equal(COMMAND_TABLE["sessions unparsable-leases"]?.controlPodOnly, true);
+});

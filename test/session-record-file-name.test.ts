@@ -507,6 +507,10 @@ const PROC = NOT("/proc");
 const LISTING_INVENTORY: Readonly<Record<string, Listing>> = {
   "session/persistence/index.ts::listSessionRecordFiles": { records: true },
   "session/archive/retention.ts::scanSessionDir": { records: true }, // every name, to CLAIM them to ids; the record read is behind the predicate (readRecordCandidates)
+  "cli/queue/lease-removal.ts::listQueues": NOT("the queues directory (<key>.lock lease files)"),
+  "cli/queue/lease-removal.ts::sessionLookup": NOT(
+    "every name in the hot and archive directories, to map a queue key to a session (residue-only sessions included); it reads no record and its `<id>.json` check only ranks hits",
+  ),
   "cli/transcripts-dedup.ts::readDirents": { records: true }, // indexRecordFiles filters its entries through the predicate
   "session/persistence/repository.ts::unlinkHardDeletedFiles": NOT(
     "per-id stream-file lookup by id prefix",
