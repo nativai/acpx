@@ -7,7 +7,7 @@
 // Every arm puts ONE record on disk with an adapter pid and its identity (this process's own, so the
 // identity is a real one), takes the close's FIRST read, optionally lets "another writer" move the
 // record's adapter, and then runs the close's terminal write with the kill outcome under test.
-// The pass/fail pairs control each other: (a)–(c) must clear, (d)–(h) must keep, and the proven-stopped
+// The pass/fail pairs control each other: (a)–(b) must clear, (c)–(h) must keep (`foreign` included), and the proven-stopped
 // arm must still clear.
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -75,7 +75,7 @@ const ADAPTER_PID = process.pid;
 const KILLS: { arm: string; kill: SessionCloseAdapterKill; clears: boolean }[] = [
   { arm: "a signalled", kill: { signalled: true }, clears: true },
   { arm: "b gone", kill: { signalled: false, reason: "gone" }, clears: true },
-  { arm: "c foreign", kill: { signalled: false, reason: "foreign" }, clears: true },
+  { arm: "c foreign", kill: { signalled: false, reason: "foreign" }, clears: false },
   { arm: "d no-identity", kill: { signalled: false, reason: "no-identity" }, clears: false },
   { arm: "e unverified", kill: { signalled: false, reason: "unverified" }, clears: false },
 ];
