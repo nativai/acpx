@@ -4,6 +4,7 @@ import {
   isoNow,
   readRawRecordClosedState,
   resolveSessionRecord,
+  writeCloseScalarsOnFreshRecord,
   writeSessionRecordAtBoundaryWithLifecycle,
 } from "../../session/persistence.js";
 import type { MessageWriteMode, RawRecordFieldState } from "../../session/persistence.js";
@@ -64,7 +65,8 @@ export async function writeTerminalCloseRecord(
  *   log the dead owner's last inline partial, at the log's true end (`adopt`).
  * - Owner NOT proven stopped (`successor`, `survived`, `identity-unverified`, …): a live writer may
  *   still append. The close writes the scalars only — `closed`, `closed_at`, the adapter pid cleared —
- *   keeps the watermark and the inline entries as they are on disk, and says why on stderr (`keep`).
+ *   onto a record read fresh under the lock (`writeCloseScalarsOnFreshRecord`): every other field, the
+ *   watermark and the inline entries stay as the owner left them, and stderr says why.
  *
  * ⚠️ DO NOT "SIMPLIFY" THIS BACK TO `writeTerminalCloseRecord(record)` WITH THE EARLY COPY. That copy is
  * the stale one. Rows 60.1, 60.5 and 60.10 (test/writer-rules-a60*.test.ts) go red if you do.
@@ -79,7 +81,9 @@ export async function writeTerminalCloseAfterOwnerStop(
       `[acpx] close: owner of ${record.acpxRecordId} not proven stopped (${ownerStop.reason ?? "unknown"}); ` +
         `wrote the record's scalars only — its messages log and inline entries are left to the owner\n`,
     );
-    return { record, state: await writeTerminalCloseRecord(record, "keep") };
+    // The scalars only, onto a record read fresh under the lock: the early copy is never written (TE L1).
+    const closed = await writeCloseScalarsOnFreshRecord(record.acpxRecordId, isoNow());
+    return { record: closed, state: await readBackRecordClosedState(record.acpxRecordId) };
   }
   const afterStop = await resolveSessionRecord(record.acpxRecordId);
   return { record: afterStop, state: await writeTerminalCloseRecord(afterStop, "adopt") };
