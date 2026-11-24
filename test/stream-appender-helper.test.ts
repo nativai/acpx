@@ -311,6 +311,158 @@ test("63.4 SCAN negatives: a planted append past the helper is red, in every sha
   );
 });
 
+// ---- A-80 row 80.1's scan, beside 63.4: no append to a session's stream or owner log on a control-role host passes
+// without the proof (`streamWriteVerdict`, src/pod/stream-write-guard.ts). DISCOVERING and BY CONSTRUCTION.
+
+/** The text of the `{ … }` block that follows the parameter list of the function whose header matches `header`. */
+function functionBody(text: string, header: RegExp): string | undefined {
+  const match = header.exec(text);
+  if (!match) {
+    return undefined;
+  }
+  const argsStart = match.index + match[0].length - 1;
+  const args = balancedArgs(text, argsStart);
+  const open = text.indexOf("{", argsStart + args.length + 1);
+  if (open < 0) {
+    return undefined;
+  }
+  let depth = 0;
+  for (let i = open; i < text.length; i += 1) {
+    if (text[i] === "{") {
+      depth += 1;
+    } else if (text[i] === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(open, i + 1);
+      }
+    }
+  }
+  return undefined;
+}
+
+const VERDICT_CALL = /\bstreamWriteVerdict(Sync)?\s*\(/;
+const GUARD_MODULE = "pod/stream-write-guard.ts";
+/** Files that name the owner log and append, each reviewed: why none of them is a foreign write. */
+const OWNER_LOG_APPEND_REVIEWED: Record<string, string> = {
+  "cli/session/queue-owner-process.ts":
+    "opens the fd a spawning owner takes as its stdio: the OWNER is the writer, behind assertBridgeMayStartHere",
+};
+
+export function guardViolations(files: Map<string, string>): string[] {
+  const violations: string[] = [];
+  const events = code(files.get("session/events.ts") ?? "");
+  const entries: [string, RegExp][] = [
+    ["SessionEventWriter.open", /static\s+async\s+open\s*\(/],
+    ...[...events.matchAll(/export\s+(?:async\s+)?function\s+(append\w*)\s*\(/g)]
+      .map((m) => m[1] ?? "")
+      .filter((name) => name !== "appendInParts")
+      .map((name): [string, RegExp] => [name, new RegExp(`function\\s+${name}\\s*\\(`)]),
+  ];
+  for (const [name, header] of entries) {
+    const body = functionBody(events, header);
+    if (body === undefined) {
+      violations.push(`session/events.ts: cannot find the entry ${name}`);
+    } else if (!VERDICT_CALL.test(body)) {
+      violations.push(
+        `session/events.ts: the entry ${name} writes without asking streamWriteVerdict`,
+      );
+    }
+  }
+  for (const [file, raw] of files) {
+    const text = code(raw);
+    if (file === GUARD_MODULE || !/\bqueueOwnerLogPath\b|\.owner\.log\b/.test(text)) {
+      continue;
+    }
+    const shapes = appendShapes(text);
+    if (shapes.length > 0 && OWNER_LOG_APPEND_REVIEWED[file] === undefined) {
+      violations.push(
+        `${file}: names the owner log and appends (${shapes.map((x) => x.shape).join(", ")}) outside appendOwnerLogLine`,
+      );
+    }
+  }
+  return violations;
+}
+
+test("80.1 SCAN: every append entry of the helper module asks the C3.3 proof first, and only the guard module appends to an owner log (discovering)", () => {
+  const files = realSources();
+  const events = code(files.get("session/events.ts") ?? "");
+  assert.ok(
+    [...events.matchAll(/export\s+(?:async\s+)?function\s+(append\w*)/g)].length >= 3,
+    "positive control: the scan finds the exported appenders",
+  );
+  assert.ok(
+    functionBody(events, /static\s+async\s+open\s*\(/)?.includes("acquireEventsLock"),
+    "positive control: it reads the open body",
+  );
+  assert.ok(
+    code(files.get(GUARD_MODULE) ?? "").includes("fs.appendFile"),
+    "positive control: the owner log's raw append is in the guard module",
+  );
+  const named = [...files].filter(
+    ([file, text]) =>
+      file !== GUARD_MODULE &&
+      /\bqueueOwnerLogPath\b|\.owner\.log\b/.test(code(text)) &&
+      appendShapes(code(text)).length > 0,
+  );
+  assert.deepEqual(
+    named.map(([file]) => file).toSorted(),
+    Object.keys(OWNER_LOG_APPEND_REVIEWED).toSorted(),
+    "positive control: the scan finds the reviewed owner-log append, and nothing else",
+  );
+  assert.deepEqual(guardViolations(files), []);
+});
+
+test("80.1 SCAN negatives: an entry without the proof, a new unguarded appender, and a raw owner-log append are each red", () => {
+  const base = realSources();
+  const events = base.get("session/events.ts") ?? "";
+  const withEvents = (text: string): string[] =>
+    guardViolations(new Map([...base, ["session/events.ts", text]]));
+  const plant = (name: string, text: string): string[] =>
+    guardViolations(new Map([...base, [name, text]]));
+  assert.equal(
+    withEvents(events.replace("streamWriteVerdictSync(sessionId)", "alwaysHere(sessionId)")).length,
+    1,
+    "the sync entry loses its proof",
+  );
+  assert.equal(
+    withEvents(events.replace("await streamWriteVerdict(record.acpxRecordId)", "alwaysHere()"))
+      .length,
+    1,
+    "SessionEventWriter.open loses its proof",
+  );
+  assert.equal(
+    withEvents(
+      `${events}\nexport async function appendMore(sessionId: string, text: string) { await appendStreamTextSync(sessionId, text); }`,
+    ).length,
+    1,
+    "a NEW exported appender that does not ask",
+  );
+  assert.equal(
+    plant(
+      "cli/new-owner-log.ts",
+      `import { queueOwnerLogPath } from "./session/queue-owner-process.js";\nawait fs.appendFile(queueOwnerLogPath(id), line);`,
+    ).length,
+    1,
+    "a raw append to the owner log outside the guard module",
+  );
+  assert.equal(
+    plant(
+      "cli/by-hand.ts",
+      "const log = path.join(dir, `${id}.owner.log`);\nfs.appendFileSync(log, line);",
+    ).length,
+    1,
+    "an owner log named by hand",
+  );
+  assert.deepEqual(
+    plant(
+      "cli/uses-guard.ts",
+      `import { queueOwnerLogPath } from "./session/queue-owner-process.js";\nawait appendOwnerLogLine(id, queueOwnerLogPath(id), line);`,
+    ),
+    [],
+    "negative: a module that goes through the guard is not an appender",
+  );
+});
+
 test("63.3 a damaged line is skipped, COUNTED and LOGGED by listSessionEvents and by the export reader, once per process and line", async () => {
   await withTempHome("acpx-appender-reader-", async (homeDir) => {
     const id = "damaged-reader";

@@ -1,4 +1,11 @@
-import { readQueueOwnerLeaseFile, type UnparsableShape } from "../cli/queue/lease-store.js";
+import { readFileSync } from "node:fs";
+import {
+  classifyLeasePayload,
+  readQueueOwnerLeaseFile,
+  type LeaseFile,
+  type UnparsableShape,
+} from "../cli/queue/lease-store.js";
+import { queueLockFilePath } from "../cli/queue/paths.js";
 import { lockHostPlace, lockPodIdentity } from "./identity.js";
 import { placeOf, podModeVerdictNow, readPodFileWithWitness } from "./placement.js";
 
@@ -38,6 +45,32 @@ export async function localProofScope(
   recordId: string,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<ProofScope> {
+  return scopeWithoutLease(recordId, env) ?? scopeOfLease(await readQueueOwnerLeaseFile(recordId));
+}
+
+/**
+ * `localProofScope` for a SYNCHRONOUS caller (A-80's sync stream helper): the same rule, the lease read with
+ * `readFileSync`. One rule — both call `scopeWithoutLease` and `scopeOfLease`; there is no second copy.
+ */
+export function localProofScopeSync(
+  recordId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): ProofScope {
+  return scopeWithoutLease(recordId, env) ?? scopeOfLease(readLeaseFileSync(recordId));
+}
+
+function readLeaseFileSync(recordId: string): LeaseFile {
+  try {
+    return classifyLeasePayload(readFileSync(queueLockFilePath(recordId), "utf8"));
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? { kind: "missing" }
+      : { kind: "unparsable", shape: { kind: "bytes" } };
+  }
+}
+
+/** The answer that needs no lease; `undefined` when the lease decides. */
+function scopeWithoutLease(recordId: string, env: NodeJS.ProcessEnv): ProofScope | undefined {
   if (lockHostPlace(env) === "agent-pod") {
     return placeOf(readPodFileWithWitness(env), recordId) === "own-pod"
       ? { local: true }
@@ -47,14 +80,10 @@ export async function localProofScope(
   if (podModeVerdictNow(env).mode === "refuse") {
     return { local: false, reason: "pod-unreadable" };
   }
-  if (lockPodIdentity(env) === undefined) {
-    return { local: true };
-  }
-  return await leaseScope(recordId);
+  return lockPodIdentity(env) === undefined ? { local: true } : undefined;
 }
 
-async function leaseScope(recordId: string): Promise<ProofScope> {
-  const lease = await readQueueOwnerLeaseFile(recordId);
+function scopeOfLease(lease: LeaseFile): ProofScope {
   if (lease.kind === "unparsable") {
     return unparsableScope(lease.shape);
   }

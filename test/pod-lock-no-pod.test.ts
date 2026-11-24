@@ -156,7 +156,7 @@ test("no pod: an unjudgeable holder YOUNGER than the age bound is broken only af
   noLedger(dir);
 });
 
-test("no pod: a holder on ANOTHER BOOT is judged dead at once — today's rule, unchanged (why the identity lands before the switch)", async () => {
+test("no pod: a holder on ANOTHER BOOT is UNJUDGEABLE, never dead (A-80, C3.2 row 3): broken only past the stale age, with the warning", async () => {
   const { dir, options, record } = setup();
   const raw = JSON.stringify({
     pid: process.pid,
@@ -169,15 +169,17 @@ test("no pod: a holder on ANOTHER BOOT is judged dead at once — today's rule, 
       timeNamespace: "time:[4026531834]",
     },
   });
+  // Across NFS clients another boot id means ANOTHER MACHINE, not a reboot: its holder may be alive (X-NFS F1,
+  // taken over in 21-28 ms). Today's "judged dead at once" is the defect this row used to pin.
   fs.writeFileSync(`${record}.lock`, raw);
-  const started = Date.now();
+  const old = new Date(Date.now() - 10 * 60_000);
+  fs.utimesSync(`${record}.lock`, old, old);
   const run = await runInPod(undefined, CHILD, ["record-acquire", record], controlShaped(options));
   assert.deepEqual(JSON.parse(run.stdout), { acquired: true });
-  assert.ok(Date.now() - started < 5_000);
-  assert.equal(
-    run.stderr.includes("WARNING"),
-    false,
-    "a 'dead' holder is broken silently, as today",
+  assert.match(
+    run.stderr,
+    /\[acpx\] WARNING: broke stale session record lock .*holder cannot be judged from here/,
+    "past the stale age it is broken by AGE, loudly — not silently as a dead holder",
   );
   noLedger(dir);
 });

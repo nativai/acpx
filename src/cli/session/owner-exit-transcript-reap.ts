@@ -8,6 +8,7 @@ import {
   type TranscriptReapSummary,
 } from "../../config/transcript-reap.js";
 import { localProofScope, type ProofScope } from "../../pod/proof-scope.js";
+import { appendOwnerLogLine } from "../../pod/stream-write-guard.js";
 import {
   isRecordedPidPossiblyAlive,
   observeProcessIncarnation,
@@ -355,8 +356,9 @@ const defaultCloseReapDeps: CloseReapDeps = {
   hasLeftBehind: async (record) => await hasLeftBehindTranscript(record),
   proofScope: localProofScope,
   reap: reapLeftBehindTranscripts,
+  // A-80: the owner log of a pod's session is written by the pod; the control pod's line goes through the guard.
   writeLog: async (sessionId, line) =>
-    await fs.promises.appendFile(queueOwnerLogPath(sessionId), line),
+    await appendOwnerLogLine(sessionId, queueOwnerLogPath(sessionId), line),
 };
 
 export type CloseReapOutcome =

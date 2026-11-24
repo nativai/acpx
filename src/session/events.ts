@@ -10,6 +10,14 @@ import {
 import fs, { type FileHandle } from "node:fs/promises";
 import { isAcpJsonRpcMessage } from "../acp/jsonrpc.js";
 import { incrementPerfCounter, measurePerf } from "../perf-metrics.js";
+import {
+  divertStreamMessages,
+  divertStreamText,
+  REPROVE_AFTER_MS,
+  streamWriteVerdict,
+  streamWriteVerdictSync,
+  type ForeignWriteWhy,
+} from "../pod/stream-write-guard.js";
 import { getOwnProcessIdentity } from "../process-identity.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
 import { DELIVERY_EVENT_METHOD } from "./delivery-events.js";
@@ -490,6 +498,13 @@ function sharedSyncDeadline(filePath: string, now: number, capMs: number): numbe
  * line still grows; then it ENDS the line and writes (A-66: end, never drop), logging the forced end.
  */
 export function appendStreamTextSync(sessionId: string, text: string): void {
+  // A-80: a control-role host writes a pod session's stream only after C3.3 proved the pod gone; a sync caller can
+  // never prove it, so its line goes to the sidecar (`stream-write-guard.ts`). Everything else is today's write.
+  const verdict = streamWriteVerdictSync(sessionId);
+  if (verdict.write === "sidecar") {
+    divertStreamText(sessionId, text, verdict.why);
+    return;
+  }
   const wait = new SyncWait(
     activeEventPath(sessionId),
     streamAppendTimingForTest() ?? STREAM_APPEND_SYNC_MAX_WAIT_MS,
@@ -532,32 +547,73 @@ class SyncWait {
   }
 }
 
+/** The async appender's own deadline: the foreign line stopped growing (`stall`) or the overall budget ran out. */
+function asyncAppendBound(
+  now: number,
+  growth: { lastGrowthAt: number; startedAt: number },
+  limits: { stallMs: number; budgetMs: number },
+): ForcedEndBound | undefined {
+  if (now - growth.lastGrowthAt >= limits.stallMs) {
+    return "stall";
+  }
+  return now - growth.startedAt >= limits.budgetMs ? "deadline" : undefined;
+}
+
 /** The asynchronous appender: the same rule, waiting without blocking the loop. */
 export async function appendStreamText(sessionId: string, text: string): Promise<void> {
-  const stallMs = streamAppendTimingForTest() ?? STREAM_APPEND_STALL_MS;
-  const budgetMs = streamAppendDeadlineForTest() ?? STREAM_LOCK_BUDGET_MS;
+  // A-80: the proof comes IMMEDIATELY before the write — at entry, and again before any attempt that follows a wait
+  // of more than REPROVE_AFTER_MS (the pod may have been replaced meanwhile). A diverted line is never written into
+  // the stream, a forced end (A-66) included.
+  const proof = { at: Date.now() };
+  if (await divertedBeforeWrite(sessionId, text)) {
+    return;
+  }
+  const limits = {
+    stallMs: streamAppendTimingForTest() ?? STREAM_APPEND_STALL_MS,
+    budgetMs: streamAppendDeadlineForTest() ?? STREAM_LOCK_BUDGET_MS,
+  };
   const active = activeEventPath(sessionId);
-  const startedAt = Date.now();
+  const growth = { lastGrowthAt: Date.now(), startedAt: Date.now() };
   let lastSize = -1;
-  let lastGrowthAt = startedAt;
   for (;;) {
     const now = Date.now();
     const size = sizeOrZero(active);
     if (size !== lastSize) {
       lastSize = size;
-      lastGrowthAt = now;
+      growth.lastGrowthAt = now;
     }
-    const bound: ForcedEndBound | undefined =
-      now - lastGrowthAt >= stallMs
-        ? "stall"
-        : now - startedAt >= budgetMs
-          ? "deadline"
-          : undefined;
+    const bound = asyncAppendBound(now, growth, limits);
+    if (await reprovedDiverts(proof, sessionId, text)) {
+      return;
+    }
     if (appendStepSync(sessionId, text, bound) !== "wait") {
       return;
     }
     await new Promise((resolve) => setTimeout(resolve, STREAM_APPEND_POLL_MS));
   }
+}
+
+/** A-80: the proof again when the last one is older than REPROVE_AFTER_MS (the pod may have been replaced). */
+async function reprovedDiverts(
+  proof: { at: number },
+  sessionId: string,
+  text: string,
+): Promise<boolean> {
+  if (Date.now() - proof.at < REPROVE_AFTER_MS) {
+    return false;
+  }
+  proof.at = Date.now();
+  return await divertedBeforeWrite(sessionId, text);
+}
+
+/** A-80: asks the proof; when the pod is not proven gone the line goes to the sidecar and this says `true`. */
+async function divertedBeforeWrite(sessionId: string, text: string): Promise<boolean> {
+  const verdict = await streamWriteVerdict(sessionId);
+  if (verdict.write === "here") {
+    return false;
+  }
+  divertStreamText(sessionId, text, verdict.why);
+  return true;
 }
 
 /** A line that follows a writer which will never finish its own: close the tail if it is mid-line, then append. */
@@ -681,7 +737,10 @@ type AppendOptions = {
 
 export class SessionEventWriter {
   private readonly record: SessionRecord;
-  private readonly lock: LockHandle;
+  /** Absent in sidecar mode (A-80): that writer takes no stream lock and writes no stream byte. */
+  private readonly lock: LockHandle | undefined;
+  /** A-80: set when C3.3 did not prove the session's pod gone — every frame goes to `<id>.markers.ndjson`. */
+  private readonly sidecarWhy: ForeignWriteWhy | undefined;
   private readonly maxSegmentBytes: number;
   private readonly maxSegments: number;
   private activePath: string;
@@ -691,7 +750,8 @@ export class SessionEventWriter {
 
   private constructor(
     record: SessionRecord,
-    lock: LockHandle,
+    lock: LockHandle | undefined,
+    sidecarWhy: ForeignWriteWhy | undefined,
     options: Required<SessionEventWriterOptions>,
     state: {
       activePath: string;
@@ -701,6 +761,7 @@ export class SessionEventWriter {
   ) {
     this.record = record;
     this.lock = lock;
+    this.sidecarWhy = sidecarWhy;
     this.maxSegmentBytes = options.maxSegmentBytes;
     this.maxSegments = options.maxSegments;
     this.activePath = state.activePath;
@@ -712,6 +773,12 @@ export class SessionEventWriter {
     record: SessionRecord,
     options: SessionEventWriterOptions = {},
   ): Promise<SessionEventWriter> {
+    // A-80: BEFORE the stream lock (a pod's owner holds it; waiting 20 s for it and then writing is the bug).
+    // Not proven gone ⇒ a sidecar-mode writer: no lock, no closed tail, no flush into the stream.
+    const verdict = await streamWriteVerdict(record.acpxRecordId);
+    if (verdict.write === "sidecar") {
+      return SessionEventWriter.sidecarMode(record, verdict.why, options);
+    }
     const lock = await acquireEventsLock(record.acpxRecordId);
     // ⚠️ AT ACQUISITION, under the lock just taken (the previous holder is released or proven dead, so no
     // live multi-part write exists): a dead predecessor's partial line is closed with ONE newline NOW, not
@@ -735,6 +802,7 @@ export class SessionEventWriter {
     return new SessionEventWriter(
       record,
       lock,
+      undefined,
       {
         maxSegmentBytes,
         maxSegments,
@@ -743,6 +811,31 @@ export class SessionEventWriter {
         activePath,
         activeSizeBytes,
         segmentCount,
+      },
+    );
+  }
+
+  private static sidecarMode(
+    record: SessionRecord,
+    why: ForeignWriteWhy,
+    options: SessionEventWriterOptions,
+  ): SessionEventWriter {
+    return new SessionEventWriter(
+      record,
+      undefined,
+      why,
+      {
+        maxSegmentBytes:
+          options.maxSegmentBytes ??
+          record.eventLog.max_segment_bytes ??
+          DEFAULT_EVENT_SEGMENT_MAX_BYTES,
+        maxSegments:
+          options.maxSegments ?? record.eventLog.max_segments ?? DEFAULT_EVENT_MAX_SEGMENTS,
+      },
+      {
+        activePath: activeEventPath(record.acpxRecordId),
+        activeSizeBytes: 0,
+        segmentCount: record.eventLog.segment_count,
       },
     );
   }
@@ -774,6 +867,13 @@ export class SessionEventWriter {
         }
       }
 
+      // A-80: a sidecar-mode writer (the pod was not proven gone) diverts the whole batch, once validated. Nothing
+      // reached the stream, so no record bookkeeping (`lastSeq`, `eventLog`) moves either.
+      if (this.sidecarWhy !== undefined) {
+        divertStreamMessages(this.record.acpxRecordId, messages, this.sidecarWhy);
+        return;
+      }
+
       // C10 / A-14: ONE write per flush. The lines bound for the active file are gathered and written
       // together; only a rotation (a different file) ends a group early.
       let group: { message: AcpJsonRpcMessage; line: Buffer }[] = [];
@@ -784,7 +884,7 @@ export class SessionEventWriter {
         const written = group;
         group = [];
         // C3.2 A-4: the holder checks its lock immediately before it publishes.
-        await assertLockHeld(this.lock.filePath, this.lock.content);
+        await assertLockHeld(this.heldLock().filePath, this.heldLock().content);
         await this.appendActive(Buffer.concat(written.map((entry) => entry.line)));
         for (const entry of written) {
           this.noteWritten(entry.message);
@@ -810,6 +910,13 @@ export class SessionEventWriter {
     if (options.checkpoint === true) {
       await writeSessionRecord(this.record);
     }
+  }
+
+  private heldLock(): LockHandle {
+    if (this.lock === undefined) {
+      throw new Error("SessionEventWriter has no stream lock (sidecar mode writes no stream byte)");
+    }
+    return this.lock;
   }
 
   /**
@@ -866,7 +973,9 @@ export class SessionEventWriter {
       }
     } finally {
       this.closed = true;
-      await releaseEventsLock(this.lock);
+      if (this.lock) {
+        await releaseEventsLock(this.lock);
+      }
     }
   }
 }

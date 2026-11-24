@@ -353,7 +353,7 @@ test("80.1 the pod exists, or C3.3 cannot say `gone`: the control pod writes NOT
         );
         const lines = sidecarLines(sid);
         assert.equal(lines.length, 1, `${why}: exactly one line in ${sidecarPath(sid)}`);
-        assertC5Line(lines[0] as SidecarLine, before, controlPath.method, why);
+        assertC5Line(lines[0], before, controlPath.method, why);
         assert.equal(
           foreignWriteLines(stderr.lines()).length,
           1,
@@ -552,6 +552,18 @@ test("80.3 the stream lock: on the control pod a no-pod body from another boot i
         body,
         "the holder's lock is untouched",
       );
+      // Past the stale age the control pod may break it (by AGE, the unjudgeable row) — the rule is not "never".
+      const old = new Date(Date.now() - 10 * 60_000);
+      fs.utimesSync(sessionEventLockPath(sid), old, old);
+      const stderr = captureStderr();
+      try {
+        const lock = await acquireEventsLock(sid, 5_000);
+        assert.notEqual(fs.readFileSync(sessionEventLockPath(sid), "utf8"), body);
+        assert.ok(lock.content.length > 0);
+      } finally {
+        stderr.restore();
+      }
+      assert.ok(stderr.lines().some((line) => line.includes("broke stale session stream lock")));
     });
     await withEnv(
       worldEnv(world, { place: "agent-pod", podMode: true, extra: { HOME: world.home } }),

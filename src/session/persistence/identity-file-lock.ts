@@ -24,6 +24,7 @@ import {
   getOwnProcessIdentity,
   isOwnProcessScopeVerified,
   classifyRecordedIdentity,
+  identityScope,
   observeProcessIncarnation,
   processHostName,
   type ProcessBirthIdentity,
@@ -205,6 +206,18 @@ function verdictForLegacy(
   return isProcessDefinitelyDead(pid) ? "breakable" : "unjudgeable";
 }
 
+/** A holder that recorded its birth identity: by pid and start ticks, except that ANOTHER BOOT is never `gone`. */
+function judgeBirthHolder(pid: number, birth: ProcessBirthIdentity): LockHolderVerdict {
+  // ⚠️ A-80 (C3.2 row 3, brick 766c4dd7): A BOOT ID THAT DIFFERS FROM THE READER'S IS NEVER "GONE". On one
+  // machine it means a prior boot; across NFS clients (a state home shared by several machines) it means
+  // ANOTHER MACHINE, and the reader cannot tell the two apart. `observeProcessIncarnation` calls it `gone`
+  // (right for the lease, the capacity ledger and a signal), which here made a LIVE holder on machine A
+  // breakable on machine B in 21–28 ms (X-NFS F1). The lease already reads it as foreign
+  // (`identityScope() === "other-boot"`); the lock judge now does too. DO NOT fold this into
+  // `compareLinuxScope`: every other reader of it wants "gone". `test/pod-a80-foreign-write.test.ts` 80.3.
+  return identityScope(birth) === "other-boot" ? "unjudgeable" : verdictForIncarnation(pid, birth);
+}
+
 /** Today's pid rules — for a body without `pod`, and for a holder in the reader's own pod. */
 function judgeByPid(
   body: Record<string, unknown> | undefined,
@@ -216,7 +229,7 @@ function judgeByPid(
   }
   const recorded = classifyRecordedIdentity(body.processIdentity);
   if (recorded.kind === "birth") {
-    return verdictForIncarnation(pid, recorded.birth);
+    return judgeBirthHolder(pid, recorded.birth);
   }
   if (recorded.kind === "scope-only") {
     // Scope but no start ticks: foreign ⇒ never pid-judged; our own scope ⇒ ESRCH is proof of
@@ -255,7 +268,16 @@ export function judgeLockHolder(
   body: Record<string, unknown> | undefined,
   judgeLegacy?: (body: Record<string, unknown>) => LockHolderVerdict,
 ): LockHolderVerdict {
-  return holderPlace(body).kind === "foreign" ? "unjudgeable" : judgeByPid(body, judgeLegacy);
+  const place = holderPlace(body);
+  if (place.kind === "foreign") {
+    return "unjudgeable";
+  }
+  const verdict = judgeByPid(body, judgeLegacy);
+  // A-80 (C3.2 row 3, "in an agent pod: not judged"): an agent pod never takes a holder WITHOUT `pod` for dead —
+  // `planBreak` already never breaks it there; this aligns the stream appender's dead-writer test with it.
+  return place.kind === "no-pod" && verdict === "breakable" && deps.place() === "agent-pod"
+    ? "unjudgeable"
+    : verdict;
 }
 
 /**
