@@ -40,6 +40,8 @@ export const REVIEWED: Record<string, string> = {
   "capacity/reading.ts": CAPACITY,
   "capacity/run-build.ts": CAPACITY,
   "cli/governor-command.ts": CAPACITY,
+  "cli/lease-removal-command.ts":
+    'A-71 `sessions unparsable-leases`: reads /proc/stat btime and the /proc/1/stat and /proc/self/stat starttimes only to date the CONTROL pod\'s start for its age rule, and passes no verdict about any process\'s liveness or ownership. ⚠️ Inside an agent pod /proc/1/stat dates the AGENT pod\'s start, so the verb must never run there: it is CONTROL-POD ONLY — command-classes entry `sessions unparsable-leases` is class control-store + controlPodOnly, so an agent pod refuses it `control_pod_only` before it runs (pinned by `test/pod-command-classes.test.ts` "A-71: `sessions unparsable-leases` is control-store and controlPodOnly" and the A-7 row of `test/pod-placement.test.ts`), and readControlPodStart itself answers "not the control pod" on any other place (`test/lease-removal.test.ts`) — an unknown start removes nothing',
   "cli/prompt-routing.ts":
     "capacity admission's owner-tree check: a lease scan and this host's own tree (R12)",
   "cli/queue/ipc.ts": C3,

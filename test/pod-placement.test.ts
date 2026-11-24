@@ -364,6 +364,9 @@ test("A-7: control-pod maintenance refuses in an agent pod (control_pod_only), r
     ["governor", "status"],
     ["governor", "scan"],
     ["capacity", "run-build", "x"],
+    // A-71: the lease census / removal dates leases by the CONTROL pod's start; in an agent pod it never runs.
+    ["sessions", "unparsable-leases"],
+    ["sessions", "unparsable-leases", "--apply"],
   ]) {
     const d = decide(argv, { pod });
     assert.equal(d.kind, "refuse-control-pod-only", JSON.stringify(argv));

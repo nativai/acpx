@@ -17,6 +17,7 @@ import {
   type LeaseRemovalResult,
 } from "../src/cli/queue/lease-removal.js";
 import { queueKeyForSession } from "../src/cli/queue/paths.js";
+import { removeTempHomeSync } from "./temp-home.js";
 
 // A-71 (brick 70921280; CONTRACTS-r4 A-71 (2), A-72 (1); test-plan row 71.3, offline half). The verb removes a
 // lease only if its body cannot be read, is not JSON or is JSON that is not an object (A-69's kind (1)),
@@ -65,7 +66,7 @@ function makeWorld(): World {
           process.env[name] = value;
         }
       }
-      fs.rmSync(home, { recursive: true, force: true });
+      removeTempHomeSync(home);
     },
   };
 }
