@@ -11,7 +11,7 @@ import {
   type LeaseFile,
 } from "../src/cli/queue/lease-store.js";
 import { queueLockFilePath } from "../src/cli/queue/paths.js";
-import { heldLeasePod } from "../src/cli/session/pod-wake-guard.js";
+import { heldLeasePod, refuseWhileUnparsableLeaseHeld } from "../src/cli/session/pod-wake-guard.js";
 import { localProofScope } from "../src/pod/proof-scope.js";
 import {
   clearNodes,
@@ -588,4 +588,136 @@ test("A-16 / 69.1 passing pairs through the real CLI: a host WITHOUT the identit
     await api.close();
     fs.rmSync(cwd, { recursive: true, force: true });
   }
+});
+
+// ---- round 2 (TE F-1): the setting verbs' no-owner fallbacks and `cancel` ----
+// A lease acpx cannot parse is no owner record, so `set-mode`, `set model`, `set <key>` and `cancel` read "no
+// owner" and acted locally — `set-mode` & co. started a LOCAL ADAPTER and rewrote `acp_session_id`, while the same
+// session with a PARSEABLE lease naming the same pod got the connect door's 75. Red at 0334cca7.
+
+const SETTING_VERBS: Array<[string, (id: string) => string[]]> = [
+  ["set-mode", (id) => ["set-mode", "plan", "--session-id", id]],
+  ["set model", (id) => ["set", "model", "opus", "--session-id", id]],
+  ["set <key>", (id) => ["set", "thought_level", "high", "--session-id", id]],
+  ["cancel", (id) => ["cancel", "--session-id", id]],
+];
+
+/** A whole lease naming `OTHER_POD`, stale heartbeat, dead pid: the parseable control of the held bodies. */
+function parseableLease(world: PodWorld): string {
+  return schemaRefused(world, { present: true, value: OTHER_POD }).replace(
+    '"ownerGeneration": "g-3"',
+    '"ownerGeneration": 3',
+  );
+}
+
+test("A-16 round 2 / 69.1 a REAL set-mode, set model, set <key> and cancel, identity + switch OFF: a lease acpx cannot parse answers 75 exactly as the parseable control does — record and lease byte-identical, no adapter started", async () => {
+  const api = await startKitApi("dev-kit");
+  const world = makeWorld("a69-cli-r2");
+  const env = cliEnv(world, true, api.url);
+  const cwd = cliCwd();
+  try {
+    setProof(api, "exists");
+    const bodies: Array<[string, (w: PodWorld) => string]> = [
+      ["parseable control (readable pod that exists)", parseableLease],
+      ["empty", () => ""],
+      [
+        "truncated mid-pod",
+        (w) => schemaRefused(w, { present: true, value: OTHER_POD }).slice(0, -90),
+      ],
+      ["JSON null", () => "null\n"],
+      [
+        "schema-refused, pod names no pod",
+        (w) => schemaRefused(w, { present: true, value: "ag-a69-other" }),
+      ],
+      [
+        "schema-refused, readable pod that exists",
+        (w) => schemaRefused(w, { present: true, value: OTHER_POD }),
+      ],
+    ];
+    for (const [label, raw] of bodies) {
+      for (const [verb, argv] of SETTING_VERBS) {
+        const id = await createSession(env, cwd, `a69-r2-${label.replace(/\W/g, "")}`);
+        const lease = plantFor(world, id, raw(world));
+        const bytes = fs.readFileSync(lease, "utf8");
+        const record = fs.readFileSync(recordFileOf(world, id), "utf8");
+        const result = await runCli(env, cwd, argv(id));
+        const where = `${label} / ${verb}: rc ${result.status} ${result.stderr.slice(0, 300)}`;
+        assert.equal(result.status, 75, where);
+        assert.match(result.stderr.split("\n")[0] ?? "", TURNOVER_TOKEN, where);
+        assert.equal(fs.readFileSync(lease, "utf8"), bytes, `lease: ${where}`);
+        assert.equal(fs.readFileSync(recordFileOf(world, id), "utf8"), record, `record: ${where}`);
+      }
+    }
+  } finally {
+    await api.close();
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("A-16 round 2 passing pairs through the real CLI: a host WITHOUT the identity, a body with no `pod` key, and a readable pod proven gone are not held — set-mode and cancel run", async () => {
+  const api = await startKitApi("dev-kit");
+  const cwd = cliCwd();
+  try {
+    const cases: Array<[string, boolean, Proof, (w: PodWorld) => string]> = [
+      ["no identity, empty lease", false, "exists", () => ""],
+      ["identity, no `pod` key", true, "exists", (w) => schemaRefused(w, { present: false })],
+      [
+        "identity, readable pod, C3.3 gone",
+        true,
+        "gone",
+        (w) => schemaRefused(w, { present: true, value: OTHER_POD }),
+      ],
+    ];
+    for (const [label, identity, proof, raw] of cases) {
+      for (const [verb, argv] of [SETTING_VERBS[0], SETTING_VERBS[3]] as typeof SETTING_VERBS) {
+        setProof(api, proof);
+        const world = makeWorld("a69-cli-r2-pass");
+        const env = cliEnv(world, identity, api.url);
+        const id = await createSession(env, cwd, `a69-r2pass-${label.replace(/\W/g, "")}`);
+        plantFor(world, id, raw(world));
+        const result = await runCli(env, cwd, argv(id));
+        const where = `${label} / ${verb}: rc ${result.status} ${result.stderr.slice(0, 300)}`;
+        assert.doesNotMatch(result.stderr, /REFUSED /, where);
+        assert.equal(result.status, 0, where);
+      }
+    }
+  } finally {
+    await api.close();
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("A-16 round 2 unit: `refuseWhileUnparsableLeaseHeld` judges only an UNPARSABLE lease — a parseable one is left to its own door, a missing one passes", async () => {
+  const world = makeWorld("a69-r2-unit");
+  const asked: string[] = [];
+  const deps = {
+    applies: () => true,
+    prove: async () => {
+      asked.push("prove");
+      return { answer: "exists" as const };
+    },
+  };
+  await withEnv(hostEnv(world, "control, switch off"), async () => {
+    await refuseWhileUnparsableLeaseHeld(ID, deps); // no lease at all
+    plant(world, parseableLease(world), OLD_MS);
+    await refuseWhileUnparsableLeaseHeld(ID, deps); // parseable: not this guard's
+    assert.deepEqual(asked, []);
+    plant(world, "", OLD_MS);
+    await assert.rejects(refuseWhileUnparsableLeaseHeld(ID, deps), (e: Error) =>
+      TURNOVER_TOKEN.test(e.message),
+    );
+    plant(world, schemaRefused(world, { present: true, value: OTHER_POD }), OLD_MS);
+    await assert.rejects(refuseWhileUnparsableLeaseHeld(ID, deps), (e: Error) =>
+      TURNOVER_TOKEN.test(e.message),
+    );
+    assert.deepEqual(
+      asked,
+      ["prove"],
+      "a readable pod is proven once; a body that names none is not",
+    );
+  });
+  await withEnv(hostEnv(world, "no identity"), async () => {
+    plant(world, "", OLD_MS);
+    await refuseWhileUnparsableLeaseHeld(ID, deps); // without the identity: as before
+  });
 });

@@ -100,6 +100,7 @@ import type {
 } from "./contracts.js";
 import { observeOwnerBeforeStop, reapTranscriptsAfterClose } from "./owner-exit-transcript-reap.js";
 import { clearBackgroundTaskChipAfterReap } from "./owner-task-reap.js";
+import { refuseWhileUnparsableLeaseHeld } from "./pod-wake-guard.js";
 import {
   runSessionSetConfigOptionDirect,
   runSessionSetDepthDirect,
@@ -118,6 +119,8 @@ import { gateSetConnect } from "./wake-gate.js";
 export async function cancelSessionPrompt(
   options: SessionCancelOptions,
 ): Promise<SessionCancelResult> {
+  // A-69 (3): a lease acpx cannot parse is no owner record, so the fallbacks below would act locally.
+  await refuseWhileUnparsableLeaseHeld(options.sessionId);
   const cancelled = await tryCancelOnRunningOwner(options);
   return {
     sessionId: options.sessionId,
@@ -128,6 +131,8 @@ export async function cancelSessionPrompt(
 export async function setSessionMode(
   options: SessionSetModeOptions,
 ): Promise<SessionSetModeResult> {
+  // A-69 (3): a lease acpx cannot parse is no owner record, so the fallbacks below would act locally.
+  await refuseWhileUnparsableLeaseHeld(options.sessionId);
   const submittedToOwner = await trySetModeOnRunningOwner(
     options.sessionId,
     options.modeId,
@@ -265,6 +270,8 @@ async function recycleLiveOwner(sessionId: string): Promise<OwnerRecycle> {
 export async function setSessionModel(
   options: SessionSetModelOptions,
 ): Promise<SessionSetModelResult> {
+  // A-69 (3): a lease acpx cannot parse is no owner record, so the fallbacks below would act locally.
+  await refuseWhileUnparsableLeaseHeld(options.sessionId);
   const record = await resolveSessionRecord(options.sessionId);
   // ⚠️ ORDER IS THE FIX. This refusal runs
   // BEFORE `trySetModelOnRunningOwner` / `runSessionSetModelDirect`, so a harness
@@ -367,6 +374,8 @@ async function setSessionConfigOptionOnRecord(
 export async function setSessionConfigOption(
   options: SessionSetConfigOptionOptions,
 ): Promise<SessionSetConfigOptionResult> {
+  // A-69 (3): a lease acpx cannot parse is no owner record, so the fallbacks below would act locally.
+  await refuseWhileUnparsableLeaseHeld(options.sessionId);
   // CLI-verb path: refuse if a turn is in flight, then recycle the owner after the
   // apply below (setDesiredConfigOption also syncs session_options.effort, which
   // the fresh owner reads into sessionContext). Internal/replay callers leave
@@ -457,6 +466,8 @@ async function setSessionConfigOptionWithoutOwner(
 export async function setSessionDepth(
   options: SessionSetDepthOptions,
 ): Promise<SessionSetDepthResult> {
+  // A-69 (3): a lease acpx cannot parse is no owner record, so the fallbacks below would act locally.
+  await refuseWhileUnparsableLeaseHeld(options.sessionId);
   const ownerProjection = await trySetDepthOnRunningOwner(
     options.sessionId,
     options.requested,

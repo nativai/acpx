@@ -69,3 +69,28 @@ export async function refuseWakeWhilePodNotGone(
     await refuseWhilePodNotGone(sessionId, pod, deps);
   }
 }
+
+/**
+ * A-69 (3) for every path that can start an adapter or contact an owner WITHOUT going through
+ * `connectToQueueOwner`: the setting verbs' no-owner fallbacks (`runSession*Direct`), `cancel`, and the
+ * flows' direct send. A lease acpx cannot parse is never a parsed owner record, so the connect door never
+ * sees it and each of those paths reads "no owner" and acts locally. This holds exactly what A-69 holds
+ * (`heldLeasePod`) with the one refusal the door gives a parseable lease: `pod_starting … phase=turnover`
+ * (75), before anything is written or started. ⚠️ ONLY an UNPARSABLE lease is judged here: a parseable one
+ * keeps its own door (a second proof of the same pod would be a second API request), and a host without the
+ * pod's identity reads an unparsable lease as no lease (`heldLeasePod`), so it is unchanged. Not for the queue
+ * owner itself, which holds its own lease. Pinned by the real-CLI row in `test/pod-a69-unparsable-lease.test.ts`.
+ */
+export async function refuseWhileUnparsableLeaseHeld(
+  sessionId: string,
+  deps: PodTurnoverDeps = livePodTurnoverDeps,
+): Promise<void> {
+  if (!deps.applies()) {
+    return;
+  }
+  const lease = await readQueueOwnerLeaseFile(sessionId);
+  const pod = lease.kind === "unparsable" ? heldLeasePod(lease) : undefined;
+  if (pod !== undefined) {
+    await refuseWhilePodNotGone(sessionId, pod, deps);
+  }
+}
