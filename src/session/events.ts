@@ -216,9 +216,11 @@ export async function appendInParts(
  * ⚠️ TEST SEAM, honoured ONLY under a non-empty `NODE_TEST_CONTEXT` (`node --test` sets it; `""` does not
  * count): when `ACPX_TEST_STREAM_HOLD_MID_LINE` names a file, the writer that has just synced a part of
  * a larger flush writes that file (its content is the stream path, so a test sees which file is held)
- * and then never returns. A test SIGKILLs the process there — a REAL writer dead mid-line, the A8 TE's
- * F1 shape (brick eef0805f) — instead of racing the parts. In production the variable is ignored.
- * Held by `test/stream-partial-line.test.ts` ("the hold seam is honoured only under NODE_TEST_CONTEXT").
+ * and then waits until a test REMOVES that file. A test either SIGKILLs the process there — a REAL
+ * writer dead mid-line, the A8 TE's F1 shape (brick eef0805f) — or removes the file and lets the
+ * writer finish its line (brick 3f33cc2d: a LIVE writer between parts while another appender comes).
+ * In production the variable is ignored. Held by `test/stream-partial-line.test.ts` ("the hold seam is
+ * honoured only under NODE_TEST_CONTEXT") and by the rows of `test/stream-appenders.test.ts`.
  */
 export function streamHoldMarkerForTest(env: NodeJS.ProcessEnv = process.env): string | undefined {
   if ((env.NODE_TEST_CONTEXT ?? "") === "") {
@@ -234,9 +236,9 @@ async function holdMidLineForTest(filePath: string): Promise<void> {
     return;
   }
   await fs.writeFile(marker, filePath, "utf8");
-  await new Promise<never>(() => {
-    setInterval(() => {}, 1_000_000);
-  });
+  while (await pathExists(marker)) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
 }
 
 /**
