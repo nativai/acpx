@@ -471,6 +471,13 @@ test("ee99 G1' batch twin (79.2) · atrium's batch spawn (`--batch-file -`, neve
         `${reason}/room: the batch goes to the pod once; the owner delivers each member once by its id`,
       );
       assert.equal((out.calls[0] ?? []).filter((arg) => arg === "--batch-file").length, 1, reason);
+      // da4b08ec: the token alone proved nothing — the `-` must be resolved to the payload file (a routed call has no stdin).
+      const batchAt = (out.calls[0] ?? []).indexOf("--batch-file");
+      assert.match(
+        (out.calls[0] ?? [])[batchAt + 1] ?? "",
+        /\.payload$/u,
+        `${reason}/room: --batch-file names the payload file, never "-"`,
+      );
       assert.equal(out.brokerRequests, 0, `${reason}/room: a Ready pod needs no broker`);
       assert.doesNotMatch(out.result.stderr, /REFUSED/u, `${reason}/room: nothing refused`);
       if (reason === "admission_busy") {
