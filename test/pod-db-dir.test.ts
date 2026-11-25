@@ -769,6 +769,16 @@ const SETTINGS: readonly Setting[] = [
     refuses: { source: "pointer", why: "unreadable", mention: pointerFile },
   },
   {
+    // atrium's `pointerProblem` (joint A-84 check, F-A84-2): lstat says the entry exists, so a failed
+    // read — ENOENT through a dead link included — is an unusable pointer, never an absent one.
+    name: "pointer is a DANGLING SYMLINK",
+    arrange: (box) => {
+      fs.rmSync(pointerFile(box), { force: true });
+      fs.symlinkSync(path.join(box.home, "unmounted", "pointer.json"), pointerFile(box));
+    },
+    refuses: { source: "pointer", why: "unreadable", mention: pointerFile },
+  },
+  {
     name: "pointer empty",
     arrange: withPointer(""),
     refuses: { source: "pointer", why: "not_json", mention: pointerFile },
@@ -821,6 +831,32 @@ const SETTINGS: readonly Setting[] = [
       source: "pointer",
       why: "dir_not_found",
       mention: (box) => path.join(box.home, "unmounted", "volume", "db"),
+    },
+  },
+  {
+    name: "pointer names a DANGLING SYMLINK as the directory",
+    arrange: (box) => {
+      const link = path.join(box.home, "control", "dead-link");
+      fs.symlinkSync(path.join(box.home, "unmounted", "volume"), link);
+      withPointer(JSON.stringify({ dir: link }))(box);
+    },
+    refuses: {
+      source: "pointer",
+      why: "dir_not_found",
+      mention: (box) => path.join(box.home, "control", "dead-link"),
+    },
+  },
+  {
+    name: "ACPX_UI_DB_DIR is a DANGLING SYMLINK",
+    arrange: (box) => {
+      const link = path.join(box.home, "control", "dead-env-link");
+      fs.symlinkSync(path.join(box.home, "unmounted", "volume"), link);
+      process.env.ACPX_UI_DB_DIR = link;
+    },
+    refuses: {
+      source: "env",
+      why: "dir_not_found",
+      mention: (box) => path.join(box.home, "control", "dead-env-link"),
     },
   },
   {
