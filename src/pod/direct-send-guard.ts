@@ -65,5 +65,5 @@ async function leaseHeldElsewhere(
   }
   return holder.uid === lockPodIdentity(env)?.uid
     ? undefined
-    : `The session's lease is held by another pod (${holder.name}).`;
+    : "The session's lease is held by another pod.";
 }

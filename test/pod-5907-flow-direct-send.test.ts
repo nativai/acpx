@@ -193,7 +193,7 @@ test("C1.2-F.1 (ii): in the utility pod, a session whose lease is held elsewhere
   }[] = [
     {
       name: "a POOL session: the lease names another pod",
-      holder: /The session's lease is held by another pod \(ag-/,
+      holder: /The session's lease is held by another pod\./,
       lease: async (world) => {
         await writePodLease({ ...makeWorld("f1iipo"), home: world.home }, SESSION);
       },
