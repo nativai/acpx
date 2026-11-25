@@ -165,7 +165,8 @@ test("C1.2-F.1 (i): a control-role host in pod mode refuses the direct send befo
 test("C1.2-F.1 (ii): in the utility pod, a session whose lease is held elsewhere is refused before anything is written — a POOL session (another pod's lease) and a HOME session (a lease without `pod`)", async () => {
   await inWorld("f1iip", { place: "agent-pod", podMode: true }, async (world) => {
     const other = { ...makeWorld("f1iipo"), home: world.home };
-    await writePodLease(other, SESSION);
+    await writePodLease(other, SESSION); // removes the place file (same home): put this pod's back
+    fs.writeFileSync(path.join(world.home, ".nv-agent"), `${world.pod.name}\n`);
     await refused(
       world,
       /reason=pod_foreign_write file=session/,
