@@ -191,8 +191,12 @@ function pointerDir(database: SqliteDatabaseName, file: string, text: string): s
   }
   const dir =
     typeof parsed === "object" && parsed !== null ? (parsed as { dir?: unknown }).dir : undefined;
-  const named = typeof dir === "string" ? dir.trim() : "";
-  if (!named) {
+  // ⚠️ THE POINTER'S `dir` IS READ UNTRIMMED — only the blank test trims. atrium's `pointerProblem` tests
+  // `j.dir` as it stands: ` /x/db` is relative there and `/x/db ` names a directory that is not there.
+  // A `.trim()` here opened `/x/db` for both, so the two sides classified one pointer two ways (and two
+  // ledgers if both directories existed). `ACPX_UI_DB_DIR` IS trimmed on both sides (atrium: `dbDir()`).
+  const named = typeof dir === "string" ? dir : "";
+  if (!named.trim()) {
     throw new DatabaseDirUnusableError(database, "pointer", "no_dir_string", { pointer: file });
   }
   if (!path.isAbsolute(named)) {
