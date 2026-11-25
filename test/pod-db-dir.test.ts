@@ -644,12 +644,8 @@ const CLI = path.resolve(
 
 function childEnv(box: Box): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
-  for (const name of [
-    "ACPX_STATE_HOME",
-    "ACPX_UI_PREFS_DB",
-    "ACPX_UI_DB_DIR",
-    "ACPX_UI_INTERNAL_URL",
-  ]) {
+  // ACPX_UI_DB_DIR is the row's own: `sandbox()` cleared it, and an A-84 row may have set it since.
+  for (const name of ["ACPX_STATE_HOME", "ACPX_UI_PREFS_DB", "ACPX_UI_INTERNAL_URL"]) {
     delete env[name];
   }
   return { ...env, HOME: box.home };
@@ -905,6 +901,11 @@ for (const setting of SETTINGS) {
       );
     }
     assert.deepEqual(tree(box.home), before, "the state tree is byte-identical");
+    assert.equal(
+      fs.existsSync(path.resolve("rel")),
+      false,
+      "a relative setting is never taken from the caller's own working directory",
+    );
     assert.deepEqual(present(box.acpx, "brick-outbox"), []);
     assert.deepEqual(present(box.acpx, "ui-prefs"), []);
   });
@@ -921,9 +922,9 @@ for (const setting of SETTINGS) {
       );
       const output = `${run.stdout}\n${run.stderr}`;
       assert.equal(run.status, 2, output);
-      const refusedLines = output.split("\n").filter((line) => line.includes("REFUSED"));
+      const refusedLine = output.split("\n").find((line) => line.includes("REFUSED"));
       assert.ok(
-        refusedLines[0]?.includes(FIRST_REFUSED("ui-prefs", refuses.source, refuses.why)),
+        refusedLine?.includes(FIRST_REFUSED("ui-prefs", refuses.source, refuses.why)),
         output,
       );
       assert.ok(!output.includes('"favorites":[]') && !output.includes('"favorites": []'), output);

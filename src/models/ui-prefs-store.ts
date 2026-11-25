@@ -24,7 +24,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { StatementSync } from "node:sqlite";
-import { assertNotAtOldPlace, type ControlDatabase, controlDatabase } from "../pod/db-dir.js";
+import { assertPlaced, type ControlDatabase, controlDatabase } from "../pod/db-dir.js";
 import { loadSqlite } from "../pod/sqlite-loader.js";
 
 const SCHEMA_SQL = `
@@ -104,9 +104,12 @@ export function openUiPrefsStore(explicitPath?: string): UiPrefsStore {
   const dbPath = placed.path;
   // Before the directory is created: an agent pod's refusal leaves nothing behind.
   const { DatabaseSync: Database } = loadSqlite("ui-prefs", dbPath);
-  // Never a second store: found only at the old place, a pod-mode open refuses (nothing made).
-  assertNotAtOldPlace("ui-prefs", placed);
-  fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  // Never a second store (found only at the old place: refused) and never atrium's directory made (a
+  // setting naming none: refused); only the legacy place, or an explicit path, is ever created (A-83, A-84).
+  assertPlaced("ui-prefs", placed);
+  if (!placed.relocated) {
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+  }
   const db = new Database(dbPath);
   // WAL is what makes the two-writer case safe for concurrent readers.
   db.exec("PRAGMA journal_mode = WAL");
