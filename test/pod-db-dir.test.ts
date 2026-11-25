@@ -742,7 +742,13 @@ async function openOn(surface: Surface): Promise<void> {
   }
 }
 
-type Unusable = { source: "env" | "pointer"; why: string; mention: (box: Box) => string };
+type Unusable = {
+  source: "env" | "pointer";
+  why: string;
+  mention: (box: Box) => string;
+  /** What `wakeups`' pass-over resolver (which TRIMS the pointer's dir) resolves to, where it differs from `mention`. */
+  wakeupsDir?: (box: Box) => string;
+};
 type Setting = { name: string; arrange: (box: Box) => void; refuses?: Unusable };
 
 const pointerFile = (box: Box): string => path.join(box.acpx, ".db-dir.json");
@@ -857,6 +863,29 @@ const SETTINGS: readonly Setting[] = [
       source: "env",
       why: "dir_not_found",
       mention: (box) => path.join(box.home, "control", "dead-env-link"),
+    },
+  },
+  {
+    // TE F1 (A-84 verification of 0932d29d): atrium's `pointerProblem` tests `dir` UNtrimmed, so a leading
+    // space is relative and a trailing one names a directory that is not there. acpx trimmed both away
+    // and opened the trimmed directory — two ledgers if `/x/db ` and `/x/db` both exist.
+    name: "pointer dir has a LEADING space (` /abs/db`)",
+    arrange: (box) => withPointer(JSON.stringify({ dir: ` ${box.dbDir}` }))(box),
+    refuses: {
+      source: "pointer",
+      why: "relative",
+      mention: (box) => ` ${box.dbDir}`,
+      wakeupsDir: (box) => box.dbDir,
+    },
+  },
+  {
+    name: "pointer dir has a TRAILING space (`/abs/db `)",
+    arrange: (box) => withPointer(JSON.stringify({ dir: `${box.dbDir} ` }))(box),
+    refuses: {
+      source: "pointer",
+      why: "dir_not_found",
+      mention: (box) => `${box.dbDir} `,
+      wakeupsDir: (box) => box.dbDir,
     },
   },
   {
@@ -983,9 +1012,11 @@ for (const setting of SETTINGS) {
     const expected =
       refuses.source === "env"
         ? path.join(process.env.ACPX_UI_DB_DIR as string, "wakeups.db")
-        : refuses.why === "dir_not_found"
-          ? path.join(refuses.mention(box), "wakeups.db")
-          : path.join(box.acpx, "wakeups.db");
+        : refuses.wakeupsDir
+          ? path.join(refuses.wakeupsDir(box), "wakeups.db")
+          : refuses.why === "dir_not_found"
+            ? path.join(refuses.mention(box), "wakeups.db")
+            : path.join(box.acpx, "wakeups.db");
     assert.equal(resolved, expected);
     const liveness = await loadWakeupLiveness(hot);
     assert.ok(["absent", "unevaluable"].includes(liveness.status), liveness.status);
