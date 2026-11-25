@@ -40,19 +40,22 @@ function hostFacts(env: NodeJS.ProcessEnv): HostFacts {
   return { env, controlRole: isControlPod(env), homedir: os.homedir() };
 }
 
+const OWNER_ENTRY_SENTENCE =
+  "In pod mode a session's owner runs only in that session's own agent pod; this process is not it, so no lease was taken and nothing was started.";
+
 /**
  * C7.2 `acpx: REFUSED reason=owner_outside_pod session=<record id>` (exit 2): the owner entry was
  * started anywhere but in the session's own pod. A guard that fails closed — not a hold reason.
+ * (C7.2, clarified 2026-11-25) Also what a flow's direct send meets in an agent pod that does not hold the session's
+ * lease (`direct-send-guard.ts`): the refusal line is the same; the sentence after it names the holder.
  */
 export class OwnerOutsidePodError extends Error {
   readonly stderrLine: string;
   readonly exitCode = OWNER_OUTSIDE_POD_EXIT_CODE;
   readonly sessionId: string;
-  constructor(sessionId: string) {
+  constructor(sessionId: string, sentence: string = OWNER_ENTRY_SENTENCE) {
     const line = `acpx: REFUSED reason=${OWNER_OUTSIDE_POD_REASON} session=${sessionId}`;
-    super(
-      `${line}\nIn pod mode a session's owner runs only in that session's own agent pod; this process is not it, so no lease was taken and nothing was started.`,
-    );
+    super(`${line}\n${sentence}`);
     this.stderrLine = line;
     this.sessionId = sessionId;
   }

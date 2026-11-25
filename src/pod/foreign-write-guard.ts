@@ -25,23 +25,11 @@ export type BoxWideFile = "index" | "seat-store" | "registry" | "ledger";
 
 export const POD_FOREIGN_WRITE_REASON = "pod_foreign_write";
 
-/**
- * `session` (brick 59070d68, C1.2 "A flow's direct send"): the target session's own files, refused to a pod that
- * does not hold the session's lease. Same reason token, same exit code, same class — only the `file=` value is new.
- */
-export type RefusedFile = BoxWideFile | "session";
-
-const SESSION_REFUSAL_TAIL =
-  "this agent pod does not hold the session's lease; a session's files are written only by the pod " +
-  "that holds it (C10, C1.2). Nothing was written.";
-const BOX_WIDE_REFUSAL_TAIL =
-  "this is an agent pod; box-wide files are written on the control pod only (C1.2). Nothing was written.";
-
 export class PodForeignWriteError extends AcpxOperationalError {
-  constructor(readonly file: RefusedFile) {
+  constructor(readonly file: BoxWideFile) {
     super(
-      `acpx: REFUSED reason=${POD_FOREIGN_WRITE_REASON} file=${file} — ` +
-        (file === "session" ? SESSION_REFUSAL_TAIL : BOX_WIDE_REFUSAL_TAIL),
+      `acpx: REFUSED reason=${POD_FOREIGN_WRITE_REASON} file=${file} — this is an agent pod; ` +
+        `box-wide files are written on the control pod only (C1.2). Nothing was written.`,
       { outputCode: "USAGE", detailCode: POD_FOREIGN_WRITE_REASON, origin: "cli" },
     );
   }

@@ -1,6 +1,6 @@
 import { readQueueOwnerLeaseFile } from "../cli/queue/lease-store.js";
-import { PodForeignWriteError } from "./foreign-write-guard.js";
 import { lockHostPlace, lockPodIdentity } from "./identity.js";
+import { OwnerOutsidePodError } from "./owner-pod.js";
 import { BridgeOnControlPodError, podModeVerdictNow, readPodFileWithWitness } from "./placement.js";
 
 /**
@@ -29,17 +29,41 @@ export async function refuseFlowDirectSendOutsideItsPod(
   if (podModeVerdictNow(env).mode !== "off" && readPodFileWithWitness(env).kind === "absent") {
     throw new BridgeOnControlPodError("adapter");
   }
-  if (lockHostPlace(env) === "agent-pod" && !(await leaseIsAbsentOrOwn(sessionId, env))) {
-    throw new PodForeignWriteError("session");
+  if (lockHostPlace(env) !== "agent-pod") {
+    return;
+  }
+  const heldBy = await leaseHeldElsewhere(sessionId, env);
+  if (heldBy !== undefined) {
+    throw new OwnerOutsidePodError(
+      sessionId,
+      `${heldBy} A flow's direct send runs a turn only in the pod that holds the session's lease; nothing was written.`,
+    );
   }
 }
 
-/** No lease, or one this pod wrote. Anything else — another pod, no `pod`, unreadable — is not this pod's to write beside. */
-async function leaseIsAbsentOrOwn(sessionId: string, env: NodeJS.ProcessEnv): Promise<boolean> {
+/**
+ * Undefined: no lease, or the lease of THIS pod. Else the sentence that names the holder: another pod, a home owner
+ * (a lease without `pod`), a `pod` key that names no pod, or a lease that cannot be read. Never an API call (C3.2).
+ */
+async function leaseHeldElsewhere(
+  sessionId: string,
+  env: NodeJS.ProcessEnv,
+): Promise<string | undefined> {
   const lease = await readQueueOwnerLeaseFile(sessionId);
   if (lease.kind === "missing") {
-    return true;
+    return undefined;
   }
-  const own = lockPodIdentity(env);
-  return own !== undefined && lease.kind === "ok" && lease.record.pod?.uid === own.uid;
+  if (lease.kind !== "ok") {
+    return "The session's lease cannot be read.";
+  }
+  if (lease.record.podUnreadable === true) {
+    return "The session's lease names a pod that cannot be read.";
+  }
+  const holder = lease.record.pod;
+  if (holder === undefined) {
+    return "The session's lease is held by a home owner on the control pod (a lease without a pod).";
+  }
+  return holder.uid === lockPodIdentity(env)?.uid
+    ? undefined
+    : `The session's lease is held by another pod (${holder.name}).`;
 }
