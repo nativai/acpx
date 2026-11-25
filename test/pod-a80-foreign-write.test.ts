@@ -822,3 +822,72 @@ test("80.1 pair: on a control-role host with NO lease naming a pod, an async app
     fs.rmSync(world.root, { recursive: true, force: true });
   }
 });
+
+// ---- 80.4, TE E2 (F-1): the 1 s a proof may serve counts from when the proof STARTED ----------------------------
+
+test("80.4 E2: a SLOW `gone` proof (1.8 s) and a live pod's lease that appears 0.3 s into it: the writer's next frame goes to the sidecar, never into the stream", async () => {
+  const ctl = makeWorld("a80e2");
+  const podABase = makeWorld("a80e2a");
+  const podBBase = makeWorld("a80e2b");
+  const podA: PodWorld = { ...podABase, home: ctl.home };
+  const podB: PodWorld = { ...podBBase, home: ctl.home };
+  const api = await startFakeApiServer({
+    // A: absent on a Ready node (`gone`) — but its GET answers 1.8 s late. B exists.
+    pods: [
+      { name: podB.pod.name, namespace: KIT_NAMESPACE, uid: podB.pod.uid, node: podB.pod.node },
+    ],
+    nodes: [
+      { name: podA.pod.node, ready: "True" },
+      { name: podB.pod.node, ready: "True" },
+    ],
+    faults: [
+      {
+        mode: "slow",
+        delayMs: 1_800,
+        times: 1,
+        path: `/api/v1/namespaces/${KIT_NAMESPACE}/pods/${podA.pod.name}`,
+      },
+    ],
+  });
+  const env = worldEnv(ctl, {
+    podMode: true,
+    extra: { ACPX_POD_API_URL: api.url, HOME: ctl.home },
+  });
+  try {
+    await withEnv(env, async () => {
+      const sid = "a80-e2";
+      fs.mkdirSync(sessionBaseDir(), { recursive: true });
+      fs.writeFileSync(sessionEventActivePath(sid), SEED_STREAM_LINE);
+      await writeSessionRecord(record(sid, ctl.home));
+      // B's lease bytes, built BEFORE the measured window and swapped by an atomic rename: `writePodLease` swaps
+      // `process.env` to the other pod's identity in-process, which a polling appender would take on (TE hazard).
+      await writePodLease(podB, sid);
+      const leaseB = fs.readFileSync(queueLockFilePath(sid, ctl.home));
+      fs.rmSync(queueLockFilePath(sid, ctl.home));
+      await writePodLease(podA, sid);
+      const before = fs.readFileSync(sessionEventActivePath(sid), "utf8");
+      const started = Date.now();
+      const opening = SessionEventWriter.open(record(sid, ctl.home));
+      await sleep(300);
+      const swapTmp = `${queueLockFilePath(sid, ctl.home)}.swap`;
+      fs.writeFileSync(swapTmp, leaseB);
+      fs.renameSync(swapTmp, queueLockFilePath(sid, ctl.home));
+      const writer = await opening;
+      assert.ok(Date.now() - started >= 1_700, "the proof really was slow");
+      await sleep(400);
+      await writer.appendMessage(frame(1));
+      await writer.close();
+      assert.equal(
+        fs.readFileSync(sessionEventActivePath(sid), "utf8"),
+        before,
+        "no frame reaches the stream more than 1 s after the live pod's lease appeared — the proof's 1 s counts from its START",
+      );
+      assert.equal(sidecarLines(sid).length, 1);
+    });
+  } finally {
+    await api.close();
+    for (const root of [ctl.root, podABase.root, podBBase.root]) {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
