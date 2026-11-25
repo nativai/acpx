@@ -1,5 +1,5 @@
 /**
- * `~/.acpx/ui-prefs.db` — the per-box model preferences store: favorites, and
+ * `ui-prefs.db` (`~/.acpx`, or atrium's database directory in pod mode) — the per-box model preferences store: favorites, and
  * the last-used model per agent type.
  *
  * WHY A DATABASE AND NOT A JSON FILE (C4 §7.5): it has TWO writers in two
@@ -24,6 +24,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { StatementSync } from "node:sqlite";
+import { assertNotAtOldPlace, type ControlDatabase, controlDatabase } from "../pod/db-dir.js";
 import { loadSqlite } from "../pod/sqlite-loader.js";
 
 const SCHEMA_SQL = `
@@ -67,13 +68,24 @@ export type UiPrefsStore = {
   close(): void;
 };
 
-/** `ACPX_UI_PREFS_DB` overrides the file; `ACPX_STATE_HOME` moves the whole `.acpx` tree. */
-export function defaultUiPrefsDbPath(): string {
+/**
+ * `ACPX_UI_PREFS_DB` overrides the file; `ACPX_STATE_HOME` moves the whole `.acpx` tree. In pod mode the
+ * file is in atrium's database directory (A-83, `pod/db-dir.ts`), unless the override names it.
+ */
+function placeUiPrefsDb(): ControlDatabase {
   const explicit = process.env.ACPX_UI_PREFS_DB?.trim();
   if (explicit) {
-    return path.resolve(explicit);
+    const target = path.resolve(explicit);
+    return { path: target, legacyPath: target, relocated: false };
   }
-  return path.join(process.env.ACPX_STATE_HOME || os.homedir(), ".acpx", "ui-prefs.db");
+  return controlDatabase(
+    "ui-prefs.db",
+    path.join(process.env.ACPX_STATE_HOME || os.homedir(), ".acpx"),
+  );
+}
+
+export function defaultUiPrefsDbPath(): string {
+  return placeUiPrefsDb().path;
 }
 
 // The one `node:sqlite` loader (and its agent-pod refusal) lives in `pod/sqlite-loader.ts`; the
@@ -84,9 +96,16 @@ function toIso(epochMs: number): string {
   return new Date(epochMs).toISOString();
 }
 
-export function openUiPrefsStore(dbPath: string = defaultUiPrefsDbPath()): UiPrefsStore {
+export function openUiPrefsStore(explicitPath?: string): UiPrefsStore {
+  const placed: ControlDatabase =
+    explicitPath === undefined
+      ? placeUiPrefsDb()
+      : { path: explicitPath, legacyPath: explicitPath, relocated: false };
+  const dbPath = placed.path;
   // Before the directory is created: an agent pod's refusal leaves nothing behind.
   const { DatabaseSync: Database } = loadSqlite("ui-prefs", dbPath);
+  // Never a second store: found only at the old place, a pod-mode open refuses (nothing made).
+  assertNotAtOldPlace("ui-prefs", placed);
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new Database(dbPath);
   // WAL is what makes the two-writer case safe for concurrent readers.
@@ -172,7 +191,9 @@ export function getUiPrefsStore(): UiPrefsStore {
   const dbPath = defaultUiPrefsDbPath();
   if (!singleton || singleton.dbPath !== dbPath) {
     singleton?.close();
-    singleton = openUiPrefsStore(dbPath);
+    singleton = undefined;
+    // No path argument: the store places itself, which is where the never-a-second-store check lives.
+    singleton = openUiPrefsStore();
   }
   return singleton;
 }

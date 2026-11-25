@@ -1,19 +1,26 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { openUiPrefsStore } from "../src/models/ui-prefs-store.js";
+import { fileURLToPath } from "node:url";
+import {
+  getUiPrefsStore,
+  openUiPrefsStore,
+  readFavoriteKeysSafely,
+} from "../src/models/ui-prefs-store.js";
 import { DatabaseAtOldPlaceError, DB_AT_OLD_PLACE_REASON } from "../src/pod/db-dir.js";
 import { podModeVerdictNow } from "../src/pod/placement.js";
 import { PodNoSqliteError } from "../src/pod/sqlite-loader.js";
 import { SpawnLedger } from "../src/spawn-ledger.js";
 
-// A-83 / block A7 (brick 231b61db), rows 83.1 and 83.2 (acpx's half): in pod mode the spawn ledger
+// A-83 / block A7 (brick 231b61db), rows 83.1 and 83.2 (acpx's half): the spawn ledger
 // (`brick-outbox.db`) and the model preferences (`ui-prefs.db`) open in the directory atrium's databases
-// are in — `ACPX_UI_DB_DIR`, else the `dir` of `<root>/.db-dir.json`, else `<root>` — and never a second
+// are in — `ACPX_UI_DB_DIR`, else the `dir` of `<root>/.db-dir.json`, else `<root>` — in pod mode AND
+// out of it (the key is the directory setting; atrium's pointer survives a revert), never in an agent pod, and never a second
 // ledger: a file found only at the old place is REFUSED (acpx never moves a WAL database that a live
 // process may hold open; atrium's start does the move, behind its fence).
 //
@@ -113,35 +120,54 @@ function admit(box: Box): void {
   );
 }
 
+/**
+ * Runs `make` as an old build would have: no database directory yet (the pointer hidden, the env
+ * unset), so the file is made at the old place — then everything is put back.
+ */
+function atTheOldPlace<T>(box: Box, make: () => T): T {
+  const pointer = path.join(box.acpx, ".db-dir.json");
+  const kept = fs.existsSync(pointer) ? fs.readFileSync(pointer) : undefined;
+  const keptEnv = process.env.ACPX_UI_DB_DIR;
+  fs.rmSync(pointer, { force: true });
+  delete process.env.ACPX_UI_DB_DIR;
+  try {
+    return make();
+  } finally {
+    if (kept !== undefined) {
+      fs.writeFileSync(pointer, kept);
+    }
+    if (keptEnv !== undefined) {
+      process.env.ACPX_UI_DB_DIR = keptEnv;
+    }
+  }
+}
+
 /** A ledger the way today's build leaves it: at the old place, with a committed row still in its WAL. */
 function fullLedgerAtOldPlace(box: Box): SpawnLedger {
-  const saved = process.env.ACPX_OWNER_PLACEMENT;
-  delete process.env.ACPX_OWNER_PLACEMENT; // pod mode off: the old place
-  try {
+  return atTheOldPlace(box, () => {
     admit(box);
     const ledger = new SpawnLedger();
     assert.equal(ledger.dbPath, path.join(box.acpx, "brick-outbox.db"));
     ledger.bindIdentity({ instance_id: INSTANCE });
     return ledger; // left open: its -wal holds the committed row
-  } finally {
-    if (saved !== undefined) {
-      process.env.ACPX_OWNER_PLACEMENT = saved;
-    }
-  }
+  });
 }
 
 function fullPrefsAtOldPlace(box: Box): ReturnType<typeof openUiPrefsStore> {
-  const saved = process.env.ACPX_OWNER_PLACEMENT;
-  delete process.env.ACPX_OWNER_PLACEMENT;
-  try {
+  return atTheOldPlace(box, () => {
     const store = openUiPrefsStore();
     assert.equal(store.dbPath, path.join(box.acpx, "ui-prefs.db"));
     store.addFavorite("openrouter", "acme/model-1", 1000);
     return store;
-  } finally {
-    if (saved !== undefined) {
-      process.env.ACPX_OWNER_PLACEMENT = saved;
-    }
+  });
+}
+
+/** The two states the key must hold in: pod mode on, and pod mode off (a revert keeps the pointer). */
+const MODES = [true, false] as const;
+const modeLabel = (switched: boolean): string => `pod mode ${switched ? "on" : "off"}`;
+function eachMode(title: string, run: (switched: boolean) => void | Promise<void>): void {
+  for (const switched of MODES) {
+    test(`${title} [${modeLabel(switched)}]`, () => run(switched));
   }
 }
 
@@ -214,34 +240,51 @@ test("83.1 the model preferences open in the pointer's directory, WAL files incl
   }
 });
 
-test("83.1 (pair) pod mode off: both stay under ~/.acpx whatever the pointer and ACPX_UI_DB_DIR say", () => {
-  const box = sandbox({ switched: false });
-  process.env.ACPX_UI_DB_DIR = box.otherDir;
-  const ledger = new SpawnLedger();
-  const store = openUiPrefsStore();
-  try {
-    assert.equal(ledger.dbPath, path.join(box.acpx, "brick-outbox.db"));
-    assert.equal(store.dbPath, path.join(box.acpx, "ui-prefs.db"));
-  } finally {
-    ledger.close();
-    store.close();
-  }
-  assert.equal(fs.existsSync(box.dbDir), false);
-  assert.equal(fs.existsSync(box.otherDir), false);
-});
+// The key is the directory setting, not pod mode (atrium sub-HoD #9 measured the pointer and the moved
+// files surviving a revert to pod mode off on devbox-staging): both states, both ways.
+for (const switched of MODES) {
+  test(`83.1 the pointer is followed in ${modeLabel(switched)}: both files in its directory, nothing under ~/.acpx`, () => {
+    const box = sandbox({ switched });
+    const ledger = new SpawnLedger();
+    const store = openUiPrefsStore();
+    try {
+      assert.equal(ledger.dbPath, path.join(box.dbDir, "brick-outbox.db"));
+      assert.equal(store.dbPath, path.join(box.dbDir, "ui-prefs.db"));
+      store.addFavorite("openrouter", "acme/model-1", 1000);
+    } finally {
+      ledger.close();
+      store.close();
+    }
+    assert.deepEqual(present(box.acpx, "brick-outbox"), []);
+    assert.deepEqual(present(box.acpx, "ui-prefs"), []);
+  });
 
-test("83.1 pod mode with no pointer and no ACPX_UI_DB_DIR: today's place, the state home", () => {
-  const box = sandbox({ pointer: false });
-  const ledger = new SpawnLedger();
-  const store = openUiPrefsStore();
-  try {
-    assert.equal(ledger.dbPath, path.join(box.acpx, "brick-outbox.db"));
-    assert.equal(store.dbPath, path.join(box.acpx, "ui-prefs.db"));
-  } finally {
-    ledger.close();
-    store.close();
-  }
-});
+  test(`83.1 ACPX_UI_DB_DIR alone (no pointer) is followed in ${modeLabel(switched)}`, () => {
+    const box = sandbox({ switched, pointer: false });
+    process.env.ACPX_UI_DB_DIR = box.otherDir;
+    const ledger = new SpawnLedger();
+    try {
+      assert.equal(ledger.dbPath, path.join(box.otherDir, "brick-outbox.db"));
+    } finally {
+      ledger.close();
+    }
+    assert.deepEqual(present(box.acpx, "brick-outbox"), []);
+  });
+
+  test(`83.1 NEGATIVE: with no pointer and no ACPX_UI_DB_DIR the place is today's, in ${modeLabel(switched)}`, () => {
+    const box = sandbox({ switched, pointer: false });
+    const ledger = new SpawnLedger();
+    const store = openUiPrefsStore();
+    try {
+      assert.equal(ledger.dbPath, path.join(box.acpx, "brick-outbox.db"));
+      assert.equal(store.dbPath, path.join(box.acpx, "ui-prefs.db"));
+    } finally {
+      ledger.close();
+      store.close();
+    }
+    assert.equal(fs.existsSync(path.join(box.home, "control")), false);
+  });
+}
 
 test("83.1 an explicit ACPX_UI_PREFS_DB still names the preferences file, in pod mode too", () => {
   const box = sandbox();
@@ -277,68 +320,66 @@ test("83.1 NEGATIVE: an agent pod never learns the directory — both open as be
 
 // ---------------------------------------------------------------- 83.2 — never two ledgers
 
-test("83.2 a ledger found only at the old place is refused: nothing is opened, made or moved", () => {
-  const box = sandbox({ switched: false });
-  const holder = fullLedgerAtOldPlace(box);
-  const old = path.join(box.acpx, "brick-outbox.db");
-  try {
-    assert.ok(fs.existsSync(`${old}-wal`), "the committed row is still in the WAL");
-    const before = { main: sha(old), wal: sha(`${old}-wal`) };
-    process.env.ACPX_OWNER_PLACEMENT = "pod";
-    assert.equal(podModeVerdictNow().mode, "pod");
-    assert.throws(() => new SpawnLedger(), refusedAtOldPlace("spawn-ledger"));
-    assert.deepEqual(
-      present(box.dbDir, ""),
-      [],
-      "no empty ledger beside the full one — nothing in the directory",
-    );
-    assert.equal(fs.existsSync(box.dbDir), false);
-    assert.deepEqual(
-      { main: sha(old), wal: sha(`${old}-wal`) },
-      before,
-      "the old files are untouched",
-    );
-  } finally {
-    holder.close();
-  }
-});
+eachMode(
+  `83.2 a ledger found only at the old place is refused: nothing is opened, made or moved`,
+  (switched) => {
+    const box = sandbox({ switched });
+    const holder = fullLedgerAtOldPlace(box);
+    const old = path.join(box.acpx, "brick-outbox.db");
+    try {
+      assert.ok(fs.existsSync(`${old}-wal`), "the committed row is still in the WAL");
+      const before = { main: sha(old), wal: sha(`${old}-wal`) };
+      assert.throws(() => new SpawnLedger(), refusedAtOldPlace("spawn-ledger"));
+      assert.deepEqual(
+        present(box.dbDir, ""),
+        [],
+        "no empty ledger beside the full one — nothing in the directory",
+      );
+      assert.equal(fs.existsSync(box.dbDir), false);
+      assert.deepEqual(
+        { main: sha(old), wal: sha(`${old}-wal`) },
+        before,
+        "the old files are untouched",
+      );
+    } finally {
+      holder.close();
+    }
+  },
+);
 
-test("83.2 the refusal names both places and says who moves the file", () => {
-  const box = sandbox({ switched: false });
+eachMode(`83.2 the refusal names both places and says who moves the file`, (switched) => {
+  const box = sandbox({ switched });
   const holder = fullLedgerAtOldPlace(box);
   try {
-    process.env.ACPX_OWNER_PLACEMENT = "pod";
     assert.throws(
       () => new SpawnLedger(),
       (error) =>
         error instanceof DatabaseAtOldPlaceError &&
         error.message.includes(path.join(box.acpx, "brick-outbox.db")) &&
         error.message.includes(path.join(box.dbDir, "brick-outbox.db")) &&
-        /atrium/.test(error.message),
+        error.message.includes("atrium"),
     );
   } finally {
     holder.close();
   }
 });
 
-test("83.2 NEGATIVE: only the old place's -wal (main file gone) is data too — refused", () => {
-  const box = sandbox({ switched: false });
-  const holder = fullLedgerAtOldPlace(box);
-  const old = path.join(box.acpx, "brick-outbox.db");
-  try {
+eachMode(
+  `83.2 NEGATIVE: only the old place's -wal (main file gone) is data too — refused`,
+  (switched) => {
+    const box = sandbox({ switched });
+    const holder = fullLedgerAtOldPlace(box);
+    const old = path.join(box.acpx, "brick-outbox.db");
     fs.copyFileSync(`${old}-wal`, path.join(box.home, "wal.keep"));
     holder.close();
     fs.rmSync(old, { force: true });
     fs.rmSync(`${old}-shm`, { force: true });
     fs.rmSync(`${old}-wal`, { force: true });
     fs.copyFileSync(path.join(box.home, "wal.keep"), `${old}-wal`);
-    process.env.ACPX_OWNER_PLACEMENT = "pod";
     assert.throws(() => new SpawnLedger(), refusedAtOldPlace("spawn-ledger"));
     assert.equal(fs.existsSync(box.dbDir), false);
-  } finally {
-    holder.close();
-  }
-});
+  },
+);
 
 test("83.2 a stray -shm alone at the old place is not data: the open goes ahead at the new place", () => {
   const box = sandbox();
@@ -351,20 +392,22 @@ test("83.2 a stray -shm alone at the old place is not data: the open goes ahead 
   }
 });
 
-test("83.2 the model preferences found only at the old place are refused the same way", () => {
-  const box = sandbox({ switched: false });
-  const holder = fullPrefsAtOldPlace(box);
-  const old = path.join(box.acpx, "ui-prefs.db");
-  try {
-    const before = { main: sha(old), wal: sha(`${old}-wal`) };
-    process.env.ACPX_OWNER_PLACEMENT = "pod";
-    assert.throws(() => openUiPrefsStore(), refusedAtOldPlace("ui-prefs"));
-    assert.equal(fs.existsSync(box.dbDir), false, "no empty preferences beside the full ones");
-    assert.deepEqual({ main: sha(old), wal: sha(`${old}-wal`) }, before);
-  } finally {
-    holder.close();
-  }
-});
+eachMode(
+  `83.2 the model preferences found only at the old place are refused the same way`,
+  (switched) => {
+    const box = sandbox({ switched });
+    const holder = fullPrefsAtOldPlace(box);
+    const old = path.join(box.acpx, "ui-prefs.db");
+    try {
+      const before = { main: sha(old), wal: sha(`${old}-wal`) };
+      assert.throws(() => openUiPrefsStore(), refusedAtOldPlace("ui-prefs"));
+      assert.equal(fs.existsSync(box.dbDir), false, "no empty preferences beside the full ones");
+      assert.deepEqual({ main: sha(old), wal: sha(`${old}-wal`) }, before);
+    } finally {
+      holder.close();
+    }
+  },
+);
 
 test("83.2 files at both places: the directory's file is the one opened, the old ones are not touched", () => {
   const box = sandbox();
@@ -401,51 +444,53 @@ test("83.2 files at both places: the directory's file is the one opened, the old
   );
 });
 
-test("83.2 after atrium's move (sidecars first, then the main file) both open with their committed rows", () => {
-  const box = sandbox({ switched: false });
-  const ledgerHolder = fullLedgerAtOldPlace(box);
-  const prefsHolder = fullPrefsAtOldPlace(box);
-  // The move, as atrium's S6 does it for a unit whose process is gone: here the holders' handles
-  // are abandoned in place (no checkpoint), so the WAL is still the only home of the rows.
-  fs.mkdirSync(box.dbDir, { recursive: true });
-  for (const base of ["brick-outbox.db", "ui-prefs.db"]) {
-    for (const suffix of ["-wal", "-shm", ""]) {
-      const from = path.join(box.acpx, `${base}${suffix}`);
-      if (fs.existsSync(from)) {
-        fs.copyFileSync(from, path.join(box.dbDir, `${base}${suffix}`));
-        fs.rmSync(from);
+eachMode(
+  `83.2 after atrium's move (sidecars first, then the main file) both open with their committed rows`,
+  (switched) => {
+    const box = sandbox({ switched });
+    const ledgerHolder = fullLedgerAtOldPlace(box);
+    const prefsHolder = fullPrefsAtOldPlace(box);
+    // The move, as atrium's S6 does it for a unit whose process is gone: here the holders' handles
+    // are abandoned in place (no checkpoint), so the WAL is still the only home of the rows.
+    fs.mkdirSync(box.dbDir, { recursive: true });
+    for (const base of ["brick-outbox.db", "ui-prefs.db"]) {
+      for (const suffix of ["-wal", "-shm", ""]) {
+        const from = path.join(box.acpx, `${base}${suffix}`);
+        if (fs.existsSync(from)) {
+          fs.copyFileSync(from, path.join(box.dbDir, `${base}${suffix}`));
+          fs.rmSync(from);
+        }
       }
     }
-  }
-  ledgerHolder.close();
-  prefsHolder.close();
-  fs.rmSync(path.join(box.acpx, "brick-outbox.db-wal"), { force: true });
-  fs.rmSync(path.join(box.acpx, "ui-prefs.db-wal"), { force: true });
-  process.env.ACPX_OWNER_PLACEMENT = "pod";
-  const ledger = new SpawnLedger();
-  const store = openUiPrefsStore();
-  try {
-    assert.equal(ledger.dbPath, path.join(box.dbDir, "brick-outbox.db"));
-    assert.equal(
-      store.isFavorite("openrouter", "acme/model-1"),
-      true,
-      "the committed preference row survived",
-    );
-    const raw = rawOpen(ledger.dbPath);
+    ledgerHolder.close();
+    prefsHolder.close();
+    fs.rmSync(path.join(box.acpx, "brick-outbox.db-wal"), { force: true });
+    fs.rmSync(path.join(box.acpx, "ui-prefs.db-wal"), { force: true });
+    const ledger = new SpawnLedger();
+    const store = openUiPrefsStore();
     try {
+      assert.equal(ledger.dbPath, path.join(box.dbDir, "brick-outbox.db"));
       assert.equal(
-        raw.prepare("SELECT value FROM meta WHERE key='instance_id'").get()?.value,
-        INSTANCE,
+        store.isFavorite("openrouter", "acme/model-1"),
+        true,
+        "the committed preference row survived",
       );
-      assert.equal(raw.prepare("PRAGMA integrity_check").get()?.integrity_check, "ok");
+      const raw = rawOpen(ledger.dbPath);
+      try {
+        assert.equal(
+          raw.prepare("SELECT value FROM meta WHERE key='instance_id'").get()?.value,
+          INSTANCE,
+        );
+        assert.equal(raw.prepare("PRAGMA integrity_check").get()?.integrity_check, "ok");
+      } finally {
+        raw.close();
+      }
     } finally {
-      raw.close();
+      ledger.close();
+      store.close();
     }
-  } finally {
-    ledger.close();
-    store.close();
-  }
-});
+  },
+);
 
 test("83.2 a box with nothing to move starts as today: the files are created in the directory", () => {
   const box = sandbox();
@@ -476,19 +521,165 @@ test("83.1 the PACKAGE export `acpx/spawn-ledger` (dist) resolves through the po
   assert.deepEqual(present(box.acpx, "brick-outbox"), [], "nothing appears under ~/.acpx");
 });
 
-test("83.2 the PACKAGE export refuses a ledger found only at the old place, and makes no second one", async () => {
-  const box = sandbox({ switched: false });
-  const holder = fullLedgerAtOldPlace(box);
-  try {
-    process.env.ACPX_OWNER_PLACEMENT = "pod";
-    const specifier = "acpx/spawn-ledger";
-    const mod = (await import(specifier)) as { SpawnLedger: new () => SpawnLedger };
-    assert.throws(
-      () => new mod.SpawnLedger(),
-      (error) => (error as Error).name === "DatabaseAtOldPlaceError",
-    );
-    assert.equal(fs.existsSync(box.dbDir), false);
-  } finally {
-    holder.close();
+eachMode(
+  `83.2 the PACKAGE export refuses a ledger found only at the old place, and makes no second one`,
+  async (switched) => {
+    const box = sandbox({ switched });
+    const holder = fullLedgerAtOldPlace(box);
+    try {
+      const specifier = "acpx/spawn-ledger";
+      const mod = (await import(specifier)) as { SpawnLedger: new () => SpawnLedger };
+      assert.throws(
+        () => new mod.SpawnLedger(),
+        (error) => (error as Error).name === "DatabaseAtOldPlaceError",
+      );
+      assert.equal(fs.existsSync(box.dbDir), false);
+    } finally {
+      holder.close();
+    }
+  },
+);
+
+eachMode(
+  `83.2 the per-process singleton places itself too: old-place-only is refused there, and favorites degrade to none`,
+  (switched) => {
+    const box = sandbox({ switched });
+    const holder = fullPrefsAtOldPlace(box);
+    try {
+      assert.throws(() => getUiPrefsStore(), refusedAtOldPlace("ui-prefs"));
+      assert.deepEqual(readFavoriteKeysSafely(), []);
+      assert.equal(fs.existsSync(box.dbDir), false);
+    } finally {
+      holder.close();
+    }
+  },
+);
+
+// ---------------------------------------------------------------- every opener goes through the placement
+
+/** Every `"brick-outbox.db"` / `"ui-prefs.db"` literal in `source` that is not the first argument of `controlDatabase(`. */
+function fixedPathOccurrences(text: string): string[] {
+  const found: string[] = [];
+  const source = text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|\s)\/\/.*$/gm, "$1");
+  const literal = /["'`](?:brick-outbox|ui-prefs)\.db["'`]/g;
+  for (let match = literal.exec(source); match; match = literal.exec(source)) {
+    const before = source.slice(0, match.index);
+    if (!/controlDatabase\(\s*$/.test(before)) {
+      found.push(match[0]);
+    }
   }
+  return found;
+}
+
+function walk(dir: string): string[] {
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const full = path.join(dir, entry.name);
+    return entry.isDirectory() ? walk(full) : entry.name.endsWith(".ts") ? [full] : [];
+  });
+}
+
+test("83.1 DISCOVERY: no file in src/ names either database as a fixed path — only controlDatabase places them", () => {
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+  const files = walk(path.join(root, "src"));
+  assert.ok(files.length > 200, `scanned ${files.length} files — the walk found src/`);
+  const offenders = files
+    .filter((file) => !file.endsWith(path.join("pod", "db-dir.ts")))
+    .flatMap((file) =>
+      fixedPathOccurrences(fs.readFileSync(file, "utf8")).map((hit) => `${file}: ${hit}`),
+    );
+  assert.deepEqual(offenders, []);
+  // positive control: the two real call sites are seen, and each as an allowed one
+  const placed = files.filter((file) =>
+    /controlDatabase\(\s*"(?:brick-outbox|ui-prefs)\.db"/.test(fs.readFileSync(file, "utf8")),
+  );
+  assert.deepEqual(placed.map((file) => path.basename(file)).toSorted(), [
+    "spawn-ledger.ts",
+    "ui-prefs-store.ts",
+  ]);
+});
+
+test("83.1 the scan ignores comments (a name in prose is not an opener)", () => {
+  assert.deepEqual(
+    fixedPathOccurrences("// the `brick-outbox.db` file\n/** `ui-prefs.db` */\nconst x = 1;"),
+    [],
+  );
+});
+
+test("83.1 the scan's NEGATIVE: a fresh fixed-path opener is flagged without being registered anywhere", () => {
+  assert.deepEqual(fixedPathOccurrences('const f = path.join(dir, "brick-outbox.db");'), [
+    '"brick-outbox.db"',
+  ]);
+  assert.deepEqual(fixedPathOccurrences("const f = path.join(dir, `ui-prefs.db`);"), [
+    "`ui-prefs.db`",
+  ]);
+  assert.deepEqual(
+    fixedPathOccurrences('const ok = controlDatabase(\n    "ui-prefs.db",\n    root);'),
+    [],
+  );
+  assert.deepEqual(
+    fixedPathOccurrences('a(controlDatabase("brick-outbox.db", r), "ui-prefs.db")'),
+    ['"ui-prefs.db"'],
+  );
+});
+
+// ---------------------------------------------------------------- the real CLI (dist/cli.js)
+
+const CLI = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "dist",
+  "cli.js",
+);
+
+function childEnv(box: Box): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const name of [
+    "ACPX_STATE_HOME",
+    "ACPX_UI_PREFS_DB",
+    "ACPX_UI_DB_DIR",
+    "ACPX_UI_INTERNAL_URL",
+  ]) {
+    delete env[name];
+  }
+  return { ...env, HOME: box.home };
+}
+
+for (const format of ["text", "json"] as const) {
+  test(`83.2 the real CLI: \`models fav\` with the preferences only at the old place exits 2 with the refusal as its first stderr line (${format})`, () => {
+    const box = sandbox();
+    const holder = fullPrefsAtOldPlace(box);
+    holder.close();
+    const old = path.join(box.acpx, "ui-prefs.db");
+    const before = sha(old);
+    const run = spawnSync(
+      process.execPath,
+      [CLI, "models", "fav", ...(format === "json" ? ["--format", "json"] : [])],
+      {
+        env: childEnv(box),
+        encoding: "utf8",
+      },
+    );
+    const output = `${run.stdout}\n${run.stderr}`;
+    assert.equal(run.status, 2, output);
+    const firstLine = run.stderr.split("\n")[0] ?? "";
+    assert.ok(
+      firstLine.startsWith(`acpx: REFUSED reason=${DB_AT_OLD_PLACE_REASON} db=ui-prefs`) ||
+        (format === "json" && run.stdout.includes(DB_AT_OLD_PLACE_REASON)),
+      output,
+    );
+    assert.equal(fs.existsSync(box.dbDir), false, "nothing made in the directory");
+    assert.equal(sha(old), before, "the old file is untouched");
+  });
+}
+
+test("83.1 the real CLI: `models fav` in pod mode opens the preferences in the pointer's directory and nothing under ~/.acpx", () => {
+  const box = sandbox();
+  const run = spawnSync(process.execPath, [CLI, "models", "fav"], {
+    env: childEnv(box),
+    encoding: "utf8",
+  });
+  assert.equal(run.status, 0, `${run.stdout}\n${run.stderr}`);
+  assert.ok(fs.existsSync(path.join(box.dbDir, "ui-prefs.db")));
+  assert.deepEqual(present(box.acpx, "ui-prefs"), []);
 });
