@@ -288,6 +288,8 @@ async function run(shape: Shape) {
     result,
     calls: calls(),
     atriumRequests: stub.requests.length,
+    brokerUrl,
+    brokerRequests: broker.requests.length,
     agentStarts: agentStarts(f),
     admissionLog: (() => {
       const dir = path.join(f.root, "admission", "log");
@@ -446,25 +448,39 @@ test("ee99 G1' batch twin (79.2) · atrium's batch spawn (`--batch-file -`, neve
       },
     );
   }
-  await withRun(
-    {
-      reason: "cap",
+  // "With room": a Ready pod. The same rig, per reason, first WITHOUT the pod (it must be refused with this
+  // reason's own token — so the iteration really is that reason), then WITH it (sent to the pod exactly once).
+  // admission_busy's rig is a broker that never answers (a closed port): a Ready pod must not need it.
+  for (const reason of REASONS) {
+    const shape: Shape = {
+      reason,
       env: "shell",
       addressing: "session-id",
       batch: true,
       runnerClass: true,
-      woken: { exit: 0 },
-    },
-    (out) => {
-      assert.equal(out.result.code, 0, out.result.stderr);
+    };
+    await withRun(shape, (out) => {
+      assert.equal(out.result.code, 75, `${reason}/no room: ${out.result.stderr}`);
+      assert.equal(lines(out.result.stderr)[0], BASE[reason].token, `${reason}/no room: the token`);
+    });
+    await withRun({ ...shape, woken: { exit: 0 } }, async (out) => {
+      assert.equal(out.result.code, 0, `${reason}/room: ${out.result.stderr}`);
       assert.equal(
         out.calls.length,
         1,
-        "the batch goes to the pod once; the owner delivers each member once by its id",
+        `${reason}/room: the batch goes to the pod once; the owner delivers each member once by its id`,
       );
-      assert.equal((out.calls[0] ?? []).filter((arg) => arg === "--batch-file").length, 1);
-    },
-  );
+      assert.equal((out.calls[0] ?? []).filter((arg) => arg === "--batch-file").length, 1, reason);
+      assert.equal(out.brokerRequests, 0, `${reason}/room: a Ready pod needs no broker`);
+      assert.doesNotMatch(out.result.stderr, /REFUSED/u, `${reason}/room: nothing refused`);
+      if (reason === "admission_busy") {
+        await assert.rejects(
+          fetch(out.brokerUrl),
+          `${reason}/room: the broker really is silent (closed port)`,
+        );
+      }
+    });
+  }
 });
 
 // ───────────────────────── woken sessions ─────────────────────────
