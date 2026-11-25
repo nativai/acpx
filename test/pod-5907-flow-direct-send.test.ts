@@ -3,12 +3,12 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { PromptResponse } from "@agentclientprotocol/sdk";
 import type { AcpClient } from "../src/acp/client.js";
 import { tryAcquireQueueOwnerLease } from "../src/cli/queue/lease-store.js";
 import { queueLockFilePath } from "../src/cli/queue/paths.js";
 import { sendSessionDirect } from "../src/cli/session/runtime.js";
-import { FlowRunner } from "../src/flows.js";
 import { createQuietCaptureOutput } from "../src/flows/runtime-support.js";
 import { writeSessionRecord } from "../src/session/persistence.js";
 import { makeWorld, withEnv, worldEnv, type PodWorld, type WorldEnv } from "./pod-owner-helpers.js";
@@ -19,6 +19,25 @@ import { makeSessionRecord } from "./runtime-test-helpers.js";
 // writes anything — no record write, no stream writer, no marker, no lock — (i) on a control-role host in pod mode,
 // (ii) in an agent pod whose target session's lease is held elsewhere. The refusals are the existing ones.
 // The function is called DIRECTLY, as an in-process caller of `acpx/flows` would (no CLI placement step).
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+
+type FlowsExport = {
+  FlowRunner: new (options: Record<string, unknown>) => object;
+};
+
+/** The REAL package export: `exports["./flows"]` of package.json, which maps into `dist/` (needs `pnpm build`). */
+async function loadFlowsExport(): Promise<FlowsExport> {
+  const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as {
+    exports: Record<string, string>;
+  };
+  const mapped = path.join(REPO_ROOT, pkg.exports["./flows"] ?? "");
+  assert.ok(
+    mapped.endsWith(`${path.sep}dist${path.sep}flows.js`),
+    "GUARD: the `acpx/flows` export maps into dist/flows.js",
+  );
+  return (await import(pathToFileURL(mapped).href)) as FlowsExport;
+}
 
 /** A mock adapter client: counts the prompts it is asked to run, never spawns anything. */
 function mockClient(): { client: AcpClient; prompts: () => number } {
@@ -260,7 +279,8 @@ test("C1.2-F.1 pairs: a flow driving its own session — no lease, or the pod's 
   });
 });
 
-test("C1.2-F.1 (i) through the LIBRARY EXPORT `acpx/flows`: a FlowRunner (an in-process caller, no CLI placement) on a pod-mode control pod is refused at its direct send before anything is written", async () => {
+test("C1.2-F.1 (i) through the LIBRARY EXPORT `acpx/flows` (dist/flows.js, the package's own export): a FlowRunner (an in-process caller, no CLI placement) on a pod-mode control pod is refused at its direct send before anything is written", async () => {
+  const { FlowRunner } = await loadFlowsExport();
   await inWorld("f1lib", { podMode: true }, async (world) => {
     const { client, prompts } = mockClient();
     const runner = new FlowRunner({
