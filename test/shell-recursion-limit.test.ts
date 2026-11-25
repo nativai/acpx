@@ -121,7 +121,7 @@ async function dumpedFuncnest(parentValue: string | undefined): Promise<string |
       `--env-dump-extra ${AGENT_FUNCNEST_ENV}`,
     cwd: scratchDir,
     permissionMode: "approve-reads",
-    sessionContext: { acpxRecordId: "rec-funcnest" },
+    sessionContext: { seatNameGeneric: false, acpxRecordId: "rec-funcnest" },
   });
   try {
     return await withParentEnvAsync(parentValue, async () => {

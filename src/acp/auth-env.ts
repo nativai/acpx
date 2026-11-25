@@ -566,6 +566,14 @@ export type AgentSessionContext = {
    * an earlier spawn. A spawn that renders no primer of its own re-arms the OS notice from it.
    */
   osPrimerError?: string | null;
+  /**
+   * Brick fac2128a §4.2 — the seat's name is still GENERIC at this spawn (`seatNameIsGeneric`: unnamed,
+   * or equal to the holder's `metadata.seat_auto_name`), exported as `ACPX_SEAT_NAME_GENERIC=1`; `false`
+   * leaves the variable UNSET. ⚠️ NON-OPTIONAL ON PURPOSE: every context builder must decide it, so a new
+   * builder cannot silently omit it — and the creation spawn of a JOIN must read the joined seat, never
+   * treat its absent `seatName` as "unnamed" (`creationSessionContext`).
+   */
+  seatNameGeneric: boolean;
 };
 
 /**
@@ -809,6 +817,10 @@ function buildAgentEnvironment(
   delete env.ACPX_SESSION_SHARED_TMP;
   delete env.ACPX_PARENT_SESSION_URL;
   delete env.ACPX_SESSION_NAME;
+  // Brick fac2128a — "your seat's name is still generic" is seat identity like ACPX_SESSION_NAME: a child of a
+  // long-lived owner or of a generic seat must never inherit it, or its agent would rename a seat a person
+  // named. Re-set below only when THIS spawn's context says so.
+  delete env.ACPX_SEAT_NAME_GENERIC;
   // ── TOMBSTONE STRIP (brick b11f98fb, 2026-09-19) — HAS A RETIREMENT CONDITION ──
   //
   // WHAT: the legacy task-folder mechanism is removed. NOTHING in this codebase sets
@@ -1092,6 +1104,9 @@ function buildAgentEnvironment(
     if (trimmedName.length > 0) {
       env.ACPX_SESSION_NAME = trimmedName;
     }
+  }
+  if (sessionContext?.seatNameGeneric === true) {
+    env.ACPX_SEAT_NAME_GENERIC = "1";
   }
   // brick://c6e3618b — prefer the explicit parentSessionUrl: always recomposing
   // `${baseUrl}/?session=${parentId}` against the LOCAL base silently re-hosts a

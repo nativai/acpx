@@ -132,7 +132,7 @@ async function spawnAndDumpEnv(
       `--env-dump-extra ${CONFIG_DIR_NAMES.join(",")}`,
     cwd: scratchDir,
     permissionMode: "approve-reads",
-    sessionContext: { acpxRecordId: `rec-b3-rs13-${harness}` },
+    sessionContext: { seatNameGeneric: false, acpxRecordId: `rec-b3-rs13-${harness}` },
     ...(sessionOptions ? { sessionOptions } : {}),
   });
   try {
@@ -623,6 +623,7 @@ async function readWrittenPrimer(
     cwd: scratchDir,
     permissionMode: "approve-reads",
     sessionContext: {
+      seatNameGeneric: false,
       acpxRecordId: `rec-968519c3-${harness}-${options.brick ? "brick" : "nobrick"}`,
       ...(options.brick ? { brick: options.brick } : {}),
     },

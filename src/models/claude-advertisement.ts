@@ -521,7 +521,7 @@ export async function probeClaudeAdvertisement(params: {
  * usable default → `undefined`, and the probe runs raw as before.
  */
 async function defaultSubscriptionContext(): Promise<
-  { acpxRecordId: string; subscriptionId: string } | undefined
+  { acpxRecordId: string; subscriptionId: string; seatNameGeneric: false } | undefined
 > {
   try {
     const { chooseSubscriptionConfigDir, loadSubscriptionRegistry } =
@@ -529,7 +529,9 @@ async function defaultSubscriptionContext(): Promise<
     const registry = loadSubscriptionRegistry();
     const choice = chooseSubscriptionConfigDir(undefined, registry);
     const subscriptionId = (choice.resolvedId ?? registry.default)?.trim();
-    return choice.configDir && subscriptionId ? { acpxRecordId: "", subscriptionId } : undefined;
+    return choice.configDir && subscriptionId
+      ? { acpxRecordId: "", subscriptionId, seatNameGeneric: false }
+      : undefined;
   } catch {
     return undefined;
   }

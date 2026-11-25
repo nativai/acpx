@@ -47,6 +47,7 @@ function withEnvVar<T>(name: string, value: string | undefined, fn: () => T): T 
 test("buildAgentSpawnOptions composes ACPX_SEAT_URL exactly like ACPX_SESSION_URL, substituting ?seat=", () => {
   withAcpxUiBaseUrlEnv("https://atrium.devbox.nativai.de", () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-record-id",
       seatId: "11111111-2222-3333-4444-555555555555",
     });
@@ -66,12 +67,14 @@ test("buildAgentSpawnOptions composes ACPX_SEAT_URL exactly like ACPX_SESSION_UR
 test("buildAgentSpawnOptions omits ACPX_SEAT_URL when seatId is empty/whitespace/absent", () => {
   withAcpxUiBaseUrlEnv("https://atrium.devbox.nativai.de", () => {
     const whitespace = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-record-id",
       seatId: "   ",
     });
     assert.equal(Object.prototype.hasOwnProperty.call(whitespace.env, "ACPX_SEAT_URL"), false);
 
     const absent = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-record-id",
     });
     assert.equal(Object.prototype.hasOwnProperty.call(absent.env, "ACPX_SEAT_URL"), false);
@@ -81,6 +84,7 @@ test("buildAgentSpawnOptions omits ACPX_SEAT_URL when seatId is empty/whitespace
 test("buildAgentSpawnOptions injects ACPX_PARENT_SEAT_URL when parentSeatId is non-empty, trimmed", () => {
   withAcpxUiBaseUrlEnv("https://atrium.devbox.nativai.de", () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-record-id",
       parentSeatId: "  parent-seat-id-xyz  ",
     });
@@ -95,6 +99,7 @@ test("buildAgentSpawnOptions omits ACPX_PARENT_SEAT_URL when parentSeatId is nul
   withAcpxUiBaseUrlEnv("https://atrium.devbox.nativai.de", () => {
     for (const parentSeatId of [null, undefined, "   "] as const) {
       const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
         acpxRecordId: "child-record-id",
         parentSeatId,
       });
@@ -119,6 +124,7 @@ test("FW-07 · a STALE ACPX_SEAT_URL never survives a spawn with no seat in cont
   withAcpxUiBaseUrlEnv("https://atrium.devbox.nativai.de", () => {
     withEnvVar("ACPX_SEAT_URL", "https://atrium.devbox.nativai.de/?seat=stale-foreign-seat", () => {
       const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
         acpxRecordId: "child-record-id",
         // No seatId supplied — this spawn has no seat context of its own.
       });
@@ -139,6 +145,7 @@ test("FW-07 · a STALE ACPX_PARENT_SEAT_URL never survives a spawn with no paren
       "https://atrium.devbox.nativai.de/?seat=stale-foreign-parent-seat",
       () => {
         const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+          seatNameGeneric: false,
           acpxRecordId: "child-record-id",
           // No parentSeatId supplied.
         });
@@ -156,6 +163,7 @@ test("FW-07 · a spawn WITH its own seat context overwrites, never merges with, 
   withAcpxUiBaseUrlEnv("https://atrium.devbox.nativai.de", () => {
     withEnvVar("ACPX_SEAT_URL", "https://atrium.devbox.nativai.de/?seat=stale-foreign-seat", () => {
       const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
         acpxRecordId: "child-record-id",
         seatId: "this-spawns-own-seat",
       });

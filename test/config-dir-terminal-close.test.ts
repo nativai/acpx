@@ -153,7 +153,7 @@ test("4a6fdda0 REAL SPAWN: the dir survives client A's close AND client B's TURN
         agentCommand: `node ${JSON.stringify(mockLink)}`,
         cwd: scratch,
         permissionMode: "approve-reads",
-        sessionContext: { acpxRecordId: recordId },
+        sessionContext: { seatNameGeneric: false, acpxRecordId: recordId },
       });
       clients.push(client);
       await client.start();
@@ -234,7 +234,10 @@ test("074a1bd9 REAL SPAWN: a session/new that names a seeded extension names the
         agentCommand: `node ${JSON.stringify(mockLink)} --fail-new-session-on-seeded-extension half-written.js`,
         cwd: scratch,
         permissionMode: "approve-reads",
-        sessionContext: { acpxRecordId: `rec-074a1bd9-${path.basename(scratch)}` },
+        sessionContext: {
+          seatNameGeneric: false,
+          acpxRecordId: `rec-074a1bd9-${path.basename(scratch)}`,
+        },
       });
       clients.push(client);
       await client.start();
@@ -484,7 +487,7 @@ test("cb214e48 REAL SPAWN: a child of a PARENT-shaped env is pointed at the BOX 
       ]),
       cwd,
       permissionMode: "approve-reads",
-      sessionContext: { acpxRecordId: "rec-cb214e48-child" },
+      sessionContext: { seatNameGeneric: false, acpxRecordId: "rec-cb214e48-child" },
     });
 
     try {
@@ -564,7 +567,7 @@ test("cb214e48 REAL SPAWN: after the config dir is removed, a CLEAN-env respawn 
       agentCommand: await command(firstDump),
       cwd,
       permissionMode: "approve-reads",
-      sessionContext: { acpxRecordId: "rec-cb214e48-resume" },
+      sessionContext: { seatNameGeneric: false, acpxRecordId: "rec-cb214e48-resume" },
     });
     let sessionId = "";
     let firstConfigDir: string | undefined;
@@ -603,7 +606,7 @@ test("cb214e48 REAL SPAWN: after the config dir is removed, a CLEAN-env respawn 
       agentCommand: record.agentCommand,
       cwd,
       permissionMode: "approve-reads",
-      sessionContext: { acpxRecordId: "rec-cb214e48-resume" },
+      sessionContext: { seatNameGeneric: false, acpxRecordId: "rec-cb214e48-resume" },
     });
     try {
       // NO PI_* in the environment — deliberately not wrapped in withParentShapedEnv.

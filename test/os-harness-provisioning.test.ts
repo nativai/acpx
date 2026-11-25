@@ -222,7 +222,7 @@ test("W2 provisioning: no registry provisioning block means legacy subscription 
     const options = buildAgentSpawnOptions(
       fixture.root,
       undefined,
-      { acpxRecordId: "record-default-off", subscriptionId: "sub1" },
+      { seatNameGeneric: false, acpxRecordId: "record-default-off", subscriptionId: "sub1" },
       fixture.lookup,
       SDK_CLAUDE_COMMAND,
     );
@@ -253,7 +253,7 @@ test("W2 provisioning: provisioning errors produce warning breadcrumb and spawn 
     const options = buildAgentSpawnOptions(
       fixture.root,
       undefined,
-      { acpxRecordId: "record-warning", subscriptionId: "sub1" },
+      { seatNameGeneric: false, acpxRecordId: "record-warning", subscriptionId: "sub1" },
       fixture.lookup,
       SDK_CLAUDE_COMMAND,
       (warning) => warnings.push(warning),

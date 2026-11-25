@@ -61,7 +61,7 @@ async function withGatedClient(
     agentCommand: `node ${JSON.stringify(MOCK_AGENT_PATH)} --operation-log ${JSON.stringify(operationLog)}`,
     cwd: scratchDir,
     permissionMode: "approve-reads",
-    sessionContext: { acpxRecordId: "prompt-start-window" },
+    sessionContext: { seatNameGeneric: false, acpxRecordId: "prompt-start-window" },
   });
   const restore = setTurnContextProvidersForTesting([
     {

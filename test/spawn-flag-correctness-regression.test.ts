@@ -124,7 +124,7 @@ test("T4.3 BUG1: profileId set → buildAgentEnvironment does NOT fall back to t
         undefined,
         // profileId carries the recorded selection (sub2); NO subscriptionId — the
         // exact shape the deployed code threads from session_options.profile.
-        { acpxRecordId: "rec", profileId: "sub2" },
+        { seatNameGeneric: false, acpxRecordId: "rec", profileId: "sub2" },
         ctx.lookupOptions,
       );
       // The synchronous build must NOT set CLAUDE_CONFIG_DIR (the async profile-auth
@@ -151,7 +151,7 @@ test("T4.3 BUG1 (exact bug shape): profileId=sub2 wins even when a legacy subscr
       const options = buildAgentSpawnOptions(
         "/tmp/acpx-agent",
         undefined,
-        { acpxRecordId: "rec", profileId: "sub2", subscriptionId: "sub1" },
+        { seatNameGeneric: false, acpxRecordId: "rec", profileId: "sub2", subscriptionId: "sub1" },
         ctx.lookupOptions,
       );
       // profileId presence suppresses the synchronous subscription path entirely,
@@ -170,7 +170,7 @@ test("T4.3 W14-01: NO profileId/subscriptionId → env builder no longer late-bi
       const options = buildAgentSpawnOptions(
         "/tmp/acpx-agent",
         undefined,
-        { acpxRecordId: "rec" }, // no profileId, no subscriptionId
+        { seatNameGeneric: false, acpxRecordId: "rec" }, // no profileId, no subscriptionId
         ctx.lookupOptions,
       );
       // W14-01 moved default selection out of buildAgentEnvironment. New and

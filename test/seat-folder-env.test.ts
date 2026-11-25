@@ -37,6 +37,7 @@ function has(env: NodeJS.ProcessEnv, name: string): boolean {
 test("buildAgentSpawnOptions exports ACPX_SEAT_FOLDER beside ACPX_AGENT_FOLDER for a seated context", () => {
   withEnvVars({ ACPX_SEAT_FOLDER: undefined, ACPX_AGENT_FOLDER: undefined }, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
       seatId: "137b9523-2f75-4172-8e96-94d52eeea152",
       agentFolder: "/pool/b/agents/137b9523/holders/child-id",
@@ -50,6 +51,7 @@ test("buildAgentSpawnOptions exports ACPX_SEAT_FOLDER beside ACPX_AGENT_FOLDER f
 test("buildAgentSpawnOptions trims ACPX_SEAT_FOLDER", () => {
   withEnvVars({ ACPX_SEAT_FOLDER: undefined }, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
       seatFolder: "   /pool/b/agents/137b9523  ",
     });
@@ -60,6 +62,7 @@ test("buildAgentSpawnOptions trims ACPX_SEAT_FOLDER", () => {
 test("ACPX_SEAT_FOLDER does not depend on a resolvable UI base URL (unlike ACPX_SEAT_URL)", () => {
   withEnvVars({ ACPX_SEAT_FOLDER: undefined, ACPX_UI_BASE_URL: undefined }, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
       seatFolder: "/pool/b/agents/137b9523",
     });
@@ -76,6 +79,7 @@ test("a seat-less context DELETES a stale inherited ACPX_SEAT_FOLDER and ACPX_AG
     () => {
       for (const seatFolder of [undefined, null, "", "   "]) {
         const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+          seatNameGeneric: false,
           acpxRecordId: "child-id",
           seatFolder,
         });

@@ -122,7 +122,12 @@ async function withClient(c: AcpClient, run: (c: AcpClient) => Promise<void>): P
 
 test("G1 requireOsPrimer + a failing primer → refused BEFORE session/new, after exactly one retry", async () => {
   await withRig("fail", async (rig) => {
-    const c = client(rig, "--claude-agent-acp", { acpxRecordId: "rec-g1-a" }, true);
+    const c = client(
+      rig,
+      "--claude-agent-acp",
+      { seatNameGeneric: false, acpxRecordId: "rec-g1-a" },
+      true,
+    );
     await withClient(c, async () => {
       await assert.rejects(c.createSession(rig.dir), (error: unknown) => {
         assert.ok(error instanceof OsPrimerRequiredError, String(error));
@@ -145,7 +150,12 @@ test("G1 requireOsPrimer + a failing primer → refused BEFORE session/new, afte
 
 test("G1 the retry rescues the create: first render fails, the retry renders → created, no alarm", async () => {
   await withRig("fail-then-ok", async (rig) => {
-    const c = client(rig, "--claude-agent-acp", { acpxRecordId: "rec-g1-b" }, true);
+    const c = client(
+      rig,
+      "--claude-agent-acp",
+      { seatNameGeneric: false, acpxRecordId: "rec-g1-b" },
+      true,
+    );
     await withClient(c, async () => {
       await c.createSession(rig.dir);
     });
@@ -158,7 +168,12 @@ test("G1 the retry rescues the create: first render fails, the retry renders →
 test("G1 negative: the directory case (requireOsPrimer false) and a respawn client (option absent) only ALARM", async () => {
   for (const requireOsPrimer of [false, undefined]) {
     await withRig("fail", async (rig) => {
-      const c = client(rig, "--claude-agent-acp", { acpxRecordId: "rec-g1-c" }, requireOsPrimer);
+      const c = client(
+        rig,
+        "--claude-agent-acp",
+        { seatNameGeneric: false, acpxRecordId: "rec-g1-c" },
+        requireOsPrimer,
+      );
       await withClient(c, async () => {
         await c.createSession(rig.dir);
       });
@@ -178,7 +193,12 @@ test("G1 negative: the directory case (requireOsPrimer false) and a respawn clie
 
 test("G1 negative: only the client's FIRST creating render can refuse — a later session/new only alarms", async () => {
   await withRig("ok", async (rig) => {
-    const c = client(rig, "--claude-agent-acp", { acpxRecordId: "rec-g1-d" }, true);
+    const c = client(
+      rig,
+      "--claude-agent-acp",
+      { seatNameGeneric: false, acpxRecordId: "rec-g1-d" },
+      true,
+    );
     await withClient(c, async () => {
       await c.createSession(rig.dir);
       // The later fresh session/new (a reconnect's fallback) renders again and fails.
@@ -198,7 +218,11 @@ const STORED = "2026-11-14T21:01:27.410Z exec error: spawn /nonexistent/primer.s
 
 test("G2 a stored primer failure re-arms the notice at a spawn that renders no primer (codex)", async () => {
   await withRig("ok", async (rig) => {
-    const c = client(rig, "--codex-acp", { acpxRecordId: "rec-g2-a", osPrimerError: STORED });
+    const c = client(rig, "--codex-acp", {
+      seatNameGeneric: false,
+      acpxRecordId: "rec-g2-a",
+      osPrimerError: STORED,
+    });
     await withClient(c, async () => {
       // start() spawned the adapter; codex renders nothing until a session/new, which a resume never sends.
       const notice = takeAtriumOsNotice("rec-g2-a") ?? "";
@@ -221,7 +245,7 @@ test("G2 a stored primer failure re-arms the notice at a spawn that renders no p
 
 test("G2 negative: no stored failure → no notice", async () => {
   await withRig("ok", async (rig) => {
-    const c = client(rig, "--codex-acp", { acpxRecordId: "rec-g2-b" });
+    const c = client(rig, "--codex-acp", { seatNameGeneric: false, acpxRecordId: "rec-g2-b" });
     await withClient(c, async () => {
       assert.equal(takeAtriumOsNotice("rec-g2-b"), undefined);
     });
@@ -230,7 +254,11 @@ test("G2 negative: no stored failure → no notice", async () => {
 
 test("G2 a render in the same spawn CLEARS the carried notice (success) or REPLACES it (failure)", async () => {
   await withRig("ok", async (rig) => {
-    const c = client(rig, "--codex-acp", { acpxRecordId: "rec-g2-c", osPrimerError: STORED });
+    const c = client(rig, "--codex-acp", {
+      seatNameGeneric: false,
+      acpxRecordId: "rec-g2-c",
+      osPrimerError: STORED,
+    });
     await withClient(c, async () => {
       await c.createSession(rig.dir);
       assert.equal(takeAtriumOsNotice("rec-g2-c"), undefined, "a good render clears the carry");
@@ -238,7 +266,11 @@ test("G2 a render in the same spawn CLEARS the carried notice (success) or REPLA
     assert.equal(c.getAgentLifecycleSnapshot().os?.primerError, null, "…and clears the record key");
   });
   await withRig("fail", async (rig) => {
-    const c = client(rig, "--codex-acp", { acpxRecordId: "rec-g2-d", osPrimerError: STORED });
+    const c = client(rig, "--codex-acp", {
+      seatNameGeneric: false,
+      acpxRecordId: "rec-g2-d",
+      osPrimerError: STORED,
+    });
     await withClient(c, async () => {
       await c.createSession(rig.dir);
       const notice = takeAtriumOsNotice("rec-g2-d") ?? "";
@@ -262,7 +294,11 @@ test("N4 the fallback notice: claude's primer follows the default root; codex's 
     ],
   ] as const) {
     await withRig("ok", async (rig) => {
-      const c = client(rig, harness, { acpxRecordId: recordId, osChoice: missing });
+      const c = client(rig, harness, {
+        seatNameGeneric: false,
+        acpxRecordId: recordId,
+        osChoice: missing,
+      });
       await withClient(c, async () => {
         const notice = takeAtriumOsNotice(recordId) ?? "";
         assert.match(

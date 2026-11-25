@@ -1,3 +1,5 @@
+import { SEAT_AUTO_NAME_KEY, withoutSeatAutoName } from "../../session/seat-display-name.js";
+
 export function applyBrickFlag(
   childMetadata: Record<string, string> | undefined,
   resolvedBrick: string | false | undefined,
@@ -208,4 +210,27 @@ export function withInheritedWorktree(
     }
   }
   return Object.keys(inherited).length > 0 ? { ...childMetadata, ...inherited } : childMetadata;
+}
+
+/**
+ * Brick fac2128a §4.2 — the seat-name marker of a JOIN (`--seat`, or a `--from` / handover successor) — pure,
+ * no IO. A joiner never asserts a marker of its own: a caller-passed `seat_auto_name` is DROPPED, so nobody can
+ * mark a name a person chose by joining its seat (TE finding F2). Only a SUCCESSION carries one — the
+ * predecessor's (`successionSource`), because it is the same seat continuing and a successor of a still-generic
+ * seat must still be able to name it. A non-join (`joining === false`) is returned untouched.
+ *
+ * 🛑 Never applied to a copy, fork, by-the-way or template child (`copyMetadata`): those mint a NEW seat, and
+ * the source's marker names the SOURCE's machine-made name, not theirs.
+ */
+export function withJoinSeatAutoName(
+  childMetadata: Record<string, string> | undefined,
+  joining: boolean,
+  successionSource: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (!joining) {
+    return childMetadata;
+  }
+  const own = withoutSeatAutoName(childMetadata);
+  const inherited = successionSource?.[SEAT_AUTO_NAME_KEY];
+  return typeof inherited === "string" ? { ...own, [SEAT_AUTO_NAME_KEY]: inherited } : own;
 }

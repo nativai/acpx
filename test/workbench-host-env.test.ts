@@ -49,6 +49,7 @@ function hostFor(
     },
     () => {
       const env = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
         acpxRecordId: "record-id",
         ...context,
       }).env;
@@ -91,6 +92,7 @@ test("the seat is lower-cased and trimmed, the template trimmed", () => {
 test("no baseUrl gate: the host is exported with ACPX_UI_BASE_URL blank", () => {
   withEnv({ ACPX_UI_BASE_URL: "", ACPX_WORKBENCH_HOST_TEMPLATE: TEMPLATE }, () => {
     const env = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "record-id",
       seatId: SEAT_A,
     }).env;
@@ -208,6 +210,7 @@ test("fork (NEW seat) spawned from the source's env ⇒ the fork's own value, no
 test("the template itself passes through to the child, so the child's own children get their own host", () => {
   withEnv({ ACPX_WORKBENCH_HOST_TEMPLATE: TEMPLATE }, () => {
     const env = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "record-id",
       seatId: SEAT_A,
     }).env;
