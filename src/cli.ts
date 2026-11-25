@@ -82,17 +82,37 @@ async function armedVerdictRun(): Promise<boolean> {
   return true;
 }
 
+/**
+ * TEST SEAM (brick c8146ccd, row C7.2-B.1): `ACPX_POD_TEST_SKIP_PLACEMENT=1` runs the command's real local path
+ * without the placement step, so a test can reach the spawn tripwire (`assertBridgeMayStartHere`) and the lock
+ * writers' identity refusal through the SHIPPED CLI — the step never lets a bridge-starting command, or a writer in
+ * a host without an identity, through on its own.
+ *
+ * ⚠️ HONOURED ONLY UNDER `node --test` (`NODE_TEST_CONTEXT`, non-empty), like `ACPX_POD_TEST_HOME`
+ * (`pod/placement.ts`). DO NOT "simplify" this to read the variable alone: on a box it would turn the placement
+ * step off for any process that sets it. No row can show the gate from outside: pod mode is itself honoured only
+ * under that context on a test home, so without it the step decides nothing to skip. What the row DOES hold is the
+ * other direction — "the seam is what reaches the tripwire" in `test/pod-c814-exit-codes.test.ts` is red if the step
+ * stops being skipped under it.
+ */
+function placementSkippedForTest(): boolean {
+  return (
+    (process.env.NODE_TEST_CONTEXT ?? "") !== "" && process.env.ACPX_POD_TEST_SKIP_PLACEMENT === "1"
+  );
+}
+
 async function start(): Promise<void> {
   registerRoutedBranches();
   registerUtilityBranch();
-  const outcome = (await armedVerdictRun())
-    ? "proceed"
-    : await runPlacementStep({
-        argv: placementArgv(process.argv),
-        builtInAgents: () => listBuiltInAgents(),
-        write: (line) => process.stderr.write(`${line}\n`),
-        writeStdout: (line) => process.stdout.write(`${line}\n`),
-      });
+  const outcome =
+    (await armedVerdictRun()) || placementSkippedForTest()
+      ? "proceed"
+      : await runPlacementStep({
+          argv: placementArgv(process.argv),
+          builtInAgents: () => listBuiltInAgents(),
+          write: (line) => process.stderr.write(`${line}\n`),
+          writeStdout: (line) => process.stdout.write(`${line}\n`),
+        });
   if (outcome !== "proceed") {
     process.exitCode = outcome.exitCode;
     return;
