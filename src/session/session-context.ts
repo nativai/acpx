@@ -7,7 +7,11 @@ import type { SessionRecord } from "../types.js";
 import { normalizeName, sessionBaseDir } from "./persistence.js";
 import { principalContextFields } from "./persistence/principal.js";
 import { readSeatStore, seatFromStore } from "./persistence/seat-store.js";
-import { seatNameIsGeneric, seatNamingForRecord } from "./seat-display-name.js";
+import {
+  seatNameIsGeneric,
+  seatNamingForRecord,
+  withVerifiedSeatAutoName,
+} from "./seat-display-name.js";
 
 /**
  * The `sessionContext` a RECORD-backed spawn hands its client — every field of `AgentSessionContext`,
@@ -110,13 +114,19 @@ export async function creationSessionContext(
  * unreadable store or a missing row answers `false` (fail safe).
  */
 async function creationSeatNameGeneric(options: SessionCreateOptions): Promise<boolean> {
-  const holder = { metadata: options.metadata };
+  // The marker is judged exactly as the create will store it (`withVerifiedSeatAutoName`, also run by
+  // `reconcileSeatAndBrickForCreate`): this context is built BEFORE that reconcile, so reading the raw
+  // caller value here would miss a marker the create keeps after its trim (TE finding F6).
+  const holderFor = (storedName: string | undefined) => ({
+    metadata: withVerifiedSeatAutoName(options.metadata, storedName),
+  });
   if (options.seatId === undefined) {
-    return seatNameIsGeneric({ name: normalizeName(options.seatName) }, holder);
+    const name = normalizeName(options.seatName);
+    return seatNameIsGeneric({ name }, holderFor(name));
   }
   try {
     const seat = seatFromStore(await readSeatStore(sessionBaseDir()), options.seatId);
-    return seat ? seatNameIsGeneric(seat, holder) : false;
+    return seat ? seatNameIsGeneric(seat, holderFor(seat.name)) : false;
   } catch {
     return false;
   }

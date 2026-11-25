@@ -453,9 +453,12 @@ test("REAL CLI (TE F2): `sessions set-metadata seat_auto_name …` is refused an
 test("REAL CLI (TE F3): a caller marker padded like its -s is kept, stored trimmed", async () => {
   await withMockHome(async (f) => {
     const s = await create(f, ["-s", "  tg-ws  ", "--metadata", "seat_auto_name=  tg-ws  "]);
+    // TE F6: the CREATION spawn (codex's only primer render) judges the marker as the create stores it
+    assert.equal(await spawnedGenericVar(f), "1", "the creation spawn's env");
     assert.equal((await seatShow(f, s.seatId)).name, "tg-ws", "control: -s is trimmed");
     assert.equal((await metadataOf(f, s.id)).seat_auto_name, "tg-ws");
     assert.equal((await seatShow(f, s.seatId)).nameGeneric, true);
+    assert.equal(await turnEnv(f, s.id), "1", "the record-backed turn agrees");
   });
 });
 
