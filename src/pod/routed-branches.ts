@@ -110,17 +110,34 @@ type PayloadPlan =
   | { text: string; argvFor: (payloadPath: string | undefined) => string[] }
   | undefined;
 
-/** The index of `--file`/`-f` taking `-`, or -1; the inline form `--file=-` is index of that token. */
+/**
+ * THE list of the options of a routable prompt/exec that read their input from stdin when given `-`
+ * (brick da4b08ec). `stdinFileFlagIndex` (the payload plan) and `hasFileFlag` (a file named, so stdin is
+ * not read) both take their flags from here, so a new stdin-reading option cannot be taught to one and
+ * missed by the other. ⚠️ A routed call has no stdin: an option left as `-` makes the POD read an empty
+ * stdin — for `--batch-file -` (atrium's batch spawn) that is `acpx: --batch-file body is not JSON`,
+ * exit 2, which atrium reads as "this acpx has no --batch-file" and switches prompt-batch off box-wide.
+ * `test/pod-da4b-batch-first-wake.test.ts` and `pod-routed-branches.test.ts` go red if one is dropped.
+ * Census (da4b08ec): `--file`/`-f` and `--batch-file` are the only such options on the verbs
+ * `PROMPT_PATHS` names; `--prompt-file -` belongs to `sessions new` / `sessions handover`, which are
+ * not routed here (record-only creation, or the pass-through's own `carry: "stdin"`).
+ */
+const STDIN_FILE_FLAGS: readonly string[] = ["--file", "-f", "--batch-file"];
+/** `--flag=value` exists for the long spellings only: commander reads `-f=-` as the value `=-`. */
+const inlineFlag = (token: string, flag: string, value: string): boolean =>
+  flag.startsWith("--") && token === `${flag}=${value}`;
+
+/** The index of a stdin-reading option's `-` value, or -1; the inline form `--flag=-` is the index of that token. */
 function stdinFileFlagIndex(argv: readonly string[]): number {
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
     if (token === "--") {
       return -1;
     }
-    if ((token === "--file" || token === "-f") && argv[i + 1] === "-") {
+    if (STDIN_FILE_FLAGS.includes(token) && argv[i + 1] === "-") {
       return i + 1;
     }
-    if (token === "--file=-") {
+    if (STDIN_FILE_FLAGS.some((flag) => inlineFlag(token, flag, "-"))) {
       return i;
     }
   }
@@ -130,13 +147,10 @@ function stdinFileFlagIndex(argv: readonly string[]): number {
 function hasFileFlag(argv: readonly string[]): boolean {
   const stop = argv.indexOf("--");
   const head = stop >= 0 ? argv.slice(0, stop) : argv;
-  return head.some(
-    (t) =>
-      t === "--file" ||
-      t === "-f" ||
-      t.startsWith("--file=") ||
-      t === "--batch-file" ||
-      t.startsWith("--batch-file="),
+  return head.some((t) =>
+    STDIN_FILE_FLAGS.some(
+      (flag) => t === flag || (flag.startsWith("--") && t.startsWith(`${flag}=`)),
+    ),
   );
 }
 
@@ -148,8 +162,8 @@ function replaceStdinFlag(
 ): string[] {
   const out = [...argv];
   const path = payloadPath ?? "-";
-  if (out[at] === "--file=-") {
-    out[at] = `--file=${path}`;
+  if (out[at].endsWith("=-")) {
+    out[at] = `${out[at].slice(0, -1)}${path}`;
   } else {
     out[at] = path;
   }

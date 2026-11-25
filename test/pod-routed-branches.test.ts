@@ -308,6 +308,50 @@ test("stdin: `--file -` (both spellings) is read here and travels as the payload
   ]);
 });
 
+test("stdin (da4b08ec): atrium's `--batch-file -` (both spellings) is read here and travels as the payload; the argument points at the file, `--no-wait` and the session are kept", async () => {
+  const split = await plan([
+    "claude",
+    "prompt",
+    "--no-wait",
+    "--session-id",
+    SESSION,
+    "--batch-file",
+    "-",
+  ]);
+  assert.ok(split.result && split.result !== "prompt_required");
+  assert.equal(split.result.text, "from stdin");
+  assert.deepEqual(split.result.argvFor("/p/x.payload"), [
+    "claude",
+    "prompt",
+    "--no-wait",
+    "--session-id",
+    SESSION,
+    "--batch-file",
+    "/p/x.payload",
+  ]);
+  const inline = await plan([
+    "claude",
+    "prompt",
+    "--no-wait",
+    "--session-id",
+    SESSION,
+    "--batch-file=-",
+  ]);
+  assert.ok(inline.result && inline.result !== "prompt_required");
+  assert.deepEqual(inline.result.argvFor("/p/x.payload"), [
+    "claude",
+    "prompt",
+    "--no-wait",
+    "--session-id",
+    SESSION,
+    "--batch-file=/p/x.payload",
+  ]);
+  // After `--` it is prompt text, not the flag (O-1): nothing is read for it.
+  const text = await plan(["claude", "prompt", "--session-id", SESSION, "--", "--batch-file", "-"]);
+  assert.equal(text.result, undefined);
+  assert.equal(text.h.stdinReads, 0);
+});
+
 test("stdin: no text, no --file, stdin not a terminal (what the local CLI does) → read here, `--file <payload>` added", async () => {
   const bare = await plan(["claude", "prompt", "--session-id", SESSION]);
   assert.ok(bare.result && bare.result !== "prompt_required");

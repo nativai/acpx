@@ -43,6 +43,10 @@ const BATCH = JSON.stringify({
       prompt: [{ type: "text", text: "the brief" }],
       options: { sessionOptions: { model: "claude-opus-4-1" } },
     },
+    {
+      messageId: "22222222-2222-4222-8222-bbbbbbbbbbbb",
+      prompt: [{ type: "text", text: "a second message" }],
+    },
   ],
 });
 
@@ -74,7 +78,7 @@ if (!ok) {
 
 type Call = { argv: string[]; value: string | undefined; source: string; body: string };
 
-async function run(batchFlag: string[], stdin: string) {
+async function run(batchFlag: string[], stdin: string, options: { noPod?: boolean } = {}) {
   const f = makeBox({ requestMib: 4000 });
   const record = makeSessionRecord({
     acpxRecordId: SESSION,
@@ -101,21 +105,39 @@ async function run(batchFlag: string[], stdin: string) {
     }),
   );
   const before = sha256(recordPath(f, SESSION));
-  const broker = await startFakeBroker({});
+  const broker = await startFakeBroker(
+    options.noPod
+      ? {
+          default: {
+            final: {
+              ready: {
+                ip: "10.9.8.7",
+                pod: `ag-${KEY}-abcde`,
+                uid: UID,
+                node: "node-a",
+                placement: "home",
+              },
+            },
+          },
+        }
+      : {},
+  );
   const atrium = await startStubAtrium(() => ({ status: 202, body: { status: "queued" } }));
   writeAtriumJson(f, { internalUrl: atrium.url });
   const api = await startFakeApiServer({
     namespace: "dev-devbox",
     token: "tok-1",
-    pods: [
-      {
-        name: `ag-${KEY}-abcde`,
-        uid: UID,
-        podIP: "10.9.8.7",
-        readyTransitionTime: "2026-11-21T12:00:00Z",
-        labels: { "workbench.nativai.de/session-key": KEY },
-      },
-    ],
+    pods: options.noPod
+      ? []
+      : [
+          {
+            name: `ag-${KEY}-abcde`,
+            uid: UID,
+            podIP: "10.9.8.7",
+            readyTransitionTime: "2026-11-21T12:00:00Z",
+            labels: { "workbench.nativai.de/session-key": KEY },
+          },
+        ],
   });
   const sa = path.join(f.root, "serviceaccount");
   fs.mkdirSync(sa, { recursive: true });
@@ -177,6 +199,7 @@ async function run(batchFlag: string[], stdin: string) {
   return {
     result,
     calls,
+    brokerRequests: broker.requests.length,
     recordUnchanged: sha256(recordPath(f, SESSION)) === before,
     close: async () => {
       await Promise.all([atrium.close(), broker.close(), api.close()]);
@@ -188,8 +211,9 @@ async function withRun(
   batchFlag: string[],
   stdin: string,
   check: (out: Awaited<ReturnType<typeof run>>) => void,
+  options: { noPod?: boolean } = {},
 ) {
-  const out = await run(batchFlag, stdin);
+  const out = await run(batchFlag, stdin, options);
   try {
     check(out);
   } finally {
@@ -205,14 +229,24 @@ for (const [label, flag] of [
     await withRun([...flag], BATCH, (out) => {
       assert.equal(out.result.code, 0, `exit: ${out.result.stderr}`);
       assert.equal(out.calls.length, 1, "the batch goes to the pod once");
-      const call = out.calls[0]!;
+      const call = out.calls[0];
       assert.equal(
         call.source,
         "file",
         `the pod got ${JSON.stringify(call.value)}, which it must be able to read`,
       );
       assert.notEqual(call.value, "-", "never the stdin placeholder: a routed call has no stdin");
+      assert.match(call.value ?? "", /\.payload$/u, "the payload file, as `--file -` is carried");
       assert.equal(call.body, BATCH, "the pod reads exactly the batch atrium sent");
+      const delivered = (
+        JSON.parse(call.body) as { messages: Array<{ messageId: string }> }
+      ).messages.map((m) => m.messageId);
+      assert.deepEqual(
+        delivered,
+        ["11111111-1111-4111-8111-aaaaaaaaaaaa", "22222222-2222-4222-8222-bbbbbbbbbbbb"],
+        "every member, in order, once",
+      );
+      assert.equal(out.brokerRequests, 0, "a Ready pod needs no broker");
       assert.doesNotMatch(out.result.stderr, /not JSON|usage/iu);
     });
   });
@@ -221,7 +255,7 @@ for (const [label, flag] of [
 test("da4b · negative: a path form is untouched (nothing read from stdin) and the pod sees the same path", async () => {
   await withRun(["--batch-file", "/workspace/da4b-no-such-batch.json"], "", (out) => {
     assert.equal(out.calls.length, 1);
-    assert.equal(out.calls[0]!.value, "/workspace/da4b-no-such-batch.json");
+    assert.equal(out.calls[0].value, "/workspace/da4b-no-such-batch.json");
   });
 });
 
@@ -229,4 +263,21 @@ test("da4b · negative: a genuinely malformed batch on stdin is still refused wi
   await withRun(["--batch-file", "-"], "this is not json", (out) => {
     assert.equal(out.result.code, 2, out.result.stderr);
     assert.match(out.result.stderr, /acpx: --batch-file body is not JSON/u);
-    assert.equal(out.calls.length, 1, "it reached the po
+    assert.equal(out.calls.length, 1, "it reached the pod once and was refused there, not retried");
+  });
+});
+
+test("da4b · the NO-POD-YET path: the broker ensures the pod, and the batch still arrives as the payload file (the plan is made before the broker call)", async () => {
+  await withRun(
+    ["--batch-file", "-"],
+    BATCH,
+    (out) => {
+      assert.equal(out.result.code, 0, `exit: ${out.result.stderr}`);
+      assert.ok(out.brokerRequests >= 1, "the broker was asked for the pod");
+      assert.equal(out.calls.length, 1);
+      assert.equal(out.calls[0].source, "file");
+      assert.equal(out.calls[0].body, BATCH);
+    },
+    { noPod: true },
+  );
+});
