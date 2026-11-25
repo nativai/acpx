@@ -134,6 +134,7 @@ import {
   SEAT_AUTO_NAME_KEY,
   seatDisplayName,
   seatNameFromStore,
+  withoutSeatAutoName,
 } from "../session/seat-display-name.js";
 import { EXIT_CODES } from "../types.js";
 import type {
@@ -247,7 +248,7 @@ import {
   withInheritedProfile,
   withInheritedOutputStyle,
   withInheritedReasoningEffort,
-  withInheritedSeatAutoName,
+  withJoinSeatAutoName,
   withInheritedWorktree,
 } from "./session/inherited-metadata.js";
 import { refuseCloseOverOpenPersonRequests } from "./session/open-person-requests-guard.js";
@@ -1488,6 +1489,22 @@ function recordPrincipal(
     : withSeatJoinPrincipal(metadata, params.seatJoin.firstHolder);
 }
 
+/**
+ * The metadata a `sessions new` carries over before brick / principal: §5.8's worktree keys from a `--from`
+ * source, and (brick fac2128a §4.2) on ANY join the seat-name marker only from a succession's predecessor.
+ */
+function newSessionCarriedMetadata(
+  osMetadata: Record<string, string> | undefined,
+  flags: SessionsNewFlags,
+  from: SessionRecord | undefined,
+): Record<string, string> | undefined {
+  return withJoinSeatAutoName(
+    from ? withInheritedWorktree(osMetadata, from.metadata) : osMetadata,
+    seatToJoin(flags, from) !== undefined,
+    isSuccession(flags, from) ? from?.metadata : undefined,
+  );
+}
+
 function buildSessionStartOptions(params: {
   agent: EffectiveSpawnAgent;
   flags: SessionsNewFlags;
@@ -1557,13 +1574,8 @@ function buildSessionStartOptions(params: {
       withInheritedBrick(
         applyBrickFlag(
           // §5.8 carry rule: a `--from` / handover successor continues in the old session's worktree.
-          // brick fac2128a §4.2: … and carries its seat's generic-name marker (the same seat).
-          params.from
-            ? withInheritedSeatAutoName(
-                withInheritedWorktree(params.osMetadata, params.from.metadata),
-                params.from.metadata,
-              )
-            : params.osMetadata,
+          // brick fac2128a §4.2: on ANY join the seat-name marker comes only from a succession's predecessor.
+          newSessionCarriedMetadata(params.osMetadata, params.flags, params.from),
           params.resolvedBrick,
         ),
         params.inherit?.brick,
@@ -1651,11 +1663,19 @@ async function sourceDefaultForkName(source: SessionRecord): Promise<string> {
  * caller-passed value: the stored name is acpx's default, so a different caller value could only mark a
  * name the seat does not carry. With `-s` the metadata is returned untouched (a passed marker is then
  * checked against the stored name at the create, `withVerifiedSeatAutoName`).
+ *
+ * 🛑 An EPHEMERAL copy (`--ephemeral`, a by-the-way side thread) carries NO marker at all — neither acpx's
+ * default nor a caller's: side threads are not naming targets (CONCEPTION §5 row 9), and their agent must
+ * not rename the seat it was forked into.
  */
 function withAcpxDefaultSeatName(
   metadata: Record<string, string> | undefined,
   acpxDefaultName: string | undefined,
+  ephemeral: boolean,
 ): Record<string, string> | undefined {
+  if (ephemeral) {
+    return withoutSeatAutoName(metadata);
+  }
   return acpxDefaultName === undefined
     ? metadata
     : { ...metadata, [SEAT_AUTO_NAME_KEY]: acpxDefaultName };
@@ -5076,6 +5096,7 @@ async function runSessionCopy(
     withAcpxDefaultSeatName(
       copyMetadata(flags, source, forkAtMessageIndex, forkAtLogIndex, requireTemplate),
       acpxDefaultName,
+      flags.ephemeral === true,
     ),
     copyOsInput(flags, source, caller, requireTemplate),
   );

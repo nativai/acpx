@@ -1,4 +1,4 @@
-import { SEAT_AUTO_NAME_KEY } from "../../session/seat-display-name.js";
+import { SEAT_AUTO_NAME_KEY, withoutSeatAutoName } from "../../session/seat-display-name.js";
 
 export function applyBrickFlag(
   childMetadata: Record<string, string> | undefined,
@@ -213,20 +213,24 @@ export function withInheritedWorktree(
 }
 
 /**
- * Brick fac2128a §4.2 handover carry — pure, no IO. A `--from` / handover successor is the SAME seat, so
- * it inherits the predecessor's `seat_auto_name` marker: a successor of a still-generic seat can then
- * still name it. A caller that passes its own `seat_auto_name` keeps it.
+ * Brick fac2128a §4.2 — the seat-name marker of a JOIN (`--seat`, or a `--from` / handover successor) — pure,
+ * no IO. A joiner never asserts a marker of its own: a caller-passed `seat_auto_name` is DROPPED, so nobody can
+ * mark a name a person chose by joining its seat (TE finding F2). Only a SUCCESSION carries one — the
+ * predecessor's (`successionSource`), because it is the same seat continuing and a successor of a still-generic
+ * seat must still be able to name it. A non-join (`joining === false`) is returned untouched.
  *
- * 🛑 `--from` ONLY — never a copy, fork, by-the-way or template child (`copyMetadata`): those mint a NEW
- * seat, and the source's marker names the SOURCE's machine-made name, not theirs.
+ * 🛑 Never applied to a copy, fork, by-the-way or template child (`copyMetadata`): those mint a NEW seat, and
+ * the source's marker names the SOURCE's machine-made name, not theirs.
  */
-export function withInheritedSeatAutoName(
+export function withJoinSeatAutoName(
   childMetadata: Record<string, string> | undefined,
-  sourceMetadata: Record<string, string> | undefined,
+  joining: boolean,
+  successionSource: Record<string, string> | undefined,
 ): Record<string, string> | undefined {
-  const inherited = sourceMetadata?.[SEAT_AUTO_NAME_KEY];
-  if (childMetadata?.[SEAT_AUTO_NAME_KEY] !== undefined || typeof inherited !== "string") {
+  if (!joining) {
     return childMetadata;
   }
-  return { ...childMetadata, [SEAT_AUTO_NAME_KEY]: inherited };
+  const own = withoutSeatAutoName(childMetadata);
+  const inherited = successionSource?.[SEAT_AUTO_NAME_KEY];
+  return typeof inherited === "string" ? { ...own, [SEAT_AUTO_NAME_KEY]: inherited } : own;
 }

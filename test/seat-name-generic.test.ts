@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { buildAgentSpawnOptions } from "../src/acp/client.js";
-import { withInheritedSeatAutoName } from "../src/cli/session/inherited-metadata.js";
+import { withJoinSeatAutoName } from "../src/cli/session/inherited-metadata.js";
 import {
   SEAT_AUTO_NAME_KEY,
   seatNameIsGeneric,
@@ -65,18 +65,46 @@ test("withVerifiedSeatAutoName keeps the marker only when it names the stored na
   assert.deepEqual(withVerifiedSeatAutoName({ brick: "b" }, "Foo"), { brick: "b" });
 });
 
-test("withInheritedSeatAutoName carries the predecessor's marker; a caller's own wins", () => {
+test("withVerifiedSeatAutoName compares after the -s trim and stores the marker trimmed (TE F3)", () => {
+  const padded = { [SEAT_AUTO_NAME_KEY]: "  tg-ws  ", brick: "b" };
+  assert.deepEqual(withVerifiedSeatAutoName(padded, "tg-ws"), {
+    [SEAT_AUTO_NAME_KEY]: "tg-ws",
+    brick: "b",
+  });
+  assert.deepEqual(withVerifiedSeatAutoName(padded, "  tg-ws  "), {
+    [SEAT_AUTO_NAME_KEY]: "tg-ws",
+    brick: "b",
+  });
+  // negative: the trim is the ONLY normalisation — case and inner spacing still differ
+  assert.deepEqual(withVerifiedSeatAutoName({ [SEAT_AUTO_NAME_KEY]: "TG-WS" }, "tg-ws"), undefined);
+  assert.deepEqual(
+    withVerifiedSeatAutoName({ [SEAT_AUTO_NAME_KEY]: "tg  ws" }, "tg ws"),
+    undefined,
+  );
+  // a whitespace-only marker never marks an unnamed seat
+  assert.equal(withVerifiedSeatAutoName({ [SEAT_AUTO_NAME_KEY]: "   " }, undefined), undefined);
+});
+
+test("withJoinSeatAutoName: a succession carries the predecessor's marker; a joiner's own is always dropped (TE F2)", () => {
   const source = { [SEAT_AUTO_NAME_KEY]: "gen (fork)", worktree_path: "/w" };
-  assert.deepEqual(withInheritedSeatAutoName({ brick: "b" }, source), {
+  assert.deepEqual(withJoinSeatAutoName({ brick: "b" }, true, source), {
     brick: "b",
     [SEAT_AUTO_NAME_KEY]: "gen (fork)",
   });
-  assert.deepEqual(withInheritedSeatAutoName(undefined, source), {
+  assert.deepEqual(withJoinSeatAutoName(undefined, true, source), {
     [SEAT_AUTO_NAME_KEY]: "gen (fork)",
   });
-  const own = { [SEAT_AUTO_NAME_KEY]: "mine" };
-  assert.deepEqual(withInheritedSeatAutoName(own, source), own);
-  assert.equal(withInheritedSeatAutoName(undefined, { brick: "b" }), undefined);
+  const own = { [SEAT_AUTO_NAME_KEY]: "Person Choice", brick: "b" };
+  assert.deepEqual(withJoinSeatAutoName(own, true, source), {
+    brick: "b",
+    [SEAT_AUTO_NAME_KEY]: "gen (fork)",
+  });
+  assert.deepEqual(withJoinSeatAutoName(own, true, undefined), { brick: "b" }, "plain join drops");
+  assert.equal(
+    withJoinSeatAutoName({ [SEAT_AUTO_NAME_KEY]: "x" }, true, { brick: "b" }),
+    undefined,
+  );
+  assert.deepEqual(withJoinSeatAutoName(own, false, source), own, "not a join ⇒ untouched");
 });
 
 // ─── The spawn env ──────────────────────────────────────────────────────────
@@ -374,5 +402,79 @@ test("REAL CLI: a JOIN (--seat) of an UNNAMED seat is generic", async () => {
     const joined = await create(f, ["--seat", unnamed.seatId]);
     assert.equal(joined.seatId, unnamed.seatId, "control: joined");
     assert.equal(await spawnedGenericVar(f), "1");
+  });
+});
+
+test("REAL CLI (TE F2): a plain --seat JOIN cannot assert the marker onto a person's name", async () => {
+  await withMockHome(async (f) => {
+    const named = await create(f, ["-s", "Person Choice"]);
+    const joined = await create(f, [
+      "--seat",
+      named.seatId,
+      "--metadata",
+      "seat_auto_name=Person Choice",
+    ]);
+    assert.equal(joined.seatId, named.seatId, "control: joined");
+    assert.equal(Object.hasOwn(await metadataOf(f, joined.id), "seat_auto_name"), false);
+    assert.equal(await spawnedGenericVar(f), undefined, "the joiner's creation spawn");
+    assert.equal(await turnEnv(f, joined.id), undefined, "the joiner's record-backed turn");
+  });
+});
+
+test("REAL CLI (TE F2): `sessions set-metadata seat_auto_name …` is refused and writes nothing", async () => {
+  await withMockHome(async (f) => {
+    const named = await create(f, ["-s", "Person Choice"]);
+    const refused = await runCli(
+      [
+        "codex",
+        "sessions",
+        "set-metadata",
+        "seat_auto_name",
+        "Person Choice",
+        "--session-id",
+        named.id,
+      ],
+      f.home,
+    );
+    assert.notEqual(refused.code, 0, refused.stdout);
+    assert.match(refused.stderr, /seat_auto_name is recorded once/);
+    assert.equal(Object.hasOwn(await metadataOf(f, named.id), "seat_auto_name"), false);
+    assert.equal((await seatShow(f, named.seatId)).nameGeneric, false);
+    // control: the verb itself works for an ordinary key
+    const ordinary = await runCli(
+      ["codex", "sessions", "set-metadata", "note_key", "x", "--session-id", named.id],
+      f.home,
+    );
+    assert.equal(ordinary.code, 0, ordinary.stderr);
+    assert.equal((await metadataOf(f, named.id)).note_key, "x");
+  });
+});
+
+test("REAL CLI (TE F3): a caller marker padded like its -s is kept, stored trimmed", async () => {
+  await withMockHome(async (f) => {
+    const s = await create(f, ["-s", "  tg-ws  ", "--metadata", "seat_auto_name=  tg-ws  "]);
+    assert.equal((await seatShow(f, s.seatId)).name, "tg-ws", "control: -s is trimmed");
+    assert.equal((await metadataOf(f, s.id)).seat_auto_name, "tg-ws");
+    assert.equal((await seatShow(f, s.seatId)).nameGeneric, true);
+  });
+});
+
+test("REAL CLI (deviation 3): an --ephemeral copy without -s is NOT marked — side threads are not targets", async () => {
+  await withMockHome(async (f) => {
+    const source = await create(f, ["-s", "Mein Name"]);
+    const byway = await copy(f, source.id, [
+      "--ephemeral",
+      "--metadata",
+      "seat_auto_name=Mein Name (fork)",
+    ]);
+    assert.equal(
+      (await seatShow(f, byway.seatId)).name,
+      "Mein Name (fork)",
+      "control: acpx's default",
+    );
+    assert.equal((await metadataOf(f, byway.id)).byway, "1", "control: it is a by-the-way copy");
+    assert.equal(Object.hasOwn(await metadataOf(f, byway.id), "seat_auto_name"), false);
+    assert.equal((await seatShow(f, byway.seatId)).nameGeneric, false);
+    assert.equal(await turnEnv(f, byway.id), undefined);
   });
 });

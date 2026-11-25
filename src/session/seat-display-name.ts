@@ -26,7 +26,8 @@ export function seatNameFromStore(
  *
  * It lives on the HOLDER, never the seat row — the seat's field set is closed (Daniel, 2026-09-28,
  * `seat-store.ts`), and a seat-row key would be stripped by every field-by-field rewrite. A handover
- * successor carries it (`withInheritedSeatAutoName`); a copy never inherits the source's.
+ * successor carries it (`withJoinSeatAutoName`); a copy never inherits the source's, and `sessions set-metadata`
+ * refuses the key (`validateSessionMetadataValue`).
  */
 export const SEAT_AUTO_NAME_KEY = "seat_auto_name";
 
@@ -59,17 +60,35 @@ export function seatNameIsGeneric(
  * Brick fac2128a §4.2 — a create keeps a `seat_auto_name` only when it equals the name the seat will
  * actually carry (`storedName`: the trimmed `-s` of a fresh mint, the joined seat's current name on a
  * join/handover); otherwise the key is DROPPED. So a caller mistake — or a handover marker gone stale
- * because the seat was renamed — can never mark a name the seat does not carry. Pure, no IO.
+ * because the seat was renamed — can never mark a name the seat does not carry. Both sides are compared
+ * after the SAME trim `-s` gets, and a kept marker is stored trimmed (TE finding F3): a caller that sends
+ * `"  tg-ws  "` for both the name and the marker keeps its marker. Pure, no IO.
  */
 export function withVerifiedSeatAutoName(
   metadata: Record<string, string> | undefined,
   storedName: string | undefined,
 ): Record<string, string> | undefined {
   const marker = metadata?.[SEAT_AUTO_NAME_KEY];
-  if (marker === undefined || marker === storedName?.trim()) {
+  if (marker === undefined) {
     return metadata;
   }
-  const { [SEAT_AUTO_NAME_KEY]: _dropped, ...rest } = metadata ?? {};
+  const trimmedMarker = marker.trim();
+  if (trimmedMarker.length > 0 && trimmedMarker === storedName?.trim()) {
+    return trimmedMarker === marker
+      ? metadata
+      : { ...metadata, [SEAT_AUTO_NAME_KEY]: trimmedMarker };
+  }
+  return withoutSeatAutoName(metadata);
+}
+
+/** `metadata` without a `seat_auto_name` key; `undefined` when nothing else is left. Pure, no IO. */
+export function withoutSeatAutoName(
+  metadata: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (metadata?.[SEAT_AUTO_NAME_KEY] === undefined) {
+    return metadata;
+  }
+  const { [SEAT_AUTO_NAME_KEY]: _dropped, ...rest } = metadata;
   return Object.keys(rest).length > 0 ? rest : undefined;
 }
 
