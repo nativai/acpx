@@ -478,6 +478,19 @@ export function placeOf(podFile: AgentPodFile, targetSessionId: string | undefin
  */
 export class BridgeOnControlPodError extends Error {
   readonly stderrLine: string;
+  // ⚠️ THESE THREE FIELDS ARE WHAT MAKE THE CLI EXIT 2 (brick c8146ccd, CONTRACTS-r4 C7.2 `bridge_on_control_pod`,
+  // corrected 2026-11-25): the top-level handler maps a thrown error through `normalizeOutputError` →
+  // `exitCodeForOutputErrorCode`, and an error that carries no `outputCode` is RUNTIME → exit 1. atrium's reader finds
+  // a REFUSED token only at exit 75 or 2 (A-53), so at exit 1 a delivery is retried blind or failed as "outcome
+  // unknown" though nothing started. It is the shape `OwnerOutsidePodError` and `PodForeignWriteError` get by
+  // extending `AcpxOperationalError` (`USAGE` + a detail code, origin `cli`); the normalizer reads the three as plain
+  // fields of any error (`readOutputErrorMeta`), and they are plain fields HERE because this module is loaded before
+  // the rest of acpx and must not import `errors.ts` (the light graph above; `test/pod-command-classes.test.ts`).
+  // Do not add a `cause`: the normalizer would print it. Held at both spawn sites, text and json, through the shipped
+  // CLI by `test/pod-c814-exit-codes.test.ts` (C7.2-B.1).
+  readonly outputCode = "USAGE";
+  readonly detailCode = "bridge_on_control_pod";
+  readonly origin = "cli";
   constructor(what: "adapter" | "owner") {
     const line = `acpx: REFUSED reason=bridge_on_control_pod nothing_started=true protocol=1 what=${what}`;
     super(

@@ -264,6 +264,11 @@ for (const { host, env } of HOSTS) {
         line?.startsWith(IDENTITY_TOKEN),
         `the token is the first REFUSED line, with no prefix: ${r.stderr.slice(-800)}`,
       );
+      assert.equal(
+        r.stderr.split("\n").filter((l) => l.includes("reason=pod_identity_missing")).length,
+        1,
+        `the token line appears once on stderr, in text and in json: ${r.stderr.slice(-800)}`,
+      );
       assert.deepEqual(
         files(home).filter((f) => f.endsWith(".lock")),
         [],
@@ -297,4 +302,32 @@ test("A-5 control: the placement step's own `pod_identity_missing` (no seam) exi
   );
   assert.equal(r.status, 2, r.stderr.slice(-600));
   assert.equal(firstRefusedLine(r.stderr), IDENTITY_TOKEN);
+});
+
+// ─── The seam is airtight ───────────────────────────────────────────────────────────────────────────
+
+test("the seam set WITHOUT NODE_TEST_CONTEXT through dist/cli.js: the placement step still refuses (exit 2), and no spawn site is reached", () => {
+  // The REAL canonical home on a control-role host, pod mode on, no identity: nothing here is a test seam but the one
+  // under test. Honoured, it would skip the step and reach the tripwire (`bridge_on_control_pod`) instead.
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: "/home/node",
+    NV_DEV_SERVER_ROLE: "control",
+    ACPX_OWNER_PLACEMENT: "pod",
+    ACPX_POD_TEST_SKIP_PLACEMENT: "1",
+  };
+  for (const name of [
+    "NODE_TEST_CONTEXT",
+    "ACPX_STATE_HOME",
+    "ACPX_POD_TEST_HOME",
+    "NV_POD_NAME",
+    "NV_POD_UID",
+    "NV_NODE_NAME",
+  ]) {
+    delete env[name];
+  }
+  const r = run(["--agent", MOCK, "--approve-all", "--cwd", makeHome(), "exec", "hello"], env);
+  assert.equal(r.status, 2, r.stderr.slice(-600));
+  assert.equal(firstRefusedLine(r.stderr), IDENTITY_TOKEN, "the placement step's own refusal");
+  assert.doesNotMatch(r.stderr, /bridge_on_control_pod/u);
 });

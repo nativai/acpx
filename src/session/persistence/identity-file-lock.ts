@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { AcpxOperationalError } from "../../errors.js";
 import {
   DEATH_PROOF_TIMEOUT_MS,
   proveDeathDetailed,
@@ -108,14 +109,27 @@ const DEATH_PROOF_RETRY_MS = 1_000;
 
 /** C1.1 A-5: in pod mode the module throws rather than write a body without `pod`. */
 export const POD_IDENTITY_MISSING_CODE = "pod_identity_missing";
-export class PodIdentityMissingError extends Error {
+const POD_IDENTITY_MISSING_LINE =
+  "acpx: REFUSED reason=pod_identity_missing — pod mode is on but this process cannot name its " +
+  "pod (NV_POD_NAME, NV_POD_UID, NV_NODE_NAME, service-account namespace); no lock is written " +
+  "without `pod` (C1.1 A-5)";
+export class PodIdentityMissingError extends AcpxOperationalError {
   readonly code = POD_IDENTITY_MISSING_CODE;
+  /** The token line itself: `--format json` keeps it on stderr (`writeErrorStderrLine`), where atrium's reader looks (A-53). */
+  readonly stderrLine = POD_IDENTITY_MISSING_LINE;
   constructor() {
-    super(
-      "acpx: REFUSED reason=pod_identity_missing — pod mode is on but this process cannot name its " +
-        "pod (NV_POD_NAME, NV_POD_UID, NV_NODE_NAME, service-account namespace); no lock is written " +
-        "without `pod` (C1.1 A-5)",
-    );
+    // ⚠️ `outputCode: "USAGE"` IS WHAT MAKES THE CLI EXIT 2 (brick c8146ccd, CONTRACTS-r4 C7.2 / A-5, A-25, A-26):
+    // the top-level handler maps a thrown error through `normalizeOutputError` → `exitCodeForOutputErrorCode`, and an
+    // error that carries no code is RUNTIME → exit 1 — the placement step's own `pod_identity_missing` already
+    // exits 2. The same pair (`USAGE` + a detail code, origin `cli`) shapes `OwnerOutsidePodError` and
+    // `PodForeignWriteError`. `stderrLine` is what puts the token on stderr in json mode, as `OwnerOutsidePodError`'s
+    // does; text mode prints the message, which IS that line. Held through the shipped CLI, text and json, by
+    // `test/pod-c814-exit-codes.test.ts` (A-25 rows). Do not add a `cause`: the normalizer would print it.
+    super(POD_IDENTITY_MISSING_LINE, {
+      outputCode: "USAGE",
+      detailCode: POD_IDENTITY_MISSING_CODE,
+      origin: "cli",
+    });
   }
 }
 
