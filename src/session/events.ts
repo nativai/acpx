@@ -805,8 +805,12 @@ export class SessionEventWriter {
   ): Promise<SessionEventWriter> {
     // A-80: BEFORE the stream lock (a pod's owner holds it; waiting 20 s for it and then writing is the bug).
     // Not proven gone ⇒ a sidecar-mode writer: no lock, no closed tail, no flush into the stream.
-    const verdict = await streamWriteVerdict(record.acpxRecordId);
+    // ⚠️ THE 1 s A PROOF MAY SERVE COUNTS FROM WHEN IT STARTED, NOT FROM WHEN IT ENDED (TE F-1, case E2): the
+    // verdict reads the lease first and then waits on the API up to 3 s, so a stamp taken after the await would
+    // stretch the window by the proof's duration — a live pod's lease that appeared meanwhile went unseen for
+    // that long plus 1 s. `test/pod-a80-foreign-write.test.ts` "80.4 E2".
     const provenAt = Date.now();
+    const verdict = await streamWriteVerdict(record.acpxRecordId);
     if (verdict.write === "sidecar") {
       return SessionEventWriter.sidecarMode(record, verdict.why, options, provenAt);
     }
@@ -960,8 +964,9 @@ export class SessionEventWriter {
   }
 
   private async proveBeforeWrite(): Promise<void> {
-    const verdict = await streamWriteVerdict(this.record.acpxRecordId);
+    // Stamped BEFORE the await, as in `open` (TE F-1): the window runs from the start of the proof.
     this.provenAt = Date.now();
+    const verdict = await streamWriteVerdict(this.record.acpxRecordId);
     if (verdict.write === "sidecar") {
       this.sidecarWhy = verdict.why;
     }
