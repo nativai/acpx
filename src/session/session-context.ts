@@ -36,7 +36,7 @@ export async function sessionContextFromRecord(
   const agentFolders = resolveAndEnsureAgentFolder(record, brickPath);
   return {
     acpxRecordId: record.acpxRecordId,
-    sessionName: seatNaming.name ?? null,
+    sessionName: seatNaming.seatName ?? null,
     seatNameGeneric: seatNaming.generic,
     parentSessionId: record.parentSessionId ?? null,
     parentSessionUrl: record.parentSessionUrl ?? null,

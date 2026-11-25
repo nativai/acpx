@@ -86,7 +86,7 @@ export function withVerifiedSeatAutoName(
 export async function seatDisplayName(
   record: Pick<SessionRecord, "seatId">,
 ): Promise<string | undefined> {
-  return (await seatNamingForRecord(record)).name;
+  return (await seatNamingForRecord(record)).seatName;
 }
 
 /**
@@ -97,17 +97,20 @@ export async function seatDisplayName(
  */
 export async function seatNamingForRecord(
   record: Pick<SessionRecord, "seatId" | "metadata">,
-): Promise<{ name: string | undefined; generic: boolean }> {
+): Promise<{ seatName: string | undefined; generic: boolean }> {
   if (record.seatId !== undefined) {
     try {
       const seat = seatFromStore(await readSeatStore(sessionBaseDir()), record.seatId);
       if (seat) {
         const trimmed = seat.name?.trim();
-        return { name: trimmed ? trimmed : undefined, generic: seatNameIsGeneric(seat, record) };
+        return {
+          seatName: trimmed ? trimmed : undefined,
+          generic: seatNameIsGeneric(seat, record),
+        };
       }
     } catch {
       // display-only: a label never fails a spawn
     }
   }
-  return { name: undefined, generic: false };
+  return { seatName: undefined, generic: false };
 }
