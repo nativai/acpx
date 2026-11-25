@@ -14,8 +14,9 @@ import { BridgeOnControlPodError, podModeVerdictNow, readPodFileWithWitness } fr
  *        classified — `FlowRunner` of the public `acpx/flows` export reaches it with no CLI placement step.
  *   (ii) an agent pod whose target session's lease is held elsewhere (another pod, or — without `pod` — a home
  *        owner on the control pod: a holder this pod cannot judge, C3.2, and may not write beside, C10) → the
- *        existing A-8 refusal, `pod_foreign_write file=session`. The pod only READS the lease file; it never asks
- *        the API server (C3.2). An unreadable lease, or a pod that cannot name itself, is not judgeable: refused.
+ *        existing owner-entry refusal, `owner_outside_pod session=<record id>` (exit 2; its next line names the
+ *        holder). The pod only READS the lease file; it never asks the API server (C3.2). An unreadable lease, or a
+ *        pod that cannot name itself, is not judgeable: refused.
  *
  * Anywhere else — pod mode off, a workbench, a rig — nothing changes (rows 60.2 / 60.4 run there).
  * ⚠️ (i) is `assertBridgeMayStartHere`'s predicate taken NOW instead of memoised, so a test can vary the

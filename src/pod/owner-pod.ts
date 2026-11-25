@@ -1,6 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import { isControlPod } from "../config/control-pod.js";
+import { AcpxOperationalError } from "../errors.js";
 import { PodIdentityMissingError } from "../session/persistence/identity-file-lock.js";
 import { CALLER_IDENTITY_VARS } from "./caller-identity.js";
 import {
@@ -49,13 +50,22 @@ const OWNER_ENTRY_SENTENCE =
  * (C7.2, clarified 2026-11-25) Also what a flow's direct send meets in an agent pod that does not hold the session's
  * lease (`direct-send-guard.ts`): the refusal line is the same; the sentence after it names the holder.
  */
-export class OwnerOutsidePodError extends Error {
+export class OwnerOutsidePodError extends AcpxOperationalError {
   readonly stderrLine: string;
   readonly exitCode = OWNER_OUTSIDE_POD_EXIT_CODE;
   readonly sessionId: string;
   constructor(sessionId: string, sentence: string = OWNER_ENTRY_SENTENCE) {
     const line = `acpx: REFUSED reason=${OWNER_OUTSIDE_POD_REASON} session=${sessionId}`;
-    super(`${line}\n${sentence}`);
+    // ⚠️ `outputCode: "USAGE"` IS WHAT MAKES THE CLI EXIT 2 (brick 59070d68, TE F-1): the top-level handler maps a
+    // thrown error through `normalizeOutputError` → `exitCodeForOutputErrorCode`, and an error that carries no code
+    // is RUNTIME → exit 1 — `exitCode` above is read only by the `__queue-owner` entry. The same pair
+    // (`USAGE` + a detail code, origin `cli`) is how `pod_foreign_write` and the other exit-2 refusals are shaped.
+    // `test/pod-5907-flow-cli.test.ts` (the shipped `flow run`, text and json) goes red if it is dropped.
+    super(`${line}\n${sentence}`, {
+      outputCode: "USAGE",
+      detailCode: OWNER_OUTSIDE_POD_REASON,
+      origin: "cli",
+    });
     this.stderrLine = line;
     this.sessionId = sessionId;
   }
