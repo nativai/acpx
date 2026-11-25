@@ -70,6 +70,29 @@ export class DatabaseAtOldPlaceError extends AcpxOperationalError {
   }
 }
 
+export const DB_DIR_UNUSABLE_REASON = "db_dir_unusable";
+export type DbDirSource = "env" | "pointer";
+export type DbDirWhy = "unreadable" | "not_json" | "no_dir_string" | "relative" | "dir_not_found";
+
+/** RED-FIRST STUB (A-84): the rows of test/pod-db-dir.test.ts fail by assertion; the behaviour follows. */
+export class DatabaseDirUnusableError extends AcpxOperationalError {
+  constructor(
+    readonly database: SqliteDatabaseName,
+    readonly source: DbDirSource,
+    readonly why: DbDirWhy,
+  ) {
+    super(
+      `acpx: REFUSED reason=${DB_DIR_UNUSABLE_REASON} db=${database} source=${source} why=${why}`,
+      {
+        outputCode: "USAGE",
+        detailCode: DB_DIR_UNUSABLE_REASON,
+        origin: "cli",
+      },
+    );
+    this.name = "DatabaseDirUnusableError";
+  }
+}
+
 export type ControlDatabase = {
   /** Where this process opens the database. */
   readonly path: string;
