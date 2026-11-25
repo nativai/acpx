@@ -60,8 +60,9 @@ const textBase = (f: Fixture): string[] => [
 const OUTPUT_SPELLINGS: Array<{ name: string; flags: string[] }> = [
   { name: "--format json", flags: ["--format", "json"] },
   { name: "--format=json", flags: ["--format=json"] },
-  { name: "--json-strict", flags: ["--json-strict"] },
+  // `--json-strict` alone is a usage error (it "requires --format json"), so it always rides with a format.
   { name: "--format json --json-strict", flags: ["--format", "json", "--json-strict"] },
+  { name: "--json-strict --format=json", flags: ["--json-strict", "--format=json"] },
 ];
 
 /** Every file under the state dir, path and bytes, hashed: a replay must leave this unchanged. */
