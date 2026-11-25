@@ -20,8 +20,11 @@ import { withTempHome } from "./temp-home.js";
 // `reasoningEffort` key, the builder carries `reasoningEffort: null` — equivalent for every reader
 // (`client.ts` reads it as `trimmedOrUndefined(ctx?.reasoningEffort)` and `ctx?.reasoningEffort ?? null`).
 
-/** The OS fields P3a adds on top of the merge — not part of the pre-merge literal. */
-const NEW_FIELDS = ["osChoice", "osPrimerError"] as const;
+/**
+ * The fields added on top of the merge — not part of the pre-merge literal: P3a's OS fields and brick fac2128a's
+ * `seatNameGeneric` (its values are pinned in `test/seat-name-generic.test.ts`).
+ */
+const NEW_FIELDS = ["osChoice", "osPrimerError", "seatNameGeneric"] as const;
 
 function withoutNewFields(context: Record<string, unknown>): Record<string, unknown> {
   const copy = { ...context };

@@ -128,7 +128,7 @@ test("adapter env: a padded / trailing-slash ACPX_UI_BASE_URL is NORMALIZED for 
     const spawnOptions = buildAgentSpawnOptions(
       process.cwd(),
       undefined,
-      { acpxRecordId: "rec-1" },
+      { seatNameGeneric: false, acpxRecordId: "rec-1" },
       {},
       SDK_CLAUDE_COMMAND,
     );
@@ -235,7 +235,7 @@ test("buildAgentSpawnOptions (SDK claude): subscription resolution unchanged whe
     const options = buildAgentSpawnOptions(
       "/tmp/acpx-auth-env-cwd",
       undefined,
-      { acpxRecordId: "rec", subscriptionId: "sub1" },
+      { seatNameGeneric: false, acpxRecordId: "rec", subscriptionId: "sub1" },
       ctx.lookupOptions,
       SDK_CLAUDE_COMMAND,
     );
@@ -275,7 +275,7 @@ test("92121ff9 · a subscription (non-shim) claude spawn carries NO capability k
       const options = buildAgentSpawnOptions(
         "/tmp/acpx-auth-env-cwd",
         undefined,
-        { acpxRecordId: "rec", subscriptionId: "sub1" },
+        { seatNameGeneric: false, acpxRecordId: "rec", subscriptionId: "sub1" },
         ctx.lookupOptions,
         SDK_CLAUDE_COMMAND,
       );
@@ -301,7 +301,7 @@ test("92121ff9 · an operator's own knob on a non-shim spawn passes through UNCH
       const options = buildAgentSpawnOptions(
         "/tmp/acpx-auth-env-cwd",
         undefined,
-        { acpxRecordId: "rec", subscriptionId: "sub1" },
+        { seatNameGeneric: false, acpxRecordId: "rec", subscriptionId: "sub1" },
         ctx.lookupOptions,
         SDK_CLAUDE_COMMAND,
       );

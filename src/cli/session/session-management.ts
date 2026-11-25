@@ -96,6 +96,7 @@ import {
 import { normalizeRuntimeSessionId } from "../../session/runtime-session-id.js";
 import { explainSeatRowMissing } from "../../session/seat-backfill.js";
 import { withBrickCache } from "../../session/seat-brick.js";
+import { withVerifiedSeatAutoName } from "../../session/seat-display-name.js";
 import { creationSessionContext } from "../../session/session-context.js";
 import type { SessionRecord, SessionSleepingState } from "../../types.js";
 import { DEFAULT_QUEUE_OWNER_TTL_MS } from "./contracts.js";
@@ -570,7 +571,15 @@ async function reconcileSeatAndBrickForCreate(
       ),
     };
   }
-  return options;
+  // Brick fac2128a §4.2 — a passed (or handover-carried) generic-name marker survives only when it names
+  // the name this seat will carry: the joined seat's current name, else the `-s` the mint stores.
+  return {
+    ...options,
+    metadata: withVerifiedSeatAutoName(
+      options.metadata,
+      joinedSeat ? joinedSeat.name : normalizeName(options.seatName),
+    ),
+  };
 }
 
 function assertRecordIdFree(recordId: string | undefined): void {

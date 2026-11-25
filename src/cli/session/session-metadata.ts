@@ -4,6 +4,7 @@ import {
   ATRIUM_OS_METADATA_PREFIX,
   PRINCIPAL_METADATA_PREFIX,
 } from "../../session/persistence/principal.js";
+import { SEAT_AUTO_NAME_KEY } from "../../session/seat-display-name.js";
 import type { SessionRecord } from "../../types.js";
 import { isBrickUuid } from "./brick-link.js";
 
@@ -37,6 +38,14 @@ export function validateSessionMetadataValue(key: string, value: string): string
   if (key.startsWith(ATRIUM_OS_METADATA_PREFIX)) {
     throw new InvalidArgumentError(
       `${key} is not set with set-metadata; use acpx sessions set-os <session> <default|path>`,
+    );
+  }
+  // brick fac2128a §4.2 (TE finding F2): the generic-name marker is written only by a create — acpx's own copy
+  // default, a caller's `--metadata` checked against the name it stores, a succession's carry. Set later it
+  // could mark a name a PERSON chose as machine-made, and that seat's agent would then rename it.
+  if (key === SEAT_AUTO_NAME_KEY) {
+    throw new InvalidArgumentError(
+      `${key} is recorded once, when the session is created, and cannot be set afterwards`,
     );
   }
   const trimmed = value.trim();

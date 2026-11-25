@@ -136,7 +136,7 @@ async function spawnAndDumpEnv(
       `--env-dump-extra ${DUMP_EXTRA.join(",")}`,
     cwd: scratch.scratchDir,
     permissionMode: "approve-reads",
-    sessionContext: { acpxRecordId: "rec-1dc24c1c" },
+    sessionContext: { seatNameGeneric: false, acpxRecordId: "rec-1dc24c1c" },
     ...(authCredentials ? { authCredentials } : {}),
   });
   try {

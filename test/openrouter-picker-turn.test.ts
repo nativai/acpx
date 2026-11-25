@@ -242,15 +242,21 @@ test("a blank record id never yields the SHARED /tmp/or- config dir — on eithe
   // rule under repair. True and unattached is the pair that survives review.
   for (const blank of ["", " ", "\t", "\n", "   "]) {
     assert.equal(
-      shimConfigDirSessionId({ acpxRecordId: blank }, "fallback-id"),
+      shimConfigDirSessionId({ seatNameGeneric: false, acpxRecordId: blank }, "fallback-id"),
       "fallback-id",
       `${JSON.stringify(blank)} must fall back, not become part of the path`,
     );
   }
   // The positive control: a real id must survive untouched, or the rule would
   // "pass" by rejecting everything and every session would share the fallback.
-  assert.equal(shimConfigDirSessionId({ acpxRecordId: "real-id" }, "fallback-id"), "real-id");
-  assert.equal(shimConfigDirSessionId({ acpxRecordId: "  padded  " }, "fallback-id"), "padded");
+  assert.equal(
+    shimConfigDirSessionId({ seatNameGeneric: false, acpxRecordId: "real-id" }, "fallback-id"),
+    "real-id",
+  );
+  assert.equal(
+    shimConfigDirSessionId({ seatNameGeneric: false, acpxRecordId: "  padded  " }, "fallback-id"),
+    "padded",
+  );
   assert.equal(shimConfigDirSessionId(undefined, "fallback-id"), "fallback-id");
 });
 

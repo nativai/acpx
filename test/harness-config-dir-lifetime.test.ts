@@ -45,7 +45,10 @@ async function spawnConfigDirClient() {
     agentCommand: `node ${JSON.stringify(mockLink)}`,
     cwd: scratchDir,
     permissionMode: "approve-reads",
-    sessionContext: { acpxRecordId: `rec-lifetime-${path.basename(scratchDir)}` },
+    sessionContext: {
+      seatNameGeneric: false,
+      acpxRecordId: `rec-lifetime-${path.basename(scratchDir)}`,
+    },
   });
   await client.start();
   const session = await client.createSession();

@@ -50,6 +50,7 @@ test("buildAgentSpawnOptions never injects ACPX_SESSION_ID (URL-only identity co
     // resolution.
     withAcpxUiBaseUrlEnv("https://atrium.devbox.nativai.de", () => {
       const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
         acpxRecordId: "11111111-2222-3333-4444-555555555555",
       });
       assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SESSION_ID"), false);
@@ -73,6 +74,7 @@ test("buildAgentSpawnOptions never injects ACPX_SESSION_ID (URL-only identity co
 // env carries.
 test("adapter env carries the acpx RECORD id for the pi sticky-routing seam", () => {
   const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    seatNameGeneric: false,
     acpxRecordId: "11111111-2222-3333-4444-555555555555",
   });
   assert.equal(options.env.ACPX_SESSION_RECORD_ID, "11111111-2222-3333-4444-555555555555");
@@ -87,6 +89,7 @@ test("adapter env: the sticky-routing key rides even where no base URL resolves"
   // hermetically as the pairing rule instead.
   withAcpxUiBaseUrlEnv(undefined, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "11111111-2222-3333-4444-555555555555",
     });
     assert.equal(options.env.ACPX_SESSION_RECORD_ID, "11111111-2222-3333-4444-555555555555");
@@ -129,6 +132,7 @@ test("buildAgentSpawnOptions never injects ACPX_PARENT_SESSION_ID (URL-only iden
   try {
     withAcpxUiBaseUrlEnv("https://atrium.devbox.nativai.de", () => {
       const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
         acpxRecordId: "child-id",
         parentSessionId: "parent-id-abc",
       });
@@ -153,6 +157,7 @@ test("buildAgentSpawnOptions never injects ACPX_PARENT_SESSION_ID (URL-only iden
 test("buildAgentSpawnOptions trims whitespace around parentSessionId into ACPX_PARENT_SESSION_URL", () => {
   withAcpxUiBaseUrlEnv("https://atrium.devbox.nativai.de", () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
       parentSessionId: "  parent-id-xyz  ",
     });
@@ -202,6 +207,7 @@ function expectedSessionUrl(sessionId: string): string | undefined {
 test("buildAgentSpawnOptions composes ACPX_SESSION_URL from the box's resolved base URL when acpxRecordId is set", () => {
   withAcpxUiBaseUrlEnv(undefined, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "11111111-2222-3333-4444-555555555555",
     });
     // With rung 1 unset, the emit side falls through to the box ladder (rung 2
@@ -221,6 +227,7 @@ test("buildAgentSpawnOptions omits ACPX_SESSION_URL when acpxRecordId is empty/w
   delete process.env.ACPX_SESSION_URL;
   try {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "   ",
     });
     assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SESSION_URL"), false);
@@ -236,6 +243,7 @@ test("buildAgentSpawnOptions omits ACPX_SESSION_URL when acpxRecordId is empty/w
 test("buildAgentSpawnOptions injects ACPX_PARENT_SESSION_URL when parentSessionId is non-empty", () => {
   withAcpxUiBaseUrlEnv(undefined, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
       parentSessionId: "parent-id-abc",
     });
@@ -256,6 +264,7 @@ test("buildAgentSpawnOptions omits ACPX_PARENT_SESSION_URL when parentSessionId 
   delete process.env.ACPX_PARENT_SESSION_URL;
   try {
     const nullCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
       parentSessionId: null,
     });
@@ -265,6 +274,7 @@ test("buildAgentSpawnOptions omits ACPX_PARENT_SESSION_URL when parentSessionId 
     );
 
     const undefinedCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
     });
     assert.equal(
@@ -273,6 +283,7 @@ test("buildAgentSpawnOptions omits ACPX_PARENT_SESSION_URL when parentSessionId 
     );
 
     const whitespaceCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
       parentSessionId: "   ",
     });
@@ -292,6 +303,7 @@ test("buildAgentSpawnOptions omits ACPX_PARENT_SESSION_URL when parentSessionId 
 test("buildAgentSpawnOptions honors ACPX_UI_BASE_URL override for both URL vars", () => {
   withAcpxUiBaseUrlEnv("http://localhost:3456", () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
       parentSessionId: "parent-id",
     });
@@ -303,6 +315,7 @@ test("buildAgentSpawnOptions honors ACPX_UI_BASE_URL override for both URL vars"
 test("buildAgentSpawnOptions normalizes a trailing slash on ACPX_UI_BASE_URL", () => {
   withAcpxUiBaseUrlEnv("https://x.example.com/", () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
     });
     assert.equal(options.env.ACPX_SESSION_URL, "https://x.example.com/?session=child-id");
@@ -317,6 +330,7 @@ test("buildAgentSpawnOptions falls through to the box ladder when ACPX_UI_BASE_U
     undefined,
     () =>
       buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
         acpxRecordId: "child-id",
       }).env.ACPX_SESSION_URL,
   );
@@ -324,6 +338,7 @@ test("buildAgentSpawnOptions falls through to the box ladder when ACPX_UI_BASE_U
   for (const blank of ["   ", ""]) {
     withAcpxUiBaseUrlEnv(blank, () => {
       const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
         acpxRecordId: "child-id",
       });
       if (unsetUrl === undefined) {
@@ -338,6 +353,7 @@ test("buildAgentSpawnOptions falls through to the box ladder when ACPX_UI_BASE_U
 test("buildAgentSpawnOptions reflects trimmed UUIDs in URL vars", () => {
   withAcpxUiBaseUrlEnv(undefined, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "  child-id  ",
       parentSessionId: "  parent-id-xyz  ",
     });
@@ -354,6 +370,7 @@ test("buildAgentSpawnOptions: URL is the only identity surface — no _ID vars e
   try {
     withAcpxUiBaseUrlEnv(undefined, () => {
       const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
         acpxRecordId: "child-id",
         parentSessionId: "parent-id",
       });
@@ -381,6 +398,7 @@ test("buildAgentSpawnOptions: URL is the only identity surface — no _ID vars e
 
 test("buildAgentSpawnOptions injects ACPX_SESSION_NAME when sessionContext.sessionName is non-empty", () => {
   const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    seatNameGeneric: false,
     acpxRecordId: "child-id",
     sessionName: " self-status ",
   });
@@ -392,17 +410,20 @@ test("buildAgentSpawnOptions omits ACPX_SESSION_NAME for unnamed sessions and cl
   process.env.ACPX_SESSION_NAME = "stale-parent-name";
   try {
     const unnamed = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
     });
     assert.equal(Object.prototype.hasOwnProperty.call(unnamed.env, "ACPX_SESSION_NAME"), false);
 
     const nullName = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
       sessionName: null,
     });
     assert.equal(Object.prototype.hasOwnProperty.call(nullName.env, "ACPX_SESSION_NAME"), false);
 
     const whitespaceName = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
       sessionName: "   ",
     });
@@ -436,6 +457,7 @@ test("buildAgentSpawnOptions clears a stale inherited ACPX_TASK_FOLDER", () => {
   process.env.ACPX_TASK_FOLDER = "/stale/task";
   try {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
     });
     assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_TASK_FOLDER"), false);
@@ -458,6 +480,7 @@ test("buildAgentSpawnOptions drops an inherited PORT and keeps HOST=0.0.0.0", ()
   process.env.HOST = "0.0.0.0";
   try {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
     });
     assert.equal(Object.prototype.hasOwnProperty.call(options.env, "PORT"), false);
@@ -475,6 +498,7 @@ test("buildAgentSpawnOptions drops an inherited PORT and keeps HOST=0.0.0.0", ()
 
 test("buildAgentSpawnOptions injects ACPX_BRICK and ACPX_BRICK_PATH when present", () => {
   const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    seatNameGeneric: false,
     acpxRecordId: "child-id",
     brick: "11111111-2222-3333-4444-555555555555",
     brickPath: "/wisdom/Operating System/Bricks/11111111-2222-3333-4444-555555555555",
@@ -488,6 +512,7 @@ test("buildAgentSpawnOptions injects ACPX_BRICK and ACPX_BRICK_PATH when present
 
 test("buildAgentSpawnOptions trims brick env vars and omits path without a brick id", () => {
   const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    seatNameGeneric: false,
     acpxRecordId: "child-id",
     brick: "  11111111-2222-3333-4444-555555555555  ",
     brickPath: "  /brick/path  ",
@@ -496,6 +521,7 @@ test("buildAgentSpawnOptions trims brick env vars and omits path without a brick
   assert.equal(options.env.ACPX_BRICK_PATH, "/brick/path");
 
   const noBrick = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    seatNameGeneric: false,
     acpxRecordId: "child-id",
     brickPath: "/brick/path",
   });
@@ -512,6 +538,7 @@ test("buildAgentSpawnOptions clears stale ACPX_BRICK vars and owner-log marker",
   process.env.ACPX_OWNER_LOG = "1";
   try {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
     });
     assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_BRICK"), false);
@@ -544,6 +571,7 @@ test("buildAgentSpawnOptions: URL session + parent vars replace the _ID vars", (
   try {
     withAcpxUiBaseUrlEnv(undefined, () => {
       const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
         acpxRecordId: "child-id",
         parentSessionId: "parent-id",
       });
@@ -571,6 +599,7 @@ test("buildAgentSpawnOptions: URL session + parent vars replace the _ID vars", (
 
 test("buildAgentSpawnOptions injects ACPX_AGENT_FOLDER when sessionContext.agentFolder is non-empty", () => {
   const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    seatNameGeneric: false,
     acpxRecordId: "child-id",
     agentFolder: "/abs/task/agents/child-12345678",
   });
@@ -579,6 +608,7 @@ test("buildAgentSpawnOptions injects ACPX_AGENT_FOLDER when sessionContext.agent
 
 test("buildAgentSpawnOptions trims whitespace around agentFolder before injecting ACPX_AGENT_FOLDER", () => {
   const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+    seatNameGeneric: false,
     acpxRecordId: "child-id",
     agentFolder: "   /abs/task/agents/child  ",
   });
@@ -590,6 +620,7 @@ test("buildAgentSpawnOptions omits ACPX_AGENT_FOLDER when agentFolder is null/un
   delete process.env.ACPX_AGENT_FOLDER;
   try {
     const undefinedCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
     });
     assert.equal(
@@ -598,18 +629,21 @@ test("buildAgentSpawnOptions omits ACPX_AGENT_FOLDER when agentFolder is null/un
     );
 
     const nullCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
       agentFolder: null,
     });
     assert.equal(Object.prototype.hasOwnProperty.call(nullCase.env, "ACPX_AGENT_FOLDER"), false);
 
     const emptyCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
       agentFolder: "",
     });
     assert.equal(Object.prototype.hasOwnProperty.call(emptyCase.env, "ACPX_AGENT_FOLDER"), false);
 
     const whitespaceCase = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
       agentFolder: "   ",
     });
@@ -629,6 +663,7 @@ test("buildAgentSpawnOptions omits ACPX_AGENT_FOLDER when agentFolder is null/un
 test("buildAgentSpawnOptions: ACPX_AGENT_FOLDER coexists with the URL session vars", () => {
   withAcpxUiBaseUrlEnv(undefined, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
       parentSessionId: "parent-id",
       agentFolder: "/task/abs/agents/child-id",
@@ -685,6 +720,7 @@ function withScopedSessionTmpRoot<T>(fn: (root: string, sharedRoot: string) => T
 test("buildAgentSpawnOptions creates ACPX_SESSION_TMP mode 0700 under the configured root", () => {
   withScopedSessionTmpRoot((root) => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "11111111-2222-3333-4444-555555555555",
     });
     const expected = path.join(root, "acpx-11111111-2222-3333-4444-555555555555");
@@ -698,9 +734,11 @@ test("buildAgentSpawnOptions creates ACPX_SESSION_TMP mode 0700 under the config
 test("buildAgentSpawnOptions gives two different sessions two different ACPX_SESSION_TMP dirs", () => {
   withScopedSessionTmpRoot(() => {
     const a = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "11111111-2222-3333-4444-555555555555",
     });
     const b = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "22222222-3333-4444-5555-666666666666",
     });
     assert.notEqual(a.env.ACPX_SESSION_TMP, b.env.ACPX_SESSION_TMP);
@@ -712,6 +750,7 @@ test("buildAgentSpawnOptions gives two different sessions two different ACPX_SES
 test("buildAgentSpawnOptions omits ACPX_SESSION_TMP when acpxRecordId is empty/whitespace", () => {
   withScopedSessionTmpRoot(() => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "   ",
     });
     assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SESSION_TMP"), false);
@@ -724,6 +763,7 @@ test("buildAgentSpawnOptions clears a stale inherited ACPX_SESSION_TMP", () => {
     process.env.ACPX_SESSION_TMP = "/tmp/acpx-some-other-session";
     try {
       const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
         acpxRecordId: "11111111-2222-3333-4444-555555555555",
       });
       assert.equal(
@@ -743,10 +783,12 @@ test("buildAgentSpawnOptions clears a stale inherited ACPX_SESSION_TMP", () => {
 test("buildAgentSpawnOptions: ACPX_SESSION_TMP survives being created twice (idempotent respawn)", () => {
   withScopedSessionTmpRoot((root) => {
     const first = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "11111111-2222-3333-4444-555555555555",
     });
     fsSync.writeFileSync(path.join(first.env.ACPX_SESSION_TMP ?? "", "marker.txt"), "hi");
     const second = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "11111111-2222-3333-4444-555555555555",
     });
     assert.equal(second.env.ACPX_SESSION_TMP, first.env.ACPX_SESSION_TMP);
@@ -765,6 +807,7 @@ test("buildAgentSpawnOptions: ACPX_SESSION_TMP survives being created twice (ide
 test("buildAgentSpawnOptions creates ACPX_SESSION_SHARED_TMP mode 0700 under the configured root", () => {
   withScopedSessionTmpRoot((_root, sharedRoot) => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "11111111-2222-3333-4444-555555555555",
     });
     const expected = path.join(sharedRoot, "acpx-11111111-2222-3333-4444-555555555555");
@@ -780,6 +823,7 @@ test("buildAgentSpawnOptions creates ACPX_SESSION_SHARED_TMP mode 0700 under the
 test("buildAgentSpawnOptions keeps tier 1 and tier 2 as two DIFFERENT directories", () => {
   withScopedSessionTmpRoot((root, sharedRoot) => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "11111111-2222-3333-4444-555555555555",
     });
     assert.notEqual(options.env.ACPX_SESSION_TMP, options.env.ACPX_SESSION_SHARED_TMP);
@@ -797,9 +841,11 @@ test("buildAgentSpawnOptions keeps tier 1 and tier 2 as two DIFFERENT directorie
 test("buildAgentSpawnOptions gives two sessions two different ACPX_SESSION_SHARED_TMP dirs", () => {
   withScopedSessionTmpRoot(() => {
     const a = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "11111111-2222-3333-4444-555555555555",
     });
     const b = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "22222222-3333-4444-5555-666666666666",
     });
     assert.notEqual(a.env.ACPX_SESSION_SHARED_TMP, b.env.ACPX_SESSION_SHARED_TMP);
@@ -811,6 +857,7 @@ test("buildAgentSpawnOptions gives two sessions two different ACPX_SESSION_SHARE
 test("buildAgentSpawnOptions omits ACPX_SESSION_SHARED_TMP when acpxRecordId is empty/whitespace", () => {
   withScopedSessionTmpRoot(() => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "   ",
     });
     assert.equal(
@@ -829,6 +876,7 @@ test("buildAgentSpawnOptions clears a stale inherited ACPX_SESSION_SHARED_TMP", 
     process.env.ACPX_SESSION_SHARED_TMP = "/workspace/.session-scratch/acpx-some-other-session";
     try {
       const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
         acpxRecordId: "11111111-2222-3333-4444-555555555555",
       });
       assert.equal(
@@ -854,6 +902,7 @@ test("buildAgentSpawnOptions strips an inherited ACPX_SESSION_SHARED_TMP even wi
     process.env.ACPX_SESSION_SHARED_TMP = "/workspace/.session-scratch/acpx-some-other-session";
     try {
       const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
         acpxRecordId: "   ",
       });
       assert.equal(
@@ -874,10 +923,12 @@ test("buildAgentSpawnOptions strips an inherited ACPX_SESSION_SHARED_TMP even wi
 test("buildAgentSpawnOptions: ACPX_SESSION_SHARED_TMP survives a respawn (idempotent)", () => {
   withScopedSessionTmpRoot((_root, sharedRoot) => {
     const first = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "11111111-2222-3333-4444-555555555555",
     });
     fsSync.writeFileSync(path.join(first.env.ACPX_SESSION_SHARED_TMP ?? "", "marker.txt"), "hi");
     const second = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "11111111-2222-3333-4444-555555555555",
     });
     assert.equal(second.env.ACPX_SESSION_SHARED_TMP, first.env.ACPX_SESSION_SHARED_TMP);
@@ -950,6 +1001,7 @@ function withProcessEnv(name: string, value: string | undefined, body: () => voi
 test("cb214e48: an inherited acpx-pi-* PI_CODING_AGENT_DIR does not reach the child spawn env", () => {
   withProcessEnv("PI_CODING_AGENT_DIR", "/tmp/acpx-pi-01a08744-8e1f-74ab-93a1-368e09e68a13", () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
     });
     assert.equal(
@@ -966,6 +1018,7 @@ test("cb214e48: a BOX-level PI_CODING_AGENT_DIR DOES reach it", () => {
   // `delete env.PI_CODING_AGENT_DIR` on every spawn passes the row above.
   withProcessEnv("PI_CODING_AGENT_DIR", "/opt/pi-box/agent", () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
     });
     assert.equal(options.env.PI_CODING_AGENT_DIR, "/opt/pi-box/agent");
@@ -985,7 +1038,7 @@ test("cb214e48: PI_CODING_AGENT_SESSION_DIR never survives the copy — for ANY 
         const options = buildAgentSpawnOptions(
           "/tmp/acpx-agent",
           undefined,
-          { acpxRecordId: "child-id" },
+          { seatNameGeneric: false, acpxRecordId: "child-id" },
           undefined,
           agentCommand,
         );
@@ -1064,7 +1117,7 @@ test("27894f40: none of pi's five descriptive session vars survives the copy —
       const options = buildAgentSpawnOptions(
         "/tmp/acpx-agent",
         undefined,
-        { acpxRecordId: "child-id" },
+        { seatNameGeneric: false, acpxRecordId: "child-id" },
         undefined,
         agentCommand,
       );
@@ -1090,6 +1143,7 @@ test("27894f40: the scrub is scoped to those five — an unrelated PI_* var is u
     [...PARENT_PI_ENV, ["PI_UNRELATED_CONTROL", "keep-me"], ["PI_CODING_AGENT", "true"]],
     () => {
       const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
         acpxRecordId: "child-id",
       });
       assert.equal(options.env.PI_UNRELATED_CONTROL, "keep-me");
@@ -1239,8 +1293,13 @@ test("7395a3c8: production Codex strips metadata across no-context, creation and
     withProcessEnv("CLAUDE_EFFORT", "high", () => {
       for (const context of [
         undefined,
-        { acpxRecordId: "" },
-        { acpxRecordId: "effort-child", seatId: "child-seat", reasoningEffort: "max" },
+        { seatNameGeneric: false, acpxRecordId: "" },
+        {
+          seatNameGeneric: false,
+          acpxRecordId: "effort-child",
+          seatId: "child-seat",
+          reasoningEffort: "max",
+        },
       ]) {
         const { env } = buildAgentSpawnOptions(
           process.cwd(),
@@ -1715,7 +1774,7 @@ test("buildAgentSpawnOptions (N1) explicit valid subscription → CLAUDE_CONFIG_
       const options = buildAgentSpawnOptions(
         "/tmp/acpx-agent",
         undefined,
-        { acpxRecordId: "rec", subscriptionId: "sub1" },
+        { seatNameGeneric: false, acpxRecordId: "rec", subscriptionId: "sub1" },
         ctx.lookupOptions,
       );
       assert.equal(options.env.CLAUDE_CONFIG_DIR, ctx.configDir("sub1"));
@@ -1731,7 +1790,7 @@ test("buildAgentSpawnOptions (N2/W14-01) unselected + usable default → raw env
         const options = buildAgentSpawnOptions(
           "/tmp/acpx-agent",
           undefined,
-          { acpxRecordId: "rec" }, // no subscriptionId
+          { seatNameGeneric: false, acpxRecordId: "rec" }, // no subscriptionId
           ctx.lookupOptions,
         );
         assert.equal(hasClaudeConfigDir(options.env), false);
@@ -1750,7 +1809,7 @@ test("buildAgentSpawnOptions (N3) unselected + default whose dir is MISSING → 
         const options = buildAgentSpawnOptions(
           "/tmp/acpx-agent",
           undefined,
-          { acpxRecordId: "rec" },
+          { seatNameGeneric: false, acpxRecordId: "rec" },
           ctx.lookupOptions,
         );
         assert.equal(hasClaudeConfigDir(options.env), false);
@@ -1770,7 +1829,7 @@ test("buildAgentSpawnOptions (N4) explicit unknown + usable default → loud ref
             buildAgentSpawnOptions(
               "/tmp/acpx-agent",
               undefined,
-              { acpxRecordId: "rec", subscriptionId: "ghost" },
+              { seatNameGeneric: false, acpxRecordId: "rec", subscriptionId: "ghost" },
               ctx.lookupOptions,
             ),
           /subscription "ghost" not found in registry; refusing to spawn on a different account/,
@@ -1787,7 +1846,7 @@ test("buildAgentSpawnOptions (G1) no registry + unselected → CLAUDE_CONFIG_DIR
       const options = buildAgentSpawnOptions(
         "/tmp/acpx-agent",
         undefined,
-        { acpxRecordId: "rec" },
+        { seatNameGeneric: false, acpxRecordId: "rec" },
         ctx.lookupOptions,
       );
       assert.equal(hasClaudeConfigDir(options.env), false);
@@ -1804,7 +1863,7 @@ test("buildAgentSpawnOptions (G2) no registry + explicit unknown → loud refusa
           buildAgentSpawnOptions(
             "/tmp/acpx-agent",
             undefined,
-            { acpxRecordId: "rec", subscriptionId: "ghost" },
+            { seatNameGeneric: false, acpxRecordId: "rec", subscriptionId: "ghost" },
             ctx.lookupOptions,
           ),
         /subscription "ghost" not found in registry; refusing to spawn on a different account/,
@@ -1822,7 +1881,7 @@ test("buildAgentSpawnOptions (G3) registry present but default ABSENT + unselect
         const options = buildAgentSpawnOptions(
           "/tmp/acpx-agent",
           undefined,
-          { acpxRecordId: "rec" },
+          { seatNameGeneric: false, acpxRecordId: "rec" },
           ctx.lookupOptions,
         );
         assert.equal(hasClaudeConfigDir(options.env), false);
@@ -1842,7 +1901,7 @@ test("buildAgentSpawnOptions (G4) explicit id with MISSING dir, no default → l
             buildAgentSpawnOptions(
               "/tmp/acpx-agent",
               undefined,
-              { acpxRecordId: "rec", subscriptionId: "sub1" },
+              { seatNameGeneric: false, acpxRecordId: "rec", subscriptionId: "sub1" },
               ctx.lookupOptions,
             ),
           new RegExp(
@@ -1867,7 +1926,7 @@ test("buildAgentSpawnOptions (S1) explicit sub → ACPX_SUBSCRIPTION = that id",
       const options = buildAgentSpawnOptions(
         "/tmp/acpx-agent",
         undefined,
-        { acpxRecordId: "rec", subscriptionId: "sub1" },
+        { seatNameGeneric: false, acpxRecordId: "rec", subscriptionId: "sub1" },
         ctx.lookupOptions,
       );
       assert.equal(options.env.ACPX_SUBSCRIPTION, "sub1");
@@ -1884,7 +1943,7 @@ test("buildAgentSpawnOptions (S2/W14-01) unselected + default → ACPX_SUBSCRIPT
         const options = buildAgentSpawnOptions(
           "/tmp/acpx-agent",
           undefined,
-          { acpxRecordId: "rec" },
+          { seatNameGeneric: false, acpxRecordId: "rec" },
           ctx.lookupOptions,
         );
         assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SUBSCRIPTION"), false);
@@ -1900,7 +1959,7 @@ test("buildAgentSpawnOptions (S3) no registry → ACPX_SUBSCRIPTION ABSENT (back
     const options = buildAgentSpawnOptions(
       "/tmp/acpx-agent",
       undefined,
-      { acpxRecordId: "rec" },
+      { seatNameGeneric: false, acpxRecordId: "rec" },
       ctx.lookupOptions,
     );
     assert.equal(Object.prototype.hasOwnProperty.call(options.env, "ACPX_SUBSCRIPTION"), false);
@@ -1920,7 +1979,7 @@ test("buildAgentSpawnOptions (K1) explicit resolved sub known-dead → no hidden
           const options = buildAgentSpawnOptions(
             "/tmp/acpx-agent",
             undefined,
-            { acpxRecordId: "rec", subscriptionId: "sub1" }, // explicitly pinned to the dead sub
+            { seatNameGeneric: false, acpxRecordId: "rec", subscriptionId: "sub1" }, // explicitly pinned to the dead sub
             ctx.lookupOptions,
           );
           assert.equal(options.env.CLAUDE_CONFIG_DIR, ctx.configDir("sub1"));
@@ -1941,7 +2000,7 @@ test("buildAgentSpawnOptions (K2) known-dead set empty → no substitution (iden
       const options = buildAgentSpawnOptions(
         "/tmp/acpx-agent",
         undefined,
-        { acpxRecordId: "rec", subscriptionId: "sub1" },
+        { seatNameGeneric: false, acpxRecordId: "rec", subscriptionId: "sub1" },
         ctx.lookupOptions,
       );
       assert.equal(options.env.CLAUDE_CONFIG_DIR, ctx.configDir("sub1"));
@@ -1978,7 +2037,7 @@ test("buildAgentSpawnOptions injects ACPX_AGENT_TYPE for every classified harnes
     const options = buildAgentSpawnOptions(
       "/tmp/acpx-agent",
       undefined,
-      { acpxRecordId: "11111111-2222-3333-4444-555555555555" },
+      { seatNameGeneric: false, acpxRecordId: "11111111-2222-3333-4444-555555555555" },
       undefined,
       agentCommand,
     );
@@ -2005,7 +2064,7 @@ test("buildAgentSpawnOptions leaves ACPX_AGENT_TYPE UNSET for an unclassifiable 
       const options = buildAgentSpawnOptions(
         "/tmp/acpx-agent",
         undefined,
-        { acpxRecordId: "11111111-2222-3333-4444-555555555555" },
+        { seatNameGeneric: false, acpxRecordId: "11111111-2222-3333-4444-555555555555" },
         undefined,
         agentCommand,
       );
@@ -2042,7 +2101,7 @@ function codexConfigEnvFor(agentCommand: string | undefined, inherited: string |
     return buildAgentSpawnOptions(
       "/tmp/acpx-agent",
       undefined,
-      { acpxRecordId: "11111111-2222-3333-4444-555555555555" },
+      { seatNameGeneric: false, acpxRecordId: "11111111-2222-3333-4444-555555555555" },
       undefined,
       agentCommand,
     ).env.CODEX_CONFIG;
@@ -2147,7 +2206,7 @@ test("buildAgentSpawnOptions does not leak the parent's account stamp into a chi
     const options = buildAgentSpawnOptions(
       "/tmp/acpx-agent",
       undefined,
-      { acpxRecordId: "11111111-2222-3333-4444-555555555555" },
+      { seatNameGeneric: false, acpxRecordId: "11111111-2222-3333-4444-555555555555" },
       undefined,
       "node /opt/pi-acp/dist/index.js",
     );
@@ -2175,7 +2234,7 @@ test("buildAgentSpawnOptions still stamps the account for a session that HAS a s
         const options = buildAgentSpawnOptions(
           "/tmp/acpx-agent",
           undefined,
-          { acpxRecordId: "rec", subscriptionId: "sub1" },
+          { seatNameGeneric: false, acpxRecordId: "rec", subscriptionId: "sub1" },
           ctx.lookupOptions,
           "node /opt/claude-agent-acp/dist/index.js",
         );
@@ -2217,7 +2276,7 @@ test("buildAgentSpawnOptions does not leak CLAUDE_CONFIG_DIR into a non-claude c
     const options = buildAgentSpawnOptions(
       "/tmp/acpx-agent",
       undefined,
-      { acpxRecordId: "11111111-2222-3333-4444-555555555555" },
+      { seatNameGeneric: false, acpxRecordId: "11111111-2222-3333-4444-555555555555" },
       undefined,
       "node /opt/pi-acp/dist/index.js",
     );
@@ -2240,7 +2299,7 @@ test("buildAgentSpawnOptions still resolves CLAUDE_CONFIG_DIR for a subscription
         const options = buildAgentSpawnOptions(
           "/tmp/acpx-agent",
           undefined,
-          { acpxRecordId: "rec", subscriptionId: "sub1" },
+          { seatNameGeneric: false, acpxRecordId: "rec", subscriptionId: "sub1" },
           ctx.lookupOptions,
           "node /opt/claude-agent-acp/dist/index.js",
         );

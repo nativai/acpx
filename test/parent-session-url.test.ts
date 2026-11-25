@@ -91,6 +91,7 @@ function recordWithParent(overrides: Partial<SessionRecord> = {}): SessionRecord
 test("c6e3618b: a foreign parent URL reaches the child with its ORIGIN host intact", () => {
   withEnv({ ACPX_UI_BASE_URL: LOCAL_HOST }, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-1",
       parentSessionId: PARENT_ID,
       parentSessionUrl: FOREIGN_PARENT_URL,
@@ -108,6 +109,7 @@ test("c6e3618b: a foreign parent URL reaches the child with its ORIGIN host inta
 test("c6e3618b control: a SAME-box parent (id only) still derives against the local base", () => {
   withEnv({ ACPX_UI_BASE_URL: LOCAL_HOST }, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-1",
       parentSessionId: PARENT_ID,
     });
@@ -118,13 +120,16 @@ test("c6e3618b control: a SAME-box parent (id only) still derives against the lo
 test("c6e3618b: no parent at all → no ACPX_PARENT_SESSION_URL, and a blank url does not win", () => {
   withEnv({ ACPX_UI_BASE_URL: LOCAL_HOST }, () => {
     assert.equal(
-      buildAgentSpawnOptions("/tmp/acpx-agent", undefined, { acpxRecordId: "child-1" }).env
-        .ACPX_PARENT_SESSION_URL,
+      buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
+        acpxRecordId: "child-1",
+      }).env.ACPX_PARENT_SESSION_URL,
       undefined,
     );
     // A whitespace-only url must fall through to the id, not emit an empty host.
     assert.equal(
       buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
         acpxRecordId: "child-1",
         parentSessionId: PARENT_ID,
         parentSessionUrl: "   ",

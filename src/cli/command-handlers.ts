@@ -118,6 +118,7 @@ import {
   manifestFailureRemedy,
   writeSessionRecord,
   writeSessionRecordWithLifecycle,
+  normalizeName,
 } from "../session/persistence.js";
 import type { MigrateSlugsResult, TemplateRollbackResult } from "../session/persistence.js";
 import { readIndexEntryFromDisk, type SessionIndexEntry } from "../session/persistence/index.js";
@@ -130,7 +131,12 @@ import {
 import { templateActorFromEnv } from "../session/persistence/template-actor.js";
 import { SeatBrickReassignRequiredError, writeBrickLink } from "../session/seat-brick-write.js";
 import { decideSessionBrick } from "../session/seat-brick.js";
-import { seatDisplayName, seatNameFromStore } from "../session/seat-display-name.js";
+import {
+  SEAT_AUTO_NAME_KEY,
+  seatDisplayName,
+  seatNameFromStore,
+  withoutSeatAutoName,
+} from "../session/seat-display-name.js";
 import { EXIT_CODES } from "../types.js";
 import type {
   OutputFormat,
@@ -243,6 +249,7 @@ import {
   withInheritedProfile,
   withInheritedOutputStyle,
   withInheritedReasoningEffort,
+  withJoinSeatAutoName,
   withInheritedWorktree,
 } from "./session/inherited-metadata.js";
 import { refuseCloseOverOpenPersonRequests } from "./session/open-person-requests-guard.js";
@@ -523,7 +530,13 @@ async function readModelAdvertisement(
     timeoutMs: globalFlags.timeout,
     verbose: globalFlags.verbose,
     ...(globalFlags.profile
-      ? { sessionContext: { acpxRecordId: "", profileId: globalFlags.profile } }
+      ? {
+          sessionContext: {
+            acpxRecordId: "",
+            profileId: globalFlags.profile,
+            seatNameGeneric: false,
+          },
+        }
       : {}),
   });
   return { models, served: undefined };
@@ -1477,6 +1490,22 @@ function recordPrincipal(
     : withSeatJoinPrincipal(metadata, params.seatJoin.firstHolder);
 }
 
+/**
+ * The metadata a `sessions new` carries over before brick / principal: §5.8's worktree keys from a `--from`
+ * source, and (brick fac2128a §4.2) on ANY join the seat-name marker only from a succession's predecessor.
+ */
+function newSessionCarriedMetadata(
+  osMetadata: Record<string, string> | undefined,
+  flags: SessionsNewFlags,
+  from: SessionRecord | undefined,
+): Record<string, string> | undefined {
+  return withJoinSeatAutoName(
+    from ? withInheritedWorktree(osMetadata, from.metadata) : osMetadata,
+    seatToJoin(flags, from) !== undefined,
+    isSuccession(flags, from) ? from?.metadata : undefined,
+  );
+}
+
 function buildSessionStartOptions(params: {
   agent: EffectiveSpawnAgent;
   flags: SessionsNewFlags;
@@ -1546,9 +1575,8 @@ function buildSessionStartOptions(params: {
       withInheritedBrick(
         applyBrickFlag(
           // §5.8 carry rule: a `--from` / handover successor continues in the old session's worktree.
-          params.from
-            ? withInheritedWorktree(params.osMetadata, params.from.metadata)
-            : params.osMetadata,
+          // brick fac2128a §4.2: on ANY join the seat-name marker comes only from a succession's predecessor.
+          newSessionCarriedMetadata(params.osMetadata, params.flags, params.from),
           params.resolvedBrick,
         ),
         params.inherit?.brick,
@@ -1629,6 +1657,29 @@ function resolveCopyDestinationCwd(
 async function sourceDefaultForkName(source: SessionRecord): Promise<string> {
   const sourceName = (await seatDisplayName(source)) ?? source.title ?? "session";
   return `${sourceName} (fork)`;
+}
+
+/**
+ * Brick fac2128a §4.2 — the copy's `seat_auto_name` when acpx made the name up (no `-s`). It REPLACES any
+ * caller-passed value: the stored name is acpx's default, so a different caller value could only mark a
+ * name the seat does not carry. With `-s` the metadata is returned untouched (a passed marker is then
+ * checked against the stored name at the create, `withVerifiedSeatAutoName`).
+ *
+ * 🛑 An EPHEMERAL copy (`--ephemeral`, a by-the-way side thread) carries NO marker at all — neither acpx's
+ * default nor a caller's: side threads are not naming targets (CONCEPTION §5 row 9), and their agent must
+ * not rename the seat it was forked into.
+ */
+function withAcpxDefaultSeatName(
+  metadata: Record<string, string> | undefined,
+  acpxDefaultName: string | undefined,
+  ephemeral: boolean,
+): Record<string, string> | undefined {
+  if (ephemeral) {
+    return withoutSeatAutoName(metadata);
+  }
+  return acpxDefaultName === undefined
+    ? metadata
+    : { ...metadata, [SEAT_AUTO_NAME_KEY]: acpxDefaultName };
 }
 
 function agentTypeLabel(agentCommand: string, config: ResolvedAcpxConfig): string {
@@ -5040,9 +5091,17 @@ async function runSessionCopy(
   // /fork origin (forkFromSessionId) — the "both edges" write. With no parent
   // context the `?.` guards omit both fields → byte-identical to today.
   const { caller, parent, spawnedBySessionId } = await resolveCopyLineage(flags);
+  // brick fac2128a §4.2 — with no `-s` acpx INVENTS the name, so it marks it machine-made on the new
+  // holder in the same create; the copy's agent then names the seat once its purpose is clear.
+  const acpxDefaultName =
+    flags.name === undefined ? normalizeName(await sourceDefaultForkName(source)) : undefined;
   // P3a §2 — resolved (and `--os` validated) before the admission and the create.
   const osMetadata = withOsChoice(
-    copyMetadata(flags, source, forkAtMessageIndex, forkAtLogIndex, requireTemplate),
+    withAcpxDefaultSeatName(
+      copyMetadata(flags, source, forkAtMessageIndex, forkAtLogIndex, requireTemplate),
+      acpxDefaultName,
+      flags.ephemeral === true,
+    ),
     copyOsInput(flags, source, caller, requireTemplate),
   );
   const { value: resolvedBrick, validated: resolvedBrickValidated } = await resolveBrickFlagValue(
@@ -5063,7 +5122,7 @@ async function runSessionCopy(
       agentName:
         source.agentName ?? resolveAgentNameFromCommand(source.agentCommand, config.agents),
       cwd: destination.cwd,
-      seatName: flags.name ?? (await sourceDefaultForkName(source)),
+      seatName: flags.name ?? acpxDefaultName,
       // metadata.brick carry: precedence = --brick flag > spawn-parent brick (--parent-id / byway)
       // > none. A plain fork/copy carries NO brick by default (the 07-15 source.metadata.brick
       // fallback was reversed, brick://1113da9d) so it does not impersonate the source's brick.
