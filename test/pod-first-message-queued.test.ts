@@ -5,13 +5,20 @@ import path from "node:path";
 import test from "node:test";
 import { agentPodEnv, agentPodHome, tmpDir } from "./pod-a3-helpers.js";
 import { startRecordedAtrium } from "./pod-kit/recorded-atrium.js";
-import type { AtriumScript, RecordedAtrium } from "./pod-kit/recorded-atrium.js";
+import type {
+  AtriumRequestRecord,
+  AtriumScript,
+  RecordedAtrium,
+} from "./pod-kit/recorded-atrium.js";
 
-// brick cc2f6a98 — from an agent pod, `sessions new --prompt-file` must say `promptQueued:true`
-// exactly when atrium queued the brief. Through the SHIPPED CLI (src/cli.js → dist), as the defect
-// lives on the CLI path: the pass-through prints the control pod's stdout, and that stdout was
-// written by an acpx that was never given the brief (atrium takes it out of argv, C6.2), so it
-// says `promptQueued:false` for a brief atrium then queued. The truth is in the answer's `delivery`.
+// brick cc2f6a98, ruling of 2026-11-25 (CONTRACTS-r4 C6.2, "Clarified 2026-11-25 (cc2f6a98)"; row
+// C6.2-Q.1): from an agent pod, the first message of a create is reported by ATRIUM's own queue —
+// `promptQueued:true` once atrium queued it. ATRIUM owns that answer and its order (a0d5ac36). The
+// pod client is NOT a second owner of the field: it relays atrium's answer, stdout and stderr, byte
+// for byte (C6.2: "The pod-side acpx prints stdout and stderr"). These rows pin the relay through
+// the SHIPPED `dist/cli.js` over the pod kit's recorded atrium, JSON and text. A pod client that
+// reconciles `promptQueued` from `delivery` (the first design of this brick, dropped by the ruling)
+// goes red on row 2.
 
 /**
  * What the CONTROL pod's acpx prints for a sleeping create it was given no first turn for — the TE's
@@ -49,7 +56,11 @@ function runCli(
   });
 }
 
-const ASK = ["--format", "json", "sessions", "new", "--name", "child", "--prompt-file", "brief.md"];
+const BRIEF_ASK = ["sessions", "new", "--name", "child", "--prompt-file", "brief.md"];
+const NOTICE = "[acpx] created session ed3e38bd-2768-48ca-8912-97aa64813288\n";
+
+/** atrium's answer line when ITS queue took the brief (the contract's answer, C6.2-Q.1): true. */
+const QUEUED_LINE = SLEEPING_CREATE_LINE.replace('"promptQueued":false', '"promptQueued":true');
 
 async function withAtrium(script: AtriumScript, run: (atrium: RecordedAtrium) => Promise<void>) {
   const atrium = await startRecordedAtrium(script);
@@ -60,82 +71,103 @@ async function withAtrium(script: AtriumScript, run: (atrium: RecordedAtrium) =>
   }
 }
 
-async function spawnWithBrief(atrium: RecordedAtrium, brief: string) {
+async function spawnWithBrief(atrium: RecordedAtrium, argv: string[], brief = "the brief\n") {
   const { home } = agentPodHome();
   const work = tmpDir("acpx-cc2f-work-");
   fs.writeFileSync(path.join(work, "brief.md"), brief);
-  const result = await runCli(ASK, agentPodEnv(home, atrium.url), { cwd: work });
+  const result = await runCli(argv, agentPodEnv(home, atrium.url), { cwd: work });
   const call = atrium.requests.find((r) => r.route === "call");
   return { result, call };
 }
 
-function resultLine(stdout: string): Record<string, unknown> {
-  const lines = stdout.split("\n").filter((l) => l.trim() !== "");
-  assert.equal(lines.length, 1, `one result line, got: ${stdout}`);
-  return JSON.parse(lines[0]!) as Record<string, unknown>;
+/**
+ * The kit's atrium took the brief out of argv and queued it (`delivery.status:"queued"`, id = call id,
+ * as acpx-ui passThrough.ts does) — so a row that sees `false` on stdout proves "not overridden", not
+ * "no delivery".
+ */
+function assertBriefQueuedByAtrium(call: AtriumRequestRecord | undefined): void {
+  assert.ok(call, "the call reached atrium");
+  assert.equal(call.stdin, "the brief\n", "the brief travelled as stdin");
+  assert.equal(call.ranArgv?.includes("--prompt-file"), false, "atrium took the brief out of argv");
 }
 
-test("cc2f row 1: the brief atrium queued is reported promptQueued:true (still sleeping), the other fields untouched", async () => {
+test("cc2f relay 1: atrium's answer says promptQueued:true (delivery queued) — the caller sees that line byte for byte", async () => {
+  await withAtrium({ calls: [{ answer: { exit: 0, stdout: QUEUED_LINE } }] }, async (atrium) => {
+    const { result, call } = await spawnWithBrief(atrium, ["--format", "json", ...BRIEF_ASK]);
+    assert.equal(result.status, 0, result.stderr);
+    assertBriefQueuedByAtrium(call);
+    assert.equal(result.stdout, QUEUED_LINE, "relayed verbatim");
+    assert.equal(result.stderr, "");
+  });
+});
+
+test("cc2f relay 2 (NEGATIVE — the pod client is not the owner): atrium's answer says false while its delivery says queued — the caller sees false", async () => {
   await withAtrium(
     { calls: [{ answer: { exit: 0, stdout: SLEEPING_CREATE_LINE } }] },
     async (atrium) => {
-      const { result, call } = await spawnWithBrief(atrium, "the brief\n");
+      const { result, call } = await spawnWithBrief(atrium, ["--format", "json", ...BRIEF_ASK]);
       assert.equal(result.status, 0, result.stderr);
-      assert.ok(call, "the call reached atrium");
-      const line = resultLine(result.stdout);
-      assert.equal(line.promptQueued, true, `atrium queued the brief: ${result.stdout}`);
-      assert.equal(line.sleeping, true, "the session still sleeps: queued AND sleeping");
-      const expected = JSON.parse(SLEEPING_CREATE_LINE) as Record<string, unknown>;
-      expected.promptQueued = true;
-      assert.deepEqual(line, expected, "nothing but promptQueued changed");
+      assertBriefQueuedByAtrium(call);
+      // the kit queued the brief (delivery.status "queued" under the call id) — and acpx still prints atrium's line
+      assert.equal(result.stdout, SLEEPING_CREATE_LINE, "not reconciled from `delivery`");
+      assert.equal(result.stdout.includes('"promptQueued":true'), false, result.stdout);
     },
   );
 });
 
-test("cc2f row 1b: a brief atrium HOLDS for room is still queued — promptQueued:true", async () => {
+test("cc2f relay 3 (NEGATIVE): a held brief — atrium's `delivery.held` — changes nothing the client prints", async () => {
   await withAtrium(
     {
-      calls: [{ answer: { exit: 0, stdout: SLEEPING_CREATE_LINE } }],
+      calls: [{ answer: { exit: 0, stdout: QUEUED_LINE } }],
       firstMessageHold: { reason: "no_capacity", ahead: 2 },
     },
     async (atrium) => {
-      const { result } = await spawnWithBrief(atrium, "the brief\n");
+      const { result } = await spawnWithBrief(atrium, ["--format", "json", ...BRIEF_ASK]);
       assert.equal(result.status, 0, result.stderr);
-      assert.equal(resultLine(result.stdout).promptQueued, true, result.stdout);
+      assert.equal(result.stdout, QUEUED_LINE);
     },
   );
 });
 
-test("cc2f row 2 (NEGATIVE): a brief that is blank queues nothing — atrium answers no delivery, the field says false", async () => {
-  await withAtrium(
-    { calls: [{ answer: { exit: 0, stdout: SLEEPING_CREATE_LINE } }] },
-    async (atrium) => {
-      const { result } = await spawnWithBrief(atrium, "  \n\n");
-      assert.equal(result.status, 0, result.stderr);
-      assert.equal(resultLine(result.stdout).promptQueued, false, result.stdout);
-    },
-  );
-});
-
-test("cc2f row 3 (NEGATIVE): only the fork NOTICE was queued, not the brief — the field says false", async () => {
+test("cc2f relay 4 (text mode): atrium's stdout and stderr are printed exactly — the client adds no 'first turn' line of its own", async () => {
   await withAtrium(
     {
-      calls: [{ answer: { exit: 0, stdout: SLEEPING_CREATE_LINE } }],
-      forkNotice: "You are a fork.",
+      calls: [
+        {
+          answer: {
+            exit: 0,
+            stdout: "ed3e38bd-2768-48ca-8912-97aa64813288\n",
+            stderr: `${NOTICE}[acpx] first turn queued (from brief.md)\n`,
+          },
+        },
+      ],
     },
     async (atrium) => {
-      const { result } = await spawnWithBrief(atrium, "\n");
+      const { result } = await spawnWithBrief(atrium, BRIEF_ASK);
       assert.equal(result.status, 0, result.stderr);
-      assert.equal(
-        resultLine(result.stdout).promptQueued,
-        false,
-        `the notice is not the brief: ${result.stdout}`,
-      );
+      assert.equal(result.stdout, "ed3e38bd-2768-48ca-8912-97aa64813288\n");
+      assert.equal(result.stderr, `${NOTICE}[acpx] first turn queued (from brief.md)\n`);
     },
   );
 });
 
-test("cc2f row 4 (NEGATIVE, the real failure): atrium could not queue the brief — non-zero exit, and NO promptQueued:true anywhere on stdout", async () => {
+test("cc2f relay 5 (text mode, NEGATIVE): atrium's stderr does not say queued — the client does not say it either", async () => {
+  await withAtrium(
+    {
+      calls: [
+        { answer: { exit: 0, stdout: "ed3e38bd-2768-48ca-8912-97aa64813288\n", stderr: NOTICE } },
+      ],
+    },
+    async (atrium) => {
+      const { result } = await spawnWithBrief(atrium, BRIEF_ASK);
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stderr, NOTICE);
+      assert.doesNotMatch(result.stderr, /first turn queued/u);
+    },
+  );
+});
+
+test("cc2f relay 6 (NEGATIVE, the real failure): atrium could not queue the brief — non-zero exit, no promptQueued:true on stdout", async () => {
   await withAtrium(
     {
       calls: [
@@ -144,7 +176,7 @@ test("cc2f row 4 (NEGATIVE, the real failure): atrium could not queue the brief 
             status: 500,
             body: {
               exit: 0,
-              stdout: SLEEPING_CREATE_LINE,
+              stdout: QUEUED_LINE,
               stderr: "",
               error: "first-message-not-queued",
               reason: "append failed",
@@ -154,14 +186,18 @@ test("cc2f row 4 (NEGATIVE, the real failure): atrium could not queue the brief 
       ],
     },
     async (atrium) => {
-      const { result } = await spawnWithBrief(atrium, "the brief\n");
+      const { result } = await spawnWithBrief(atrium, ["--format", "json", ...BRIEF_ASK]);
       assert.notEqual(result.status, 0, "the failure is loud");
-      assert.equal(result.stdout.includes('"promptQueued":true'), false, result.stdout);
+      assert.equal(
+        result.stdout.includes('"promptQueued":true'),
+        false,
+        "the 500's body stdout is not relayed as a success",
+      );
     },
   );
 });
 
-test("cc2f row 5 (NEGATIVE): a create with NO brief is not rewritten — it still prints what the control pod printed", async () => {
+test("cc2f relay 7: a create with NO brief is relayed verbatim too", async () => {
   await withAtrium(
     { calls: [{ answer: { exit: 0, stdout: SLEEPING_CREATE_LINE } }] },
     async (atrium) => {
@@ -171,63 +207,12 @@ test("cc2f row 5 (NEGATIVE): a create with NO brief is not rewritten — it stil
         agentPodEnv(home, atrium.url),
       );
       assert.equal(result.status, 0, result.stderr);
-      assert.equal(result.stdout, SLEEPING_CREATE_LINE, "verbatim");
+      assert.equal(result.stdout, SLEEPING_CREATE_LINE);
     },
   );
 });
 
-test("cc2f row 6 (text mode): atrium queued the brief — stderr says first turn queued, never that it was NOT queued", async () => {
-  await withAtrium(
-    {
-      calls: [
-        {
-          answer: {
-            exit: 0,
-            stdout: "ed3e38bd-2768-48ca-8912-97aa64813288\n",
-            stderr:
-              "[acpx] created session ed3e38bd-2768-48ca-8912-97aa64813288 (sleeping — its first message starts it)\n",
-          },
-        },
-      ],
-    },
-    async (atrium) => {
-      const { home } = agentPodHome();
-      const work = tmpDir("acpx-cc2f-work-");
-      fs.writeFileSync(path.join(work, "brief.md"), "the brief\n");
-      const result = await runCli(
-        ["sessions", "new", "--name", "child", "--prompt-file", "brief.md"],
-        agentPodEnv(home, atrium.url),
-        { cwd: work },
-      );
-      assert.equal(result.status, 0, result.stderr);
-      assert.equal(result.stdout, "ed3e38bd-2768-48ca-8912-97aa64813288\n", "stdout verbatim");
-      assert.match(result.stderr, /\[acpx\] first turn queued \(from brief\.md\)/u);
-      assert.doesNotMatch(result.stderr, /NOT queued/u);
-    },
-  );
-});
-
-test("cc2f row 7 (text mode, NEGATIVE): a blank brief queued nothing — no 'first turn queued' line", async () => {
-  await withAtrium(
-    {
-      calls: [{ answer: { exit: 0, stdout: "ed3e38bd-2768-48ca-8912-97aa64813288\n" } }],
-    },
-    async (atrium) => {
-      const { home } = agentPodHome();
-      const work = tmpDir("acpx-cc2f-work-");
-      fs.writeFileSync(path.join(work, "brief.md"), " \n");
-      const result = await runCli(
-        ["sessions", "new", "--name", "child", "--prompt-file", "brief.md"],
-        agentPodEnv(home, atrium.url),
-        { cwd: work },
-      );
-      assert.equal(result.status, 0, result.stderr);
-      assert.doesNotMatch(result.stderr, /first turn queued/u);
-    },
-  );
-});
-
-test("cc2f row 8 (NEGATIVE): a non-create verb prints the control pod's stdout verbatim, even a line that looks like a sleeping create", async () => {
+test("cc2f relay 8: a non-create verb is relayed verbatim, whatever its stdout looks like", async () => {
   await withAtrium(
     { calls: [{ answer: { exit: 0, stdout: SLEEPING_CREATE_LINE } }] },
     async (atrium) => {
@@ -237,20 +222,7 @@ test("cc2f row 8 (NEGATIVE): a non-create verb prints the control pod's stdout v
         agentPodEnv(home, atrium.url),
       );
       assert.equal(result.status, 0, result.stderr);
-      assert.equal(result.stdout, SLEEPING_CREATE_LINE, "verbatim");
-    },
-  );
-});
-
-test("cc2f row 3b: a brief AND a fork notice both queued — delivery names the brief, the field says true", async () => {
-  await withAtrium(
-    {
-      calls: [{ answer: { exit: 0, stdout: SLEEPING_CREATE_LINE } }],
-      forkNotice: "You are a fork.",
-    },
-    async (atrium) => {
-      const { result } = await spawnWithBrief(atrium, "a real brief\n");
-      assert.equal(resultLine(result.stdout).promptQueued, true, result.stdout);
+      assert.equal(result.stdout, SLEEPING_CREATE_LINE);
     },
   );
 });
