@@ -37,8 +37,9 @@ import {
   SeatBrickReassignRequiredError,
   writeBrickLink,
 } from "../session/seat-brick-write.js";
+import { seatNameIsGeneric } from "../session/seat-display-name.js";
 import { isSleepingRecord, SLEEPING_TEXT } from "../session/sleeping.js";
-import type { OutputFormat } from "../types.js";
+import type { OutputFormat, SessionRecord } from "../types.js";
 import type { ResolvedAcpxConfig } from "./config.js";
 import { parseOutputFormat, resolveGlobalFlags } from "./flags.js";
 import { emitJsonResult } from "./output/json-output.js";
@@ -1570,14 +1571,37 @@ async function handleSeatsShow(
     const row = requireSeatRow(store, seatId);
     const holderState = await resolveActiveHolderState(row.activeHolderId);
     const holders = await listSeatHolders(seatId);
-    renderSeatShow(format, row, holderState, holders);
+    const nameGeneric = seatNameIsGeneric(row, await activeHolderRecord(row.activeHolderId));
+    renderSeatShow(format, row, holderState, holders, nameGeneric);
   });
+}
+
+/**
+ * Brick fac2128a §4.2 — the record whose `metadata.seat_auto_name` decides `nameGeneric`: the seat's
+ * holder by the RAW pointer (a closed holder still holds the seat). No pointer or no record ⇒ `undefined`,
+ * so a named seat then reads NOT generic (fail safe) and an unnamed one generic.
+ */
+async function activeHolderRecord(
+  activeHolderId: string | null,
+): Promise<SessionRecord | undefined> {
+  if (activeHolderId === null) {
+    return undefined;
+  }
+  try {
+    return await resolveSessionRecord(activeHolderId);
+  } catch (error) {
+    if (error instanceof SessionNotFoundError) {
+      return undefined;
+    }
+    throw error;
+  }
 }
 
 function seatShowJsonPayload(
   row: SeatRecord,
   holderState: ActiveHolderState,
   holders: readonly SeatHolderSummary[],
+  nameGeneric: boolean,
 ): Record<string, unknown> {
   return {
     ok: true,
@@ -1586,6 +1610,10 @@ function seatShowJsonPayload(
     closedAt: row.closedAt,
     nextOrdinal: row.nextOrdinal,
     name: row.name ?? null,
+    // Brick fac2128a §4.2 — the LIVE generic-name check an agent runs before naming its seat
+    // (`seatNameIsGeneric` against the active holder). The spawn env's ACPX_SEAT_NAME_GENERIC is only a
+    // snapshot; this is the authority.
+    nameGeneric,
     brickId: row.brickId?.ref ?? null,
     // Brick `9984c510` — ADDITIVE: `brickId` keeps its existing shape (a bare
     // ref or `null`) for every pre-existing consumer; the validation state
@@ -1630,9 +1658,11 @@ function renderSeatShowText(
   row: SeatRecord,
   holderState: ActiveHolderState,
   holders: readonly SeatHolderSummary[],
+  nameGeneric: boolean,
 ): void {
   process.stdout.write(`seat ${row.seatId}\n`);
   process.stdout.write(`  name:          ${row.name ?? "(unnamed)"}\n`);
+  process.stdout.write(`  name_generic:  ${nameGeneric ? "yes" : "no"}\n`);
   process.stdout.write(`  created_at:    ${row.createdAt}\n`);
   process.stdout.write(`  closed_at:     ${row.closedAt ?? "(open)"}\n`);
   process.stdout.write(`  next_ordinal:  ${row.nextOrdinal}\n`);
@@ -1663,15 +1693,16 @@ function renderSeatShow(
   row: SeatRecord,
   holderState: ActiveHolderState,
   holders: readonly SeatHolderSummary[],
+  nameGeneric: boolean,
 ): void {
-  if (emitJsonResult(format, seatShowJsonPayload(row, holderState, holders))) {
+  if (emitJsonResult(format, seatShowJsonPayload(row, holderState, holders, nameGeneric))) {
     return;
   }
   if (format === "quiet") {
     process.stdout.write(`${row.seatId}\n`);
     return;
   }
-  renderSeatShowText(row, holderState, holders);
+  renderSeatShowText(row, holderState, holders, nameGeneric);
 }
 
 /**

@@ -72,7 +72,7 @@ async function runOnePrompt(options: {
     agentCommand: `node ${JSON.stringify(mockLink)} --operation-log ${JSON.stringify(operationLog)}`,
     cwd: scratchDir,
     permissionMode: "approve-reads",
-    sessionContext: { acpxRecordId: "turnctx-chokepoint" },
+    sessionContext: { seatNameGeneric: false, acpxRecordId: "turnctx-chokepoint" },
   });
   try {
     await client.start();

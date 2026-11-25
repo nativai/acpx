@@ -44,7 +44,7 @@ async function connect(
     agentCommand: `node ${JSON.stringify(mockLink)} --operation-log ${JSON.stringify(operationLog)}`,
     cwd: scratchDir,
     permissionMode: "approve-reads",
-    sessionContext: { acpxRecordId: "rec-f10" },
+    sessionContext: { seatNameGeneric: false, acpxRecordId: "rec-f10" },
   });
   return {
     client,

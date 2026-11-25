@@ -163,6 +163,7 @@ test("AcpClient renders the brick block from the SAME seat and session $ACPX_AGE
       cwd: process.cwd(),
       permissionMode: "approve-reads",
       sessionContext: {
+        seatNameGeneric: false,
         acpxRecordId: record.acpxRecordId,
         seatId: record.seatId,
         brick: BRICK_ID,
@@ -288,7 +289,7 @@ test("G4 AcpClient hands the brick CLI the root its own spawn resolved", async (
     agentCommand: "node /opt/claude-agent-acp/dist/index.js",
     cwd: process.cwd(),
     permissionMode: "approve-reads",
-    sessionContext: { acpxRecordId: CHILD_SESSION, brick: BRICK_ID },
+    sessionContext: { seatNameGeneric: false, acpxRecordId: CHILD_SESSION, brick: BRICK_ID },
   });
   // What `resolveAgentLaunchPlan` records from `applyAtriumOsEnvironment` at a real spawn.
   (client as unknown as { atriumOsOutcome: unknown }).atriumOsOutcome = { root: CHILD_OS };

@@ -40,6 +40,7 @@ function has(env: NodeJS.ProcessEnv, name: string): boolean {
 test("buildAgentSpawnOptions exports ACPX_SEAT_ORDINAL for a seated holder", () => {
   withEnvVars({ ACPX_SEAT_ORDINAL: undefined }, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "holder-b",
       seatId: "137b9523-2f75-4172-8e96-94d52eeea152",
       seatOrdinal: 2,
@@ -51,6 +52,7 @@ test("buildAgentSpawnOptions exports ACPX_SEAT_ORDINAL for a seated holder", () 
 test("ordinal 0 is exported (a falsy number is still an ordinal)", () => {
   withEnvVars({ ACPX_SEAT_ORDINAL: undefined }, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "holder-zero",
       seatOrdinal: 0,
     });
@@ -62,6 +64,7 @@ test("a context with no ordinal DELETES a stale inherited ACPX_SEAT_ORDINAL (FW-
   withEnvVars({ ACPX_SEAT_ORDINAL: "9" }, () => {
     for (const seatOrdinal of [undefined, null, -1, 1.5, Number.NaN]) {
       const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
         acpxRecordId: "child-id",
         seatOrdinal,
       });

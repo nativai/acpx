@@ -969,10 +969,7 @@ test("AcpClient createSession injects brick context on the system-prompt channel
   const cwd = path.resolve("/tmp/acpx-client-brick-context");
   const client = makeClient({
     agentCommand: "node /opt/claude-agent-acp/dist/index.js",
-    sessionContext: {
-      acpxRecordId: "child-id",
-      brick: BRICK_ID,
-    },
+    sessionContext: { seatNameGeneric: false, acpxRecordId: "child-id", brick: BRICK_ID },
     sessionOptions: {
       systemPrompt: { append: "HUMAN" },
     },
@@ -1016,10 +1013,7 @@ test("AcpClient createSession skips brick context when --system-prompt replace i
   const cwd = path.resolve("/tmp/acpx-client-brick-replace");
   const client = makeClient({
     agentCommand: "node /opt/claude-agent-acp/dist/index.js",
-    sessionContext: {
-      acpxRecordId: "child-id",
-      brick: BRICK_ID,
-    },
+    sessionContext: { seatNameGeneric: false, acpxRecordId: "child-id", brick: BRICK_ID },
     sessionOptions: {
       systemPrompt: "REPLACE",
     },
@@ -1110,10 +1104,7 @@ test("AcpClient load/resume re-supplies fresh brick context on the system-prompt
     const logPath = path.join(dir, "brick.log");
     const client = makeClient({
       agentCommand: "node /opt/claude-agent-acp/dist/index.js",
-      sessionContext: {
-        acpxRecordId: "child-id",
-        brick: BRICK_ID,
-      },
+      sessionContext: { seatNameGeneric: false, acpxRecordId: "child-id", brick: BRICK_ID },
     });
 
     let capturedLoadParams: Record<string, unknown> | undefined;
@@ -1206,10 +1197,7 @@ test("AcpClient load/resume skips brick context on the codex channel", async () 
     const logPath = path.join(dir, "brick.log");
     const client = makeClient({
       agentCommand: "npx -y @agentclientprotocol/codex-acp",
-      sessionContext: {
-        acpxRecordId: "child-id",
-        brick: BRICK_ID,
-      },
+      sessionContext: { seatNameGeneric: false, acpxRecordId: "child-id", brick: BRICK_ID },
     });
 
     let capturedLoadParams: Record<string, unknown> | undefined;

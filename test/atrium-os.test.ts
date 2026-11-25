@@ -337,7 +337,7 @@ test("buildAgentSpawnOptions applies the session's OS as the env's last step and
       const { env } = buildAgentSpawnOptions(
         "/tmp",
         undefined,
-        { acpxRecordId: "r1", osChoice: b },
+        { seatNameGeneric: false, acpxRecordId: "r1", osChoice: b },
         undefined,
         "claude",
         undefined,
@@ -359,7 +359,7 @@ test("T28 neutral: nothing set → ATRIUM_OS is the literal, and the OS bin move
     const { env } = buildAgentSpawnOptions(
       "/tmp",
       undefined,
-      { acpxRecordId: "r1" },
+      { seatNameGeneric: false, acpxRecordId: "r1" },
       undefined,
       "claude",
     );

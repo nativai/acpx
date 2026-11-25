@@ -1,3 +1,5 @@
+import { SEAT_AUTO_NAME_KEY } from "../../session/seat-display-name.js";
+
 export function applyBrickFlag(
   childMetadata: Record<string, string> | undefined,
   resolvedBrick: string | false | undefined,
@@ -208,4 +210,23 @@ export function withInheritedWorktree(
     }
   }
   return Object.keys(inherited).length > 0 ? { ...childMetadata, ...inherited } : childMetadata;
+}
+
+/**
+ * Brick fac2128a §4.2 handover carry — pure, no IO. A `--from` / handover successor is the SAME seat, so
+ * it inherits the predecessor's `seat_auto_name` marker: a successor of a still-generic seat can then
+ * still name it. A caller that passes its own `seat_auto_name` keeps it.
+ *
+ * 🛑 `--from` ONLY — never a copy, fork, by-the-way or template child (`copyMetadata`): those mint a NEW
+ * seat, and the source's marker names the SOURCE's machine-made name, not theirs.
+ */
+export function withInheritedSeatAutoName(
+  childMetadata: Record<string, string> | undefined,
+  sourceMetadata: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  const inherited = sourceMetadata?.[SEAT_AUTO_NAME_KEY];
+  if (childMetadata?.[SEAT_AUTO_NAME_KEY] !== undefined || typeof inherited !== "string") {
+    return childMetadata;
+  }
+  return { ...childMetadata, [SEAT_AUTO_NAME_KEY]: inherited };
 }

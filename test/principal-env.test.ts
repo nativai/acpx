@@ -43,6 +43,7 @@ function has(env: NodeJS.ProcessEnv, name: string): boolean {
 test("a context naming a person exports ACPX_PRINCIPAL_ID and ACPX_PRINCIPAL_NAME", () => {
   withEnvVars({ ACPX_PRINCIPAL_ID: undefined, ACPX_PRINCIPAL_NAME: undefined }, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child",
       principalId: P,
       principalName: NAME,
@@ -55,6 +56,7 @@ test("a context naming a person exports ACPX_PRINCIPAL_ID and ACPX_PRINCIPAL_NAM
 test("an id without a name exports the id only; a name without an id exports nothing", () => {
   withEnvVars({ ACPX_PRINCIPAL_ID: undefined, ACPX_PRINCIPAL_NAME: undefined }, () => {
     const idOnly = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "c",
       principalId: P,
       principalName: null,
@@ -63,6 +65,7 @@ test("an id without a name exports the id only; a name without an id exports not
     assert.equal(has(idOnly.env, "ACPX_PRINCIPAL_NAME"), false);
 
     const nameOnly = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "c",
       principalId: null,
       principalName: NAME,
@@ -77,10 +80,20 @@ test("a context with NO principal leaves both UNSET — and strips the caller's 
     { ACPX_PRINCIPAL_ID: "p-fb566154c0bf245b7538", ACPX_PRINCIPAL_NAME: "Daniel Laatz" },
     () => {
       for (const context of [
-        { acpxRecordId: "bare-shell-child" },
-        { acpxRecordId: "bare-shell-child", principalId: null, principalName: null },
-        { acpxRecordId: "c", ...principalContextFields({ principal_via: "none" }) },
+        { seatNameGeneric: false, acpxRecordId: "bare-shell-child" },
         {
+          seatNameGeneric: false,
+          acpxRecordId: "bare-shell-child",
+          principalId: null,
+          principalName: null,
+        },
+        {
+          seatNameGeneric: false,
+          acpxRecordId: "c",
+          ...principalContextFields({ principal_via: "none" }),
+        },
+        {
+          seatNameGeneric: false,
           acpxRecordId: "c",
           ...principalContextFields({ principal_via: "inherited", principal_from: "x" }),
         },
@@ -101,6 +114,7 @@ test("the caller's inherited person never reaches a child that is itself princip
     { ACPX_PRINCIPAL_ID: "p-fb566154c0bf245b7538", ACPX_PRINCIPAL_NAME: "Daniel Laatz" },
     () => {
       const { env } = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
         acpxRecordId: "c",
         principalId: P,
         principalName: NAME,
@@ -122,6 +136,7 @@ test("a malformed principal id is no principal: nothing is exported, and no padd
       "",
     ]) {
       const { env } = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
         acpxRecordId: "c",
         principalId: bad,
         principalName: NAME,

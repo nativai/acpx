@@ -4,9 +4,10 @@ import { resolveAndEnsureAgentFolder } from "../cli/session/agent-folder.js";
 import { resolveSessionBrickContext } from "../cli/session/brick-link.js";
 import type { RunOnceOptions, SessionCreateOptions } from "../cli/session/contracts.js";
 import type { SessionRecord } from "../types.js";
-import { normalizeName } from "./persistence.js";
+import { normalizeName, sessionBaseDir } from "./persistence.js";
 import { principalContextFields } from "./persistence/principal.js";
-import { seatDisplayName } from "./seat-display-name.js";
+import { readSeatStore, seatFromStore } from "./persistence/seat-store.js";
+import { seatNameIsGeneric, seatNamingForRecord } from "./seat-display-name.js";
 
 /**
  * The `sessionContext` a RECORD-backed spawn hands its client — every field of `AgentSessionContext`,
@@ -30,12 +31,13 @@ export async function sessionContextFromRecord(
   record: SessionRecord,
   opts: { reasoningEffort?: string | null } = {},
 ): Promise<RecordSessionContext> {
-  const displayName = await seatDisplayName(record);
+  const seatNaming = await seatNamingForRecord(record);
   const { brick, brickPath } = await resolveSessionBrickContext(record);
   const agentFolders = resolveAndEnsureAgentFolder(record, brickPath);
   return {
     acpxRecordId: record.acpxRecordId,
-    sessionName: displayName ?? null,
+    sessionName: seatNaming.name ?? null,
+    seatNameGeneric: seatNaming.generic,
     parentSessionId: record.parentSessionId ?? null,
     parentSessionUrl: record.parentSessionUrl ?? null,
     brick,
@@ -94,7 +96,30 @@ export async function creationSessionContext(
     // The creation precedence (§2) has already resolved the choice into the metadata the record is
     // born with, so the creation spawn reads it from there.
     osChoice: options.metadata?.atrium_os ?? null,
+    seatNameGeneric: await creationSeatNameGeneric(options),
   };
+}
+
+/**
+ * Brick fac2128a §4.2 — the creation spawn's `seatNameGeneric`. A fresh mint judges the name it is about
+ * to store (`-s`, trimmed exactly as the mint trims it) against the metadata the record is born with.
+ *
+ * 🛑 A JOIN (`options.seatId` — `--seat`, a `--from`/handover successor) READS THE JOINED SEAT. Its
+ * `seatName` is ALWAYS absent (`-s` is refused on a join), so the mint rule's "no name ⇒ generic" would
+ * mark every named seat's successor generic and its agent would rename a seat a person named. An
+ * unreadable store or a missing row answers `false` (fail safe).
+ */
+async function creationSeatNameGeneric(options: SessionCreateOptions): Promise<boolean> {
+  const holder = { metadata: options.metadata };
+  if (options.seatId === undefined) {
+    return seatNameIsGeneric({ name: normalizeName(options.seatName) }, holder);
+  }
+  try {
+    const seat = seatFromStore(await readSeatStore(sessionBaseDir()), options.seatId);
+    return seat ? seatNameIsGeneric(seat, holder) : false;
+  } catch {
+    return false;
+  }
 }
 
 /** Creation rules 4/5 for a record-less one-shot (it never refuses: no `--os` on exec). */
@@ -121,5 +146,7 @@ export function execSessionContext(options: RunOnceOptions): AgentSessionContext
     subscriptionId: options.sessionOptions?.subscription ?? null,
     profileId: options.sessionOptions?.profile ?? null,
     reasoningEffort: options.sessionOptions?.reasoningEffort ?? null,
+    // A one-shot has no seat, so nothing for its agent to name.
+    seatNameGeneric: false,
   };
 }

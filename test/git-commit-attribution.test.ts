@@ -55,6 +55,7 @@ test("git attribution: sets author/committer identity from name + recordId + bas
   // rung-2/3 resolution and carried the stale `acpx.` literal.
   withEnv({ ...CLEAN_GIT_ENV, ACPX_UI_BASE_URL: "https://atrium.devbox.nativai.de" }, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "11111111-2222-3333-4444-555555555555",
       sessionName: "  w13-42-dev  ",
     });
@@ -73,6 +74,7 @@ test("git attribution: sets author/committer identity from name + recordId + bas
 test("git attribution: falls back to acpx:<recordId8> when no session name", () => {
   withEnv(CLEAN_GIT_ENV, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "abcdef01-2222-3333-4444-555555555555",
     });
     assert.equal(options.env.GIT_AUTHOR_NAME, "acpx:abcdef01");
@@ -83,6 +85,7 @@ test("git attribution: falls back to acpx:<recordId8> when no session name", () 
 test("git attribution: honors ACPX_UI_BASE_URL host for the author email", () => {
   withEnv({ ...CLEAN_GIT_ENV, ACPX_UI_BASE_URL: "https://acpx.tubeyakker.nativai.de" }, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "deadbeef-0000-0000-0000-000000000000",
       sessionName: "runner",
     });
@@ -96,6 +99,7 @@ test("git attribution: honors ACPX_UI_BASE_URL host for the author email", () =>
 test("git attribution: activates core.hooksPath via GIT_CONFIG_* with no pre-existing count", () => {
   withEnv(CLEAN_GIT_ENV, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "child-id",
       sessionName: "runner",
     });
@@ -122,6 +126,7 @@ test("git attribution: appends to a pre-existing GIT_CONFIG_COUNT without clobbe
     },
     () => {
       const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+        seatNameGeneric: false,
         acpxRecordId: "child-id",
         sessionName: "runner",
       });
@@ -143,6 +148,7 @@ test("git attribution: appends to a pre-existing GIT_CONFIG_COUNT without clobbe
 test("git attribution: omitted entirely when recordId is absent/whitespace", () => {
   withEnv(CLEAN_GIT_ENV, () => {
     const options = buildAgentSpawnOptions("/tmp/acpx-agent", undefined, {
+      seatNameGeneric: false,
       acpxRecordId: "   ",
       sessionName: "runner",
     });
