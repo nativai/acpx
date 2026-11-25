@@ -340,7 +340,7 @@ function functionBody(text: string, header: RegExp): string | undefined {
   return undefined;
 }
 
-const VERDICT_CALL = /\b(streamWriteVerdict(Sync)?|divertedBeforeWrite)\s*\(/;
+const VERDICT_CALL = /\bstreamWriteVerdict(Sync)?\s*\(/;
 const GUARD_MODULE = "pod/stream-write-guard.ts";
 /** Files that name the owner log and append, each reviewed: why none of them is a foreign write. */
 const OWNER_LOG_APPEND_REVIEWED: Record<string, string> = {
@@ -368,10 +368,11 @@ export function guardViolations(files: Map<string, string>): string[] {
       );
     }
   }
-  // The async entry asks through `divertedBeforeWrite`; that helper must itself ask the proof.
-  const asker = functionBody(events, /function\s+divertedBeforeWrite\s*\(/);
+  // The async entry asks the sync verdict itself and, for a session in a pod, C3.3 through `divertedAfterQuick`;
+  // that helper must itself ask the proof.
+  const asker = functionBody(events, /function\s+divertedAfterQuick\s*\(/);
   if (asker === undefined || !/\bstreamWriteVerdict\s*\(/.test(asker)) {
-    violations.push("session/events.ts: divertedBeforeWrite does not ask streamWriteVerdict");
+    violations.push("session/events.ts: divertedAfterQuick does not ask streamWriteVerdict");
   }
   for (const [file, raw] of files) {
     const text = code(raw);
@@ -428,6 +429,26 @@ test("80.1 SCAN negatives: an entry without the proof, a new unguarded appender,
     withEvents(events.replace("streamWriteVerdictSync(sessionId)", "alwaysHere(sessionId)")).length,
     1,
     "the sync entry loses its proof",
+  );
+  assert.equal(
+    withEvents(
+      events.replace(
+        "const quick = streamWriteVerdictSync(sessionId);\n  if",
+        "const quick = alwaysHere(sessionId);\n  if",
+      ),
+    ).length,
+    1,
+    "the async entry loses its proof",
+  );
+  assert.equal(
+    withEvents(
+      events.replace(
+        'quick.why === "no-sync-proof" ? await streamWriteVerdict(sessionId) : quick',
+        "quick",
+      ),
+    ).length,
+    1,
+    "the helper the async entry asks through stops asking C3.3",
   );
   assert.equal(
     withEvents(events.replace("await streamWriteVerdict(record.acpxRecordId)", "alwaysHere()"))

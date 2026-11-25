@@ -548,6 +548,24 @@ class SyncWait {
   }
 }
 
+function asyncAppendLimits(): { stallMs: number; budgetMs: number } {
+  return {
+    stallMs: streamAppendTimingForTest() ?? STREAM_APPEND_STALL_MS,
+    budgetMs: streamAppendDeadlineForTest() ?? STREAM_LOCK_BUDGET_MS,
+  };
+}
+
+function noteGrowth(
+  growth: { lastGrowthAt: number; lastSize: number },
+  size: number,
+  now: number,
+): void {
+  if (size !== growth.lastSize) {
+    growth.lastSize = size;
+    growth.lastGrowthAt = now;
+  }
+}
+
 /** The async appender's own deadline: the foreign line stopped growing (`stall`) or the overall budget ran out. */
 function asyncAppendBound(
   now: number,
@@ -566,25 +584,20 @@ export async function appendStreamText(sessionId: string, text: string): Promise
   // of more than REPROVE_AFTER_MS (the pod may have been replaced meanwhile). A diverted line is never written into
   // the stream, a forced end (A-66) included.
   const proof = { at: Date.now() };
-  if (await divertedBeforeWrite(sessionId, text)) {
+  // The local case (no lease names a pod) answers without yielding, so a line is queued behind this process's own
+  // flush in CALL ORDER exactly as before A-80; only a session in a pod waits for C3.3.
+  const quick = streamWriteVerdictSync(sessionId);
+  if (quick.write === "sidecar" && (await divertedAfterQuick(sessionId, text, quick))) {
     return;
   }
-  const limits = {
-    stallMs: streamAppendTimingForTest() ?? STREAM_APPEND_STALL_MS,
-    budgetMs: streamAppendDeadlineForTest() ?? STREAM_LOCK_BUDGET_MS,
-  };
+  const limits = asyncAppendLimits();
   const active = activeEventPath(sessionId);
-  const growth = { lastGrowthAt: Date.now(), startedAt: Date.now() };
-  let lastSize = -1;
+  const growth = { lastGrowthAt: Date.now(), startedAt: Date.now(), lastSize: -1 };
   for (;;) {
     const now = Date.now();
-    const size = sizeOrZero(active);
-    if (size !== lastSize) {
-      lastSize = size;
-      growth.lastGrowthAt = now;
-    }
+    noteGrowth(growth, sizeOrZero(active), now);
     const bound = asyncAppendBound(now, growth, limits);
-    if (await reprovedDiverts(proof, sessionId, text)) {
+    if (proofExpired(proof) && (await reprovedDiverts(proof, sessionId, text))) {
       return;
     }
     if (appendStepSync(sessionId, text, bound) !== "wait") {
@@ -594,22 +607,31 @@ export async function appendStreamText(sessionId: string, text: string): Promise
   }
 }
 
-/** A-80: the proof again when the last one is older than REPROVE_AFTER_MS (the pod may have been replaced). */
+function proofExpired(proof: { at: number }): boolean {
+  return Date.now() - proof.at >= REPROVE_AFTER_MS;
+}
+
+/** A-80: the proof again (the pod may have been replaced while the appender waited). */
 async function reprovedDiverts(
   proof: { at: number },
   sessionId: string,
   text: string,
 ): Promise<boolean> {
-  if (Date.now() - proof.at < REPROVE_AFTER_MS) {
-    return false;
-  }
   proof.at = Date.now();
-  return await divertedBeforeWrite(sessionId, text);
+  const quick = streamWriteVerdictSync(sessionId);
+  return quick.write === "sidecar" && (await divertedAfterQuick(sessionId, text, quick));
 }
 
-/** A-80: asks the proof; when the pod is not proven gone the line goes to the sidecar and this says `true`. */
-async function divertedBeforeWrite(sessionId: string, text: string): Promise<boolean> {
-  const verdict = await streamWriteVerdict(sessionId);
+/**
+ * A-80: the sync verdict said the session may be in a pod. A lease that cannot be read is final (`pod-unreadable`);
+ * a lease naming a pod needs C3.3, which only the async proof can take. True: the line went to the sidecar.
+ */
+async function divertedAfterQuick(
+  sessionId: string,
+  text: string,
+  quick: { write: "sidecar"; why: ForeignWriteWhy },
+): Promise<boolean> {
+  const verdict = quick.why === "no-sync-proof" ? await streamWriteVerdict(sessionId) : quick;
   if (verdict.write === "here") {
     return false;
   }
@@ -881,7 +903,9 @@ export class SessionEventWriter {
 
       // A-80, PER WRITE (C10; architect #19 on S4): a writer that stays open proves the pod gone again before each
       // write (a proof serves REPROVE_AFTER_MS), BEFORE any rotation too. Once it diverts it stays diverted.
-      await this.proveBeforeWrite();
+      if (this.proveIsDue()) {
+        await this.proveBeforeWrite();
+      }
       // A-80: a sidecar-mode writer (the pod was not proven gone) diverts the whole batch, once validated. Nothing
       // reached the stream, so no record bookkeeping (`lastSeq`, `eventLog`) moves either.
       if (this.sidecarWhy !== undefined) {
@@ -927,14 +951,15 @@ export class SessionEventWriter {
     }
   }
 
+  private proveIsDue(): boolean {
+    return (
+      this.proofNeeded &&
+      this.sidecarWhy === undefined &&
+      Date.now() - this.provenAt >= REPROVE_AFTER_MS
+    );
+  }
+
   private async proveBeforeWrite(): Promise<void> {
-    if (
-      !this.proofNeeded ||
-      this.sidecarWhy !== undefined ||
-      Date.now() - this.provenAt < REPROVE_AFTER_MS
-    ) {
-      return;
-    }
     const verdict = await streamWriteVerdict(this.record.acpxRecordId);
     this.provenAt = Date.now();
     if (verdict.write === "sidecar") {

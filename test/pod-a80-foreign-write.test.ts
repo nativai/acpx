@@ -23,6 +23,7 @@ import {
   acquireEventsLock,
   appendStreamText,
   appendStreamTextSync,
+  listSessionEvents,
   SessionEventWriter,
 } from "../src/session/events.js";
 import { writeSessionRecord } from "../src/session/persistence.js";
@@ -38,7 +39,14 @@ import {
   type PodWorld,
 } from "./pod-owner-helpers.js";
 import { writeLeaseWithBadPod, writePodLease } from "./pod-proof-helpers.js";
-import { frame, record } from "./stream-appender-kit.js";
+import {
+  frame,
+  holdInProcess,
+  methodsOf,
+  record,
+  releaseUntil,
+  waitFor,
+} from "./stream-appender-kit.js";
 import { writeRecordFixture, writeRegistry } from "./transcript-fixture-test-helpers.js";
 
 // A-80 (bricks ce139c8a + 766c4dd7): rows 80.1 and 80.3 of TEST-PLAN-ROWS-A29-A36.md.
@@ -772,5 +780,45 @@ test("80.4 a writer that stays open proves again before each write: a live pod's
     for (const root of [ctl.root, podABase.root, podBBase.root]) {
       fs.rmSync(root, { recursive: true, force: true });
     }
+  }
+});
+
+// ---- the call-order property must survive the guard on a control-role host --------------------------------------
+
+test("80.1 pair: on a control-role host with NO lease naming a pod, an async appender still queues behind this process's own flush in CALL ORDER (the proof never yields for a local session)", async () => {
+  const world = makeWorld("a80q");
+  const marker = path.join(world.root, "own-hold");
+  try {
+    await withEnv(
+      worldEnv(world, {
+        podMode: true,
+        extra: { HOME: world.home, ACPX_TEST_STREAM_HOLD_MID_LINE: marker },
+      }),
+      async () => {
+        const sid = "a80-order";
+        await writeSessionRecord(record(sid, world.home));
+        const writer = await SessionEventWriter.open(record(sid, world.home));
+        const flush = writer.appendMessages([frame(1), frame(2, 2.5 * 1024 * 1024)]);
+        holdInProcess(marker, flush, () => writer.close({ checkpoint: false }));
+        await waitFor("the writer between parts", () => fs.existsSync(marker));
+        const line = (n: number): string =>
+          `${JSON.stringify({ jsonrpc: "2.0", method: `acpx/order-${n}`, params: {} })}\n`;
+        appendStreamTextSync(sid, line(1));
+        const asyncOne = appendStreamText(sid, line(2)); // no await between the three calls
+        appendStreamTextSync(sid, line(3));
+        await releaseUntil(marker, flush);
+        await asyncOne;
+        await writer.close({ checkpoint: false });
+        const events = await listSessionEvents(sid);
+        assert.deepEqual(
+          methodsOf(events).slice(-3),
+          ["acpx/order-1", "acpx/order-2", "acpx/order-3"],
+          "call order, as before A-80",
+        );
+        assert.equal(fs.existsSync(sidecarPath(sid)), false);
+      },
+    );
+  } finally {
+    fs.rmSync(world.root, { recursive: true, force: true });
   }
 });
