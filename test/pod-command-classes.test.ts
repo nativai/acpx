@@ -975,7 +975,7 @@ test("CONFORMANCE: every verb whose class is decided by its target and that regi
     .map(([p]) => p);
   assert.ok(
     withSeat.length >= 5,
-    `commander registers --seat on almost nothing — vacuous: ${withSeat}`,
+    `commander registers --seat on almost nothing — vacuous: ${withSeat.join(",")}`,
   );
   const missing = withSeat.filter((p) => {
     const entry = COMMAND_TABLE[p];

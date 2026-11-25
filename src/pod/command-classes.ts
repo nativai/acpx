@@ -91,6 +91,8 @@ const SELECT_SEAT = [...SELECT, "--seat"] as const;
 const BY_FLAGS: TargetSpec = { flags: SELECT };
 const BY_FLAGS_OR_SEAT: TargetSpec = { flags: SELECT_SEAT };
 const BY_OPERAND: TargetSpec = { flags: SELECT, operand: 0 };
+/** A verb that names its session by operand AND registers `--seat` (`sessions close`, brick 7686016f). */
+const BY_OPERAND_OR_SEAT: TargetSpec = { flags: SELECT_SEAT, operand: 0 };
 
 /**
  * `""` is the bare program (`acpx [prompt...]`) and `"<agent>"` the per-agent prompt
@@ -204,7 +206,7 @@ export const COMMAND_TABLE: Readonly<Record<string, CommandEntry>> = {
   "sessions close": {
     class: "owner-if-pod",
     reason: "close reaches the live owner if any (C1.2 example)",
-    target: BY_OPERAND,
+    target: BY_OPERAND_OR_SEAT,
   },
   "sessions copy": { class: "create", reason: "copy / fork is a create (C1.3)" },
   "sessions reopen": {
