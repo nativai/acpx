@@ -960,3 +960,38 @@ test("A-71: `sessions unparsable-leases` is control-store and controlPodOnly, in
   assert.equal(COMMAND_TABLE["sessions unparsable-leases"]?.class, "control-store");
   assert.equal(COMMAND_TABLE["sessions unparsable-leases"]?.controlPodOnly, true);
 });
+
+// brick 7686016f — THE FLAG THE CLI ACCEPTS AND THE TABLE DOES NOT LIST. `sessions close --seat <seat>` registered
+// `--seat` (command-registration.ts, `addSeatSelectorOption`) while its class entry's target spec did not name it,
+// so the classifier found no target and an agent pod's close-by-seat was refused `target-unresolved`.
+// DERIVED FROM THE REAL COMMANDER REGISTRATION: for every registered path whose class decides acceptance by TARGET
+// (record / owner-if-pod / owner-ensure), a registered `--seat` must be a target flag of its entry. (A create's `--seat`
+// — `sessions new --seat` — means "into this seat", and `context --seat` is control-store: neither names a target.)
+test("CONFORMANCE: every verb whose class is decided by its target and that registers --seat lists --seat as a target flag", () => {
+  const grammar = grammarFromCommander();
+  const targetClasses = new Set<CommandClass>(["record", "owner-if-pod", "owner-ensure"]);
+  const withSeat = Object.entries(grammar)
+    .filter(([, node]) => node.valueFlags.includes("--seat"))
+    .map(([p]) => p);
+  assert.ok(
+    withSeat.length >= 5,
+    `commander registers --seat on almost nothing — vacuous: ${withSeat.join(",")}`,
+  );
+  const missing = withSeat.filter((p) => {
+    const entry = COMMAND_TABLE[p];
+    return (
+      entry !== undefined &&
+      targetClasses.has(entry.class) &&
+      !entry.target?.flags.includes("--seat")
+    );
+  });
+  assert.deepEqual(
+    missing,
+    [],
+    "these verbs accept --seat but their class entry's target does not name it: a seat address finds no target",
+  );
+  // The scan is not vacuous: the verbs this fixed and the ones that always had it are all in the set it judged.
+  for (const verb of ["prompt", "cancel", "status", "sessions close"]) {
+    assert.ok(withSeat.includes(verb), `${verb} registers --seat`);
+  }
+});
