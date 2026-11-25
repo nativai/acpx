@@ -334,10 +334,73 @@ export function isRecordOnlyCreate(): boolean {
 // ─── C6.2 at most once: a replay must be the identical request (TE finding M-2) ───────────────
 
 /**
- * The fingerprint of a create's request — its whole argv, hashed. It is written into the record's
- * metadata (`created_by_request`) in the create's own write, beside `created_by_call`, and compared on
- * every replay. A replay is a retry of the SAME call, so its argv is identical by construction (atrium
- * re-runs the argv it first ran); anything else — another cut, an added `--prompt`, another template or
+ * A-82 (architect #20, option C; C6.2): the OUTPUT OPTIONS — the global options that change how an answer
+ * is printed, never what is created or what the first answer says. A CLOSED list kept here: a replay that
+ * differs from the first call only in these is an identical replay (atrium replays a text-mode create as
+ * JSON). Adding a name needs the same proof the two below have — it changes nothing a create writes, and
+ * nothing in the answer beyond its format — and a row in `test/pod-create-fingerprint-output.test.ts`.
+ *
+ * - `--format <fmt>` (and `--format=<fmt>`): picks the printer.
+ * - `--json-strict` (and `--json-strict=…`): JSON printer plus a quiet stderr.
+ *
+ * Left IN the fingerprint on purpose (each reaches something a create does): `--verbose` (threads into
+ * session creation and the adapter), `--suppress-reads` (the turn's tool-output renderer: output-only for a
+ * turn, but no create has been shown not to carry it into a queued first turn, and nobody asked), `--json` (no create verb has it: an unknown option, refused), and every
+ * other global option.
+ */
+export const CREATE_OUTPUT_ONLY_OPTIONS = {
+  /** Options that take the NEXT token (or `=value`) as their value. */
+  valued: ["--format"],
+  /** Options that are a bare switch (an `=value` spelling is accepted and ignored by the CLI). */
+  switches: ["--json-strict"],
+} as const;
+
+/**
+ * The argv with the output options (and a valued option's value) removed — what a create REQUESTED.
+ * Everything after a bare `--` is positional and stays as it was.
+ */
+export function stripOutputOptions(argv: readonly string[]): string[] {
+  const kept: string[] = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (token === "--") {
+      kept.push(...argv.slice(index));
+      break;
+    }
+    if (CREATE_OUTPUT_ONLY_OPTIONS.valued.some((flag) => token === flag)) {
+      index += 1; // its value
+      continue;
+    }
+    if (
+      CREATE_OUTPUT_ONLY_OPTIONS.valued.some((flag) => token.startsWith(`${flag}=`)) ||
+      CREATE_OUTPUT_ONLY_OPTIONS.switches.some(
+        (flag) => token === flag || token.startsWith(`${flag}=`),
+      )
+    ) {
+      continue;
+    }
+    kept.push(token);
+  }
+  return kept;
+}
+
+/** sha256 over the canonical bytes of an argv (file-valued arguments by their bytes), 32 hex. */
+function hashRequest(
+  argv: readonly string[],
+  fileDigests: Readonly<Record<string, string>>,
+): string {
+  const request = argv.map((arg) =>
+    Object.hasOwn(fileDigests, arg) ? `file-sha256:${fileDigests[arg]}` : arg,
+  );
+  return createHash("sha256").update(JSON.stringify(request)).digest("hex").slice(0, 32);
+}
+
+/**
+ * The fingerprint of a create's request — its argv WITHOUT the output options (A-82), hashed. It is
+ * written into the record's metadata (`created_by_request`) in the create's own write, beside
+ * `created_by_call`, and compared on every replay. A replay is a retry of the SAME call, so its argv is
+ * identical by construction (atrium re-runs the argv it first ran), save for the output options atrium may
+ * change between its two calls; anything else — another cut, an added `--prompt`, another template or
  * source — is a different request that must not be answered with the first record.
  *
  * ⚠️ A FILE-VALUED ARGUMENT IS ITS BYTES, NOT ITS PATH (TE R2-F4). `fileDigests` maps each such argument's
@@ -350,10 +413,37 @@ export function createRequestFingerprint(
   argv: readonly string[],
   fileDigests: Readonly<Record<string, string>> = {},
 ): string {
-  const request = argv.map((arg) =>
-    Object.hasOwn(fileDigests, arg) ? `file-sha256:${fileDigests[arg]}` : arg,
+  return hashRequest(stripOutputOptions(argv), fileDigests);
+}
+
+/**
+ * The fingerprint an OLD build (before A-82) stored: the WHOLE argv, output options included. Kept only so a
+ * record written before the deploy still recognises its own identical retry (architect #21: refusing it
+ * would break A-20). Never written by this build.
+ */
+export function legacyCreateRequestFingerprint(
+  argv: readonly string[],
+  fileDigests: Readonly<Record<string, string>> = {},
+): string {
+  return hashRequest(argv, fileDigests);
+}
+
+/**
+ * Is this replay the request the record holds? The stored value is compared in both schemes: the current
+ * one (output options stripped), and the old one (the whole argv — an old build's JSON first call hashed
+ * its `--format json`, and its text first call hashed an argv that is already free of them). Only a
+ * difference in the closed list can pass either way; anything else still differs in both.
+ */
+export function createRequestMatches(
+  stored: string | undefined,
+  argv: readonly string[],
+  fileDigests: Readonly<Record<string, string>> = {},
+): boolean {
+  return (
+    stored !== undefined &&
+    (stored === createRequestFingerprint(argv, fileDigests) ||
+      stored === legacyCreateRequestFingerprint(argv, fileDigests))
   );
-  return createHash("sha256").update(JSON.stringify(request)).digest("hex").slice(0, 32);
 }
 
 /** The sha256 of each named file's bytes, keyed by the path as it appears in the argv. */

@@ -4,12 +4,18 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
-import { createRequestFingerprint } from "../src/pod/create-plan.js";
+import {
+  CREATE_OUTPUT_ONLY_OPTIONS,
+  createRequestFingerprint,
+  createRequestMatches,
+  stripOutputOptions,
+} from "../src/pod/create-plan.js";
 import {
   createdRecordIds,
   type Fixture,
   makeBox,
   makeTarget,
+  readRecord,
   runCli,
   type Run,
 } from "./umq-rig.js";
@@ -81,13 +87,49 @@ type Answer = Record<string, unknown>;
 const answerOf = (run: Run): Answer =>
   JSON.parse(run.stdout.trim().split("\n").at(-1) ?? "{}") as Answer;
 
-/** An answer with its record ids and timestamps masked, so two creates of one form compare. */
-function masked(answer: Answer, ids: string[]): string {
-  let text = JSON.stringify(answer, Object.keys(answer).toSorted());
-  for (const id of ids) {
-    text = text.split(id).join("<record-id>");
+/** `{ <value>: <label> }` replacements, applied wherever the value appears in the text. */
+function maskIds(text: string, ids: Record<string, string>): string {
+  let out = text;
+  for (const [value, label] of Object.entries(ids)) {
+    out = out.split(value).join(label);
   }
-  return text.replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/gu, "<time>");
+  return out;
+}
+
+/** The mask of one create: its record id and the seat id it minted. */
+function idsOf(f: Fixture, recordId: string): Record<string, string> {
+  const seat = (readRecord(f, recordId) as { seat_id?: string }).seat_id;
+  assert.equal(typeof seat, "string", "the create minted a seat");
+  return { [recordId]: "<record-id>", [String(seat)]: "<seat-id>" };
+}
+
+/** JSON with every object's keys sorted, at every depth: two answers compare field for field. */
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonical);
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .toSorted(([x], [y]) => x.localeCompare(y))
+        .map(([key, entry]) => [key, canonical(entry)]),
+    );
+  }
+  return value;
+}
+
+/**
+ * An answer reduced to what must be EQUAL between two creates of one form. The ONLY things masked, because
+ * they legitimately differ between two runs (each create mints them): the record id and the NEW SEAT id
+ * (wherever they appear: `acpxRecordId`, `seatId`, `seatUrl`, `sessionUrl`, the fork notice) and ISO
+ * timestamps. Every field name and every other value — `forkNotice`, `templatePrompt`, `forkedFromSessionId`,
+ * `sourceSessionId`, `cwd`, `sleeping`, `promptQueued` … — stays.
+ */
+function masked(answer: Answer, ids: Record<string, string>): string {
+  return maskIds(JSON.stringify(canonical(answer)), ids).replace(
+    /\d{4}-\d{2}-\d{2}T[\d:.]+Z/gu,
+    "<time>",
+  );
 }
 
 type Form = { name: string; argv: (source: string, template: string) => string[]; key: string };
@@ -170,9 +212,19 @@ for (const form of FORMS) {
       const answer = answerOf(repeat);
       assert.equal(answer.acpxRecordId, RECORD_ID, `${spelling.name}: the first call's record`);
       assert.equal(typeof answer[form.key], "string", `${spelling.name}: carries ${form.key}`);
+      assert.deepEqual(
+        Object.keys(answer).toSorted(),
+        Object.keys(expected).toSorted(),
+        `${spelling.name}: the same fields — the hand-off is not silently dropped`,
+      );
       assert.equal(
-        masked(answer, [RECORD_ID]),
-        masked(expected, [ORACLE_RECORD_ID]),
+        maskIds(String(answer[form.key]), idsOf(f, RECORD_ID)),
+        maskIds(String(expected[form.key]), idsOf(f, ORACLE_RECORD_ID)),
+        `${spelling.name}: ${form.key} is the same text`,
+      );
+      assert.equal(
+        masked(answer, idsOf(f, RECORD_ID)),
+        masked(expected, idsOf(f, ORACLE_RECORD_ID)),
         `${spelling.name}: the answer a JSON first call would have given`,
       );
     }
@@ -241,7 +293,11 @@ for (const form of FORMS) {
       );
       assert.doesNotMatch(identical.stdout + identical.stderr, /CREATE_REPLAY_MISMATCH/u);
       assert.equal(stateDigest(f), before, "nothing was written");
-      assert.equal(answerOf(identical).acpxRecordId, RECORD_ID);
+      if (firstMode.output.length === 0) {
+        assert.equal(identical.stdout, first.stdout, "a text replay prints the first answer");
+      } else {
+        assert.equal(answerOf(identical).acpxRecordId, RECORD_ID);
+      }
 
       if (firstMode.output.length === 0) {
         // A text first call on the old build hashed an argv with no output option: atrium's JSON second call
@@ -319,4 +375,50 @@ test("row 82.1 unit negative (A-82): every other argument still counts — anoth
   ]) {
     assert.notEqual(createRequestFingerprint(variant), plain, variant.join(" "));
   }
+});
+
+test("row 82.1 unit (A-82): the closed list is exactly --format (valued) and --json-strict (switch); stripOutputOptions removes them and a valued option's value, and stops at `--`", () => {
+  assert.deepEqual(CREATE_OUTPUT_ONLY_OPTIONS, {
+    valued: ["--format"],
+    switches: ["--json-strict"],
+  });
+  assert.deepEqual(stripOutputOptions(CREATE), CREATE);
+  assert.deepEqual(
+    stripOutputOptions([
+      "--format",
+      "json",
+      "a",
+      "--json-strict",
+      "b",
+      "--format=quiet",
+      "--json-strict=1",
+    ]),
+    ["a", "b"],
+  );
+  assert.deepEqual(stripOutputOptions(["a", "--", "--format", "json", "--json-strict"]), [
+    "a",
+    "--",
+    "--format",
+    "json",
+    "--json-strict",
+  ]);
+});
+
+test("row 82.1 unit (A-82, architect #21): a stored fingerprint is matched in the current scheme AND the old whole-argv scheme — and nothing else matches", () => {
+  const json = ["--format", "json", ...CREATE];
+  const oldBytes = (argv: string[]): string =>
+    createHash("sha256").update(JSON.stringify(argv)).digest("hex").slice(0, 32);
+  // old build, JSON first call: stored over the whole argv, replayed identically
+  assert.equal(createRequestMatches(oldBytes(json), json), true);
+  // old build, text first call: replayed as JSON (atrium's second call)
+  assert.equal(createRequestMatches(oldBytes(CREATE), json), true);
+  // the new build's own value
+  assert.equal(createRequestMatches(createRequestFingerprint(json), CREATE), true);
+  // negatives: another argument, no stored value
+  assert.equal(createRequestMatches(oldBytes(json), [...json, "--name", "x"]), false);
+  assert.equal(
+    createRequestMatches(createRequestFingerprint(CREATE), [...CREATE, "--name", "x"]),
+    false,
+  );
+  assert.equal(createRequestMatches(undefined, CREATE), false);
 });
