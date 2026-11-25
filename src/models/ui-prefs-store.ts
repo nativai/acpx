@@ -1,5 +1,5 @@
 /**
- * `ui-prefs.db` (`~/.acpx`, or atrium's database directory in pod mode) — the per-box model preferences store: favorites, and
+ * `ui-prefs.db` (`~/.acpx`, or atrium's database directory where one is set; A-83) — the per-box model preferences store: favorites, and
  * the last-used model per agent type.
  *
  * WHY A DATABASE AND NOT A JSON FILE (C4 §7.5): it has TWO writers in two
