@@ -129,7 +129,7 @@ function describeUnusable(source: DbDirSource, why: DbDirWhy, subject: Subject):
  * The directory setting as A-84 reads it — STRICT, and used only by `controlDatabase` (NEVER by `wakeups`'
  * liveness read, which keeps `atriumDbDirOfRoot`'s pass-over byte for byte). `undefined` = no setting:
  * today's place. `ACPX_UI_DB_DIR` set and non-blank names the directory and must be absolute — while it is
- * set the pointer is never read; else a pointer that EXISTS must be usable (ENOENT alone is "no pointer").
+ * set the pointer is never read; else a pointer that EXISTS must be usable (no entry at all is "no pointer"; a dead link is an entry).
  * Whether the directory exists is `assertPlaced`'s, after the old-place check.
  */
 function strictDbDirSetting(
@@ -152,13 +152,26 @@ function strictDbDirSetting(
   return { dir: pointerDir(database, file, text), source: "pointer" };
 }
 
-/** The pointer's text, `undefined` for ENOENT alone (no pointer); any other read failure is `unreadable`. */
+/** Does an entry of any kind (a dangling link included) exist at `file`? lstat, which never follows. */
+function entryExists(file: string): boolean {
+  try {
+    fs.lstatSync(file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The pointer's text, `undefined` when no entry exists at all (no pointer); any other read failure, a dead link included, is `unreadable`. */
 function readPointerText(database: SqliteDatabaseName, file: string): string | undefined {
   try {
     return fs.readFileSync(file, "utf8");
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") {
+    // ⚠️ ENOENT ALONE IS NOT "NO POINTER": a DANGLING SYMLINK reads ENOENT too, and the entry exists.
+    // lstat decides, as atrium's `pointerProblem` does (joint A-84 check, F-A84-2) — taken for "absent",
+    // a dead link would send this process to `~/.acpx` to make an empty ledger beside the full one.
+    if (code === "ENOENT" && !entryExists(file)) {
       return undefined;
     }
     throw new DatabaseDirUnusableError(database, "pointer", "unreadable", {
