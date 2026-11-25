@@ -4,11 +4,8 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import {
-  atriumDbDirFor,
-  loadWakeupLiveness,
-  wakeupsDbPathFor,
-} from "../src/session/archive/liveness.js";
+import { atriumDbDirFor } from "../src/pod/db-dir.js";
+import { loadWakeupLiveness, wakeupsDbPathFor } from "../src/session/archive/liveness.js";
 import { removeTempHome } from "./temp-home.js";
 
 // brick 6b93b95e (atrium S6): the archive-liveness reader of `wakeups.db` honours the database

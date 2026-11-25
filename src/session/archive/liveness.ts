@@ -1,6 +1,6 @@
-import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { atriumDbDirFor } from "../../pod/db-dir.js";
 import { podModeVerdictNow } from "../../pod/placement.js";
 import { localProofScope } from "../../pod/proof-scope.js";
 import { loadSqlite } from "../../pod/sqlite-loader.js";
@@ -17,35 +17,6 @@ import { hasActiveSidecar } from "./identity.js";
  */
 
 export type LivenessVerdict = { live: boolean; signal?: string };
-
-/** The pointer atrium writes when its databases live outside the state home: `<root>/.db-dir.json`. */
-export const DB_DIR_POINTER_FILE = ".db-dir.json";
-
-/**
- * The directory atrium's SQLite databases are in, resolved as atrium resolves it (atrium S6, brick
- * 6b93b95e; sub-HoD ruling): `ACPX_UI_DB_DIR` if set, else the `dir` the pointer file
- * `<root>/.db-dir.json` names, else `<root>` — the state home THIS PROCESS resolved (`dirname(hotDir)`),
- * so an isolated HOME or a rig slot still reads its own. A pointer that is absent, unparsable or does not
- * name an absolute directory is as good as none: today's place. Read-only — nothing here creates a file.
- */
-export function atriumDbDirFor(hotDir: string, env: NodeJS.ProcessEnv = process.env): string {
-  const root = path.dirname(hotDir);
-  const fromEnv = env.ACPX_UI_DB_DIR?.trim();
-  if (fromEnv) {
-    return fromEnv;
-  }
-  try {
-    const pointer = JSON.parse(readFileSync(path.join(root, DB_DIR_POINTER_FILE), "utf8")) as {
-      dir?: unknown;
-    };
-    if (typeof pointer.dir === "string" && path.isAbsolute(pointer.dir.trim())) {
-      return pointer.dir.trim();
-    }
-  } catch {
-    // no pointer, or not readable JSON: the default place
-  }
-  return root;
-}
 
 /**
  * `<db dir>/wakeups.db` — the file the archive-liveness gate READS. Never created here: `wakeups.db` is a

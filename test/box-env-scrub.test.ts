@@ -295,3 +295,12 @@ test("8d85cb47: the suite starts with no pod identity in process.env, so no lock
   }
   assert.equal(process.env[POD_SA_DIR_ENV], NO_POD_SA_DIR);
 });
+
+test("231b61db: the scrub removes ACPX_UI_DB_DIR (atrium's database directory is box state)", () => {
+  const env: NodeJS.ProcessEnv = {
+    ACPX_UI_DB_DIR: "/home/node/.acpx-control/db",
+    HOME: "/home/node",
+  };
+  assert.deepEqual(scrubBoxHarnessEnvOverrides(env), ["ACPX_UI_DB_DIR"]);
+  assert.equal(env.HOME, "/home/node");
+});
