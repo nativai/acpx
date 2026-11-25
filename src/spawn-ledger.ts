@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { queueLockFilePath } from "./cli/queue/paths.js";
+import { assertNotAtOldPlace, controlDatabase } from "./pod/db-dir.js";
 import { isBoxWideFileInAgentPod } from "./pod/foreign-write-guard.js";
 import {
   isTransientReadError,
@@ -557,11 +558,17 @@ export class SpawnLedger {
   constructor() {
     const directory = path.join(os.homedir(), ".acpx");
     // The file keeps its pre-ledger name: renaming a live WAL database while old-code processes
-    // still hold it open across a deploy is not safe.
-    this.dbPath = path.join(directory, "brick-outbox.db");
+    // still hold it open across a deploy is not safe. In pod mode it lives in atrium's database
+    // directory (A-83), resolved HERE so a library importer (atrium's own process) follows the pointer
+    // exactly as the CLI does; the sessions directory stays under the state home.
+    const placed = controlDatabase("brick-outbox.db", directory);
+    this.dbPath = placed.path;
     // First: in an agent pod nothing below runs — no directory is made, no module is loaded.
     const { DatabaseSync: Database } = loadSqlite("spawn-ledger", this.dbPath);
+    // Never a second ledger: found only at the old place, a pod-mode open refuses (nothing made).
+    assertNotAtOldPlace("spawn-ledger", placed);
     fs.mkdirSync(directory, { recursive: true });
+    fs.mkdirSync(path.dirname(this.dbPath), { recursive: true });
     this.sessionsDir = path.join(directory, "sessions");
     fs.mkdirSync(this.sessionsDir, { recursive: true });
     this.db = new Database(this.dbPath);

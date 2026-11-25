@@ -167,6 +167,15 @@ export const POD_IDENTITY_ENV = ["NV_POD_NAME", "NV_POD_UID", "NV_NODE_NAME"] as
 export const POD_SA_DIR_ENV = "ACPX_POD_SA_DIR";
 export const NO_POD_SA_DIR = "/nonexistent/acpx-test/serviceaccount";
 
+/**
+ * brick 231b61db (A-83) — atrium's database directory is BOX state: wherever `ACPX_UI_DB_DIR` is set
+ * (a box whose manifests carry it, an agent shell on atrium's own slot), the spawn ledger and the
+ * model preferences open THERE instead of under the row's throwaway HOME. The suite removes it, so
+ * "the databases are under HOME/.acpx" is a property of the repo; a row that wants the directory sets
+ * it (or the pointer) itself (`test/pod-db-dir.test.ts`).
+ */
+export const DB_DIR_ENV = "ACPX_UI_DB_DIR";
+
 export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env): string[] {
   const removed: string[] = [];
   for (const name of Object.keys(env)) {
@@ -176,6 +185,7 @@ export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env
       (OS_ROOT_ENV as readonly string[]).includes(name) ||
       name === DEFAULT_OWNER_ENV ||
       name === SESSION_ROOT_ENV ||
+      name === DB_DIR_ENV ||
       (POD_PLACEMENT_ENV as readonly string[]).includes(name)
     ) {
       delete env[name];
