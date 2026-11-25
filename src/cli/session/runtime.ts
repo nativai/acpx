@@ -68,6 +68,7 @@ import {
 export { InterruptedError, TimeoutError } from "../../async-control.js";
 import { isFableModel } from "../../config/subscription-usage.js";
 import { formatPerfMetric, measurePerf, startPerfTimer } from "../../perf-metrics.js";
+import { refuseFlowDirectSendOutsideItsPod } from "../../pod/direct-send-guard.js";
 import { textPrompt } from "../../prompt-content.js";
 import { admitCodexSubscriptionTurn } from "../../runtime/engine/codex-subscription-cap.js";
 import {
@@ -5443,6 +5444,9 @@ export async function runOnce(runOptions: RunOnceOptions): Promise<RunPromptResu
 }
 
 export async function sendSessionDirect(options: SessionSendOptions): Promise<SessionSendResult> {
+  // C1.2 "A flow's direct send": in pod mode this turn runs only in the pod that holds the session's lease —
+  // refused FIRST, before the record write, the turn writer and its marker (brick 59070d68).
+  await refuseFlowDirectSendOutsideItsPod(options.sessionId);
   // A-69 (3): the flows' direct send starts an adapter without an owner and without `sendSession`.
   await refuseWakeWhilePodNotGone(options.sessionId);
   const record = await resolveSessionRecord(options.sessionId);
