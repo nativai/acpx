@@ -4,6 +4,7 @@ import { acpAdapterKind } from "../acp/agent-command.js";
 import { CapacityRefusedError } from "../errors.js";
 import { assertBoxWideWriteAllowed, PodForeignWriteError } from "../pod/foreign-write-guard.js";
 import { lockHostPlace } from "../pod/identity.js";
+import { sessionKey } from "../pod/placement.js";
 import { isControlPlaneInPodMode, podRoom, readAgentsFigures } from "../pod/pod-capacity.js";
 import { admissionBusyRefusal, agentCapRefusal } from "../pod/pod-refusal.js";
 import type { CapacityRefusalReason } from "../types.js";
@@ -1201,7 +1202,11 @@ function podWakeRefusal(
 async function decideWakeInPodPlane(ctx: WakeContext): Promise<WakeDecision> {
   // A-87: a target IN the line counts only the items AHEAD of it (never itself) — the held-queue deadlock.
   const waiting = waitingAheadOf(readWaiting(ctx.dir), ctx.request.target.id);
-  const figures = await readAgentsFigures(ctx.env);
+  // brick 8e5a4ea4: a starting head's own pod is in the broker's `live`; read the figures WITHOUT it (the same
+  // key acpx's POST for this session carries — `sessionKey`, never the Job name), so a head at cap − 1 is not
+  // refused by its own pod. A stranger's wake names its own key and sees every other Job.
+  const ownKey = sessionKey(ctx.request.target.id);
+  const figures = await readAgentsFigures(ctx.env, undefined, ownKey);
   if (!figures.ok) {
     await logWake(ctx, "refused", undefined, {
       reason: "admission_busy",
@@ -1225,6 +1230,7 @@ async function decideWakeInPodPlane(ctx: WakeContext): Promise<WakeDecision> {
     live: figures.agents.live,
     cap: figures.agents.cap,
     waiting: waiting.count,
+    ownPodExcluded: figures.agents.excluded === ownKey,
   };
   if (room.slots >= 1) {
     await logWake(ctx, "not-gated", undefined, {

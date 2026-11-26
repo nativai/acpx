@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { ensureAgentPod, getAgents } from "../src/pod/broker-client.js";
 import { sessionKey } from "../src/pod/placement.js";
+import { agentPodKey } from "../src/pod/routed-call.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence/serialize.js";
 import {
   type BrokerBehavior,
@@ -221,5 +222,45 @@ test("own-pod row 4: an OLDER broker ignores `exclude` and sends no `excluded` â
     assert.equal(raw.excluded, undefined, "the older broker sends no `excluded` echo");
   } finally {
     await broker.close();
+  }
+});
+
+test("own-pod row 5 (unit): `getAgents` puts exactly the key on the URL; with no key the URL is byte-identical to before; the echo is read", async () => {
+  const urls: string[] = [];
+  const answer = (excluded?: string) => ({
+    live: 3,
+    cap: 10,
+    reserve: 1,
+    quota: { used: 3, hard: 10 },
+    home: { live: 0, cap: 2 },
+    pool: { state: "ready" },
+    ...(excluded === undefined ? {} : { excluded }),
+  });
+  const fetchImpl = (async (url: string | URL | Request) => {
+    urls.push(String(url));
+    const asked = new URL(String(url)).searchParams.get("exclude") ?? undefined;
+    return new Response(JSON.stringify(answer(asked)), { status: 200 });
+  }) as typeof fetch;
+  const origin = "http://broker.invalid:8081";
+  const without = await getAgents({ origin, fetchImpl });
+  assert.ok(without.ok);
+  assert.equal(urls[0], `${origin}/v1/agents`);
+  assert.equal(without.agents.excluded, undefined);
+  const withKey = await getAgents({ origin, fetchImpl, exclude: HEAD_KEY });
+  assert.ok(withKey.ok);
+  assert.equal(urls[1], `${origin}/v1/agents?exclude=${HEAD_KEY}`);
+  assert.equal(withKey.agents.excluded, HEAD_KEY);
+  // an echo of ANOTHER key is not this key's exclusion
+  const wrongEcho = (async () =>
+    new Response(JSON.stringify(answer(STRANGER_KEY)), { status: 200 })) as typeof fetch;
+  const mismatched = await getAgents({ origin, fetchImpl: wrongEcho, exclude: HEAD_KEY });
+  assert.ok(mismatched.ok);
+  assert.equal(mismatched.agents.excluded, undefined);
+});
+
+test("own-pod: the key the gate excludes IS the key the POST carries (`sessionKey` = `agentPodKey`, never the Job name)", () => {
+  for (const id of [HEAD, STRANGER, "0f0e0d0c-0b0a-4909-8807-060504030201"]) {
+    assert.equal(sessionKey(id), agentPodKey(id));
+    assert.match(sessionKey(id), /^[0-9a-f]{24}$/u);
   }
 });

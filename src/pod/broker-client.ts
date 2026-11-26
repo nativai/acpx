@@ -76,6 +76,13 @@ export type BrokerAgentsSnapshot = {
   pool: { state: string };
   /** A-49: `"home"` while the broker's safe harbour forces every request home; an absent field is an older broker. */
   placement: { forced: "home" | null };
+  /**
+   * brick 8e5a4ea4: the key whose Job the broker left out of `live`, `home.live` and `quota.used` — set ONLY when
+   * the broker echoed exactly the key this read asked to exclude. ⚠️ ABSENT IS NOT EXCLUDED: an older broker
+   * ignores `?exclude=` and sends no echo, so its figures still count that key's Job; never read an absent field as
+   * success (rows: `test/pod-own-pod-count.test.ts`).
+   */
+  excluded?: string;
 };
 
 export type BrokerAgentsResult =
@@ -458,7 +465,7 @@ function forcedPlacementOf(body: unknown): "home" | null | undefined {
   return forced === "home" ? "home" : undefined;
 }
 
-function parseAgents(body: unknown): BrokerAgentsSnapshot | undefined {
+function parseAgents(body: unknown, exclude?: string): BrokerAgentsSnapshot | undefined {
   const at = (path: readonly string[]) =>
     path.reduce<unknown>((value, key) => objOf(value)?.[key], body);
   const counts = AGENT_COUNT_PATHS.map(at);
@@ -476,22 +483,35 @@ function parseAgents(body: unknown): BrokerAgentsSnapshot | undefined {
     home: { live: homeLive, cap: homeCap },
     pool: { state: poolState },
     placement: { forced },
+    ...(exclude !== undefined && objOf(body)?.excluded === exclude ? { excluded: exclude } : {}),
   };
 }
 
-/** `GET /v1/agents` — for A9; also what `agent_cap` at the wake bound reads its figures from. */
+/**
+ * `GET /v1/agents` — for A9; also what `agent_cap` at the wake bound reads its figures from.
+ * `exclude` (brick 8e5a4ea4, infra #17): ONE bare session key — the SAME string a POST carries as its key, never the
+ * Job name `ag-<key>`. The broker then leaves that key's Job out of `live`, `home.live` and `quota.used`, so a
+ * starting head does not count its own pod, and echoes `excluded` (see {@link BrokerAgentsSnapshot.excluded}).
+ * Without `exclude` the URL is exactly `<origin>/v1/agents`. A value that is not a session key is not sent: the
+ * broker answers 400 `invalid exclude` for it, and a read must never fail for a probe it can answer.
+ */
 export async function getAgents(
-  options: Pick<BrokerClientOptions, "origin" | "fetchImpl">,
+  options: Pick<BrokerClientOptions, "origin" | "fetchImpl"> & { exclude?: string },
 ): Promise<BrokerAgentsResult> {
   const fetchImpl = options.fetchImpl ?? fetch;
+  const exclude =
+    options.exclude !== undefined && AGENT_KEY_RE.test(options.exclude)
+      ? options.exclude
+      : undefined;
   try {
-    const response = await fetchImpl(`${options.origin}/v1/agents`, {
+    const query = exclude === undefined ? "" : `?exclude=${exclude}`;
+    const response = await fetchImpl(`${options.origin}/v1/agents${query}`, {
       signal: AbortSignal.timeout(GET_AGENTS_BOUND_MS),
     });
     if (!response.ok) {
       return { ok: false, detail: `http ${response.status}` };
     }
-    const agents = parseAgents(await response.json());
+    const agents = parseAgents(await response.json(), exclude);
     return agents ? { ok: true, agents } : { ok: false, detail: "malformed answer" };
   } catch {
     return { ok: false, detail: "no answer" };
