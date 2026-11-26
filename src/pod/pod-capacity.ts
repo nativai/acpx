@@ -41,10 +41,15 @@ export type AgentsFigures =
   | { readonly ok: true; readonly agents: BrokerAgentsSnapshot; readonly box: string }
   | { readonly ok: false; readonly detail: string; readonly box: string };
 
-/** One `GET /v1/agents`. Never throws: a broker that does not answer is `ok: false`. */
+/**
+ * One `GET /v1/agents`. Never throws: a broker that does not answer is `ok: false`. `exclude` is the bare pod key of
+ * the session being woken (the wake gate only): its own starting Job is left out of the figures. The target-less
+ * probes (`capacity`, `--need`, the waiting line, the utility branch) pass none and send no query.
+ */
 export async function readAgentsFigures(
   env: NodeJS.ProcessEnv = process.env,
   fetchImpl?: typeof fetch,
+  exclude?: string,
 ): Promise<AgentsFigures> {
   const sources = readAgentBrokerOriginSources();
   const box = boxOfNamespace(namespaceFromSources(sources));
@@ -52,7 +57,7 @@ export async function readAgentsFigures(
   if (!origin) {
     return { ok: false, detail: "no broker address", box };
   }
-  const answer = await getAgents({ origin, fetchImpl });
+  const answer = await getAgents({ origin, fetchImpl, exclude });
   return answer.ok
     ? { ok: true, agents: answer.agents, box }
     : { ok: false, detail: answer.detail, box };
