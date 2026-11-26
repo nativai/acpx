@@ -8,6 +8,7 @@ import {
   admissionBusyRefusal,
   agentCapRefusal,
   podStartingRefusal,
+  type PodStartingPhase,
   refusalForCaller,
   withHoldPromise,
 } from "../src/pod/pod-refusal.js";
@@ -702,6 +703,61 @@ test("builders: a session's refusal DEFAULTS to the sentence that names no messa
   const other = new AcpxOperationalError("boom", { outputCode: "RUNTIME", origin: "cli" });
   assert.equal(refusalForCaller(other, PROMPT), other);
   assert.equal(refusalForCaller("text", PROMPT), "text");
+});
+
+test("M-1 (f8078700): the HOLD sentence of `pod_starting phase=unfit` does not promise a ready pod — it says retried for a while and fails visibly; the token and `queued: true` are unchanged; the other five phases' hold sentences stay byte-identical", () => {
+  const FIVE: Array<[PodStartingPhase, string]> = [
+    ["scheduling", "is being placed on a machine"],
+    ["scaling-up", "waits for a machine to be added (about 2 minutes)"],
+    ["pulling", "is pulling its image"],
+    ["starting", "is starting"],
+    ["turnover", "is being replaced by a newer one"],
+  ];
+  for (const [phase, lead] of FIVE) {
+    const held = withHoldPromise(podStartingRefusal({ phase, wake: "w1" }));
+    assert.equal(
+      held.message.slice(held.stderrLine.length + 1),
+      `acpx: the session's agent pod ${lead}. Nothing was run; the message stays queued and is delivered when the pod is ready.`,
+      phase,
+    );
+    assert.equal(held.capacityRefusal.queued, true, phase);
+  }
+  const base = podStartingRefusal({ phase: "unfit", wake: "w1" });
+  const held = withHoldPromise(base);
+  const lead =
+    "acpx: the session's agent pod is too big for any machine the cluster has now. Nothing was run; ";
+  assert.equal(
+    held.message.slice(held.stderrLine.length + 1),
+    `${lead}the message stays queued and is retried for a while; it fails visibly if no machine can take the pod.`,
+  );
+  const sentence = held.message.slice(held.stderrLine.length + 1);
+  assert.doesNotMatch(sentence, /pod is ready|delivered when/u);
+  assert.doesNotMatch(sentence, /broker|too_big|Job|phase/u);
+  // the token, the exit-code fields and queued are what atrium reads
+  assert.equal(held.stderrLine, base.stderrLine);
+  assert.equal(
+    held.stderrLine,
+    "acpx: REFUSED reason=pod_starting nothing_started=true protocol=1 retry_after_s=300 phase=unfit wake=w1",
+  );
+  assert.equal(held.capacityRefusal.queued, true);
+  assert.equal(held.capacityRefusal.retryAfterS, 300);
+  assert.deepEqual(held.capacityRefusal.pod, { phase: "unfit" });
+  // the no-promise and prompt forms of unfit are unchanged by the tail, and the hold is idempotent / reversible
+  assert.equal(
+    base.message.slice(base.stderrLine.length + 1),
+    `${lead}repeat the command after about 300 s.`,
+  );
+  assert.equal(withHoldPromise(held).message, held.message);
+  const hand = refusalForCaller(
+    base,
+    ["prompt", "--session-id", "x", "--message-id", "m", "hi"],
+    false,
+  );
+  assert.match(
+    hand.message,
+    /the message was NOT queued and NOT sent\. Run the same command again in about 300 s;/u,
+  );
+  assert.equal(hand.capacityRefusal.queued, false);
 });
 
 test("refusalForCaller: the hold needs a mark AND the runner's class, on a prompt; every other prompt is told NOT queued; a command with no message names none", () => {

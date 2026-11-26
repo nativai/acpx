@@ -955,13 +955,19 @@ test("owner-ensure: the bound with the pool at its maximum → agent_cap why=poo
   }
 });
 
-test("owner-ensure: broker `error <reason>` — a bad image (pull), a bad config/template, a failed start, an old contract — stays a named FINAL failure (exit 1, not_run), nothing sent (f8078700 N6 negative: only `too_big` became holdable)", async () => {
+test("owner-ensure: broker `error <reason>` — a bad image (pull), a bad config (`start_failed`), a bad request, the API server, a timeout, a bad template, an old contract — stays a named FINAL failure (exit 1, not_run), nothing sent (f8078700 N6 negative: only `too_big` became holdable)", async () => {
   for (const [line, reason] of [
     ["error unsupported_contract", "broker_unsupported_contract"],
     ["error template_rejected -- bad", "broker_template_rejected"],
     ["error start_failed", "broker_start_failed"],
     ["error image_pull_failed -- ErrImagePull", "broker_image_pull_failed"],
-    ["error invalid_config -- bad env", "broker_invalid_config"],
+    // the REAL broker's reasons (broker.py, argocd agent-pods 401c4558): a configuration error ends as
+    // `start_failed -- <reason> <msg>` (CONFIG_ERRORS, after config_fail_secs); `invalid_request`, `kube_api_error`
+    // and `timeout` are its other final answers. There is no `invalid_config`.
+    ["error start_failed -- CreateContainerConfigError secret x not found", "broker_start_failed"],
+    ["error invalid_request", "broker_invalid_request"],
+    ["error kube_api_error -- 500", "broker_kube_api_error"],
+    ["error timeout", "broker_timeout"],
   ] as const) {
     const broker = await startFakeBroker({ default: { final: line } });
     try {
@@ -977,6 +983,21 @@ test("owner-ensure: broker `error <reason>` — a bad image (pull), a bad config
     } finally {
       await broker.close();
     }
+  }
+});
+
+test("owner-ensure: broker `error deleted` is NOT final — it is held as pod_starting phase=turnover (exit 75); only the other `error <reason>` answers are final", async () => {
+  const broker = await startFakeBroker({ default: { final: "error deleted" } });
+  try {
+    const stub = makeStub();
+    const refusal = await expectRefusal(runRoutedCall(ensureOptions(stub, broker.url)));
+    assert.equal(
+      refusal.stderrLine,
+      `acpx: REFUSED reason=pod_starting nothing_started=true protocol=1 retry_after_s=3 phase=turnover wake=${SESSION}`,
+    );
+    assert.equal(stub.calls().length, 0);
+  } finally {
+    await broker.close();
   }
 });
 

@@ -47,9 +47,22 @@ const HOLD_TAILS: Record<PromiseReason, string> = {
   admission_busy: "the message stays queued and is delivered when they answer.",
 };
 
-function tailOf(reason: PromiseReason, promise: Promise_, retryAfterS: number): string {
+/**
+ * The hold tail of `pod_starting phase=unfit` (M-1): the pod fits no machine now and will not become ready unless the
+ * cluster or the request changes, so "delivered when the pod is ready" would be predictably false. Atrium does hold
+ * the item (`queued: true`) and retries it for a while, then fails it visibly. Names nothing internal.
+ */
+const UNFIT_HOLD_TAIL =
+  "the message stays queued and is retried for a while; it fails visibly if no machine can take the pod.";
+
+function tailOf(
+  reason: PromiseReason,
+  promise: Promise_,
+  retryAfterS: number,
+  phase?: string,
+): string {
   if (promise === "hold") {
-    return HOLD_TAILS[reason];
+    return reason === "pod_starting" && phase === "unfit" ? UNFIT_HOLD_TAIL : HOLD_TAILS[reason];
   }
   return promise === "prompt"
     ? `the message was NOT queued and NOT sent. Run the same command again in about ${retryAfterS} s; ` +
@@ -223,17 +236,18 @@ function withPromise(error: CapacityRefusedError, promise: Promise_): CapacityRe
     return error;
   }
   const sentence = error.message.slice(error.stderrLine.length + 1);
+  const phase = detail.pod?.phase;
   const current = PROMISES.find((candidate) =>
-    sentence.endsWith(tailOf(reason, candidate, detail.retryAfterS)),
+    sentence.endsWith(tailOf(reason, candidate, detail.retryAfterS, phase)),
   );
   if (current === undefined) {
     return error;
   }
   const lead = sentence.slice(
     0,
-    sentence.length - tailOf(reason, current, detail.retryAfterS).length,
+    sentence.length - tailOf(reason, current, detail.retryAfterS, phase).length,
   );
-  const rewritten = lead + tailOf(reason, promise, detail.retryAfterS);
+  const rewritten = lead + tailOf(reason, promise, detail.retryAfterS, phase);
   return new CapacityRefusedError({
     tokenLine: error.stderrLine,
     sentence: rewritten,
