@@ -50,6 +50,8 @@ import path from "node:path";
  *             string `key`, `kind` and `ref` is skipped. Every one of these fails OPEN: W only ever
  *             gets smaller, never larger, from a bad file.
  *
+ * A WAKE of an item IN this line deducts only the items AHEAD of it (`waitingAheadOf`, below; A-87).
+ *
  * Rows: "waiting:" in test/capacity-waiting.test.ts.
  */
 
@@ -142,5 +144,36 @@ export function readWaiting(admissionDir: string, now: Date = new Date()): Waiti
     .filter((file) => isFresh(file, now.getTime()))
     .flatMap(itemsOfFile)
     .toSorted(bySinceThenKey);
+  return { count: items.length, items };
+}
+
+/**
+ * What a WOKEN target counts of the waiting line (brick 7176ec40, contract A-87; the held-queue deadlock).
+ *
+ * `readCapacity` sizes a spawn-class wake net of the line's count W so queued automation starts before new
+ * fan-out. For the item being woken that included ITSELF: with W ≥ free the head got 0 slots, forever
+ * (devbox 2026-11-25 20:03Z → 11-26 05:57Z, 19 waiting, 16 free). A target IN the line counts only the
+ * items AHEAD of it — k − 1 at position k; never itself, never those behind. A target NOT in the line
+ * returns the whole queue: the full deduction stays for a stranger.
+ *
+ * "AHEAD" IS THE LINE'S OWN ORDER: `readWaiting` sorts every writer's items oldest `since` first, then by
+ * key, and that is the order `acpx capacity` lists them and atrium's drainer wakes them. The FIRST item
+ * of the target decides, so a copy of the target (a `pod_starting` re-drive's item, a second writer's
+ * file) is never counted ahead of itself. The item is the recipient's `delivery:<id>`: a `wakeup:` /
+ * `trigger-run:` ref is not a session id and is not matched.
+ *
+ * ⚠️ ONLY THE TARGETED WAKE PATHS CALL THIS (`decideWakeUnderLock`, `decideWakeInPodPlane`). The
+ * TARGET-LESS probe — `acpx capacity --class automation --need 1`, which atrium's drainer runs before each
+ * start — and every other reading keep the whole count; `test/capacity-wake.test.ts` ("row 4") holds it.
+ */
+export function waitingAheadOf(queue: WaitingQueue, targetId: string): WaitingQueue {
+  const index = queue.items.findIndex(
+    (item) =>
+      item.key === `delivery:${targetId}` || (item.kind === "delivery" && item.ref === targetId),
+  );
+  if (index === -1) {
+    return queue;
+  }
+  const items = queue.items.slice(0, index);
   return { count: items.length, items };
 }
