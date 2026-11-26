@@ -1,8 +1,9 @@
 // brick 35d4e64b (acpx half of ef5934ba) — `acpx sessions release --if-idle`, END TO END, in the production
 // shape: the real CLI starts a real queue owner (a detached process), the owner spawns the mock agent as its
 // adapter, and `sessions release --if-idle` is a SEPARATE real CLI process that asks that owner over its
-// socket. The pod's marks are files in a temp directory the owner reads through the idle loop's own knobs
-// (NV_AG_RUN_DIR / NV_AG_STATUS_DIR / NV_AGENT_SESSION_KEY).
+// socket. The pod's idle predicate (`nv-agent-idle --check`, infra's, not installed anywhere yet) is a STUB
+// executable whose exit code the test sets per row (0 idle · 10 browser_open · 11 call_in_flight · 12 busy)
+// and which logs its argv; the owner finds it through the test-only ACPX_IDLE_PREDICATE override.
 //
 // Each guarantee has its own row and each row can fail. The refusal rows are the committed negatives: the
 // owner is asserted ALIVE afterwards, and the turn it was running still ends with its own answer.
@@ -28,19 +29,21 @@ type Rig = {
   id: string;
   sessionsDir: string;
   runDir: string;
-  statusDir: string;
+  stub: string;
+  verdictFile: string;
+  argvLog: string;
 };
 
-function cliEnv(rig: Pick<Rig, "runDir" | "statusDir">, homeDir: string): NodeJS.ProcessEnv {
+function cliEnv(rig: Pick<Rig, "runDir" | "stub">, homeDir: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     HOME: homeDir,
     ACPX_STATE_HOME: homeDir,
     ACPX_SESSION_PRIMER_COMMAND: "/nonexistent/acpx-test-primer.sh",
     NV_AG_RUN_DIR: rig.runDir,
-    NV_AG_STATUS_DIR: rig.statusDir,
-    NV_AGENT_SESSION_KEY: "ritest",
+    ACPX_IDLE_PREDICATE: rig.stub,
   };
+  delete env.ACPX_ROUTED_CALL_ID;
   for (const key of [
     "ACPX_SESSION_URL",
     "ACPX_SEAT_URL",
@@ -86,34 +89,35 @@ async function runCli(
   });
 }
 
-async function writeStatus(rig: Rig, overrides: Record<string, unknown> = {}): Promise<void> {
-  await fs.writeFile(
-    path.join(rig.statusDir, "ritest.json"),
-    `${JSON.stringify({
-      version: 1,
-      kind: "agent",
-      state: "running",
-      updatedAt: new Date().toISOString(),
-      browser: { open: false, since: null },
-      ...overrides,
-    })}\n`,
-  );
+/** What the stub predicate answers next: its exit code, or `hang` (sleeps past the owner's 5 s bound). */
+async function setVerdict(rig: Rig, verdict: string): Promise<void> {
+  await fs.writeFile(rig.verdictFile, verdict);
 }
 
 async function withSession(run: (rig: Rig) => Promise<void>): Promise<void> {
   await withTempHome(async (homeDir) => {
     const cwd = path.join(homeDir, "workspace");
     const runDir = path.join(homeDir, "nv-run");
-    const statusDir = path.join(homeDir, "nv-status");
+    const stubDir = path.join(homeDir, "nv-stub");
+    const stub = path.join(stubDir, "nv-agent-idle");
+    const verdictFile = path.join(stubDir, "verdict");
+    const argvLog = path.join(stubDir, "argv.log");
     await fs.mkdir(cwd, { recursive: true });
-    await fs.mkdir(path.join(runDir, "inflight"), { recursive: true });
-    await fs.mkdir(statusDir, { recursive: true });
+    await fs.mkdir(runDir, { recursive: true });
+    await fs.mkdir(stubDir, { recursive: true });
+    await fs.writeFile(verdictFile, "0");
+    await fs.writeFile(
+      stub,
+      `#!/bin/sh\necho "$@" >> ${JSON.stringify(argvLog)}\nv=$(cat ${JSON.stringify(verdictFile)})\n` +
+        `[ "$v" = hang ] && exec sleep 30\ncase $v in 10) echo browser_open;; 11) echo call_in_flight;; 12) echo busy;; esac\nexit "$v"\n`,
+      { mode: 0o755 },
+    );
     await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
     await fs.writeFile(
       path.join(homeDir, ".acpx", "config.json"),
       `${JSON.stringify({ agents: { codex: { command: MOCK_AGENT_COMMAND } } })}\n`,
     );
-    const rig: Rig = { homeDir, cwd, id: "", sessionsDir: "", runDir, statusDir };
+    const rig: Rig = { homeDir, cwd, id: "", sessionsDir: "", runDir, stub, verdictFile, argvLog };
     const created = await runCli(
       ["--cwd", cwd, "--format", "json", "codex", "sessions", "new", "--name", "reclaimable"],
       rig,
@@ -121,7 +125,6 @@ async function withSession(run: (rig: Rig) => Promise<void>): Promise<void> {
     assert.equal(created.code, 0, created.stderr);
     rig.id = String((JSON.parse(created.stdout.trim()) as { acpxRecordId: unknown }).acpxRecordId);
     rig.sessionsDir = path.join(homeDir, ".acpx", "sessions");
-    await writeStatus(rig);
     await run(rig);
   });
 }
@@ -322,67 +325,100 @@ test("COMMITTED NEGATIVE — a QUEUED prompt behind a running turn is never lost
   });
 });
 
-test("COMMITTED NEGATIVE — an agent BROWSER open is not reclaimed: refused(pod_busy:browser_open), owner alive, no mark; closed again, the same owner IS released", async () => {
-  await withSession(async (rig) => {
-    assert.equal((await prompt(rig, "echo BROWSER-ROW")).code, 0);
-    const ownerPid = await ownerPidOf(rig);
-    await writeStatus(rig, { browser: { open: true, since: new Date().toISOString(), pages: 1 } });
+/** One refusal row: the predicate answers `verdict`, the owner is untouched; set back to 0 the SAME owner is released. */
+async function pinnedRefusalRow(
+  rig: Rig,
+  label: string,
+  verdict: string,
+  expected: string,
+): Promise<void> {
+  assert.equal((await prompt(rig, `echo ${label}-ROW`)).code, 0);
+  const ownerPid = await ownerPidOf(rig);
+  await setVerdict(rig, verdict);
 
-    const refused = await releaseOnceParked(rig);
-    assert.equal(refused.code, 1);
-    assert.equal(answer(refused).reason, "pod_busy:browser_open");
-    assert.equal(isProcessAlive(ownerPid), true);
-    assert.equal(await exists(path.join(rig.runDir, "reclaim")), false);
+  const refused = await releaseOnceParked(rig);
+  assert.equal(refused.code, 1);
+  assert.equal(answer(refused).released, false);
+  assert.equal(answer(refused).reason, expected);
+  assert.equal(isProcessAlive(ownerPid), true, "the owner is untouched");
+  assert.equal(await exists(path.join(rig.runDir, "reclaim")), false, "no reclaim mark");
 
-    // CONTROL: the identical pod with the browser closed is released — so the refusal came from the browser.
-    await writeStatus(rig);
-    const result = await releaseOnceParked(rig);
-    assert.equal(result.code, 0, `${result.stdout} ${result.stderr}`);
-    await waitForOwnerGone(rig, ownerPid);
-  });
+  // CONTROL: the identical pod with an idle answer is released — so the refusal came from the predicate.
+  await setVerdict(rig, "0");
+  const result = await releaseOnceParked(rig);
+  assert.equal(result.code, 0, `${result.stdout} ${result.stderr}`);
+  await waitForOwnerGone(rig, ownerPid);
+}
+
+test("COMMITTED NEGATIVE — an agent BROWSER open is not reclaimed: predicate exit 10 ⇒ refused(pod_busy:browser_open)", async () => {
+  await withSession((rig) => pinnedRefusalRow(rig, "BROWSER", "10", "pod_busy:browser_open"));
 });
 
-test("COMMITTED NEGATIVE — a COMMAND IN FLIGHT is not reclaimed: refused(pod_busy:call_in_flight); the asking call's OWN mark is ignored", async () => {
-  await withSession(async (rig) => {
-    assert.equal((await prompt(rig, "echo FLIGHT-ROW")).code, 0);
-    const ownerPid = await ownerPidOf(rig);
-    // The asker's own routed call: the entry writes one mark per call with `call_id=` inside, and exports
-    // the same id to the command as ACPX_ROUTED_CALL_ID, which the release CLI hands to the owner.
-    const mark = (callId: string) =>
-      `pid=${process.pid}\npid_start=1\nchild=${process.pid}\nstart_ms=1\ndeadline_ms=2\ncall_id=${callId}\n`;
-    await fs.writeFile(
-      path.join(rig.runDir, "inflight", `own-call.${process.pid}`),
-      mark("own-call"),
-    );
-    // ANOTHER command in flight — same pids, a different call id:
-    await fs.writeFile(path.join(rig.runDir, "inflight", "other-call.1"), mark("other-call"));
-    const asker = { ACPX_ROUTED_CALL_ID: "own-call" };
-
-    const refused = await releaseOnceParked(rig, ["--held-target", HELD], asker);
-    assert.equal(refused.code, 1);
-    assert.equal(answer(refused).reason, "pod_busy:call_in_flight");
-    assert.equal(isProcessAlive(ownerPid), true);
-    assert.equal(await exists(path.join(rig.runDir, "reclaim")), false);
-
-    // CONTROL: with only the asker's own mark left, the owner IS released — the own call is not work.
-    await fs.rm(path.join(rig.runDir, "inflight", "other-call.1"));
-    const result = await releaseOnceParked(rig, ["--held-target", HELD], asker);
-    assert.equal(result.code, 0, `${result.stdout} ${result.stderr}`);
-    await waitForOwnerGone(rig, ownerPid);
-  });
+test("COMMITTED NEGATIVE — a COMMAND IN FLIGHT is not reclaimed: predicate exit 11 ⇒ refused(pod_busy:call_in_flight)", async () => {
+  await withSession((rig) => pinnedRefusalRow(rig, "FLIGHT", "11", "pod_busy:call_in_flight"));
 });
 
-test("COMMITTED NEGATIVE — marks that cannot be read are NEVER idle: refused(pod_busy:unknown), owner untouched", async () => {
+test("COMMITTED NEGATIVE — a BUSY pod is not reclaimed: predicate exit 12 ⇒ refused(pod_busy:busy)", async () => {
+  await withSession((rig) => pinnedRefusalRow(rig, "BUSY", "12", "pod_busy:busy"));
+});
+
+test("COMMITTED NEGATIVE — a predicate that answers anything else is NEVER idle: refused(pod_busy:unknown)", async () => {
+  await withSession((rig) => pinnedRefusalRow(rig, "UNKNOWN", "1", "pod_busy:unknown"));
+});
+
+test("COMMITTED NEGATIVE — a predicate that is NOT INSTALLED (the image lands later) refuses pod_busy:unknown; once it is there the same owner is released", async () => {
   await withSession(async (rig) => {
-    assert.equal((await prompt(rig, "echo UNKNOWN-ROW")).code, 0);
+    assert.equal((await prompt(rig, "echo MISSING-ROW")).code, 0);
     const ownerPid = await ownerPidOf(rig);
-    await fs.rm(path.join(rig.statusDir, "ritest.json"));
+    const hidden = `${rig.stub}.hidden`;
+    await fs.rename(rig.stub, hidden);
 
     const refused = await releaseOnceParked(rig);
     assert.equal(refused.code, 1);
     assert.equal(answer(refused).reason, "pod_busy:unknown");
     assert.equal(isProcessAlive(ownerPid), true);
     assert.equal(await exists(path.join(rig.runDir, "reclaim")), false);
+
+    await fs.rename(hidden, rig.stub);
+    const result = await releaseOnceParked(rig);
+    assert.equal(result.code, 0, `${result.stdout} ${result.stderr}`);
+    await waitForOwnerGone(rig, ownerPid);
+  });
+});
+
+test("COMMITTED NEGATIVE — a predicate that HANGS is bounded at 5 s and refuses pod_busy:unknown, owner untouched", async () => {
+  await withSession(async (rig) => {
+    assert.equal((await prompt(rig, "echo HANG-ROW")).code, 0);
+    const ownerPid = await ownerPidOf(rig);
+    await setVerdict(rig, "hang");
+    const started = Date.now();
+    const refused = await releaseOnceParked(rig);
+    assert.equal(refused.code, 1);
+    assert.equal(answer(refused).reason, "pod_busy:unknown");
+    assert.ok(Date.now() - started < 25_000, "bounded");
+    assert.equal(isProcessAlive(ownerPid), true);
+  });
+});
+
+test("the predicate is called with --check, the OWNER's pid and the asking call's id; a release that is not routed passes NO id (fail closed)", async () => {
+  await withSession(async (rig) => {
+    assert.equal((await prompt(rig, "echo ARGV-ROW")).code, 0);
+    const ownerPid = await ownerPidOf(rig);
+    // Not routed: no ACPX_ROUTED_CALL_ID ⇒ no --exclude-call-id (every mark counts). Refused, so it can be repeated.
+    await setVerdict(rig, "11");
+    await releaseOnceParked(rig);
+    await releaseOnceParked(rig, ["--held-target", HELD], { ACPX_ROUTED_CALL_ID: "own-call-1" });
+    const calls = (await fs.readFile(rig.argvLog, "utf8")).split("\n").filter(Boolean);
+    assert.ok(calls.includes(`--check --owner-pid ${ownerPid}`), calls.join(" | "));
+    assert.ok(
+      calls.includes(`--check --owner-pid ${ownerPid} --exclude-call-id own-call-1`),
+      calls.join(" | "),
+    );
+    assert.equal(
+      calls.filter((line) => line.includes("--exclude-call-id") && !line.endsWith("own-call-1"))
+        .length,
+      0,
+    );
   });
 });
 

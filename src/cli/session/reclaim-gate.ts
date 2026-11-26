@@ -1,4 +1,4 @@
-import type { PodMarksVerdict } from "../../pod/reclaim-marks.js";
+import type { PodMarksVerdict } from "../../pod/idle-predicate.js";
 import type { ReleaseRefusal } from "../queue/messages.js";
 
 // brick 35d4e64b (acpx half of ef5934ba) — the ON-DEMAND release gate: may this owner be ended NOW to make

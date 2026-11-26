@@ -215,8 +215,8 @@ export type QueueScheduleCloseRequest = {
 
 // brick 35d4e64b (acpx half of ef5934ba) — "end this owner NOW if, and only if, it is idle": decided and
 // done in ONE synchronous step on the owner's own loop, so a prompt racing it either starts a turn first
-// (the answer is `turn_running`) or finds the owner gone. `callId` is the asking call's `ACPX_ROUTED_CALL_ID`: the routed entry's in-flight mark for THAT call
-// (`call_id=` inside it) is the call that asks, not work in the pod.
+// (the answer is `turn_running`) or finds the owner gone. `callId` is the asking call's `ACPX_ROUTED_CALL_ID`:
+// the routed entry's in-flight mark for THAT call (`call_id=` inside it) is the call that asks, not work.
 export type QueueReleaseIfIdleRequest = {
   type: "release_if_idle";
   requestId: string;
@@ -381,6 +381,7 @@ export const RELEASE_REFUSALS = [
   "queued",
   "pod_busy:browser_open",
   "pod_busy:call_in_flight",
+  "pod_busy:busy",
   "pod_busy:unknown",
   "unsupported",
   "held_target_self",

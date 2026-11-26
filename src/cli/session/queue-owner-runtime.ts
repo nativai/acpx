@@ -10,13 +10,9 @@ import { defaultBoxRuntimeInfoPath } from "../../box-runtime-info.js";
 import { QueueConnectionError, SessionClosedError } from "../../errors.js";
 import { checkpointPerfMetricsCapture } from "../../perf-metrics-capture.js";
 import { incrementPerfCounter, setPerfGauge } from "../../perf-metrics.js";
+import { idlePredicatePath, runIdlePredicate } from "../../pod/idle-predicate.js";
 import { assertOwnerEntryInOwnPod } from "../../pod/owner-pod.js";
-import {
-  clearReclaimMark,
-  podMarksConfigFromEnv,
-  readPodIdleMarks,
-  writeReclaimMark,
-} from "../../pod/reclaim-marks.js";
+import { clearReclaimMark, podRunDir, writeReclaimMark } from "../../pod/reclaim-marks.js";
 import {
   createPodReleaseStalenessProbe,
   inAgentPod,
@@ -1534,21 +1530,26 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
               detail: "the held message is for this very session",
             };
           }
-          const marksConfig = podMarksConfigFromEnv(process.env, params.callId);
+          const runDir = podRunDir(process.env);
           const verdict = decideReclaim({
             loopParked,
             hasActiveTurn: turnController.hasActiveTurn() || owner?.isClosePending() === true,
             queued: params.queued,
             quiescent: now - lastIdleDrainActivityAt >= IDLE_CHECK_CADENCE_MS,
             liveBackgroundTaskCount: backgroundTasks.liveCount(),
-            podMarks: () => readPodIdleMarks(marksConfig),
+            podMarks: () =>
+              runIdlePredicate({
+                path: idlePredicatePath(process.env),
+                ownerPid: process.pid,
+                ...(params.callId ? { excludeCallId: params.callId } : {}),
+              }),
           });
           if (!verdict.ok) {
             return verdict;
           }
           const idleMs = now - Math.max(lastTaskCompletedAt, lastIdleDrainActivityAt);
           try {
-            writeReclaimMark(marksConfig.runDir, {
+            writeReclaimMark(runDir, {
               sessionId: options.sessionId,
               at: now,
               ownerPid: process.pid,
@@ -1585,7 +1586,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     await heartbeat.beat(owner.queueDepth());
     // brick 35d4e64b: a reclaim mark an earlier owner of this pod left means nothing for THIS owner (the pod
     // did not end, so the release was moot); the idle loop's rule needs the owner gone, and this one is not.
-    clearReclaimMark(podMarksConfigFromEnv(process.env, undefined).runDir);
+    clearReclaimMark(podRunDir(process.env));
     socketContinuityTimer = setInterval(
       scheduleSocketContinuityCheck,
       QUEUE_OWNER_SOCKET_CONTINUITY_INTERVAL_MS,

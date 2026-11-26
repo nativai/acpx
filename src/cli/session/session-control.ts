@@ -1822,7 +1822,7 @@ function classifySessionOwnerStatus(
  * (no turn, nothing queued, no background task, the pod's marks clear). The owner decides and exits in one
  * step on its own loop; this function only asks. The record is untouched: the session's next message starts
  * a fresh owner from it. In a pod the routed entry's own in-flight mark for THIS call must not count as
- * work, so the call's `ACPX_ROUTED_CALL_ID` travels with the request.
+ * work, so the call's `ACPX_ROUTED_CALL_ID` travels with the request (the idle predicate excludes it).
  *
  * `heldTarget` is the session the held message is FOR. It is never released: asked for itself, the answer
  * is `held_target_self` and the owner is not even contacted.

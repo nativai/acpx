@@ -33,12 +33,16 @@ import {
 } from "../src/cli/session/reclaim-gate.js";
 import { releaseOutcomePayload } from "../src/cli/session/session-control.js";
 import {
+  IDLE_PREDICATE_PATH,
+  IDLE_PREDICATE_TEST_ENV,
+  IDLE_PREDICATE_TIMEOUT_MS,
+  idlePredicatePath,
+  runIdlePredicate,
+} from "../src/pod/idle-predicate.js";
+import {
   clearReclaimMark,
-  podMarksConfigFromEnv,
-  type PodMarksConfig,
-  readPodIdleMarks,
+  podRunDir,
   reclaimMarkPath,
-  STATUS_FILE_MAX_AGE_MS,
   writeReclaimMark,
 } from "../src/pod/reclaim-marks.js";
 import type { DepthProjection } from "../src/session/depth-projection.js";
@@ -94,6 +98,11 @@ test("gate: each refusal is idle in every respect but ONE (committed negatives)"
       name: "a command is in flight",
       input: { podMarks: () => ({ ok: false, reason: "call_in_flight", detail: "x" }) },
       reason: "pod_busy:call_in_flight",
+    },
+    {
+      name: "the pod is busy",
+      input: { podMarks: () => ({ ok: false, reason: "busy", detail: "x" }) },
+      reason: "pod_busy:busy",
     },
     {
       name: "the marks cannot be read",
@@ -203,6 +212,7 @@ test("the verb's JSON: EVERY outcome — released, each refusal, no_owner, unsup
     "queued",
     "pod_busy:browser_open",
     "pod_busy:call_in_flight",
+    "pod_busy:busy",
     "pod_busy:unknown",
     "no_owner",
     "unsupported",
@@ -229,6 +239,7 @@ test("the verb's JSON: EVERY outcome — released, each refusal, no_owner, unsup
   assert.deepEqual([...RELEASE_REFUSALS].toSorted(), [
     "held_target_self",
     "pod_busy:browser_open",
+    "pod_busy:busy",
     "pod_busy:call_in_flight",
     "pod_busy:unknown",
     "queued",
@@ -288,188 +299,117 @@ test("wire: a result round-trips; a malformed one is never read as released", ()
 });
 
 // ---------------------------------------------------------------------------------------------------------
-// The pod's marks (files in a temp directory standing for /run/nv-agent and the status directory).
+// The pod's idle predicate (`nv-agent-idle --check`): REAL stub executables in a temp directory.
 // ---------------------------------------------------------------------------------------------------------
 
-type PodRig = { runDir: string; statusDir: string; config: PodMarksConfig };
-
-function withPod(run: (rig: PodRig) => void, ownCallId?: string): void {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "reclaim-marks-"));
+function withStub(script: string, run: (stub: string, argvFile: string) => void): void {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "idle-predicate-"));
   try {
-    const runDir = path.join(root, "run");
-    const statusDir = path.join(root, "status");
-    fs.mkdirSync(path.join(runDir, "inflight"), { recursive: true });
-    fs.mkdirSync(statusDir, { recursive: true });
-    const config: PodMarksConfig = {
-      runDir,
-      statusDir,
-      sessionKey: "key1",
-      ownCallId,
-      now: () => Date.UTC(2026, 10, 26, 12, 0, 0),
-    };
-    run({ runDir, statusDir, config });
+    const stub = path.join(root, "nv-agent-idle");
+    const argvFile = path.join(root, "argv");
+    fs.writeFileSync(stub, `#!/bin/sh\necho "$@" > ${JSON.stringify(argvFile)}\n${script}\n`, {
+      mode: 0o755,
+    });
+    run(stub, argvFile);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 }
 
-function writeStatus(rig: PodRig, overrides: Record<string, unknown> = {}): void {
-  fs.writeFileSync(
-    path.join(rig.statusDir, "key1.json"),
-    `${JSON.stringify({
-      version: 1,
-      kind: "agent",
-      state: "running",
-      updatedAt: "2026-11-26T11:59:30Z",
-      browser: { open: false, since: null },
-      ...overrides,
-    })}\n`,
-  );
-}
+const ask = (path: string, overrides: Partial<Parameters<typeof runIdlePredicate>[0]> = {}) =>
+  runIdlePredicate({ path, ownerPid: 4242, ...overrides });
 
-function writeMark(rig: PodRig, name: string, body: string): void {
-  fs.writeFileSync(path.join(rig.runDir, "inflight", name), body);
-}
-
-const markBody = (pid: number, child: number, callId = "c") =>
-  `pid=${pid}\npid_start=1\nchild=${child}\nstart_ms=1\ndeadline_ms=2\ncall_id=${callId}\n`;
-
-test("marks: the positive control — a running idle loop, browser closed, nothing in flight ⇒ ok", () => {
-  withPod((rig) => {
-    writeStatus(rig);
-    assert.deepEqual(readPodIdleMarks(rig.config), { ok: true });
+test("predicate: exit 0 ⇒ idle (the positive control of the table below)", () => {
+  withStub("exit 0", (stub) => {
+    assert.deepEqual(ask(stub), { ok: true });
   });
 });
 
-test("marks: an agent browser open ⇒ browser_open (committed negative)", () => {
-  withPod((rig) => {
-    writeStatus(rig, { browser: { open: true, since: "2026-11-26T11:00:00Z", pages: 1 } });
-    const verdict = readPodIdleMarks(rig.config);
-    assert.equal(refusalOf(verdict), "browser_open");
-  });
-});
-
-test("marks: a command in flight ⇒ call_in_flight (committed negative); the call that ASKS is not work", () => {
-  withPod((rig) => {
-    writeStatus(rig);
-    // The routed entry's own mark for THIS release call: its call_id is the asker's ACPX_ROUTED_CALL_ID.
-    writeMark(rig, "ask-call.500", markBody(500, 501, "ask-call"));
-    assert.deepEqual(readPodIdleMarks(rig.config), { ok: true }, "the asker's own mark is ignored");
-    // NEGATIVE: the same pod with ANOTHER call in flight is refused — even one whose pids equal the
-    // asker's (only the call id identifies the asker).
-    writeMark(rig, "other-call.500", markBody(500, 501, "other-call"));
-    const verdict = readPodIdleMarks(rig.config);
-    assert.equal(refusalOf(verdict), "call_in_flight");
-  }, "ask-call");
-  // NEGATIVE: with no call id (not a routed call) NO mark is ignored.
-  withPod((rig) => {
-    writeStatus(rig);
-    writeMark(rig, "ask-call.500", markBody(500, 501, "ask-call"));
-    const verdict = readPodIdleMarks(rig.config);
-    assert.equal(refusalOf(verdict), "call_in_flight");
-  });
-});
-
-test("marks: a mark nobody can parse counts as in flight (a doubt is not idle)", () => {
-  withPod((rig) => {
-    writeStatus(rig);
-    writeMark(rig, "junk.1", "not a mark at all\n");
-    const verdict = readPodIdleMarks(rig.config);
-    assert.equal(refusalOf(verdict), "call_in_flight");
-  });
-});
-
-test("marks: every unreadable input is `unknown`, never idle (committed negatives)", () => {
-  const cases: Array<{
-    name: string;
-    arrange: (rig: PodRig) => void;
-    config?: Partial<PodMarksConfig>;
-  }> = [
-    { name: "no status file", arrange: () => {} },
-    {
-      name: "a status file that is not JSON",
-      arrange: (rig) => fs.writeFileSync(path.join(rig.statusDir, "key1.json"), "{not json"),
-    },
-    {
-      name: "a status file that is not an object",
-      arrange: (rig) => fs.writeFileSync(path.join(rig.statusDir, "key1.json"), "[1,2]\n"),
-    },
-    {
-      name: "no session key",
-      arrange: (rig) => writeStatus(rig),
-      config: { sessionKey: undefined },
-    },
-    {
-      name: "a session key that is not a key",
-      arrange: (rig) => writeStatus(rig),
-      config: { sessionKey: "../escape" },
-    },
-    { name: "state is not running", arrange: (rig) => writeStatus(rig, { state: "ending" }) },
-    { name: "state ended", arrange: (rig) => writeStatus(rig, { state: "ended" }) },
-    {
-      name: "a status file older than the idle loop's cadence allows",
-      arrange: (rig) =>
-        writeStatus(rig, {
-          updatedAt: new Date(
-            Date.UTC(2026, 10, 26, 12, 0, 0) - STATUS_FILE_MAX_AGE_MS - 1000,
-          ).toISOString(),
-        }),
-    },
-    { name: "no updatedAt", arrange: (rig) => writeStatus(rig, { updatedAt: undefined }) },
-    { name: "no browser record", arrange: (rig) => writeStatus(rig, { browser: undefined }) },
-    {
-      name: "browser.open that is not a boolean",
-      arrange: (rig) => writeStatus(rig, { browser: { open: "no" } }),
-    },
-    {
-      name: "no in-flight directory",
-      arrange: (rig) => {
-        writeStatus(rig);
-        fs.rmSync(path.join(rig.runDir, "inflight"), { recursive: true });
-      },
-    },
+test("predicate: each busy exit maps to ITS reason — 10 browser_open, 11 call_in_flight, 12 busy (committed negatives)", () => {
+  const rows: Array<[number, string]> = [
+    [10, "browser_open"],
+    [11, "call_in_flight"],
+    [12, "busy"],
   ];
-  for (const { name, arrange, config } of cases) {
-    withPod((rig) => {
-      arrange(rig);
-      const verdict = readPodIdleMarks({ ...rig.config, ...config });
-      assert.equal(refusalOf(verdict), "unknown", name);
+  for (const [code, reason] of rows) {
+    withStub(`echo ${reason}\nexit ${code}`, (stub) => {
+      const verdict = ask(stub);
+      assert.equal(refusalOf(verdict), reason, `exit ${code}`);
+      assert.equal(!verdict.ok && verdict.detail, reason, "the reason word is kept");
     });
   }
 });
 
-test("marks: the control for the table above — the same pod, repaired, is ok", () => {
-  withPod((rig) => {
-    writeStatus(rig);
-    assert.deepEqual(readPodIdleMarks(rig.config), { ok: true });
-    assert.deepEqual(
-      readPodIdleMarks({
-        ...rig.config,
-        now: () => Date.UTC(2026, 10, 26, 12, 0, 0) + 60_000,
-      }),
-      { ok: true },
-      "a status file a minute old is fresh (the loop rewrites it every 60 s)",
-    );
+test("predicate: ANYTHING else is unknown, never idle — another exit code, a signal, a timeout, a missing binary (committed negatives)", () => {
+  for (const code of [1, 2, 3, 9, 13, 64, 126, 127, 255]) {
+    withStub(`exit ${code}`, (stub) => {
+      assert.equal(refusalOf(ask(stub)), "unknown", `exit ${code}`);
+    });
+  }
+  withStub("kill -9 $$", (stub) => {
+    assert.equal(refusalOf(ask(stub)), "unknown", "ended by a signal");
+  });
+  const started = Date.now();
+  withStub("exec sleep 30", (stub) => {
+    assert.equal(refusalOf(ask(stub, { timeoutMs: 300 })), "unknown", "a timeout");
+  });
+  assert.ok(Date.now() - started < 10_000, "the timeout bounds the call");
+  assert.equal(
+    refusalOf(ask("/nonexistent/nv-agent-idle")),
+    "unknown",
+    "the predicate is not installed yet (the image carrying it lands after the devbox switch)",
+  );
+  withStub("exit 0", (stub) => {
+    fs.chmodSync(stub, 0o644);
+    assert.equal(refusalOf(ask(stub)), "unknown", "present but not executable");
   });
 });
 
-test("marks: the config reads the idle loop's own knobs from the environment", () => {
-  const config = podMarksConfigFromEnv(
-    { NV_AG_RUN_DIR: "/r", NV_AG_STATUS_DIR: "/s", NV_AGENT_SESSION_KEY: "k" },
-    "call-7",
+test("predicate: the call passes --check, the owner's pid and the asking call's id; with no call id none is passed", () => {
+  withStub("exit 0", (stub, argvFile) => {
+    ask(stub, { excludeCallId: "call-7" });
+    assert.equal(
+      fs.readFileSync(argvFile, "utf8").trim(),
+      "--check --owner-pid 4242 --exclude-call-id call-7",
+    );
+    ask(stub);
+    assert.equal(fs.readFileSync(argvFile, "utf8").trim(), "--check --owner-pid 4242");
+  });
+});
+
+test("predicate: the path is infra's fixed install path; the test override is honoured ONLY under node --test", () => {
+  assert.equal(idlePredicatePath({}), IDLE_PREDICATE_PATH);
+  assert.equal(IDLE_PREDICATE_PATH, "/usr/local/bin/nv-agent-idle");
+  // NEGATIVE: a box (no NODE_TEST_CONTEXT) setting the override changes nothing.
+  assert.equal(idlePredicatePath({ [IDLE_PREDICATE_TEST_ENV]: "/tmp/evil" }), IDLE_PREDICATE_PATH);
+  assert.equal(
+    idlePredicatePath({ [IDLE_PREDICATE_TEST_ENV]: "/tmp/stub", NODE_TEST_CONTEXT: "child-v8" }),
+    "/tmp/stub",
   );
-  assert.equal(config.runDir, "/r");
-  assert.equal(config.statusDir, "/s");
-  assert.equal(config.sessionKey, "k");
-  assert.equal(config.ownCallId, "call-7");
-  const defaults = podMarksConfigFromEnv({}, undefined);
-  assert.equal(defaults.runDir, "/run/nv-agent");
-  assert.equal(defaults.statusDir, "/workspace/.workbench/agents");
-  assert.equal(defaults.sessionKey, undefined);
+});
+
+test("predicate: the spawn is synchronous and bounded at 5 s (the owner holds its loop for the call)", () => {
+  assert.equal(IDLE_PREDICATE_TIMEOUT_MS, 5_000);
+  let seen: { timeout?: number } | undefined;
+  const verdict = runIdlePredicate({
+    path: "x",
+    ownerPid: 1,
+    spawn: ((_path: string, _args: readonly string[], options: { timeout?: number }) => {
+      seen = options;
+      return { status: 0, signal: null, stdout: "", stderr: "", output: [], pid: 1 };
+    }) as unknown as typeof import("node:child_process").spawnSync,
+  });
+  assert.deepEqual(verdict, { ok: true });
+  assert.equal(seen?.timeout, 5_000);
+});
+
+test("run dir: the idle loop's own knob, default /run/nv-agent", () => {
+  assert.equal(podRunDir({ NV_AG_RUN_DIR: "/r" }), "/r");
+  assert.equal(podRunDir({}), "/run/nv-agent");
 });
 
 test("reclaim mark: written whole and atomically with the session and the held target; cleared; a failed write leaves nothing", () => {
-  withPod((rig) => {
+  withRunDir((rig) => {
     writeReclaimMark(rig.runDir, {
       sessionId: "sess-1",
       at: Date.UTC(2026, 10, 26, 12, 0, 0),
@@ -497,6 +437,16 @@ test("reclaim mark: written whole and atomically with the session and the held t
     assert.equal(fs.existsSync(missing), false);
   });
 });
+
+function withRunDir(run: (rig: { runDir: string }) => void): void {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "reclaim-mark-"));
+  try {
+    fs.mkdirSync(path.join(root, "inflight"));
+    run({ runDir: root });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
 
 // ---------------------------------------------------------------------------------------------------------
 // The owner's atomic step, on a real queue-owner socket. The runtime's `loopParked` is modelled by the test
