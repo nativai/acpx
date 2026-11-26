@@ -16,6 +16,7 @@ export const POD_STARTING_PHASES = [
   "pulling",
   "starting",
   "turnover",
+  "unfit",
 ] as const;
 export type PodStartingPhase = (typeof POD_STARTING_PHASES)[number];
 
@@ -56,8 +57,18 @@ function tailOf(reason: PromiseReason, promise: Promise_, retryAfterS: number): 
     : `repeat the command after about ${retryAfterS} s.`;
 }
 
-/** C7.2: 3 for scheduling, starting, turnover; 15 for pulling (a pull took 43 s); 60 for scaling-up. */
+/**
+ * `unfit` (f8078700 C5): the broker answered `too_big` — the pod fits no machine the cluster has now. Held like any
+ * start, so atrium's one hold deadline covers it and records the failure where the sender looks; it is NOT final
+ * here, because a bigger machine (or a changed request) can heal it. Long, because a wait of seconds does not.
+ */
+const UNFIT_RETRY_AFTER_S = 300;
+
+/** C7.2: 3 for scheduling, starting, turnover; 15 for pulling (a pull took 43 s); 60 for scaling-up; 300 for unfit. */
 export function podStartingRetryAfterS(phase: PodStartingPhase): number {
+  if (phase === "unfit") {
+    return UNFIT_RETRY_AFTER_S;
+  }
   if (phase === "pulling") {
     return 15;
   }
@@ -70,6 +81,7 @@ const PHASE_SENTENCE: Record<PodStartingPhase, string> = {
   pulling: "is pulling its image",
   starting: "is starting",
   turnover: "is being replaced by a newer one",
+  unfit: "is too big for any machine the cluster has now",
 };
 
 export function podStartingRefusal(input: {

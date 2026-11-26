@@ -514,12 +514,10 @@ function brokerRefusal(
   ctx: BrokerContext,
 ): Error {
   if (answer.reason === "too_big") {
-    // The pod cannot fit any machine: no wait heals it, so it is not a "retry later" refusal.
-    return new RoutedCallError({
-      outcome: "not_run",
-      reason: "broker_too_big",
-      callId: ctx.callId,
-    });
+    // f8078700 C5: the pod fits no machine now, but a bigger machine or a changed request can heal it — so it is HELD
+    // (`pod_starting phase=unfit`, a long retry_after_s), under atrium's one hold deadline, never final. A bad image
+    // or a bad config (`error <reason>`, below) is different: no wait heals it, and it stays `not_run`.
+    return podStartingRefusal({ phase: "unfit", wake: ctx.wake });
   }
   const why: AgentCapWhy = answer.reason === "agent_cap" ? "cap" : answer.reason;
   return agentCapRefusal({ live: answer.live, cap: answer.cap, box: ctx.box, why, wake: ctx.wake });
