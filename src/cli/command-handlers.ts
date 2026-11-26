@@ -62,6 +62,7 @@ import { inCallHomeMode } from "../pod/call-home.js";
 import {
   createReplayMismatchError,
   createRequestFingerprint,
+  createRequestMatches,
   fileArgumentDigests,
   forkSourceSleepingError,
   isRecordOnlyCreate,
@@ -4303,8 +4304,11 @@ function assertSameRequest(
   fileDigests?: Readonly<Record<string, string>>,
 ): void {
   if (
-    record.metadata?.[CREATED_BY_REQUEST_KEY] !==
-    createRequestFingerprint(process.argv.slice(2), fileDigests)
+    !createRequestMatches(
+      record.metadata?.[CREATED_BY_REQUEST_KEY],
+      process.argv.slice(2),
+      fileDigests,
+    )
   ) {
     throw createReplayMismatchError(record.acpxRecordId);
   }
