@@ -144,3 +144,8 @@ export function readWaiting(admissionDir: string, now: Date = new Date()): Waiti
     .toSorted(bySinceThenKey);
   return { count: items.length, items };
 }
+
+/** RED-FIRST STUB (brick 7176ec40): returns the whole queue; the rows fail by assertion, the behaviour follows. */
+export function waitingAheadOf(queue: WaitingQueue, _targetId: string): WaitingQueue {
+  return queue;
+}

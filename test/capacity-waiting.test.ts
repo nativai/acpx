@@ -8,6 +8,8 @@ import {
   readWaiting,
   WAITING_FRESH_MS,
   WAITING_FUTURE_SKEW_MS,
+  type WaitingQueue,
+  waitingAheadOf,
   waitingDirOf,
 } from "../src/capacity/waiting.js";
 
@@ -146,4 +148,52 @@ test("waiting: only *.json is read — a writer's temp file never counts", () =>
 test("waiting: no waiting dir at all is an empty queue", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-waiting-none-"));
   assert.deepEqual(readWaiting(dir), { count: 0, items: [] });
+});
+
+// brick 7176ec40 — `waitingAheadOf`: what a woken target counts of the queue.
+function queueOf(...refs: string[]): WaitingQueue {
+  const items = refs.map((ref, index) => ({
+    key: `delivery:${ref}`,
+    kind: "delivery",
+    ref,
+    label: ref,
+    harness: "claude",
+    since: new Date(index * 1000).toISOString(),
+  }));
+  return { count: items.length, items };
+}
+
+test("7176ec40 waitingAheadOf: a queued target counts only the items ahead of it (k − 1 at position k)", () => {
+  const queue = queueOf("a", "b", "c", "d");
+  for (const [index, ref] of ["a", "b", "c", "d"].entries()) {
+    const ahead = waitingAheadOf(queue, ref);
+    assert.equal(ahead.count, index, ref);
+    assert.deepEqual(
+      ahead.items.map((item) => item.ref),
+      ["a", "b", "c", "d"].slice(0, index),
+    );
+  }
+});
+
+test("7176ec40 waitingAheadOf NEGATIVE: a target not in the queue keeps the whole queue; the first occurrence decides; a non-delivery ref is not matched by id", () => {
+  const queue = queueOf("a", "b", "c");
+  assert.equal(waitingAheadOf(queue, "zzz").count, 3);
+  assert.equal(
+    waitingAheadOf(queueOf("x", "t", "y", "t"), "t").count,
+    1,
+    "a second copy is not ahead",
+  );
+  const wakeup: WaitingQueue = {
+    count: 2,
+    items: [
+      { key: "wakeup:w1", kind: "wakeup", ref: "w1", label: "", harness: "claude", since: "1" },
+      { key: "delivery:t", kind: "delivery", ref: "t", label: "", harness: "claude", since: "2" },
+    ],
+  };
+  assert.equal(waitingAheadOf(wakeup, "t").count, 1);
+  assert.equal(
+    waitingAheadOf(wakeup, "w1").count,
+    2,
+    "an automation wakeup's ref is not a recipient: no match",
+  );
 });

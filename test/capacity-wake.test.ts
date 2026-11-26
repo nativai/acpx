@@ -1103,3 +1103,147 @@ test("set gate: a set the RECORD vouches for is never gated — an agent's `set 
   assert.equal(agentStarts(f), starts);
   assert.deepEqual(wakeLines(f), []);
 });
+
+// ---------------------------------------------------------------------------------------------
+// brick 7176ec40 — THE HELD-QUEUE DEADLOCK. A `delivery` wake used to be sized net of the WHOLE
+// waiting queue W, the item being woken included, so the queue head got 0 slots whenever W ≥ free
+// (devbox 11-25 20:03Z → 11-26 05:57Z: 19 waiting, 16 free, 23k refusals). A target IN the queue now
+// counts only the items AHEAD of it; one NOT in it keeps the full deduction; the target-less probe
+// (`capacity --class automation --need 1`, atrium's drainer) is unchanged.
+// ---------------------------------------------------------------------------------------------
+
+/** One writer's waiting file: `refs` oldest first (`since` rises by a second per item). */
+function writeWaitingQueue(f: Fixture, refs: string[], writer = "atrium-ahead", baseMs = 0): void {
+  const dir = path.join(admission(f), "waiting");
+  fs.mkdirSync(dir, { recursive: true });
+  const base = Date.now() - 60_000 + baseMs;
+  fs.writeFileSync(
+    path.join(dir, `${writer}.json`),
+    JSON.stringify({
+      schema: 1,
+      writer,
+      writtenAt: new Date().toISOString(),
+      items: refs.map((ref, index) => ({
+        key: `delivery:${ref}`,
+        kind: "delivery",
+        ref,
+        label: `c → ${ref.slice(0, 6)}`,
+        harness: "claude",
+        since: new Date(base + index * 1000).toISOString(),
+        to: ref,
+      })),
+    }),
+  );
+}
+
+const filler = (count: number, from = 0): string[] =>
+  Array.from({ length: count }, (_, index) => `filler-${from + index}`);
+
+type ProbeJson = { freeSlots: Record<string, number>; waiting: { count: number } };
+
+async function probeJson(f: Fixture, cls: "automation" | "spawn"): Promise<ProbeJson> {
+  const run = await runCli(["--format", "json", "capacity", "--class", cls], f.env, f.root);
+  const line = run.stdout.trim().split("\n").findLast(Boolean) ?? "";
+  return JSON.parse(line) as ProbeJson;
+}
+
+test("7176ec40 row 1: W ≥ free and the target at the HEAD — it IS admitted (the deadlock)", async () => {
+  const f = makeBox({ requestMib: 2700 }); // one agent slot
+  const id = await makeTarget(f);
+  const free = (await probeJson(f, "automation")).freeSlots.claude;
+  writeWaitingQueue(f, [id, ...filler(free + 2)]); // W = free + 3, the head is the target
+  const run = await admitWakeCli(f, id, ["--class", "delivery"]);
+  assert.equal(run.code, 0, `${run.stdout}\n${run.stderr}`);
+  assert.equal(run.json.decision, "admitted");
+});
+
+test("7176ec40 row 2 NEGATIVE: a target NOT in the queue still sees the FULL deduction", async () => {
+  const f = makeBox({ requestMib: 2700 });
+  const id = await makeTarget(f);
+  const free = (await probeJson(f, "automation")).freeSlots.claude;
+  writeWaitingQueue(f, filler(free + 2));
+  const run = await admitWakeCli(f, id, ["--class", "delivery"]);
+  assert.equal(run.code, 75, run.stderr);
+  assert.equal(
+    run.json.refusal?.queuedAhead,
+    free + 2,
+    "every waiting item is ahead of a stranger",
+  );
+});
+
+test("7176ec40 row 3: a target at position k sees exactly k − 1 ahead — admitted at the last free slot, refused one behind it", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  const id = await makeTarget(f);
+  const free = (await probeJson(f, "automation")).freeSlots.claude;
+  assert.ok(free >= 2, `a box with several slots (${free})`);
+  // free items ahead: nothing is left for the target
+  writeWaitingQueue(f, [...filler(free), id, ...filler(2, 100)]);
+  const behind = await admitWakeCli(f, id, ["--class", "delivery"]);
+  assert.equal(behind.code, 75, behind.stderr);
+  assert.equal(behind.json.refusal?.queuedAhead, free, "position free+1 ⇒ exactly `free` ahead");
+  assert.match(
+    behind.json.refusal?.tokenLine ?? "",
+    new RegExp(` queued_ahead=${free} wake=`, "u"),
+  );
+  // free − 1 items ahead: the one remaining slot is the target's
+  writeWaitingQueue(f, [...filler(free - 1), id, ...filler(2, 100)]);
+  const last = await admitWakeCli(f, id, ["--class", "delivery"]);
+  assert.equal(last.code, 0, `${last.stdout}\n${last.stderr}`);
+  assert.equal(last.json.decision, "admitted");
+});
+
+test("7176ec40 row 4: the target-less probes are UNCHANGED — automation is gross, spawn is net of the WHOLE queue, with W ≥ free", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  const empty = await probeJson(f, "automation");
+  const free = empty.freeSlots.claude;
+  assert.ok(free >= 1);
+  writeWaitingQueue(f, filler(free + 3));
+  const automation = await probeJson(f, "automation");
+  assert.equal(automation.freeSlots.claude, free, "the same figure before and after the queue");
+  assert.equal(automation.waiting.count, free + 3);
+  const need = await runCli(
+    ["--format", "json", "capacity", "--class", "automation", "--need", "1"],
+    f.env,
+    f.root,
+  );
+  assert.equal(need.code, 0, `the drainer's probe still says room: ${need.stdout}`);
+  const spawn = await probeJson(f, "spawn");
+  assert.equal(spawn.freeSlots.claude, 0, "spawn stays net of every waiting item");
+});
+
+test("7176ec40 row 5: a re-drive does not count ITSELF — duplicates of the target (another writer) are not ahead, a stranger behind is not either", async () => {
+  const f = makeBox({ requestMib: 2700 }); // one slot
+  const id = await makeTarget(f);
+  // the same item twice (two writers), the target first: nothing is ahead of its first occurrence
+  writeWaitingQueue(f, [id, ...filler(2)], "atrium-a", 0);
+  writeWaitingQueue(f, [id], "atrium-b", 500);
+  const redrive = await admitWakeCli(f, id, ["--class", "delivery"]);
+  assert.equal(redrive.code, 0, `${redrive.stdout}\n${redrive.stderr}`);
+  // one slot, one real item ahead: the duplicate after it is NOT a second one ahead
+  const g = makeBox({ requestMib: 2700 });
+  const other = await makeTarget(g);
+  writeWaitingQueue(g, [...filler(1), other, ...filler(2, 100)], "atrium-a", 0);
+  writeWaitingQueue(g, [other], "atrium-b", 5_000);
+  const behindOne = await admitWakeCli(g, other, ["--class", "delivery"]);
+  assert.equal(behindOne.code, 75);
+  assert.equal(
+    behindOne.json.refusal?.queuedAhead,
+    1,
+    "exactly one item is ahead, the copy of itself is not",
+  );
+});
+
+test("87.1 (on-box) the line drains in order: the head takes the one free slot, the next waits behind it, nothing is admitted twice", async () => {
+  const f = makeBox({ requestMib: 2700 }); // one slot
+  const a = await makeTarget(f);
+  const b = await makeTarget(f);
+  writeWaitingQueue(f, [a, b, ...filler(3)]); // W = 5 ≥ free = 1
+  const head = await admitWakeCli(f, a, ["--class", "delivery"]);
+  assert.equal(head.code, 0, `${head.stdout}\n${head.stderr}`);
+  assert.equal(head.json.decision, "admitted", "the head is admitted while a slot is free");
+  const next = await admitWakeCli(f, b, ["--class", "delivery"]);
+  assert.equal(next.code, 75, "the next item waits: the head holds the slot");
+  assert.equal(next.json.refusal?.queuedAhead, 1, "one ahead (the head), not the whole line");
+  const again = await admitWakeCli(f, a, ["--class", "delivery"]);
+  assert.equal(again.json.decision, "already-reserved", "the head is admitted ONCE");
+});

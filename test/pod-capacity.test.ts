@@ -467,6 +467,154 @@ test("pod mode admit-wake NEGATIVE: a broker that does not answer refuses `admis
   assert.equal((lastJson(run.stdout).refusal as Json).reason, "admission_busy");
 });
 
+// ── brick 7176ec40: the held-queue deadlock, pod plane ──────────────────────────────────────────
+// `podRoom` deducted the WHOLE waiting count for the spawn class a delivery wake maps to, the woken item
+// included. A target IN the queue now counts only the items AHEAD of it.
+
+function writeWaitingFile(f: Fixture, refs: string[], writer = "atrium-ahead", baseMs = 0): void {
+  const dir = path.join(admissionDir(f), "waiting");
+  fs.mkdirSync(dir, { recursive: true });
+  const base = Date.now() - 60_000 + baseMs;
+  fs.writeFileSync(
+    path.join(dir, `${writer}.json`),
+    JSON.stringify({
+      schema: 1,
+      writer,
+      writtenAt: new Date().toISOString(),
+      items: refs.map((ref, index) => ({
+        key: `delivery:${ref}`,
+        kind: "delivery",
+        ref,
+        label: ref.slice(0, 8),
+        harness: "claude",
+        since: new Date(base + index * 1000).toISOString(),
+        to: ref,
+      })),
+    }),
+  );
+}
+
+const fillers = (count: number, from = 0): string[] =>
+  Array.from({ length: count }, (_, index) => `filler-${from + index}`);
+const ONE_FREE: BrokerStatus = { live: 9, cap: 11 }; // 11 − 1 kept for people − 9 live = 1 slot
+
+test("7176ec40 pod row 1: W ≥ free and the target at the HEAD — it IS admitted", async () => {
+  const f = makeBox({});
+  writeRecord(f, "wake-h", CLAUDE);
+  writeWaitingFile(f, ["wake-h", ...fillers(3)]);
+  const broker = await BROKER(ONE_FREE);
+  try {
+    const run = await wake(f, broker.url, "wake-h");
+    assert.equal(run.code, 0, `${run.stdout}\n${run.stderr}`);
+    assert.deepEqual(
+      [lastJson(run.stdout).decision, lastJson(run.stdout).why],
+      ["not-gated", "pod-room"],
+    );
+  } finally {
+    await broker.close();
+  }
+});
+
+test("7176ec40 pod row 2 NEGATIVE: a target NOT in the queue still sees the full deduction", async () => {
+  const f = makeBox({});
+  writeRecord(f, "wake-s", CLAUDE);
+  writeWaitingFile(f, fillers(4));
+  const broker = await BROKER(ONE_FREE);
+  try {
+    const run = await wake(f, broker.url, "wake-s");
+    assert.equal(run.code, 75, run.stderr);
+    assert.equal((lastJson(run.stdout).refusal as Json).queuedAhead, 4);
+  } finally {
+    await broker.close();
+  }
+});
+
+test("7176ec40 pod row 3: a target at position k sees exactly k − 1 ahead (3 free)", async () => {
+  const f = makeBox({});
+  writeRecord(f, "wake-k", CLAUDE);
+  const broker = await BROKER({ live: 7, cap: 11 }); // 3 slots
+  try {
+    writeWaitingFile(f, [...fillers(3), "wake-k", ...fillers(2, 50)]); // position 4: 3 ahead
+    const behind = await wake(f, broker.url, "wake-k");
+    assert.equal(behind.code, 75, behind.stderr);
+    assert.equal((lastJson(behind.stdout).refusal as Json).queuedAhead, 3);
+    writeWaitingFile(f, [...fillers(2), "wake-k", ...fillers(2, 50)]); // position 3: 2 ahead
+    const last = await wake(f, broker.url, "wake-k");
+    assert.equal(last.code, 0, `${last.stdout}\n${last.stderr}`);
+  } finally {
+    await broker.close();
+  }
+});
+
+test("7176ec40 pod row 4: the target-less probes are UNCHANGED (automation gross, spawn net of the whole queue)", async () => {
+  const f = makeBox({});
+  writeWaitingFile(f, fillers(5));
+  const broker = await BROKER(ONE_FREE);
+  try {
+    const automation = lastJson((await capacity(f, broker.url, ["--class", "automation"])).stdout);
+    assert.equal((automation.freeSlots as Json).claude, 1, "gross, whatever waits");
+    const need = await runCli(
+      ["--format", "json", "capacity", "--class", "automation", "--need", "1"],
+      podEnv(f, broker.url),
+      f.root,
+    );
+    assert.equal(need.code, 0, need.stdout);
+    const spawn = lastJson((await capacity(f, broker.url, ["--class", "spawn"])).stdout);
+    assert.equal((spawn.freeSlots as Json).claude, 0, "net of all 5 waiting");
+  } finally {
+    await broker.close();
+  }
+});
+
+test("7176ec40 pod row 5: a pod_starting re-drive does not count ITSELF — a copy of the target is not ahead", async () => {
+  const f = makeBox({});
+  writeRecord(f, "wake-r", CLAUDE);
+  const broker = await BROKER(ONE_FREE);
+  try {
+    // the target twice (two writers), first at the head: nothing is ahead of its first occurrence
+    writeWaitingFile(f, ["wake-r", ...fillers(2)], "atrium-a", 0);
+    writeWaitingFile(f, ["wake-r"], "atrium-b", 500);
+    const first = await wake(f, broker.url, "wake-r");
+    assert.equal(first.code, 0, `${first.stdout}\n${first.stderr}`);
+    const again = await wake(f, broker.url, "wake-r"); // the re-drive after pod_starting
+    assert.equal(again.code, 0, `${again.stdout}\n${again.stderr}`);
+    // one real item ahead and one slot: the later copy is NOT a second one ahead
+    writeWaitingFile(f, [...fillers(1), "wake-r", ...fillers(2, 50)], "atrium-a", 0);
+    writeWaitingFile(f, ["wake-r"], "atrium-b", 5_000);
+    const behind = await wake(f, broker.url, "wake-r");
+    assert.equal(behind.code, 75);
+    assert.equal((lastJson(behind.stdout).refusal as Json).queuedAhead, 1);
+  } finally {
+    await broker.close();
+  }
+});
+
+test("87.1 (pod) the line drains in order: the head takes the free slot, the next waits, then is admitted when a slot frees", async () => {
+  const f = makeBox({});
+  writeRecord(f, "wake-a", CLAUDE);
+  writeRecord(f, "wake-b", CLAUDE);
+  const one = await BROKER(ONE_FREE);
+  try {
+    writeWaitingFile(f, ["wake-a", "wake-b", ...fillers(3)]); // W = 5 ≥ free = 1
+    const head = await wake(f, one.url, "wake-a");
+    assert.equal(head.code, 0, `${head.stdout}\n${head.stderr}`);
+    const next = await wake(f, one.url, "wake-b");
+    assert.equal(next.code, 75, "one ahead and one slot: the next waits");
+    assert.equal((lastJson(next.stdout).refusal as Json).queuedAhead, 1);
+  } finally {
+    await one.close();
+  }
+  // the head is delivered (it left the line and now lives): the next is the head, and the slot is free again
+  writeWaitingFile(f, ["wake-b", ...fillers(3)]);
+  const freed = await BROKER(ONE_FREE);
+  try {
+    const run = await wake(f, freed.url, "wake-b");
+    assert.equal(run.code, 0, `${run.stdout}\n${run.stderr}`);
+  } finally {
+    await freed.close();
+  }
+});
+
 // ── the waiting line at create ──────────────────────────────────────────────────────────────────
 
 const newSession = async (f: Fixture, url: string) =>
