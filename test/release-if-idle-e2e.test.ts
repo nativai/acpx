@@ -109,7 +109,7 @@ async function withSession(run: (rig: Rig) => Promise<void>): Promise<void> {
     await fs.writeFile(
       stub,
       `#!/bin/sh\necho "$@" >> ${JSON.stringify(argvLog)}\nv=$(cat ${JSON.stringify(verdictFile)})\n` +
-        `[ "$v" = hang ] && exec sleep 30\ncase $v in 10) echo browser_open;; 11) echo call_in_flight;; 12) echo busy;; esac\nexit "$v"\n`,
+        `[ "$v" = hang ] && exec sleep 30\ncase $v in 2) echo 'unknown no_idle_loop';; 10) echo browser_open;; 11) echo call_in_flight;; 12) echo busy;; esac\nexit "$v"\n`,
       { mode: 0o755 },
     );
     await fs.mkdir(path.join(homeDir, ".acpx"), { recursive: true });
@@ -209,7 +209,13 @@ async function releaseOnceParked(
   const deadline = Date.now() + 30_000;
   for (;;) {
     const result = await release(rig, extra, extraEnv);
-    if (result.code === 0 || answer(result).reason !== "turn_running") {
+    const raw = answer(result).detail;
+    const detail = typeof raw === "string" ? raw : "";
+    if (
+      result.code === 0 ||
+      answer(result).reason !== "turn_running" ||
+      /^(background|closing):/.test(detail)
+    ) {
       return result;
     }
     assert.ok(Date.now() < deadline, `the owner never parked: ${result.stdout}`);
@@ -240,6 +246,10 @@ test("production shape: an idle owner is released on demand — reply first, own
     const mark = await readText(path.join(rig.runDir, "reclaim"));
     assert.match(mark, new RegExp(`^session=${rig.id}$`, "m"));
     assert.match(mark, /^held_target=sess-held-9$/m);
+    // The pod's rule ignores a symlink: the mark is a REGULAR file (temp + rename in the run dir).
+    const markStat = await fs.lstat(path.join(rig.runDir, "reclaim"));
+    assert.equal(markStat.isFile(), true, "a regular file");
+    assert.equal(markStat.isSymbolicLink(), false, "never a symlink");
     assert.match(mark, new RegExp(`^owner_pid=${ownerPid}$`, "m"));
     const log = await ownerLogOf(rig);
     const lines = log.split("\n").filter((line) => line.includes("queue owner RECLAIMED"));
@@ -362,6 +372,10 @@ test("COMMITTED NEGATIVE — a BUSY pod is not reclaimed: predicate exit 12 ⇒ 
   await withSession((rig) => pinnedRefusalRow(rig, "BUSY", "12", "pod_busy:busy"));
 });
 
+test("COMMITTED NEGATIVE — the predicate's own fail-closed answer (exit 2, `unknown no_idle_loop`) is pod_busy:unknown, owner untouched", async () => {
+  await withSession((rig) => pinnedRefusalRow(rig, "EXIT2", "2", "pod_busy:unknown"));
+});
+
 test("COMMITTED NEGATIVE — a predicate that answers anything else is NEVER idle: refused(pod_busy:unknown)", async () => {
   await withSession((rig) => pinnedRefusalRow(rig, "UNKNOWN", "1", "pod_busy:unknown"));
 });
@@ -419,6 +433,75 @@ test("the predicate is called with --check, the OWNER's pid and the asking call'
         .length,
       0,
     );
+  });
+});
+
+/** The prompt that makes the agent run `argv` itself, start a background task, and answer `say`. */
+function runThenSayWithBackgroundTask(say: string, bgTask: [number, string]): string {
+  const spec = { argv: ["true"], say, bgTask };
+  return `run-then-say ${Buffer.from(JSON.stringify(spec)).toString("base64url")}`;
+}
+
+test("COMMITTED NEGATIVE — a live BACKGROUND TASK is never killed by a release: refused(turn_running, detail background:), owner untouched, the session keeps working", async () => {
+  await withSession(async (rig) => {
+    const result = await prompt(rig, runThenSayWithBackgroundTask("BG-ANSWER", [120_000, "bg-1"]));
+    assert.equal(result.code, 0, result.stderr);
+    const ownerPid = await ownerPidOf(rig);
+
+    const refused = await releaseOnceParked(rig);
+    assert.equal(refused.code, 1, `${refused.stdout} ${refused.stderr}`);
+    assert.equal(answer(refused).released, false);
+    assert.equal(answer(refused).reason, "turn_running");
+    assert.match(JSON.stringify(answer(refused).detail), /^"background:/);
+    assert.equal(isProcessAlive(ownerPid), true, "the owner is untouched");
+    assert.equal(await exists(path.join(rig.runDir, "reclaim")), false);
+
+    const next = await prompt(rig, "echo STILL-SERVING");
+    assert.equal(next.code, 0, next.stderr);
+    assert.match(next.stdout, /STILL-SERVING/);
+  });
+});
+
+test("atrium's EXACT argv — `acpx --format json sessions release --if-idle --session-id <id> --held-target <id>`, no agent word — refuses and releases", async () => {
+  await withSession(async (rig) => {
+    assert.equal((await prompt(rig, "echo ATRIUM-ARGV-ROW")).code, 0);
+    const ownerPid = await ownerPidOf(rig);
+    const atrium = () =>
+      runCli(
+        [
+          "--format",
+          "json",
+          "sessions",
+          "release",
+          "--if-idle",
+          "--session-id",
+          rig.id,
+          "--held-target",
+          HELD,
+        ],
+        rig,
+      );
+    await setVerdict(rig, "10");
+    const deadline = Date.now() + 30_000;
+    let refused = await atrium();
+    while (
+      refused.code === 1 &&
+      answer(refused).reason === "turn_running" &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      refused = await atrium();
+    }
+    assert.equal(refused.code, 1, `${refused.stdout} ${refused.stderr}`);
+    assert.equal(answer(refused).action, "session_release");
+    assert.equal(answer(refused).reason, "pod_busy:browser_open");
+    assert.equal(isProcessAlive(ownerPid), true);
+
+    await setVerdict(rig, "0");
+    const released = await atrium();
+    assert.equal(released.code, 0, `${released.stdout} ${released.stderr}`);
+    assert.equal(answer(released).released, true);
+    await waitForOwnerGone(rig, ownerPid);
   });
 });
 

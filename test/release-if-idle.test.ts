@@ -87,7 +87,7 @@ test("gate: each refusal is idle in every respect but ONE (committed negatives)"
     {
       name: "a background task is live",
       input: { liveBackgroundTaskCount: 1 },
-      reason: "background",
+      reason: "turn_running",
     },
     {
       name: "an agent browser is open",
@@ -114,6 +114,9 @@ test("gate: each refusal is idle in every respect but ONE (committed negatives)"
     const verdict = decideReclaim(idleInput(input));
     assert.equal(verdict.ok, false, `${name} must refuse`);
     assert.equal(refusalOf(verdict), reason, name);
+    if (name === "a background task is live") {
+      assert.match(!verdict.ok ? verdict.detail : "", /^background:/);
+    }
     assert.ok(RELEASE_REFUSALS.includes(reason as (typeof RELEASE_REFUSALS)[number]));
   }
 });
@@ -420,6 +423,10 @@ test("reclaim mark: written whole and atomically with the session and the held t
     assert.match(text, /^session=sess-1$/m);
     assert.match(text, /^owner_pid=4242$/m);
     assert.match(text, /^held_target=sess-9$/m);
+    // The pod's rule `reclaimed` ignores a symlink and wants a regular file (its mtime >= the loop's start).
+    const stat = fs.lstatSync(reclaimMarkPath(rig.runDir));
+    assert.equal(stat.isFile(), true);
+    assert.equal(stat.isSymbolicLink(), false);
     assert.deepEqual(
       fs.readdirSync(rig.runDir).toSorted(),
       ["inflight", "reclaim"],
