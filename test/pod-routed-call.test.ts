@@ -955,12 +955,13 @@ test("owner-ensure: the bound with the pool at its maximum → agent_cap why=poo
   }
 });
 
-test("owner-ensure: broker `error <reason>` and `too_big` are named failures (exit 1), nothing sent", async () => {
+test("owner-ensure: broker `error <reason>` — a bad image (pull), a bad config/template, a failed start, an old contract — stays a named FINAL failure (exit 1, not_run), nothing sent (f8078700 N6 negative: only `too_big` became holdable)", async () => {
   for (const [line, reason] of [
     ["error unsupported_contract", "broker_unsupported_contract"],
     ["error template_rejected -- bad", "broker_template_rejected"],
     ["error start_failed", "broker_start_failed"],
-    ["refused reason=too_big live=1 cap=2", "broker_too_big"],
+    ["error image_pull_failed -- ErrImagePull", "broker_image_pull_failed"],
+    ["error invalid_config -- bad env", "broker_invalid_config"],
   ] as const) {
     const broker = await startFakeBroker({ default: { final: line } });
     try {
@@ -971,10 +972,54 @@ test("owner-ensure: broker `error <reason>` and `too_big` are named failures (ex
         error.stderrLine,
         `acpx: ROUTED outcome=not_run reason=${reason} call_id=${options.callId}`,
       );
+      assert.equal(error.outcome, "not_run");
       assert.equal(stub.calls().length, 0);
     } finally {
       await broker.close();
     }
+  }
+});
+
+test("owner-ensure: broker `refused reason=too_big` is HELD, never not_run — pod_starting phase=unfit, a long retry_after_s, exit 75, nothing sent (f8078700 C5 / N6)", async () => {
+  const broker = await startFakeBroker({
+    default: { final: "refused reason=too_big live=1 cap=2" },
+  });
+  try {
+    const stub = makeStub();
+    const refusal = await expectRefusal(runRoutedCall(ensureOptions(stub, broker.url)));
+    assert.equal(
+      refusal.stderrLine,
+      `acpx: REFUSED reason=pod_starting nothing_started=true protocol=1 retry_after_s=300 phase=unfit wake=${SESSION}`,
+    );
+    assert.equal(exitCodeForOutputErrorCode(normalizeOutputError(refusal).code), 75);
+    assert.equal(refusal.capacityRefusal.nothingStarted, true);
+    assert.equal(refusal.capacityRefusal.reason, "pod_starting");
+    assert.equal(refusal.capacityRefusal.retryAfterS, 300);
+    assert.equal(stub.calls().length, 0, "nothing sent to a pod that cannot be placed");
+  } finally {
+    await broker.close();
+  }
+});
+
+test("a utility pod that is too_big is held too — pod_starting phase=unfit WITHOUT `wake=` (no message waits for it), exit 75", async () => {
+  const broker = await startFakeBroker({
+    default: { final: "refused reason=too_big live=0 cap=2" },
+  });
+  try {
+    const stub = makeStub();
+    const refusal = await expectRefusal(
+      runRoutedCall(
+        oneShotOptions(stub, { lookup: ABSENT, broker: { origin: broker.url, wakeBoundMs: 500 } }),
+      ),
+    );
+    assert.equal(
+      refusal.stderrLine,
+      "acpx: REFUSED reason=pod_starting nothing_started=true protocol=1 retry_after_s=300 phase=unfit",
+    );
+    assert.equal(exitCodeForOutputErrorCode(normalizeOutputError(refusal).code), 75);
+    assert.equal(stub.calls().length, 0);
+  } finally {
+    await broker.close();
   }
 });
 
