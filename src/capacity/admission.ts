@@ -32,7 +32,7 @@ import {
   needMet,
   readCapacity,
 } from "./reading.js";
-import { readWaiting, type WaitingQueue } from "./waiting.js";
+import { readWaiting, type WaitingQueue, waitingAheadOf } from "./waiting.js";
 
 /**
  * The create gate (CONCEPTION f7587c86 §6.1 A2, AMENDMENT 2026-10-29): `sessions new`, `sessions
@@ -910,7 +910,8 @@ async function decideWakeUnderLock(
     agent: ctx.harness,
     sources,
     pending: reservations,
-    waiting: readWaiting(ctx.dir, now),
+    // A-87: a target IN the line counts only the items AHEAD of it (never itself) — the held-queue deadlock.
+    waiting: waitingAheadOf(readWaiting(ctx.dir, now), ctx.request.target.id),
     admissionClass: ctx.capacityClass,
     now,
   });
@@ -1198,7 +1199,8 @@ function podWakeRefusal(
  * (C2), not a pass: this gate does not fail open on the broker.
  */
 async function decideWakeInPodPlane(ctx: WakeContext): Promise<WakeDecision> {
-  const waiting = readWaiting(ctx.dir);
+  // A-87: a target IN the line counts only the items AHEAD of it (never itself) — the held-queue deadlock.
+  const waiting = waitingAheadOf(readWaiting(ctx.dir), ctx.request.target.id);
   const figures = await readAgentsFigures(ctx.env);
   if (!figures.ok) {
     await logWake(ctx, "refused", undefined, {

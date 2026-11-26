@@ -1247,3 +1247,24 @@ test("87.1 (on-box) the line drains in order: the head takes the one free slot, 
   const again = await admitWakeCli(f, a, ["--class", "delivery"]);
   assert.equal(again.json.decision, "already-reserved", "the head is admitted ONCE");
 });
+
+test("7176ec40 side effect: a queued target's refusal AND the decision log carry its AHEAD count; a stranger's carry the whole line", async () => {
+  const f = makeBox({ requestMib: 2700 }); // one slot, taken by the item ahead
+  const id = await makeTarget(f);
+  writeWaitingQueue(f, [...filler(1), id, ...filler(3, 100)]); // W = 5, position 2
+  const queued = await admitWakeCli(f, id, ["--class", "delivery"]);
+  assert.equal(queued.code, 75);
+  assert.equal(queued.json.refusal?.queuedAhead, 1, "refusal: k − 1");
+  assert.match(queued.json.refusal?.tokenLine ?? "", / queued_ahead=1 wake=/u);
+  const logDir = path.join(admission(f), "log");
+  const lastLog = (): { waiting?: number } => {
+    const file = fs.readdirSync(logDir).toSorted().at(-1) ?? "";
+    const lines = fs.readFileSync(path.join(logDir, file), "utf8").trim().split("\n");
+    return JSON.parse(lines.at(-1) ?? "{}") as { waiting?: number };
+  };
+  assert.equal(lastLog().waiting, 1, "decision log: the ahead count");
+  writeWaitingQueue(f, filler(5));
+  const stranger = await admitWakeCli(f, id, ["--class", "delivery"]);
+  assert.equal(stranger.json.refusal?.queuedAhead, 5, "a stranger: the whole line");
+  assert.equal(lastLog().waiting, 5);
+});
