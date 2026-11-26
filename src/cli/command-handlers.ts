@@ -188,6 +188,7 @@ import {
   type GlobalFlags,
   type SessionsCopyFlags,
   type SessionsExportFlags,
+  type SessionsReleaseFlags,
   type PromptFlags,
   type SessionsImportFlags,
   type SessionsHistoryFlags,
@@ -6308,6 +6309,56 @@ function recoverSummary(result: QueueOwnerRecoveryResult): string {
   return result.alive !== false
     ? `FAILED to kill ${target} (still alive)`
     : `${target} already gone; cleared stale lease`;
+}
+
+// brick 35d4e64b (acpx half of ef5934ba) — `sessions release --if-idle`. The owner decides AND exits in one
+// atomic step on its own loop (see `SessionQueueOwner.releaseIfIdle`); this only asks and reports. Exit 0 =
+// released; 1 = refused (a normal answer, printed on stdout like every verdict here), so a `&&` chain never
+// proceeds on a refusal and a caller that reads the JSON gets the reason.
+function requireReleaseFlags(flags: SessionsReleaseFlags): string {
+  if (flags.ifIdle !== true) {
+    throw new InvalidArgumentError(
+      "sessions release requires --if-idle: there is no unconditional release (use `sessions close` or `sessions recover`)",
+    );
+  }
+  if (!flags.heldTarget) {
+    throw new InvalidArgumentError(
+      "sessions release requires --held-target <id>: the session the held message is FOR, which is never released",
+    );
+  }
+  return flags.heldTarget;
+}
+
+export async function handleSessionsRelease(
+  explicitAgentName: string | undefined,
+  sessionName: string | undefined,
+  flags: SessionsReleaseFlags,
+  command: Command,
+  config: ResolvedAcpxConfig,
+): Promise<void> {
+  const heldTarget = requireReleaseFlags(flags);
+  const globalFlags = resolveGlobalFlags(command, config);
+  const agent = resolveAgentInvocation(explicitAgentName, globalFlags, config);
+  const selector = resolveSessionTargetSelector({ flags, command, positionalName: sessionName });
+  const record = await requireExplicitSessionRecord(selector, agent.agentName, config);
+  const { releaseSessionIfIdle, releaseOutcomePayload } = await loadSessionModule();
+
+  const { sessionId, outcome } = await releaseSessionIfIdle(record.acpxRecordId, {
+    heldTarget,
+    ...(process.env.ACPX_ROUTED_CALL_ID ? { callId: process.env.ACPX_ROUTED_CALL_ID } : {}),
+  });
+
+  const payload = releaseOutcomePayload(sessionId, outcome);
+  if (!emitJsonResult(globalFlags.format, payload)) {
+    process.stdout.write(
+      payload.released
+        ? `released ${sessionId}\n`
+        : `refused ${sessionId}: ${payload.reason ?? "unknown"}${payload.detail ? ` (${payload.detail})` : ""}\n`,
+    );
+  }
+  if (!payload.released) {
+    process.exitCode = EXIT_CODES.ERROR;
+  }
 }
 
 // Read-only owner-state probe so acpx-ui/heartbeat callers can consume the CLI

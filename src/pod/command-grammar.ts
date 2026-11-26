@@ -154,6 +154,7 @@ export const COMMAND_GRAMMAR: Readonly<Record<string, GrammarNode>> = {
   },
   "sessions reopen": { valueFlags: [] },
   "sessions recover": { valueFlags: [] },
+  "sessions release": { valueFlags: ["--held-target", "--session-id", "--session-url"] },
   "sessions owner-status": { valueFlags: ["--descendants-of"] },
   "sessions show": { valueFlags: ["--session-id", "--session-url"] },
   "sessions set-metadata": { valueFlags: ["--session", "--session-id", "--session-url", "-s"] },

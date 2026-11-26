@@ -213,6 +213,19 @@ export type QueueScheduleCloseRequest = {
   onlyIfActiveTurn?: boolean;
 };
 
+// brick 35d4e64b (acpx half of ef5934ba) — "end this owner NOW if, and only if, it is idle": decided and
+// done in ONE synchronous step on the owner's own loop, so a prompt racing it either starts a turn first
+// (the answer is `turn_running`) or finds the owner gone. `callId` is the asking call's `ACPX_ROUTED_CALL_ID`: the routed entry's in-flight mark for THAT call
+// (`call_id=` inside it) is the call that asks, not work in the pod.
+export type QueueReleaseIfIdleRequest = {
+  type: "release_if_idle";
+  requestId: string;
+  ownerGeneration?: number;
+  /** The session the held message is FOR — never released, and named in the owner's one loud log line. */
+  heldTarget?: string;
+  callId?: string;
+};
+
 export type QueueRequest =
   | QueueSubmitRequest
   | QueueSubmitPromptBatchRequest
@@ -225,7 +238,8 @@ export type QueueRequest =
   | QueueQueryActiveTurnRequest
   | QueueQueryBackgroundTasksRequest
   | QueueDrainDeliveriesRequest
-  | QueueScheduleCloseRequest;
+  | QueueScheduleCloseRequest
+  | QueueReleaseIfIdleRequest;
 
 export type QueueOwnerAcceptedMessage = {
   type: "accepted";
@@ -358,6 +372,33 @@ export type QueueOwnerScheduleCloseResultMessage = {
   activeTurn: boolean;
 };
 
+/** Why an on-demand release was refused; the owner is untouched in every case. */
+// The CLOSED set the verb answers (with `no_owner`, which only the CLI can say). `background` and `closing`
+// are NOT reasons of their own: a live background task or a close in progress is the session still
+// working, and says so in `detail`.
+export const RELEASE_REFUSALS = [
+  "turn_running",
+  "queued",
+  "pod_busy:browser_open",
+  "pod_busy:call_in_flight",
+  "pod_busy:unknown",
+  "unsupported",
+  "held_target_self",
+] as const;
+export type ReleaseRefusal = (typeof RELEASE_REFUSALS)[number];
+
+export type QueueOwnerReleaseIfIdleResultMessage = {
+  type: "release_if_idle_result";
+  requestId: string;
+  ownerGeneration?: number;
+  released: boolean;
+  /** Present exactly when `released` is false. */
+  reason?: ReleaseRefusal;
+  detail?: string;
+  /** Present when released: how long the owner had been idle. */
+  idleMs?: number;
+};
+
 export type QueueOwnerErrorMessage = {
   type: "error";
   requestId: string;
@@ -389,6 +430,7 @@ export type QueueOwnerMessage =
   | QueueOwnerBackgroundTasksResultMessage
   | QueueOwnerDrainResultMessage
   | QueueOwnerScheduleCloseResultMessage
+  | QueueOwnerReleaseIfIdleResultMessage
   | QueueOwnerErrorMessage;
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -670,6 +712,20 @@ function parsePositiveTimeout(value: unknown): number | undefined {
   return Math.round(value);
 }
 
+// The requests whose payload is only OPTIONAL flags (they parse to a request whatever they carry).
+function optionalFieldsRequestParser(
+  type: unknown,
+): ((request: Record<string, unknown>, context: QueueRequestContext) => QueueRequest) | undefined {
+  switch (type) {
+    case "schedule_close":
+      return parseScheduleCloseRequest;
+    case "release_if_idle":
+      return parseReleaseIfIdleRequest;
+    default:
+      return undefined;
+  }
+}
+
 function parseTypedQueueRequest(
   request: Record<string, unknown>,
   context: QueueRequestContext,
@@ -677,6 +733,10 @@ function parseTypedQueueRequest(
   const submit = parseSubmitFamilyRequest(request, context);
   if (submit !== undefined) {
     return submit;
+  }
+  const optional = optionalFieldsRequestParser(request.type);
+  if (optional) {
+    return optional(request, context);
   }
   switch (request.type) {
     case "drain_deliveries":
@@ -689,8 +749,6 @@ function parseTypedQueueRequest(
       return parseSetConfigOptionRequest(request, context);
     case "set_depth":
       return parseSetDepthRequest(request, context);
-    case "schedule_close":
-      return parseScheduleCloseRequest(request, context);
     default:
       return parsePayloadlessQueueRequest(request.type, context);
   }
@@ -1011,6 +1069,30 @@ function parseScheduleCloseRequest(
   };
 }
 
+const MAX_HELD_TARGET_LENGTH = 200;
+const CALL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+function parseReleaseIfIdleRequest(
+  request: Record<string, unknown>,
+  context: QueueRequestContext,
+): QueueReleaseIfIdleRequest {
+  const heldTarget =
+    typeof request.heldTarget === "string" && request.heldTarget.trim().length > 0
+      ? request.heldTarget.trim().slice(0, MAX_HELD_TARGET_LENGTH)
+      : undefined;
+  const callId =
+    typeof request.callId === "string" && CALL_ID_PATTERN.test(request.callId)
+      ? request.callId
+      : undefined;
+  return {
+    type: "release_if_idle",
+    requestId: context.requestId,
+    ownerGeneration: context.ownerGeneration,
+    ...(heldTarget ? { heldTarget } : {}),
+    ...(callId ? { callId } : {}),
+  };
+}
+
 function parseSetConfigOptionRequest(
   request: Record<string, unknown>,
   context: QueueRequestContext,
@@ -1154,6 +1236,7 @@ const QUEUE_OWNER_MESSAGE_PARSERS: Record<string, QueueOwnerMessageParser> = {
   set_depth_result: parseSetDepthResultOwnerMessage,
   drain_deliveries_result: parseDrainResultOwnerMessage,
   schedule_close_result: parseScheduleCloseResultOwnerMessage,
+  release_if_idle_result: parseReleaseIfIdleResultOwnerMessage,
   error: parseErrorOwnerMessage,
 };
 
@@ -1175,6 +1258,38 @@ function parseScheduleCloseResultOwnerMessage(
     ...context,
     scheduled: message.scheduled,
     activeTurn: message.activeTurn,
+  };
+}
+
+function parseReleaseIfIdleResultOwnerMessage(
+  message: Record<string, unknown>,
+  context: QueueOwnerMessageContext,
+): QueueOwnerReleaseIfIdleResultMessage | null {
+  if (typeof message.released !== "boolean") {
+    return null;
+  }
+  if (message.released) {
+    return {
+      type: "release_if_idle_result",
+      ...context,
+      released: true,
+      ...(typeof message.idleMs === "number" && Number.isFinite(message.idleMs)
+        ? { idleMs: message.idleMs }
+        : {}),
+    };
+  }
+  const reason = (RELEASE_REFUSALS as readonly unknown[]).includes(message.reason)
+    ? (message.reason as ReleaseRefusal)
+    : undefined;
+  if (!reason) {
+    return null;
+  }
+  return {
+    type: "release_if_idle_result",
+    ...context,
+    released: false,
+    reason,
+    ...(typeof message.detail === "string" ? { detail: message.detail } : {}),
   };
 }
 

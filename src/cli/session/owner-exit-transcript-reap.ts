@@ -36,10 +36,17 @@ import { queueOwnerLogPath } from "./queue-owner-process.js";
 // the deferred self-close) reaps too, with the CLOSE's parameters (quiet window, budget,
 // `reduced_by`, trigger): it IS the session's close, so it removes what the non-self close's last
 // step would — proven from inside, like an idle exit, because no closer outside survives to prove it.
-export type OwnerExitKind = "idle-release" | "turn-boundary-recycle" | "session-close" | "other";
+// brick 35d4e64b: `reclaim` is an on-demand release (a held message needs this pod's place). Like
+// `idle-release`, nobody waits on it, so it reaps the transcript copies the same way.
+export type OwnerExitKind =
+  | "idle-release"
+  | "reclaim"
+  | "turn-boundary-recycle"
+  | "session-close"
+  | "other";
 
 export function ownerExitReapsTranscripts(kind: OwnerExitKind): boolean {
-  return kind === "idle-release" || kind === "session-close";
+  return kind === "idle-release" || kind === "reclaim" || kind === "session-close";
 }
 
 /** Wait this long for the owner's process group to empty on its own, then SIGKILL the rest. */

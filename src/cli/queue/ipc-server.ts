@@ -48,8 +48,11 @@ import {
   type QueueOwnerDrainResultMessage,
   type QueueOwnerErrorMessage,
   type QueueOwnerMessage,
+  type QueueOwnerReleaseIfIdleResultMessage,
   type QueueOwnerScheduleCloseResultMessage,
+  type QueueReleaseIfIdleRequest,
   type QueueRequest,
+  type ReleaseRefusal,
 } from "./messages.js";
 import { noteSessionCloseDrain } from "./session-close-intent.js";
 
@@ -444,12 +447,51 @@ export type QueueOwnerControlHandlers = {
   queryActiveTurn: () => boolean;
   /** brick ad6ba1c2 (Contract C4): the live background tasks, read-only. Optional: test owners omit it. */
   queryBackgroundTasks?: () => BackgroundTaskAnswer;
+  /**
+   * brick 35d4e64b — the runtime's half of the on-demand release: its turn state, the pod's marks, and (only
+   * on `ok`) the reclaim mark. SYNCHRONOUS by contract — the owner commits in the same step, so nothing may
+   * start a turn between the check and the commit. Optional: test owners omit it (⇒ `unsupported`).
+   */
+  reclaimGate?: (params: {
+    queued: boolean;
+    heldTarget?: string;
+    callId?: string;
+  }) => ReleaseGateAnswer;
 };
+
+export type ReleaseGateAnswer =
+  | { ok: true; idleMs: number }
+  | { ok: false; reason: ReleaseRefusal; detail: string };
+
+/** The owner's refusal of a submission once it is committed to an on-demand release: RETRYABLE, and worded
+ * so acpx-ui re-drives it (never "session is closed" / "read-only" / "template": it would fail the message). */
+export const QUEUE_OWNER_RECLAIMING_DETAIL_CODE = "QUEUE_OWNER_RECLAIMING";
+export const QUEUE_OWNER_RECLAIMING_MESSAGE =
+  "Queue owner is being released to make room for another session; retry shortly — the next message starts this session again.";
 
 type SessionQueueOwnerOptions = {
   maxQueueDepth: number;
   onQueueDepthChanged?: (queueDepth: number) => void;
 };
+
+function optionalReleaseFields(request: QueueReleaseIfIdleRequest): {
+  heldTarget?: string;
+  callId?: string;
+} {
+  return {
+    ...(request.heldTarget ? { heldTarget: request.heldTarget } : {}),
+    ...(request.callId ? { callId: request.callId } : {}),
+  };
+}
+
+function releaseResult(
+  request: QueueReleaseIfIdleRequest,
+  body:
+    | { released: true; idleMs: number }
+    | { released: false; reason: ReleaseRefusal; detail: string },
+): QueueOwnerReleaseIfIdleResultMessage {
+  return { type: "release_if_idle_result", requestId: request.requestId, ...body };
+}
 
 export class SessionQueueOwner {
   private readonly server: net.Server;
@@ -491,6 +533,9 @@ export class SessionQueueOwner {
   private drainCause: OwnerExitCause = "owner-exit";
   // brick 9d34a178 — set by `schedule_close`, taken by the runtime at the turn boundary.
   private deferredClose?: DeferredCloseRequest;
+  // brick 35d4e64b — set, once and for good, by an accepted `release_if_idle`: from that instant no work is
+  // handed out and every submission is refused RETRYABLY, so the exit that follows can lose no prompt.
+  private reclaiming = false;
 
   private constructor(
     server: net.Server,
@@ -713,6 +758,63 @@ export class SessionQueueOwner {
 
   hasDeferredClose(): boolean {
     return this.deferredClose !== undefined;
+  }
+
+  /** brick 35d4e64b — an on-demand release was accepted: the runtime's loop must exit as `reclaim`. */
+  isReclaiming(): boolean {
+    return this.reclaiming;
+  }
+
+  /**
+   * brick 35d4e64b — THE ATOMIC STEP. Everything from the first read to `this.reclaiming = true` is
+   * synchronous: this runs on the owner's own event loop, where a prompt's `enqueuePromptRequest` and the
+   * runtime's `nextBatch` also run, so no turn can start between the check and the commit.
+   * A refusal changes NOTHING (no flag, no wake, no mark: the runtime's gate writes the reclaim mark only
+   * once it has said `ok`). The parked loop is woken by the caller AFTER the reply is written.
+   */
+  releaseIfIdle(request: QueueReleaseIfIdleRequest): QueueOwnerReleaseIfIdleResultMessage {
+    if (this.reclaiming) {
+      return releaseResult(request, { released: true, idleMs: 0 });
+    }
+    if (this.isClosingForRelease()) {
+      return releaseResult(request, {
+        released: false,
+        reason: "turn_running",
+        detail: "closing: the owner is closing (a close is on, or pending)",
+      });
+    }
+    const gate = this.controlHandlers.reclaimGate;
+    if (!gate) {
+      return releaseResult(request, {
+        released: false,
+        reason: "unsupported",
+        detail: "no reclaim gate",
+      });
+    }
+    const answer = gate({
+      queued: this.pending.length > 0,
+      ...optionalReleaseFields(request),
+    });
+    if (!answer.ok) {
+      return releaseResult(request, {
+        released: false,
+        reason: answer.reason,
+        detail: answer.detail,
+      });
+    }
+    this.reclaiming = true;
+    return releaseResult(request, { released: true, idleMs: answer.idleMs });
+  }
+
+  private isClosingForRelease(): boolean {
+    return this.closed || this.draining || this.closePending || this.deferredClose !== undefined;
+  }
+
+  /** brick 35d4e64b — wake the parked loop so it reaches its exit; called after the reply is written. */
+  wakeForReclaim(): void {
+    for (const waiter of this.waiters.splice(0)) {
+      waiter(undefined);
+    }
   }
 
   // 1. Quiesce, before any await. From this instant `submit_prompt` is rejected, so nothing can arrive
@@ -1009,7 +1111,8 @@ export class SessionQueueOwner {
     // parked waiter is woken with the oldest held item (`abortClosePending`).
     // brick 9d34a178: nor while a deferred close waits — the runtime must reach its turn-boundary
     // check instead, so a queued prompt can never start between that turn's end and the close.
-    if (this.deferredClose) {
+    // brick 35d4e64b: nor once an on-demand release is committed — the loop must reach its exit.
+    if (this.deferredClose || this.reclaiming) {
       return undefined;
     }
     if (!this.draining && !this.closePending && this.pending.length > 0) {
@@ -1157,6 +1260,8 @@ export class SessionQueueOwner {
     socket: net.Socket;
     requestId: string;
     run: () => Promise<TMessage>;
+    /** Runs once the reply has been written (not on an error). */
+    afterReply?: (message: TMessage) => void;
   }): void {
     writeQueueMessage(options.socket, {
       type: "accepted",
@@ -1171,6 +1276,7 @@ export class SessionQueueOwner {
           ...message,
           ownerGeneration: this.ownerGeneration,
         });
+        options.afterReply?.(message);
       })
       .catch((error) => {
         writeQueueMessage(options.socket, {
@@ -1264,6 +1370,20 @@ export class SessionQueueOwner {
           requestId: request.requestId,
           closed: await this.controlHandlers.closeSession(request.timeoutMs),
         }),
+      });
+      return true;
+    }
+    if (request.type === "release_if_idle") {
+      this.handleControlRequest<QueueOwnerReleaseIfIdleResultMessage>({
+        socket,
+        requestId: request.requestId,
+        run: async () => this.releaseIfIdle(request),
+        // The reply is on the wire before the loop is woken: the exit that follows must not beat it.
+        afterReply: (message) => {
+          if (message.released) {
+            setImmediate(() => this.wakeForReclaim());
+          }
+        },
       });
       return true;
     }
@@ -1422,6 +1542,18 @@ export class SessionQueueOwner {
         request.requestId,
         QUEUE_OWNER_CLOSE_PENDING_MESSAGE,
         QUEUE_OWNER_CLOSE_PENDING_DETAIL_CODE,
+        true,
+      );
+      return;
+    }
+    // brick 35d4e64b: committed to an on-demand release. Rejected BEFORE `accepted` like every refusal here, and
+    // RETRYABLE: the retry meets the cold start the release leaves behind.
+    if (this.reclaiming) {
+      this.failRequest(
+        socket,
+        request.requestId,
+        QUEUE_OWNER_RECLAIMING_MESSAGE,
+        QUEUE_OWNER_RECLAIMING_DETAIL_CODE,
         true,
       );
       return;

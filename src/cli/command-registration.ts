@@ -24,6 +24,7 @@ import {
   handleSessionsOwnerStatus,
   handleSessionsPrune,
   handleSessionsRecover,
+  handleSessionsRelease,
   handleSessionsReopen,
   handleSessionsReindex,
   handleSessionsRepairAccountSeam,
@@ -69,6 +70,7 @@ import {
   type SessionsCloseFlags,
   type SessionsCopyFlags,
   type SessionsExportFlags,
+  type SessionsReleaseFlags,
   type SessionsHistoryFlags,
   type SessionsImportFlags,
   type SessionsListFlags,
@@ -757,6 +759,30 @@ Closing your OWN session (run from inside it, e.g. --seat "$ACPX_SEAT_URL"):
     .action(async function (this: Command, id: string) {
       await handleSessionsRecover(explicitAgentName, id, this, config);
     });
+
+  // brick 35d4e64b (acpx half of ef5934ba) — the on-demand idle release. NOT `recover` (which SIGKILLs a
+  // wedged owner) and NOT `close` (which ends the session): this ends an IDLE owner, asked for by the
+  // box's admission path to make room, and leaves the record open for the next message to restart it.
+  const releaseCommand = sessionsCommand
+    .command("release")
+    .description(
+      "End a session's queue owner NOW, only if it is idle: no turn running, nothing queued, no background task, and — in a pod — no agent browser open and no command in flight. The owner decides and exits in one step on its own loop, or refuses and stays untouched. Prints ONE `session_release` line (use --format json); decide on its `released` — a non-zero exit WITHOUT that line is an error, not a refusal. `reason` is one of: turn_running, queued, pod_busy:browser_open, pod_busy:call_in_flight, pod_busy:unknown, no_owner, unsupported, held_target_self. The record stays open; the next message starts the session again. Exit 0 = released, 1 = refused, 2 = usage. --if-idle and --held-target are required: there is no unconditional form.",
+    )
+    .argument("[name]", "REFUSED — sessions are addressed by --session-id", parseSessionName)
+    .option("--if-idle", "Release only if the owner is idle (required)")
+    .option(
+      "--held-target <id>",
+      "The session the held message is FOR (required): never released, and named in the owner's one log line",
+      (value: string) => parseNonEmptyValue("Held target", value),
+    );
+  addSessionIdentityOptions(releaseCommand);
+  releaseCommand.action(async function (
+    this: Command,
+    name: string | undefined,
+    flags: SessionsReleaseFlags,
+  ) {
+    await handleSessionsRelease(explicitAgentName, name, flags, this, config);
+  });
 
   sessionsCommand
     .command("owner-status")

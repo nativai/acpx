@@ -51,7 +51,10 @@ import {
   type QueueOwnerSetModeResultMessage,
   type QueueQueryActiveTurnRequest,
   type QueueQueryBackgroundTasksRequest,
+  type QueueOwnerReleaseIfIdleResultMessage,
   type QueueOwnerScheduleCloseResultMessage,
+  type QueueReleaseIfIdleRequest,
+  type ReleaseRefusal,
   type QueueRequest,
   type QueueScheduleCloseRequest,
   type QueueSetConfigOptionRequest,
@@ -1422,6 +1425,86 @@ function scheduleCloseErrorDetail(error: unknown): string {
     return error.detailCode ?? error.message;
   }
   return error instanceof Error ? error.message : String(error);
+}
+
+/** brick 35d4e64b — what asking the live owner to release itself NOW (if idle) produced. */
+export type ReleaseIfIdleOutcome =
+  /** The owner committed: it exits as `reclaim`; the session's record stays and its next message restarts it. */
+  | { kind: "released"; ownerPid: number; idleMs?: number }
+  /** The owner refused and is UNTOUCHED. */
+  | { kind: "refused"; ownerPid: number; reason: ReleaseRefusal; detail?: string }
+  /** No owner to ask (no lease, or its socket did not answer): nothing to release. */
+  | { kind: "no-owner" }
+  /** The owner answered but cannot do this — above all an owner still running an older acpx. */
+  | { kind: "unsupported"; detail: string };
+
+const RELEASE_IF_IDLE_DEADLINE_MS = 5_000;
+
+/**
+ * brick 35d4e64b — `release_if_idle` on the session's live owner. NEVER throws. Control path only, like
+ * `schedule_close`: never through `trySubmitToRunningOwner`, whose protocol-mismatch recovery terminates
+ * an owner that answers unexpectedly — an OLD owner answering this verb is `unsupported`, never killed.
+ */
+export async function tryReleaseIfIdleOnRunningOwner(
+  sessionId: string,
+  options: { heldTarget?: string; callId?: string },
+): Promise<ReleaseIfIdleOutcome> {
+  const owner = await readQueueOwnerRecord(sessionId).catch(() => undefined);
+  if (!owner) {
+    return { kind: "no-owner" };
+  }
+  try {
+    return await submitReleaseIfIdleToQueueOwner(owner, options);
+  } catch (error) {
+    return { kind: "unsupported", detail: scheduleCloseErrorDetail(error) };
+  }
+}
+
+async function submitReleaseIfIdleToQueueOwner(
+  owner: QueueOwnerRecord,
+  options: { heldTarget?: string; callId?: string },
+): Promise<ReleaseIfIdleOutcome> {
+  const request: QueueReleaseIfIdleRequest = {
+    type: "release_if_idle",
+    requestId: randomUUID(),
+    ownerGeneration: owner.ownerGeneration,
+    ...(options.heldTarget ? { heldTarget: options.heldTarget } : {}),
+    ...(options.callId ? { callId: options.callId } : {}),
+  };
+  const response = await submitControlToQueueOwner(
+    owner,
+    request,
+    (message): message is QueueOwnerReleaseIfIdleResultMessage =>
+      message.type === "release_if_idle_result",
+    RELEASE_IF_IDLE_DEADLINE_MS,
+  );
+  if (!response) {
+    return { kind: "no-owner" };
+  }
+  return releaseOutcomeFromResponse(owner, request, response);
+}
+
+function releaseOutcomeFromResponse(
+  owner: QueueOwnerRecord,
+  request: QueueReleaseIfIdleRequest,
+  response: QueueOwnerReleaseIfIdleResultMessage,
+): ReleaseIfIdleOutcome {
+  if (response.requestId !== request.requestId) {
+    return { kind: "unsupported", detail: "mismatched release_if_idle response" };
+  }
+  if (response.released) {
+    return {
+      kind: "released",
+      ownerPid: owner.pid,
+      ...(response.idleMs !== undefined ? { idleMs: response.idleMs } : {}),
+    };
+  }
+  return {
+    kind: "refused",
+    ownerPid: owner.pid,
+    reason: response.reason ?? "unsupported",
+    ...(response.detail !== undefined ? { detail: response.detail } : {}),
+  };
 }
 
 /** brick ad6ba1c2 (Contract C4) — one hard deadline over connect AND answer. */

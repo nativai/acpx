@@ -218,6 +218,12 @@ export type SessionsExportFlags = SessionSelectorFlags & {
   output: string;
 };
 
+// brick 35d4e64b — `sessions release --if-idle`.
+export type SessionsReleaseFlags = SessionSelectorFlags & {
+  ifIdle?: boolean;
+  heldTarget?: string;
+};
+
 export type SessionsImportFlags = {
   destinationCwd?: string;
   /** `--record-id <uuid>` (C6.2): the imported record's id, chosen by the caller. */

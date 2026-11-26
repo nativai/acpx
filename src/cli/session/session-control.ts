@@ -69,7 +69,9 @@ import {
   tryCancelOnRunningOwner,
   tryCloseSessionOnRunningOwner,
   tryQueryActiveTurnOnRunningOwner,
+  tryReleaseIfIdleOnRunningOwner,
   tryScheduleCloseOnRunningOwner,
+  type ReleaseIfIdleOutcome,
   type ScheduleCloseOutcome,
   trySetConfigOptionOnRunningOwner,
   trySetDepthOnRunningOwner,
@@ -1813,6 +1815,80 @@ function classifySessionOwnerStatus(
     return state.state;
   }
   return "healthy";
+}
+
+/**
+ * brick 35d4e64b (acpx half of ef5934ba) — end this session's queue owner NOW if, and only if, it is idle
+ * (no turn, nothing queued, no background task, the pod's marks clear). The owner decides and exits in one
+ * step on its own loop; this function only asks. The record is untouched: the session's next message starts
+ * a fresh owner from it. In a pod the routed entry's own in-flight mark for THIS call must not count as
+ * work, so the call's `ACPX_ROUTED_CALL_ID` travels with the request.
+ *
+ * `heldTarget` is the session the held message is FOR. It is never released: asked for itself, the answer
+ * is `held_target_self` and the owner is not even contacted.
+ */
+export async function releaseSessionIfIdle(
+  sessionId: string,
+  options: { heldTarget: string; callId?: string },
+): Promise<{ sessionId: string; outcome: ReleaseIfIdleOutcome }> {
+  const record = await resolveSessionRecord(sessionId);
+  if (options.heldTarget === record.acpxRecordId || options.heldTarget === record.acpSessionId) {
+    return {
+      sessionId: record.acpxRecordId,
+      outcome: {
+        kind: "refused",
+        ownerPid: 0,
+        reason: "held_target_self",
+        detail: "the held message is for this very session",
+      },
+    };
+  }
+  const outcome = await tryReleaseIfIdleOnRunningOwner(record.acpxRecordId, {
+    heldTarget: options.heldTarget,
+    ...(options.callId ? { callId: options.callId } : {}),
+  });
+  return { sessionId: record.acpxRecordId, outcome };
+}
+
+/**
+ * The ONE JSON line `sessions release` prints — the contract: a caller decides on `released` from THIS
+ * line; a non-zero exit WITHOUT it is an error, not a refusal. The closed set of `reason`s:
+ * turn_running · queued · pod_busy:browser_open · pod_busy:call_in_flight · pod_busy:unknown · no_owner ·
+ * unsupported · held_target_self.
+ */
+export type ReleaseVerbPayload = {
+  action: "session_release";
+  sessionId: string;
+  released: boolean;
+  reason?: string;
+  detail?: string;
+  idleMs?: number;
+};
+
+export function releaseOutcomePayload(
+  sessionId: string,
+  outcome: ReleaseIfIdleOutcome,
+): ReleaseVerbPayload {
+  const base = { action: "session_release", sessionId } as const;
+  if (outcome.kind === "released") {
+    return {
+      ...base,
+      released: true,
+      ...(outcome.idleMs !== undefined ? { idleMs: outcome.idleMs } : {}),
+    };
+  }
+  if (outcome.kind === "refused") {
+    return {
+      ...base,
+      released: false,
+      reason: outcome.reason,
+      ...(outcome.detail ? { detail: outcome.detail } : {}),
+    };
+  }
+  if (outcome.kind === "no-owner") {
+    return { ...base, released: false, reason: "no_owner" };
+  }
+  return { ...base, released: false, reason: "unsupported", detail: outcome.detail };
 }
 
 // Force-restart (un-wedge) a session's queue owner. Resolves the caller-supplied

@@ -12,6 +12,12 @@ import { checkpointPerfMetricsCapture } from "../../perf-metrics-capture.js";
 import { incrementPerfCounter, setPerfGauge } from "../../perf-metrics.js";
 import { assertOwnerEntryInOwnPod } from "../../pod/owner-pod.js";
 import {
+  clearReclaimMark,
+  podMarksConfigFromEnv,
+  readPodIdleMarks,
+  writeReclaimMark,
+} from "../../pod/reclaim-marks.js";
+import {
   createPodReleaseStalenessProbe,
   inAgentPod,
   type PodReleaseDetail,
@@ -57,6 +63,7 @@ import type {
 } from "../../types.js";
 import { wasAnotherCopyCancelled } from "../queue/accepted-message-ids.js";
 import { canJoinBatch, type DeferredCloseRequest } from "../queue/ipc-server.js";
+import type { ReleaseGateAnswer } from "../queue/ipc-server.js";
 import {
   appendDeliveryStreamEvent,
   appendDeliveryStreamEventSync,
@@ -117,6 +124,7 @@ import {
   readQueueOwnerStartupFailureDetail,
   spawnQueueOwnerProcess,
 } from "./queue-owner-process.js";
+import { decideReclaim, formatOwnerReclaimLine } from "./reclaim-gate.js";
 import {
   cancelledDeferredCopyResult,
   runQueuedTask,
@@ -1314,6 +1322,13 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   // WHEN an already-idle owner is released; WHETHER an active owner is protected is
   // the hasActiveTurn()+quiescence gate (see decideIdleOwnerRelease).
   let lastTaskCompletedAt = Date.now();
+  // brick 35d4e64b — true ONLY while the loop is parked in `owner.nextBatch` waiting for work: the one state
+  // in which no turn is starting, running or finishing, which is what an on-demand release needs to see
+  // (`hasActiveTurn()` alone misses the gap between a handed-out batch and its turn's start). Set and
+  // cleared synchronously around the await, so a request handled on this event loop reads it exactly.
+  let loopParked = false;
+  // What the accepted release recorded for the exit's one loud log line.
+  let reclaimRequest: { at: number; idleMs: number; heldTarget: string | undefined } | undefined;
   // brick://3356183e: `let`, because a switch decided before a turn replaces it
   // (replaceSharedClient below). Every closure here reads the binding, never a copy.
   // brick 6e27669f — the owner's CURRENT options and the settings its client is bound to, both
@@ -1506,6 +1521,51 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           ...backgroundTasks.list(),
           monitorCommands: backgroundTasks.monitorCommands(),
         }),
+        // brick 35d4e64b — SYNCHRONOUS (see QueueOwnerControlHandlers.reclaimGate): the checks, the pod's
+        // marks and the reclaim mark are one step, and the owner commits in the same turn of the event loop.
+        reclaimGate: (params): ReleaseGateAnswer => {
+          const now = Date.now();
+          // The held message's own target is never released (HoD condition 1) — checked here too, on the
+          // owner's own id, so a caller that skipped the CLI's check cannot end the very session it serves.
+          if (params.heldTarget !== undefined && params.heldTarget === options.sessionId) {
+            return {
+              ok: false,
+              reason: "held_target_self",
+              detail: "the held message is for this very session",
+            };
+          }
+          const marksConfig = podMarksConfigFromEnv(process.env, params.callId);
+          const verdict = decideReclaim({
+            loopParked,
+            hasActiveTurn: turnController.hasActiveTurn() || owner?.isClosePending() === true,
+            queued: params.queued,
+            quiescent: now - lastIdleDrainActivityAt >= IDLE_CHECK_CADENCE_MS,
+            liveBackgroundTaskCount: backgroundTasks.liveCount(),
+            podMarks: () => readPodIdleMarks(marksConfig),
+          });
+          if (!verdict.ok) {
+            return verdict;
+          }
+          const idleMs = now - Math.max(lastTaskCompletedAt, lastIdleDrainActivityAt);
+          try {
+            writeReclaimMark(marksConfig.runDir, {
+              sessionId: options.sessionId,
+              at: now,
+              ownerPid: process.pid,
+              heldTarget: params.heldTarget,
+            });
+          } catch (error) {
+            // The mark is how the pod learns this exit is a reclaim: without it the owner would go and
+            // the slot not be freed. Refuse, owner untouched.
+            return {
+              ok: false,
+              reason: "pod_busy:unknown",
+              detail: `the reclaim mark cannot be written: ${formatErrorMessage(error)}`,
+            };
+          }
+          reclaimRequest = { at: now, idleMs, heldTarget: params.heldTarget };
+          return { ok: true, idleMs };
+        },
       },
       {
         maxQueueDepth,
@@ -1523,6 +1583,9 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       verbose: options.verbose,
     });
     await heartbeat.beat(owner.queueDepth());
+    // brick 35d4e64b: a reclaim mark an earlier owner of this pod left means nothing for THIS owner (the pod
+    // did not end, so the release was moot); the idle loop's rule needs the owner gone, and this one is not.
+    clearReclaimMark(podMarksConfigFromEnv(process.env, undefined).runDir);
     socketContinuityTimer = setInterval(
       scheduleSocketContinuityCheck,
       QUEUE_OWNER_SOCKET_CONTINUITY_INTERVAL_MS,
@@ -1779,7 +1842,27 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       // So: poll on a short cadence, hand the gate the ORIGINAL window. Never
       // collapse these back into one variable.
       const { pollTimeoutMs, quiescenceWindowMs: gateWindowMs } = idleCheckTimings(idleWindowMs);
+      loopParked = true;
       let batch = await owner.nextBatch(pollTimeoutMs);
+      loopParked = false;
+      // brick 35d4e64b — an accepted on-demand release: the owner is committed (no work is handed out, every
+      // submission is refused retryably). One loud line, then the graceful exit the idle release uses.
+      if (!batch && owner.isReclaiming()) {
+        const request = reclaimRequest;
+        process.stderr.write(
+          formatOwnerReclaimLine({
+            sessionId: options.sessionId,
+            at: request?.at ?? Date.now(),
+            idleMs: request?.idleMs ?? 0,
+            heldTarget: request?.heldTarget,
+          }),
+        );
+        incrementPerfCounter("queue.owner.reclaimed");
+        checkpointPerfMetricsCapture();
+        ownerExitReason = "reclaim";
+        ownerExitKind = "reclaim";
+        break;
+      }
       // brick 9d34a178 — a deferred close requested while no turn ran (or that waited out a turn
       // the boundary check below never saw) is performed here, before any release decision.
       if (!batch && (await performDeferredClose(deferredCloseParams))) {

@@ -219,6 +219,12 @@ export const COMMAND_TABLE: Readonly<Record<string, CommandEntry>> = {
     reason: "recover (C1.2 example)",
     target: BY_OPERAND,
   },
+  "sessions release": {
+    class: "owner-if-pod",
+    reason:
+      "ends the live owner on demand when it is idle; never starts one (brick 35d4e64b). The owner's socket is pod-local, so in pod mode it runs IN the session's pod",
+    target: BY_FLAGS,
+  },
   "sessions owner-status": {
     class: "owner-if-pod",
     reason: "the owner's state; a pid in another pod is not checkable locally (C3.3)",
