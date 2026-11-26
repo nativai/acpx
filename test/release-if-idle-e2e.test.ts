@@ -548,7 +548,8 @@ test("the verb has NO unconditional form: without --if-idle, or without --held-t
     assert.match(noIdle.stderr, /requires --if-idle/);
     const noTarget = await release(rig, []);
     assert.equal(noTarget.code, 2);
-    assert.match(noTarget.stderr, /requires --held-target/);
+    // With --format json a usage error is reported as the JSON error document, on stdout.
+    assert.match(`${noTarget.stdout}${noTarget.stderr}`, /requires --held-target/);
     assert.equal(
       noTarget.stdout.includes("session_release"),
       false,

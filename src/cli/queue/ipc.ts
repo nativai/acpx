@@ -1438,7 +1438,9 @@ export type ReleaseIfIdleOutcome =
   /** The owner answered but cannot do this — above all an owner still running an older acpx. */
   | { kind: "unsupported"; detail: string };
 
-const RELEASE_IF_IDLE_DEADLINE_MS = 5_000;
+// ⚠️ Must stay ABOVE the owner's own idle-predicate bound (IDLE_PREDICATE_TIMEOUT_MS, 5 s, which it holds its
+// loop for): a client that gives up at the same instant reads a slow-but-answered refusal as `unsupported`.
+const RELEASE_IF_IDLE_DEADLINE_MS = 15_000;
 
 /**
  * brick 35d4e64b — `release_if_idle` on the session's live owner. NEVER throws. Control path only, like

@@ -324,6 +324,15 @@ const OWN_ID_INVOCATIONS: Readonly<Record<string, string[]>> = {
   "sessions close": ["sessions", "close", "--session-id", POD_SESSION],
   "sessions recover": ["sessions", "recover", POD_SESSION],
   "sessions owner-status": ["sessions", "owner-status", POD_SESSION],
+  "sessions release": [
+    "sessions",
+    "release",
+    "--if-idle",
+    "--session-id",
+    POD_SESSION,
+    "--held-target",
+    "held-target-elsewhere",
+  ],
   // one-shot: the forms that answer from records and start no adapter
   "output-styles": ["output-styles", "--session-id", POD_SESSION],
   sessions: ["sessions", "--local"],
@@ -412,6 +421,7 @@ const OWN_ID_OUTCOMES: Readonly<Record<string, OwnIdOutcome>> = {
   "sessions close": { status: 0, reached: POD_ID, writes: true },
   "sessions recover": { status: 0, reached: /no queue owner found/u },
   "sessions owner-status": { status: 0, reached: /"ownerFound":false/u },
+  "sessions release": { status: 1, reached: /refused .*: no_owner/u },
   "output-styles": { status: 0, reached: /does not support output styles/u },
   sessions: { status: 0, reached: /No sessions/u },
   "sessions list": { status: 0, reached: /No sessions/u },
