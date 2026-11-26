@@ -119,6 +119,12 @@ export interface BrokerStatus {
    * `omit: true` serves a GET WITHOUT the field: an older broker, which acpx reads as `null`.
    */
   placement?: { forced?: "home" | null; omit?: boolean };
+  /**
+   * brick 8e5a4ea4: `GET /v1/agents?exclude=<key>` (ONE bare session key) drops that key's Job from `live`, `home.live`
+   * and `quota.used` and echoes `excluded: "<key>"`. `ignoreExclude: true` is an OLDER broker: the parameter is not read,
+   * the figures keep every Job and no `excluded` field is sent.
+   */
+  ignoreExclude?: boolean;
 }
 
 export interface BrokerScript {
@@ -206,6 +212,8 @@ interface Job {
 }
 
 const KEY_PATTERN = /^[A-Za-z0-9-]+$/;
+/** The POST path's key validation (broker-client `AGENT_KEY_RE`): what `?exclude=` must also satisfy. */
+const AGENT_KEY_PATTERN = /^([0-9a-f]{24}|util-pool|util-home)$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -672,6 +680,17 @@ export class FakeBroker {
         record.outcome = "status_hung";
         return;
       }
+      const exclude = url.searchParams.get("exclude");
+      if (exclude !== null && this.script.status?.ignoreExclude !== true) {
+        if (!AGENT_KEY_PATTERN.test(exclude)) {
+          record.outcome = "status_invalid_exclude";
+          this.sendJson(response, 400, { error: "invalid exclude" });
+          return;
+        }
+        record.outcome = "status";
+        this.sendJson(response, 200, { ...this.limits(exclude), excluded: exclude });
+        return;
+      }
       record.outcome = "status";
       this.sendJson(response, 200, this.statusBody());
       return;
@@ -705,17 +724,31 @@ export class FakeBroker {
   } {
     const scripted = this.script.status ?? {};
     const occupying = [...this.jobs.values(), ...[...this.terminating.values()].map((t) => t.job)]
-      .filter((job) => !job.ended && job.key !== excludeKey)
+      .filter((job) => !job.ended)
       .filter((job, index, all) => all.indexOf(job) === index);
-    const live = scripted.live ?? occupying.length;
+    // brick 8e5a4ea4: the excluded key's Job leaves every figure the broker derives from occupancy — scripted
+    // figures stand for the box WITH that Job, so its share comes off them too.
+    const dropped = occupying.filter((job) => job.key === excludeKey);
+    const droppedHome = dropped.filter((job) => job.target === "home").length;
+    const live = Math.max(0, (scripted.live ?? occupying.length) - dropped.length);
     const cap = scripted.cap ?? 100;
     return {
       live,
       cap,
       reserve: scripted.reserve ?? 1,
-      quota: { used: scripted.quota?.used ?? live, hard: scripted.quota?.hard ?? cap },
+      quota: {
+        used: Math.max(
+          0,
+          (scripted.quota?.used ?? scripted.live ?? occupying.length) - dropped.length,
+        ),
+        hard: scripted.quota?.hard ?? cap,
+      },
       home: {
-        live: scripted.home?.live ?? occupying.filter((job) => job.target === "home").length,
+        live: Math.max(
+          0,
+          (scripted.home?.live ?? occupying.filter((job) => job.target === "home").length) -
+            droppedHome,
+        ),
         cap: scripted.home?.cap ?? 0,
       },
       pool: scripted.pool ?? { state: "ready" },
