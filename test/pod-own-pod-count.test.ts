@@ -110,7 +110,7 @@ const POOL_AT_CAP_MINUS_1: BrokerStatus = { live: 10, cap: 11 };
 // home-only harness: the home cap binds — home 2/2 with the head's own Job one of the two.
 const HOME_AT_CAP_MINUS_1: BrokerStatus = { live: 3, cap: 11, home: { live: 2, cap: 2 } };
 
-test("own-pod row 1 (pool): a STARTING head at cap − 1 — its own Job is in `live` — is admitted; the request carries exactly its key", async () => {
+test("89.2 own-pod row 1 (pool): a STARTING head at cap − 1 — its own Job is in `live` — is admitted; the request carries exactly its key", async () => {
   const f = makeBox({});
   writeRecord(f, HEAD, CLAUDE);
   const broker = await brokerWithStartingHead(HEAD, POOL_AT_CAP_MINUS_1, "auto", "claude");
@@ -133,7 +133,7 @@ test("own-pod row 1 (pool): a STARTING head at cap − 1 — its own Job is in `
   }
 });
 
-test("own-pod row 1 (home): a STARTING home-only head at home cap − 1 — its own Job is in `home.live` — is admitted", async () => {
+test("89.2 own-pod row 1 (home): a STARTING home-only head at home cap − 1 — its own Job is in `home.live` — is admitted", async () => {
   const f = makeBox({});
   writeRecord(f, HEAD, CODEX);
   const broker = await brokerWithStartingHead(HEAD, HOME_AT_CAP_MINUS_1, "home", "codex");
@@ -146,7 +146,7 @@ test("own-pod row 1 (home): a STARTING home-only head at home cap − 1 — its 
   }
 });
 
-test("own-pod row 2 NEGATIVE: a STRANGER (another key) still sees the whole `live` — refused, and the request names the stranger's key, not the starting head's", async () => {
+test("89.2 own-pod row 2 NEGATIVE: a STRANGER (another key) still sees the whole `live` — refused, and the request names the stranger's key, not the starting head's", async () => {
   for (const [harness, command, status, placement] of [
     ["claude", CLAUDE, POOL_AT_CAP_MINUS_1, "auto"],
     ["codex", CODEX, HOME_AT_CAP_MINUS_1, "home"],
@@ -165,7 +165,7 @@ test("own-pod row 2 NEGATIVE: a STRANGER (another key) still sees the whole `liv
   }
 });
 
-test("own-pod row 3: the target-less probes send NO `exclude` and answer as before (the whole live count)", async () => {
+test("89.2 own-pod row 3: the target-less probes send NO `exclude` and answer as before (the whole live count)", async () => {
   const f = makeBox({});
   const broker = await brokerWithStartingHead(HEAD, POOL_AT_CAP_MINUS_1, "auto", "claude");
   try {
@@ -198,7 +198,7 @@ test("own-pod row 3: the target-less probes send NO `exclude` and answer as befo
   }
 });
 
-test("own-pod row 4: an OLDER broker ignores `exclude` and sends no `excluded` — today's answer (refused, whole live), no failure", async () => {
+test("89.2 own-pod row 4: an OLDER broker ignores `exclude` and sends no `excluded` — today's answer (refused, whole live), no failure", async () => {
   const f = makeBox({});
   writeRecord(f, HEAD, CLAUDE);
   const broker = await brokerWithStartingHead(
@@ -225,7 +225,7 @@ test("own-pod row 4: an OLDER broker ignores `exclude` and sends no `excluded` �
   }
 });
 
-test("own-pod row 5 (unit): `getAgents` puts exactly the key on the URL; with no key the URL is byte-identical to before; the echo is read", async () => {
+test("89.2 own-pod row 5 (unit): `getAgents` puts exactly the key on the URL; with no key the URL is byte-identical to before; the echo is read", async () => {
   const urls: string[] = [];
   const answer = (excluded?: string) => ({
     live: 3,
@@ -236,7 +236,7 @@ test("own-pod row 5 (unit): `getAgents` puts exactly the key on the URL; with no
     pool: { state: "ready" },
     ...(excluded === undefined ? {} : { excluded }),
   });
-  const fetchImpl = (async (url: string | URL | Request) => {
+  const fetchImpl = (async (url: string | URL) => {
     urls.push(String(url));
     const asked = new URL(String(url)).searchParams.get("exclude") ?? undefined;
     return new Response(JSON.stringify(answer(asked)), { status: 200 });
@@ -258,7 +258,7 @@ test("own-pod row 5 (unit): `getAgents` puts exactly the key on the URL; with no
   assert.equal(mismatched.agents.excluded, undefined);
 });
 
-test("own-pod: the key the gate excludes IS the key the POST carries (`sessionKey` = `agentPodKey`, never the Job name)", () => {
+test("89.2 own-pod: the key the gate excludes IS the key the POST carries (`sessionKey` = `agentPodKey`, never the Job name)", () => {
   for (const id of [HEAD, STRANGER, "0f0e0d0c-0b0a-4909-8807-060504030201"]) {
     assert.equal(sessionKey(id), agentPodKey(id));
     assert.match(sessionKey(id), /^[0-9a-f]{24}$/u);
