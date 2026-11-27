@@ -13,6 +13,7 @@ import path from "node:path";
 import readline from "node:readline";
 import test from "node:test";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
+import { warnUncheckedBackgroundTasks } from "../src/cli/background-task-gate.js";
 import {
   type QueueOwnerControlHandlers,
   SessionQueueOwner,
@@ -659,14 +660,16 @@ test("owner: something QUEUED ⇒ refused(queued), the queued prompt is not lost
   });
 });
 
-test("owner: asking twice is idempotent; an owner already closing refuses; an old owner without the gate says unsupported", async () => {
+test("owner: asking twice — the second is REFUSED (one slot, one release); an owner already closing refuses; an old owner without the gate says unsupported", async () => {
   await withOwner("ri-twice", newState(), async () => {
     assert.equal((await tryReleaseIfIdleOnRunningOwner("ri-twice", {})).kind, "released");
-    assert.equal(
-      (await tryReleaseIfIdleOnRunningOwner("ri-twice", {})).kind,
-      "released",
-      "a second ask finds the committed owner and says so",
-    );
+    // L3 (TE): a SECOND ask for the same candidate must NOT also say released — two held messages would
+    // each believe they freed a slot, and only one slot is freed. It is a refusal that sends atrium to
+    // its next candidate at once: `turn_running`, detail `reclaiming:`.
+    const second = await tryReleaseIfIdleOnRunningOwner("ri-twice", {});
+    assert.equal(second.kind, "refused");
+    assert.equal(second.kind === "refused" && second.reason, "turn_running");
+    assert.match(second.kind === "refused" ? (second.detail ?? "") : "", /^reclaiming:/);
   });
   await withOwner("ri-closing", newState(), async (owner) => {
     owner.scheduleClose({ killBackgroundTasks: false, onlyIfActiveTurn: false });
@@ -716,4 +719,76 @@ test("RACE: a prompt and a release in the same tick — either the prompt is kep
     });
   }
   assert.equal(kept + released, 25);
+});
+
+test("L3 RACE: two CONCURRENT releases of one candidate — exactly ONE says released, the other is refused turn_running (reclaiming)", async () => {
+  for (let i = 0; i < 10; i += 1) {
+    const state = newState({ parked: true });
+    await withOwner(`ri-two-${i}`, state, async (owner) => {
+      const [a, b] = await Promise.all([
+        tryReleaseIfIdleOnRunningOwner(`ri-two-${i}`, { heldTarget: "held-a" }),
+        tryReleaseIfIdleOnRunningOwner(`ri-two-${i}`, { heldTarget: "held-b" }),
+      ]);
+      const kinds = [a.kind, b.kind].toSorted();
+      assert.deepEqual(kinds, ["refused", "released"], JSON.stringify([a, b]));
+      const loser = a.kind === "refused" ? a : b;
+      assert.equal(loser.kind === "refused" && loser.reason, "turn_running");
+      assert.equal(state.markWrites, 1, "ONE reclaim mark, written once");
+      assert.equal(owner.isReclaiming(), true);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------------------------------------
+// L2 (TE): a `sessions close` that meets a reclaiming owner must say so, not "older acpx".
+// ---------------------------------------------------------------------------------------------------------
+
+function captureStderr(run: () => void): string {
+  const original = process.stderr.write.bind(process.stderr);
+  let out = "";
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    out += String(chunk);
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    run();
+  } finally {
+    process.stderr.write = original;
+  }
+  return out;
+}
+
+test("L2: the close's unanswered-owner warning names a RECLAIM when the pod's reclaim mark names this session; otherwise it is unchanged", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "reclaim-warn-"));
+  const saved = process.env.NV_AG_RUN_DIR;
+  process.env.NV_AG_RUN_DIR = root;
+  try {
+    const unanswered = { queried: false as const, ownerUnanswered: true as const };
+    // CONTROL: no mark ⇒ the old wording, untouched.
+    const plain = captureStderr(() => warnUncheckedBackgroundTasks("sess-1", unanswered));
+    assert.match(plain, /owner runs an older acpx or did not answer/);
+
+    writeReclaimMark(root, { sessionId: "sess-1", at: Date.now(), ownerPid: 1, heldTarget: "h" });
+    const reclaimed = captureStderr(() => warnUncheckedBackgroundTasks("sess-1", unanswered));
+    assert.match(reclaimed, /being reclaimed/);
+    assert.match(reclaimed, /no live background task/);
+    assert.doesNotMatch(reclaimed, /older acpx|may still be running/);
+
+    // NEGATIVE: a mark for ANOTHER session says nothing about this one.
+    const other = captureStderr(() => warnUncheckedBackgroundTasks("sess-2", unanswered));
+    assert.match(other, /owner runs an older acpx or did not answer/);
+
+    // NEGATIVE: an answered query / an absent owner stays silent either way.
+    assert.equal(
+      captureStderr(() => warnUncheckedBackgroundTasks("sess-1", { queried: false })),
+      "",
+    );
+  } finally {
+    if (saved === undefined) {
+      delete process.env.NV_AG_RUN_DIR;
+    } else {
+      process.env.NV_AG_RUN_DIR = saved;
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

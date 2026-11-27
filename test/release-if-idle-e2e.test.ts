@@ -573,3 +573,25 @@ test("no owner to release: refused(no_owner), exit 1, the session_release JSON i
     );
   });
 });
+
+test("the help names the WHOLE closed reason set (incl. pod_busy:busy) and says that outside an agent pod a release always refuses pod_busy:unknown (L1, L5)", async () => {
+  await withSession(async (rig) => {
+    const help = await runCli(["sessions", "release", "--help"], rig);
+    assert.equal(help.code, 0, help.stderr);
+    const text = help.stdout.replaceAll(/\s+/g, " ");
+    for (const reason of [
+      "turn_running",
+      "queued",
+      "pod_busy:browser_open",
+      "pod_busy:call_in_flight",
+      "pod_busy:busy",
+      "pod_busy:unknown",
+      "no_owner",
+      "unsupported",
+      "held_target_self",
+    ]) {
+      assert.ok(text.includes(reason), `help lists ${reason}`);
+    }
+    assert.match(text, /outside an agent pod[^.]*always[^.]*pod_busy:unknown/i);
+  });
+});
