@@ -35,7 +35,9 @@ export {
  * path missing here REFUSES (`acpx: REFUSED reason=unclassified_command`, exit 2) — it never runs.
  */
 
-export const COMMAND_CLASSES_CONTRACT = 1 as const;
+// TEST ARTIFACT, NEVER MERGE (row 95.2): atrium's loader accepts only contract 1
+// (server/acpxCall/commandClasses.ts validateCommandClassesModule), so this build is refused there.
+export const COMMAND_CLASSES_CONTRACT = 2 as const;
 
 export const COMMAND_CLASSES = [
   "read",
