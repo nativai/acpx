@@ -898,6 +898,23 @@ function wakeVerdictExtra(verdict: WakeVerdict): Record<string, unknown> {
   }
 }
 
+/**
+ * NATIVAI HOTFIX (devbox, 2026-11-26, not in git: the next acpx release replaces this file). A woken session that is
+ * itself in the waiting queue yields only to the items AHEAD of it, never to itself or to the items behind it.
+ * Without this the held drainer's head (class `delivery`, sized net of the WHOLE queue W) was refused whenever
+ * W >= the box's free slots, so the queue could never drain (19 waiting, 16 free => 0 slots).
+ */
+function nvHotfixWaitingAheadOf(queue: WaitingQueue, targetId: string): WaitingQueue {
+  const index = queue.items.findIndex(
+    (item) => item.ref === targetId || item.key === `delivery:${targetId}`,
+  );
+  if (index === -1) {
+    return queue;
+  }
+  const items = queue.items.slice(0, index);
+  return { count: items.length, items };
+}
+
 /** Lock to unlock: read, decide, prune and write the ledger, log. Nothing slower happens here. */
 async function decideWakeUnderLock(
   ctx: WakeContext,
@@ -910,7 +927,7 @@ async function decideWakeUnderLock(
     agent: ctx.harness,
     sources,
     pending: reservations,
-    waiting: readWaiting(ctx.dir, now),
+    waiting: nvHotfixWaitingAheadOf(readWaiting(ctx.dir, now), ctx.request.target.id),
     admissionClass: ctx.capacityClass,
     now,
   });
