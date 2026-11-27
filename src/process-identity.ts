@@ -574,6 +574,33 @@ export function classifyRecordedIdentity(raw: unknown): RecordedIdentity {
 }
 
 /**
+ * Did the holder that wrote this RECORDED identity run in a scope that is NOT the reader's — another
+ * boot, or another pid / time namespace — with the scope actually RECORDED and PARSED (a birth identity
+ * or a scope-only one)? A legacy artefact (no scope), a malformed scope, a timestamp identity and a reader
+ * whose own scope is unverified all answer `false`: nothing is claimed without a scope on both sides.
+ * Used ONLY by the lock primitive's same-pod row (A-94 row 94.6): inside ONE pod, which runs acpx in ONE
+ * container, a different scope can only be a previous incarnation of that container. Do not use it for a
+ * holder in another pod — there another namespace is the normal case and proves nothing.
+ */
+export function recordedScopeDiffersFromOwn(raw: unknown): boolean {
+  const own = getOwnProcessScope();
+  if (!own) {
+    return false;
+  }
+  const recorded = classifyRecordedIdentity(raw);
+  if (recorded.kind === "birth") {
+    return (
+      recorded.birth.kind === "linux-proc" && compareLinuxScope(recorded.birth, own) !== "matching"
+    );
+  }
+  if (recorded.kind === "scope-only" && isRecord(raw)) {
+    const scope = parseLinuxScope(raw);
+    return scope !== undefined && compareLinuxScope(scope, own) !== "matching";
+  }
+  return false;
+}
+
+/**
  * Is the adapter at `record.pid` POSSIBLY alive? For KEEP decisions only — the archive gate, export's
  * "active", reconnect, the account-seam sweep — never for a signal (process-signal.ts). With a valid
  * `pid_identity` it is judged by identity, and `unknown` (another pid namespace, unreadable /proc)
