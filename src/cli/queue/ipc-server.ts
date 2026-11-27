@@ -773,8 +773,15 @@ export class SessionQueueOwner {
    * once it has said `ok`). The parked loop is woken by the caller AFTER the reply is written.
    */
   releaseIfIdle(request: QueueReleaseIfIdleRequest): QueueOwnerReleaseIfIdleResultMessage {
+    // L3 (TE): a SECOND ask for an owner already committed is a REFUSAL, never a second `released` — two
+    // held messages would each believe they freed a slot, and exactly one slot is freed. `turn_running`
+    // sends atrium to its next candidate at once; `detail` says why.
     if (this.reclaiming) {
-      return releaseResult(request, { released: true, idleMs: 0 });
+      return releaseResult(request, {
+        released: false,
+        reason: "turn_running",
+        detail: "reclaiming: this owner is already released for another held message",
+      });
     }
     if (this.isClosingForRelease()) {
       return releaseResult(request, {

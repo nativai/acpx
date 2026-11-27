@@ -1,3 +1,4 @@
+import { podRunDir, readReclaimMarkSession } from "../pod/reclaim-marks.js";
 import {
   formatSurvivors,
   isProcessBackedTask,
@@ -351,6 +352,15 @@ export function warnUncheckedBackgroundTasks(
   answer: BackgroundTasksQuery,
 ): void {
   if (answer.queried || answer.ownerUnanswered !== true) {
+    return;
+  }
+  // L2 (TE): an owner that does not answer because it is being RECLAIMED (released to make room for a held
+  // message) is not "older" and is not wedged: the release proved it held no live background task.
+  if (readReclaimMarkSession(podRunDir(process.env)) === sessionId) {
+    process.stderr.write(
+      `[acpx] note: ${sessionId}'s owner is being reclaimed (released to make room for a held message); ` +
+        `the release proved it had no live background task\n`,
+    );
     return;
   }
   process.stderr.write(

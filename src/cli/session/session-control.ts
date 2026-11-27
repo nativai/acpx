@@ -1853,8 +1853,8 @@ export async function releaseSessionIfIdle(
 /**
  * The ONE JSON line `sessions release` prints — the contract: a caller decides on `released` from THIS
  * line; a non-zero exit WITHOUT it is an error, not a refusal. The closed set of `reason`s:
- * turn_running · queued · pod_busy:browser_open · pod_busy:call_in_flight · pod_busy:unknown · no_owner ·
- * unsupported · held_target_self.
+ * turn_running · queued · pod_busy:browser_open · pod_busy:call_in_flight · pod_busy:busy ·
+ * pod_busy:unknown · no_owner · unsupported · held_target_self.
  */
 export type ReleaseVerbPayload = {
   action: "session_release";

@@ -46,6 +46,16 @@ export function writeReclaimMark(
   }
 }
 
+/** The session a reclaim mark names, or undefined when there is no mark or it cannot be read. */
+export function readReclaimMarkSession(runDir: string): string | undefined {
+  try {
+    const text = fs.readFileSync(reclaimMarkPath(runDir), "utf8");
+    return /^session=(.+)$/m.exec(text)?.[1]?.trim();
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * A cold-started owner removes a reclaim mark an earlier owner of this pod left (the pod did not end,
  * so the reclaim was moot): the mark means "this owner's predecessor was released to free the pod".
