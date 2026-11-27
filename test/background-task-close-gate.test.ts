@@ -644,9 +644,12 @@ test("G3 / AC8 (v3): an OLD owner (QUEUE_REQUEST_INVALID) fails open — not aut
       const prev = process.env.HOME;
       process.env.HOME = homeDir;
       try {
+        // D-L3 (brick 35d4e64b): the unanswered shape also names the lease's owner pid (the close matches a
+        // reclaim mark to THIS owner by it).
         assert.deepEqual(await tryQueryBackgroundTasksOnRunningOwner(sessionId), {
           queried: false,
           ownerUnanswered: true,
+          ownerPid: rig.pids.ownerPid,
         });
       } finally {
         process.env.HOME = prev;
@@ -957,6 +960,7 @@ test("C4 fail-open: no lease, and an owner that accepts but never answers, both 
       assert.deepEqual(await tryQueryBackgroundTasksOnRunningOwner(sessionId, 400), {
         queried: false,
         ownerUnanswered: true,
+        ownerPid: process.pid,
       });
       assert.ok(Date.now() - startedAt < 1_500, "the deadline bounds connect AND answer");
     } finally {

@@ -46,11 +46,15 @@ export function writeReclaimMark(
   }
 }
 
-/** The session a reclaim mark names, or undefined when there is no mark or it cannot be read. */
-export function readReclaimMarkSession(runDir: string): string | undefined {
+/** The session and owner pid a reclaim mark names, or undefined when there is no mark or it cannot be read. */
+export function readReclaimMark(
+  runDir: string,
+): { session: string; ownerPid: number | undefined } | undefined {
   try {
     const text = fs.readFileSync(reclaimMarkPath(runDir), "utf8");
-    return /^session=(.+)$/m.exec(text)?.[1]?.trim();
+    const session = /^session=(.+)$/m.exec(text)?.[1]?.trim();
+    const pid = /^owner_pid=(\d{1,9})$/m.exec(text)?.[1];
+    return session ? { session, ownerPid: pid === undefined ? undefined : Number(pid) } : undefined;
   } catch {
     return undefined;
   }

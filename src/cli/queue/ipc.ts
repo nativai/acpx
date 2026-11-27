@@ -1427,6 +1427,40 @@ function scheduleCloseErrorDetail(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+const OWNER_GONE_DETAIL_CODES = new Set([
+  "QUEUE_OWNER_CLOSED",
+  "QUEUE_OWNER_SHUTTING_DOWN",
+  "QUEUE_DISCONNECTED_BEFORE_ACK",
+  "QUEUE_DISCONNECTED_BEFORE_COMPLETION",
+  "EPIPE",
+  "ECONNRESET",
+  "ECONNREFUSED",
+]);
+
+function errorCodeOf(error: unknown): string | undefined {
+  if (error instanceof QueueConnectionError || error instanceof QueueProtocolError) {
+    return error.detailCode;
+  }
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === "string" ? code : undefined;
+}
+
+/**
+ * brick 35d4e64b (D-L2) — the text of a release that got no verdict. Atrium acts on the `unsupported` reason
+ * either way; the TEXT must not blame an "older acpx" when the owner simply went away mid-release (it had
+ * just been released by another call, or exited): only a protocol mismatch is the older-acpx shape.
+ */
+export function releaseErrorDetail(error: unknown): string {
+  const code = errorCodeOf(error);
+  if (code !== undefined && OWNER_GONE_DETAIL_CODES.has(code)) {
+    return `the owner went away mid-release (${code})`;
+  }
+  if (error instanceof QueueProtocolError) {
+    return `the owner answered unexpectedly — it may run an older acpx (${code ?? error.message})`;
+  }
+  return scheduleCloseErrorDetail(error);
+}
+
 /** brick 35d4e64b — what asking the live owner to release itself NOW (if idle) produced. */
 export type ReleaseIfIdleOutcome =
   /** The owner committed: it exits as `reclaim`; the session's record stays and its next message restarts it. */
@@ -1458,7 +1492,7 @@ export async function tryReleaseIfIdleOnRunningOwner(
   try {
     return await submitReleaseIfIdleToQueueOwner(owner, options);
   } catch (error) {
-    return { kind: "unsupported", detail: scheduleCloseErrorDetail(error) };
+    return { kind: "unsupported", detail: releaseErrorDetail(error) };
   }
 }
 
@@ -1522,6 +1556,8 @@ export type BackgroundTasksQuery =
        * Absent when there was no owner to ask at all.
        */
       ownerUnanswered?: true;
+      /** The pid of the owner the lease named when it did not answer (D-L3: matches a reclaim mark to THIS owner). */
+      ownerPid?: number;
     };
 
 function isForeignOwner(owner: QueueOwnerRecord): boolean {
@@ -1572,6 +1608,7 @@ export async function tryQueryBackgroundTasksOnRunningOwner(
   let timer: NodeJS.Timeout | undefined;
   // Pessimistic: until the lease is read and shows no live owner, a missing answer is unanswered.
   let ownerAbsent = false;
+  let ownerPidSeen: number | undefined;
   const deadline = new Promise<undefined>((resolve) => {
     timer = setTimeout(() => resolve(undefined), deadlineMs);
     timer.unref();
@@ -1586,6 +1623,7 @@ export async function tryQueryBackgroundTasksOnRunningOwner(
     if (isForeignOwner(owner)) {
       return undefined;
     }
+    ownerPidSeen = owner.pid;
     const remaining = Math.max(1, deadlineMs - (Date.now() - startedAt));
     return await submitQueryBackgroundTasksToQueueOwner(owner, remaining);
   })().catch(() => undefined);
@@ -1594,7 +1632,14 @@ export async function tryQueryBackgroundTasksOnRunningOwner(
   if (list) {
     return { queried: true, ...list };
   }
-  return ownerAbsent ? { queried: false } : { queried: false, ownerUnanswered: true };
+  if (ownerAbsent) {
+    return { queried: false };
+  }
+  return {
+    queried: false,
+    ownerUnanswered: true,
+    ...(ownerPidSeen === undefined ? {} : { ownerPid: ownerPidSeen }),
+  };
 }
 
 /**

@@ -14,7 +14,6 @@ import readline from "node:readline";
 import test from "node:test";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { warnUncheckedBackgroundTasks } from "../src/cli/background-task-gate.js";
-import { QueueConnectionError, QueueProtocolError } from "../src/errors.js";
 import {
   type QueueOwnerControlHandlers,
   SessionQueueOwner,
@@ -35,6 +34,7 @@ import {
   type ReclaimGateInput,
 } from "../src/cli/session/reclaim-gate.js";
 import { releaseOutcomePayload } from "../src/cli/session/session-control.js";
+import { QueueConnectionError, QueueProtocolError } from "../src/errors.js";
 import {
   IDLE_PREDICATE_PATH,
   IDLE_PREDICATE_TEST_ENV,
@@ -777,7 +777,12 @@ test("L2/D-L3: the close's unanswered-owner warning names a RECLAIM only when th
       OLD,
     );
 
-    writeReclaimMark(root, { sessionId: "sess-1", at: Date.now(), ownerPid: 4242, heldTarget: "h" });
+    writeReclaimMark(root, {
+      sessionId: "sess-1",
+      at: Date.now(),
+      ownerPid: 4242,
+      heldTarget: "h",
+    });
     const reclaimed = captureStderr(() => warnUncheckedBackgroundTasks("sess-1", unanswered(4242)));
     assert.match(reclaimed, /being reclaimed/);
     assert.match(reclaimed, /no live background task/);
@@ -791,14 +796,23 @@ test("L2/D-L3: the close's unanswered-owner warning names a RECLAIM only when th
       "owner_pid differs from the lease pid the close saw",
     );
     // NEGATIVE: the close could not name the owner's pid ⇒ the mark cannot be matched ⇒ old warning.
-    assert.match(captureStderr(() => warnUncheckedBackgroundTasks("sess-1", unanswered())), OLD);
+    assert.match(
+      captureStderr(() => warnUncheckedBackgroundTasks("sess-1", unanswered())),
+      OLD,
+    );
     // NEGATIVE: a mark with no owner_pid line.
     fs.writeFileSync(path.join(root, "reclaim"), "session=sess-1\nreason=reclaim\n");
-    assert.match(captureStderr(() => warnUncheckedBackgroundTasks("sess-1", unanswered(4242))), OLD);
+    assert.match(
+      captureStderr(() => warnUncheckedBackgroundTasks("sess-1", unanswered(4242))),
+      OLD,
+    );
 
     // NEGATIVE: a mark for ANOTHER session says nothing about this one.
     writeReclaimMark(root, { sessionId: "sess-1", at: Date.now(), ownerPid: 4242 });
-    assert.match(captureStderr(() => warnUncheckedBackgroundTasks("sess-2", unanswered(4242))), OLD);
+    assert.match(
+      captureStderr(() => warnUncheckedBackgroundTasks("sess-2", unanswered(4242))),
+      OLD,
+    );
 
     // NEGATIVE: an answered query / an absent owner stays silent either way.
     assert.equal(

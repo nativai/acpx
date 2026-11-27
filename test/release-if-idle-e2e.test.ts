@@ -595,3 +595,39 @@ test("the help names the WHOLE closed reason set (incl. pod_busy:busy) and says 
     assert.match(text, /outside an agent pod[^.]*always[^.]*pod_busy:unknown/i);
   });
 });
+
+/**
+ * A `sessions close` that meets an owner whose loop is BLOCKED (a hung predicate holds it for 5 s, so the close's
+ * 2 s background-task query goes unanswered) while a reclaim mark `session=<id> owner_pid=<markPid>` is planted.
+ */
+async function closeDuringBlockedOwner(rig: Rig, markPid: number): Promise<CliResult> {
+  await setVerdict(rig, "hang");
+  const releasing = release(rig);
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  await fs.writeFile(
+    path.join(rig.runDir, "reclaim"),
+    `session=${rig.id}\nat=2026-01-01T00:00:00.000Z\nowner_pid=${markPid}\nreason=reclaim\n`,
+  );
+  const closed = await runCli(
+    ["--cwd", rig.cwd, "--format", "json", "codex", "sessions", "close", "--session-id", rig.id],
+    rig,
+  );
+  await releasing;
+  return closed;
+}
+
+test("L2/D-L3 on the real path: a close that meets an unanswering owner says RECLAIM only when the mark's owner_pid is THE LEASE OWNER's; a stale mark keeps the old warning", async () => {
+  await withSession(async (rig) => {
+    assert.equal((await prompt(rig, "echo WARN-ROW-1")).code, 0);
+    const ownerPid = await ownerPidOf(rig);
+    const mine = await closeDuringBlockedOwner(rig, ownerPid);
+    assert.match(mine.stderr, /owner is being reclaimed/, mine.stderr);
+    assert.doesNotMatch(mine.stderr, /older acpx or did not answer/);
+  });
+  await withSession(async (rig) => {
+    assert.equal((await prompt(rig, "echo WARN-ROW-2")).code, 0);
+    const stale = await closeDuringBlockedOwner(rig, 1);
+    assert.match(stale.stderr, /owner runs an older acpx or did not answer/, stale.stderr);
+    assert.doesNotMatch(stale.stderr, /being reclaimed/);
+  });
+});
