@@ -27,6 +27,7 @@ import {
   identityScope,
   observeProcessIncarnation,
   processHostName,
+  recordedScopeDiffersFromOwn,
   type ProcessBirthIdentity,
   serializeProcessBirthIdentity,
 } from "../../process-identity.js";
@@ -48,6 +49,8 @@ import { isProcessDefinitelyDead } from "../../process-liveness.js";
  *   unverified own scope) ⇒ unjudgeable. A legacy body (no identity — pre-0a code, which CONCEPT
  *   §4.5 places in the reader's own container) is breakable on ESRCH, and otherwise unjudgeable
  *   unless the policy keeps an older, stronger rule (the record lock does).
+ * - A holder in the reader's own POD that recorded ANOTHER scope (boot / pid ns / time ns) is a previous
+ *   incarnation of the pod's one acpx container ⇒ breakable (A-94 row 94.6). One with no recorded scope is not.
  * - An unjudgeable holder WITHOUT `pod` is broken only once the lock is older than `staleMs`, with
  *   a stderr warning naming the file, holder and age. Legitimate holds are milliseconds.
  *
@@ -464,7 +467,7 @@ export async function withBreakMutex<T>(
 // Judging and breaking
 // ---------------------------------------------------------------------------------------------
 
-export type BreakProof = "pid" | "pod-gone" | "pod-terminal" | "age";
+export type BreakProof = "pid" | "scope" | "pod-gone" | "pod-terminal" | "age";
 
 type BreakPlan = { kind: "none" } | { kind: "break"; proof: BreakProof; reason: string };
 type DecidedBreak = Extract<BreakPlan, { kind: "break" }>;
@@ -540,6 +543,20 @@ async function planBreak(
     return { kind: "none" };
   }
   if (holder.kind === "same-pod") {
+    // ⚠️ A-94 row 94.6 (a C3.2 A-4 correction, brick 14901ced). A pod runs acpx in ONE container, so a holder
+    // of THIS pod that recorded another boot or pid/time namespace is a PREVIOUS INCARNATION of it — an in-place
+    // container restart keeps the pod uid and gives the new container a new pid namespace. Its pid reads
+    // `unknown` here, which without this row is "never broken": one stale `admission.lock` refused every create
+    // box-wide. Only a RECORDED, differing scope counts; a legacy body (no scope) and a live holder in the
+    // reader's own scope stay on the pid rule below. DO NOT give this row an age rule.
+    if (recordedScopeDiffersFromOwn(current.body?.processIdentity)) {
+      return {
+        kind: "break",
+        proof: "scope",
+        reason:
+          "holder ran in a previous incarnation of this pod's acpx container (another boot or pid namespace)",
+      };
+    }
     // pid and start time only — no age rule for a body that carries `pod` (C3.2 A-4).
     return judgeByPid(current.body, policy.judgeLegacy) === "breakable"
       ? { kind: "break", proof: "pid", reason: "holder is dead" }
@@ -708,6 +725,10 @@ function reportBreak(
     process.stderr.write(
       `[acpx] WARNING: broke stale ${policy.label} ${lockPath} (${plan.reason}); holder ${raw}\n`,
     );
+  } else if (plan.proof === "scope") {
+    process.stderr.write(
+      `[acpx] broke ${policy.label} ${lockPath}: ${plan.reason}; breaker pod ${describePod(deps.ownPod())} pid ${process.pid}; holder ${raw}\n`,
+    );
   } else if (plan.proof !== "pid") {
     process.stderr.write(
       `[acpx] broke ${policy.label} ${lockPath}: ${plan.reason} — proven by the API server ` +
@@ -849,6 +870,9 @@ const SWEPT_LOCKS: ReadonlyArray<{ suffix: string; staleMs: number }> = [
   { suffix: ".lock.guard", staleMs: 10_000 }, // lease guard
   { suffix: ".acpx-stage.lock", staleMs: 120_000 }, // fork-source stage lock
   { suffix: ".stream.lock", staleMs: 15_000 }, // session stream writer lock (A8, G1)
+  // The box-wide admission ledger's lock (capacity/ledger.ts `withAdmissionLock`): the same primitive and
+  // the same `planBreak`. Only a caller that passes `admissionDir()` reaches it (A-94 row 94.6).
+  { suffix: "admission.lock", staleMs: 4_000 },
 ];
 
 export type PodLockSweepResult = { removed: string[] };
