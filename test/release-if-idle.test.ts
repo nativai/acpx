@@ -14,10 +14,12 @@ import readline from "node:readline";
 import test from "node:test";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { warnUncheckedBackgroundTasks } from "../src/cli/background-task-gate.js";
+import { QueueConnectionError, QueueProtocolError } from "../src/errors.js";
 import {
   type QueueOwnerControlHandlers,
   SessionQueueOwner,
   tryAcquireQueueOwnerLease,
+  releaseErrorDetail,
   tryReleaseIfIdleOnRunningOwner,
 } from "../src/cli/queue/ipc.js";
 import {
@@ -758,25 +760,45 @@ function captureStderr(run: () => void): string {
   return out;
 }
 
-test("L2: the close's unanswered-owner warning names a RECLAIM when the pod's reclaim mark names this session; otherwise it is unchanged", () => {
+test("L2/D-L3: the close's unanswered-owner warning names a RECLAIM only when the mark belongs to the CURRENT owner (owner_pid == the lease pid the close saw); a stale mark keeps the old warning", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "reclaim-warn-"));
   const saved = process.env.NV_AG_RUN_DIR;
   process.env.NV_AG_RUN_DIR = root;
   try {
-    const unanswered = { queried: false as const, ownerUnanswered: true as const };
+    const unanswered = (ownerPid?: number) => ({
+      queried: false as const,
+      ownerUnanswered: true as const,
+      ...(ownerPid === undefined ? {} : { ownerPid }),
+    });
+    const OLD = /owner runs an older acpx or did not answer/;
     // CONTROL: no mark ⇒ the old wording, untouched.
-    const plain = captureStderr(() => warnUncheckedBackgroundTasks("sess-1", unanswered));
-    assert.match(plain, /owner runs an older acpx or did not answer/);
+    assert.match(
+      captureStderr(() => warnUncheckedBackgroundTasks("sess-1", unanswered(4242))),
+      OLD,
+    );
 
-    writeReclaimMark(root, { sessionId: "sess-1", at: Date.now(), ownerPid: 1, heldTarget: "h" });
-    const reclaimed = captureStderr(() => warnUncheckedBackgroundTasks("sess-1", unanswered));
+    writeReclaimMark(root, { sessionId: "sess-1", at: Date.now(), ownerPid: 4242, heldTarget: "h" });
+    const reclaimed = captureStderr(() => warnUncheckedBackgroundTasks("sess-1", unanswered(4242)));
     assert.match(reclaimed, /being reclaimed/);
     assert.match(reclaimed, /no live background task/);
     assert.doesNotMatch(reclaimed, /older acpx|may still be running/);
 
+    // D-L3 NEGATIVE (the TE's TE-13b shape): a STALE mark naming this session — its owner_pid is a PREVIOUS
+    // owner, the release was refused or the pod did not end — says nothing about the owner the close saw.
+    assert.match(
+      captureStderr(() => warnUncheckedBackgroundTasks("sess-1", unanswered(9999))),
+      OLD,
+      "owner_pid differs from the lease pid the close saw",
+    );
+    // NEGATIVE: the close could not name the owner's pid ⇒ the mark cannot be matched ⇒ old warning.
+    assert.match(captureStderr(() => warnUncheckedBackgroundTasks("sess-1", unanswered())), OLD);
+    // NEGATIVE: a mark with no owner_pid line.
+    fs.writeFileSync(path.join(root, "reclaim"), "session=sess-1\nreason=reclaim\n");
+    assert.match(captureStderr(() => warnUncheckedBackgroundTasks("sess-1", unanswered(4242))), OLD);
+
     // NEGATIVE: a mark for ANOTHER session says nothing about this one.
-    const other = captureStderr(() => warnUncheckedBackgroundTasks("sess-2", unanswered));
-    assert.match(other, /owner runs an older acpx or did not answer/);
+    writeReclaimMark(root, { sessionId: "sess-1", at: Date.now(), ownerPid: 4242 });
+    assert.match(captureStderr(() => warnUncheckedBackgroundTasks("sess-2", unanswered(4242))), OLD);
 
     // NEGATIVE: an answered query / an absent owner stays silent either way.
     assert.equal(
@@ -791,4 +813,32 @@ test("L2: the close's unanswered-owner warning names a RECLAIM when the pod's re
     }
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("D-L2: a release that loses its owner mid-call says SO — only a real protocol mismatch says `older acpx`", () => {
+  const closed = new QueueConnectionError("Queue owner is closed", {
+    detailCode: "QUEUE_OWNER_CLOSED",
+    origin: "queue",
+    retryable: true,
+  });
+  const dropped = new QueueConnectionError("disconnected", {
+    detailCode: "QUEUE_DISCONNECTED_BEFORE_COMPLETION",
+    origin: "queue",
+    retryable: true,
+  });
+  const epipe = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+  for (const error of [closed, dropped, epipe]) {
+    const detail = releaseErrorDetail(error);
+    assert.match(detail, /went away mid-release/);
+    assert.doesNotMatch(detail, /older acpx/);
+  }
+  // NEGATIVE: an owner that answers with a protocol error IS the older-acpx shape.
+  const old = new QueueProtocolError("malformed", {
+    detailCode: "QUEUE_PROTOCOL_MALFORMED_MESSAGE",
+    origin: "queue",
+  });
+  assert.match(releaseErrorDetail(old), /older acpx/);
+  assert.match(releaseErrorDetail(old), /QUEUE_PROTOCOL_MALFORMED_MESSAGE/);
+  // Anything else keeps its own text.
+  assert.equal(releaseErrorDetail(new Error("boom")), "boom");
 });
