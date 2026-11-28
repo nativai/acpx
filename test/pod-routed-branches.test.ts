@@ -293,8 +293,29 @@ test("P1: a Pi session is placed `auto` with ACPX_PI_PLACEMENT=pool and `home` w
   assert.equal(await placementOf("pi", { ACPX_PI_PLACEMENT: "pool" }), "auto");
   assert.equal(await placementOf("codex", { ACPX_PI_PLACEMENT: "pool" }), "home");
   for (const value of [undefined, "", "home", "Pool"]) {
-    const env: NodeJS.ProcessEnv = value === undefined ? {} : { ACPX_PI_PLACEMENT: value };
+    const env: NodeJS.ProcessEnv =
+      value === undefined
+        ? { NODE_TEST_CONTEXT: "child", ACPX_TEST_PI_PLACEMENT_FILE: "/nonexistent/pi-placement" }
+        : { ACPX_PI_PLACEMENT: value };
     assert.equal(await placementOf("pi", env), "home", String(value));
+  }
+  // The control's source (contract §2 amended): the release-pins file, followed home → pool → home in this
+  // one process, and the env winning over it.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "acpx-p1-routed-"));
+  const file = path.join(dir, "pi-placement");
+  const fileEnv = { NODE_TEST_CONTEXT: "child", ACPX_TEST_PI_PLACEMENT_FILE: file };
+  try {
+    const seen: Array<string | undefined> = [];
+    for (const value of ["home\n", "pool\n", "home\n"]) {
+      fs.writeFileSync(file, value);
+      seen.push(await placementOf("pi", fileEnv));
+    }
+    assert.deepEqual(seen, ["home", "auto", "home"]);
+    fs.writeFileSync(file, "pool\n");
+    assert.equal(await placementOf("pi", { ...fileEnv, ACPX_PI_PLACEMENT: "home" }), "home");
+    assert.equal(await placementOf("codex", fileEnv), "home");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

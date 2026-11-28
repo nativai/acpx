@@ -33,7 +33,9 @@ import {
   OS_COMPAT_LINK_ENV,
   POD_IDENTITY_ENV,
   POD_SA_DIR_ENV,
+  NO_PI_PLACEMENT_FILE,
   NO_RUNTIME_INFO_PATH,
+  PI_PLACEMENT_FILE_SEAM_ENV,
   RUNTIME_INFO_PATH_ENV,
   scrubBoxHarnessEnvOverrides,
 } from "./box-env-scrub.js";
@@ -59,6 +61,7 @@ test("3b1ec678: the scrub removes every ACPX_PI_* override and leaves the rest a
     POD_SA_DIR_ENV,
     RUNTIME_INFO_PATH_ENV,
     "ACPX_SESSION_URL",
+    PI_PLACEMENT_FILE_SEAM_ENV,
     "ACPX_UI_INTERNAL_URL",
     "HOME",
   ]);
@@ -80,6 +83,7 @@ test("c2df657e: the scrub removes ACPX_SESSION_RECORD_ID (product-set session id
     POD_SA_DIR_ENV,
     RUNTIME_INFO_PATH_ENV,
     "ACPX_SESSION_URL",
+    PI_PLACEMENT_FILE_SEAM_ENV,
     "ACPX_UI_INTERNAL_URL",
     "HOME",
   ]);
@@ -126,6 +130,7 @@ test("45917618: the scrub removes ACPX_SESSION_ROOT (a rig's session-root seam),
       POD_SA_DIR_ENV,
       RUNTIME_INFO_PATH_ENV,
       "ACPX_SESSION_URL",
+      PI_PLACEMENT_FILE_SEAM_ENV,
       "ACPX_UI_INTERNAL_URL",
       "HOME",
     ]);
@@ -204,6 +209,24 @@ test("ebfe4c3c: the suite never keys the Claude advertisement on this box's info
   assert.equal(fs.existsSync(NO_RUNTIME_INFO_PATH), false, "the seam must point at NOTHING");
   // …and the bootstrap applied it in THIS process.
   assert.equal(process.env[RUNTIME_INFO_PATH_ENV], NO_RUNTIME_INFO_PATH);
+});
+
+test("P1: the suite never reads this box's release-pins pi-placement file", () => {
+  const env: NodeJS.ProcessEnv = {
+    [PI_PLACEMENT_FILE_SEAM_ENV]: "/etc/nativai/release-pins/pi-placement",
+  };
+  scrubBoxHarnessEnvOverrides(env);
+  assert.equal(
+    env[PI_PLACEMENT_FILE_SEAM_ENV],
+    NO_PI_PLACEMENT_FILE,
+    "an inherited value is overwritten",
+  );
+  assert.equal(fs.existsSync(NO_PI_PLACEMENT_FILE), false, "the seam must point at NOTHING");
+  assert.equal(
+    process.env[PI_PLACEMENT_FILE_SEAM_ENV],
+    NO_PI_PLACEMENT_FILE,
+    "applied in THIS process",
+  );
 });
 
 test("78623030: the suite never inherits whether this box mounts the OS compatibility link", async () => {

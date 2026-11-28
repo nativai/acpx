@@ -24,6 +24,7 @@ import {
 } from "../capacity/reading.js";
 import { type RunBuildResult, runBuild } from "../capacity/run-build.js";
 import type { BrokerAgentsSnapshot } from "../pod/broker-client.js";
+import { readBoxFacts } from "../pod/home-only.js";
 import {
   isControlPlaneInPodMode,
   podCapacitySnapshot,
@@ -466,17 +467,22 @@ async function podAnswerFor(flags: CapacityFlags): Promise<PodAnswer> {
   if (!figures.ok) {
     return podUnavailable(flags, figures, waiting);
   }
+  // P1: ONE read of the box's facts (env, else the release-pins file) for the snapshot and the `--need`
+  // verdict, so `placedAt` and the verdict can never disagree across a file flip mid-command.
+  const boxFacts = readBoxFacts();
   const snapshot = podCapacitySnapshot({
     agents: figures.agents,
     box: figures.box,
     agent,
     admissionClass,
     waiting,
+    boxFacts,
   });
   const room = podRoom(figures.agents, {
     harness: agent,
     admissionClass,
     waitingCount: waiting.count,
+    box: boxFacts,
   });
   // `--need-build` stays local: a release build runs on the control pod (the broker knows nothing of it).
   const build = flags.needBuild ? localBuildSnapshot(agent).build : undefined;

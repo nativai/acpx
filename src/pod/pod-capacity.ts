@@ -11,7 +11,7 @@ import {
   resolveAgentBrokerOrigin,
 } from "./broker-client.js";
 import type { AgentPlacement } from "./broker-client.js";
-import { isHomeOnlyHarness } from "./home-only.js";
+import { type BoxFacts, isHomeOnlyHarness, readBoxFacts } from "./home-only.js";
 import { podMode, thisPodFile } from "./placement.js";
 import type { AgentCapWhy } from "./pod-refusal.js";
 
@@ -73,11 +73,19 @@ export type PodRoom = {
   readonly room: { readonly cap: number; readonly quota: number; readonly home: number | null };
   /** Where the broker will put the pod — the home cap binds exactly when this is `home`. */
   readonly placedAt: "pool" | "home";
+  /** The harness is home-only on this box, from the SAME box facts `placedAt` was computed with. */
+  readonly homeOnly: boolean;
 };
 
-/** What acpx asks the broker for (A-45): `home` for a home-only harness, `auto` otherwise. */
-export function placementAsked(harness: Harness): AgentPlacement {
-  return isHomeOnlyHarness(harness) ? "home" : "auto";
+/**
+ * What acpx asks the broker for (A-45): `home` for a home-only harness, `auto` otherwise.
+ * ⚠️ THE SAME READER AS A SESSION'S PLACEMENT (`routed-branches.ts` `sessionTarget`) AND A ONE-SHOT'S POD KEY
+ * (`utility-branch.ts`): `readBoxFacts` over the process env, which also reads the release-pins file on the
+ * control (P1). A capacity answer that read the box differently would report room under the wrong cap.
+ * Rows: `test/pod-capacity.test.ts` → "P1: capacity and placement agree after a file flip …".
+ */
+export function placementAsked(harness: Harness, box: BoxFacts = readBoxFacts()): AgentPlacement {
+  return isHomeOnlyHarness(harness, box) ? "home" : "auto";
 }
 
 /**
@@ -111,12 +119,15 @@ export function podRoom(
     waitingCount: number;
     /** What the request asks for; default: what acpx asks for this harness (`placementAsked`). */
     asked?: AgentPlacement;
+    /** This box's facts, read ONCE by the caller for a whole answer; default: read now. */
+    box?: BoxFacts;
   },
 ): PodRoom {
+  const box = options.box ?? readBoxFacts();
   const reserve = options.admissionClass === "interactive" ? 0 : agents.reserve;
   const cap = agents.cap - reserve - agents.live;
   const quota = agents.quota.hard - agents.quota.used;
-  const target = placedAt(agents, options.asked ?? placementAsked(options.harness));
+  const target = placedAt(agents, options.asked ?? placementAsked(options.harness, box));
   const home = target === "home" ? agents.home.cap - agents.home.live : null;
   const gross = Math.max(0, Math.min(cap, quota, home ?? Number.POSITIVE_INFINITY));
   const deduction = options.admissionClass === "spawn" ? options.waitingCount : 0;
@@ -127,6 +138,7 @@ export function podRoom(
     why: slots > 0 ? undefined : whyOf(gross, cap, quota),
     room: { cap, quota, home },
     placedAt: target,
+    homeOnly: isHomeOnlyHarness(options.harness, box),
   };
 }
 
@@ -157,16 +169,12 @@ export function podNeedReason(
     `live ${agents.live} of cap ${agents.cap} (${agents.reserve} kept for people), ` +
     `quota ${agents.quota.used}/${agents.quota.hard}, home ${agents.home.live}/${agents.home.cap}`;
   const why = room.why === undefined ? "" : ` — ${WHY_SENTENCE[room.why]}`;
-  return `${room.slots} new ${harness} session(s) fit; ${need} needed (${figures})${why}${homePlacementClause(agents, harness, room)}`;
+  return `${room.slots} new ${harness} session(s) fit; ${need} needed (${figures})${why}${homePlacementClause(agents, room)}`;
 }
 
 /** Said only when the pod goes home although the harness could use the pool: the home cap binds it, and why. */
-function homePlacementClause(
-  agents: BrokerAgentsSnapshot,
-  harness: Harness,
-  room: PodRoom,
-): string {
-  if (room.placedAt !== "home" || isHomeOnlyHarness(harness)) {
+function homePlacementClause(agents: BrokerAgentsSnapshot, room: PodRoom): string {
+  if (room.placedAt !== "home" || room.homeOnly) {
     return "";
   }
   return agents.placement.forced === "home"
@@ -215,18 +223,23 @@ export function podCapacitySnapshot(input: {
   admissionClass: CapacityClass;
   waiting?: WaitingQueue;
   now?: Date;
+  /** This box's facts for the whole answer; default: read once, now. */
+  boxFacts?: BoxFacts;
 }): PodCapacitySnapshot {
   const waiting = input.waiting ?? NO_WAITING;
+  // ONE read for the whole answer: a release-pins file flipping mid-answer must not split it.
+  const box = input.boxFacts ?? readBoxFacts();
   const rooms = perHarness((harness) =>
     podRoom(input.agents, {
       harness,
       admissionClass: input.admissionClass,
       waitingCount: waiting.count,
+      box,
     }),
   );
   const interactive = perHarness(
     (harness) =>
-      podRoom(input.agents, { harness, admissionClass: "interactive", waitingCount: 0 }).slots,
+      podRoom(input.agents, { harness, admissionClass: "interactive", waitingCount: 0, box }).slots,
   );
   const freeSlots = perHarness((harness) => rooms[harness].slots);
   return {

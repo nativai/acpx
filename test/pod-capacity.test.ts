@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { type BrokerAgentRequest, ensureAgentPod, getAgents } from "../src/pod/broker-client.js";
+import { isHomeOnlyHarness, readBoxFacts } from "../src/pod/home-only.js";
 import { podCapacitySnapshot, podRoom, WAITING_LINE_FACTOR } from "../src/pod/pod-capacity.js";
 import { waitingLineRefusal, waitingLineRefusalError } from "../src/pod/waiting-line.js";
 import { serializeSessionRecordForDisk } from "../src/session/persistence/serialize.js";
@@ -917,4 +918,47 @@ test("K3: the pod-plane `admission_busy` token carries the REAL count of waiting
   writeRecord(none, "wake-k3", CLAUDE);
   const quiet = await wake(none, await refusedUrl(), "wake-k3");
   assert.match(quiet.stderr.split("\n")[0], /queued_ahead=0$/u);
+});
+
+// P1 (brick e9f71106, contract §2 amended; W3 polls `acpx capacity --agent pi --format json` on staging's
+// control): the capacity answer reads the box with the SAME reader and precedence as a session's placement,
+// so a release-pins file flip moves `placedAt.pi` at the next poll — and it agrees with what a session of the
+// same env is asked to be placed (`isHomeOnlyHarness(readBoxFacts(env))`, the reader `sessionTarget` calls).
+test("P1: capacity and placement agree after a file flip — `placedAt.pi` follows the release-pins file home → pool → home; the env wins over it", async () => {
+  const f = makeBox({ requestMib: 4000 });
+  const file = path.join(f.root, "pi-placement");
+  const broker = await BROKER({ live: 3, cap: 10 });
+  try {
+    const poll = async (extra: NodeJS.ProcessEnv = {}) => {
+      const env = { ...podEnv(f, broker.url), ACPX_TEST_PI_PLACEMENT_FILE: file, ...extra };
+      const run = await runCli(["--format", "json", "capacity", "--agent", "pi"], env, f.root);
+      assert.equal(run.code, 0, run.stderr);
+      const capacityPlaced = (lastJson(run.stdout).placedAt as Json).pi;
+      const sessionAsked = isHomeOnlyHarness(
+        "pi",
+        readBoxFacts(env, () => {}),
+      )
+        ? "home"
+        : "auto";
+      // The broker's pool is ready, so `auto` lands on the pool: the two must name the same place.
+      assert.equal(
+        capacityPlaced,
+        sessionAsked === "home" ? "home" : "pool",
+        "capacity vs placement",
+      );
+      return capacityPlaced;
+    };
+    const seen: unknown[] = [];
+    for (const value of ["home\n", "pool\n", "home\n"]) {
+      fs.writeFileSync(file, value);
+      seen.push(await poll());
+    }
+    assert.deepEqual(seen, ["home", "pool", "home"]);
+    fs.writeFileSync(file, "pool\n");
+    assert.equal(await poll({ ACPX_PI_PLACEMENT: "home" }), "home", "the env wins over the file");
+    fs.rmSync(file);
+    assert.equal(await poll(), "home", "no file: home");
+  } finally {
+    await broker.close();
+  }
 });
