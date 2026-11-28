@@ -55,6 +55,9 @@ export async function sessionContextFromRecord(
     seatOrdinal: record.holderOrdinal ?? null,
     parentSeatId: record.parentSeatId ?? null,
     ...principalContextFields(record.metadata),
+    // P1 (F-W1-2): placed AFTER the principal spread — `test/principal-env.test.ts` requires the spread
+    // within four lines of `seatId`.
+    piResumeSessionId: record.acpSessionId || null,
     osChoice: record.metadata?.atrium_os ?? null,
     osPrimerError: record.metadata?.atrium_os_primer_error ?? null,
   };

@@ -16,6 +16,7 @@ import {
   isRetryablePromptError,
   normalizeOutputError,
 } from "../../acp/error-normalization.js";
+import { stampPiTranscriptWatermark } from "../../acp/harness-config-dir.js";
 import {
   injectionAbsorbsIntoActiveTurn,
   injectionReturnsTerminalResponse,
@@ -37,6 +38,7 @@ import {
   isModelFloorUnmetError,
   isSessionResumeRequiredError,
   PermissionPromptUnavailableError,
+  PiSessionStoreUnwritableError,
   SessionClosedError,
   SessionCwdMissingError,
   SessionMaterialisationError,
@@ -650,6 +652,24 @@ function readSteerBoundaryUuid(
 }
 
 function deliveryErrorFrom(error: unknown): DeliveryEventError {
+  // P1 (brick e9f71106, ruling row (a), sub-HoD decision A 2026-11-28; O-7): the Pi owner refused to start
+  // because the box's Pi session store cannot be written. pi was never spawned, so the prompt never reached the
+  // model: that is the CONTRACTED turn-start terminal (`turnStartTerminals`, not delivered, resend-safe,
+  // definitive, sender told), with the refusal named in its message — atrium shows the sender that message
+  // (`senderNotify.ts`: "could not be delivered (<reason>)"). ⚠️ Its own detailCode would be a code atrium has
+  // no outcome row for, i.e. "outcome unknown — resending may duplicate it". ⚠️ The SAME terminal at a
+  // sleeping session's FIRST WAKE (O-7): there the refusal arrives wrapped in `SessionMaterialisationError`
+  // (`reconnect.ts` `connectAndLoadSession`, which also restores the sleeping record — the wrap stays, it is
+  // what keeps `wakeRefused` true). ONLY this one wrapped error is looked through; every other materialisation
+  // failure keeps `SESSION_MATERIALISATION_FAILED`. Rows: `test/pi-session-store-fail-closed.test.ts`.
+  const piStoreRefusal = piStoreRefusalOf(error);
+  if (piStoreRefusal) {
+    return {
+      code: 0,
+      message: `${QUEUE_TURN_START_FAILED_MESSAGE}: ${piStoreRefusal.name}: ${piStoreRefusal.message}`,
+      detailCode: QUEUE_TURN_START_FAILED_DETAIL_CODE,
+    };
+  }
   const normalized = normalizeOutputError(error, { origin: "runtime" });
   return {
     code: normalized.acp?.code ?? 0,
@@ -659,6 +679,17 @@ function deliveryErrorFrom(error: unknown): DeliveryEventError {
       ? { effectiveAccount: normalized.effectiveAccount.effectiveAccount }
       : {}),
   };
+}
+
+/** `PiSessionStoreUnwritableError` itself, or as the one error a first wake's materialisation wrapped. */
+function piStoreRefusalOf(error: unknown): PiSessionStoreUnwritableError | undefined {
+  if (error instanceof PiSessionStoreUnwritableError) {
+    return error;
+  }
+  return error instanceof SessionMaterialisationError &&
+    error.wrapped instanceof PiSessionStoreUnwritableError
+    ? error.wrapped
+    : undefined;
 }
 
 // brick a0182aed (TE F1, F3) — the owner's custody sweep settles a deferred copy of an id as delivered once ANOTHER
@@ -4996,6 +5027,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // selection keeps the session on this subscription for an hour from here. The
     // acpxState re-sync below carries it into the persisted write.
     stampLastTurnSubscription(record);
+    // P1 (brick e9f71106, ruling row (c)): the pi JSONL's length at this COMPLETED turn — a fork's floor. The
+    // clone just below is what the persisted write is based on, so it must carry the field (it does).
+    stampPiTranscriptWatermark(record);
     // Served-truth surface (brick://07dd62c9): stamp what the harness ACTUALLY
     // served this turn (last assistant.message.model + derived effort) onto the
     // LIVE `acpx.served` block — never the desired pin. Best-effort; no-op for

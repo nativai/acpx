@@ -69,6 +69,12 @@ export const SESSION_MATERIALISATION_FAILED_DETAIL_CODE = "SESSION_MATERIALISATI
 
 export class SessionMaterialisationError extends AcpxOperationalError {
   readonly sessionId: string;
+  /**
+   * The error the wake failed with, kept as a plain field (NOT `cause`, see below) so the delivery terminal can
+   * tell ONE case apart: P1's `PiSessionStoreUnwritableError` ends on the same terminal at a first wake as on a
+   * later turn (`runtime.ts` `deliveryErrorFrom`). Every other wrapped error keeps this code.
+   */
+  readonly wrapped: unknown;
 
   // ⚠️ NO `cause` option: the output normalizer would surface the cause's bare message instead of this
   // one. The cause's own text is quoted below.
@@ -84,6 +90,7 @@ export class SessionMaterialisationError extends AcpxOperationalError {
       },
     );
     this.sessionId = sessionId;
+    this.wrapped = cause;
   }
 }
 
@@ -245,6 +252,70 @@ export class SourceTranscriptMissingError extends AcpxOperationalError {
       `${subject} cannot be copied: ${what}. Start a fresh successor: acpx sessions new --from ` +
         `${params.sessionId ?? "<id>"}.`,
       { outputCode: "RUNTIME", detailCode: "SOURCE_TRANSCRIPT_MISSING", origin: "runtime" },
+    );
+  }
+}
+
+/**
+ * P1 (brick e9f71106, ruling row (a)) — the box's Pi session store cannot be written, so pi is NOT started.
+ * Thrown from the launch plan, before the per-session `/tmp/acpx-pi-<id>` dir exists and before any spawn.
+ *
+ * ⚠️ DO NOT "DEGRADE" THIS BACK INTO UNSETTING `PI_CODING_AGENT_SESSION_DIR`. That was the old behaviour and it
+ * looks kinder: pi then writes its JSONL into the per-session temp dir, which on a pool pod dies with the pod —
+ * a lost transcript that nothing reports. In a queued turn this ends the delivery `QUEUE_TURN_START_FAILED`
+ * (never reached the model, resend-safe, sender told); the message text carries `PI_SESSION_STORE_UNWRITABLE`.
+ * Rows: `test/pi-session-store-fail-closed.test.ts`.
+ */
+export const PI_SESSION_STORE_UNWRITABLE_DETAIL_CODE = "PI_SESSION_STORE_UNWRITABLE";
+
+export class PiSessionStoreUnwritableError extends AcpxOperationalError {
+  readonly sessionDir: string;
+
+  constructor(params: { sessionDir: string; cause?: unknown }) {
+    const why = params.cause instanceof Error ? params.cause.message : "unknown error";
+    super(
+      `${PI_SESSION_STORE_UNWRITABLE_DETAIL_CODE}: the box's Pi session store ${params.sessionDir} cannot be ` +
+        `written (${why}); pi was not started, so no transcript is written anywhere else. Check that this ` +
+        `pod mounts the box's pi-home read-write.`,
+      {
+        cause: params.cause instanceof Error ? params.cause : undefined,
+        outputCode: "RUNTIME",
+        detailCode: PI_SESSION_STORE_UNWRITABLE_DETAIL_CODE,
+        origin: "runtime",
+        retryable: false,
+      },
+    );
+    this.sessionDir = params.sessionDir;
+  }
+}
+
+/**
+ * P1 (brick e9f71106, ruling row (c)) — a fork of a Pi session whose source pi JSONL, as THIS pod sees it, is
+ * shorter than the source's owner recorded at its last completed turn (`acpx.pi_transcript_bytes`). On a pool
+ * box the source can live in a pod on another machine whose writes this machine's NFS client has not seen yet;
+ * pi-acp, spawned in this same pod, would fork from that short read while acpx's record looks whole. Refused
+ * before the adapter forks.
+ */
+export const PI_FORK_SOURCE_SHORT_READ_DETAIL_CODE = "PI_FORK_SOURCE_SHORT_READ";
+
+export class PiForkSourceShortReadError extends AcpxOperationalError {
+  constructor(params: {
+    sessionId: string;
+    path: string | undefined;
+    recordedBytes: number;
+    fileBytes: number;
+  }) {
+    super(
+      `${PI_FORK_SOURCE_SHORT_READ_DETAIL_CODE}: the Pi transcript of session ${params.sessionId} ` +
+        `(${params.path ?? "not found in the box store"}) holds ${params.fileBytes} bytes here, but its ` +
+        `owner recorded ${params.recordedBytes} at its last completed turn; the fork was not made. Retry ` +
+        `once the source's writes are visible on this machine.`,
+      {
+        outputCode: "RUNTIME",
+        detailCode: PI_FORK_SOURCE_SHORT_READ_DETAIL_CODE,
+        origin: "runtime",
+        retryable: false,
+      },
     );
   }
 }

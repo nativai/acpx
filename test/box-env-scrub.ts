@@ -106,6 +106,16 @@ export const NO_ENTITLEMENT_FETCH_ENV = "ACPX_NO_OPENROUTER_ENTITLEMENT_FETCH";
 export const NOTICE_DELIVERY_DEAD_ORIGIN = "http://127.0.0.1:9";
 
 /**
+ * P1 (brick e9f71106, contract §2 amended) — the control reads the Pi placement from the release-pins
+ * ConfigMap file `/etc/nativai/release-pins/pi-placement` when `ACPX_PI_PLACEMENT` is absent. That file is
+ * BOX state: once a box opts in, every placement row that expects "home" would read `pool` from it. The
+ * suite points the seam (honoured only under `NODE_TEST_CONTEXT`) at a path that does not exist; a row that
+ * wants a file writes its own and sets the seam (`test/pod-home-only.test.ts`).
+ */
+export const PI_PLACEMENT_FILE_SEAM_ENV = "ACPX_TEST_PI_PLACEMENT_FILE";
+export const NO_PI_PLACEMENT_FILE = "/nonexistent/acpx-test/pi-placement";
+
+/**
  * Delete every box-level `ACPX_PI_*` override and every session-identity variable
  * from `env`, and set the no-network guards and the no-runtime-info seam above. Returns the names removed (sorted)
  * so a caller can assert on what actually happened rather than on the absence of a
@@ -195,6 +205,7 @@ export function scrubBoxHarnessEnvOverrides(env: NodeJS.ProcessEnv = process.env
   env[NO_ENTITLEMENT_FETCH_ENV] = "1";
   env.ACPX_UI_INTERNAL_URL = NOTICE_DELIVERY_DEAD_ORIGIN;
   env[RUNTIME_INFO_PATH_ENV] = NO_RUNTIME_INFO_PATH;
+  env[PI_PLACEMENT_FILE_SEAM_ENV] = NO_PI_PLACEMENT_FILE;
   env[OS_COMPAT_LINK_ENV] = NO_OS_COMPAT_LINK_PATH;
   env[POD_SA_DIR_ENV] = NO_POD_SA_DIR;
   return removed.toSorted();

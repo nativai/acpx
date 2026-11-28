@@ -534,6 +534,12 @@ export type AgentSessionContext = {
    */
   seatId?: string | null;
   /**
+   * P1 (brick e9f71106, F-W1-2) — the pi session this spawn will RESUME (the record's `acpSessionId`), so the
+   * config-dir writer can check that ITS transcript in the box store is writable before pi starts. `null` for
+   * a spawn that creates a new session. Never reaches the adapter's environment.
+   */
+  piResumeSessionId?: string | null;
+  /**
    * The PARENT's seat id — composed into ACPX_PARENT_SEAT_URL exactly as
    * parentSessionId/parentSessionUrl are composed into
    * ACPX_PARENT_SESSION_URL. Unlike parentSessionUrl there is no separate

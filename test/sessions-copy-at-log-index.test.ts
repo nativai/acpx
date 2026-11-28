@@ -1499,3 +1499,146 @@ test("15252af6 through the CLI: the byway copy sends the main-chain uuid as resu
     assert.equal(entryId(copied.log.at(-1)), "u2");
   });
 });
+
+// ── P1 (brick e9f71106, ruling row (c)): a Pi source whose log reads SHORT ───────────────────────
+//
+// On a pool box the source can be live in a pod on ANOTHER machine; this machine's NFS client can then read
+// a log shorter than the record's `messages_log.bytes`. Every Pi copy — copy-all (no `--expect-entry`: atrium
+// sends none), a cut at a completed turn (atrium's `--at-log-index n --expect-entry`) — is refused by name
+// (FORK_SOURCE_SHORT_READ), never copied from the short read. The source command is a pi-acp path that does
+// not exist: the refusal must come before any adapter spawn, and the asserted CODE is what tells it apart
+// from a spawn failure.
+const PI_SOURCE = "node /nonexistent/pi-acp/dist/index.js";
+
+async function shortenSourceLog(homeDir: string, id: string, keepLines: number): Promise<void> {
+  const logPath = path.join(homeDir, ".acpx", "sessions", `${id}.messages.ndjson`);
+  const kept = (await fs.readFile(logPath, "utf8")).split("\n").slice(0, keepLines);
+  await fs.writeFile(logPath, `${kept.join("\n")}\n`, "utf8");
+}
+
+test("P1 (c): a Pi source whose log reads shorter than its record is refused FORK_SOURCE_SHORT_READ — copy-all and a cut alike, no record created", async () => {
+  await withTempHome("acpx-p1c-short-", async (homeDir) => {
+    const source: Source = {
+      id: "p1c-short",
+      agentCommand: PI_SOURCE,
+      cwd: path.join(homeDir, "workspace"),
+      logLines: lines(conversation(0, 12)),
+    };
+    await writeSource(homeDir, source);
+    await shortenSourceLog(homeDir, source.id, 8);
+    const agentAt = (position: number) =>
+      `agent:${createHash("sha1")
+        .update(JSON.stringify(agent(`reply ${position}`)), "utf8")
+        .digest("hex")}`;
+    for (const extra of [
+      [],
+      ["--at-log-index", "6", "--expect-entry", agentAt(5)],
+      ["--at-log-index", "12", "--expect-entry", agentAt(11)],
+    ]) {
+      // 6 lies INSIDE the short read: without the size check its entry still matches and the copy goes
+      // through on a read the record says is incomplete.
+      const refused = await copyFails(homeDir, source, extra);
+      const line = refused.stderr
+        .split("\n")
+        .find((l) => l.includes('"code":"FORK_SOURCE_SHORT_READ"'));
+      assert.ok(
+        line,
+        `${extra.join(" ") || "copy-all"}: no FORK_SOURCE_SHORT_READ: ${refused.stderr}`,
+      );
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      assert.equal(parsed.session, source.id);
+      assert.ok(Number(parsed.file_bytes) < Number(parsed.recorded_bytes));
+    }
+  });
+});
+
+test("P1 (c): a Pi cut whose entry differs from the expected one is refused FORK_CUT_MOVED — no record created", async () => {
+  await withTempHome("acpx-p1c-moved-", async (homeDir) => {
+    const source: Source = {
+      id: "p1c-moved",
+      agentCommand: PI_SOURCE,
+      cwd: path.join(homeDir, "workspace"),
+      logLines: lines(conversation(0, 12)),
+    };
+    await writeSource(homeDir, source);
+    const refused = await copyFails(homeDir, source, [
+      "--at-log-index",
+      "6",
+      "--expect-entry",
+      "user:u-2",
+    ]);
+    assert.match(refused.stderr, /"code":"FORK_CUT_MOVED"/);
+  });
+});
+
+// ── P1 (brick e9f71106, ruling row (c)): the Pi transcript's own length floor (`acpx.pi_transcript_bytes`) ──
+//
+// acpx's messages log can be whole while pi's JSONL — what pi-acp forks from, in the fork's own pod — still
+// reads short on this machine. The source's owner records the JSONL's length at each completed turn; a fork
+// refuses PI_FORK_SOURCE_SHORT_READ when the file it can see is shorter. A source with NO floor (every record
+// before this acpx) forks exactly as before. The source is a pi-CLASSIFIED mock (the mock under a `pi-acp/`
+// path), so the real copy path — record, adapter spawn, `session/fork` — runs.
+async function piForkMock(homeDir: string): Promise<string> {
+  const dir = path.join(homeDir, "bin", "pi-acp");
+  await fs.mkdir(dir, { recursive: true });
+  const link = path.join(dir, "mock-agent.js");
+  await fs.symlink(MOCK_AGENT_PATH, link).catch(() => undefined);
+  return `node ${JSON.stringify(link)} --supports-fork-session`;
+}
+
+async function setPiFloor(homeDir: string, id: string, bytes: number): Promise<void> {
+  const file = path.join(homeDir, ".acpx", "sessions", `${id}.json`);
+  const raw = JSON.parse(await fs.readFile(file, "utf8")) as { acpx?: Record<string, unknown> };
+  raw.acpx = { ...raw.acpx, pi_transcript_bytes: bytes };
+  await fs.writeFile(file, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+}
+
+async function writePiTranscript(homeDir: string, source: Source, bytes: number): Promise<void> {
+  const slug = `--${source.cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+  const dir = path.join(homeDir, ".pi", "agent", "sessions", slug);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(
+    path.join(dir, `2026-11-28T00-00-00_acp-${source.id}.jsonl`),
+    "x".repeat(bytes),
+  );
+}
+
+test("P1 (c) pi JSONL: a source with NO recorded floor (any record before this acpx) copies exactly as before — even with no pi transcript in sight", async () => {
+  await withTempHome("acpx-p1c-nofloor-", async (homeDir) => {
+    const source: Source = {
+      id: "p1c-nofloor",
+      agentCommand: await piForkMock(homeDir),
+      cwd: path.join(homeDir, "workspace"),
+      logLines: lines(conversation(0, 6)),
+    };
+    await writeSource(homeDir, source);
+    const all = await copy(homeDir, source, []);
+    assert.equal(all.record.forked_at_message_index, 6);
+    const cut = await copy(homeDir, source, ["--at-log-index", "5", "--expect-entry", "user:u-4"]);
+    assert.ok(cut.id);
+  });
+});
+
+test("P1 (c) pi JSONL: a source whose transcript reads shorter than its floor, or is missing, is refused PI_FORK_SOURCE_SHORT_READ — no record; a whole one copies", async () => {
+  await withTempHome("acpx-p1c-floor-", async (homeDir) => {
+    const source: Source = {
+      id: "p1c-floor",
+      agentCommand: await piForkMock(homeDir),
+      cwd: path.join(homeDir, "workspace"),
+      logLines: lines(conversation(0, 6)),
+    };
+    await writeSource(homeDir, source);
+    await setPiFloor(homeDir, source.id, 500);
+    // Missing: nothing in the box store for this session.
+    const missing = await copyFails(homeDir, source, []);
+    assert.match(missing.stdout + missing.stderr, /PI_FORK_SOURCE_SHORT_READ/);
+    // Short: the other machine wrote 500 bytes, this one sees 400.
+    await writePiTranscript(homeDir, source, 400);
+    const short = await copyFails(homeDir, source, []);
+    assert.match(short.stdout + short.stderr, /PI_FORK_SOURCE_SHORT_READ/);
+    // Positive control on the same source: the whole file (and more — the source kept appending) copies.
+    await writePiTranscript(homeDir, source, 512);
+    const whole = await copy(homeDir, source, []);
+    assert.equal(whole.record.forked_at_message_index, 6);
+  });
+});

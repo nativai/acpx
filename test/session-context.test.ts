@@ -24,7 +24,7 @@ import { withTempHome } from "./temp-home.js";
  * The fields added on top of the merge — not part of the pre-merge literal: P3a's OS fields and brick fac2128a's
  * `seatNameGeneric` (its values are pinned in `test/seat-name-generic.test.ts`).
  */
-const NEW_FIELDS = ["osChoice", "osPrimerError", "seatNameGeneric"] as const;
+const NEW_FIELDS = ["osChoice", "osPrimerError", "seatNameGeneric", "piResumeSessionId"] as const;
 
 function withoutNewFields(context: Record<string, unknown>): Record<string, unknown> {
   const copy = { ...context };

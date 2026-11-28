@@ -1,4 +1,5 @@
 import type { AcpClient, SessionCreateResult, SessionForkResult } from "../../acp/client.js";
+import { assertPiForkSourceComplete } from "../../acp/harness-config-dir.js";
 import { withTimeout } from "../../async-control.js";
 import {
   readFullSourceHistory,
@@ -72,6 +73,9 @@ export async function forkTemplateForSleepingSession(params: {
   }
   const messages = (await readFullSourceHistory(template)).messages;
   const forkAtMessageIndex = messages.length;
+  if (forkAtMessageIndex > 0) {
+    assertPiForkSourceComplete(template); // P1 (ruling row (c)), before the adapter forks
+  }
   // The first wake is the moment this session is created, so its cwd goes through the session-root
   // helper like every other create site. The sleeping create already rooted `record.cwd`, so on an
   // unchanged box this is the same path (the record is left untouched, so a failed wake stays
@@ -147,6 +151,7 @@ export async function forkCutForSleepingSession(params: {
     atLogIndex: params.cut.log_index ?? params.cut.message_index,
     expectEntry: params.cut.expect_entry,
   });
+  assertPiForkSourceComplete(source); // P1 (ruling row (c)), before the adapter forks
   const forked = await withTimeout(
     params.client.forkSession(source.acpSessionId, cwd, {
       atIndex: window.logIndex,

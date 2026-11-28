@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import fs from "node:fs/promises";
 import { InvalidArgumentError } from "commander";
 import {
   assertForkAtIndexHonoured,
@@ -66,6 +67,37 @@ export class ForkCutMovedError extends Error {
   }
 }
 
+export const FORK_SOURCE_SHORT_READ = "FORK_SOURCE_SHORT_READ";
+
+/**
+ * P1 (brick e9f71106, ruling row (c)): the source's messages log on disk is SHORTER than the record says it
+ * is (`messages_log.bytes`). On a pool box the source can be live in a pod on ANOTHER machine, whose writes
+ * this machine's NFS client may not see yet; the reader clamps to the file (`readMessagesLogEntries`), so
+ * without this check a fork inherits a silently shorter history — a copy that differs, which the ruling calls
+ * a RED. Refused by name instead, like {@link ForkCutMovedError}, before any record exists.
+ *
+ * ⚠️ DO NOT relax this to "read what is there, it is only the tail". A copy-all sends no `--expect-entry`
+ * (atrium `server/forkCut.ts`), so this is the ONLY check a copy-all has. Rows:
+ * `test/fork-source-short-read.test.ts`.
+ */
+export class ForkSourceShortReadError extends Error {
+  readonly detailCode = FORK_SOURCE_SHORT_READ;
+  readonly stderrLine: string;
+
+  constructor(details: { sessionId: string; recordedBytes: number; fileBytes: number }) {
+    super(
+      JSON.stringify({
+        code: FORK_SOURCE_SHORT_READ,
+        session: details.sessionId,
+        recorded_bytes: details.recordedBytes,
+        file_bytes: details.fileBytes,
+      }),
+    );
+    this.name = "ForkSourceShortReadError";
+    this.stderrLine = this.message;
+  }
+}
+
 export type LogIndexForkWindow = {
   /** The absolute position the copy ACTUALLY ends at (after a harness's snap). */
   logIndex: number;
@@ -108,14 +140,36 @@ async function readSourceLogEntries(
   endByte: number,
 ): Promise<{ messages: SessionMessage[]; rawLines: string[] }> {
   if (!isArchivedRecord(source)) {
-    return await readMessagesLogEntries(
-      messagesLogPath(sessionBaseDir(), source.acpxRecordId),
-      endByte,
-    );
+    const logPath = messagesLogPath(sessionBaseDir(), source.acpxRecordId);
+    await assertSourceLogNotShort(source.acpxRecordId, logPath, endByte);
+    return await readMessagesLogEntries(logPath, endByte);
   }
   const archiveDir = sessionArchiveDirFor(sessionBaseDir());
   const read = await readArchivedFileVerified(archiveDir, messagesLogFileName(source.acpxRecordId));
   return read ? messagesLogEntriesFromBuffer(read.bytes, endByte) : { messages: [], rawLines: [] };
+}
+
+/** {@link ForkSourceShortReadError}: the file must hold at least the bytes the record counts. */
+async function assertSourceLogNotShort(
+  sessionId: string,
+  logPath: string,
+  recordedBytes: number,
+): Promise<void> {
+  if (recordedBytes <= 0) {
+    return;
+  }
+  const fileBytes = await fs.stat(logPath).then(
+    (stat) => stat.size,
+    (error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") {
+        return 0;
+      }
+      throw error;
+    },
+  );
+  if (fileBytes < recordedBytes) {
+    throw new ForkSourceShortReadError({ sessionId, recordedBytes, fileBytes });
+  }
 }
 
 /**

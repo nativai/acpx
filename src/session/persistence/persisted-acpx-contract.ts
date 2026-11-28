@@ -145,6 +145,7 @@ export const PERSISTED_ACPX_SENTINEL = {
   },
   harness_config_dir: "/tmp/sentinel-harness-config-dir",
   pi_session_dir: "/tmp/sentinel-pi-session-dir",
+  pi_transcript_bytes: 424242,
   model_set_unsupported_for: "sentinel-model-set-unsupported",
   depth_projection: {
     requested: "sentinel-depth-requested",
