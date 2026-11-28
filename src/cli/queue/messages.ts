@@ -3,6 +3,7 @@ import type { EffectiveAccountMetadata } from "../../acp/auth-env.js";
 import { effectiveAccountMetadataFromValue } from "../../acp/error-normalization.js";
 import { toAcpErrorPayload } from "../../acp/error-shapes.js";
 import { isAcpJsonRpcMessage } from "../../acp/jsonrpc.js";
+import { ADMISSION_CLASSES, type AdmissionClass } from "../../capacity/ledger.js";
 import { isPromptInput, textPrompt } from "../../prompt-content.js";
 import {
   OUTPUT_ERROR_CODES,
@@ -51,6 +52,10 @@ export type QueueSubmitRequest = {
   // Keep-warm-while-engaged: when set, the running owner adopts this as its new
   // idle TTL (ms; 0 = keep alive forever). Absent => leave the owner's TTL as-is.
   ttlMs?: number;
+  // The caller's declared admission class (`declaredAdmissionClass()`), carried so the OWNER can
+  // tell a person's turn from an agent's (the person keep, order 1). Absent = none declared. An
+  // owner of an older build ignores the field.
+  admissionClass?: AdmissionClass;
 };
 
 /**
@@ -97,6 +102,8 @@ export type QueueSubmitPromptBatchRequest = {
   codexSubscriptionCapWeeklyPercent?: number;
   sessionOptions?: QueueSessionOptions;
   ttlMs?: number;
+  /** One class for the whole call (one acpx process declares one): the members' highest. */
+  admissionClass?: AdmissionClass;
   /** Always false: a batch has no caller streaming its turn. */
   waitForCompletion: false;
 };
@@ -769,6 +776,7 @@ function parseSubmitRequest(
     waitForCompletion: parsed.waitForCompletion,
     ...(parsed.sessionOptions !== undefined ? { sessionOptions: parsed.sessionOptions } : {}),
     ...(parsed.ttlMs !== undefined ? { ttlMs: parsed.ttlMs } : {}),
+    ...definedFields({ admissionClass: parsed.admissionClass }),
   };
 }
 
@@ -787,7 +795,19 @@ type ParsedSubmitRequestFields = Pick<
   | "waitForCompletion"
   | "sessionOptions"
   | "ttlMs"
+  | "admissionClass"
 >;
+
+/**
+ * The declared admission class, or undefined. LENIENT on purpose, unlike every field around it: an
+ * unknown or malformed value is "no class", never `QUEUE_REQUEST_INVALID` — a class the owner does not
+ * understand must not cost the caller its prompt, and "no class" is the side that gets no keep.
+ */
+function parseAdmissionClass(value: unknown): AdmissionClass | undefined {
+  return (ADMISSION_CLASSES as readonly unknown[]).includes(value)
+    ? (value as AdmissionClass)
+    : undefined;
+}
 
 function parseSubmitRequestFields(
   request: Record<string, unknown>,
@@ -812,6 +832,7 @@ function parseSubmitRequestFields(
       typeof request.waitForCompletion === "boolean" ? request.waitForCompletion : null,
     sessionOptions: parseSessionOptions(request.sessionOptions),
     ttlMs: parseNonNegativeInteger(request.ttlMs),
+    admissionClass: parseAdmissionClass(request.admissionClass),
   };
   if (Object.values(parsed).some((value) => value === null)) {
     return null;
@@ -849,6 +870,7 @@ function parseSubmitPromptBatchRequest(
       codexSubscriptionCapWeeklyPercent: call.codexSubscriptionCapWeeklyPercent,
       sessionOptions: call.sessionOptions,
       ttlMs: call.ttlMs,
+      admissionClass: call.admissionClass,
     }),
     waitForCompletion: false,
   };

@@ -73,6 +73,32 @@ export function normalizeOwnerIdleReleaseMs(value: number | undefined): number {
   return Math.round(value);
 }
 
+// Person keep: how long a POOL-pod owner stays warm after the end of the last turn a PERSON's message
+// started (admission class `interactive`), instead of the 5-min idle release. Daniel's order 1
+// (2026-11-28): the DEFAULT lives here, in acpx, so it arrives with the version a box takes — a box
+// that wants another value sets ACPX_OWNER_PERSON_KEEP_MS (ms) on its pool pod; 0 = today's behaviour.
+export const DEFAULT_OWNER_PERSON_KEEP_MS = 3_600_000; // 60 min
+
+/**
+ * The person keep (ms) from the env value, read once at owner start like ACPX_OWNER_IDLE_RELEASE_MS.
+ * Unset/empty → the default; `0` → disabled; anything else that is not a non-negative finite number →
+ * the default, with `onInvalid` called so the owner can warn on stderr (the knob never fails silently).
+ */
+export function normalizeOwnerPersonKeepMs(
+  raw: string | undefined,
+  onInvalid?: (raw: string) => void,
+): number {
+  if (raw == null || raw.trim() === "") {
+    return DEFAULT_OWNER_PERSON_KEEP_MS;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) {
+    onInvalid?.(raw);
+    return DEFAULT_OWNER_PERSON_KEEP_MS;
+  }
+  return Math.round(value);
+}
+
 export type RunOnceOptions = {
   agentCommand: string;
   agentName?: string;

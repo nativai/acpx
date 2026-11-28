@@ -2,6 +2,7 @@ import { stat } from "node:fs/promises";
 import net from "node:net";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
 import { normalizeOutputError } from "../../acp/error-normalization.js";
+import type { AdmissionClass } from "../../capacity/ledger.js";
 import { recordPerfDuration } from "../../perf-metrics.js";
 import { textPrompt } from "../../prompt-content.js";
 import { CONSUMED_BEFORE_CUT } from "../../session/delivery-consumption.js";
@@ -391,6 +392,9 @@ export type QueueTask = {
   // submit request; the owner runtime adopts it as its new idle TTL. Absent =>
   // leave the owner's TTL unchanged.
   ttlMs?: number;
+  // The caller's declared admission class, from the submit request (absent = none declared). The
+  // owner reads it in ONE place: the person keep (`interactive`, order 1).
+  admissionClass?: AdmissionClass;
   enqueuedAt: number;
   send: (message: QueueOwnerMessage) => void;
   close: () => void;
@@ -1500,6 +1504,7 @@ export class SessionQueueOwner {
       sessionOptions: request.sessionOptions,
       waitForCompletion: request.waitForCompletion,
       ttlMs: request.ttlMs,
+      admissionClass: request.admissionClass,
       enqueuedAt,
       submissionId: request.requestId,
       ...io,

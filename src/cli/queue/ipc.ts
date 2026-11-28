@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { SetSessionConfigOptionResponse } from "@agentclientprotocol/sdk";
+import { declaredAdmissionClass } from "../../capacity/admission.js";
+import type { AdmissionClass } from "../../capacity/ledger.js";
 import { QueueConnectionError, QueueProtocolError } from "../../errors.js";
 import { incrementPerfCounter } from "../../perf-metrics.js";
 import { classifyRecordedIdentity, identityScope } from "../../process-identity.js";
@@ -562,6 +564,19 @@ function handleSubmitQueueOwnerMessage(
   handleAcknowledgedSubmitMessage(message, controls, options.outputFormatter);
 }
 
+/**
+ * The caller's declared admission class, for the request's one optional field (`admissionClass`). It is
+ * the value `takeAdmissionClassFromEnv` captured at CLI start — never the environment, which acpx has
+ * emptied by now, so a class cannot be inherited from a caller's shell: a prompt an AGENT sends with
+ * `acpx` from its own shell carries none, whoever started the agent's turn. In an agent pod the in-pod
+ * `acpx prompt` is the process that builds this request, and agent-exec forwarded the class to it
+ * (`AGX_CALLER_ENV`, `buildTransportEnv`), so the same read serves the routed path.
+ */
+function declaredClassField(): { admissionClass: AdmissionClass } | Record<string, never> {
+  const admissionClass = declaredAdmissionClass();
+  return admissionClass ? { admissionClass } : {};
+}
+
 async function submitToQueueOwner(
   owner: QueueOwnerRecord,
   options: SubmitToQueueOwnerOptions,
@@ -587,6 +602,7 @@ async function submitToQueueOwner(
     waitForCompletion: options.waitForCompletion,
     sessionOptions: options.sessionOptions,
     ...(options.ttlMs !== undefined ? { ttlMs: options.ttlMs } : {}),
+    ...declaredClassField(),
   };
 
   options.outputFormatter.setContext({
@@ -1226,6 +1242,7 @@ async function submitBatchToQueueOwner(
       : {}),
     sessionOptions: options.sessionOptions,
     waitForCompletion: false,
+    ...declaredClassField(),
   };
   options.outputFormatter.setContext({ sessionId: options.sessionId });
   const queued: SessionEnqueueResult = { queued: true, sessionId: options.sessionId, requestId };

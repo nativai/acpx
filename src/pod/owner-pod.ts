@@ -107,6 +107,17 @@ function placementOf(env: NodeJS.ProcessEnv): "pool" | "home" | undefined {
   return value === "pool" || value === "home" ? value : undefined;
 }
 
+/**
+ * The placement of THIS process's pod — `pool` or `home` — or undefined anywhere that is not an agent
+ * pod (the control pod, a workbench, a rig) and in an agent pod that does not say (`NV_AGENT_PLACEMENT`
+ * unset or not one of the two). The same fact the lease carries (`leasePodFields`), read without its
+ * identity throw: the person keep (order 1) asks only "am I in a POOL pod?" and a pod that cannot
+ * answer is not one, so it keeps today's behaviour.
+ */
+export function ownPodPlacement(env: NodeJS.ProcessEnv = process.env): "pool" | "home" | undefined {
+  return lockHostPlace(env) === "agent-pod" ? placementOf(env) : undefined;
+}
+
 /** `NV_RUNTIME_RELEASES` is the C9 object `{"<tool>":"<release>"}`; the lease names acpx's. */
 export function acpxReleaseOf(env: NodeJS.ProcessEnv): string | undefined {
   const raw = podFactValue("NV_RUNTIME_RELEASES", hostFacts(env));

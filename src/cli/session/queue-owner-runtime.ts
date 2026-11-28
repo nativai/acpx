@@ -10,7 +10,7 @@ import { defaultBoxRuntimeInfoPath } from "../../box-runtime-info.js";
 import { QueueConnectionError, SessionClosedError } from "../../errors.js";
 import { checkpointPerfMetricsCapture } from "../../perf-metrics-capture.js";
 import { incrementPerfCounter, setPerfGauge } from "../../perf-metrics.js";
-import { assertOwnerEntryInOwnPod } from "../../pod/owner-pod.js";
+import { assertOwnerEntryInOwnPod, ownPodPlacement } from "../../pod/owner-pod.js";
 import {
   createPodReleaseStalenessProbe,
   inAgentPod,
@@ -86,6 +86,7 @@ import { createBackgroundTaskTracker } from "./background-task-tracker.js";
 import {
   DEFAULT_QUEUE_OWNER_TTL_MS,
   normalizeOwnerIdleReleaseMs,
+  normalizeOwnerPersonKeepMs,
   normalizeQueueOwnerTtlMs,
   type SessionSendOptions,
 } from "./contracts.js";
@@ -891,6 +892,14 @@ export type DecideIdleOwnerReleaseInput = {
   lastTaskCompletedAt: number;
   quiescenceWindowMs: number;
   idleReleaseMs: number;
+  // Person keep (order 1): while `now - lastPersonTurnEndedAt < personKeepMs` the IDLE-MEMORY release
+  // waits, so a session a person wrote to keeps its agent past `idleReleaseMs`. Only `idle-memory` is
+  // held: the shared gate, `deploy-staleness` and every exit outside this function are untouched.
+  // `personKeepMs` 0/absent = today's behaviour (the caller passes 0 outside a pool pod).
+  personKeepMs?: number;
+  // The end of the last turn a PERSON's message started (`interactive`); undefined = none yet. A later
+  // agent or automation turn never moves it, so it can never shorten the keep.
+  lastPersonTurnEndedAt?: number;
   // brick://0c593c10 — background tasks the adapter still holds. Above zero the
   // shared gate stays CLOSED: no release for any reason, at any idle age —
   // unless the session's record is closed (`recordClosed`).
@@ -990,6 +999,55 @@ async function ownerIsIdleAndQuiescent(input: DecideIdleOwnerReleaseInput): Prom
   return input.liveBackgroundTaskCount === 0 || (await input.recordClosed());
 }
 
+/**
+ * Does the person keep hold the idle-memory release back? Yes while the last turn a person's message
+ * started ended less than `personKeepMs` ago. Measured from that turn's end alone — never from relay
+ * activity or a later agent turn, which only ever move the ordinary idle clock.
+ */
+function personKeepHolds(input: DecideIdleOwnerReleaseInput): boolean {
+  return (
+    (input.personKeepMs ?? 0) > 0 &&
+    input.lastPersonTurnEndedAt !== undefined &&
+    input.now - input.lastPersonTurnEndedAt < (input.personKeepMs ?? 0)
+  );
+}
+
+/**
+ * THE ONE PLACE THE PERSON KEEP READS A TASK'S ADMISSION CLASS (order 1, ruling 6e75a17b). The declared
+ * class decides the capacity class AND this keep, and NOTHING else — a third use goes back to the
+ * authority, not into this function's callers. Only `interactive` (atrium's word for an identified
+ * person) counts; `delivery`, `automation`, `spawn` and an ABSENT class — which is what a prompt an agent
+ * sends with `acpx` from its own shell carries, because acpx deletes the variable at CLI start — do not.
+ * ⚠️ DO NOT widen this to "anything but delivery/automation": absent is the agent's shell, and a person's
+ * turn that an agent continues must not lend its keep to the agent's own prompts.
+ * Known and accepted: an agent that sets `interactive` by hand gains one idle pod for the keep's length
+ * and no right. Pinned by test/person-keep.test.ts.
+ */
+export function startedByPerson(tasks: readonly { admissionClass?: string }[]): boolean {
+  return tasks.some((task) => task.admissionClass === "interactive");
+}
+
+/**
+ * The person keep this owner runs with, read once at owner start: `ACPX_OWNER_PERSON_KEEP_MS` (unset ⇒
+ * 60 min; 0 ⇒ off; invalid ⇒ 60 min with a stderr warning), but only in a POOL pod — told from a HOME
+ * pod by the pod's own `NV_AGENT_PLACEMENT` fact (`ownPodPlacement`, the lease's `placement`), so no
+ * manifest line is needed. Anywhere else (the control pod, a home pod, a pod that does not say) it is
+ * 0: today's behaviour.
+ */
+export function resolveOwnerPersonKeepMs(
+  env: NodeJS.ProcessEnv = process.env,
+  warn: (line: string) => void = (line) => process.stderr.write(line),
+): number {
+  if (ownPodPlacement(env) !== "pool") {
+    return 0;
+  }
+  return normalizeOwnerPersonKeepMs(env.ACPX_OWNER_PERSON_KEEP_MS, (raw) =>
+    warn(
+      `[acpx] ACPX_OWNER_PERSON_KEEP_MS=${JSON.stringify(raw)} is not a non-negative number of ms; using the default\n`,
+    ),
+  );
+}
+
 export async function decideIdleOwnerRelease(
   input: DecideIdleOwnerReleaseInput,
 ): Promise<IdleOwnerReleaseDecision> {
@@ -1011,7 +1069,8 @@ export async function decideIdleOwnerRelease(
   if (
     input.idleReleaseMs > 0 &&
     input.now - Math.max(input.lastTaskCompletedAt, input.lastIdleDrainActivityAt) >=
-      input.idleReleaseMs
+      input.idleReleaseMs &&
+    !personKeepHolds(input)
   ) {
     return { release: true, reason: "idle-memory" };
   }
@@ -1349,6 +1408,14 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   const idleReleaseMs = normalizeOwnerIdleReleaseMs(
     parseEnvMs(process.env.ACPX_OWNER_IDLE_RELEASE_MS),
   );
+  const personKeepMs = resolveOwnerPersonKeepMs();
+  // Order 1 — IN MEMORY, never on the record: `record.acpx` is rebuilt from an allowlist every turn
+  // (`cloneSessionAcpxState`), and an owner that restarts starts without a keep by design (the keep
+  // exists to spare the NEXT person message a cold start; a new owner is already warm).
+  let lastPersonTurnEndedAt: number | undefined;
+  // A person's message reached the running turn (or arrived while it ran): that turn counts as one a
+  // person started when it ends. Reset at each turn's start.
+  let personMessageInTurn = false;
   const maxQueueDepth = Math.max(1, Math.round(options.maxQueueDepth ?? 16));
   // These two remain the QUIESCENCE WINDOW — the span the shared gate requires to
   // have been free of idle-drain relay activity. TTL-derived, and UNCHANGED by the
@@ -1730,10 +1797,12 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       owner.setMidTurnHandler(
         (tasks: QueueTask[]): boolean => {
           if (activeMidTurnHandler) {
+            personMessageInTurn ||= startedByPerson(tasks);
             activeMidTurnHandler(tasks);
             return true;
           }
           if (midTurnCaptureActive) {
+            personMessageInTurn ||= startedByPerson(tasks);
             midTurnBuffer.push(tasks);
             // C4 (G3): make the capture-window wait visible. Without this the task
             // sat between `acpx/received` and acceptance with no delivery event for
@@ -1815,6 +1884,8 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
           lastTaskCompletedAt,
           quiescenceWindowMs,
           idleReleaseMs,
+          personKeepMs,
+          lastPersonTurnEndedAt,
           liveBackgroundTaskCount: backgroundTasks.liveCount(),
           // Lazy: the deploy-file read happens only after the gate already holds,
           // preserving the W13-24-10 short-circuit cost-ordering.
@@ -1888,6 +1959,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       const turnBatch = batch;
       const head = turnBatch[0];
       midTurnCaptureActive = midTurnInjectionSupported;
+      personMessageInTurn = false;
       try {
         await runPromptTurn(async () => {
           try {
@@ -2064,6 +2136,15 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       // accumulated-idle clock. Stamped at turn END (never turn start) so the
       // clock measures idle duration — a 25-min turn leaves it at ~0 when it ends.
       lastTaskCompletedAt = Date.now();
+      if (personKeepMs > 0 && (startedByPerson(turnBatch) || personMessageInTurn)) {
+        lastPersonTurnEndedAt = lastTaskCompletedAt;
+        // Diagnosable like the release line (owner.log): the tester reads when the keep runs out.
+        process.stderr.write(
+          `[acpx] person keep armed for session ${options.sessionId}: ${personKeepMs} ms until ${new Date(
+            lastPersonTurnEndedAt + personKeepMs,
+          ).toISOString()}\n`,
+        );
+      }
 
       // A failover this turn pinned the shared client to a now-stale transcript
       // anchor. Exit so the next prompt cold-spawns a fresh owner on the new

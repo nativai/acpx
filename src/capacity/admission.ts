@@ -12,6 +12,7 @@ import { readPodInfo } from "./budget.js";
 import { type Harness, isHarness, MIB } from "./constants.js";
 import {
   ADMISSION_BUSY_RETRY_AFTER_S,
+  ADMISSION_CLASSES,
   type AdmissionClass,
   AdmissionLockTimeoutError,
   admissionDir,
@@ -74,13 +75,6 @@ import { readWaiting, type WaitingQueue, waitingAheadOf } from "./waiting.js";
  * an unmeasured one fail OPEN, and so does any lock I/O fault; only lock CONTENTION refuses
  * (`admission_busy`, §3.3).
  */
-
-const ADMISSION_CLASSES: readonly AdmissionClass[] = [
-  "interactive",
-  "delivery",
-  "automation",
-  "spawn",
-];
 
 /**
  * Does this environment carry an admission class the runner set (a KNOWN one)? The routed branch and A-16's guard
