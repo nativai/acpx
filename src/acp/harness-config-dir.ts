@@ -17,6 +17,7 @@ import {
   PI_ROUTING_EXTENSION_CODE,
   PI_ROUTING_EXTENSION_FILENAME,
 } from "../config/pi-routing-extension-code.js";
+import { PiSessionStoreUnwritableError } from "../errors.js";
 import { deriveBilling } from "../models/catalogue.js";
 import {
   defaultCatalogueCachePath,
@@ -895,6 +896,13 @@ export function applyHarnessConfigDir(
     );
     return undefined;
   }
+  // ⚠️ FAIL CLOSED ON THE BOX STORE, FIRST, OUTSIDE THE FAIL-OPEN `try` BELOW (P1, brick e9f71106, ruling
+  // row (a)). Resolved before the per-session dir exists, so a refusal leaves nothing under
+  // `/tmp/acpx-pi-<id>` and the env untouched; it throws `PiSessionStoreUnwritableError` and the spawn
+  // never happens. The catch below must NOT swallow it — returning `undefined` there would spawn pi with
+  // no session dir at all. Rows: `test/pi-session-store-fail-closed.test.ts`.
+  const boxAgentDir = resolveBoxPiAgentDir(input.env);
+  const sessionDir = resolvePiSessionDir(boxAgentDir, input.cwd);
   try {
     // Same resolver the SWEEP uses, so the writer and its reaper cannot disagree
     // about where the directory is (`harness-config-dir-root.ts`).
@@ -906,7 +914,7 @@ export function applyHarnessConfigDir(
     // holders and remove the directory underneath this one. Narrowing it to two
     // syscalls is what makes the refcount worth having.
     const holderId = registerConfigDirHolder(dir);
-    const plan = writePiConfigDir(dir, input);
+    const plan = writePiConfigDir(dir, input, boxAgentDir, sessionDir);
     return { ...plan, holderId };
   } catch (error) {
     process.stderr.write(
@@ -939,15 +947,19 @@ export function applyHarnessConfigDir(
  * scanning `PI_CODING_AGENT_SESSION_DIR` for the JSONL. Which is precisely why
  * that variable must name the BOX store — see {@link resolveBoxPiAgentDir}.
  */
-function writePiConfigDir(dir: string, input: HarnessConfigDirInput): HarnessConfigDirPlan {
+function writePiConfigDir(
+  dir: string,
+  input: HarnessConfigDirInput,
+  boxAgentDir: string,
+  sessionDir: string | undefined,
+): HarnessConfigDirPlan {
   const files: string[] = [];
   // brick://cb214e48 — ONE derivation, resolved once, threaded into both consumers
   // (the catalogue read and the session store) so the writer and the detector
   // cannot drift. See {@link resolveBoxPiAgentDir} for why this replaced reading
-  // `env.PI_CODING_AGENT_DIR` at each site, and why the ordering warning that
-  // used to sit above the `resolvePiSessionDir` call below is gone rather than
-  // moved: the value no longer comes from the variable being overwritten.
-  const boxAgentDir = resolveBoxPiAgentDir(input.env);
+  // `env.PI_CODING_AGENT_DIR` at each site. P1 moved the resolution up into
+  // `applyHarnessConfigDir` (the store is probed before this dir exists); it is still
+  // resolved ONCE, before the re-point of `PI_CODING_AGENT_DIR` below.
   if (input.primer) {
     // I2 R9 measured this end-to-end: the marker was in turn 1's request body
     // AND survived a SIGKILL of both pi and pi-acp followed by a resume.
@@ -1007,10 +1019,9 @@ function writePiConfigDir(dir: string, input: HarnessConfigDirInput): HarnessCon
   const piExtensions = seedPiExtensions(dir, boxAgentDir, input.env, files);
   writePiLiveRoutingExtension(dir, input.env, files, piExtensions);
   // KEEP pi's SESSION STORE IN THE BOX STORE (brick ac86eb34, corrected by
-  // brick://cb214e48): the target is derived from `boxAgentDir` above, so it is
+  // brick://cb214e48): `sessionDir` is derived from `boxAgentDir`, so it is
   // immune to the re-point on the next line — and to whatever an ancestor pi
   // session left in `PI_CODING_AGENT_DIR`.
-  const sessionDir = resolvePiSessionDir(boxAgentDir, input.cwd);
   input.env.PI_CODING_AGENT_DIR = dir;
   const envNames = ["PI_CODING_AGENT_DIR"];
   if (sessionDir) {
@@ -1018,8 +1029,9 @@ function writePiConfigDir(dir: string, input: HarnessConfigDirInput): HarnessCon
     envNames.push("PI_CODING_AGENT_SESSION_DIR");
   } else {
     // ⚠️ ALWAYS DECIDE — NEVER LEAVE AN INHERITED VALUE STANDING (brick://cb214e48).
-    // `resolvePiSessionDir` returns `undefined` on two real legs (no cwd, and a
-    // `mkdirSync` failure). This used to be a bare `if`, so on either leg the
+    // `resolvePiSessionDir` returns `undefined` on ONE leg now: no cwd. (The other,
+    // a store it cannot write, THROWS since P1 and never reaches here.) This used
+    // to be a bare `if`, so on that leg the
     // value INHERITED from a parent pi session survived — pointing the child at
     // *the parent's directory for the PARENT's cwd*, two sessions' stores
     // colliding in one folder. The existing `with NO cwd …` test cannot see that
@@ -2266,13 +2278,27 @@ function resolvePiSessionDir(boxAgentDir: string, cwd: string | undefined): stri
   const target = join(boxAgentDir, "sessions", jsonlSessionDirectoryName(cwd.trim()));
   try {
     mkdirSync(target, { recursive: true });
-  } catch {
-    // Could not create it — so do NOT point pi at it. Pointing pi at a directory
-    // that does not exist is the hang described above; leaving the variable unset
-    // keeps today's behaviour, which is degraded but alive.
-    return undefined;
+    probeWritable(target);
+  } catch (error) {
+    // ⚠️ REFUSE — DO NOT FALL BACK (P1, brick e9f71106, ruling row (a)). This used to
+    // return `undefined`, the caller then deleted `PI_CODING_AGENT_SESSION_DIR`, and pi
+    // wrote its JSONL into the per-session temp dir: "degraded but alive" at home, a
+    // LOST TRANSCRIPT in a pool pod, whose temp dir dies with the pod. Pointing pi at
+    // the unwritable dir is no option either (the hang above). So pi does not start.
+    throw new PiSessionStoreUnwritableError({ sessionDir: target, cause: error });
   }
   return target;
+}
+
+/**
+ * WRITABLE, NOT MERELY PRESENT: a read-only mount (the pool pod's `/data/runtime` view before P1) passes
+ * `mkdirSync({recursive:true})` when the directory already exists, so only a real write answers. Create +
+ * remove one uniquely named, non-`.jsonl` file — pi-acp's scan of this directory reads `*.jsonl` only.
+ */
+function probeWritable(dir: string): void {
+  const probe = join(dir, `.acpx-write-probe-${process.pid}-${randomUUID()}`);
+  writeFileSync(probe, "", { flag: "wx" });
+  rmSync(probe, { force: true });
 }
 
 /**

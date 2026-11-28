@@ -1499,3 +1499,74 @@ test("15252af6 through the CLI: the byway copy sends the main-chain uuid as resu
     assert.equal(entryId(copied.log.at(-1)), "u2");
   });
 });
+
+// ── P1 (brick e9f71106, ruling row (c)): a Pi source whose log reads SHORT ───────────────────────
+//
+// On a pool box the source can be live in a pod on ANOTHER machine; this machine's NFS client can then read
+// a log shorter than the record's `messages_log.bytes`. Every Pi copy — copy-all (no `--expect-entry`: atrium
+// sends none), a cut at a completed turn (atrium's `--at-log-index n --expect-entry`) — is refused by name
+// (FORK_SOURCE_SHORT_READ), never copied from the short read. The source command is a pi-acp path that does
+// not exist: the refusal must come before any adapter spawn, and the asserted CODE is what tells it apart
+// from a spawn failure.
+const PI_SOURCE = "node /nonexistent/pi-acp/dist/index.js";
+
+async function shortenSourceLog(homeDir: string, id: string, keepLines: number): Promise<void> {
+  const logPath = path.join(homeDir, ".acpx", "sessions", `${id}.messages.ndjson`);
+  const kept = (await fs.readFile(logPath, "utf8")).split("\n").slice(0, keepLines);
+  await fs.writeFile(logPath, `${kept.join("\n")}\n`, "utf8");
+}
+
+test("P1 (c): a Pi source whose log reads shorter than its record is refused FORK_SOURCE_SHORT_READ — copy-all and a cut alike, no record created", async () => {
+  await withTempHome("acpx-p1c-short-", async (homeDir) => {
+    const source: Source = {
+      id: "p1c-short",
+      agentCommand: PI_SOURCE,
+      cwd: path.join(homeDir, "workspace"),
+      logLines: lines(conversation(0, 12)),
+    };
+    await writeSource(homeDir, source);
+    await shortenSourceLog(homeDir, source.id, 8);
+    const agentAt = (position: number) =>
+      `agent:${createHash("sha1")
+        .update(JSON.stringify(agent(`reply ${position}`)), "utf8")
+        .digest("hex")}`;
+    for (const extra of [
+      [],
+      ["--at-log-index", "6", "--expect-entry", agentAt(5)],
+      ["--at-log-index", "12", "--expect-entry", agentAt(11)],
+    ]) {
+      // 6 lies INSIDE the short read: without the size check its entry still matches and the copy goes
+      // through on a read the record says is incomplete.
+      const refused = await copyFails(homeDir, source, extra);
+      const line = refused.stderr
+        .split("\n")
+        .find((l) => l.includes('"code":"FORK_SOURCE_SHORT_READ"'));
+      assert.ok(
+        line,
+        `${extra.join(" ") || "copy-all"}: no FORK_SOURCE_SHORT_READ: ${refused.stderr}`,
+      );
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      assert.equal(parsed.session, source.id);
+      assert.ok(Number(parsed.file_bytes) < Number(parsed.recorded_bytes));
+    }
+  });
+});
+
+test("P1 (c): a Pi cut whose entry differs from the expected one is refused FORK_CUT_MOVED — no record created", async () => {
+  await withTempHome("acpx-p1c-moved-", async (homeDir) => {
+    const source: Source = {
+      id: "p1c-moved",
+      agentCommand: PI_SOURCE,
+      cwd: path.join(homeDir, "workspace"),
+      logLines: lines(conversation(0, 12)),
+    };
+    await writeSource(homeDir, source);
+    const refused = await copyFails(homeDir, source, [
+      "--at-log-index",
+      "6",
+      "--expect-entry",
+      "user:u-2",
+    ]);
+    assert.match(refused.stderr, /"code":"FORK_CUT_MOVED"/);
+  });
+});

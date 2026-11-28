@@ -249,6 +249,39 @@ export class SourceTranscriptMissingError extends AcpxOperationalError {
   }
 }
 
+/**
+ * P1 (brick e9f71106, ruling row (a)) — the box's Pi session store cannot be written, so pi is NOT started.
+ * Thrown from the launch plan, before the per-session `/tmp/acpx-pi-<id>` dir exists and before any spawn.
+ *
+ * ⚠️ DO NOT "DEGRADE" THIS BACK INTO UNSETTING `PI_CODING_AGENT_SESSION_DIR`. That was the old behaviour and it
+ * looks kinder: pi then writes its JSONL into the per-session temp dir, which on a pool pod dies with the pod —
+ * a lost transcript that nothing reports. In a queued turn this ends the delivery `QUEUE_TURN_START_FAILED`
+ * (never reached the model, resend-safe, sender told); the message text carries `PI_SESSION_STORE_UNWRITABLE`.
+ * Rows: `test/pi-session-store-fail-closed.test.ts`.
+ */
+export const PI_SESSION_STORE_UNWRITABLE_DETAIL_CODE = "PI_SESSION_STORE_UNWRITABLE";
+
+export class PiSessionStoreUnwritableError extends AcpxOperationalError {
+  readonly sessionDir: string;
+
+  constructor(params: { sessionDir: string; cause?: unknown }) {
+    const why = params.cause instanceof Error ? params.cause.message : String(params.cause ?? "");
+    super(
+      `${PI_SESSION_STORE_UNWRITABLE_DETAIL_CODE}: the box's Pi session store ${params.sessionDir} cannot be ` +
+        `written (${why}); pi was not started, so no transcript is written anywhere else. Check that this ` +
+        `pod mounts the box's pi-home read-write.`,
+      {
+        cause: params.cause instanceof Error ? params.cause : undefined,
+        outputCode: "RUNTIME",
+        detailCode: PI_SESSION_STORE_UNWRITABLE_DETAIL_CODE,
+        origin: "runtime",
+        retryable: false,
+      },
+    );
+    this.sessionDir = params.sessionDir;
+  }
+}
+
 export class AgentStartupError extends AcpxOperationalError {
   readonly agentCommand: string;
   readonly exitCode: number | null;

@@ -275,6 +275,29 @@ test("A-45 unit: a home-only harness is placed `home`, anything else `auto`; wit
   );
 });
 
+// P1 (brick e9f71106, contract §2): the production signal through the real session branch (deps.env is
+// process.env in production, routed-branches.ts `env: process.env`).
+test("P1: a Pi session is placed `auto` with ACPX_PI_PLACEMENT=pool and `home` with it absent, empty, home or garbage; codex stays home", async () => {
+  const placementOf = async (kind: string, env: NodeJS.ProcessEnv) => {
+    const h = harness({
+      record: { acpxRecordId: SESSION, agentCommand: `node /opt/${kind}/dist/index.js` },
+      harnessOf: () => kind,
+      env: { PATH: "/usr/bin", ...env },
+    });
+    await routedBranchHandlers(h.deps)["routed-ensure"](
+      decisionFor(["claude", "prompt", "--session-id", SESSION, "x"]),
+      ctx(),
+    );
+    return h.runs[0]?.target.placement;
+  };
+  assert.equal(await placementOf("pi", { ACPX_PI_PLACEMENT: "pool" }), "auto");
+  assert.equal(await placementOf("codex", { ACPX_PI_PLACEMENT: "pool" }), "home");
+  for (const value of [undefined, "", "home", "Pool"]) {
+    const env: NodeJS.ProcessEnv = value === undefined ? {} : { ACPX_PI_PLACEMENT: value };
+    assert.equal(await placementOf("pi", env), "home", String(value));
+  }
+});
+
 // ───────────────────────── stdin (the routed command has none) ─────────────────────────
 
 async function plan(argv: string[], over: { tty?: boolean } = {}) {

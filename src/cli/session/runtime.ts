@@ -37,6 +37,7 @@ import {
   isModelFloorUnmetError,
   isSessionResumeRequiredError,
   PermissionPromptUnavailableError,
+  PiSessionStoreUnwritableError,
   SessionClosedError,
   SessionCwdMissingError,
   SessionMaterialisationError,
@@ -650,6 +651,19 @@ function readSteerBoundaryUuid(
 }
 
 function deliveryErrorFrom(error: unknown): DeliveryEventError {
+  // P1 (brick e9f71106, ruling row (a), sub-HoD decision A 2026-11-28): the Pi owner refused to start because
+  // the box's Pi session store cannot be written. pi was never spawned, so the prompt never reached the model:
+  // that is the CONTRACTED turn-start terminal (`turnStartTerminals`, not delivered, resend-safe, definitive,
+  // sender told), with the refusal named in its message. ⚠️ Its own detailCode would be a code atrium has no
+  // outcome row for, i.e. "outcome unknown — resending may duplicate it": the wrong thing to tell a sender
+  // about a message that provably went nowhere. Row: `test/pi-session-store-fail-closed.test.ts`.
+  if (error instanceof PiSessionStoreUnwritableError) {
+    return {
+      code: 0,
+      message: `${QUEUE_TURN_START_FAILED_MESSAGE}: ${error.name}: ${error.message}`,
+      detailCode: QUEUE_TURN_START_FAILED_DETAIL_CODE,
+    };
+  }
   const normalized = normalizeOutputError(error, { origin: "runtime" });
   return {
     code: normalized.acp?.code ?? 0,

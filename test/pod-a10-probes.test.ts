@@ -1949,6 +1949,36 @@ test("A-44 row 44.2: home cap 0 — a Pi `exec` is refused agent_cap why=home_fu
   }
 });
 
+test("P1 row 44.3 (CLI, the real signal): ACPX_PI_PLACEMENT=pool sends a Pi one-shot to util-pool; absent, empty, home or garbage keep it util-home — codex stays home, claude pool", async () => {
+  for (const extraEnv of [
+    {},
+    { ACPX_PI_PLACEMENT: "" },
+    { ACPX_PI_PLACEMENT: "home" },
+    { ACPX_PI_PLACEMENT: "Pool" },
+  ]) {
+    const r = await rig({ extraEnv, stub: { exit: 0 } });
+    try {
+      await cli(["--agent", PI, "exec", "hi"], r.env);
+      assert.equal(POSTS(r)[0]?.key, "util-home", JSON.stringify(extraEnv));
+    } finally {
+      await r.close();
+    }
+  }
+  const p1 = await rig({ extraEnv: { ACPX_PI_PLACEMENT: "pool" }, stub: { exit: 0 } });
+  try {
+    await cli(["--agent", PI, "exec", "hi"], p1.env);
+    await cli(["--agent", CODEX, "exec", "hi"], p1.env);
+    await cli(["--agent", CLAUDE, "exec", "hi"], p1.env);
+    assert.deepEqual(
+      POSTS(p1).map((post) => post.key),
+      ["util-pool", "util-home", "util-pool"],
+      "with ACPX_PI_PLACEMENT=pool: Pi → pool, codex stays home, claude pool",
+    );
+  } finally {
+    await p1.close();
+  }
+});
+
 test("A-44 row 44.3 (CLI): a Pi one-shot goes home on a box WITHOUT P1's signal — the acpx release alone never moves Pi — and to the pool on a box WITH it; codex stays home, claude pool", async () => {
   // The seam is honoured only under node --test, so the rig's env carries NODE_TEST_CONTEXT; without the
   // signal (absent, or set to anything but "1") Pi stays home.
