@@ -225,9 +225,11 @@ function withEnv<T>(over: NodeJS.ProcessEnv, run: () => Promise<T>): Promise<T> 
 // The refusal reads NO placement fact: it holds in every process that starts a Pi owner. The rows run with each
 // placement fact an agent pod carries (and none, the control/legacy shape), so a future change that made it
 // pool-only — the authority's binding point: home pods lose the per-session folder too — goes red on `home`.
-// `sleeping` is pod mode's first wake of a never-run session: the start failure is wrapped there as
-// `SESSION_MATERIALISATION_FAILED` (`reconnect.ts` `connectAndLoadSession`), which atrium classifies not delivered /
-// resend-safe / never reached in its own row (acpx-ui `server/delivery-status.ts`), and the session stays sleeping.
+// `sleeping` is pod mode's first wake of a never-run session. There the start failure arrives wrapped in
+// `SessionMaterialisationError` (`reconnect.ts` `connectAndLoadSession`, which restores the sleeping record), and
+// O-7 (the authority's text for row (a) clause 3) makes it end on the SAME terminal as a live session's turn:
+// `QUEUE_TURN_START_FAILED`, the code in the message the sender is shown. The session stays sleeping. Any OTHER
+// materialisation failure keeps `SESSION_MATERIALISATION_FAILED` (`test/sleeping-first-wake-terminal.test.ts`).
 const SHAPES = [
   { placement: undefined, sleeping: false },
   { placement: "home", sleeping: false },
@@ -324,13 +326,11 @@ for (const { placement, sleeping } of SHAPES) {
       assert.equal(failed[0]?.phase, "failed");
       const after = await resolveSessionRecord(sessionId);
       if (sleeping) {
-        assert.equal(failed[0]?.error?.detailCode, SESSION_MATERIALISATION_FAILED_DETAIL_CODE);
-        assert.match(failed[0]?.error?.message ?? "", /PI_SESSION_STORE_UNWRITABLE: .*EACCES/);
         // No new conversation: still sleeping, no adapter session id minted.
         assert.equal(after.acpSessionId, "", "a conversation was created");
         assert.ok(after.acpx?.sleeping, "the session no longer sleeps");
-        return;
       }
+      assert.notEqual(failed[0]?.error?.detailCode, SESSION_MATERIALISATION_FAILED_DETAIL_CODE);
       assert.equal(failed[0]?.error?.detailCode, QUEUE_TURN_START_FAILED_DETAIL_CODE);
       assert.match(
         failed[0]?.error?.message ?? "",
@@ -347,6 +347,9 @@ for (const { placement, sleeping } of SHAPES) {
       assert.equal(row?.notifiesSender, true, "the terminal's code does not notify the sender");
       assert.equal(row?.reachedModel, "no");
       assert.equal(row?.resendSafe, true);
+      if (sleeping) {
+        return;
+      }
       // No new conversation: the record still names the original ACP session, and no turn was recorded.
       assert.equal(after.acpSessionId, acpSessionId, "a new conversation replaced the session");
       assert.equal(after.messages.length, 0, "a turn was recorded");

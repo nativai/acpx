@@ -652,16 +652,21 @@ function readSteerBoundaryUuid(
 }
 
 function deliveryErrorFrom(error: unknown): DeliveryEventError {
-  // P1 (brick e9f71106, ruling row (a), sub-HoD decision A 2026-11-28): the Pi owner refused to start because
-  // the box's Pi session store cannot be written. pi was never spawned, so the prompt never reached the model:
-  // that is the CONTRACTED turn-start terminal (`turnStartTerminals`, not delivered, resend-safe, definitive,
-  // sender told), with the refusal named in its message. ⚠️ Its own detailCode would be a code atrium has no
-  // outcome row for, i.e. "outcome unknown — resending may duplicate it": the wrong thing to tell a sender
-  // about a message that provably went nowhere. Row: `test/pi-session-store-fail-closed.test.ts`.
-  if (error instanceof PiSessionStoreUnwritableError) {
+  // P1 (brick e9f71106, ruling row (a), sub-HoD decision A 2026-11-28; O-7): the Pi owner refused to start
+  // because the box's Pi session store cannot be written. pi was never spawned, so the prompt never reached the
+  // model: that is the CONTRACTED turn-start terminal (`turnStartTerminals`, not delivered, resend-safe,
+  // definitive, sender told), with the refusal named in its message — atrium shows the sender that message
+  // (`senderNotify.ts`: "could not be delivered (<reason>)"). ⚠️ Its own detailCode would be a code atrium has
+  // no outcome row for, i.e. "outcome unknown — resending may duplicate it". ⚠️ The SAME terminal at a
+  // sleeping session's FIRST WAKE (O-7): there the refusal arrives wrapped in `SessionMaterialisationError`
+  // (`reconnect.ts` `connectAndLoadSession`, which also restores the sleeping record — the wrap stays, it is
+  // what keeps `wakeRefused` true). ONLY this one wrapped error is looked through; every other materialisation
+  // failure keeps `SESSION_MATERIALISATION_FAILED`. Rows: `test/pi-session-store-fail-closed.test.ts`.
+  const piStoreRefusal = piStoreRefusalOf(error);
+  if (piStoreRefusal) {
     return {
       code: 0,
-      message: `${QUEUE_TURN_START_FAILED_MESSAGE}: ${error.name}: ${error.message}`,
+      message: `${QUEUE_TURN_START_FAILED_MESSAGE}: ${piStoreRefusal.name}: ${piStoreRefusal.message}`,
       detailCode: QUEUE_TURN_START_FAILED_DETAIL_CODE,
     };
   }
@@ -674,6 +679,17 @@ function deliveryErrorFrom(error: unknown): DeliveryEventError {
       ? { effectiveAccount: normalized.effectiveAccount.effectiveAccount }
       : {}),
   };
+}
+
+/** `PiSessionStoreUnwritableError` itself, or as the one error a first wake's materialisation wrapped. */
+function piStoreRefusalOf(error: unknown): PiSessionStoreUnwritableError | undefined {
+  if (error instanceof PiSessionStoreUnwritableError) {
+    return error;
+  }
+  return error instanceof SessionMaterialisationError &&
+    error.wrapped instanceof PiSessionStoreUnwritableError
+    ? error.wrapped
+    : undefined;
 }
 
 // brick a0182aed (TE F1, F3) — the owner's custody sweep settles a deferred copy of an id as delivered once ANOTHER

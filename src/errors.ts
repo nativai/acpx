@@ -69,6 +69,12 @@ export const SESSION_MATERIALISATION_FAILED_DETAIL_CODE = "SESSION_MATERIALISATI
 
 export class SessionMaterialisationError extends AcpxOperationalError {
   readonly sessionId: string;
+  /**
+   * The error the wake failed with, kept as a plain field (NOT `cause`, see below) so the delivery terminal can
+   * tell ONE case apart: P1's `PiSessionStoreUnwritableError` ends on the same terminal at a first wake as on a
+   * later turn (`runtime.ts` `deliveryErrorFrom`). Every other wrapped error keeps this code.
+   */
+  readonly wrapped: unknown;
 
   // ⚠️ NO `cause` option: the output normalizer would surface the cause's bare message instead of this
   // one. The cause's own text is quoted below.
@@ -84,6 +90,7 @@ export class SessionMaterialisationError extends AcpxOperationalError {
       },
     );
     this.sessionId = sessionId;
+    this.wrapped = cause;
   }
 }
 
