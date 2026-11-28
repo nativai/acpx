@@ -24,6 +24,7 @@ import {
 import { agentPodName } from "../src/pod/placement.js";
 import { makePod, makeServiceAccountDir } from "./pod-kit/two-pods.js";
 import { queuePaths } from "./queue-test-helpers.js";
+import { removeTempHomeSync } from "./temp-home.js";
 
 const BASE_NOW = 1_700_000_000_000;
 const MIN = 60_000;
@@ -201,7 +202,7 @@ test("keep K1: pool pod ⇒ the default 60 min; unset, empty and blank all mean 
     }
     assert.equal(DEFAULT_OWNER_PERSON_KEEP_MS, 3_600_000);
   } finally {
-    fs.rmSync(root, { recursive: true, force: true });
+    removeTempHomeSync(root);
   }
 });
 
@@ -222,7 +223,7 @@ test("keep K2: a HOME pod, a pod that does not say, the control pod and a bare p
     );
     assert.equal(resolveOwnerPersonKeepMs({ NV_AGENT_PLACEMENT: "pool" }), 0, "a bare process");
   } finally {
-    fs.rmSync(root, { recursive: true, force: true });
+    removeTempHomeSync(root);
   }
 });
 
@@ -250,7 +251,7 @@ test("keep K3: the value — 0 disables, a number sets, anything invalid is the 
     assert.equal(warnings.length, before);
     assert.equal(normalizeOwnerPersonKeepMs("12.6"), 13);
   } finally {
-    fs.rmSync(root, { recursive: true, force: true });
+    removeTempHomeSync(root);
   }
 });
 
@@ -553,7 +554,7 @@ test("keep R1: a real owner — a person-class prompt keeps it past the idle rel
     }
   } finally {
     for (const { rig } of results) {
-      fs.rmSync(rig.root, { recursive: true, force: true });
+      removeTempHomeSync(rig.root);
     }
   }
 });
