@@ -755,6 +755,10 @@ export function cloneSessionAcpxState(
     // where a new `acpx.*` field goes to die: present at `sessions new`, null
     // after ONE prompt, whole suite green. Proven through a real turn.
     pi_session_dir: state.pi_session_dir,
+    // P1 (brick e9f71106) — stamped at turn END just before the clone that the persisted write is based on
+    // (`savePromptSuccess`), so a line missing here loses the fork floor on EVERY turn. Proven through a real
+    // turn: `test/pi-fork-source-watermark.test.ts`.
+    pi_transcript_bytes: state.pi_transcript_bytes,
     // Same allowlist that dropped depth_projection on every real turn. A learned
     // capability fact lost here would be re-learned only by failing again.
     model_set_unsupported_for: state.model_set_unsupported_for,

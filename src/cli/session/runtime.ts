@@ -16,6 +16,7 @@ import {
   isRetryablePromptError,
   normalizeOutputError,
 } from "../../acp/error-normalization.js";
+import { stampPiTranscriptWatermark } from "../../acp/harness-config-dir.js";
 import {
   injectionAbsorbsIntoActiveTurn,
   injectionReturnsTerminalResponse,
@@ -5010,6 +5011,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     // selection keeps the session on this subscription for an hour from here. The
     // acpxState re-sync below carries it into the persisted write.
     stampLastTurnSubscription(record);
+    // P1 (brick e9f71106, ruling row (c)): the pi JSONL's length at this COMPLETED turn — a fork's floor. The
+    // clone just below is what the persisted write is based on, so it must carry the field (it does).
+    stampPiTranscriptWatermark(record);
     // Served-truth surface (brick://07dd62c9): stamp what the harness ACTUALLY
     // served this turn (last assistant.message.model + derived effort) onto the
     // LIVE `acpx.served` block — never the desired pin. Best-effort; no-op for

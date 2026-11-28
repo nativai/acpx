@@ -17,7 +17,7 @@ import {
   PI_ROUTING_EXTENSION_CODE,
   PI_ROUTING_EXTENSION_FILENAME,
 } from "../config/pi-routing-extension-code.js";
-import { PiSessionStoreUnwritableError } from "../errors.js";
+import { PiForkSourceShortReadError, PiSessionStoreUnwritableError } from "../errors.js";
 import { deriveBilling } from "../models/catalogue.js";
 import {
   defaultCatalogueCachePath,
@@ -30,6 +30,7 @@ import {
   pidScanIsMeasured,
   scanLivePids,
 } from "../process-population.js";
+import type { SessionRecord } from "../types.js";
 import { harnessIdForAgentCommand, HARNESS_FACTS, type HarnessId } from "./harness-capabilities.js";
 import { resolveHarnessConfigDirRoot } from "./harness-config-dir-root.js";
 import {
@@ -667,6 +668,75 @@ export function locatePiSessionTranscript(params: {
     }
   }
   return undefined;
+}
+
+type PiSourceIdentity = Pick<SessionRecord, "agentCommand" | "cwd" | "acpSessionId">;
+
+/** A pi session's JSONL and its size as THIS process sees it; `undefined` when acpx cannot find it. */
+function piTranscriptSize(
+  record: PiSourceIdentity,
+  env: NodeJS.ProcessEnv,
+): { path: string; size: number } | undefined {
+  if (harnessIdForAgentCommand(record.agentCommand) !== "pi" || !record.acpSessionId) {
+    return undefined;
+  }
+  const located = locatePiSessionTranscript({
+    cwd: record.cwd,
+    acpSessionId: record.acpSessionId,
+    env,
+  });
+  if (!located) {
+    return undefined;
+  }
+  try {
+    return { path: located.path, size: statSync(located.path).size };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * P1 (brick e9f71106, ruling row (c)) — at the end of a COMPLETED turn, record how long this Pi session's JSONL
+ * is (`acpx.pi_transcript_bytes`), as the owner that just wrote it sees it. Best-effort: a transcript acpx
+ * cannot find stamps nothing, and a fork of the session then runs with no floor, as before P1.
+ */
+export function stampPiTranscriptWatermark(
+  record: SessionRecord,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  const found = piTranscriptSize(record, env);
+  if (found !== undefined) {
+    (record.acpx ??= {}).pi_transcript_bytes = found.size;
+  }
+}
+
+/**
+ * P1 (brick e9f71106, ruling row (c)) — refuse a fork whose Pi source reads SHORTER here than its owner
+ * recorded (`PiForkSourceShortReadError`, `PI_FORK_SOURCE_SHORT_READ`). Called in the fork's own process just
+ * before `session/fork`: pi-acp is spawned in this same pod and reads the same file through the same NFS
+ * client, so what passes here is at least what pi-acp will read.
+ *
+ * ⚠️ NO WATERMARK ⇒ NO CHECK, BY DESIGN. Every record written before this acpx has none, and such a fork must
+ * run exactly as it did (the sub-HoD's condition; row in `test/pi-fork-source-watermark.test.ts`). Do not
+ * "harden" this into refusing a source without a watermark: that would refuse every older Pi session's fork.
+ */
+export function assertPiForkSourceComplete(
+  source: PiSourceIdentity & Pick<SessionRecord, "acpxRecordId" | "acpx">,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  const recordedBytes = source.acpx?.pi_transcript_bytes;
+  if (harnessIdForAgentCommand(source.agentCommand) !== "pi" || recordedBytes === undefined) {
+    return;
+  }
+  const found = piTranscriptSize(source, env) ?? { path: undefined, size: 0 };
+  if (found.size < recordedBytes) {
+    throw new PiForkSourceShortReadError({
+      sessionId: source.acpxRecordId,
+      path: found.path,
+      recordedBytes,
+      fileBytes: found.size,
+    });
+  }
 }
 
 /**

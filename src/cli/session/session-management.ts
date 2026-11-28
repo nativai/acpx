@@ -15,6 +15,7 @@ import {
 import { formatErrorMessage } from "../../acp/error-normalization.js";
 import { isAcpResourceNotFoundError } from "../../acp/error-shapes.js";
 import { assertForkAtIndexHonoured } from "../../acp/harness-capabilities.js";
+import { assertPiForkSourceComplete } from "../../acp/harness-config-dir.js";
 import { readTransientAdvertisement } from "../../acp/transient-advertisement.js";
 import { withInterrupt, withTimeout } from "../../async-control.js";
 import { effectiveCreateCwd } from "../../config/session-root.js";
@@ -1429,6 +1430,10 @@ async function forkSessionRecordWithClient(
     throw new Error(
       `Agent command "${options.agentCommand}" does not advertise sessionCapabilities.fork; cannot copy session ${sourceRecord.acpxRecordId}`,
     );
+  }
+  // P1 (ruling row (c)): the Pi source as THIS process sees it must be at least as long as its owner recorded.
+  if (forkAtMessageIndex > 0) {
+    assertPiForkSourceComplete(sourceRecord);
   }
 
   try {

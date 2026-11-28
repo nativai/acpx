@@ -411,6 +411,8 @@ function parseAcpxState(raw: unknown, neverRan: boolean): SessionAcpxState | und
   // it is what the resume-failure message names, and a cold reload is exactly when
   // that message is produced.
   assignStringState(state, "pi_session_dir", record.pi_session_dir);
+  // P1 (brick e9f71106) — the pi JSONL fork floor must survive a cold reload: the fork reads it from disk.
+  assignPiTranscriptBytes(state, record.pi_transcript_bytes);
   // A LEARNED capability fact must survive a cold reload, or the session
   // re-offers a control it has already proven cannot work.
   assignStringState(state, "model_set_unsupported_for", record.model_set_unsupported_for);
@@ -535,6 +537,12 @@ function assignBooleanTrue(
 ): void {
   if (value === true) {
     state[key] = true;
+  }
+}
+
+function assignPiTranscriptBytes(state: SessionAcpxState, value: unknown): void {
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
+    state.pi_transcript_bytes = value;
   }
 }
 

@@ -929,6 +929,15 @@ export type SessionAcpxState = {
    */
   pi_session_dir?: string;
   /**
+   * P1 (brick e9f71106, ruling row (c)) — the byte size of this session's pi JSONL in the box store at the
+   * end of its last COMPLETED turn, stamped by the owner that ran it (`stampPiTranscriptWatermark`). A fork
+   * of this session reads it as a floor: the source file the fork's own pod sees must be at least this
+   * long, or the fork is refused `PI_FORK_SOURCE_SHORT_READ` (`assertPiForkSourceComplete`). pi only appends
+   * to a session file, so a later read is never legitimately shorter. ABSENT on every record written before
+   * this acpx — and then a fork runs exactly as before (no floor, no refusal).
+   */
+  pi_transcript_bytes?: number;
+  /**
    * LEARNED: this session's adapter answered `-32601 Method not found` for
    * `session/set_model` (F-12, brick 2dc93747).
    *

@@ -1570,3 +1570,75 @@ test("P1 (c): a Pi cut whose entry differs from the expected one is refused FORK
     assert.match(refused.stderr, /"code":"FORK_CUT_MOVED"/);
   });
 });
+
+// ── P1 (brick e9f71106, ruling row (c)): the Pi transcript's own length floor (`acpx.pi_transcript_bytes`) ──
+//
+// acpx's messages log can be whole while pi's JSONL — what pi-acp forks from, in the fork's own pod — still
+// reads short on this machine. The source's owner records the JSONL's length at each completed turn; a fork
+// refuses PI_FORK_SOURCE_SHORT_READ when the file it can see is shorter. A source with NO floor (every record
+// before this acpx) forks exactly as before. The source is a pi-CLASSIFIED mock (the mock under a `pi-acp/`
+// path), so the real copy path — record, adapter spawn, `session/fork` — runs.
+async function piForkMock(homeDir: string): Promise<string> {
+  const dir = path.join(homeDir, "bin", "pi-acp");
+  await fs.mkdir(dir, { recursive: true });
+  const link = path.join(dir, "mock-agent.js");
+  await fs.symlink(MOCK_AGENT_PATH, link).catch(() => undefined);
+  return `node ${JSON.stringify(link)} --supports-fork-session`;
+}
+
+async function setPiFloor(homeDir: string, id: string, bytes: number): Promise<void> {
+  const file = path.join(homeDir, ".acpx", "sessions", `${id}.json`);
+  const raw = JSON.parse(await fs.readFile(file, "utf8")) as { acpx?: Record<string, unknown> };
+  raw.acpx = { ...raw.acpx, pi_transcript_bytes: bytes };
+  await fs.writeFile(file, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+}
+
+async function writePiTranscript(homeDir: string, source: Source, bytes: number): Promise<void> {
+  const slug = `--${source.cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+  const dir = path.join(homeDir, ".pi", "agent", "sessions", slug);
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(
+    path.join(dir, `2026-11-28T00-00-00_acp-${source.id}.jsonl`),
+    "x".repeat(bytes),
+  );
+}
+
+test("P1 (c) pi JSONL: a source with NO recorded floor (any record before this acpx) copies exactly as before — even with no pi transcript in sight", async () => {
+  await withTempHome("acpx-p1c-nofloor-", async (homeDir) => {
+    const source: Source = {
+      id: "p1c-nofloor",
+      agentCommand: await piForkMock(homeDir),
+      cwd: path.join(homeDir, "workspace"),
+      logLines: lines(conversation(0, 6)),
+    };
+    await writeSource(homeDir, source);
+    const all = await copy(homeDir, source, []);
+    assert.equal(all.record.forked_at_message_index, 6);
+    const cut = await copy(homeDir, source, ["--at-log-index", "5", "--expect-entry", "user:u-4"]);
+    assert.ok(cut.id);
+  });
+});
+
+test("P1 (c) pi JSONL: a source whose transcript reads shorter than its floor, or is missing, is refused PI_FORK_SOURCE_SHORT_READ — no record; a whole one copies", async () => {
+  await withTempHome("acpx-p1c-floor-", async (homeDir) => {
+    const source: Source = {
+      id: "p1c-floor",
+      agentCommand: await piForkMock(homeDir),
+      cwd: path.join(homeDir, "workspace"),
+      logLines: lines(conversation(0, 6)),
+    };
+    await writeSource(homeDir, source);
+    await setPiFloor(homeDir, source.id, 500);
+    // Missing: nothing in the box store for this session.
+    const missing = await copyFails(homeDir, source, []);
+    assert.match(missing.stdout + missing.stderr, /PI_FORK_SOURCE_SHORT_READ/);
+    // Short: the other machine wrote 500 bytes, this one sees 400.
+    await writePiTranscript(homeDir, source, 400);
+    const short = await copyFails(homeDir, source, []);
+    assert.match(short.stdout + short.stderr, /PI_FORK_SOURCE_SHORT_READ/);
+    // Positive control on the same source: the whole file (and more — the source kept appending) copies.
+    await writePiTranscript(homeDir, source, 512);
+    const whole = await copy(homeDir, source, []);
+    assert.equal(whole.record.forked_at_message_index, 6);
+  });
+});

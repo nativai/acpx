@@ -282,6 +282,37 @@ export class PiSessionStoreUnwritableError extends AcpxOperationalError {
   }
 }
 
+/**
+ * P1 (brick e9f71106, ruling row (c)) — a fork of a Pi session whose source pi JSONL, as THIS pod sees it, is
+ * shorter than the source's owner recorded at its last completed turn (`acpx.pi_transcript_bytes`). On a pool
+ * box the source can live in a pod on another machine whose writes this machine's NFS client has not seen yet;
+ * pi-acp, spawned in this same pod, would fork from that short read while acpx's record looks whole. Refused
+ * before the adapter forks.
+ */
+export const PI_FORK_SOURCE_SHORT_READ_DETAIL_CODE = "PI_FORK_SOURCE_SHORT_READ";
+
+export class PiForkSourceShortReadError extends AcpxOperationalError {
+  constructor(params: {
+    sessionId: string;
+    path: string | undefined;
+    recordedBytes: number;
+    fileBytes: number;
+  }) {
+    super(
+      `${PI_FORK_SOURCE_SHORT_READ_DETAIL_CODE}: the Pi transcript of session ${params.sessionId} ` +
+        `(${params.path ?? "not found in the box store"}) holds ${params.fileBytes} bytes here, but its ` +
+        `owner recorded ${params.recordedBytes} at its last completed turn; the fork was not made. Retry ` +
+        `once the source's writes are visible on this machine.`,
+      {
+        outputCode: "RUNTIME",
+        detailCode: PI_FORK_SOURCE_SHORT_READ_DETAIL_CODE,
+        origin: "runtime",
+        retryable: false,
+      },
+    );
+  }
+}
+
 export class AgentStartupError extends AcpxOperationalError {
   readonly agentCommand: string;
   readonly exitCode: number | null;
