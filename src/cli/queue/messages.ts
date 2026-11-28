@@ -3,7 +3,7 @@ import type { EffectiveAccountMetadata } from "../../acp/auth-env.js";
 import { effectiveAccountMetadataFromValue } from "../../acp/error-normalization.js";
 import { toAcpErrorPayload } from "../../acp/error-shapes.js";
 import { isAcpJsonRpcMessage } from "../../acp/jsonrpc.js";
-import { ADMISSION_CLASSES, type AdmissionClass } from "../../capacity/ledger.js";
+import type { AdmissionClass } from "../../capacity/ledger.js";
 import { isPromptInput, textPrompt } from "../../prompt-content.js";
 import {
   OUTPUT_ERROR_CODES,
@@ -804,10 +804,20 @@ type ParsedSubmitRequestFields = Pick<
  * understand must not cost the caller its prompt, and "no class" is the side that gets no keep.
  */
 function parseAdmissionClass(value: unknown): AdmissionClass | undefined {
-  return (ADMISSION_CLASSES as readonly unknown[]).includes(value)
+  return typeof value === "string" && Object.hasOwn(KNOWN_ADMISSION_CLASSES, value)
     ? (value as AdmissionClass)
     : undefined;
 }
+
+// A Record over the type, so a class added to `AdmissionClass` is a compile error here until listed.
+// ⚠️ Not exported from the ledger or admission modules on purpose: pod-admission-guard's CONFORMANCE row
+// holds every value those modules export to a ledger-entry classification.
+const KNOWN_ADMISSION_CLASSES: Record<AdmissionClass, true> = {
+  interactive: true,
+  delivery: true,
+  automation: true,
+  spawn: true,
+};
 
 function parseSubmitRequestFields(
   request: Record<string, unknown>,

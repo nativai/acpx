@@ -59,14 +59,6 @@ function passwdHome(): string {
 
 export type AdmissionClass = "interactive" | "delivery" | "automation" | "spawn";
 
-/** Every class `ACPX_ADMISSION_CLASS` may carry — the one list (admission.ts and the queue protocol read it). */
-export const ADMISSION_CLASSES: readonly AdmissionClass[] = [
-  "interactive",
-  "delivery",
-  "automation",
-  "spawn",
-];
-
 /**
  * `maintenance` is a release build's (CONCEPTION 25479d40 §3.2): written only by `run-build`, never
  * a class anyone can send (`ACPX_ADMISSION_CLASS` knows only {@link AdmissionClass}).

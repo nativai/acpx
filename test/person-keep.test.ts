@@ -10,7 +10,6 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { ADMISSION_CLASSES } from "../src/capacity/ledger.js";
 import { parseQueueRequest } from "../src/cli/queue/messages.js";
 import {
   DEFAULT_OWNER_PERSON_KEEP_MS,
@@ -161,7 +160,7 @@ test("keep U6: deploy-staleness still releases inside the keep; so does nothing 
 test("keep C1: only `interactive` starts the keep — never delivery, automation, spawn or no class", () => {
   assert.equal(startedByPerson([{ admissionClass: "interactive" }]), true);
   assert.equal(startedByPerson([{}, { admissionClass: "interactive" }]), true, "any member");
-  for (const admissionClass of [...ADMISSION_CLASSES.filter((c) => c !== "interactive"), "", "x"]) {
+  for (const admissionClass of ["delivery", "automation", "spawn", "", "x"]) {
     assert.equal(startedByPerson([{ admissionClass }]), false, `class ${admissionClass}`);
   }
   assert.equal(startedByPerson([{}]), false, "NO class — the agent's own shell");
@@ -279,7 +278,7 @@ const classOf = (request: unknown) =>
   (parseQueueRequest(request) as { admissionClass?: string } | null)?.admissionClass;
 
 test("keep W1: admissionClass survives the parse on both submissions", () => {
-  for (const admissionClass of ADMISSION_CLASSES) {
+  for (const admissionClass of ["interactive", "delivery", "automation", "spawn"]) {
     assert.equal(classOf(submit({ admissionClass })), admissionClass);
     assert.equal(classOf(batch({ admissionClass })), admissionClass);
   }
