@@ -17,6 +17,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   assertPiForkSourceComplete,
+  locatePiSessionTranscript,
   stampPiTranscriptWatermark,
 } from "../src/acp/harness-config-dir.js";
 import {
@@ -220,5 +221,40 @@ test("P1 (c) REAL TURN: a completed pi turn persists acpx.pi_transcript_bytes = 
       (await fs.stat(transcript)).size,
       "the completed turn's floor is missing from the persisted record",
     );
+  });
+});
+
+test("P1 (c) F-W1-1: only the BOX STORE file counts — box file missing and a FULL stranded /tmp/acpx-pi-* copy present ⇒ refused", async () => {
+  await withTempHome("acpx-p1c-wm-stranded-", async (home) => {
+    const box = path.join(home, "box-agent");
+    const cwd = path.join(home, "work");
+    const root = process.env.ACPX_HARNESS_CONFIG_DIR_ROOT;
+    assert.ok(root, "the temp home isolates the config-dir root");
+    const env = { ACPX_PI_BOX_AGENT_DIR: box, ACPX_HARNESS_CONFIG_DIR_ROOT: root };
+    // A stranded copy, as a pod-local pi would have left it, holding MORE than the floor.
+    const stranded = plantPiTranscript(
+      path.join(root, "acpx-pi-stranded-owner"),
+      cwd,
+      "acp-p1c-source",
+      500,
+    );
+    // Control: the generic locator DOES find it — so a check built on it would have passed this source.
+    assert.equal(
+      locatePiSessionTranscript({ cwd, acpSessionId: "acp-p1c-source", env })?.path,
+      stranded,
+    );
+    assert.throws(
+      () => assertPiForkSourceComplete(piSource({ cwd, floor: 100 }), env),
+      PiForkSourceShortReadError,
+    );
+    // And the writer stamps nothing from a stranded copy either.
+    const record = makeSessionRecord({
+      acpxRecordId: "p1c-stranded",
+      acpSessionId: "acp-p1c-source",
+      agentCommand: "node /opt/pi-acp/dist/index.js",
+      cwd,
+    });
+    stampPiTranscriptWatermark(record, env);
+    assert.equal(record.acpx?.pi_transcript_bytes, undefined);
   });
 });

@@ -672,27 +672,38 @@ export function locatePiSessionTranscript(params: {
 
 type PiSourceIdentity = Pick<SessionRecord, "agentCommand" | "cwd" | "acpSessionId">;
 
-/** A pi session's JSONL and its size as THIS process sees it; `undefined` when acpx cannot find it. */
+/** A pi session's JSONL in the BOX STORE and its size as THIS process sees it; `undefined` when absent. */
 function piTranscriptSize(
   record: PiSourceIdentity,
   env: NodeJS.ProcessEnv,
 ): { path: string; size: number } | undefined {
-  if (harnessIdForAgentCommand(record.agentCommand) !== "pi" || !record.acpSessionId) {
-    return undefined;
-  }
-  const located = locatePiSessionTranscript({
-    cwd: record.cwd,
-    acpSessionId: record.acpSessionId,
-    env,
-  });
-  if (!located) {
+  const path = boxPiTranscriptPath(record, env);
+  if (!path) {
     return undefined;
   }
   try {
-    return { path: located.path, size: statSync(located.path).size };
+    return { path, size: statSync(path).size };
   } catch {
     return undefined;
   }
+}
+
+/**
+ * ⚠️ THE BOX STORE ONLY (F-W1-1), never `locatePiSessionTranscript`'s stranded `/tmp/acpx-pi-*` fallback: the
+ * fork's pi-acp reads `PI_CODING_AGENT_SESSION_DIR`, which is the box store, so a full stranded copy must not
+ * vouch for a short box file. Row: `test/pi-fork-source-watermark.test.ts` "F-W1-1".
+ */
+function boxPiTranscriptPath(record: PiSourceIdentity, env: NodeJS.ProcessEnv): string | undefined {
+  if (harnessIdForAgentCommand(record.agentCommand) !== "pi") {
+    return undefined;
+  }
+  const target = resolveRescueTarget(record.cwd, record.acpSessionId ?? "");
+  if (!target) {
+    return undefined;
+  }
+  const dir = join(resolveBoxPiAgentDir(env), "sessions", target.slug);
+  const name = findFileWithSuffix(dir, target.suffix);
+  return name ? join(dir, name) : undefined;
 }
 
 /**
