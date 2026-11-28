@@ -38,6 +38,7 @@ import { runQueuedTask } from "../src/cli/session/runtime.js";
 import {
   PI_SESSION_STORE_UNWRITABLE_DETAIL_CODE,
   PiSessionStoreUnwritableError,
+  SESSION_MATERIALISATION_FAILED_DETAIL_CODE,
 } from "../src/errors.js";
 import type { DepthProjection } from "../src/session/depth-projection.js";
 import { sessionEventActivePath } from "../src/session/event-log.js";
@@ -224,9 +225,20 @@ function withEnv<T>(over: NodeJS.ProcessEnv, run: () => Promise<T>): Promise<T> 
 // The refusal reads NO placement fact: it holds in every process that starts a Pi owner. The rows run with each
 // placement fact an agent pod carries (and none, the control/legacy shape), so a future change that made it
 // pool-only — the authority's binding point: home pods lose the per-session folder too — goes red on `home`.
-for (const placement of [undefined, "home", "pool"] as const) {
-  test(`P1 (a) real owner path, placement=${placement ?? "none"}: the Pi owner does not start; nothing is written outside the box store; the delivery ends not delivered under PI_SESSION_STORE_UNWRITABLE; the sender is told; no new conversation`, async () => {
-    await withTempHome(`acpx-p1a-owner-${placement ?? "none"}-`, async (home) => {
+// `sleeping` is pod mode's first wake of a never-run session: the start failure is wrapped there as
+// `SESSION_MATERIALISATION_FAILED` (`reconnect.ts` `connectAndLoadSession`), which atrium classifies not delivered /
+// resend-safe / never reached in its own row (acpx-ui `server/delivery-status.ts`), and the session stays sleeping.
+const SHAPES = [
+  { placement: undefined, sleeping: false },
+  { placement: "home", sleeping: false },
+  { placement: "pool", sleeping: false },
+  { placement: "home", sleeping: true },
+  { placement: "pool", sleeping: true },
+] as const;
+for (const { placement, sleeping } of SHAPES) {
+  const shape = `placement=${placement ?? "none"}${sleeping ? ", first wake of a sleeping session" : ""}`;
+  test(`P1 (a) real owner path, ${shape}: the Pi owner does not start; nothing is written outside the box store; the delivery ends not delivered under PI_SESSION_STORE_UNWRITABLE; the sender is told; no new conversation`, async () => {
+    await withTempHome(`acpx-p1a-owner-${placement ?? "none"}-${sleeping}-`, async (home) => {
       const cwd = path.join(home, "work");
       mkdirSync(cwd, { recursive: true });
       const { box, target } = readOnlyStore(home, cwd);
@@ -236,14 +248,15 @@ for (const placement of [undefined, "home", "pool"] as const) {
       const adapter = path.join(home, "fake", "pi-acp", "dist", "index.js");
       mkdirSync(path.dirname(adapter), { recursive: true });
       writeFileSync(adapter, `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "x");\n`);
-      const sessionId = `p1a-${placement ?? "none"}-session`;
-      const acpSessionId = `acp-${sessionId}`;
+      const sessionId = `p1a-${placement ?? "none"}-${sleeping ? "sleeping" : "live"}-session`;
+      const acpSessionId = sleeping ? "" : `acp-${sessionId}`;
       await writeSessionRecord(
         makeSessionRecord({
           acpxRecordId: sessionId,
           acpSessionId,
           agentCommand: `node ${adapter}`,
           cwd,
+          ...(sleeping ? { acpx: { sleeping: { since: "2026-11-28T12:00:00.000Z" } } } : {}),
         }),
       );
       const lease = await tryAcquireQueueOwnerLease(sessionId);
@@ -309,6 +322,15 @@ for (const placement of [undefined, "home", "pool"] as const) {
       const failed = await eventsOf(sessionId, "acpx/delivery");
       assert.equal(failed.length, 1, `exactly one terminal; got ${JSON.stringify(failed)}`);
       assert.equal(failed[0]?.phase, "failed");
+      const after = await resolveSessionRecord(sessionId);
+      if (sleeping) {
+        assert.equal(failed[0]?.error?.detailCode, SESSION_MATERIALISATION_FAILED_DETAIL_CODE);
+        assert.match(failed[0]?.error?.message ?? "", /PI_SESSION_STORE_UNWRITABLE: .*EACCES/);
+        // No new conversation: still sleeping, no adapter session id minted.
+        assert.equal(after.acpSessionId, "", "a conversation was created");
+        assert.ok(after.acpx?.sleeping, "the session no longer sleeps");
+        return;
+      }
       assert.equal(failed[0]?.error?.detailCode, QUEUE_TURN_START_FAILED_DETAIL_CODE);
       assert.match(
         failed[0]?.error?.message ?? "",
@@ -326,7 +348,6 @@ for (const placement of [undefined, "home", "pool"] as const) {
       assert.equal(row?.reachedModel, "no");
       assert.equal(row?.resendSafe, true);
       // No new conversation: the record still names the original ACP session, and no turn was recorded.
-      const after = await resolveSessionRecord(sessionId);
       assert.equal(after.acpSessionId, acpSessionId, "a new conversation replaced the session");
       assert.equal(after.messages.length, 0, "a turn was recorded");
     });

@@ -47,19 +47,24 @@ export function readBoxFacts(
   env: NodeJS.ProcessEnv = process.env,
   warn: (line: string) => void = (line) => process.stderr.write(line),
 ): BoxFacts {
-  const seam = Boolean(env.NODE_TEST_CONTEXT) && env.ACPX_TEST_P1_ON_BOX === "1";
   const value = env[PI_PLACEMENT_ENV];
   if (value === "pool") {
     return { p1OnBox: true };
   }
-  if (value !== undefined && value !== "" && value !== "home" && !warnedUnknownPlacement) {
-    warnedUnknownPlacement = true;
-    warn(
-      `[acpx] warning: ${PI_PLACEMENT_ENV}=${JSON.stringify(value)} is not "pool" or "home"; ` +
-        `treating it as "home" (Pi sessions stay in home-placed pods)\n`,
-    );
+  warnUnknownPlacementOnce(value, warn);
+  return { p1OnBox: Boolean(env.NODE_TEST_CONTEXT) && env.ACPX_TEST_P1_ON_BOX === "1" };
+}
+
+/** Absent, empty and `home` are the documented "not on the box"; anything else is named, once. */
+function warnUnknownPlacementOnce(value: string | undefined, warn: (line: string) => void): void {
+  if (value === undefined || value === "" || value === "home" || warnedUnknownPlacement) {
+    return;
   }
-  return { p1OnBox: seam };
+  warnedUnknownPlacement = true;
+  warn(
+    `[acpx] warning: ${PI_PLACEMENT_ENV}=${JSON.stringify(value)} is not "pool" or "home"; ` +
+      `treating it as "home" (Pi sessions stay in home-placed pods)\n`,
+  );
 }
 
 /** Tests only: forget that the once-per-process warning was written. */

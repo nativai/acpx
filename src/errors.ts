@@ -265,7 +265,7 @@ export class PiSessionStoreUnwritableError extends AcpxOperationalError {
   readonly sessionDir: string;
 
   constructor(params: { sessionDir: string; cause?: unknown }) {
-    const why = params.cause instanceof Error ? params.cause.message : String(params.cause ?? "");
+    const why = params.cause instanceof Error ? params.cause.message : "unknown error";
     super(
       `${PI_SESSION_STORE_UNWRITABLE_DETAIL_CODE}: the box's Pi session store ${params.sessionDir} cannot be ` +
         `written (${why}); pi was not started, so no transcript is written anywhere else. Check that this ` +
