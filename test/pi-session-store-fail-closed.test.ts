@@ -44,6 +44,7 @@ import type { DepthProjection } from "../src/session/depth-projection.js";
 import { sessionEventActivePath } from "../src/session/event-log.js";
 import { listSessionEvents } from "../src/session/events.js";
 import { resolveSessionRecord, writeSessionRecord } from "../src/session/persistence.js";
+import { sessionContextFromRecord } from "../src/session/session-context.js";
 import { connectSocket, nextJsonLine } from "./queue-test-helpers.js";
 import { makeSessionRecord, withTempHome } from "./runtime-test-helpers.js";
 
@@ -163,6 +164,73 @@ test("P1 (a) unit, positive control: a writable store still yields the box sessi
     assert.equal(plan?.sessionDir, target);
     assert.equal(env.PI_CODING_AGENT_SESSION_DIR, target);
     assert.deepEqual(readdirSync(target), [], "the write probe was left behind");
+  });
+});
+
+test("P1 (a) F-W1-2: a writable FOLDER with the resumed session's transcript READ-ONLY is refused PI_SESSION_STORE_UNWRITABLE", async () => {
+  await withTempHome("acpx-p1a-unit-rofile-", async (home) => {
+    const cwd = path.join(home, "work");
+    mkdirSync(cwd, { recursive: true });
+    const box = path.join(home, "box-agent");
+    const target = path.join(box, "sessions", mangled(cwd));
+    mkdirSync(target, { recursive: true });
+    const transcript = path.join(target, "2026-11-28T00-00-00_acp-resumed.jsonl");
+    writeFileSync(transcript, '{"type":"session"}\n');
+    chmodSync(transcript, 0o444);
+    const rootDir = path.join(home, "cfg-root");
+    mkdirSync(rootDir, { recursive: true });
+    const apply = (piResumeSessionId: string | undefined) =>
+      applyHarnessConfigDir({
+        env: { HOME: home, ACPX_PI_BOX_AGENT_DIR: box },
+        agentCommand: AGENT_REGISTRY.pi,
+        sessionId: `ses-rofile-${piResumeSessionId ?? "new"}`,
+        primer: "P",
+        cwd,
+        rootDir,
+        ...(piResumeSessionId === undefined ? {} : { piResumeSessionId }),
+      });
+    try {
+      assert.throws(
+        () => apply("acp-resumed"),
+        (error: unknown) => {
+          assert.ok(error instanceof PiSessionStoreUnwritableError, String(error));
+          assert.match(error.message, /^PI_SESSION_STORE_UNWRITABLE: .*EACCES/);
+          return true;
+        },
+      );
+      assert.deepEqual(readdirSync(rootDir), [], "a per-session config dir was created");
+      // Controls: a NEW session (no resume id) and ANOTHER session's resume in the same folder still start.
+      assert.equal(apply(undefined)?.sessionDir, target);
+      assert.equal(apply("acp-someone-else")?.sessionDir, target);
+      chmodSync(transcript, 0o644);
+      assert.equal(apply("acp-resumed")?.sessionDir, target, "an appendable transcript starts");
+      assert.equal(
+        readFileSync(transcript, "utf8"),
+        '{"type":"session"}\n',
+        "the probe wrote nothing",
+      );
+    } finally {
+      chmodSync(transcript, 0o644);
+    }
+  });
+});
+
+test("P1 (a) F-W1-2: a record-backed spawn carries its pi session id as the resume hint; a new one carries none", async () => {
+  await withTempHome("acpx-p1a-resume-hint-", async (home) => {
+    const live = makeSessionRecord({
+      acpxRecordId: "p1a-hint",
+      acpSessionId: "acp-p1a-hint",
+      agentCommand: AGENT_REGISTRY.pi,
+      cwd: home,
+    });
+    assert.equal((await sessionContextFromRecord(live)).piResumeSessionId, "acp-p1a-hint");
+    const sleeping = makeSessionRecord({
+      acpxRecordId: "p1a-hint-sleeping",
+      acpSessionId: "",
+      agentCommand: AGENT_REGISTRY.pi,
+      cwd: home,
+    });
+    assert.equal((await sessionContextFromRecord(sleeping)).piResumeSessionId, null);
   });
 });
 

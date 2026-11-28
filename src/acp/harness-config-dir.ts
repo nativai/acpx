@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import {
+  closeSync,
   constants,
   copyFileSync,
   cpSync,
   existsSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -931,6 +933,8 @@ export interface HarnessConfigDirInput {
   /** The session's working directory — pi namespaces its session store by it
    *  (brick ac86eb34). Absent ⇒ pi's session dir is left alone. */
   cwd?: string;
+  /** P1 (F-W1-2): the pi session id this spawn resumes; its existing transcript must be appendable. */
+  piResumeSessionId?: string;
   /** Overrides the box `providers.json` that pi's `auth.json` points at (default
    *  `boxProvidersPath()`); tests use it to keep the file inside a fixture. */
   providersPath?: string;
@@ -983,7 +987,7 @@ export function applyHarnessConfigDir(
   // never happens. The catch below must NOT swallow it — returning `undefined` there would spawn pi with
   // no session dir at all. Rows: `test/pi-session-store-fail-closed.test.ts`.
   const boxAgentDir = resolveBoxPiAgentDir(input.env);
-  const sessionDir = resolvePiSessionDir(boxAgentDir, input.cwd);
+  const sessionDir = resolvePiSessionDir(boxAgentDir, input.cwd, input.piResumeSessionId);
   try {
     // Same resolver the SWEEP uses, so the writer and its reaper cannot disagree
     // about where the directory is (`harness-config-dir-root.ts`).
@@ -2348,7 +2352,11 @@ function readBoxPiOpenRouterModels(boxAgentDir: string): PiCatalogueModel[] {
  * **empty stdout AND empty stderr**, no error of any kind. A missing `mkdir` here
  * does not degrade, it wedges the session, and it looks exactly like a slow model.
  */
-function resolvePiSessionDir(boxAgentDir: string, cwd: string | undefined): string | undefined {
+function resolvePiSessionDir(
+  boxAgentDir: string,
+  cwd: string | undefined,
+  resumeSessionId?: string,
+): string | undefined {
   if (!cwd?.trim()) {
     // No cwd, no mangled name. Better to leave pi's default alone than to invent
     // a path: the session still runs, and the JSONL is merely where it is today.
@@ -2360,6 +2368,7 @@ function resolvePiSessionDir(boxAgentDir: string, cwd: string | undefined): stri
   try {
     mkdirSync(target, { recursive: true });
     probeWritable(target);
+    probeTranscriptAppendable(target, resumeSessionId);
   } catch (error) {
     // ⚠️ REFUSE — DO NOT FALL BACK (P1, brick e9f71106, ruling row (a)). This used to
     // return `undefined`, the caller then deleted `PI_CODING_AGENT_SESSION_DIR`, and pi
@@ -2380,6 +2389,21 @@ function probeWritable(dir: string): void {
   const probe = join(dir, `.acpx-write-probe-${process.pid}-${randomUUID()}`);
   writeFileSync(probe, "", { flag: "wx" });
   rmSync(probe, { force: true });
+}
+
+/**
+ * P1 (F-W1-2): a writable FOLDER does not make the resumed session's own transcript writable — pi appends to
+ * that file. When it already exists, open it for append and close it again, writing nothing.
+ */
+function probeTranscriptAppendable(dir: string, resumeSessionId: string | undefined): void {
+  const id = resumeSessionId?.trim();
+  if (!id) {
+    return;
+  }
+  const name = findFileWithSuffix(dir, `_${id}.jsonl`);
+  if (name) {
+    closeSync(openSync(join(dir, name), "a"));
+  }
 }
 
 /**

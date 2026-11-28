@@ -52,6 +52,7 @@ export async function sessionContextFromRecord(
     profileId: record.acpx?.session_options?.profile ?? null,
     reasoningEffort: opts.reasoningEffort ?? null,
     seatId: record.seatId ?? null,
+    piResumeSessionId: record.acpSessionId || null,
     seatOrdinal: record.holderOrdinal ?? null,
     parentSeatId: record.parentSeatId ?? null,
     ...principalContextFields(record.metadata),

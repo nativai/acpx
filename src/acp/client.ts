@@ -1744,6 +1744,8 @@ export class AcpClient {
       ...(harnessProvisionsModelCatalogue(harnessIdForAgentCommand(this.options.agentCommand))
         ? { provisionModelId: this.options.sessionOptions?.model }
         : {}),
+      // P1 (F-W1-2): the resumed session's own transcript must be appendable, not only its folder.
+      piResumeSessionId: this.options.sessionContext?.piResumeSessionId ?? undefined,
     });
     this.adoptHarnessConfigDirPlan(plan);
     reportHarnessConfigDir(plan, this.options.verbose);
